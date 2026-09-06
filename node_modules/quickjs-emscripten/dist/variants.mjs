@@ -1,0 +1,2 @@
+import{DEBUG_ASYNC,DEBUG_SYNC,RELEASE_ASYNC,RELEASE_SYNC,newQuickJSAsyncWASMModule,newQuickJSWASMModule}from"./chunk-OHAYRCBA.mjs";export{DEBUG_ASYNC,DEBUG_SYNC,RELEASE_ASYNC,RELEASE_SYNC,newQuickJSAsyncWASMModule,newQuickJSWASMModule};
+//# sourceMappingURL=variants.mjs.map

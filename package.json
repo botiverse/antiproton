@@ -2,8 +2,13 @@
   "name": "agent-harness",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "conformance": "node test/conformance.ts"
+  },
+  "dependencies": {
+    "quickjs-emscripten": "^0.32.0"
   }
 }
