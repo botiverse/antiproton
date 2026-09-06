@@ -63,14 +63,16 @@ export class CodegenHarness implements HarnessAdapter {
 
   async initialize(config: Json): Promise<Json> {
     const mounts = (config as any)?.mounts ?? [];
+    const policy = (config as any)?.policy as string | undefined;
     const preamble =
       mounts.length > 0
         ? `\n\nMounts available to you right now:\n${mounts
             .map((m: any) => `  ${m.alias}  (${m.plugin} v${m.version}, account: ${JSON.stringify(m.config?.account ?? null)})`)
             .join("\n")}`
         : "";
+    const rules = policy ? `\n\n# Domain policy you must follow\n${policy}` : "";
     return {
-      messages: [{ role: "system", content: SYSTEM + preamble }],
+      messages: [{ role: "system", content: SYSTEM + preamble + rules }],
       turns: 0, done: false, finalizing: false,
     } satisfies CodegenState;
   }
