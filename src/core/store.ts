@@ -51,7 +51,10 @@ export interface StorageAdapter {
     consumer: string,
   ): Promise<"released" | "has_work" | "fenced">;
 
-  claimOutbox(limit: number): Promise<Array<{ commandId: string; taskId: string; kind: string; payload: Json }>>;
+  /** Scoped by tenant: a worker draining one tenant's task must never dispatch
+   *  another tenant's commands, and per-tenant scoping is what makes fair
+   *  scheduling possible later (§12.1). */
+  claimOutbox(limit: number, tenantId?: string): Promise<Array<{ commandId: string; taskId: string; kind: string; payload: Json }>>;
   markDispatched(commandId: string): Promise<void>;
 
   recordOperation(op: Omit<OperationRecord, "status" | "resultRef">): Promise<void>;

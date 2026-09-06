@@ -398,11 +398,15 @@ export class SqliteStore implements StorageAdapter {
     });
   }
 
-  async claimOutbox(limit: number) {
+  async claimOutbox(limit: number, tenantId?: string) {
     return this.#tx(() => {
-      const rows = this.#db
-        .prepare("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at ASC LIMIT ?")
-        .all(limit) as any[];
+      const rows = (tenantId
+        ? this.#db.prepare(
+            "SELECT * FROM outbox WHERE state='pending' AND tenant_id=? ORDER BY created_at ASC LIMIT ?",
+          ).all(tenantId, limit)
+        : this.#db.prepare(
+            "SELECT * FROM outbox WHERE state='pending' ORDER BY created_at ASC LIMIT ?",
+          ).all(limit)) as any[];
       for (const r of rows) {
         this.#db.prepare("UPDATE outbox SET state='claimed' WHERE command_id=?").run(r.command_id);
       }

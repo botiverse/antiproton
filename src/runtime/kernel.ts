@@ -123,7 +123,7 @@ export class Kernel {
 
     if (crashAt === "after_commit") return { outcome: "crashed_after_commit" };
 
-    const dispatched = dispatch ? await this.drainOutbox(dispatch) : 0;
+    const dispatched = dispatch ? await this.drainOutbox(dispatch, 100, tenantId) : 0;
     return { outcome: "committed", dispatched };
   }
 
@@ -131,8 +131,9 @@ export class Kernel {
   async drainOutbox(
     dispatch: (cmd: { commandId: string; kind: string; payload: Json }) => Promise<void>,
     limit = 100,
+    tenantId?: string,
   ): Promise<number> {
-    const batch = await this.#store.claimOutbox(limit);
+    const batch = await this.#store.claimOutbox(limit, tenantId);
     for (const cmd of batch) {
       await dispatch(cmd);
       await this.#store.markDispatched(cmd.commandId);

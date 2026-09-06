@@ -9,6 +9,7 @@
     "conformance": "node test/conformance.ts"
   },
   "dependencies": {
+    "pg": "^8.23.0",
     "quickjs-emscripten": "^0.32.0"
   }
 }
