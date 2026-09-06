@@ -2,47 +2,22 @@ import { getQuickJS, type QuickJSContext, type QuickJSHandle } from "quickjs-ems
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
+import { DEFAULT_LIMITS as LIMITS } from "../core/execution.ts";
+import type { ExecutionLimits, ExecutionResult, ExecutorHost, JsExecutor } from "../core/execution.ts";
 
-export interface ExecutionLimits {
-  wallTimeMs: number;
-  memoryBytes: number;
-  maxStackBytes: number;
-  maxHostCalls: number;
-  maxConcurrentHostCalls: number;
-  maxOutputBytes: number;
-}
-
-export const DEFAULT_LIMITS: ExecutionLimits = {
-  wallTimeMs: 5_000,
-  memoryBytes: 64 * 1024 * 1024,
-  maxStackBytes: 1024 * 1024,
-  maxHostCalls: 64,
-  maxConcurrentHostCalls: 8,
-  maxOutputBytes: 64 * 1024,
-};
-
-export interface ExecutorHost {
-  invoke(call: { tool: string; args: Json; opts: Record<string, Json> }): Promise<ToolResult>;
-}
-
-export interface ExecutionResult {
-  status: "completed" | "failed" | "interrupted";
-  outputs: Json[];
-  acceptedOperationIds: string[];
-  hostCalls: number;
-  error?: { code: string; message: string };
-}
+export { DEFAULT_LIMITS } from "../core/execution.ts";
+export type { ExecutionLimits, ExecutorHost, ExecutionResult, JsExecutor } from "../core/execution.ts";
 
 /**
  * One JSRuntime + one context per execution, destroyed at the end. Nothing from
  * the previous execution survives: no variables, no closures, no pending
  * promises. The only way out of the sandbox is the `tool` tag and `output`.
  */
-export class QuickJsExecutor {
+export class QuickJsExecutor implements JsExecutor {
   async execute(
     source: string,
     host: ExecutorHost,
-    limits: ExecutionLimits = DEFAULT_LIMITS,
+    limits: ExecutionLimits = LIMITS,
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
     const QuickJS = await getQuickJS();

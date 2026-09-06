@@ -12,6 +12,10 @@
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObjectStore } from "../../src/store/durable-object.ts";
+import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
+import { kernelSpec } from "../../test/spec/kernel-spec.ts";
+import { executorSpec } from "../../test/spec/executor-spec.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -32,13 +36,29 @@ type WorkerCode = {
 };
 type WorkerStub = { getEntrypoint(name?: string | null, opts?: unknown): { fetch(req: Request): Promise<Response> } };
 
-/** The Tool Gateway, as a capability handed to the sandbox. */
+/** The P0 probe binding (kept for the substrate checks). */
 export class ToolBinding extends WorkerEntrypoint {
   async invoke(name: string, args: unknown) {
     const caller = (this.ctx as any).props ?? {};
     if (name === "echo") return { status: "succeeded", result: { args, tenant: caller.tenantId } };
     if (name === "slow") { await new Promise((r) => setTimeout(r, 20)); return { status: "succeeded", result: {} }; }
     return { status: "rejected", error: { code: "not_mounted", message: name } };
+  }
+}
+
+/**
+ * What the sandbox sees as `env.TOOLS`. It holds no authority of its own: the
+ * execution id in ctx.props is the only thing it can say, and the supervisor
+ * decides what that id is allowed to do.
+ */
+export class SandboxTools extends WorkerEntrypoint<Env> {
+  async invoke(strings: string[], values: unknown[]) {
+    const props = ((this.ctx as any).props ?? {}) as { execId?: string; doId?: string };
+    // ctx.exports loopback entrypoints do NOT run in the Durable Object's
+    // isolate, so the execution registry is not visible from here. Hop back into
+    // the object that owns the execution.
+    const stub = this.env.AGENT.get(this.env.AGENT.idFromString(String(props.doId)));
+    return stub.sandboxCall(String(props.execId ?? ""), strings, values);
   }
 }
 
@@ -82,37 +102,38 @@ async function runSandbox(
 
 export class AgentDO extends DurableObject<Env> {
   sql: SqlStorage;
+  #store: DurableObjectStore | null = null;
   alarmFiredAt: number | null = null;
   alarmSetAt: number | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS tasks(
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_tasks(
       task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, generation INTEGER NOT NULL,
       checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS outbox(
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_outbox(
       command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL)`);
   }
 
   /** The three-gate advance from §7.3, on DO SQLite, timed. */
   async verifyStorage() {
     const t0 = Date.now();
-    this.sql.exec("DELETE FROM tasks");
-    this.sql.exec("DELETE FROM outbox");
+    this.sql.exec("DELETE FROM probe_tasks");
+    this.sql.exec("DELETE FROM probe_outbox");
     this.sql.exec(
-      "INSERT INTO tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
+      "INSERT INTO probe_tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
 
     const commit = (gen: number, token: number, version: number, cmd: string) =>
       this.ctx.storage.transactionSync(() => {
-        const row = [...this.sql.exec("SELECT * FROM tasks WHERE task_id='t1'")][0] as any;
+        const row = [...this.sql.exec("SELECT * FROM probe_tasks WHERE task_id='t1'")][0] as any;
         if (token < row.fencing_token) return "fenced";
         if (gen !== row.generation) return "stale_generation";
         if (version !== row.checkpoint_version) return "version_conflict";
         this.sql.exec(
-          "UPDATE tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
+          "UPDATE probe_tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
           row.checkpoint_version + 1, token, JSON.stringify({ log: [cmd] }));
-        this.sql.exec("INSERT INTO outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
+        this.sql.exec("INSERT INTO probe_outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
         return "ok";
       });
 
@@ -123,12 +144,41 @@ export class AgentDO extends DurableObject<Env> {
       staleGeneration: commit(9, 6, 1, "cmd-oldgen"),
       replayIsIdempotent: (() => {
         commit(0, 6, 1, "cmd-1");
-        return [...this.sql.exec("SELECT count(*) AS n FROM outbox WHERE command_id='cmd-1'")][0];
+        return [...this.sql.exec("SELECT count(*) AS n FROM probe_outbox WHERE command_id='cmd-1'")][0];
       })(),
-      rowsAfter: [...this.sql.exec("SELECT * FROM tasks")][0],
+      rowsAfter: [...this.sql.exec("SELECT * FROM probe_tasks")][0],
       ms: Date.now() - t0,
     };
     return results;
+  }
+
+  /** The kernel contract, unchanged, against Durable Object storage. */
+  async runKernelSpec() {
+    const t0 = Date.now();
+    const results = await kernelSpec(async () => {
+      const store = new DurableObjectStore(this.ctx as any);
+      return store;
+    });
+    return { backend: "durable-object", ms: Date.now() - t0, results };
+  }
+
+  /** Entered from SandboxTools; the sandbox can never reach this directly. */
+  async sandboxCall(execId: string, strings: string[], values: unknown[]) {
+    return handleSandboxCall(execId, strings, values);
+  }
+
+  /** The executor contract, unchanged, against Dynamic Workers. */
+  async runExecutorSpec() {
+    const t0 = Date.now();
+    const exec = new DynamicWorkerExecutor({
+      loader: this.env.LOADER,
+      makeToolBinding: (execId) =>
+        (this.ctx as any).exports.SandboxTools({
+          props: { execId, doId: this.ctx.id.toString() },
+        }),
+    });
+    const results = await executorSpec(exec);
+    return { implementation: "cloudflare-dynamic-workers", ms: Date.now() - t0, results };
   }
 
   async armAlarm(delayMs: number) {
@@ -198,6 +248,44 @@ export class AgentDO extends DurableObject<Env> {
     await timed("noBindingsMeansNoTools", () => runSandbox(this.env, `
       return { envKeys: Object.keys(env ?? {}), hasTools: typeof (env ?? {}).TOOLS };`));
 
+    await timed("nodeCompatSurface", () => runSandbox(this.env, `
+      const probe = { hasProcess: typeof process };
+      try {
+        const fs = await import("node:fs");
+        probe.importedFs = Object.keys(fs).slice(0, 6);
+        try { probe.readEtcPasswd = String(fs.readFileSync("/etc/passwd")).slice(0, 20); }
+        catch (e) { probe.readEtcPasswd = "threw: " + String(e.message || e).slice(0, 60); }
+        try { probe.readdirRoot = fs.readdirSync("/"); }
+        catch (e) { probe.readdirRoot = "threw: " + String(e.message || e).slice(0, 60); }
+      } catch (e) { probe.importedFs = "import refused: " + String(e.message || e).slice(0, 60); }
+      try { const cp = await import("node:child_process"); probe.childProcess = Object.keys(cp).slice(0, 4); }
+      catch (e) { probe.childProcess = "refused"; }
+      try {
+        const net = await import("node:net");
+        probe.net = typeof net.Socket;
+        // The real question: globalOutbound is documented to intercept connect()
+        // as well as fetch(). Does the node:net path honour it?
+        probe.socketConnect = await new Promise((resolve) => {
+          try {
+            const sock = net.connect({ host: "example.com", port: 443 });
+            const done = (v) => { try { sock.destroy(); } catch {} resolve(v); };
+            sock.on("connect", () => done("CONNECTED — ESCAPE"));
+            sock.on("error", (e) => done("refused: " + String(e && e.message).slice(0, 50)));
+            setTimeout(() => done("timeout (no connection)"), 3000);
+          } catch (e) { resolve("threw: " + String(e.message || e).slice(0, 50)); }
+        });
+      } catch (e) { probe.net = "refused"; }
+      try {
+        const cp2 = await import("node:child_process");
+        probe.execWorks = await new Promise((resolve) => {
+          try { cp2.exec("id", (err, out) => resolve(err ? "threw: " + String(err.message).slice(0, 50) : "RAN: " + out)); }
+          catch (e) { resolve("threw: " + String(e.message || e).slice(0, 50)); }
+        });
+      } catch (e) { probe.execWorks = "refused"; }
+      try { const fs2 = await import("node:fs"); probe.bundleListing = fs2.readdirSync("/bundle").slice(0, 5); }
+      catch (e) { probe.bundleListing = "refused"; }
+      return probe;`));
+
     return checks;
   }
 }
@@ -228,11 +316,15 @@ async function latency(env: Env) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const id = env.AGENT.idFromName("p0");
-    const stub = env.AGENT.get(id);
+    // Conformance gets its own object: the P0 probe created an incompatible
+    // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
+    const name = url.pathname.startsWith("/conformance") ? "conformance-v2" : "p0";
+    const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
         case "/storage": return Response.json(await stub.verifyStorage());
+        case "/conformance/kernel": return Response.json(await stub.runKernelSpec());
+        case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
         case "/sandbox": return Response.json(await stub.verifySandbox());
         case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
