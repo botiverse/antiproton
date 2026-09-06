@@ -11,5 +11,8 @@
   "dependencies": {
     "pg": "^8.23.0",
     "quickjs-emscripten": "^0.32.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.129.0"
   }
 }

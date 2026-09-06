@@ -56,6 +56,9 @@ const RETRYABLE = new Set(["40001", "40P01"]);
 export class PostgresStore implements StorageAdapter {
   readonly name = "postgres";
   #pool: pg.Pool;
+  /** Optional round-trip observer. Round trips, not bytes, dominate cost on a
+   *  remote store: at ~90ms RTT every extra statement is another 90ms. */
+  onQuery: ((sql: string, ms: number) => void) | null = null;
 
   constructor(cfg: { connectionString: string; max?: number }) {
     this.#pool = new pg.Pool({
@@ -79,13 +82,42 @@ export class PostgresStore implements StorageAdapter {
   }
 
   async #q(sql: string, params: unknown[] = []) {
-    return this.#pool.query(sql, params);
+    if (!this.onQuery) return this.#pool.query(sql, params);
+    const t = performance.now();
+    const r = await this.#pool.query(sql, params);
+    this.onQuery(sql, performance.now() - t);
+    return r;
+  }
+
+  #wrap(c: pg.PoolClient): pg.PoolClient {
+    if (!this.onQuery || (c as any).__observed) return c;
+    const observe = this.onQuery;
+    const orig = c.query.bind(c);
+    // Full argument passthrough: pg's own Pool.query calls client.query with a
+    // callback, so a wrapper that only understands (sql, params) and returns a
+    // promise silently swallows it and the pool hangs forever.
+    (c as any).query = (...args: unknown[]) => {
+      const t = performance.now();
+      const label = typeof args[0] === "string" ? args[0] : ((args[0] as any)?.text ?? "?");
+      const out = (orig as any)(...args);
+      if (out && typeof (out as any).then === "function") {
+        (out as Promise<unknown>).then(
+          () => observe(label, performance.now() - t),
+          () => observe(label, performance.now() - t),
+        );
+      } else {
+        observe(label, performance.now() - t);
+      }
+      return out;
+    };
+    (c as any).__observed = true;
+    return c;
   }
 
   async #tx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 5; attempt++) {
-      const c = await this.#pool.connect();
+      const c = this.#wrap(await this.#pool.connect());
       try {
         await c.query("BEGIN");
         const out = await fn(c);

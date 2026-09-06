@@ -1,0 +1,223 @@
+/**
+ * P0-CF: does the Cloudflare substrate actually give us what the plan needs?
+ *
+ * Verifies, on real infrastructure and not from documentation:
+ *   1. Worker Loader is available on this account at all.
+ *   2. A dynamically loaded Worker is a fresh isolate — no state carries over.
+ *   3. `globalOutbound: null` blocks the network at the platform level, so the
+ *      tool binding really is the only way out (§4.4).
+ *   4. `limits.cpuMs` kills a runaway loop without taking the host down (§6.3).
+ *   5. A capability binding reaches the sandbox and nothing else does (§5.1).
+ *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
+ *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
+ */
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+
+export interface Env {
+  AGENT: DurableObjectNamespace<AgentDO>;
+  LOADER: {
+    load(code: WorkerCode): WorkerStub;
+    get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
+  };
+}
+type WorkerCode = {
+  compatibilityDate: string;
+  compatibilityFlags?: string[];
+  mainModule: string;
+  modules: Record<string, string>;
+  env?: Record<string, unknown>;
+  globalOutbound?: unknown;
+  limits?: { cpuMs?: number; subRequests?: number };
+};
+type WorkerStub = { getEntrypoint(name?: string | null, opts?: unknown): { fetch(req: Request): Promise<Response> } };
+
+/** The Tool Gateway, as a capability handed to the sandbox. */
+export class ToolBinding extends WorkerEntrypoint {
+  async invoke(name: string, args: unknown) {
+    const caller = (this.ctx as any).props ?? {};
+    if (name === "echo") return { status: "succeeded", result: { args, tenant: caller.tenantId } };
+    if (name === "slow") { await new Promise((r) => setTimeout(r, 20)); return { status: "succeeded", result: {} }; }
+    return { status: "rejected", error: { code: "not_mounted", message: name } };
+  }
+}
+
+const RUNNER = (body: string) => `
+export default {
+  async fetch(request, env) {
+    const out = [];
+    const output = (v) => out.push(v);
+    try {
+      const result = await (async () => { ${body} })();
+      return Response.json({ ok: true, out, result: result ?? null });
+    } catch (e) {
+      return Response.json({ ok: false, out, error: String(e && e.message || e) });
+    }
+  }
+};`;
+
+async function runSandbox(
+  env: Env,
+  body: string,
+  opts: { limits?: { cpuMs?: number; subRequests?: number }; outbound?: unknown; tools?: unknown } = {},
+) {
+  const stub = env.LOADER.load({
+    compatibilityDate: "2026-09-05",
+    mainModule: "main.js",
+    modules: { "main.js": RUNNER(body) },
+    globalOutbound: opts.outbound === undefined ? null : opts.outbound,
+    env: opts.tools ? { TOOLS: opts.tools } : {},
+    limits: opts.limits,
+  });
+  // A CPU/subrequest kill is NOT catchable inside the sandbox: it surfaces as a
+  // rejection here, in the caller. Every invocation must therefore be wrapped —
+  // otherwise one runaway script takes down the supervisor's whole request.
+  try {
+    const res = await stub.getEntrypoint().fetch(new Request("https://sandbox/"));
+    return await res.json();
+  } catch (e: any) {
+    return { ok: false, terminatedByHost: true, error: String(e?.message ?? e).slice(0, 120) };
+  }
+}
+
+export class AgentDO extends DurableObject<Env> {
+  sql: SqlStorage;
+  alarmFiredAt: number | null = null;
+  alarmSetAt: number | null = null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS tasks(
+      task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, generation INTEGER NOT NULL,
+      checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS outbox(
+      command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL)`);
+  }
+
+  /** The three-gate advance from §7.3, on DO SQLite, timed. */
+  async verifyStorage() {
+    const t0 = Date.now();
+    this.sql.exec("DELETE FROM tasks");
+    this.sql.exec("DELETE FROM outbox");
+    this.sql.exec(
+      "INSERT INTO tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
+
+    const commit = (gen: number, token: number, version: number, cmd: string) =>
+      this.ctx.storage.transactionSync(() => {
+        const row = [...this.sql.exec("SELECT * FROM tasks WHERE task_id='t1'")][0] as any;
+        if (token < row.fencing_token) return "fenced";
+        if (gen !== row.generation) return "stale_generation";
+        if (version !== row.checkpoint_version) return "version_conflict";
+        this.sql.exec(
+          "UPDATE tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
+          row.checkpoint_version + 1, token, JSON.stringify({ log: [cmd] }));
+        this.sql.exec("INSERT INTO outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
+        return "ok";
+      });
+
+    const results = {
+      happyPath: commit(0, 5, 0, "cmd-1"),
+      staleVersion: commit(0, 5, 0, "cmd-dup"),
+      fenced: commit(0, 1, 1, "cmd-zombie"),
+      staleGeneration: commit(9, 6, 1, "cmd-oldgen"),
+      replayIsIdempotent: (() => {
+        commit(0, 6, 1, "cmd-1");
+        return [...this.sql.exec("SELECT count(*) AS n FROM outbox WHERE command_id='cmd-1'")][0];
+      })(),
+      rowsAfter: [...this.sql.exec("SELECT * FROM tasks")][0],
+      ms: Date.now() - t0,
+    };
+    return results;
+  }
+
+  async armAlarm(delayMs: number) {
+    this.alarmSetAt = Date.now();
+    this.alarmFiredAt = null;
+    await this.ctx.storage.setAlarm(Date.now() + delayMs);
+    return { armedAt: this.alarmSetAt, delayMs };
+  }
+  async alarm() {
+    this.alarmFiredAt = Date.now();
+    this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
+    this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
+  }
+  async alarmStatus() {
+    this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
+    const rows = [...this.sql.exec("SELECT at FROM alarms ORDER BY at DESC LIMIT 1")] as any[];
+    return {
+      armedAt: this.alarmSetAt, firedAt: rows[0]?.at ?? null,
+      latencyMs: rows[0]?.at && this.alarmSetAt ? rows[0].at - this.alarmSetAt : null,
+    };
+  }
+
+  /** Isolated: does a runaway child kill the supervisor, or only itself? */
+  async verifyCpuLimit(cpuMs: number) {
+    const t0 = Date.now();
+    const killed = await runSandbox(this.env, `while (true) {}`, { limits: { cpuMs } });
+    const afterMs = Date.now() - t0;
+    // If the supervisor is still executing here, it survived the runaway child.
+    const survivor = await runSandbox(this.env, `output("still alive"); return "alive";`);
+    return { killed, killTookMs: afterMs, hostSurvived: survivor };
+  }
+
+  /** Dynamic Workers get a higher concurrency budget inside a DO (10 vs 4). */
+  async verifySandbox() {
+    const checks: Record<string, unknown> = {};
+    const timed = async (name: string, fn: () => Promise<unknown>) => {
+      const t = Date.now();
+      try { checks[name] = { ...(await fn() as object), ms: Date.now() - t }; }
+      catch (e: any) { checks[name] = { threw: String(e?.message ?? e).slice(0, 120), ms: Date.now() - t }; }
+    };
+    const t0 = Date.now();
+
+    await timed("freshIsolateA", () => runSandbox(this.env, `globalThis.leaked = 42; output(typeof globalThis.leaked); return "a";`));
+    await timed("freshIsolateB", () => runSandbox(this.env, `output(typeof globalThis.leaked); return "b";`));
+    checks.twoLoadsMs = Date.now() - t0;
+
+    await timed("networkBlocked", () => runSandbox(this.env, `
+      const probe = {};
+      try { await fetch("https://example.com"); probe.fetch = "ALLOWED"; }
+      catch (e) { probe.fetch = "blocked"; }
+      probe.hasConnect = typeof connect;
+      output(probe); return probe;`));
+
+    await timed("capabilityBinding", () => runSandbox(this.env, `
+      const r = await env.TOOLS.invoke("echo", { repo: "example/project" });
+      const bad = await env.TOOLS.invoke("slack.post", {});
+      return { ok: r, rejected: bad };`,
+      { tools: this.ctx.exports.ToolBinding({ props: { tenantId: "tenant-a" } }) }));
+
+    await timed("subRequestLimit", () => runSandbox(this.env, `
+      let n = 0;
+      try { for (let i = 0; i < 10; i++) { await env.TOOLS.invoke("slow", {}); n++; } }
+      catch (e) { return { completed: n, stopped: String(e.message || e).slice(0, 60) }; }
+      return { completed: n, stopped: null };`,
+      { tools: this.ctx.exports.ToolBinding({ props: {} }), limits: { subRequests: 3 } }));
+
+    await timed("noBindingsMeansNoTools", () => runSandbox(this.env, `
+      return { envKeys: Object.keys(env ?? {}), hasTools: typeof (env ?? {}).TOOLS };`));
+
+    return checks;
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const id = env.AGENT.idFromName("p0");
+    const stub = env.AGENT.get(id);
+    try {
+      switch (url.pathname) {
+        case "/storage": return Response.json(await stub.verifyStorage());
+        case "/sandbox": return Response.json(await stub.verifySandbox());
+        case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
+        case "/alarm/arm": return Response.json(await stub.armAlarm(Number(url.searchParams.get("ms") ?? 2000)));
+        case "/alarm/status": return Response.json(await stub.alarmStatus());
+        default:
+          return Response.json({ routes: ["/storage", "/sandbox", "/alarm/arm?ms=", "/alarm/status"] });
+      }
+    } catch (e: any) {
+      return Response.json({ error: String(e?.message ?? e), stack: String(e?.stack ?? "").slice(0, 600) }, { status: 500 });
+    }
+  },
+};
