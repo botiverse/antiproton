@@ -6,6 +6,7 @@ import type {
   OperationRecord,
   OperationStatus,
   RuntimeEvent,
+  MountRecord,
   TaskRecord,
   WaitSpec,
 } from "./types.ts";
@@ -71,4 +72,9 @@ export interface StorageAdapter {
   ): Promise<"registered" | "already_satisfied">;
 
   interrupt(tenantId: string, taskId: string): Promise<number>;
+
+  addMount(m: MountRecord): Promise<void>;
+  getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;
+  findMountsByPlugin(tenantId: string, agentId: string, plugin: string): Promise<MountRecord[]>;
+  listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;
 }

@@ -6,6 +6,7 @@ import type {
   CommitResult,
   Json,
   Lease,
+  MountRecord,
   OperationRecord,
   OperationStatus,
   RuntimeEvent,
@@ -509,5 +510,55 @@ export class SqliteStore implements StorageAdapter {
         .get(tenantId, taskId) as any;
       return r.generation as number;
     });
+  }
+
+  #mountRow(r: any): MountRecord {
+    return {
+      tenantId: r.tenant_id,
+      agentId: r.agent_id,
+      alias: r.alias,
+      plugin: r.plugin,
+      installationId: r.installation_id,
+      connectionId: r.connection_id,
+      toolVersion: r.tool_version,
+      publicConfig: JSON.parse(r.public_config),
+      secretRef: r.secret_ref,
+    };
+  }
+
+  async addMount(m: MountRecord) {
+    this.#db
+      .prepare(
+        `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id,
+           plugin, tool_version, public_config, secret_ref)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId,
+        m.plugin, m.toolVersion, j(m.publicConfig), m.secretRef,
+      );
+  }
+
+  async getMountByAlias(tenantId: string, agentId: string, alias: string) {
+    const r = this.#db
+      .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?")
+      .get(tenantId, agentId, alias) as any;
+    return r ? this.#mountRow(r) : null;
+  }
+
+  async findMountsByPlugin(tenantId: string, agentId: string, plugin: string) {
+    return (
+      this.#db
+        .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? AND plugin=? ORDER BY alias")
+        .all(tenantId, agentId, plugin) as any[]
+    ).map((r) => this.#mountRow(r));
+  }
+
+  async listMounts(tenantId: string, agentId: string) {
+    return (
+      this.#db
+        .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias")
+        .all(tenantId, agentId) as any[]
+    ).map((r) => this.#mountRow(r));
   }
 }

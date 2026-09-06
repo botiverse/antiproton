@@ -96,3 +96,16 @@ export interface OperationRecord {
   status: OperationStatus;
   resultRef: string | null;
 }
+
+/** Config-time binding. The agent addresses `alias`, never a connection id. */
+export interface MountRecord {
+  tenantId: string;
+  agentId: string;
+  alias: string;
+  plugin: string;
+  installationId: string;
+  connectionId: string | null;
+  toolVersion: string;
+  publicConfig: Record<string, Json>;
+  secretRef: string | null;
+}
