@@ -51,6 +51,7 @@ async function rig(retentionFloor = 0) {
     tokens: new Map([[A_KEY, "tenant-a"], [B_KEY, "tenant-b"]]),
     retentionFloor,
     sseIntervalMs: 40,
+    sseKeepaliveMs: 120,
     async onNewTask(tenantId, agentId, taskId) {
       await store.createTask(tenantId, agentId, taskId, await harness.initialize({}));
     },
@@ -164,6 +165,27 @@ test("事件流续读", "the SSE stream replays from a cursor and resumes withou
   assert(all.length >= 3, `stream carried the run (${all.length} events)`);
   const resumed = await read(all[0]!);
   eq(resumed.join(","), all.slice(1).join(","), "resume from a cursor yields exactly the remainder");
+  await r.done();
+});
+
+test("流保活", "an idle stream keeps sending bytes so client timeouts do not kill it", async () => {
+  const r = await rig();
+  const { body: agent } = await r.call("POST", "/agents", A_KEY, {});
+  const res = await fetch(`${r.base}/agents/${agent.agentId}/events?after=0`, {
+    headers: { authorization: `Bearer ${A_KEY}` },
+  });
+  const reader = res.body!.getReader();
+  const dec = new TextDecoder();
+  let text = "";
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline && !text.includes(": keepalive")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += dec.decode(value, { stream: true });
+  }
+  await reader.cancel().catch(() => {});
+  assert(text.includes(": connected"), "stream opens with a byte immediately");
+  assert(text.includes(": keepalive"), "idle stream emits keepalive comments");
   await r.done();
 });
 

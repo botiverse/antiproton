@@ -9,6 +9,9 @@ export interface ApiOptions {
   /** Events at or below this sequence are treated as aged out of the window. */
   retentionFloor?: number;
   sseIntervalMs?: number;
+  /** Idle keepalive. A long-waiting agent produces no events for minutes; without
+   *  a periodic byte, client body timeouts and proxies drop the stream. */
+  sseKeepaliveMs?: number;
   onNewTask?: (tenantId: string, agentId: string, taskId: string) => Promise<void> | void;
 }
 
@@ -38,6 +41,7 @@ async function readJson(req: IncomingMessage): Promise<any> {
 export function createApi(store: SqliteStore, opts: ApiOptions) {
   const retentionFloor = opts.retentionFloor ?? 0;
   const sseIntervalMs = opts.sseIntervalMs ?? 120;
+  const sseKeepaliveMs = opts.sseKeepaliveMs ?? 15_000;
 
   /** Command idempotency: a retry returns the first response, it does not re-act.
    *  A retry that arrives while the original is still running is told so rather
@@ -176,15 +180,22 @@ export function createApi(store: SqliteStore, opts: ApiOptions) {
         });
         let cursor = after;
         let closed = false;
+        let lastWrite = Date.now();
         req.on("close", () => { closed = true; });
+        res.write(`: connected cursor=${cursor}\n\n`);
         const pump = async () => {
           while (!closed) {
             const batch = await store.eventsSince(ctx.tenantId, agentId, cursor, 100);
             for (const e of batch) {
               cursor = e.sequence;
               res.write(`id: ${e.sequence}\nevent: ${e.kind}\ndata: ${JSON.stringify(e)}\n\n`);
+              lastWrite = Date.now();
             }
             if (url.searchParams.get("once") === "1" && batch.length === 0) break;
+            if (Date.now() - lastWrite >= sseKeepaliveMs) {
+              res.write(`: keepalive ${cursor}\n\n`);
+              lastWrite = Date.now();
+            }
             await new Promise((r) => setTimeout(r, sseIntervalMs));
           }
           res.end();
