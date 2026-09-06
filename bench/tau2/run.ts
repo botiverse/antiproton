@@ -109,7 +109,7 @@ async function runTask(task: any, verbose: boolean) {
 
     await store.appendEvent({ tenantId: T, agentId: AGENT, taskId: TASK, kind: "message", payload: { text: u.text } });
     let guard = 0, answered: string | null = null;
-    while (guard++ < 30) {
+    while (guard++ < 90) {
       const r = await kernel.step(T, TASK, null, (cmd) => commands.dispatch(ctx, cmd));
       if (r.outcome === "no_work") break;
       const t = await store.loadTask(T, TASK);
@@ -120,7 +120,7 @@ async function runTask(task: any, verbose: boolean) {
     }
     modelCalls += commands.trace.filter((x) => x.kind === "model").length;
     commands.trace.length = 0;
-    if (!answered) { ended = "agent_stalled"; break; }
+    if (!answered) { ended = guard >= 90 ? "step_budget" : "agent_stalled"; break; }
     agentSaid = answered;
     if (verbose) console.log(`    agent > ${answered.replace(/\s+/g, " ").slice(0, 130)}`);
   }
