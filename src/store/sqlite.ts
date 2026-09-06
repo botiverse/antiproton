@@ -1,0 +1,513 @@
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
+import type { StorageAdapter } from "../core/store.ts";
+import type {
+  AdvanceTxn,
+  CommitResult,
+  Json,
+  Lease,
+  OperationRecord,
+  OperationStatus,
+  RuntimeEvent,
+  TaskRecord,
+  WaitSpec,
+} from "../core/types.ts";
+
+const SCHEMA = `
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+-- tenant_id is denormalised onto every table on purpose: §12.1 wants isolation
+-- to be structural, not a join away.
+CREATE TABLE IF NOT EXISTS agents (
+  tenant_id TEXT NOT NULL, agent_id TEXT PRIMARY KEY,
+  config TEXT NOT NULL, created_at INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  tenant_id TEXT NOT NULL, task_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+  status TEXT NOT NULL, generation INTEGER NOT NULL,
+  checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL DEFAULT 0,
+  checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS tasks_tenant ON tasks(tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS events (
+  event_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  task_id TEXT, thread_id TEXT, sequence INTEGER NOT NULL, kind TEXT NOT NULL,
+  payload TEXT NOT NULL, dedup_key TEXT, created_at INTEGER NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS events_dedup ON events(tenant_id, dedup_key)
+  WHERE dedup_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS events_seq ON events(tenant_id, agent_id, sequence);
+CREATE INDEX IF NOT EXISTS events_task ON events(tenant_id, task_id, sequence);
+
+-- Cursors live in their own record, not on the event row: consumption position
+-- is per-consumer, and the plan's §7.2 model conflated the two.
+CREATE TABLE IF NOT EXISTS cursors (
+  tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, consumer TEXT NOT NULL,
+  consumed_through INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, task_id, consumer));
+
+CREATE TABLE IF NOT EXISTS leases (
+  task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, holder TEXT NOT NULL,
+  fencing_token INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS outbox (
+  command_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+  state TEXT NOT NULL, created_at INTEGER NOT NULL, dispatched_at INTEGER);
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(state, created_at);
+
+CREATE TABLE IF NOT EXISTS waits (
+  wait_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  generation INTEGER NOT NULL, kind TEXT NOT NULL, operation_id TEXT,
+  deadline INTEGER, resolved INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS waits_op ON waits(tenant_id, operation_id, resolved);
+
+CREATE TABLE IF NOT EXISTS operations (
+  operation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  task_id TEXT NOT NULL, mount_alias TEXT NOT NULL, tool TEXT NOT NULL,
+  tool_version TEXT NOT NULL, status TEXT NOT NULL, result_ref TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS operations_task ON operations(tenant_id, task_id, status);
+
+-- Config-time binding (alias -> installation + connection). The agent addresses
+-- a mount; credentials never reach it.
+CREATE TABLE IF NOT EXISTS mounts (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
+  installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
+  tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT,
+  PRIMARY KEY (tenant_id, agent_id, alias));
+`;
+
+const now = () => Date.now();
+const j = (v: Json) => JSON.stringify(v ?? null);
+
+export class SqliteStore implements StorageAdapter {
+  readonly name = "sqlite";
+  #db: DatabaseSync;
+
+  constructor(path = ":memory:") {
+    this.#db = new DatabaseSync(path);
+  }
+
+  async init() {
+    this.#db.exec(SCHEMA);
+    this.#db
+      .prepare("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)")
+      .run();
+  }
+
+  async close() {
+    this.#db.close();
+  }
+
+  #tx<T>(fn: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.#db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  #nextCounter(name: string): number {
+    this.#db
+      .prepare("INSERT INTO counters(name, value) VALUES (?, 0) ON CONFLICT(name) DO NOTHING")
+      .run(name);
+    this.#db.prepare("UPDATE counters SET value = value + 1 WHERE name = ?").run(name);
+    const row = this.#db.prepare("SELECT value FROM counters WHERE name = ?").get(name) as
+      | { value: number }
+      | undefined;
+    return row!.value;
+  }
+
+  async createAgent(tenantId: string, agentId: string, config: Json = {}) {
+    this.#db
+      .prepare("INSERT INTO agents(tenant_id, agent_id, config, created_at) VALUES (?,?,?,?)")
+      .run(tenantId, agentId, j(config), now());
+  }
+
+  async createTask(tenantId: string, agentId: string, taskId: string, checkpoint: Json) {
+    this.#db
+      .prepare(
+        `INSERT INTO tasks(tenant_id, task_id, agent_id, status, generation,
+           checkpoint_version, fencing_token, checkpoint, updated_at)
+         VALUES (?,?,?,'runnable',0,0,0,?,?)`,
+      )
+      .run(tenantId, taskId, agentId, j(checkpoint), now());
+  }
+
+  async loadTask(tenantId: string, taskId: string): Promise<TaskRecord | null> {
+    const r = this.#db
+      .prepare("SELECT * FROM tasks WHERE tenant_id = ? AND task_id = ?")
+      .get(tenantId, taskId) as any;
+    if (!r) return null;
+    return {
+      tenantId: r.tenant_id,
+      agentId: r.agent_id,
+      taskId: r.task_id,
+      status: r.status,
+      generation: r.generation,
+      checkpointVersion: r.checkpoint_version,
+      fencingToken: r.fencing_token,
+      checkpoint: JSON.parse(r.checkpoint),
+    };
+  }
+
+  async appendEvent(e: {
+    tenantId: string;
+    agentId: string;
+    taskId?: string | null;
+    threadId?: string | null;
+    kind: string;
+    payload: Json;
+    dedupKey?: string | null;
+  }) {
+    return this.#tx(() => this.#insertEvent(e));
+  }
+
+  /** Non-transactional insert, so callers already inside #tx can reuse it. */
+  #insertEvent(e: {
+    tenantId: string;
+    agentId: string;
+    taskId?: string | null;
+    threadId?: string | null;
+    kind: string;
+    payload: Json;
+    dedupKey?: string | null;
+  }): { inserted: boolean; sequence: number; eventId: string } {
+    if (e.dedupKey) {
+      const dup = this.#db
+        .prepare("SELECT event_id, sequence FROM events WHERE tenant_id = ? AND dedup_key = ?")
+        .get(e.tenantId, e.dedupKey) as any;
+      if (dup) return { inserted: false, sequence: dup.sequence, eventId: dup.event_id };
+    }
+    const sequence = this.#nextCounter(`seq:${e.tenantId}:${e.agentId}`);
+    const eventId = randomUUID();
+    this.#db
+      .prepare(
+        `INSERT INTO events(event_id, tenant_id, agent_id, task_id, thread_id,
+           sequence, kind, payload, dedup_key, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        eventId,
+        e.tenantId,
+        e.agentId,
+        e.taskId ?? null,
+        e.threadId ?? null,
+        sequence,
+        e.kind,
+        j(e.payload),
+        e.dedupKey ?? null,
+        now(),
+      );
+    return { inserted: true, sequence, eventId };
+  }
+
+  #cursor(tenantId: string, taskId: string, consumer: string): number {
+    const r = this.#db
+      .prepare(
+        "SELECT consumed_through FROM cursors WHERE tenant_id=? AND task_id=? AND consumer=?",
+      )
+      .get(tenantId, taskId, consumer) as any;
+    return r ? r.consumed_through : 0;
+  }
+
+  async pendingEvents(tenantId: string, taskId: string, consumer: string): Promise<RuntimeEvent[]> {
+    const from = this.#cursor(tenantId, taskId, consumer);
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM events WHERE tenant_id=? AND task_id=? AND sequence > ?
+         ORDER BY sequence ASC`,
+      )
+      .all(tenantId, taskId, from) as any[];
+    return rows.map((r) => ({
+      eventId: r.event_id,
+      tenantId: r.tenant_id,
+      agentId: r.agent_id,
+      taskId: r.task_id,
+      threadId: r.thread_id,
+      sequence: r.sequence,
+      kind: r.kind,
+      payload: JSON.parse(r.payload),
+      dedupKey: r.dedup_key,
+      createdAt: r.created_at,
+    }));
+  }
+
+  async acquireLease(
+    tenantId: string,
+    taskId: string,
+    holder: string,
+    ttlMs: number,
+  ): Promise<Lease | null> {
+    return this.#tx(() => {
+      const t = now();
+      const cur = this.#db.prepare("SELECT * FROM leases WHERE task_id = ?").get(taskId) as any;
+      if (cur && cur.expires_at > t && cur.holder !== holder) return null;
+      const token = this.#nextCounter("fencing");
+      this.#db
+        .prepare(
+          `INSERT INTO leases(task_id, tenant_id, holder, fencing_token, expires_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(task_id) DO UPDATE SET
+             holder=excluded.holder, fencing_token=excluded.fencing_token,
+             expires_at=excluded.expires_at`,
+        )
+        .run(taskId, tenantId, holder, token, t + ttlMs);
+      return { tenantId, taskId, holder, fencingToken: token, expiresAt: t + ttlMs };
+    });
+  }
+
+  async commitAdvance(txn: AdvanceTxn): Promise<CommitResult> {
+    return this.#tx(() => {
+      const t = this.#db
+        .prepare("SELECT * FROM tasks WHERE tenant_id=? AND task_id=?")
+        .get(txn.tenantId, txn.taskId) as any;
+      if (!t) return { ok: false, reason: "no_task" } as const;
+      // Fencing first: a resurrected worker must never win, whatever else is true.
+      if (txn.fencingToken < t.fencing_token) return { ok: false, reason: "fenced" } as const;
+      if (txn.generation !== t.generation) return { ok: false, reason: "stale_generation" } as const;
+      if (txn.expectedCheckpointVersion !== t.checkpoint_version)
+        return { ok: false, reason: "version_conflict" } as const;
+
+      const nextVersion = t.checkpoint_version + 1;
+      this.#db
+        .prepare(
+          `UPDATE tasks SET status=?, checkpoint=?, checkpoint_version=?,
+             fencing_token=?, updated_at=? WHERE tenant_id=? AND task_id=?`,
+        )
+        .run(
+          txn.status,
+          j(txn.checkpoint),
+          nextVersion,
+          txn.fencingToken,
+          now(),
+          txn.tenantId,
+          txn.taskId,
+        );
+
+      if (txn.consumedThrough !== null) {
+        this.#db
+          .prepare(
+            `INSERT INTO cursors(tenant_id, task_id, consumer, consumed_through)
+             VALUES (?,?, 'harness', ?)
+             ON CONFLICT(tenant_id, task_id, consumer) DO UPDATE SET
+               consumed_through = MAX(cursors.consumed_through, excluded.consumed_through)`,
+          )
+          .run(txn.tenantId, txn.taskId, txn.consumedThrough);
+      }
+
+      // Resolved waits have been folded into this checkpoint; clearing them keeps
+      // releaseIfNoWork() from reporting phantom work forever.
+      this.#db
+        .prepare("DELETE FROM waits WHERE tenant_id=? AND task_id=? AND resolved=1")
+        .run(txn.tenantId, txn.taskId);
+
+      for (const w of txn.waits) {
+        this.#db
+          .prepare(
+            `INSERT INTO waits(wait_id, tenant_id, task_id, generation, kind, operation_id, deadline)
+             VALUES (?,?,?,?,?,?,?)`,
+          )
+          .run(
+            randomUUID(),
+            txn.tenantId,
+            txn.taskId,
+            txn.generation,
+            w.kind,
+            w.operationId ?? null,
+            w.deadline ?? null,
+          );
+      }
+
+      // Deterministic command_id + INSERT OR IGNORE == replaying advance after a
+      // pre-commit crash cannot double-dispatch.
+      for (const c of txn.commands) {
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO outbox(command_id, tenant_id, task_id, generation,
+               kind, payload, state, created_at)
+             VALUES (?,?,?,?,?,?,'pending',?)`,
+          )
+          .run(c.commandId, txn.tenantId, txn.taskId, txn.generation, c.kind, j(c.payload), now());
+      }
+      return { ok: true, checkpointVersion: nextVersion } as const;
+    });
+  }
+
+  async releaseIfNoWork(
+    tenantId: string,
+    taskId: string,
+    fencingToken: number,
+    consumer: string,
+  ): Promise<"released" | "has_work" | "fenced"> {
+    return this.#tx(() => {
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE task_id=?").get(taskId) as any;
+      if (lease && lease.fencing_token > fencingToken) return "fenced" as const;
+      const from = this.#cursor(tenantId, taskId, consumer);
+      const pending = this.#db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM events WHERE tenant_id=? AND task_id=? AND sequence > ?",
+        )
+        .get(tenantId, taskId, from) as any;
+      if (pending.n > 0) return "has_work" as const;
+      const resolved = this.#db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM waits WHERE tenant_id=? AND task_id=? AND resolved=1",
+        )
+        .get(tenantId, taskId) as any;
+      if (resolved.n > 0) return "has_work" as const;
+      this.#db.prepare("DELETE FROM leases WHERE task_id=? AND fencing_token=?").run(taskId, fencingToken);
+      return "released" as const;
+    });
+  }
+
+  async claimOutbox(limit: number) {
+    return this.#tx(() => {
+      const rows = this.#db
+        .prepare("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at ASC LIMIT ?")
+        .all(limit) as any[];
+      for (const r of rows) {
+        this.#db.prepare("UPDATE outbox SET state='claimed' WHERE command_id=?").run(r.command_id);
+      }
+      return rows.map((r) => ({
+        commandId: r.command_id,
+        taskId: r.task_id,
+        kind: r.kind,
+        payload: JSON.parse(r.payload),
+      }));
+    });
+  }
+
+  async markDispatched(commandId: string) {
+    this.#db
+      .prepare("UPDATE outbox SET state='dispatched', dispatched_at=? WHERE command_id=?")
+      .run(now(), commandId);
+  }
+
+  async recordOperation(op: Omit<OperationRecord, "status" | "resultRef">) {
+    this.#db
+      .prepare(
+        `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias,
+           tool, tool_version, status, result_ref, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?, 'pending', NULL, ?, ?)`,
+      )
+      .run(
+        op.operationId,
+        op.tenantId,
+        op.agentId,
+        op.taskId,
+        op.mountAlias,
+        op.tool,
+        op.toolVersion,
+        now(),
+        now(),
+      );
+  }
+
+  async getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null> {
+    const r = this.#db
+      .prepare("SELECT * FROM operations WHERE tenant_id=? AND operation_id=?")
+      .get(tenantId, operationId) as any;
+    if (!r) return null;
+    return {
+      operationId: r.operation_id,
+      tenantId: r.tenant_id,
+      agentId: r.agent_id,
+      taskId: r.task_id,
+      mountAlias: r.mount_alias,
+      tool: r.tool,
+      toolVersion: r.tool_version,
+      status: r.status,
+      resultRef: r.result_ref,
+    };
+  }
+
+  async completeOperation(
+    tenantId: string,
+    operationId: string,
+    status: OperationStatus,
+    resultRef: string | null,
+  ) {
+    this.#tx(() => {
+      this.#db
+        .prepare(
+          "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
+        )
+        .run(status, resultRef, now(), tenantId, operationId);
+      this.#db
+        .prepare(
+          "UPDATE waits SET resolved=1 WHERE tenant_id=? AND operation_id=? AND resolved=0",
+        )
+        .run(tenantId, operationId);
+      // Uniform wakeup: everything the harness reacts to arrives as an event.
+      const op = this.#db
+        .prepare("SELECT agent_id, task_id FROM operations WHERE tenant_id=? AND operation_id=?")
+        .get(tenantId, operationId) as any;
+      if (op) {
+        this.#insertEvent({
+          tenantId,
+          agentId: op.agent_id,
+          taskId: op.task_id,
+          kind: "operation.completed",
+          payload: { operationId, status, resultRef },
+          dedupKey: `op:${operationId}:completed`,
+        });
+      }
+    });
+  }
+
+  async registerWait(
+    tenantId: string,
+    taskId: string,
+    generation: number,
+    wait: WaitSpec,
+  ): Promise<"registered" | "already_satisfied"> {
+    return this.#tx(() => {
+      if (wait.kind === "operation" && wait.operationId) {
+        const op = this.#db
+          .prepare("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?")
+          .get(tenantId, wait.operationId) as any;
+        // Result-arrived-before-wait-registered race (§7.3).
+        if (op && ["succeeded", "failed", "cancelled", "unknown"].includes(op.status)) {
+          return "already_satisfied" as const;
+        }
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO waits(wait_id, tenant_id, task_id, generation, kind, operation_id, deadline)
+           VALUES (?,?,?,?,?,?,?)`,
+        )
+        .run(
+          randomUUID(),
+          tenantId,
+          taskId,
+          generation,
+          wait.kind,
+          wait.operationId ?? null,
+          wait.deadline ?? null,
+        );
+      return "registered" as const;
+    });
+  }
+
+  async interrupt(tenantId: string, taskId: string): Promise<number> {
+    return this.#tx(() => {
+      this.#db
+        .prepare(
+          "UPDATE tasks SET generation = generation + 1, status='interrupted', updated_at=? WHERE tenant_id=? AND task_id=?",
+        )
+        .run(now(), tenantId, taskId);
+      const r = this.#db
+        .prepare("SELECT generation FROM tasks WHERE tenant_id=? AND task_id=?")
+        .get(tenantId, taskId) as any;
+      return r.generation as number;
+    });
+  }
+}
