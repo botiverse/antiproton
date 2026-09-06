@@ -7,6 +7,7 @@ import { createApi } from "../src/api/server.ts";
 import { Scheduler } from "../src/runtime/scheduler.ts";
 import { Kernel } from "../src/runtime/kernel.ts";
 import { CommandExecutor } from "../src/runtime/commands.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
 import { CodegenHarness } from "../src/harness/codegen.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
@@ -60,7 +61,7 @@ const scheduler = new Scheduler(store, async (tenantId, taskId) => {
   const task = await store.loadTask(tenantId, taskId);
   if (!task) return;
   const ctx = { tenantId, agentId: task.agentId, taskId };
-  const commands = new CommandExecutor(store, model, makeHost(ctx));
+  const commands = new CommandExecutor(store, model, makeHost(ctx), new QuickJsExecutor());
   const kernel = new Kernel(store, harness, { holder: "api-worker", leaseTtlMs: 120_000 });
   return kernel.step(tenantId, taskId, null, (cmd) => commands.dispatch(ctx, cmd));
 }, { intervalMs: 200 });

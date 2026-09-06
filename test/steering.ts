@@ -6,6 +6,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { Kernel } from "../src/runtime/kernel.ts";
 import { CommandExecutor } from "../src/runtime/commands.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
 import { CodegenHarness } from "../src/harness/codegen.ts";
 import type { ModelAdapter, ModelMessage, ModelResponse } from "../src/model/types.ts";
 import type { ExecutorHost } from "../src/runtime/executor.ts";
@@ -42,7 +43,7 @@ async function fixture(script: string[]) {
   const harness = new CodegenHarness({ maxTurns: 10 });
   await store.createTask(T, AGENT, TASK, await harness.initialize({}));
   const model = new ScriptedModel(script);
-  const commands = new CommandExecutor(store, model, host);
+  const commands = new CommandExecutor(store, model, host, new QuickJsExecutor());
   const kernel = new Kernel(store, harness, { holder: "w1", leaseTtlMs: 60_000 });
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
   const step = () => kernel.step(T, TASK, null, (cmd) => commands.dispatch(ctx, cmd));

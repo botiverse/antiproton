@@ -11,5 +11,10 @@
   },
   "worker_loaders": [{ "binding": "LOADER" }],
   "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "harness-p0-artifacts" }],
+  "vars": {
+    "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+    "HARNESS_MODEL": "deepseek-v4-pro",
+    "ARTIFACT_BUCKET": "harness-p0-artifacts"
+  },
   "observability": { "enabled": true }
 }

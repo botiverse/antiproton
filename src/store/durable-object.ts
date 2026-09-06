@@ -339,4 +339,37 @@ export class DurableObjectStore implements StorageAdapter {
     return this.#all("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias",
       tenantId, agentId).map((r) => this.#mount(r));
   }
+
+  /** What the alarm needs: which tasks still have unconsumed events. */
+  async tasksWithPendingWork(limit = 25) {
+    return this.#all(
+      `SELECT DISTINCT t.tenant_id, t.task_id FROM tasks t
+         JOIN events e ON e.tenant_id = t.tenant_id AND e.task_id = t.task_id
+         LEFT JOIN cursors c ON c.tenant_id = t.tenant_id AND c.task_id = t.task_id
+                            AND c.consumer = 'harness'
+        WHERE t.status NOT IN ('completed','failed')
+          AND e.sequence > COALESCE(c.consumed_through, 0)
+        LIMIT ?`,
+      limit,
+    ).map((r) => ({ tenantId: r.tenant_id, taskId: r.task_id }));
+  }
+
+  async listTasks(tenantId: string, agentId: string) {
+    return this.#all(
+      "SELECT * FROM tasks WHERE tenant_id=? AND agent_id=? ORDER BY updated_at DESC", tenantId, agentId,
+    ).map((r) => ({
+      taskId: r.task_id, status: r.status, generation: Number(r.generation),
+      checkpointVersion: Number(r.checkpoint_version), updatedAt: Number(r.updated_at),
+    }));
+  }
+
+  async eventsSince(tenantId: string, agentId: string, after: number, limit = 200) {
+    return this.#all(
+      `SELECT * FROM events WHERE tenant_id=? AND agent_id=? AND sequence > ?
+       ORDER BY sequence ASC LIMIT ?`, tenantId, agentId, after, limit,
+    ).map((r) => ({
+      eventId: r.event_id, sequence: Number(r.sequence), kind: r.kind, taskId: r.task_id,
+      threadId: r.thread_id, payload: JSON.parse(r.payload), createdAt: Number(r.created_at),
+    }));
+  }
 }

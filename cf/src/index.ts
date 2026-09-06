@@ -16,10 +16,15 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { kernelSpec } from "../../test/spec/kernel-spec.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
+import { AgentRuntime } from "./runtime.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
   ARTIFACTS: R2Bucket;
+  DEEPSEEK_API_KEY: string;
+  DEEPSEEK_BASE_URL: string;
+  HARNESS_MODEL: string;
+  ARTIFACT_BUCKET: string;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
@@ -103,6 +108,7 @@ async function runSandbox(
 export class AgentDO extends DurableObject<Env> {
   sql: SqlStorage;
   #store: DurableObjectStore | null = null;
+  #runtime: AgentRuntime | null = null;
   alarmFiredAt: number | null = null;
   alarmSetAt: number | null = null;
 
@@ -162,6 +168,102 @@ export class AgentDO extends DurableObject<Env> {
     return { backend: "durable-object", ms: Date.now() - t0, results };
   }
 
+  runtime(): AgentRuntime {
+    this.#runtime ??= new AgentRuntime({
+      ctx: this.ctx,
+      bucket: this.env.ARTIFACTS,
+      bucketName: this.env.ARTIFACT_BUCKET,
+      loader: this.env.LOADER,
+      makeToolBinding: (execId) =>
+        (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
+      modelBaseUrl: this.env.DEEPSEEK_BASE_URL,
+      modelApiKey: this.env.DEEPSEEK_API_KEY,
+      modelName: this.env.HARNESS_MODEL,
+    });
+    return this.#runtime;
+  }
+
+  async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
+    const rt = this.runtime();
+    await rt.provision(tenantId, agentId);
+    const r = await rt.postMessage(tenantId, agentId, taskId, text);
+    // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
+    await this.ctx.storage.setAlarm(Date.now());
+    return r;
+  }
+
+  async taskState(tenantId: string, agentId: string, taskId: string) {
+    const rt = this.runtime();
+    await rt.ready();
+    const task = await rt.store.loadTask(tenantId, taskId);
+    const events = await rt.store.eventsSince(tenantId, agentId, 0, 200);
+    const answer = task && (task.checkpoint as any)?.done
+      ? (task.checkpoint as any).messages.at(-1).content
+      : null;
+    return {
+      status: task?.status ?? null,
+      generation: task?.generation ?? null,
+      checkpointVersion: task?.checkpointVersion ?? null,
+      answer,
+      events: events.map((e) => ({
+        sequence: e.sequence, kind: e.kind,
+        usage: (e.payload as any)?.usage ?? undefined,
+        jsStatus: (e.payload as any)?.status ?? undefined,
+        ops: (e.payload as any)?.acceptedOperationIds ?? undefined,
+      })),
+    };
+  }
+
+  /**
+   * Client event stream. Hibernation is the point: a task that waits an hour for
+   * a webhook should not hold a live object open just because a browser tab is
+   * still attached.
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("expected websocket", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    this.ctx.acceptWebSocket(server);
+    const cursor = {
+      after: Number(url.searchParams.get("after") ?? 0),
+      tenantId: url.searchParams.get("tenantId") ?? "tenant-a",
+      agentId: url.searchParams.get("agentId") ?? "agent-1",
+    };
+    (server as any).serializeAttachment(cursor);
+    await this.pushTo(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string) {
+    if (String(message) === "ping") ws.send(JSON.stringify({ kind: "pong" }));
+  }
+
+  /** Sends whatever a socket has not seen and advances its stored cursor. */
+  async pushTo(ws: WebSocket) {
+    const cur = (ws as any).deserializeAttachment() as
+      | { after: number; tenantId: string; agentId: string }
+      | null;
+    if (!cur) return;
+    const rt = this.runtime();
+    await rt.ready();
+    const events = await rt.store.eventsSince(cur.tenantId, cur.agentId, cur.after, 200);
+    for (const e of events) {
+      ws.send(JSON.stringify({ id: e.sequence, kind: e.kind, payload: e.payload }));
+    }
+    if (events.length) {
+      (ws as any).serializeAttachment({ ...cur, after: events.at(-1)!.sequence });
+    }
+  }
+
+  async broadcast() {
+    for (const ws of this.ctx.getWebSockets()) {
+      try { await this.pushTo(ws); } catch { /* a dead socket must not stall the run */ }
+    }
+  }
+
   /** Entered from SandboxTools; the sandbox can never reach this directly. */
   async sandboxCall(execId: string, strings: string[], values: unknown[]) {
     return handleSandboxCall(execId, strings, values);
@@ -191,6 +293,13 @@ export class AgentDO extends DurableObject<Env> {
     this.alarmFiredAt = Date.now();
     this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
     this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
+    // The object may have been evicted since the alarm was armed, so this
+    // instance can be brand new: build the runtime rather than assuming it.
+    const { more } = await this.runtime().drain(3);
+    await this.broadcast();
+    // Bounded work per invocation; if there is more, come back rather than
+    // holding one alarm open until the platform ends it.
+    if (more) await this.ctx.storage.setAlarm(Date.now() + 50);
   }
   async alarmStatus() {
     this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
@@ -318,13 +427,32 @@ export default {
     const url = new URL(request.url);
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
-    const name = url.pathname.startsWith("/conformance") ? "conformance-v2" : "p0";
+    const name = url.pathname.startsWith("/conformance")
+      ? "conformance-v2"
+      : url.pathname.startsWith("/agent")
+        ? "runtime-v1"
+        : "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
         case "/storage": return Response.json(await stub.verifyStorage());
         case "/conformance/kernel": return Response.json(await stub.runKernelSpec());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
+        case "/agent/message": {
+          const body = (await request.json()) as any;
+          return Response.json(await stub.startTask(
+            body.tenantId ?? "tenant-a", body.agentId ?? "agent-1",
+            body.taskId ?? `task_${crypto.randomUUID().slice(0, 8)}`, String(body.text),
+          ));
+        }
+        case "/agent/events":
+          return stub.fetch(request);
+        case "/agent/state":
+          return Response.json(await stub.taskState(
+            url.searchParams.get("tenantId") ?? "tenant-a",
+            url.searchParams.get("agentId") ?? "agent-1",
+            String(url.searchParams.get("taskId")),
+          ));
         case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
         case "/sandbox": return Response.json(await stub.verifySandbox());
         case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));

@@ -1,7 +1,8 @@
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json } from "../core/types.ts";
 import type { ModelAdapter } from "../model/types.ts";
-import { QuickJsExecutor, DEFAULT_LIMITS, type ExecutionLimits, type ExecutorHost } from "./executor.ts";
+import { DEFAULT_LIMITS } from "../core/execution.ts";
+import type { ExecutionLimits, ExecutorHost, JsExecutor } from "../core/execution.ts";
 
 export interface CommandContext {
   tenantId: string;
@@ -22,13 +23,22 @@ export class CommandExecutor {
   #store: StorageAdapter;
   #model: ModelAdapter;
   #host: ExecutorHost;
+  #executor: JsExecutor;
   #limits: ExecutionLimits;
   trace: CommandTrace[] = [];
 
-  constructor(store: StorageAdapter, model: ModelAdapter, host: ExecutorHost, limits = DEFAULT_LIMITS) {
+  constructor(
+    store: StorageAdapter,
+    model: ModelAdapter,
+    host: ExecutorHost,
+    /** Injected, not constructed: QuickJS in Node, Dynamic Workers at the edge. */
+    executor: JsExecutor,
+    limits = DEFAULT_LIMITS,
+  ) {
     this.#store = store;
     this.#model = model;
     this.#host = host;
+    this.#executor = executor;
     this.#limits = limits;
   }
 
@@ -57,7 +67,7 @@ export class CommandExecutor {
         break;
       }
       case "js.execute": {
-        const r = await new QuickJsExecutor().execute(String(p.source), this.#host, this.#limits);
+        const r = await this.#executor.execute(String(p.source), this.#host, this.#limits);
         this.trace.push({
           kind: "js",
           detail: {

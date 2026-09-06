@@ -9,6 +9,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { Kernel } from "../src/runtime/kernel.ts";
 import { CommandExecutor } from "../src/runtime/commands.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
 import { CodegenHarness } from "../src/harness/codegen.ts";
 import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
 import { R2Artifacts } from "../src/store/artifacts.ts";
@@ -96,7 +97,7 @@ const init = await harness.initialize({
 await store.createTask(T, AGENT, TASK, init);
 await store.appendEvent({ tenantId: T, agentId: AGENT, taskId: TASK, kind: "message", payload: { text: TASK_TEXT } });
 
-const commands = new CommandExecutor(store, model, host);
+const commands = new CommandExecutor(store, model, host, new QuickJsExecutor());
 const kernel = new Kernel(store, harness, { holder: "worker-1", leaseTtlMs: 120_000 });
 
 console.log(`\n  model: ${model.id}\n  task:  ${TASK_TEXT}\n  ${"─".repeat(72)}`);

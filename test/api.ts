@@ -5,6 +5,7 @@ import { createApi } from "../src/api/server.ts";
 import { Scheduler } from "../src/runtime/scheduler.ts";
 import { Kernel } from "../src/runtime/kernel.ts";
 import { CommandExecutor } from "../src/runtime/commands.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
 import { CodegenHarness } from "../src/harness/codegen.ts";
 import type { ModelAdapter, ModelMessage, ModelResponse } from "../src/model/types.ts";
 import type { ExecutorHost } from "../src/runtime/executor.ts";
@@ -34,7 +35,7 @@ async function rig(retentionFloor = 0) {
   const store = new SqliteStore(":memory:");
   await store.init();
   const harness = new CodegenHarness({ maxTurns: 4 });
-  const commands = new CommandExecutor(store, new Scripted(), host);
+  const commands = new CommandExecutor(store, new Scripted(), host, new QuickJsExecutor());
   const kernel = new Kernel(store, harness, { holder: "api-worker", leaseTtlMs: 30_000 });
   const scheduler = new Scheduler(
     store,
