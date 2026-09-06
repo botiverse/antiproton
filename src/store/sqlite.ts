@@ -51,6 +51,21 @@ CREATE TABLE IF NOT EXISTS leases (
   task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, holder TEXT NOT NULL,
   fencing_token INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 
+CREATE TABLE IF NOT EXISTS threads (
+  thread_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  metadata TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS threads_agent ON threads(tenant_id, agent_id);
+
+CREATE TABLE IF NOT EXISTS task_threads (
+  tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, task_id, thread_id));
+
+-- Command de-duplication: a retried POST must not act twice (§10.1 requestId).
+CREATE TABLE IF NOT EXISTS requests (
+  tenant_id TEXT NOT NULL, request_id TEXT NOT NULL, kind TEXT NOT NULL,
+  state TEXT NOT NULL, response TEXT, created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, request_id));
+
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 
 CREATE TABLE IF NOT EXISTS outbox (
@@ -181,6 +196,20 @@ export class SqliteStore implements StorageAdapter {
     payload: Json;
     dedupKey?: string | null;
   }): { inserted: boolean; sequence: number; eventId: string } {
+    // Sequence numbers are per (tenant, agent) while consumption cursors are per
+    // task. If an event for a task carried a different agent it would get its own
+    // counter, land at a sequence at or below the cursor, and never be consumed —
+    // a silent stall. Fail loudly instead.
+    if (e.taskId) {
+      const owner = this.#db
+        .prepare("SELECT agent_id FROM tasks WHERE tenant_id=? AND task_id=?")
+        .get(e.tenantId, e.taskId) as any;
+      if (owner && owner.agent_id !== e.agentId) {
+        throw new Error(
+          `event agent "${e.agentId}" does not own task ${e.taskId} (owner: ${owner.agent_id})`,
+        );
+      }
+    }
     if (e.dedupKey) {
       const dup = this.#db
         .prepare("SELECT event_id, sequence FROM events WHERE tenant_id = ? AND dedup_key = ?")
@@ -560,5 +589,120 @@ export class SqliteStore implements StorageAdapter {
         .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias")
         .all(tenantId, agentId) as any[]
     ).map((r) => this.#mountRow(r));
+  }
+
+  async createThread(tenantId: string, agentId: string, threadId: string, metadata: Json = {}) {
+    this.#db
+      .prepare("INSERT INTO threads(thread_id, tenant_id, agent_id, metadata, created_at) VALUES (?,?,?,?,?)")
+      .run(threadId, tenantId, agentId, j(metadata), now());
+  }
+
+  async getThread(tenantId: string, threadId: string) {
+    const r = this.#db
+      .prepare("SELECT * FROM threads WHERE tenant_id=? AND thread_id=?")
+      .get(tenantId, threadId) as any;
+    return r ? { threadId: r.thread_id, tenantId: r.tenant_id, agentId: r.agent_id, metadata: JSON.parse(r.metadata) } : null;
+  }
+
+  async linkTaskThread(tenantId: string, taskId: string, threadId: string) {
+    this.#db
+      .prepare("INSERT OR IGNORE INTO task_threads(tenant_id, task_id, thread_id) VALUES (?,?,?)")
+      .run(tenantId, taskId, threadId);
+  }
+
+  async listTasks(tenantId: string, agentId: string) {
+    return (
+      this.#db
+        .prepare("SELECT * FROM tasks WHERE tenant_id=? AND agent_id=? ORDER BY updated_at DESC")
+        .all(tenantId, agentId) as any[]
+    ).map((r) => ({
+      taskId: r.task_id, status: r.status, generation: r.generation,
+      checkpointVersion: r.checkpoint_version, updatedAt: r.updated_at,
+    }));
+  }
+
+  /** Everything the scheduler needs to know: which tasks have unconsumed work. */
+  async tasksWithPendingWork(limit = 50) {
+    return (
+      this.#db
+        .prepare(
+          `SELECT DISTINCT t.tenant_id, t.task_id FROM tasks t
+             JOIN events e ON e.tenant_id = t.tenant_id AND e.task_id = t.task_id
+             LEFT JOIN cursors c ON c.tenant_id = t.tenant_id AND c.task_id = t.task_id
+                                AND c.consumer = 'harness'
+            WHERE t.status NOT IN ('completed','failed')
+              AND e.sequence > COALESCE(c.consumed_through, 0)
+            LIMIT ?`,
+        )
+        .all(limit) as any[]
+    ).map((r) => ({ tenantId: r.tenant_id, taskId: r.task_id }));
+  }
+
+  async eventsSince(tenantId: string, agentId: string, after: number, limit = 200) {
+    return (
+      this.#db
+        .prepare(
+          `SELECT * FROM events WHERE tenant_id=? AND agent_id=? AND sequence > ?
+           ORDER BY sequence ASC LIMIT ?`,
+        )
+        .all(tenantId, agentId, after, limit) as any[]
+    ).map((r) => ({
+      eventId: r.event_id, sequence: r.sequence, kind: r.kind, taskId: r.task_id,
+      threadId: r.thread_id, payload: JSON.parse(r.payload), createdAt: r.created_at,
+    }));
+  }
+
+  async oldestEventSequence(tenantId: string, agentId: string): Promise<number> {
+    const r = this.#db
+      .prepare("SELECT MIN(sequence) AS s FROM events WHERE tenant_id=? AND agent_id=?")
+      .get(tenantId, agentId) as any;
+    return r?.s ?? 0;
+  }
+
+  /** Claims a request id. Returns null when this caller won the claim, or the
+   *  prior record (pending or done) when someone already has it. */
+  async claimRequest(
+    tenantId: string,
+    requestId: string,
+    kind: string,
+  ): Promise<{ state: "pending" | "done"; response: Json } | null> {
+    return this.#tx(() => {
+      const prior = this.#db
+        .prepare("SELECT state, response FROM requests WHERE tenant_id=? AND request_id=?")
+        .get(tenantId, requestId) as any;
+      if (prior) {
+        return { state: prior.state, response: prior.response ? JSON.parse(prior.response) : null };
+      }
+      this.#db
+        .prepare(
+          "INSERT INTO requests(tenant_id, request_id, kind, state, response, created_at) VALUES (?,?,?,'pending',NULL,?)",
+        )
+        .run(tenantId, requestId, kind, now());
+      return null;
+    });
+  }
+
+  async finishRequest(tenantId: string, requestId: string, response: Json) {
+    this.#db
+      .prepare("UPDATE requests SET state='done', response=? WHERE tenant_id=? AND request_id=?")
+      .run(j(response), tenantId, requestId);
+  }
+
+  async interruptAgent(tenantId: string, agentId: string): Promise<string[]> {
+    return this.#tx(() => {
+      const rows = this.#db
+        .prepare(
+          "SELECT task_id FROM tasks WHERE tenant_id=? AND agent_id=? AND status NOT IN ('completed','failed')",
+        )
+        .all(tenantId, agentId) as any[];
+      for (const r of rows) {
+        this.#db
+          .prepare(
+            "UPDATE tasks SET generation = generation + 1, status='interrupted', updated_at=? WHERE tenant_id=? AND task_id=?",
+          )
+          .run(now(), tenantId, r.task_id);
+      }
+      return rows.map((r) => r.task_id as string);
+    });
   }
 }
