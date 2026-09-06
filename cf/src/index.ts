@@ -15,6 +15,7 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
+  ARTIFACTS: R2Bucket;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
@@ -201,6 +202,29 @@ export class AgentDO extends DurableObject<Env> {
   }
 }
 
+/** Where does the wall clock actually go, measured from the edge? */
+async function latency(env: Env) {
+  const time = async (label: string, fn: () => Promise<unknown>) => {
+    const t = Date.now();
+    try { await fn(); return [label, Date.now() - t] as const; }
+    catch (e: any) { return [label, `error: ${String(e?.message ?? e).slice(0, 60)}`] as const; }
+  };
+  const small = new Uint8Array(200).fill(65);
+  const big = new Uint8Array(1024 * 1024).fill(66);
+  const results = await Promise.all([]);
+  void results;
+  const out: Record<string, unknown> = {};
+  for (const r of [
+    await time("r2.put 200B", () => env.ARTIFACTS.put("bench/small.bin", small)),
+    await time("r2.get 200B", () => env.ARTIFACTS.get("bench/small.bin").then((o) => o?.arrayBuffer())),
+    await time("r2.put 1MB", () => env.ARTIFACTS.put("bench/big.bin", big)),
+    await time("r2.get 1MB", () => env.ARTIFACTS.get("bench/big.bin").then((o) => o?.arrayBuffer())),
+    await time("fetch api.github.com", () => fetch("https://api.github.com/repos/nodejs/node", { headers: { "user-agent": "agent-harness/0.1" } }).then((r) => r.text())),
+    await time("fetch api.deepseek.com (unauth RTT)", () => fetch("https://api.deepseek.com/models").then((r) => r.text())),
+  ]) out[r[0]] = r[1];
+  return out;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -209,6 +233,7 @@ export default {
     try {
       switch (url.pathname) {
         case "/storage": return Response.json(await stub.verifyStorage());
+        case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
         case "/sandbox": return Response.json(await stub.verifySandbox());
         case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
         case "/alarm/arm": return Response.json(await stub.armAlarm(Number(url.searchParams.get("ms") ?? 2000)));

@@ -10,5 +10,6 @@
     "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
+  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "harness-p0-artifacts" }],
   "observability": { "enabled": true }
 }
