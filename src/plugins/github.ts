@@ -41,7 +41,8 @@ export const githubPlugin: Plugin = {
         properties: {
           repo: { type: "string" },
           state: { type: "string", enum: ["open", "closed", "all"] },
-          perPage: { type: "integer" },
+          perPage: { type: "integer", description: "max 100; use page to go further" },
+          page: { type: "integer" },
         },
         required: ["repo"],
       },
@@ -55,9 +56,12 @@ export const githubPlugin: Plugin = {
       case "repos.get":
         return get(`/repos/${a.repo}`, ctx);
       case "issues.list": {
+        // GitHub silently caps per_page at 100; clamping here makes the limit
+        // visible in the schema instead of surprising the agent.
         const q = new URLSearchParams({
           state: a.state ?? "open",
-          per_page: String(a.perPage ?? 10),
+          per_page: String(Math.min(Math.max(a.perPage ?? 10, 1), 100)),
+          page: String(Math.max(a.page ?? 1, 1)),
         });
         return get(`/repos/${a.repo}/issues?${q}`, ctx);
       }

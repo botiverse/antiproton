@@ -102,6 +102,7 @@ export class ToolGateway {
     const credential = r.mount.secretRef ? await this.#secrets.resolve(r.mount.secretRef) : null;
     try {
       const result = await plugin.invoke(r.tool, args, {
+        caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
         credential,
         publicConfig: r.mount.publicConfig,
       });

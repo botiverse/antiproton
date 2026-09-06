@@ -10,6 +10,8 @@ export interface ToolSchema {
 }
 
 export interface PluginContext {
+  /** Read-only identity of the caller. Plugins cannot use it to escalate. */
+  caller: { tenantId: string; agentId: string; taskId: string };
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
   publicConfig: Record<string, Json>;

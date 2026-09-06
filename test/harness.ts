@@ -1,0 +1,104 @@
+/** Harness decision logic, offline. The live run proved the loop works; these
+ *  pin the behaviours that the live run showed were wrong. */
+import { CodegenHarness, extractCode } from "../src/harness/codegen.ts";
+import type { RuntimeEvent } from "../src/core/types.ts";
+
+let seq = 0;
+const ev = (kind: string, payload: unknown): RuntimeEvent => ({
+  eventId: `e${++seq}`, tenantId: "t", agentId: "a", taskId: "task", threadId: null,
+  sequence: seq, kind, payload, dedupKey: null, createdAt: 0,
+});
+const ctx = { tenantId: "t", agentId: "a", taskId: "task", generation: 0 };
+
+type Test = { row: string; name: string; fn: () => Promise<void> };
+const tests: Test[] = [];
+const test = (row: string, name: string, fn: () => Promise<void>) => tests.push({ row, name, fn });
+function assert(c: unknown, w: string): asserts c { if (!c) throw new Error(`assertion failed: ${w}`); }
+const eq = (a: unknown, b: unknown, w: string) =>
+  assert(Object.is(a, b), `${w} (got ${JSON.stringify(a)}, want ${JSON.stringify(b)})`);
+
+test("代码提取", "a fenced js block is extracted, prose is not", async () => {
+  eq(extractCode("here you go\n```js\nconst x = 1;\n```\ndone"), "const x = 1;", "js fence");
+  eq(extractCode("```javascript\nlet y;\n```"), "let y;", "javascript fence");
+  eq(extractCode("no code at all"), null, "prose returns null");
+});
+
+test("消息转命令", "an inbound message produces exactly one model request", async () => {
+  const h = new CodegenHarness();
+  const state = await h.initialize({ mounts: [{ alias: "gh", plugin: "github", version: "1.0.0", config: {} }] });
+  const out = await h.advance({ state, events: [ev("message", { text: "do it" })], context: ctx });
+  eq(out.commands.length, 1, "one command");
+  eq(out.commands[0]!.kind, "model.request", "model request");
+  eq(out.status, "waiting", "parked");
+  const msgs = (out.state as any).messages;
+  eq(msgs[msgs.length - 1].content, "do it", "user message folded in");
+  assert(String(msgs[0].content).includes("gh  (github v1.0.0"), "mounts advertised in the system prompt");
+});
+
+test("代码转执行", "a reply containing code becomes a js.execute command", async () => {
+  const h = new CodegenHarness();
+  let state = await h.initialize({});
+  state = (await h.advance({ state, events: [ev("message", { text: "go" })], context: ctx })).state;
+  const out = await h.advance({
+    state, events: [ev("model.response", { text: "sure\n```js\noutput(1);\n```" })], context: ctx,
+  });
+  eq(out.commands[0]!.kind, "js.execute", "js command");
+  eq((out.commands[0]!.payload as any).source, "output(1);", "source extracted");
+});
+
+test("无代码即终态", "a reply with no code ends the task", async () => {
+  const h = new CodegenHarness();
+  let state = await h.initialize({});
+  state = (await h.advance({ state, events: [ev("message", { text: "go" })], context: ctx })).state;
+  const out = await h.advance({ state, events: [ev("model.response", { text: "The answer is 42." })], context: ctx });
+  eq(out.status, "completed", "completed");
+  eq((out.commands[0]!.payload as any).text, "The answer is 42.", "answer emitted");
+});
+
+test("剩余轮次可见", "execution feedback tells the model how many turns remain", async () => {
+  const h = new CodegenHarness({ maxTurns: 4 });
+  let state = await h.initialize({});
+  state = (await h.advance({ state, events: [ev("message", { text: "go" })], context: ctx })).state;
+  state = (await h.advance({ state, events: [ev("model.response", { text: "```js\noutput(1);\n```" })], context: ctx })).state;
+  const out = await h.advance({
+    state, events: [ev("js.result", { status: "completed", outputs: [1] })], context: ctx,
+  });
+  const msgs = (out.state as any).messages;
+  assert(String(msgs[msgs.length - 1].content).includes("3 execution turn(s) left"), "budget surfaced to the model");
+});
+
+test("预算耗尽不丢工作", "a spent budget asks for a final answer instead of blocking", async () => {
+  const h = new CodegenHarness({ maxTurns: 2 });
+  let state = await h.initialize({});
+  state = (await h.advance({ state, events: [ev("message", { text: "go" })], context: ctx })).state;
+  // Turn 1: still inside budget, so this one runs.
+  const first = await h.advance({ state, events: [ev("model.response", { text: "```js\noutput(1);\n```" })], context: ctx });
+  eq(first.commands[0]!.kind, "js.execute", "turn 1 still executes");
+  state = (await h.advance({ state: first.state, events: [ev("js.result", { status: "completed", outputs: [1] })], context: ctx })).state;
+  // Turn 2 spends the last of the budget.
+  const over = await h.advance({
+    state, events: [ev("model.response", { text: "```js\noutput(2);\n```" })], context: ctx,
+  });
+  eq(over.status, "waiting", "not blocked");
+  eq(over.commands[0]!.kind, "model.request", "asks the model to wrap up");
+  eq((over.state as any).finalizing, true, "finalizing flagged");
+  const last = (over.state as any).messages.at(-1).content;
+  assert(String(last).includes("out of execution turns"), "instruction is explicit");
+
+  const done = await h.advance({
+    state: over.state,
+    events: [ev("model.response", { text: "Found 21 matches.\n```js\nignored();\n```" })],
+    context: ctx,
+  });
+  eq(done.status, "completed", "final reply completes the task");
+  eq((done.commands[0]!.payload as any).text, "Found 21 matches.", "trailing code stripped from the answer");
+});
+
+let pass = 0, fail = 0;
+console.log(`\n  Harness (codegen loop)\n  ${"─".repeat(62)}`);
+for (const t of tests) {
+  try { await t.fn(); pass++; console.log(`  \x1b[32m✓\x1b[0m ${t.row.padEnd(14)} ${t.name}`); }
+  catch (e) { fail++; console.log(`  \x1b[31m✗\x1b[0m ${t.row.padEnd(14)} ${t.name}\n      \x1b[31m${(e as Error).message}\x1b[0m`); }
+}
+console.log(`  ${"─".repeat(62)}\n  ${pass} passed, ${fail} failed\n`);
+process.exit(fail ? 1 : 0);
