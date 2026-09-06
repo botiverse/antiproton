@@ -32,15 +32,43 @@ Rules that matter:
 Keep each code block small and purposeful. Prefer one or two calls per block, look at the
 result, then decide the next block.`;
 
+/**
+ * Messages carry a tag so compaction can distinguish requirements from scratch
+ * work. A customer turn is the specification; an execution cycle is working out.
+ */
+type Tag = "system" | "customer" | "agent" | "execution" | "note";
+interface TaggedMessage extends ModelMessage {
+  tag: Tag;
+}
+
 interface CodegenState {
-  messages: ModelMessage[];
+  messages: TaggedMessage[];
   turns: number;
   done: boolean;
   /** Set once the turn budget is spent: the next reply is taken as the answer. */
   finalizing: boolean;
+  /** Last measured prompt size, reported by the provider. */
+  promptTokens: number;
+  compactions: number;
 }
 
+export interface CompactionConfig {
+  /** "none" keeps everything; "cycles" drops old execution cycles. */
+  mode: "none" | "cycles";
+  /** Compact once the measured prompt exceeds this. */
+  triggerTokens: number;
+  /** Execution cycles kept verbatim after a compaction. */
+  keepCycles: number;
+}
+
+export const NO_COMPACTION: CompactionConfig = { mode: "none", triggerTokens: Infinity, keepCycles: 0 };
+export const DEFAULT_COMPACTION: CompactionConfig = { mode: "cycles", triggerTokens: 24_000, keepCycles: 3 };
+
 const fence = /```(?:js|javascript)\s*\n([\s\S]*?)```/;
+
+/** Tags are internal bookkeeping; the provider never sees them. */
+const plain = (msgs: TaggedMessage[]): ModelMessage[] =>
+  msgs.map(({ role, content }) => ({ role, content }));
 
 export function extractCode(text: string): string | null {
   const m = fence.exec(text);
@@ -54,11 +82,72 @@ export function extractCode(text: string): string | null {
  */
 export class CodegenHarness implements HarnessAdapter {
   readonly kind = "codegen";
-  readonly stateVersion = 1;
+  readonly stateVersion = 2;
   #maxTurns: number;
+  #compaction: CompactionConfig;
+  /** Set by the last compaction, for reporting. */
+  lastCompaction: { dropped: number; from: number } | null = null;
 
-  constructor(opts: { maxTurns?: number } = {}) {
+  constructor(opts: { maxTurns?: number; compaction?: CompactionConfig } = {}) {
     this.#maxTurns = opts.maxTurns ?? 8;
+    this.#compaction = opts.compaction ?? NO_COMPACTION;
+  }
+
+  /**
+   * Drops old execution cycles, keeps every customer turn.
+   *
+   * Two constraints shape this. Provider prompt caching means a rewritten prefix
+   * is a cache miss for everything after the edit, so compaction has to be rare
+   * and leave the head untouched — hysteresis, not a moving window. And what the
+   * agent must not lose is the requirements, which live in customer turns; the
+   * code it wrote three cycles ago is scratch work.
+   */
+  #compact(state: CodegenState): boolean {
+    const c = this.#compaction;
+    if (c.mode === "none" || state.promptTokens < c.triggerTokens) return false;
+
+    const msgs = state.messages;
+    // Index execution cycles: an agent reply followed by its execution result.
+    const cycleIdx: number[] = [];
+    for (let i = 0; i < msgs.length; i++) if (msgs[i]!.tag === "execution") cycleIdx.push(i);
+    if (cycleIdx.length <= c.keepCycles) return false;
+
+    const keepFrom = cycleIdx[cycleIdx.length - c.keepCycles]!;
+    const dropped: TaggedMessage[] = [];
+    const kept: TaggedMessage[] = [];
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i]!;
+      const isScratch = m.tag === "agent" || m.tag === "execution";
+      if (i < keepFrom && isScratch) dropped.push(m);
+      else kept.push(m);
+    }
+    if (!dropped.length) return false;
+
+    // A structural note, not an LLM summary: no extra model call, and the text
+    // is deterministic so it does not itself churn the prefix.
+    const tools = new Set<string>();
+    const refs = new Set<string>();
+    for (const d of dropped) {
+      for (const m of d.content.matchAll(/tool`\s*([a-z0-9_]+(?:\.[a-z0-9_]+)+)/g)) tools.add(m[1]!);
+      for (const m of d.content.matchAll(/r2:\/\/[^\s"',)]+/g)) refs.add(m[0]);
+    }
+    const note: TaggedMessage = {
+      role: "user",
+      tag: "note",
+      content:
+        `[Context compacted: ${dropped.length} earlier messages of your own code and its output were removed ` +
+        `to stay within budget. Every customer message is still above.` +
+        (tools.size ? ` Tools you already used: ${[...tools].sort().join(", ")}.` : "") +
+        (refs.size ? ` Artifacts you parked: ${[...refs].sort().join(", ")}.` : "") +
+        ` If you need something you no longer see, fetch it again rather than guessing.]`,
+    };
+    // Insert the note where the dropped span began, so the head stays byte-identical.
+    const firstDrop = msgs.findIndex((m) => dropped.includes(m));
+    kept.splice(Math.max(1, kept.findIndex((m) => msgs.indexOf(m) > firstDrop)), 0, note);
+    state.messages = kept;
+    state.compactions++;
+    this.lastCompaction = { dropped: dropped.length, from: state.promptTokens };
+    return true;
   }
 
   async initialize(config: Json): Promise<Json> {
@@ -72,8 +161,8 @@ export class CodegenHarness implements HarnessAdapter {
         : "";
     const rules = policy ? `\n\n# Domain policy you must follow\n${policy}` : "";
     return {
-      messages: [{ role: "system", content: SYSTEM + preamble + rules }],
-      turns: 0, done: false, finalizing: false,
+      messages: [{ role: "system", tag: "system", content: SYSTEM + preamble + rules }],
+      turns: 0, done: false, finalizing: false, promptTokens: 0, compactions: 0,
     } satisfies CodegenState;
   }
 
@@ -90,17 +179,19 @@ export class CodegenHarness implements HarnessAdapter {
       const p = e.payload as any;
       switch (e.kind) {
         case "message":
-          messages.push({ role: "user", content: String(p.text) });
+          messages.push({ role: "user", tag: "customer", content: String(p.text) });
           break;
         case "model.response":
-          messages.push({ role: "assistant", content: String(p.text) });
+          messages.push({ role: "assistant", tag: "agent", content: String(p.text) });
           sawModelReply = String(p.text);
           state.turns++;
+          if (p.usage?.promptTokens) state.promptTokens = Number(p.usage.promptTokens);
           break;
         case "js.result": {
           const left = Math.max(0, this.#maxTurns - state.turns);
           messages.push({
             role: "user",
+            tag: "execution",
             content:
               `Execution ${p.status}` +
               (p.error ? ` (${p.error.code}: ${p.error.message})` : "") +
@@ -112,6 +203,7 @@ export class CodegenHarness implements HarnessAdapter {
         case "operation.completed":
           messages.push({
             role: "user",
+            tag: "execution",
             content: `Operation ${p.operationId} finished: ${p.status}${p.resultRef ? ` -> ${p.resultRef}` : ""}`,
           });
           break;
@@ -134,6 +226,7 @@ export class CodegenHarness implements HarnessAdapter {
         if (state.turns >= this.#maxTurns) {
           messages.push({
             role: "user",
+            tag: "note",
             content:
               "You are out of execution turns. Do not write any more code. " +
               "Answer the original question now using what you already have, and say plainly " +
@@ -142,7 +235,7 @@ export class CodegenHarness implements HarnessAdapter {
           return {
             state: { ...state, finalizing: true },
             status: "waiting",
-            commands: [{ kind: "model.request", payload: { messages } }],
+            commands: [{ kind: "model.request", payload: { messages: plain(messages) } }],
             waits: [],
           };
         }
@@ -161,10 +254,11 @@ export class CodegenHarness implements HarnessAdapter {
       };
     }
 
+    this.#compact(state);
     return {
       state,
       status: "waiting",
-      commands: [{ kind: "model.request", payload: { messages } }],
+      commands: [{ kind: "model.request", payload: { messages: plain(state.messages) } }],
       waits: [],
     };
   }

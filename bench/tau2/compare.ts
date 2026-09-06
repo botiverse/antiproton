@@ -12,7 +12,8 @@ import { SqliteStore } from "../../src/store/sqlite.ts";
 import { Kernel } from "../../src/runtime/kernel.ts";
 import { CommandExecutor } from "../../src/runtime/commands.ts";
 import { QuickJsExecutor } from "../../src/runtime/executor.ts";
-import { CodegenHarness } from "../../src/harness/codegen.ts";
+import { CodegenHarness, NO_COMPACTION, DEFAULT_COMPACTION } from "../../src/harness/codegen.ts";
+import { HybridHarness } from "../../src/harness/hybrid.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
@@ -40,11 +41,12 @@ const canon = (v: unknown): string => {
   return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canon((v as any)[k])}`).join(",")}}`;
 };
 
-interface Usage { calls: number; prompt: number; cached: number; completion: number; reasoning: number }
-const zero = (): Usage => ({ calls: 0, prompt: 0, cached: 0, completion: 0, reasoning: 0 });
+interface Usage { calls: number; prompt: number; cached: number; completion: number; reasoning: number; perCall: number[] }
+const zero = (): Usage => ({ calls: 0, prompt: 0, cached: 0, completion: 0, reasoning: 0, perCall: [] });
 const add = (u: Usage, r: any) => {
   u.calls++; u.prompt += r.usage.promptTokens; u.cached += r.usage.cachedPromptTokens;
   u.completion += r.usage.completionTokens; u.reasoning += r.usage.reasoningTokens;
+  u.perCall.push(r.usage.promptTokens);
 };
 
 /** An agent is anything that can answer a customer turn. */
@@ -68,7 +70,10 @@ async function codegenAgent(db: RetailDB, performed: any[]): Promise<Agent> {
   const gw = new ToolGateway(store, plugins);
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
   const host = { invoke: (c: { tool: string; args: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args) };
-  const harness = new CodegenHarness({ maxTurns: 60 });
+  const compaction = process.env.COMPACTION === "cycles"
+    ? { ...DEFAULT_COMPACTION, triggerTokens: Number(process.env.TRIGGER ?? 24000), keepCycles: Number(process.env.KEEP ?? 3) }
+    : NO_COMPACTION;
+  const harness = new CodegenHarness({ maxTurns: 60, compaction });
   await store.createTask(T, AGENT, TASK, await harness.initialize({
     mounts: (await store.listMounts(T, AGENT)).map((m) => ({
       alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
@@ -92,6 +97,52 @@ async function codegenAgent(db: RetailDB, performed: any[]): Promise<Agent> {
         const t = await store.loadTask(T, TASK);
         if (t && ["completed", "failed", "blocked"].includes(t.status)) {
           return (t.checkpoint as any).messages.at(-1).content as string;
+        }
+      }
+      return null;
+    },
+  };
+}
+
+async function hybridAgent(db: RetailDB, performed: any[]): Promise<Agent> {
+  const T = "tenant-a", AGENT = "agent-1", TASK = "task-1";
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent(T, AGENT);
+  const retail = retailPlugin(db, performed);
+  const plugins = [retail, builtinToolsPlugin(store, () => plugins)];
+  for (const alias of ["retail", "tools"]) {
+    await store.addMount({
+      tenantId: T, agentId: AGENT, alias, plugin: alias, installationId: `inst-${alias}`,
+      connectionId: null, toolVersion: "1.0.0", publicConfig: { account: "benchmark" }, secretRef: null,
+    });
+  }
+  const gw = new ToolGateway(store, plugins);
+  const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
+  const host = { invoke: (c: { tool: string; args: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args) };
+  const harness = new HybridHarness({ maxTurns: 40 });
+  await store.createTask(T, AGENT, TASK, await harness.initialize({
+    tools: retail.tools.map((x) => ({
+      name: x.name, description: x.summary, parameters: x.parameters, address: `retail.${x.name}`,
+    })),
+    policy: POLICY,
+  }));
+  const usage = zero();
+  const commands = new CommandExecutor(store, {
+    id: model.id,
+    async complete(m: any, o: any) { const r = await model.complete(m, o); add(usage, r); return r; },
+  } as any, host, new QuickJsExecutor());
+  const kernel = new Kernel(store, harness, { holder: "bench", leaseTtlMs: 300_000 });
+  return {
+    usage,
+    async say(userMessage: string) {
+      await store.appendEvent({ tenantId: T, agentId: AGENT, taskId: TASK, kind: "message", payload: { text: userMessage } });
+      for (let g = 0; g < 120; g++) {
+        const r = await kernel.step(T, TASK, null, (cmd) => commands.dispatch(ctx, cmd));
+        if (r.outcome === "no_work") break;
+        const t2 = await store.loadTask(T, TASK);
+        if (t2 && ["completed", "failed", "blocked"].includes(t2.status)) {
+          return (t2.checkpoint as any).messages.at(-1).content as string;
         }
       }
       return null;
@@ -143,10 +194,14 @@ async function toolcallAgent(db: RetailDB, performed: any[]): Promise<Agent> {
   };
 }
 
-async function runTask(task: any, mode: "codegen" | "toolcall") {
+let COMPACTIONS = 0;
+async function runTask(task: any, mode: "codegen" | "toolcall" | "hybrid") {
+  COMPACTIONS = 0;
   const db = structuredClone(BASE_DB);
   const performed: Array<{ name: string; args: any }> = [];
-  const agent = mode === "codegen" ? await codegenAgent(db, performed) : await toolcallAgent(db, performed);
+  const agent = mode === "codegen" ? await codegenAgent(db, performed)
+    : mode === "hybrid" ? await hybridAgent(db, performed)
+    : await toolcallAgent(db, performed);
 
   const instr = task.user_scenario?.instructions ?? {};
   const scenario = [
@@ -194,7 +249,7 @@ async function runTask(task: any, mode: "codegen" | "toolcall") {
 
 const N = Number(process.argv[2] ?? 6);
 const OFFSET = Number(process.argv[3] ?? 0);
-const MODES = (process.env.MODES ?? "codegen,toolcall").split(",") as Array<"codegen" | "toolcall">;
+const MODES = (process.env.MODES ?? "codegen,toolcall").split(",") as Array<"codegen" | "toolcall" | "hybrid">;
 const selected = TASKS.slice(OFFSET, OFFSET + N);
 console.log(`\n  token efficiency — ${selected.length} tasks × ${MODES.join(" / ")}, model ${MODEL}\n  ${"─".repeat(88)}`);
 console.log(`  ${"mode".padEnd(9)}${"task".padEnd(6)}${"ok".padEnd(4)}${"turns".padEnd(7)}${"tool".padEnd(6)}${"calls".padEnd(7)}${"prompt".padEnd(9)}${"cached".padEnd(9)}${"out".padEnd(8)}${"reason".padEnd(8)}sec`);
@@ -206,6 +261,7 @@ for (const task of selected) {
     catch (e) { r = { id: task.id, mode, reward: 0, ended: `error: ${(e as Error).message.slice(0, 40)}`, turns: 0, seconds: 0, agent: zero(), sim: zero(), toolCalls: 0 }; }
     all.push(r);
     const mark = r.reward ? "\x1b[32m✓\x1b[0m " : "\x1b[31m✗\x1b[0m ";
+    if (process.env.CURVE) console.log(`      prompt curve: ${r.agent.perCall.join(" → ")}`);
     console.log(`  ${r.mode.padEnd(9)}${String(r.id).padEnd(6)}${mark}  ${String(r.turns).padEnd(7)}${String(r.toolCalls).padEnd(6)}${String(r.agent.calls).padEnd(7)}${String(r.agent.prompt).padEnd(9)}${String(r.agent.cached).padEnd(9)}${String(r.agent.completion).padEnd(8)}${String(r.agent.reasoning).padEnd(8)}${r.seconds}`);
   }
 }

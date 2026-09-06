@@ -1,6 +1,6 @@
 /** Harness decision logic, offline. The live run proved the loop works; these
  *  pin the behaviours that the live run showed were wrong. */
-import { CodegenHarness, extractCode } from "../src/harness/codegen.ts";
+import { CodegenHarness, extractCode, DEFAULT_COMPACTION } from "../src/harness/codegen.ts";
 import type { RuntimeEvent } from "../src/core/types.ts";
 
 let seq = 0;
@@ -92,6 +92,36 @@ test("预算耗尽不丢工作", "a spent budget asks for a final answer instead
   });
   eq(done.status, "completed", "final reply completes the task");
   eq((done.commands[0]!.payload as any).text, "Found 21 matches.", "trailing code stripped from the answer");
+});
+
+test("上下文压缩", "compaction drops scratch work, keeps every customer turn", async () => {
+  const h = new CodegenHarness({ maxTurns: 40, compaction: { ...DEFAULT_COMPACTION, triggerTokens: 100, keepCycles: 2 } });
+  let state = await h.initialize({});
+  // Five cycles: customer asks, agent writes code, execution reports back.
+  for (let i = 0; i < 5; i++) {
+    state = (await h.advance({ state, events: [ev("message", { text: `requirement ${i}` })], context: ctx })).state;
+    state = (await h.advance({
+      state,
+      events: [ev("model.response", { text: `\`\`\`js\nawait tool\`retail.get_order_details \${{}}\`;\n\`\`\``, usage: { promptTokens: 50_000 } })],
+      context: ctx,
+    })).state;
+    state = (await h.advance({
+      state,
+      events: [ev("js.result", { status: "completed", outputs: [{ ref: `r2://bucket/blob-${i}.json` }] })],
+      context: ctx,
+    })).state;
+  }
+  const msgs = (state as any).messages as Array<{ role: string; tag: string; content: string }>;
+  eq((state as any).compactions > 0, true, "compaction ran");
+  eq(msgs[0]!.tag, "system", "head untouched — the cached prefix must not move");
+  for (let i = 0; i < 5; i++) {
+    assert(msgs.some((m) => m.tag === "customer" && m.content === `requirement ${i}`), `requirement ${i} kept`);
+  }
+  const note = msgs.find((m) => m.tag === "note" && m.content.includes("Context compacted"));
+  assert(note, "a note records what was removed");
+  assert(note!.content.includes("retail.get_order_details"), "note names the tools already used");
+  assert(note!.content.includes("r2://bucket/blob-0.json"), "note names the parked artifacts");
+  assert(msgs.filter((m) => m.tag === "execution").length <= 3, "old execution cycles dropped");
 });
 
 let pass = 0, fail = 0;

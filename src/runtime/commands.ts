@@ -46,7 +46,7 @@ export class CommandExecutor {
     const p = cmd.payload as any;
     switch (cmd.kind) {
       case "model.request": {
-        const res = await this.#model.complete(p.messages, { maxTokens: 8192 });
+        const res = await this.#model.complete(p.messages, { maxTokens: 8192, tools: p.tools });
         this.trace.push({
           kind: "model",
           detail: {
@@ -61,8 +61,24 @@ export class CommandExecutor {
         await this.#store.appendEvent({
           tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
           kind: "model.response",
-          payload: { text: res.text, truncated: res.truncated, usage: res.usage },
+          payload: {
+            text: res.text, truncated: res.truncated, usage: res.usage,
+            ...(res.toolCalls ? { toolCalls: res.toolCalls } : {}),
+          },
           dedupKey: `cmd:${cmd.commandId}:response`,
+        });
+        break;
+      }
+      case "tool.call": {
+        // A native tool call is dispatched through the very same host the sandbox
+        // uses, so permission, budget and the operation record are identical.
+        const res = await this.#host.invoke({ tool: String(p.tool), args: p.args, opts: {} });
+        this.trace.push({ kind: "tool", detail: { tool: p.tool, status: (res as any).status } });
+        await this.#store.appendEvent({
+          tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
+          kind: "tool.result",
+          payload: { callId: p.callId, tool: p.tool, content: JSON.stringify(res).slice(0, 12_000) },
+          dedupKey: `cmd:${cmd.commandId}:result`,
         });
         break;
       }
@@ -79,7 +95,7 @@ export class CommandExecutor {
           tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
           kind: "js.result",
           payload: {
-            status: r.status, outputs: r.outputs, error: r.error,
+            callId: p.callId, status: r.status, outputs: r.outputs, error: r.error,
             acceptedOperationIds: r.acceptedOperationIds,
           },
           dedupKey: `cmd:${cmd.commandId}:result`,
