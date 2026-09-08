@@ -2,6 +2,7 @@
  *  stream, explicit interrupt scope. Runs the real scheduler with a scripted model. */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { createApi } from "../src/api/server.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
 import { Scheduler } from "../src/runtime/scheduler.ts";
 import { Kernel } from "../src/runtime/kernel.ts";
 import { CommandExecutor } from "../src/runtime/commands.ts";
@@ -48,7 +49,28 @@ async function rig(retentionFloor = 0) {
     },
     { intervalMs: 40 },
   );
+  // A mount whose writes need a human, so the approval surface has something
+  // real to hold.
+  let deployed = 0;
+  const prodPlugin = {
+    id: "prod", version: "1.0.0",
+    tools: [
+      { name: "deploy", summary: "", parameters: {}, sideEffects: "write" as const, idempotency: "none" as const },
+      { name: "status", summary: "", parameters: {}, sideEffects: "read" as const, idempotency: "native" as const },
+    ],
+    async invoke(tool: string) { if (tool === "deploy") deployed++; return { tool }; },
+  };
+  await store.createAgent("tenant-a", "ag-approve", {});
+  await store.createTask("tenant-a", "ag-approve", "tk-approve", {}, 1);
+  await store.addMount({
+    tenantId: "tenant-a", agentId: "ag-approve", alias: "prod", plugin: "prod",
+    installationId: "i", connectionId: null, toolVersion: "1.0.0",
+    publicConfig: {}, secretRef: null, policy: { write: "approval" },
+  });
+  const gateway = new ToolGateway(store, [prodPlugin], { async resolve() { return null; } });
+
   const server = createApi(store, {
+    gateway,
     tokens: new Map([[A_KEY, "tenant-a"], [B_KEY, "tenant-b"]]),
     retentionFloor,
     sseIntervalMs: 40,
@@ -72,7 +94,7 @@ async function rig(retentionFloor = 0) {
     await new Promise<void>((r) => server.close(() => r()));
     await store.close();
   };
-  return { store, scheduler, server, base, call, done };
+  return { store, scheduler, server, base, call, done, gateway, deployedCount: () => deployed };
 }
 
 type Test = { row: string; name: string; fn: () => Promise<void> };
@@ -82,6 +104,82 @@ function assert(c: unknown, w: string): asserts c { if (!c) throw new Error(`ass
 const eq = (a: unknown, b: unknown, w: string) =>
   assert(Object.is(a, b), `${w} (got ${JSON.stringify(a)}, want ${JSON.stringify(b)})`);
 const settle = async (s: Scheduler, n = 12) => { for (let i = 0; i < n; i++) await s.tick(); };
+
+test("审批队列", "a held call appears in the queue with the request a human must read", async () => {
+  const r = await rig();
+  const ctx = { tenantId: "tenant-a", agentId: "ag-approve", taskId: "tk-approve" };
+  const held = await r.gateway.invoke(ctx, "prod.deploy", { env: "production" });
+  eq(held.status, "pending", "held by policy");
+  eq(r.deployedCount(), 0, "not executed");
+
+  const list = (await r.call("GET", "/approvals?state=pending", A_KEY)).body;
+  eq(list.approvals.length, 1, "one pending approval");
+  eq(list.approvals[0].tool, "deploy", "names the tool");
+  eq(list.approvals[0].request.args.env, "production", "and the exact request");
+  await r.done();
+});
+
+test("审批只属于本租户", "another tenant can neither see nor decide it", async () => {
+  const r = await rig();
+  const ctx = { tenantId: "tenant-a", agentId: "ag-approve", taskId: "tk-approve" };
+  const held = await r.gateway.invoke(ctx, "prod.deploy", {});
+  const opId = (held as any).operationId;
+
+  const theirs = (await r.call("GET", "/approvals?state=pending", B_KEY)).body;
+  eq(theirs.approvals.length, 0, "tenant-b sees nothing");
+  const stolen = await r.call("POST", `/approvals/${opId}/decide`, B_KEY,
+    { decision: "approved", approver: "mallory" });
+  eq(stolen.status, 404, "and cannot decide it");
+  eq(r.deployedCount(), 0, "nothing executed");
+  await r.done();
+});
+
+test("批准即执行一次", "approving executes it once; a second decision is refused", async () => {
+  const r = await rig();
+  const ctx = { tenantId: "tenant-a", agentId: "ag-approve", taskId: "tk-approve" };
+  const held = await r.gateway.invoke(ctx, "prod.deploy", {});
+  const opId = (held as any).operationId;
+
+  const ok = await r.call("POST", `/approvals/${opId}/decide`, A_KEY,
+    { decision: "approved", approver: "alice" });
+  eq(ok.status, 200, "approved");
+  eq(ok.body.executed, true, "and executed");
+  eq(r.deployedCount(), 1, "performed once");
+
+  const again = await r.call("POST", `/approvals/${opId}/decide`, A_KEY,
+    { decision: "approved", approver: "alice" });
+  eq(again.status, 409, "a second decision is refused");
+  eq(r.deployedCount(), 1, "still once");
+  await r.done();
+});
+
+test("审批要留名", "a decision without an approver is refused, because the record is the audit", async () => {
+  const r = await rig();
+  const ctx = { tenantId: "tenant-a", agentId: "ag-approve", taskId: "tk-approve" };
+  const held = await r.gateway.invoke(ctx, "prod.deploy", {});
+  const opId = (held as any).operationId;
+  eq((await r.call("POST", `/approvals/${opId}/decide`, A_KEY, { decision: "approved" })).status, 400,
+     "no approver, no decision");
+  eq((await r.call("POST", `/approvals/${opId}/decide`, A_KEY,
+     { decision: "maybe", approver: "alice" })).status, 400, "and the decision must be real");
+  eq(r.deployedCount(), 0, "nothing executed");
+  await r.done();
+});
+
+test("审计可查", "the audit shows what a human authorised alongside what happened", async () => {
+  const r = await rig();
+  const ctx = { tenantId: "tenant-a", agentId: "ag-approve", taskId: "tk-approve" };
+  const held = await r.gateway.invoke(ctx, "prod.deploy", { env: "production" });
+  await r.call("POST", `/approvals/${(held as any).operationId}/decide`, A_KEY,
+    { decision: "approved", approver: "alice" });
+
+  const audit = (await r.call("GET", "/tasks/tk-approve/audit", A_KEY)).body;
+  eq(audit.approvals.length, 1, "the authorisation is on the record");
+  eq(audit.approvals[0].approver, "alice", "with who approved it");
+  eq(audit.approvals[0].state, "approved", "and the decision");
+  assert(audit.events.some((e: any) => e.kind === "operation.completed"), "and what then happened");
+  await r.done();
+});
 
 test("鉴权", "no token, no access; the token is the only source of tenant identity", async () => {
   const r = await rig();

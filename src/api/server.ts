@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import type { SqliteStore } from "../store/sqlite.ts";
 import type { Json } from "../core/types.ts";
+import type { ToolGateway } from "../runtime/gateway.ts";
 
 export interface ApiOptions {
   /** api key -> tenant. Auth is the only place tenant identity enters. */
@@ -13,6 +14,9 @@ export interface ApiOptions {
    *  a periodic byte, client body timeouts and proxies drop the stream. */
   sseKeepaliveMs?: number;
   onNewTask?: (tenantId: string, agentId: string, taskId: string) => Promise<void> | void;
+  /** Needed to act on an approval: deciding executes the held call. Without one
+   *  the queue is still readable, but nothing can be approved. */
+  gateway?: ToolGateway;
 }
 
 type Ctx = { tenantId: string };
@@ -134,6 +138,60 @@ export function createApi(store: SqliteStore, opts: ApiOptions) {
           interrupted: await store.interruptAgent(ctx.tenantId, agentId),
         }));
         return json(res, out.status || 200, { ...(out.body as object), replayed: out.replayed });
+      }
+
+      // ---------------------------------------------------------- approvals
+      //
+      // The operator surface for calls the policy held back. Tenant identity
+      // comes from the token and never from the request, so one tenant cannot
+      // approve another's call — an approval endpoint that trusted a tenant id
+      // in the body would not be a security control at all.
+
+      if (path === "/approvals" && method === "GET") {
+        const state = url.searchParams.get("state") as "pending" | "approved" | "denied" | null;
+        if (state && !["pending", "approved", "denied"].includes(state)) {
+          return json(res, 400, { error: "state must be pending, approved or denied" });
+        }
+        const rows = await store.listApprovals(ctx.tenantId, state ?? undefined);
+        return json(res, 200, { approvals: rows });
+      }
+
+      if ((m = /^\/approvals\/([^/]+)$/.exec(path)) && method === "GET") {
+        const a = await store.getApproval(ctx.tenantId, m[1]!);
+        return a ? json(res, 200, a) : json(res, 404, { error: "no such approval" });
+      }
+
+      if ((m = /^\/approvals\/([^/]+)\/decide$/.exec(path)) && method === "POST") {
+        const decision = body.decision;
+        if (decision !== "approved" && decision !== "denied") {
+          return json(res, 400, { error: "decision must be approved or denied" });
+        }
+        const approver = String(body.approver ?? "").trim();
+        // An audit record with no name in it is not much of an audit record.
+        if (!approver) return json(res, 400, { error: "approver is required" });
+        if (!opts.gateway) return json(res, 501, { error: "no gateway configured to act on approvals" });
+
+        const out = await opts.gateway.applyApproval(ctx.tenantId, m[1]!, decision, approver);
+        if (!out.ok) {
+          return json(res, out.reason === "not_found" ? 404 : 409, { error: out.reason });
+        }
+        return json(res, 200, {
+          operationId: m[1]!, decision, approver, executed: out.executed,
+          ...(out.result ? { status: out.result.status } : {}),
+        });
+      }
+
+      // Audit: what this task actually did, and what a human authorised.
+      if ((m = /^\/tasks\/([^/]+)\/audit$/.exec(path)) && method === "GET") {
+        const taskId = m[1]!;
+        const approvals = (await store.listApprovals(ctx.tenantId)).filter((a) => a.taskId === taskId);
+        return json(res, 200, {
+          taskId,
+          approvals,
+          events: (await store.taskEvents(ctx.tenantId, taskId)).map((e) => ({
+            sequence: e.sequence, kind: e.kind, createdAt: e.createdAt,
+          })),
+        });
       }
 
       if ((m = /^\/operations\/([^/]+)$/.exec(path)) && method === "GET") {
