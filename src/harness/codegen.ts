@@ -50,6 +50,7 @@ interface CodegenState {
   /** Last measured prompt size, reported by the provider. */
   promptTokens: number;
   compactions: number;
+  modelFailures?: number;
 }
 
 export interface CompactionConfig {
@@ -174,12 +175,17 @@ export class CodegenHarness implements HarnessAdapter {
     const state = structuredClone(input.state) as CodegenState;
     const messages = state.messages;
     let sawModelReply: string | null = null;
+    let lastFailure: string | null = null;
 
     for (const e of input.events) {
       const p = e.payload as any;
       switch (e.kind) {
         case "message":
           messages.push({ role: "user", tag: "customer", content: String(p.text) });
+          break;
+        case "model.failed":
+          state.modelFailures = (state.modelFailures ?? 0) + 1;
+          lastFailure = String(p.error ?? "model call failed");
           break;
         case "model.response":
           messages.push({ role: "assistant", tag: "agent", content: String(p.text) });

@@ -21,7 +21,10 @@ export class OpenAiCompatibleModel implements ModelAdapter {
 
   async complete(
     messages: ModelMessage[],
-    opts: { maxTokens?: number; temperature?: number; tools?: ToolDefinition[] } = {},
+    opts: {
+      maxTokens?: number; temperature?: number;
+      tools?: ToolDefinition[]; toolChoice?: "auto" | "required" | "none";
+    } = {},
   ): Promise<ModelResponse> {
     // Reasoning tokens are billed against max_tokens: a tight cap silently
     // yields empty content with finish_reason=length.
@@ -47,6 +50,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
                     type: "function",
                     function: { name: t.name, description: t.description, parameters: t.parameters },
                   })),
+                  ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
                 }
               : {}),
           }),

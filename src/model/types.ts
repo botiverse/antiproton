@@ -43,7 +43,14 @@ export interface ModelAdapter {
   readonly id: string;
   complete(
     messages: ModelMessage[],
-    opts?: { maxTokens?: number; temperature?: number; tools?: ToolDefinition[] },
+    opts?: {
+      maxTokens?: number;
+      temperature?: number;
+      tools?: ToolDefinition[];
+      /** "required" forces a tool call — used to separate *which* tool the model
+       *  picks from *whether* it decides to act at all. */
+      toolChoice?: "auto" | "required" | "none";
+    },
   ): Promise<ModelResponse>;
 }
 
