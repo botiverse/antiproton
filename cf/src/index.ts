@@ -721,6 +721,14 @@ export class AgentDO extends DurableObject<Env> {
       }
       // Outbound HTTP, allowlisted. Adding it separately for the same reason as
       // `ops`: it carries configuration, and provision only makes plain mounts.
+      // Reconcile agents provisioned before these mounts existed.
+      if (!(await rt.store.getMountByAlias(tenantId, agentId, "artifacts"))) {
+        await rt.store.addMount({
+          tenantId, agentId, alias: "artifacts", plugin: "artifacts",
+          installationId: "inst-artifacts", connectionId: null, toolVersion: "1.0.0",
+          publicConfig: { account: "builtin" }, secretRef: null, policy: null,
+        });
+      }
       if (!(await rt.store.getMountByAlias(tenantId, agentId, "web"))) {
         await rt.store.addMount({
           tenantId, agentId, alias: "web", plugin: "http",
@@ -728,7 +736,10 @@ export class AgentDO extends DurableObject<Env> {
           // Open: the demo is more useful reachable, and the damage is bounded
           // by the agent holding no credential and writes needing a human.
           // Set allowedHosts here to restrict a mount.
-          publicConfig: { account: "open web", maxBytes: 48_000 },
+          // Under the 32KB offload threshold on purpose: an ordinary page
+          // should reach the agent directly rather than via a round trip
+          // through storage.
+          publicConfig: { account: "open web", maxBytes: 24_000 },
           secretRef: null, policy: null,
         });
       }
@@ -737,6 +748,9 @@ export class AgentDO extends DurableObject<Env> {
         // carries a policy, and creating it twice is a primary-key conflict.
         await rt.provision(tenantId, agentId, [
           { alias: "tools", plugin: "tools", account: "builtin" },
+          // Without this a parked result is a reference the agent cannot open —
+          // it is handed an r2:// ref and no way to read it.
+          { alias: "artifacts", plugin: "artifacts", account: "builtin" },
         ]);
         await rt.store.addMount({
           tenantId, agentId, alias: "ops", plugin: "demo",

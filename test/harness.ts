@@ -125,6 +125,46 @@ test("上下文压缩", "compaction drops scratch work, keeps every customer tur
 });
 
 let pass = 0, fail = 0;
+test("被扣下即挂起", "a held call parks the task instead of asking the model to route around it", async () => {
+  const h = new CodegenHarness({ maxTurns: 20 });
+  const state: any = await h.initialize({ mounts: [] });
+  const ev = (kind: string, payload: unknown) => ({
+    eventId: "e", tenantId: "t", agentId: "a", taskId: "k", threadId: null,
+    sequence: 1, kind, payload, dedupKey: null, createdAt: 0,
+  }) as any;
+
+  const out = await h.advance({
+    state,
+    events: [ev("js.result", {
+      callId: "c1", status: "completed", outputs: [], heldOperationIds: ["op_held_1"],
+    })],
+  } as any);
+
+  // Not a model.request: the loop stops here and the decision restarts it.
+  eq(out.commands.length, 0, "no further work is dispatched");
+  eq(out.status, "waiting", "the task parks");
+  eq(out.waits.length, 1, "on the held operation");
+  eq((out.waits[0] as any).operationId, "op_held_1", "the right one");
+  const last = (out.state as any).messages.at(-1);
+  assert(String(last.content).includes("Held for approval"), "and the model is told why in words");
+  assert(String(last.content).includes("resume"), "including that it resumes by itself");
+});
+
+test("未被扣下则照常继续", "an ordinary result still drives the next turn", async () => {
+  const h = new CodegenHarness({ maxTurns: 20 });
+  const state: any = await h.initialize({ mounts: [] });
+  const out = await h.advance({
+    state,
+    events: [{
+      eventId: "e", tenantId: "t", agentId: "a", taskId: "k", threadId: null,
+      sequence: 1, kind: "js.result", payload: { callId: "c1", status: "completed", outputs: [1] },
+      dedupKey: null, createdAt: 0,
+    }],
+  } as any);
+  eq(out.commands[0]!.kind, "model.request", "asks the model again");
+  eq(out.waits.length, 0, "and parks on nothing");
+});
+
 console.log(`\n  Harness (codegen loop)\n  ${"─".repeat(62)}`);
 for (const t of tests) {
   try { await t.fn(); pass++; console.log(`  \x1b[32m✓\x1b[0m ${t.row.padEnd(14)} ${t.name}`); }

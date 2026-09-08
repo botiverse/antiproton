@@ -133,6 +133,37 @@ export class ToolGateway {
     return { ok: true, executed: true, result };
   }
 
+  /**
+   * Release whatever this agent's mounts are holding, now the task is done.
+   *
+   * Errors are swallowed on purpose: this runs after the work, and a mount that
+   * cannot tidy up must not turn a finished task into a failed one.
+   */
+  async releaseTask(ctx: CallContext): Promise<{ released: string[] }> {
+    const released: string[] = [];
+    for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
+      const plugin = this.#plugins.get(mount.plugin);
+      if (!plugin?.release) continue;
+      try {
+        const did = await plugin.release({
+          caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+          credential: mount.secretRef ? await this.#secrets.resolve(mount.secretRef) : null,
+          publicConfig: mount.publicConfig,
+          connection: {
+            get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
+            set: (state, expiresAt) =>
+              this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
+          },
+          async sibling() { return null; },
+        });
+        // Only report what was actually holding something: a release log that
+        // names every mount tells you nothing about what was costing anything.
+        if (did !== false) released.push(mount.alias);
+      } catch { /* tidying up is best effort */ }
+    }
+    return { released };
+  }
+
   async invoke(
     ctx: CallContext,
     raw: string,

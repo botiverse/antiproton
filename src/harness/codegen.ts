@@ -176,6 +176,8 @@ export class CodegenHarness implements HarnessAdapter {
     const messages = state.messages;
     let sawModelReply: string | null = null;
     let lastFailure: string | null = null;
+    /** Calls the policy is holding for a person. */
+    const held: string[] = [];
 
     for (const e of input.events) {
       const p = e.payload as any;
@@ -194,6 +196,7 @@ export class CodegenHarness implements HarnessAdapter {
           if (p.usage?.promptTokens) state.promptTokens = Number(p.usage.promptTokens);
           break;
         case "js.result": {
+          for (const id of (p.heldOperationIds ?? []) as string[]) held.push(id);
           const left = Math.max(0, this.#maxTurns - state.turns);
           messages.push({
             role: "user",
@@ -261,6 +264,33 @@ export class CodegenHarness implements HarnessAdapter {
     }
 
     this.#compact(state);
+    // A call the policy is holding is not a failure and not something to work
+    // around: it is a wait. Asking the model what to do next here is what made
+    // it announce that "the restarts could not be completed automatically" and
+    // stop — it had no way to know a person was about to decide.
+    //
+    // Pi answers a blocked call with an ordinary tool result carrying an
+    // explanation, which is right; the part that does not carry over is that Pi
+    // asks synchronously in a live terminal. Here the task parks instead, and
+    // the decision wakes it.
+    if (held.length) {
+      messages.push({
+        role: "user",
+        tag: "note",
+        content:
+          `Held for approval: ${held.length} call(s) require a person to sign off. ` +
+          `You are not blocked and nothing failed — the task is paused here and will ` +
+          `resume by itself once the decision is made. Do not retry them or look for ` +
+          `another route around them.`,
+      });
+      return {
+        state,
+        status: "waiting",
+        commands: [],
+        waits: held.map((operationId) => ({ kind: "operation" as const, operationId })),
+      };
+    }
+
     return {
       state,
       status: "waiting",

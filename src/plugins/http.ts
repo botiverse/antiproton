@@ -63,18 +63,61 @@ export function checkUrl(
   return { ok: true, url };
 }
 
+/**
+ * HTML in, readable text out.
+ *
+ * Returning raw markup and truncating from the top is the worst possible slice:
+ * the first 24 KB of a real page is `<head>` boilerplate, so the agent receives
+ * no content at all. Watched live, it spent three turns writing progressively
+ * more elaborate regexes to dig a description out of truncated markup, failed
+ * every time, and only succeeded by abandoning the page for a JSON API.
+ *
+ * Scripts, styles and markup come out; the title and description come out
+ * separately because they are small and often answer the question on their own.
+ * Raw markup is still available on request for the cases that need it.
+ */
+export function htmlToText(html: string): { title: string; description: string; text: string } {
+  const pick = (re: RegExp) => (re.exec(html)?.[1] ?? "").trim();
+  const title = pick(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const description =
+    pick(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i) ||
+    pick(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i);
+
+  const text = html
+    // Anything whose contents are not prose, removed with its contents.
+    .replace(/<(script|style|noscript|svg|template|head)[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    // Block boundaries become line breaks so the shape of the page survives.
+    .replace(/<\/(p|div|li|tr|h[1-6]|section|article|br)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
+
+  return { title: decodeEntities(title), description: decodeEntities(description), text };
+}
+
+const decodeEntities = (s: string) =>
+  s.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+   .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+
 export const httpPlugin: Plugin = {
   id: "http",
   version: "1.0.0",
   tools: [
     {
       name: "get",
-      summary: "Fetch a URL over HTTP(S). Only hosts this mount allows; returns text, truncated.",
+      summary:
+        "Fetch a URL over HTTP(S). HTML comes back as readable text with the page title and " +
+        "description; JSON and plain text come back as-is. Pass raw:true for the markup.",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string", description: "absolute http(s) url" },
           accept: { type: "string", description: "optional Accept header" },
+          raw: { type: "boolean", description: "return the markup instead of extracted text" },
         },
         required: ["url"],
       },
@@ -88,7 +131,7 @@ export const httpPlugin: Plugin = {
     const cfg = (ctx.publicConfig ?? {}) as HttpConfig;
     const allowed = cfg.allowedHosts;
     const maxBytes = cfg.maxBytes ?? 64 * 1024;
-    const a = (args ?? {}) as { url?: string; accept?: string };
+    const a = (args ?? {}) as { url?: string; accept?: string; raw?: boolean };
 
     let target = String(a.url ?? "");
     const hops: string[] = [];
@@ -113,14 +156,30 @@ export const httpPlugin: Plugin = {
         continue;
       }
 
-      const raw = await res.text();
-      const body = raw.slice(0, maxBytes);
+      const payload = await res.text();
+      const type = res.headers.get("content-type") ?? "";
+      const isHtml = /html|xml/i.test(type) || /^\s*<(!doctype|html)/i.test(payload);
+
+      if (isHtml && !a.raw) {
+        const { title, description, text } = htmlToText(payload);
+        const body = text.slice(0, maxBytes);
+        return {
+          status: res.status, url: check.url.toString(), contentType: type,
+          title, description,
+          bytes: payload.length, textBytes: text.length,
+          truncated: text.length > body.length,
+          hops: hops.length > 1 ? hops : undefined,
+          text: body,
+        };
+      }
+
+      const body = payload.slice(0, maxBytes);
       return {
         status: res.status,
         url: check.url.toString(),
-        contentType: res.headers.get("content-type"),
-        bytes: raw.length,
-        truncated: raw.length > body.length,
+        contentType: type,
+        bytes: payload.length,
+        truncated: payload.length > body.length,
         hops: hops.length > 1 ? hops : undefined,
         body,
       };

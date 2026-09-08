@@ -147,12 +147,16 @@ export class CommandExecutor {
           // A native tool call is one command, so the command id is the key.
           opts: { idempotencyKey: cmd.commandId },
         });
+        const heldOp = res.status === "pending" && "operationId" in res ? res.operationId : null;
         await charge(this.#store, ctx.tenantId, "tool_calls", 1);
         this.trace.push({ kind: "tool", detail: { tool: p.tool, status: (res as any).status } });
         await this.#store.appendEvent({
           tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
           kind: "tool.result",
-          payload: { callId: p.callId, tool: p.tool, content: JSON.stringify(res).slice(0, 12_000) },
+          payload: {
+            callId: p.callId, tool: p.tool, content: JSON.stringify(res).slice(0, 12_000),
+            ...(heldOp ? { heldOperationIds: [heldOp] } : {}),
+          },
           dedupKey: `cmd:${cmd.commandId}:result`,
         });
         break;
@@ -162,12 +166,18 @@ export class CommandExecutor {
         // this command after a crash reaches the same operation ids instead of
         // minting new ones and repeating whatever they did.
         let n = 0;
+        // Calls the policy held, so the harness can park on them instead of
+        // asking the model what to do about a status code.
+        const heldOps: string[] = [];
         const host: ExecutorHost = {
-          invoke: (call) =>
-            this.#host.invoke({
+          invoke: async (call) => {
+            const res = await this.#host.invoke({
               ...call,
               opts: { ...call.opts, idempotencyKey: `${cmd.commandId}:${n++}` },
-            }),
+            });
+            if (res.status === "pending" && "operationId" in res) heldOps.push(res.operationId);
+            return res;
+          },
         };
         const r = await this.#executor.execute(String(p.source), host, this.#limits);
         await charge(this.#store, ctx.tenantId, "tool_calls", r.hostCalls);
@@ -184,6 +194,7 @@ export class CommandExecutor {
           payload: {
             callId: p.callId, status: r.status, outputs: r.outputs, error: r.error,
             acceptedOperationIds: r.acceptedOperationIds,
+            ...(heldOps.length ? { heldOperationIds: heldOps } : {}),
           },
           dedupKey: `cmd:${cmd.commandId}:result`,
         });

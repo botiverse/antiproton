@@ -278,6 +278,7 @@ export class HybridHarness implements HarnessAdapter {
     const commands: Array<{ kind: string; payload: Json }> = [];
     let sawReply: { text: string; toolCalls?: any[] } | null = null;
     let lastFailure: string | null = null;
+    const held: string[] = [];
 
     for (const e of input.events) {
       const p = e.payload as any;
@@ -313,6 +314,7 @@ export class HybridHarness implements HarnessAdapter {
           lastFailure = String(p.error ?? "model call failed");
           break;
         case "tool.result": {
+          for (const id of (p.heldOperationIds ?? []) as string[]) held.push(id);
           const content = String(p.content);
           msgs.push({ role: "tool", tool_call_id: String(p.callId), content });
           // Discovery is what widens the offer. Any catalogue name the result
@@ -327,6 +329,7 @@ export class HybridHarness implements HarnessAdapter {
           break;
         }
         case "js.result":
+          for (const id of (p.heldOperationIds ?? []) as string[]) held.push(id);
           msgs.push({
             role: "tool",
             tool_call_id: String(p.callId),
@@ -378,6 +381,21 @@ export class HybridHarness implements HarnessAdapter {
         status: "completed",
         commands: [{ kind: "message.out", payload: { text: sawReply.text } }],
         waits: [],
+      };
+    }
+
+    // A held call is a wait, not a failure. See the note in codegen.ts.
+    if (held.length && !sawReply) {
+      msgs.push({
+        role: "user",
+        content:
+          `Held for approval: ${held.length} call(s) require a person to sign off. ` +
+          `Nothing failed — the task is paused and resumes on its own once decided. ` +
+          `Do not retry them or route around them.`,
+      });
+      return {
+        state, status: "waiting", commands: [],
+        waits: held.map((operationId) => ({ kind: "operation" as const, operationId })),
       };
     }
 

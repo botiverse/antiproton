@@ -41,4 +41,14 @@ export interface Plugin {
   version: string;
   tools: ToolSchema[];
   invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json>;
+  /**
+   * Let go of anything held on the task's behalf, once the task is over.
+   *
+   * Some mounts reserve something real and metered — a container, a session, a
+   * lease — and without a point to hand it back, it is held until something
+   * else notices. Called on a terminal task; must be safe to call twice and
+   * must not throw, because a failure to tidy up is not a reason to fail a task
+   * that has already finished.
+   */
+  release?(ctx: PluginContext): Promise<boolean | void>;
 }

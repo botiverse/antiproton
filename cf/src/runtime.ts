@@ -47,6 +47,42 @@ export interface ModelJob {
 
 const OFFLOAD_BYTES = 32 * 1024;
 
+/**
+ * What the agent is told about a result too big to hand it whole.
+ *
+ * This used to project `{number, title}` from an array — the shape of a GitHub
+ * issue list, and of nothing else. A fetched page is an object with a long
+ * `body`, so it produced an empty preview: the agent received a reference, no
+ * readable content, and no idea what it had. Offloading has to leave something
+ * usable behind whatever the result looks like, or it is just a dead end with
+ * extra steps.
+ */
+function summarise(value: unknown, budget = 1200): Json {
+  const head = (s: string, n: number) =>
+    s.length <= n ? s : `${s.slice(0, n)}… (+${s.length - n} chars)`;
+
+  if (typeof value === "string") return head(value, budget);
+  if (Array.isArray(value)) {
+    return {
+      count: value.length,
+      sample: value.slice(0, 3).map((v) => summarise(v, Math.floor(budget / 3))),
+    };
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, Json> = {};
+    const entries = Object.entries(value as Record<string, unknown>);
+    const per = Math.max(120, Math.floor(budget / Math.max(entries.length, 1)));
+    for (const [k, v] of entries.slice(0, 20)) {
+      out[k] = typeof v === "string" ? head(v, per)
+        : Array.isArray(v) ? { count: v.length }
+        : v && typeof v === "object" ? "{…}"
+        : (v as Json);
+    }
+    return out;
+  }
+  return value as Json;
+}
+
 /** Same surface the SigV4 client exposes, backed by the R2 binding instead. */
 class BoundArtifacts {
   #bucket: R2Bucket;
@@ -164,14 +200,14 @@ export class AgentRuntime {
         const key = `t/${ctx.tenantId}/${ctx.agentId}/${res.operationId}.json`;
         const stored = await artifacts.put(key, body);
         await store.completeOperation(ctx.tenantId, res.operationId, "succeeded", stored.ref);
-        const items = Array.isArray(res.result) ? (res.result as any[]) : [];
         return {
           status: "succeeded",
           operationId: res.operationId,
           result: {
-            ref: stored.ref, bytes: stored.bytes, count: items.length,
-            preview: items.slice(0, 5).map((i) => ({ number: i.number, title: i.title })),
-            note: "parked; read with artifacts.read { ref, fields, offset, limit }",
+            ref: stored.ref,
+            bytes: stored.bytes,
+            preview: summarise(res.result),
+            note: "parked because it is large; read the rest with artifacts.read { ref, fields, offset, limit }",
           },
         };
       },
@@ -346,6 +382,11 @@ export class AgentRuntime {
         });
         await kernel.step(tenantId, taskId, null, (cmd) => commands.dispatch(callCtx, cmd));
         trace.push(...commands.trace);
+        // A finished task should not still be holding a metered container.
+        const after = await this.store.loadTask(tenantId, taskId);
+        if (after && ["completed", "failed"].includes(after.status)) {
+          await this.#gateway.releaseTask(callCtx);
+        }
       }
     }
     const more = (await this.store.tasksWithPendingWork(1)).length > 0;
