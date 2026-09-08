@@ -1282,8 +1282,17 @@ export default {
         case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
         case "/alarm/arm": return Response.json(await stub.armAlarm(Number(url.searchParams.get("ms") ?? 2000)));
         case "/alarm/status": return Response.json(await stub.alarmStatus());
+        case "/":
+          // The demo is the point of this deployment; making people know to
+          // type /ui is a papercut with no upside.
+          return Response.redirect(new URL("/ui", url).toString(), 302);
         default:
-          return Response.json({ routes: ["/storage", "/sandbox", "/alarm/arm?ms=", "/alarm/status"] });
+          return Response.json({
+            demo: "/ui",
+            diagnostics: ["/conformance/kernel", "/conformance/executor", "/isolation",
+                          "/eviction", "/model-binding", "/ui/whoami"],
+            probes: ["/storage", "/sandbox", "/latency", "/alarm/status"],
+          }, { status: 404 });
       }
     } catch (e: any) {
       return Response.json({ error: String(e?.message ?? e), stack: String(e?.stack ?? "").slice(0, 600) }, { status: 500 });
