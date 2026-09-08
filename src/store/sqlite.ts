@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS model_bindings (
   secret_ref TEXT NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, agent_id));
 
+CREATE TABLE IF NOT EXISTS snapshots (
+  tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, through_sequence INTEGER NOT NULL,
+  state TEXT NOT NULL, state_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, task_id, through_sequence));
+
 CREATE TABLE IF NOT EXISTS quotas (
   tenant_id TEXT NOT NULL, resource TEXT NOT NULL,
   limit_value INTEGER, window_ms INTEGER,
@@ -179,6 +184,50 @@ export class SqliteStore implements StorageAdapter {
          VALUES (?,?,?,'runnable',0,0,0,?,?,?)`,
       )
       .run(tenantId, taskId, agentId, j(checkpoint), stateVersion, now());
+    // The log alone cannot rebuild a task without somewhere to start.
+    await this.putSnapshot(tenantId, taskId, 0, checkpoint, stateVersion);
+  }
+
+  async putSnapshot(
+    tenantId: string, taskId: string, throughSequence: number, state: Json, stateVersion: number,
+  ) {
+    this.#db
+      .prepare(
+        `INSERT INTO snapshots(tenant_id, task_id, through_sequence, state, state_version, created_at)
+         VALUES (?,?,?,?,?,?)
+         ON CONFLICT(tenant_id, task_id, through_sequence) DO UPDATE SET
+           state=excluded.state, state_version=excluded.state_version`,
+      )
+      .run(tenantId, taskId, throughSequence, j(state), stateVersion, now());
+  }
+
+  async getSnapshot(tenantId: string, taskId: string, atOrBefore = Number.MAX_SAFE_INTEGER) {
+    const r = this.#db
+      .prepare(
+        `SELECT * FROM snapshots WHERE tenant_id=? AND task_id=? AND through_sequence <= ?
+         ORDER BY through_sequence DESC LIMIT 1`,
+      )
+      .get(tenantId, taskId, atOrBefore) as any;
+    if (!r) return null;
+    return {
+      throughSequence: Number(r.through_sequence),
+      state: JSON.parse(r.state),
+      stateVersion: Number(r.state_version),
+    };
+  }
+
+  async taskEvents(tenantId: string, taskId: string, after = 0, through = Number.MAX_SAFE_INTEGER) {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM events WHERE tenant_id=? AND task_id=? AND sequence > ? AND sequence <= ?
+         ORDER BY sequence ASC`,
+      )
+      .all(tenantId, taskId, after, through) as any[];
+    return rows.map((r) => ({
+      eventId: r.event_id, tenantId: r.tenant_id, agentId: r.agent_id, taskId: r.task_id,
+      threadId: r.thread_id, sequence: Number(r.sequence), kind: r.kind,
+      payload: JSON.parse(r.payload), dedupKey: r.dedup_key, createdAt: Number(r.created_at),
+    }));
   }
 
   async loadTask(tenantId: string, taskId: string): Promise<TaskRecord | null> {

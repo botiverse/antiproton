@@ -5,6 +5,7 @@
  * not, whatever else it offers.
  */
 import { Kernel, commandId, type HarnessAdapter } from "../../src/runtime/kernel.ts";
+import { rebuildState } from "../../src/runtime/replay.ts";
 import type { StorageAdapter } from "../../src/core/store.ts";
 import type { Json } from "../../src/core/types.ts";
 
@@ -465,6 +466,90 @@ export async function kernelSpec(
     });
     eq((await k.step(TENANT, TASK2, null, async () => {})).outcome, "committed", "second advance");
     eq(migrations, 1, "not migrated a second time");
+    await store.close().catch(() => {});
+  });
+
+  test("状态可从日志重建", "state is a fold of the log, so the checkpoint is a cache", async () => {
+    const store = await fixture();
+    const k = new Kernel(store, echoHarness, { holder: "w1" });
+    for (const text of ["one", "two", "three"]) {
+      await msg(store, text);
+      await k.step(TENANT, TASK, null, async () => {});
+    }
+    const live = await store.loadTask(TENANT, TASK);
+    const rebuilt = await rebuildState(store, echoHarness, TENANT, TASK);
+    eq(
+      JSON.stringify((rebuilt.state as any).log),
+      JSON.stringify((live!.checkpoint as any).log),
+      "rebuilt state equals the live checkpoint",
+    );
+    assert(rebuilt.replayed >= 3, `folded the log (${rebuilt.replayed} events)`);
+    await store.close().catch(() => {});
+  });
+
+  test("可回溯到任一点", "the log can be rewound to any earlier point", async () => {
+    const store = await fixture();
+    const k = new Kernel(store, echoHarness, { holder: "w1" });
+    const seqs: number[] = [];
+    for (const text of ["a", "b", "c"]) {
+      seqs.push((await msg(store, text)).sequence);
+      await k.step(TENANT, TASK, null, async () => {});
+    }
+    const early = await rebuildState(store, echoHarness, TENANT, TASK, seqs[0]!);
+    const late = await rebuildState(store, echoHarness, TENANT, TASK);
+    eq((early.state as any).log.length, 1, "rewound state saw one event");
+    eq((late.state as any).log.length, 3, "current state saw all three");
+    await store.close().catch(() => {});
+  });
+
+  test("压缩不毁历史", "a harness that discards history cannot destroy the log", async () => {
+    const store = await fixture();
+    // A harness whose advance throws away everything it has seen: the harshest
+    // possible compaction. The log must still be able to reproduce the full
+    // history, because that is what an audit and a rewind depend on.
+    const forgetful: HarnessAdapter = {
+      kind: "forgetful", stateVersion: 1,
+      async initialize() { return { log: [] }; },
+      async migrate(s: Json) { return s; },
+      async advance({ events }) {
+        return { state: { log: events.map((e) => e.kind) }, status: "runnable", commands: [], waits: [] };
+      },
+    };
+    const k = new Kernel(store, forgetful, { holder: "w1" });
+    for (const text of ["x", "y", "z"]) {
+      await msg(store, text);
+      await k.step(TENANT, TASK, null, async () => {});
+    }
+    const live = await store.loadTask(TENANT, TASK);
+    eq((live!.checkpoint as any).log.length, 1, "the checkpoint kept only the last event");
+    // The log is untouched.
+    const all = await store.taskEvents(TENANT, TASK);
+    eq(all.filter((e) => e.kind === "message").length, 3, "every message is still in the log");
+    const rebuilt = await rebuildState(store, forgetful, TENANT, TASK, all[0]!.sequence);
+    eq((rebuilt.state as any).log.length, 1, "and any earlier point is reachable");
+    await store.close().catch(() => {});
+  });
+
+  test("定期快照", "snapshots keep rebuild bounded without becoming the truth", async () => {
+    const store = await fixture();
+    const k = new Kernel(store, echoHarness, { holder: "w1", snapshotEvery: 2 });
+    for (const text of ["1", "2", "3", "4", "5", "6"]) {
+      await msg(store, text);
+      await k.step(TENANT, TASK, null, async () => {});
+    }
+    const snap = await store.getSnapshot(TENANT, TASK);
+    assert(snap!.throughSequence > 0, `a later snapshot was written (at ${snap!.throughSequence})`);
+    const rebuilt = await rebuildState(store, echoHarness, TENANT, TASK);
+    assert(rebuilt.fromSnapshot > 0, "rebuild started from it rather than from zero");
+    const live = await store.loadTask(TENANT, TASK);
+    eq(
+      JSON.stringify((rebuilt.state as any).log),
+      JSON.stringify((live!.checkpoint as any).log),
+      "and still reproduces the live state exactly",
+    );
+    // The log is untouched by snapshotting.
+    eq((await store.taskEvents(TENANT, TASK)).filter((e) => e.kind === "message").length, 6,
+       "every event is still in the log");
     await store.close().catch(() => {});
   });
 

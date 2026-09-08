@@ -59,6 +59,17 @@ export type CrashPoint = "before_commit" | "after_commit" | null;
  */
 export const DEFAULT_MAX_CHECKPOINT_BYTES = 256 * 1024;
 
+/**
+ * How often to snapshot, in consumed events.
+ *
+ * Rebuilding folds the log from the last snapshot, so with only the one written
+ * at creation a long task costs O(all events) to reconstruct — and long tasks
+ * are the point. Periodic snapshots keep rebuild bounded without making the
+ * checkpoint authoritative: the log is still the truth, these are just closer
+ * starting points.
+ */
+export const DEFAULT_SNAPSHOT_EVERY = 50;
+
 /** Resources a tenant can exhaust. Charged where they are actually spent. */
 export const QUOTA_STEPS = "steps";
 export const QUOTA_MODEL_TOKENS = "model_tokens";
@@ -80,12 +91,16 @@ export class Kernel {
   // Explicit fields: node's strip-only TS mode rejects parameter properties.
   #store: StorageAdapter;
   #harness: HarnessAdapter;
-  #opts: { holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number };
+  #opts: {
+    holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number; snapshotEvery?: number;
+  };
 
   constructor(
     store: StorageAdapter,
     harness: HarnessAdapter,
-    opts: { holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number } = { holder: "worker-1" },
+    opts: {
+      holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number; snapshotEvery?: number;
+    } = { holder: "worker-1" },
   ) {
     this.#store = store;
     this.#harness = harness;
@@ -181,6 +196,20 @@ export class Kernel {
       commands,
     });
     if (!res.ok) return { outcome: "rejected", reason: res.reason };
+
+    // After the commit, never before it: a snapshot of state that was not
+    // durably committed would be a starting point for a history that did not
+    // happen. Failing to write one costs a longer rebuild, nothing more.
+    const consumed = events[events.length - 1]!.sequence;
+    const every = this.#opts.snapshotEvery ?? DEFAULT_SNAPSHOT_EVERY;
+    const prior = await this.#store.getSnapshot(tenantId, taskId);
+    if (!prior || consumed - prior.throughSequence >= every) {
+      try {
+        await this.#store.putSnapshot(
+          tenantId, taskId, consumed, out.state, this.#harness.stateVersion,
+        );
+      } catch { /* a missing snapshot only makes rebuild slower */ }
+    }
 
     if (crashAt === "after_commit") return { outcome: "crashed_after_commit" };
 

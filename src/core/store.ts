@@ -26,6 +26,28 @@ export interface StorageAdapter {
   close(): Promise<void>;
 
   createAgent(tenantId: string, agentId: string, config?: Json): Promise<void>;
+  /**
+   * Snapshots and the raw task log.
+   *
+   * `advance` is deterministic and events are append-only, so harness state is
+   * a fold of the log: `state = fold(advance, snapshot, events after it)`. That
+   * makes the checkpoint a cache rather than the truth, which is what lets
+   * compaction be a lossy *view* instead of a destructive edit — the history it
+   * hides is still in the log, so a task can be rebuilt, rewound or forked, and
+   * an audit still has everything that happened.
+   */
+  putSnapshot(
+    tenantId: string, taskId: string, throughSequence: number, state: Json, stateVersion: number,
+  ): Promise<void>;
+  /** The newest snapshot at or before `atOrBefore`. */
+  getSnapshot(
+    tenantId: string, taskId: string, atOrBefore?: number,
+  ): Promise<{ throughSequence: number; state: Json; stateVersion: number } | null>;
+  /** Raw log for one task in (after, through], independent of any cursor. */
+  taskEvents(
+    tenantId: string, taskId: string, after?: number, through?: number,
+  ): Promise<RuntimeEvent[]>;
+
   createTask(
     tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion?: number,
   ): Promise<void>;
