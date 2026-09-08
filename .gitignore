@@ -1,3 +1,14 @@
-node_modules/\n*.db\n.secrets
+# The first line of this file used to be the literal string
+# "node_modules/\n*.db\n.secrets" — backslash-n as characters, not newlines —
+# so it was one pattern that matched nothing, and node_modules was committed
+# despite the apparent intent. Written out properly now.
 node_modules/
+*.db
+*.db-wal
+*.db-shm
+.secrets
+.env
+.env.*
+data/
+experiments/
 bench/tau2/data/db.json
