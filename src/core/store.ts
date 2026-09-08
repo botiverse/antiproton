@@ -26,7 +26,9 @@ export interface StorageAdapter {
   close(): Promise<void>;
 
   createAgent(tenantId: string, agentId: string, config?: Json): Promise<void>;
-  createTask(tenantId: string, agentId: string, taskId: string, checkpoint: Json): Promise<void>;
+  createTask(
+    tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion?: number,
+  ): Promise<void>;
   loadTask(tenantId: string, taskId: string): Promise<TaskRecord | null>;
 
   /** Returns inserted=false when dedupKey was already seen (§14 重复消息). */

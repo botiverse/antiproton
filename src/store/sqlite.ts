@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   tenant_id TEXT NOT NULL, task_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
   status TEXT NOT NULL, generation INTEGER NOT NULL,
   checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL DEFAULT 0,
-  checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
+  checkpoint TEXT NOT NULL, state_version INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS tasks_tenant ON tasks(tenant_id, status);
 
 CREATE TABLE IF NOT EXISTS events (
@@ -127,6 +127,10 @@ export class SqliteStore implements StorageAdapter {
 
   async init() {
     this.#db.exec(SCHEMA);
+    // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
+    // the column, so an object created before this change would never get it.
+    try { this.#db.exec("ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"); }
+    catch { /* already present */ }
     this.#db
       .prepare("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)")
       .run();
@@ -165,14 +169,16 @@ export class SqliteStore implements StorageAdapter {
       .run(tenantId, agentId, j(config), now());
   }
 
-  async createTask(tenantId: string, agentId: string, taskId: string, checkpoint: Json) {
+  async createTask(
+    tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion = 0,
+  ) {
     this.#db
       .prepare(
         `INSERT INTO tasks(tenant_id, task_id, agent_id, status, generation,
-           checkpoint_version, fencing_token, checkpoint, updated_at)
-         VALUES (?,?,?,'runnable',0,0,0,?,?)`,
+           checkpoint_version, fencing_token, checkpoint, state_version, updated_at)
+         VALUES (?,?,?,'runnable',0,0,0,?,?,?)`,
       )
-      .run(tenantId, taskId, agentId, j(checkpoint), now());
+      .run(tenantId, taskId, agentId, j(checkpoint), stateVersion, now());
   }
 
   async loadTask(tenantId: string, taskId: string): Promise<TaskRecord | null> {
@@ -189,6 +195,7 @@ export class SqliteStore implements StorageAdapter {
       checkpointVersion: r.checkpoint_version,
       fencingToken: r.fencing_token,
       checkpoint: JSON.parse(r.checkpoint),
+      stateVersion: Number(r.state_version ?? 0),
     };
   }
 
@@ -328,13 +335,14 @@ export class SqliteStore implements StorageAdapter {
       this.#db
         .prepare(
           `UPDATE tasks SET status=?, checkpoint=?, checkpoint_version=?,
-             fencing_token=?, updated_at=? WHERE tenant_id=? AND task_id=?`,
+             fencing_token=?, state_version=?, updated_at=? WHERE tenant_id=? AND task_id=?`,
         )
         .run(
           txn.status,
           j(txn.checkpoint),
           nextVersion,
           txn.fencingToken,
+          txn.stateVersion ?? 0,
           now(),
           txn.tenantId,
           txn.taskId,

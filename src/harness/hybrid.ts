@@ -255,7 +255,7 @@ export class HybridHarness implements HarnessAdapter {
     } satisfies HybridState;
   }
 
-  async migrate(state: Json): Promise<Json> {
+  async migrate(state: Json, _from = 0): Promise<Json> {
     const s = state as any;
     // Deliberate reconciliation: names the current catalogue no longer has are
     // dropped here, where it is an explicit decision rather than a silent one.

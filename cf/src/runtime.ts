@@ -238,6 +238,7 @@ export class AgentRuntime {
     await this.store.createTask(
       tenantId, agentId, taskId,
       await this.#harness.initialize({ mounts, tools, ...policy }),
+      this.#harness.stateVersion,
     );
   }
 

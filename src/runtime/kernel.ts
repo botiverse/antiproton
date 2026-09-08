@@ -13,6 +13,16 @@ export interface HarnessAdapter {
   readonly kind: string;
   readonly stateVersion: number;
   initialize(config: Json): Promise<Json>;
+  /**
+   * Bring a checkpoint written by an older `stateVersion` up to this one.
+   *
+   * Required, not optional: an adapter that declares a version is promising it
+   * can read its own past. This was declared and never called for long enough
+   * that a migration shipped dead — the harness had one, the kernel had no path
+   * to it, and its test called the function directly so it stayed green.
+   */
+  migrate(state: Json, from: number): Promise<Json>;
+  /** Versions start at 1; 0 is reserved for "never recorded". */
   advance(input: {
     state: Json;
     events: RuntimeEvent[];
@@ -111,13 +121,24 @@ export class Kernel {
       await this.#store.commitAdvance({
         tenantId, taskId, generation: task.generation, fencingToken: lease.fencingToken,
         expectedCheckpointVersion: task.checkpointVersion, checkpoint: task.checkpoint,
-        status: "blocked", consumedThrough: null, waits: [], commands: [],
+        stateVersion: task.stateVersion, status: "blocked", consumedThrough: null, waits: [], commands: [],
       });
       return { outcome: "rejected", reason: `quota_exceeded: ${QUOTA_STEPS} ${gate.used}/${gate.limit}` };
     }
 
+    // Migrate before advancing, and commit the result under the new version, so
+    // it happens exactly once however many times the task is resumed.
+    // 0 means "no version was ever recorded" — a task opened before versions
+    // were tracked, or by a caller that did not pass one. Adopting the current
+    // version is right; migrating from a version that was never written is not.
+    const needsMigration =
+      task.stateVersion !== 0 && task.stateVersion !== this.#harness.stateVersion;
+    const state = needsMigration
+      ? await this.#harness.migrate(task.checkpoint, task.stateVersion)
+      : task.checkpoint;
+
     const out = await this.#harness.advance({
-      state: task.checkpoint,
+      state,
       events,
       context: {
         tenantId,
@@ -153,6 +174,7 @@ export class Kernel {
       fencingToken: lease.fencingToken,
       expectedCheckpointVersion: task.checkpointVersion,
       checkpoint: out.state,
+      stateVersion: this.#harness.stateVersion,
       status: out.status,
       consumedThrough: events[events.length - 1]!.sequence,
       waits: out.waits,

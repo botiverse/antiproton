@@ -429,6 +429,45 @@ export async function kernelSpec(
     await store.close().catch(() => {});
   });
 
+  test("检查点迁移", "a checkpoint written by an older harness is migrated exactly once", async () => {
+    const store = await fixture();
+    let migrations = 0;
+    const v2: HarnessAdapter = {
+      kind: "versioned", stateVersion: 2,
+      async initialize() { return { v: 2, log: [] }; },
+      async migrate(state: Json, from: number) {
+        migrations++;
+        return { ...(state as any), v: 2, migratedFrom: from };
+      },
+      async advance({ state, events }) {
+        const log = [...((state as any)?.log ?? []), ...events.map((e) => e.kind)];
+        return { state: { ...(state as any), log }, status: "runnable", commands: [], waits: [] };
+      },
+    };
+    // The task was opened by a v1 harness.
+    const TASK2 = `${TASK}-v1`;
+    await store.createTask(TENANT, AGENT, TASK2, { v: 1, log: [] }, 1);
+    eq((await store.loadTask(TENANT, TASK2))!.stateVersion, 1, "stored at v1");
+
+    const k = new Kernel(store, v2, { holder: "w1" });
+    await store.appendEvent({
+      tenantId: TENANT, agentId: AGENT, taskId: TASK2, kind: "message", payload: { text: "a" },
+    });
+    eq((await k.step(TENANT, TASK2, null, async () => {})).outcome, "committed", "first advance");
+    eq(migrations, 1, "migrated once");
+    const t1 = await store.loadTask(TENANT, TASK2);
+    eq(t1!.stateVersion, 2, "committed at the harness's version");
+    eq((t1!.checkpoint as any).migratedFrom, 1, "migrate saw where it came from");
+
+    // Resuming must not migrate again.
+    await store.appendEvent({
+      tenantId: TENANT, agentId: AGENT, taskId: TASK2, kind: "message", payload: { text: "b" },
+    });
+    eq((await k.step(TENANT, TASK2, null, async () => {})).outcome, "committed", "second advance");
+    eq(migrations, 1, "not migrated a second time");
+    await store.close().catch(() => {});
+  });
+
   const results: SpecResult[] = [];
   for (const t of tests) {
     try { await t.fn(); results.push({ row: t.row, name: t.name, ok: true }); }

@@ -50,6 +50,9 @@ export interface TaskRecord {
   checkpointVersion: number;
   fencingToken: number;
   checkpoint: Json;
+  /** Which harness schema wrote this checkpoint. Distinct from
+   *  checkpointVersion, which is optimistic-concurrency, not schema. */
+  stateVersion: number;
 }
 
 export interface WaitSpec {
@@ -72,6 +75,8 @@ export interface AdvanceTxn {
   fencingToken: number;
   expectedCheckpointVersion: number;
   checkpoint: Json;
+  /** The harness schema this checkpoint is written in. */
+  stateVersion: number;
   status: TaskStatus;
   consumedThrough: number | null;
   waits: WaitSpec[];

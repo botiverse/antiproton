@@ -167,7 +167,7 @@ export class CodegenHarness implements HarnessAdapter {
     } satisfies CodegenState;
   }
 
-  async migrate(state: Json): Promise<Json> {
+  async migrate(state: Json, _from = 0): Promise<Json> {
     return state;
   }
 
