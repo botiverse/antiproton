@@ -447,6 +447,52 @@ export class AgentDO extends DurableObject<Env> {
     if (res.status !== 202) throw new Error(`dispatcher refused: ${res.status}`);
   }
 
+  /**
+   * Why is this agent not moving?
+   *
+   * The UI is addressed by identity, so an operator cannot look at someone
+   * else's object through it — which is right, and also means a stuck agent is
+   * invisible without a way in. Reachable only with the automation secret.
+   */
+  async diagnose(tenantId: string, agentId: string, taskId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const task = await rt.store.loadTask(tenantId, taskId);
+    const events = await rt.store.taskEvents(tenantId, taskId);
+    const kinds: Record<string, number> = {};
+    for (const e of events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
+    return {
+      owner: await this.owner(),
+      task: task && {
+        status: task.status, generation: task.generation,
+        checkpointVersion: task.checkpointVersion, stateVersion: task.stateVersion,
+      },
+      modelBinding: await rt.store.getModelBinding(tenantId, agentId),
+      mounts: (await rt.store.listMounts(tenantId, agentId)).map((m) => ({
+        alias: m.alias, plugin: m.plugin, policy: m.policy,
+      })),
+      eventKinds: kinds,
+      lastEvents: events.slice(-6).map((e) => ({
+        seq: e.sequence, kind: e.kind,
+        detail: JSON.stringify(e.payload).slice(0, 220),
+      })),
+      pendingWork: (await rt.store.tasksWithPendingWork(5)).length,
+      alarm: await this.ctx.storage.getAlarm(),
+      // What the panel actually renders. "It is not replying" and "the reply is
+      // not being drawn" look identical from outside, so show the rendering.
+      rendered: await (async () => {
+        try {
+          const t = await this.uiTranscript(tenantId, agentId, taskId);
+          const out = trajectory(t.events, t.byOp, t.busy);
+          return { ok: true, bytes: out.length, steps: (out.match(/class="step /g) ?? []).length,
+                   tail: out.slice(-400) };
+        } catch (e: any) {
+          return { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+        }
+      })(),
+    };
+  }
+
   /** The binding, credential-free, so an operator can see whose key is in use. */
   async modelBinding(tenantId: string, agentId: string) {
     const rt = this.#activeRuntime();
@@ -673,6 +719,19 @@ export class AgentDO extends DurableObject<Env> {
       if (existing && !existing.policy) {
         await rt.store.updateMountPolicy(tenantId, agentId, "ops", { write: "approval" });
       }
+      // Outbound HTTP, allowlisted. Adding it separately for the same reason as
+      // `ops`: it carries configuration, and provision only makes plain mounts.
+      if (!(await rt.store.getMountByAlias(tenantId, agentId, "web"))) {
+        await rt.store.addMount({
+          tenantId, agentId, alias: "web", plugin: "http",
+          installationId: "inst-web", connectionId: null, toolVersion: "1.0.0",
+          // Open: the demo is more useful reachable, and the damage is bounded
+          // by the agent holding no credential and writes needing a human.
+          // Set allowedHosts here to restrict a mount.
+          publicConfig: { account: "open web", maxBytes: 48_000 },
+          secretRef: null, policy: null,
+        });
+      }
       if (!existing) {
         // provision creates plain mounts; `ops` is added separately because it
         // carries a policy, and creating it twice is a primary-key conflict.
@@ -710,6 +769,14 @@ export class AgentDO extends DurableObject<Env> {
     const events = (await rt.store.taskEvents(tenantId, taskId)).map((e) => ({
       sequence: e.sequence, kind: e.kind, payload: e.payload, createdAt: e.createdAt,
     }));
+    const task = await rt.store.loadTask(tenantId, taskId);
+    const pendingApproval = (await rt.store.listApprovals(tenantId, "pending"))
+      .some((a) => a.taskId === taskId);
+    const busy: "thinking" | "waiting-for-approval" | null = pendingApproval
+      ? "waiting-for-approval"
+      : task && !["completed", "failed"].includes(task.status)
+        ? "thinking"
+        : null;
     // Approvals are keyed by operation so the trajectory can show a held call
     // where it happened, with who signed it, instead of in a separate panel.
     const byOp: Record<string, any> = {};
@@ -718,7 +785,7 @@ export class AgentDO extends DurableObject<Env> {
         byOp[a.operationId] = { state: a.state, approver: a.approver, tool: `${a.mountAlias}.${a.tool}`, request: a.request };
       }
     }
-    return { events, byOp };
+    return { events, byOp, busy };
   }
 
   async uiApprovals(tenantId: string, taskId: string) {
@@ -1201,6 +1268,16 @@ export default {
         // Confirms what Access actually injects, rather than trusting the
         // header name. Also demonstrates that a client-supplied identity does
         // not survive: Cloudflare strips cf-access-* from inbound requests.
+        case "/admin/diagnose": {
+          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId"));
+          const k = url.searchParams.get("taskId") ?? `t_${a}`;
+          const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          return Response.json(await s2.diagnose(t, a, k));
+        }
         case "/ui/whoami":
           return Response.json({
             viewer: viewer(request),
@@ -1227,7 +1304,7 @@ export default {
           const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
           const taskId = String(url.searchParams.get("taskId"));
           const t = await stub.uiTranscript("demo", agentId, taskId);
-          return html(trajectory(t.events, t.byOp));
+          return html(trajectory(t.events, t.byOp, t.busy));
         }
         case "/ui/approvals": {
           const taskId = String(url.searchParams.get("taskId"));
@@ -1243,7 +1320,7 @@ export default {
           const text = String(form.get("text") ?? "").trim();
           if (text) await stub.uiSay("demo", agentId, taskId, text);
           const t = await stub.uiTranscript("demo", agentId, taskId);
-          return html(trajectory(t.events, t.byOp));
+          return html(trajectory(t.events, t.byOp, t.busy));
         }
         case "/ui/decide": {
           const form = await request.formData();

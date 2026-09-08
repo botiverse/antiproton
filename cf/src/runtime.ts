@@ -22,6 +22,7 @@ import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
+import { httpPlugin } from "../../src/plugins/http.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
@@ -118,6 +119,7 @@ export class AgentRuntime {
     plugins.push(
       githubPlugin,
       demoPlugin,
+      httpPlugin,
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),

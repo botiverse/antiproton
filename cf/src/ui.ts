@@ -35,6 +35,9 @@ text-transform:none;letter-spacing:0;color:var(--dim)}
 color:var(--ink);text-transform:none;letter-spacing:0}
 .calls{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
 details summary{cursor:pointer;color:var(--dim);font-size:12px;margin-top:5px}
+.live .lbl{color:var(--accent)}
+.dots::after{content:"";animation:d 1.4s steps(4,end) infinite}
+@keyframes d{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
 details[open] summary{color:var(--ink)}
 
 :root{--bg:#0f1115;--panel:#161a21;--line:#252b36;--ink:#d8dee9;--dim:#8b95a6;
@@ -93,7 +96,10 @@ export function page(taskId: string, who: string): string {
     <h2>trajectory</h2>
     <div class="body" id="transcript"
          hx-get="/ui/transcript?taskId=${esc(taskId)}"
-         hx-trigger="load, every 2s" hx-swap="innerHTML">loading…</div>
+         hx-trigger="load, every 2s" hx-swap="innerHTML"
+         hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
+         onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
+         >loading…</div>
     <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML"
           hx-on::after-request="this.reset()">
       <input type="hidden" name="taskId" value="${esc(taskId)}">
@@ -142,6 +148,9 @@ const secs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}
 export function trajectory(
   events: Array<{ sequence: number; kind: string; payload: any; createdAt: number }>,
   approvalsByOp: Record<string, { state: string; approver: string | null; tool: string; request: any }>,
+  /** Still working, or waiting on a person. A silent page and a dead page look
+   *  the same from the outside, and a turn here can take minutes. */
+  busy: "thinking" | "waiting-for-approval" | null = null,
 ): string {
   const steps: Step[] = events
     .filter((e) => ["message", "model.response", "model.failed", "tool.result", "js.result", "operation.completed"].includes(e.kind))
@@ -218,6 +227,16 @@ export function trajectory(
         <pre>${esc(pretty(a.request?.args ?? {}, 800))}</pre>
       </div>`);
     }
+  }
+  if (busy) {
+    const since = steps.length ? Date.now() - steps[steps.length - 1]!.at : 0;
+    out.push(
+      busy === "waiting-for-approval"
+        ? `<div class="step held live"><div class="lbl">waiting for you to decide
+             <span class="t">${esc(secs(since))}</span></div></div>`
+        : `<div class="step agent live"><div class="lbl">working<span class="dots"></span>
+             <span class="t">${esc(secs(since))}</span></div></div>`,
+    );
   }
   return out.join("");
 }
