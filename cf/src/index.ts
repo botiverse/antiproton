@@ -20,7 +20,7 @@ import { AgentRuntime, type ModelJob } from "./runtime.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
-import { page, transcript, approvals } from "./ui.ts";
+import { page, trajectory, approvals } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -707,9 +707,18 @@ export class AgentDO extends DurableObject<Env> {
   async uiTranscript(tenantId: string, agentId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
-    return (await rt.store.taskEvents(tenantId, taskId)).map((e) => ({
-      sequence: e.sequence, kind: e.kind, payload: e.payload,
+    const events = (await rt.store.taskEvents(tenantId, taskId)).map((e) => ({
+      sequence: e.sequence, kind: e.kind, payload: e.payload, createdAt: e.createdAt,
     }));
+    // Approvals are keyed by operation so the trajectory can show a held call
+    // where it happened, with who signed it, instead of in a separate panel.
+    const byOp: Record<string, any> = {};
+    for (const a of await rt.store.listApprovals(tenantId)) {
+      if (a.taskId === taskId) {
+        byOp[a.operationId] = { state: a.state, approver: a.approver, tool: `${a.mountAlias}.${a.tool}`, request: a.request };
+      }
+    }
+    return { events, byOp };
   }
 
   async uiApprovals(tenantId: string, taskId: string) {
@@ -1217,7 +1226,8 @@ export default {
           const who = gate.who;
           const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
           const taskId = String(url.searchParams.get("taskId"));
-          return html(transcript(await stub.uiTranscript("demo", agentId, taskId)));
+          const t = await stub.uiTranscript("demo", agentId, taskId);
+          return html(trajectory(t.events, t.byOp));
         }
         case "/ui/approvals": {
           const taskId = String(url.searchParams.get("taskId"));
@@ -1232,7 +1242,8 @@ export default {
           const taskId = String(form.get("taskId"));
           const text = String(form.get("text") ?? "").trim();
           if (text) await stub.uiSay("demo", agentId, taskId, text);
-          return html(transcript(await stub.uiTranscript("demo", agentId, taskId)));
+          const t = await stub.uiTranscript("demo", agentId, taskId);
+          return html(trajectory(t.events, t.byOp));
         }
         case "/ui/decide": {
           const form = await request.formData();
