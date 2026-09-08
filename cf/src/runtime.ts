@@ -178,7 +178,10 @@ export class AgentRuntime {
     });
     this.#harness = deps.harnessMode === "hybrid"
       ? new HybridHarness({ maxTurns: deps.maxTurns ?? 40 })
-      : new CodegenHarness({ maxTurns: deps.maxTurns ?? 10 });
+      // 60, the number the tau2 runner uses, not 10. The budget bounds a single
+      // request now that a new message refills it, so a low cap bought nothing
+      // and cost the agent the ability to finish anything multi-step.
+      : new CodegenHarness({ maxTurns: deps.maxTurns ?? 60 });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -352,7 +355,18 @@ export class AgentRuntime {
     await this.ready();
     // Order matters: give up on the hopeless first, so a permanently broken
     // command cannot be re-sent on every alarm for the object's lifetime.
-    await this.store.abandonStale(giveUpAfterMs, OFFLOADABLE);
+    // Turn each abandonment into a failure the harness can see. It already has
+    // a bounded retry for `model.failed`, so the task recovers or gives a real
+    // answer; before this it simply stopped, still reading "working".
+    for (const c of await this.store.abandonStale(giveUpAfterMs, OFFLOADABLE)) {
+      await appendModelFailure(
+        this.store,
+        { tenantId: c.tenantId, agentId: c.agentId, taskId: c.taskId },
+        c.commandId,
+        `no reply after ${Math.round(giveUpAfterMs / 1000)}s; the request was abandoned`,
+      );
+      await this.store.reopenTask(c.tenantId, c.taskId);
+    }
     await this.store.reclaimStuckClaims(olderThanMs);
     const stale = await this.store.staleDispatched(olderThanMs, 5, OFFLOADABLE);
     for (const c of stale) {

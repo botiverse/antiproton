@@ -650,10 +650,36 @@ export class DurableObjectStore implements StorageAdapter {
    */
   async reopenTask(tenantId: string, taskId: string): Promise<boolean> {
     const r = this.#all("SELECT status FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId)[0] as any;
-    if (!r || !["completed", "blocked"].includes(r.status)) return false;
-    this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
-      this.#now(), tenantId, taskId);
-    return true;
+    if (!r) return false;
+    if (["completed", "blocked"].includes(r.status)) {
+      this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
+        this.#now(), tenantId, taskId);
+      return true;
+    }
+    // `waiting` means "something outstanding will wake this". When nothing is
+    // outstanding that is not a wait, it is a strand: the reply that was going
+    // to arrive never will, and no message could rescue the task because this
+    // method used to refuse the status outright. Reopen only when the task is
+    // genuinely orphaned, so a real approval gate is never bypassed by typing.
+    if (r.status === "waiting" && !this.#outstanding(tenantId, taskId)) {
+      this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
+        this.#now(), tenantId, taskId);
+      return true;
+    }
+    return false;
+  }
+
+  /** Anything that could still wake a waiting task: a command not yet answered,
+   *  or a decision not yet made. */
+  #outstanding(tenantId: string, taskId: string): boolean {
+    const cmds = this.#all(
+      `SELECT 1 FROM outbox WHERE tenant_id=? AND task_id=?
+         AND state IN ('pending','claimed','dispatched') LIMIT 1`, tenantId, taskId);
+    if (cmds.length) return true;
+    const appr = this.#all(
+      "SELECT 1 FROM approvals WHERE tenant_id=? AND task_id=? AND state='pending' LIMIT 1",
+      tenantId, taskId);
+    return appr.length > 0;
   }
 
   /**
@@ -662,20 +688,29 @@ export class DurableObjectStore implements StorageAdapter {
    * eventually be given up on, or "is anything in flight?" never goes false and
    * the object re-arms its alarm indefinitely.
    */
-  async abandonStale(olderThanMs: number, kinds: string[] = ["model.request"]): Promise<number> {
+  async abandonStale(
+    olderThanMs: number,
+    kinds: string[] = ["model.request"],
+  ): Promise<Array<{ tenantId: string; agentId: string; taskId: string; commandId: string }>> {
     const marks = kinds.map(() => "?").join(",");
     const doomed = this.#all(
-      `SELECT command_id FROM outbox
-        WHERE state='dispatched' AND kind IN (${marks}) AND dispatched_at < ?
+      `SELECT o.command_id, o.tenant_id, o.task_id, t.agent_id FROM outbox o
+         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
+        WHERE o.state='dispatched' AND o.kind IN (${marks}) AND o.dispatched_at < ?
           AND NOT EXISTS (SELECT 1 FROM events e
-                           WHERE e.tenant_id = outbox.tenant_id
-                             AND e.dedup_key = 'cmd:' || outbox.command_id || ':response')`,
+                           WHERE e.tenant_id = o.tenant_id
+                             AND e.dedup_key = 'cmd:' || o.command_id || ':response')`,
       ...kinds, this.#now() - olderThanMs,
     );
     for (const r of doomed) {
       this.#sql.exec("UPDATE outbox SET state='abandoned' WHERE command_id=?", (r as any).command_id);
     }
-    return doomed.length;
+    // The caller turns each of these into a failure event. Giving up quietly is
+    // what stranded a task for two hours: the alarm stopped, the status stayed
+    // `waiting`, and nothing was left that could ever wake it.
+    return doomed.map((r: any) => ({
+      tenantId: r.tenant_id, agentId: r.agent_id, taskId: r.task_id, commandId: r.command_id,
+    }));
   }
 
   /** A claim whose dispatch threw is invisible to claimOutbox; hand it back. */

@@ -285,6 +285,13 @@ export class HybridHarness implements HarnessAdapter {
       switch (e.kind) {
         case "message":
           msgs.push({ role: "user", content: String(p.text) });
+          // A new request from the person gets a fresh execution budget. The
+          // budget bounds one request, not the conversation: without this a
+          // chat task that has spent its turns can never act again, and every
+          // later message is answered "you are out of execution turns" — which
+          // is what left a real session unable to do anything but apologise.
+          state.turns = 0;
+          state.finalizing = false;
           break;
         case "model.response": {
           state.turns++;

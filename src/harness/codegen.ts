@@ -71,6 +71,20 @@ const fence = /```(?:js|javascript)\s*\n([\s\S]*?)```/;
 const plain = (msgs: TaggedMessage[]): ModelMessage[] =>
   msgs.map(({ role, content }) => ({ role, content }));
 
+/**
+ * What to show when the turn budget ran out mid-answer. The model was asked for
+ * prose and sometimes returns more code; `replace(fence, "")` removed only the
+ * first block because the pattern is not global, so a two-block reply reached
+ * the page as a wall of code with no sentence in it.
+ */
+export function finalText(text: string): string {
+  const stripped = text
+    .replace(/```(?:js|javascript)\s*\n[\s\S]*?```/g, "")
+    .replace(/<\/?(?:pre|code)>/g, "")
+    .trim();
+  return stripped || "I ran out of execution turns before I could answer. Ask again and I will start fresh.";
+}
+
 export function extractCode(text: string): string | null {
   const m = fence.exec(text);
   return m ? m[1]!.trim() : null;
@@ -184,6 +198,13 @@ export class CodegenHarness implements HarnessAdapter {
       switch (e.kind) {
         case "message":
           messages.push({ role: "user", tag: "customer", content: String(p.text) });
+          // A new request from the person gets a fresh execution budget. The
+          // budget bounds one request, not the conversation: without this a
+          // chat task that has spent its turns can never act again, and every
+          // later message is answered "you are out of execution turns" — which
+          // is what left a real session unable to do anything but apologise.
+          state.turns = 0;
+          state.finalizing = false;
           break;
         case "model.failed":
           state.modelFailures = (state.modelFailures ?? 0) + 1;
@@ -227,7 +248,7 @@ export class CodegenHarness implements HarnessAdapter {
         return {
           state: { ...state, done: true },
           status: "completed",
-          commands: [{ kind: "message.out", payload: { text: sawModelReply.replace(fence, "").trim() } }],
+          commands: [{ kind: "message.out", payload: { text: finalText(sawModelReply) } }],
           waits: [],
         };
       }
