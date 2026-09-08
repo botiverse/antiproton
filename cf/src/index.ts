@@ -306,6 +306,28 @@ export class AgentDO extends DurableObject<Env> {
     this.#identity = { tenantId, agentId };
   }
 
+  /**
+   * Drop everything held only in memory, as an eviction does.
+   *
+   * A Durable Object is rebuilt freely, so an instance field is a cache and
+   * never a decision. That rule has already been broken once: the offload flag
+   * lived only in memory, silently reverted to its default after an eviction,
+   * and turned the control arm of an A/B into a half-offloaded run that looked
+   * completely plausible. Exercised by /eviction so the rule is checked rather
+   * than remembered.
+   */
+  async simulateEviction() {
+    this.#store = null;
+    this.#runtime = null;
+    this.#identity = null;
+    this.#bench = null;
+    this.#benchRuntime = null;
+    this.#benchPolicy = "";
+    this.#benchOffload = true;
+    this.#offloadDefault = true;
+    return { evicted: true };
+  }
+
   /** Which tenants have rows in THIS object's database. Structural isolation
    *  means this can only ever be the one tenant the object belongs to. */
   async listTenants(): Promise<string[]> {
@@ -415,6 +437,11 @@ export class AgentDO extends DurableObject<Env> {
       }),
     );
     if (res.status !== 202) throw new Error(`dispatcher refused: ${res.status}`);
+  }
+
+  /** Exposed so the eviction check can read the persisted decision. */
+  async readOffload(): Promise<boolean> {
+    return this.#offloadOn();
   }
 
   #offloadOn(): boolean {
@@ -952,6 +979,28 @@ export default {
         case "/agent/activity":
           return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
         case "/agent/activity/reset": return Response.json(await stub.resetActivity());
+        case "/eviction": {
+          // Configuration set before an eviction must still be in force after
+          // it, without the caller restating anything.
+          const stub2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName("tenant-evict", "agent-1")));
+          const out: Record<string, unknown> = {};
+          await stub2.startTask("tenant-evict", "agent-1", `ev_${Date.now()}`, "hello");
+          await stub2.setOffload(false);
+          out.before = { offload: (await stub2.setOffload(false)).offload, owner: await stub2.owner() };
+
+          await stub2.simulateEviction();
+
+          out.after = { offload: (await stub2.readOffload()), owner: await stub2.owner() };
+          out.offloadSurvived = (out.after as any).offload === false;
+          out.ownerSurvived =
+            JSON.stringify((out.before as any).owner) === JSON.stringify((out.after as any).owner);
+          // And the object still refuses a foreign identity after being rebuilt.
+          try {
+            await stub2.startTask("tenant-other", "agent-1", "ev_x", "wrong tenant");
+            out.guardSurvived = false;
+          } catch { out.guardSurvived = true; }
+          return Response.json(out);
+        }
         case "/isolation": {
           // Proves the property rather than asserting it: two tenants, two
           // objects, and an object that refuses an identity that is not its own.
