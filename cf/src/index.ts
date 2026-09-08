@@ -986,6 +986,12 @@ function viewer(request: Request): string | null {
 function requireViewer(request: Request, env: Env): { who: string } | Response {
   const who = viewer(request);
   if (who) return { who };
+  // A named automation identity, so the page stays testable after it has been
+  // closed to anonymous traffic. It is still an identity: it signs approvals
+  // under its own name, and it is not something a visitor can present.
+  if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") === env.AUTOMATION_TOKEN) {
+    return { who: "automation" };
+  }
   if (env.UI_ALLOW_ANONYMOUS === "1") return { who: "anonymous (UNPROTECTED)" };
   return new Response(
     `<!doctype html><meta charset="utf-8"><title>agent-harness</title>` +
