@@ -1,0 +1,5 @@
+# Derived from AppWorld's protected data, which may only be redistributed in
+# encrypted form. Rebuild locally with dump_catalogue.py against your own
+# licensed install.
+catalogue.json
+tasks-*.json
