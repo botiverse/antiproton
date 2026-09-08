@@ -10,6 +10,9 @@
     "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
+  // Self, via a named entrypoint: reachable from this Worker's own code but not
+  // routable over HTTP, so offloaded model jobs need no shared secret.
+  "services": [{ "binding": "DISPATCH", "service": "agent-harness-p0", "entrypoint": "ModelDispatcher" }],
   "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "harness-p0-artifacts" }],
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",

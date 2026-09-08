@@ -9,8 +9,14 @@
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { Kernel } from "../../src/runtime/kernel.ts";
-import { CommandExecutor } from "../../src/runtime/commands.ts";
+import {
+  CommandExecutor,
+  appendModelFailure,
+  appendModelResponse,
+  type CommandOffload,
+} from "../../src/runtime/commands.ts";
 import { CodegenHarness } from "../../src/harness/codegen.ts";
+import { HybridHarness, qualifyMountedTools } from "../../src/harness/hybrid.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
@@ -18,6 +24,23 @@ import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
+import type { Json } from "../../src/core/types.ts";
+import type { ModelResponse } from "../../src/model/types.ts";
+
+/** A model call handed to a Worker. Carries the command id, because the reply
+ *  has to land under the same dedup key the inline path would have used. */
+/** Commands cheap enough to send elsewhere: pure request/response, no bridge
+ *  back into this object. `js.execute` needs the sandbox host, `tool.call` is
+ *  short, and neither answers under the `:response` dedup key. */
+const OFFLOADABLE = ["model.request"];
+
+export interface ModelJob {
+  tenantId: string;
+  agentId: string;
+  taskId: string;
+  commandId: string;
+  payload: Json;
+}
 
 const OFFLOAD_BYTES = 32 * 1024;
 
@@ -50,6 +73,20 @@ export interface RuntimeDeps {
   modelBaseUrl: string;
   modelApiKey: string;
   modelName: string;
+  /**
+   * Durable Objects bill wall clock, Workers bill CPU — and a model call is
+   * ~94% waiting. Handing `model.request` to a Worker lets the object go idle
+   * for the whole completion instead of being billed for it. Omitted = inline.
+   */
+  offloadModel?: (job: ModelJob) => Promise<void>;
+  /** Domain plugins beyond the built-ins (the benchmark mounts `retail` here). */
+  extraPlugins?: Plugin[];
+  maxTurns?: number;
+  /** §18.2.1 measured hybrid best (8/8 vs 7/8 vs 5/8); codegen stays selectable
+   *  so the mode remains an ablation variable rather than a hard-coded choice. */
+  harnessMode?: "codegen" | "hybrid";
+  /** Domain policy handed to the harness at task initialisation. */
+  policy?: string;
 }
 
 export class AgentRuntime {
@@ -57,7 +94,7 @@ export class AgentRuntime {
   #deps: RuntimeDeps;
   #plugins: Plugin[];
   #gateway: ToolGateway;
-  #harness: CodegenHarness;
+  #harness: CodegenHarness | HybridHarness;
   #executor: DynamicWorkerExecutor;
   #model: OpenAiCompatibleModel;
   #artifacts: BoundArtifacts;
@@ -71,11 +108,14 @@ export class AgentRuntime {
     plugins.push(
       githubPlugin,
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
+      ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),
     );
     this.#plugins = plugins;
     this.#gateway = new ToolGateway(this.store, plugins);
-    this.#harness = new CodegenHarness({ maxTurns: 10 });
+    this.#harness = deps.harnessMode === "hybrid"
+      ? new HybridHarness({ maxTurns: deps.maxTurns ?? 40 })
+      : new CodegenHarness({ maxTurns: deps.maxTurns ?? 10 });
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -122,7 +162,17 @@ export class AgentRuntime {
     };
   }
 
-  async provision(tenantId: string, agentId: string) {
+  static readonly DEFAULT_MOUNTS = [
+    { alias: "tools", plugin: "tools", account: "builtin" },
+    { alias: "artifacts", plugin: "artifacts", account: "builtin" },
+    { alias: "gh_public", plugin: "github", account: "unauthenticated" },
+  ];
+
+  async provision(
+    tenantId: string,
+    agentId: string,
+    mounts: Array<{ alias: string; plugin: string; account: string }> = AgentRuntime.DEFAULT_MOUNTS,
+  ) {
     await this.ready();
     if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false };
     try {
@@ -130,11 +180,7 @@ export class AgentRuntime {
     } catch {
       return { agentId, created: false };
     }
-    for (const m of [
-      { alias: "tools", plugin: "tools", account: "builtin" },
-      { alias: "artifacts", plugin: "artifacts", account: "builtin" },
-      { alias: "gh_public", plugin: "github", account: "unauthenticated" },
-    ]) {
+    for (const m of mounts) {
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: `inst-${m.alias}`, connectionId: null, toolVersion: "1.0.0",
@@ -145,19 +191,95 @@ export class AgentRuntime {
   }
 
   async openTask(tenantId: string, agentId: string, taskId: string) {
-    const mounts = (await this.store.listMounts(tenantId, agentId)).map((m) => ({
+    const records = await this.store.listMounts(tenantId, agentId);
+    const mounts = records.map((m) => ({
       alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
     }));
-    await this.store.createTask(tenantId, agentId, taskId, await this.#harness.initialize({ mounts }));
+    // The model sees a plain name; the harness keeps the mount-qualified address
+    // it dispatches to, because providers restrict tool-name charsets.
+    const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
+    const tools = qualifyMountedTools(records.flatMap((m) =>
+      (byId.get(m.plugin)?.tools ?? []).map((t) => ({
+        name: t.name, description: t.summary, parameters: t.parameters,
+        address: `${m.alias}.${t.name}`,
+      })),
+    ));
+    const policy = this.#deps.policy ? { policy: this.#deps.policy } : {};
+    await this.store.createTask(
+      tenantId, agentId, taskId,
+      await this.#harness.initialize({ mounts, tools, ...policy }),
+    );
   }
 
   async postMessage(tenantId: string, agentId: string, taskId: string, text: string) {
     await this.ready();
-    if (!(await this.store.loadTask(tenantId, taskId))) await this.openTask(tenantId, agentId, taskId);
+    const existing = await this.store.loadTask(tenantId, taskId);
+    if (!existing) await this.openTask(tenantId, agentId, taskId);
     const ev = await this.store.appendEvent({
       tenantId, agentId, taskId, kind: "message", payload: { text },
     });
-    return { taskId, sequence: ev.sequence };
+    // Order matters: append first, then reopen. The reverse briefly exposes a
+    // runnable task with nothing to consume.
+    const reopened = await this.store.reopenTask(tenantId, taskId);
+    return {
+      taskId, sequence: ev.sequence, reopened,
+      checkpointVersion: existing?.checkpointVersion ?? 0,
+    };
+  }
+
+  #offload(): CommandOffload | null {
+    const send = this.#deps.offloadModel;
+    if (!send) return null;
+    return async (ctx, cmd) => {
+      // Only network-bound commands are worth offloading. `js.execute` needs the
+      // host bridge that lives in this object, and `tool.call` is short.
+      if (!OFFLOADABLE.includes(cmd.kind)) return false;
+      try {
+        await send({ ...ctx, commandId: cmd.commandId, payload: cmd.payload });
+        return true;
+      } catch {
+        // A dispatcher that will not accept the job is not a reason to strand
+        // the task: fall back to running it here.
+        return false;
+      }
+    };
+  }
+
+  /** Called back by the dispatcher once the model answered (or failed). */
+  async deliverModel(job: ModelJob, outcome: { ok: true; res: ModelResponse } | { ok: false; error: string }) {
+    await this.ready();
+    const ctx = { tenantId: job.tenantId, agentId: job.agentId, taskId: job.taskId };
+    if (outcome.ok) await appendModelResponse(this.store, ctx, job.commandId, outcome.res);
+    else await appendModelFailure(this.store, ctx, job.commandId, outcome.error);
+  }
+
+  /**
+   * Re-hands commands whose dispatcher never reported back. Safe to run on every
+   * alarm: the result event's dedup key collapses a duplicate reply.
+   */
+  async sweepStale(olderThanMs = 45_000, giveUpAfterMs = 900_000): Promise<number> {
+    if (!this.#deps.offloadModel) return 0;
+    await this.ready();
+    // Order matters: give up on the hopeless first, so a permanently broken
+    // command cannot be re-sent on every alarm for the object's lifetime.
+    await this.store.abandonStale(giveUpAfterMs, OFFLOADABLE);
+    await this.store.reclaimStuckClaims(olderThanMs);
+    const stale = await this.store.staleDispatched(olderThanMs, 5, OFFLOADABLE);
+    for (const c of stale) {
+      await this.#deps.offloadModel({
+        tenantId: c.tenantId, agentId: c.agentId, taskId: c.taskId,
+        commandId: c.commandId, payload: c.payload,
+      });
+    }
+    return stale.length;
+  }
+
+  /** True while some command is out with a dispatcher. Such a task has no
+   *  pending events, so nothing else would schedule the sweep. */
+  async hasOffloadInFlight(): Promise<boolean> {
+    if (!this.#deps.offloadModel) return false;
+    await this.ready();
+    return (await this.store.staleDispatched(0, 1, OFFLOADABLE)).length > 0;
   }
 
   /**
@@ -177,6 +299,7 @@ export class AgentRuntime {
         const callCtx = { tenantId, agentId: task.agentId, taskId };
         const commands = new CommandExecutor(
           this.store, this.#model, this.#host(callCtx), this.#executor,
+          undefined, this.#offload(),
         );
         const kernel = new Kernel(this.store, this.#harness, {
           holder: "do-worker", leaseTtlMs: 120_000,

@@ -16,7 +16,10 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { kernelSpec } from "../../test/spec/kernel-spec.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
-import { AgentRuntime } from "./runtime.ts";
+import { AgentRuntime, type ModelJob } from "./runtime.ts";
+import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
+import { runModelCommand } from "../../src/runtime/commands.ts";
+import { BenchState } from "./bench.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -29,6 +32,9 @@ export interface Env {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
   };
+  /** Self, via a named entrypoint. Named entrypoints are not routable over
+   *  HTTP, so this needs no shared secret to keep the public internet out. */
+  DISPATCH: { fetch(request: Request): Promise<Response> };
 }
 type WorkerCode = {
   compatibilityDate: string;
@@ -65,6 +71,84 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
     const stub = this.env.AGENT.get(this.env.AGENT.idFromString(String(props.doId)));
     return stub.sandboxCall(String(props.execId ?? ""), strings, values);
   }
+}
+
+/**
+ * Runs `model.request` outside the Durable Object.
+ *
+ * The point is purely economic: a Durable Object is billed for wall-clock
+ * duration while it is active, and a model completion is ~94% waiting. A Worker
+ * is billed for CPU, and awaiting I/O costs no CPU. Same call, same result
+ * event — it just stops the object from being billed for the wait.
+ *
+ * Returning before the model answers is the whole trick, so the work is handed
+ * to waitUntil. If this runtime ever stops honouring waitUntil past the return,
+ * the fallback is to await inline: slower and no cheaper, but never a lost task.
+ */
+export class ModelDispatcher extends WorkerEntrypoint<Env> {
+  /**
+   * Entered over a service binding as a *fetch*, not an RPC method.
+   *
+   * Measured, not assumed: with an RPC method the reply took a mean of 59.3s
+   * against a ~6s provider call — `ctx.waitUntil` did not keep the work moving
+   * once the RPC session closed, so the completion only progressed when some
+   * later event happened to wake the Worker. A fetch handler's waitUntil does
+   * outlive its response, which is the whole mechanism this depends on.
+   *
+   * Named entrypoints are not routable over HTTP, so this still needs no shared
+   * secret to keep the public internet out.
+   */
+  async fetch(request: Request): Promise<Response> {
+    const { job, doId } = (await request.json()) as { job: ModelJob; doId: string };
+    this.ctx.waitUntil(this.#run(job, doId));
+    return new Response(null, { status: 202 });
+  }
+
+  async #run(job: ModelJob, doId: string) {
+    const stub = this.env.AGENT.get(this.env.AGENT.idFromString(doId));
+    try {
+      // Defence in depth: a job that is not a model request must never reach a
+      // provider. It would fail confusingly and write a model.failed event
+      // under another command's key.
+      if (!Array.isArray((job.payload as any)?.messages)) {
+        throw new Error(`not a model request: ${JSON.stringify(job.payload).slice(0, 80)}`);
+      }
+      const model = new OpenAiCompatibleModel({
+        baseUrl: this.env.DEEPSEEK_BASE_URL,
+        apiKey: this.env.DEEPSEEK_API_KEY,
+        model: this.env.HARNESS_MODEL,
+      });
+      const t0 = Date.now();
+      const res = await runModelCommand(model, job.payload);
+      const modelMs = Date.now() - t0;
+      await stub.deliverModel(job, { ok: true, res, modelMs });
+    } catch (e: any) {
+      // A model call that produced nothing still has to wake the task, or the
+      // agent parks forever waiting for a reply that will never come.
+      await stub.deliverModel(job, { ok: false, error: String(e?.message ?? e) });
+    }
+  }
+}
+
+/**
+ * One Durable Object per (tenant, agent).
+ *
+ * §12.1 rule 1 asks for isolation that is structural rather than a predicate.
+ * Sharing one object put every tenant's rows in one SQLite database, so the
+ * only thing standing between two customers was a WHERE clause being correct
+ * everywhere, forever. Addressing by identity means the other tenant's data is
+ * not in the database being queried at all.
+ *
+ * The separator is not a legal character in either id (both are validated on
+ * the way in), so no two distinct pairs can collide on one name.
+ */
+export function agentObjectName(tenantId: string, agentId: string): string {
+  for (const [label, v] of [["tenant", tenantId], ["agent", agentId]] as const) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v)) {
+      throw new Error(`invalid ${label} id: ${JSON.stringify(v).slice(0, 60)}`);
+    }
+  }
+  return `a/${tenantId}/${agentId}`;
 }
 
 const RUNNER = (body: string) => `
@@ -111,6 +195,17 @@ export class AgentDO extends DurableObject<Env> {
   #runtime: AgentRuntime | null = null;
   alarmFiredAt: number | null = null;
   alarmSetAt: number | null = null;
+  /** One variable, flipped at runtime, so the A/B is the same code path. */
+  // NOT instance state. A Durable Object is evicted and rebuilt freely, and an
+  // in-memory flag silently reverts to its default when that happens — which is
+  // how the control arm of an A/B ended up half-offloaded. Persisted in SQLite,
+  // read on every use.
+  #offloadDefault = true;
+  #identity: { tenantId: string; agentId: string } | null = null;
+  #bench: BenchState | null = null;
+  #benchRuntime: AgentRuntime | null = null;
+  #benchPolicy = "";
+  #benchOffload = true;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -118,6 +213,11 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_tasks(
       task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, generation INTEGER NOT NULL,
       checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
+    // What Cloudflare bills this object for: wall clock while it is active.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
+    // The bench runtime has to survive eviction: an alarm on a fresh instance
+    // must rebuild the same harness, not fall back to the default one.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS bench_config(k TEXT PRIMARY KEY, v TEXT)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS probe_outbox(
       command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL)`);
   }
@@ -179,20 +279,351 @@ export class AgentDO extends DurableObject<Env> {
       modelBaseUrl: this.env.DEEPSEEK_BASE_URL,
       modelApiKey: this.env.DEEPSEEK_API_KEY,
       modelName: this.env.HARNESS_MODEL,
+      offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#runtime;
   }
 
+  /**
+   * Addressing alone is a convention; this makes it an invariant. The object
+   * records whose it is on first use and refuses anyone else afterwards, so a
+   * routing mistake fails loudly instead of quietly mixing two tenants' data
+   * into one database.
+   */
+  #claim(tenantId: string, agentId: string) {
+    this.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
+    const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+    if (!row) {
+      this.sql.exec("INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self',?,?)", tenantId, agentId);
+      this.#identity = { tenantId, agentId };
+      return;
+    }
+    if (row.tenant_id !== tenantId || row.agent_id !== agentId) {
+      throw new Error(
+        `object belongs to ${row.tenant_id}/${row.agent_id}, refusing ${tenantId}/${agentId}`,
+      );
+    }
+    this.#identity = { tenantId, agentId };
+  }
+
+  /** Which tenants have rows in THIS object's database. Structural isolation
+   *  means this can only ever be the one tenant the object belongs to. */
+  async listTenants(): Promise<string[]> {
+    try {
+      return (this.sql.exec("SELECT DISTINCT tenant_id FROM tasks").toArray() as any[])
+        .map((r) => String(r.tenant_id)).sort();
+    } catch { return []; }
+  }
+
+  /** Who this object serves, once claimed. */
+  async owner() {
+    const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+    return row ? { tenantId: row.tenant_id, agentId: row.agent_id } : null;
+  }
+
+  /** Wraps a billed entry point so we can measure what we are charged for. */
+  async #busy<T>(kind: string, fn: () => Promise<T>): Promise<T> {
+    const t0 = Date.now();
+    try {
+      return await fn();
+    } finally {
+      this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", t0, Date.now() - t0, kind);
+    }
+  }
+
+  /** Called by ModelDispatcher when the completion lands. */
+  async deliverModel(
+    job: ModelJob,
+    outcome: { ok: true; res: any; modelMs?: number } | { ok: false; error: string },
+  ) {
+    // How long the round trip out of this object actually took. If offloading
+    // buys cheap duration but costs seconds per call, that is the trade being
+    // made, and it should be visible rather than inferred from wall clock.
+    try {
+      const row = this.sql
+        .exec("SELECT dispatched_at FROM outbox WHERE command_id=?", job.commandId).toArray()[0] as any;
+      if (row?.dispatched_at) {
+        this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)",
+          Number(row.dispatched_at), Date.now() - Number(row.dispatched_at), "offload_rtt");
+        // Split the round trip: how much was the provider, how much was us.
+        const mms = (outcome as any).modelMs;
+        if (typeof mms === "number") {
+          this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", Number(row.dispatched_at), mms, "offload_provider");
+        }
+      }
+    } catch { /* measurement must never break delivery */ }
+    return this.#busy("deliverModel", async () => {
+      await this.#activeRuntime().deliverModel(job, outcome);
+      await this.broadcast();
+      await this.ctx.storage.setAlarm(Date.now());
+      return { ok: true };
+    });
+  }
+
+  /**
+   * Active wall clock this object has accumulated — the DO duration bill.
+   *
+   * Handlers overlap: a Durable Object is single-threaded but interleaves at
+   * await points, so an alarm that is waiting on the model does not stop the
+   * next alarm from starting. Summing handler durations therefore over-counts
+   * (an early run reported 262s of "active" inside a 241s window). Cloudflare
+   * bills the wall clock during which the object is active, so the honest
+   * measure is the UNION of the busy intervals, not their sum.
+   */
+  async activity(sinceMs = 0) {
+    const all = this.sql
+      .exec("SELECT at, ms, kind FROM do_activity WHERE at >= ? ORDER BY at ASC", sinceMs)
+      .toArray() as any[];
+    // offload_rtt measures time spent OUTSIDE this object; counting it as busy
+    // would report exactly the cost the change is meant to remove.
+    const rows = all.filter((r: any) => !String(r.kind).startsWith("offload_"));
+    let unionMs = 0, curStart = -1, curEnd = -1;
+    for (const r of rows) {
+      const a = Number(r.at), b = a + Number(r.ms);
+      if (curStart < 0) { curStart = a; curEnd = b; continue; }
+      if (a <= curEnd) curEnd = Math.max(curEnd, b);
+      else { unionMs += curEnd - curStart; curStart = a; curEnd = b; }
+    }
+    if (curStart >= 0) unionMs += curEnd - curStart;
+
+    const byKind = new Map<string, { n: number; ms: number }>();
+    for (const r of all) {
+      const e = byKind.get(r.kind) ?? { n: 0, ms: 0 };
+      e.n++; e.ms += Number(r.ms);
+      byKind.set(r.kind, e);
+    }
+    // Polling is an artefact of the benchmark driver, not of the design (the
+    // production path pushes over a hibernatable WebSocket), so it is reported
+    // separately rather than folded into the agent's own cost.
+    const pollMs = byKind.get("poll")?.ms ?? 0;
+    return {
+      activeMs: unionMs,
+      summedMs: rows.reduce((a, r) => a + Number(r.ms), 0),
+      pollMs,
+      invocations: rows.length,
+      spanMs: rows.length ? Number(rows.at(-1).at) + Number(rows.at(-1).ms) - Number(rows[0].at) : 0,
+      byKind: [...byKind].map(([kind, v]) => ({ kind, n: v.n, ms: v.ms })),
+    };
+  }
+
+  async #dispatch(job: ModelJob): Promise<void> {
+    const res = await this.env.DISPATCH.fetch(
+      new Request("https://dispatch.internal/model", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ job, doId: this.ctx.id.toString() }),
+      }),
+    );
+    if (res.status !== 202) throw new Error(`dispatcher refused: ${res.status}`);
+  }
+
+  #offloadOn(): boolean {
+    const row = this.sql.exec("SELECT v FROM bench_config WHERE k='offload'").toArray()[0] as any;
+    return row ? row.v === "1" : this.#offloadDefault;
+  }
+
+  async setOffload(on: boolean) {
+    const before = this.#offloadOn();
+    this.sql.exec(
+      "INSERT INTO bench_config(k,v) VALUES ('offload',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+      on ? "1" : "0");
+    if (on !== before) {
+      this.#runtime = null; // rebuilt with the new wiring on next use
+      this.#benchRuntime = null;
+    }
+    return { offload: on };
+  }
+
+  // ---------------------------------------------------------------- benchmark
+  //
+  // τ²-bench retail, driven from outside but executed here, so a Cloudflare
+  // change is judged on the same tasks and the same scoring as every other
+  // harness ablation.
+
+  #benchState(): BenchState {
+    this.#bench ??= new BenchState(this.env.ARTIFACTS, this.sql);
+    return this.#bench;
+  }
+
+  /**
+   * The runtime an alarm should drive.
+   *
+   * This object serves either ordinary agent traffic or a benchmark run, never
+   * both (they are addressed as different Durable Objects). Getting this wrong
+   * is silent and expensive: the alarm drained with the default runtime, so
+   * bench tasks were advanced by the codegen harness with no domain plugin
+   * mounted, and every "hybrid" measurement was really measuring codegen.
+   */
+  #activeRuntime(): AgentRuntime {
+    const row = this.sql.exec("SELECT v FROM bench_config WHERE k='policy'").toArray()[0] as any;
+    return row ? this.#benchRt(String(row.v)) : this.runtime();
+  }
+
+  #benchRt(policy: string): AgentRuntime {
+    const off = this.#offloadOn();
+    if (this.#benchRuntime && this.#benchPolicy === policy && this.#benchOffload === off) {
+      return this.#benchRuntime;
+    }
+    this.#benchPolicy = policy;
+    this.#benchOffload = off;
+    this.#benchRuntime = new AgentRuntime({
+      ctx: this.ctx,
+      bucket: this.env.ARTIFACTS,
+      bucketName: this.env.ARTIFACT_BUCKET,
+      loader: this.env.LOADER,
+      makeToolBinding: (execId) =>
+        (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
+      modelBaseUrl: this.env.DEEPSEEK_BASE_URL,
+      modelApiKey: this.env.DEEPSEEK_API_KEY,
+      modelName: this.env.HARNESS_MODEL,
+      extraPlugins: [this.#benchState().plugin()],
+      // Matches bench/tau2/compare.ts's hybrid arm, so CF numbers sit alongside
+      // the Node ones instead of measuring a different harness.
+      harnessMode: "hybrid",
+      maxTurns: 40,
+      policy,
+      offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
+    });
+    return this.#benchRuntime;
+  }
+
+  async benchStart(taskId: string, policy: string, offload: boolean) {
+    await this.setOffload(offload);
+    return this.#busy("benchStart", async () => {
+      this.sql.exec(
+        "INSERT INTO bench_config(k,v) VALUES ('policy',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", policy);
+      const rt = this.#benchRt(policy);
+      const agentId = `b_${taskId}`;
+      await this.#benchState().reset(taskId);
+      // Only what the Node bench mounts: github/artifacts would change the tool
+      // catalogue and make the two runners incomparable.
+      await rt.provision("bench", agentId, [
+        { alias: "tools", plugin: "tools", account: "builtin" },
+        { alias: "retail", plugin: "retail", account: "benchmark" },
+      ]);
+      await rt.openTask("bench", agentId, taskId);
+      return { taskId, agentId, offload: this.#offloadOn() };
+    });
+  }
+
+  async benchSay(taskId: string, text: string) {
+    return this.#busy("benchSay", async () => {
+      const rt = this.#activeRuntime();
+      const r = await rt.postMessage("bench", `b_${taskId}`, taskId, text);
+      await this.ctx.storage.setAlarm(Date.now());
+      return r;
+    });
+  }
+
+  /** Read-only, but it still wakes the object, so it is still billed. */
+  async benchPoll(taskId: string) {
+    return this.#busy("poll", () => this.#benchPollInner(taskId));
+  }
+
+  async #benchPollInner(taskId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const task = await rt.store.loadTask("bench", taskId);
+    const done = task && ["completed", "failed", "blocked"].includes(task.status);
+    return {
+      status: task?.status ?? null,
+      checkpointVersion: task?.checkpointVersion ?? 0,
+      answer: done ? (task!.checkpoint as any).messages.at(-1).content : null,
+    };
+  }
+
+  /** What the harness actually handed the provider. Guessing at this cost two
+   *  bench runs; it is cheaper to be able to look. */
+  async benchDebug(taskId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const task = await rt.store.loadTask("bench", taskId);
+    const cp = (task?.checkpoint ?? {}) as any;
+    return {
+      status: task?.status ?? null,
+      harness: this.#benchPolicy ? "hybrid" : "hybrid",
+      toolCount: Array.isArray(cp.tools) ? cp.tools.length : null,
+      toolNames: Array.isArray(cp.tools) ? cp.tools.map((t: any) => t.name) : null,
+      addresses: cp.addresses ?? null,
+      systemHead: String(cp.messages?.[0]?.content ?? "").slice(0, 400),
+      lastMessages: (cp.messages ?? []).slice(-4).map((m: any) => ({
+        role: m.role, content: String(m.content ?? "").slice(0, 300),
+        toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls).slice(0, 200) : undefined,
+      })),
+    };
+  }
+
+  /** Why is this object busy? Answers the only question that matters when an
+   *  alarm loop will not settle: which tasks still claim to have work. */
+  async benchDiag() {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const pending = await rt.store.tasksWithPendingWork(20);
+    const rows: any[] = [];
+    for (const { tenantId, taskId } of pending) {
+      const t = await rt.store.loadTask(tenantId, taskId);
+      const evs = this.sql
+        .exec(`SELECT e.kind, e.sequence FROM events e WHERE e.tenant_id=? AND e.task_id=?
+               ORDER BY e.sequence DESC LIMIT 5`, tenantId, taskId).toArray();
+      const cur = this.sql
+        .exec("SELECT consumer, consumed_through FROM cursors WHERE tenant_id=? AND task_id=?", tenantId, taskId)
+        .toArray();
+      rows.push({ taskId, status: t?.status, generation: t?.generation,
+                  checkpointVersion: t?.checkpointVersion, cursors: cur,
+                  lastEvents: evs.map((e: any) => `${e.sequence}:${e.kind}`) });
+    }
+    const ob = this.sql.exec("SELECT kind, state, COUNT(*) n FROM outbox GROUP BY kind, state").toArray();
+    return { pendingCount: pending.length, pending: rows, outbox: ob,
+             alarm: await this.ctx.storage.getAlarm() };
+  }
+
+  /** Bench state is disposable; contaminated state is worse than none. */
+  async benchPurge() {
+    await this.ctx.storage.deleteAlarm();
+    for (const t of ["events", "cursors", "waits", "outbox", "operations", "leases", "tasks", "mounts", "agents"]) {
+      try { this.sql.exec(`DELETE FROM ${t} WHERE tenant_id='bench'`); } catch { /* table may lack the column */ }
+    }
+    try { this.sql.exec("DELETE FROM leases"); } catch { /* no tenant column */ }
+    this.sql.exec("DELETE FROM bench_tasks");
+    this.sql.exec("DELETE FROM do_activity");
+    this.#benchRuntime = null;
+    return { purged: true };
+  }
+
+  async benchResult(taskId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const events = await rt.store.eventsSince("bench", `b_${taskId}`, 0, 500);
+    const usage = events.reduce(
+      (a: any, e: any) => {
+        const u = e.payload?.usage;
+        if (u) { a.prompt += u.promptTokens ?? 0; a.completion += u.completionTokens ?? 0; a.calls += 1; }
+        return a;
+      }, { prompt: 0, completion: 0, calls: 0 });
+    const kinds = events.reduce((m: any, e: any) => ((m[e.kind] = (m[e.kind] ?? 0) + 1), m), {});
+    const r = await this.#benchState().result(taskId);
+    return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds };
+  }
+
+  async resetActivity() {
+    this.sql.exec("DELETE FROM do_activity");
+    return { ok: true };
+  }
+
   async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
-    const rt = this.runtime();
-    await rt.provision(tenantId, agentId);
-    const r = await rt.postMessage(tenantId, agentId, taskId, text);
-    // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
-    await this.ctx.storage.setAlarm(Date.now());
-    return r;
+    this.#claim(tenantId, agentId);
+    return this.#busy("startTask", async () => {
+      const rt = this.runtime();
+      await rt.provision(tenantId, agentId);
+      const r = await rt.postMessage(tenantId, agentId, taskId, text);
+      // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
+      await this.ctx.storage.setAlarm(Date.now());
+      return r;
+    });
   }
 
   async taskState(tenantId: string, agentId: string, taskId: string) {
+    this.#claim(tenantId, agentId);
     const rt = this.runtime();
     await rt.ready();
     const task = await rt.store.loadTask(tenantId, taskId);
@@ -290,16 +721,28 @@ export class AgentDO extends DurableObject<Env> {
     return { armedAt: this.alarmSetAt, delayMs };
   }
   async alarm() {
-    this.alarmFiredAt = Date.now();
-    this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-    this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
-    // The object may have been evicted since the alarm was armed, so this
-    // instance can be brand new: build the runtime rather than assuming it.
-    const { more } = await this.runtime().drain(3);
-    await this.broadcast();
-    // Bounded work per invocation; if there is more, come back rather than
-    // holding one alarm open until the platform ends it.
-    if (more) await this.ctx.storage.setAlarm(Date.now() + 50);
+    return this.#busy("alarm", async () => {
+      this.alarmFiredAt = Date.now();
+      this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
+      this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
+      // The object may have been evicted since the alarm was armed, so this
+      // instance can be brand new: build the runtime rather than assuming it.
+      const rt = this.#activeRuntime();
+      // Offloaded commands whose dispatcher never reported back. Cheap query,
+      // and it is the only thing standing between a dead Worker and a task that
+      // waits forever.
+      const resent = await rt.sweepStale();
+      const { more } = await rt.drain(3);
+      await this.broadcast();
+      // Bounded work per invocation; if there is more, come back rather than
+      // holding one alarm open until the platform ends it.
+      if (more) await this.ctx.storage.setAlarm(Date.now() + 50);
+      // A task waiting on an offloaded model call has no pending work and would
+      // arm no alarm, so nothing would ever sweep it. Re-check later.
+      else if (resent > 0 || (await rt.hasOffloadInFlight())) {
+        await this.ctx.storage.setAlarm(Date.now() + 30_000);
+      }
+    });
   }
   async alarmStatus() {
     this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
@@ -399,6 +842,19 @@ export class AgentDO extends DurableObject<Env> {
   }
 }
 
+/** Stable serialisation so two databases compare by value, not key order.
+ *  Must match bench/tau2/run.ts's `canon`, or the two runners disagree. */
+function canonJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonJson).join(",")}]`;
+  return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canonJson((v as any)[k])}`).join(",")}}`;
+}
+
+async function sha256(s: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** Where does the wall clock actually go, measured from the edge? */
 async function latency(env: Env) {
   const time = async (label: string, fn: () => Promise<unknown>) => {
@@ -427,11 +883,25 @@ export default {
     const url = new URL(request.url);
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
-    const name = url.pathname.startsWith("/conformance")
-      ? "conformance-v2"
-      : url.pathname.startsWith("/agent")
-        ? "runtime-v1"
-        : "p0";
+    // Each benchmark arm gets its own object. Sharing one meant asynchronous
+    // stragglers from an earlier run — dispatcher callbacks, re-armed alarms —
+    // landed in the next arm's measurement window. A fresh object per arm makes
+    // cross-talk impossible instead of merely unlikely.
+    // Agent traffic is addressed by identity; probes and the benchmark keep
+    // their own fixed objects.
+    let name: string;
+    if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
+    else if (url.pathname.startsWith("/bench")) name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
+    else if (url.pathname.startsWith("/agent")) {
+      const body = request.method === "POST" ? await request.clone().json().catch(() => ({})) : {};
+      const tenantId = String((body as any).tenantId ?? url.searchParams.get("tenantId") ?? "tenant-a");
+      const agentId = String((body as any).agentId ?? url.searchParams.get("agentId") ?? "agent-1");
+      try {
+        name = agentObjectName(tenantId, agentId);
+      } catch (e: any) {
+        return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
+      }
+    } else name = "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
     try {
       switch (url.pathname) {
@@ -440,6 +910,7 @@ export default {
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/agent/message": {
           const body = (await request.json()) as any;
+          await stub.setOffload(String(body.offload ?? "1") !== "0");
           return Response.json(await stub.startTask(
             body.tenantId ?? "tenant-a", body.agentId ?? "agent-1",
             body.taskId ?? `task_${crypto.randomUUID().slice(0, 8)}`, String(body.text),
@@ -453,6 +924,65 @@ export default {
             url.searchParams.get("agentId") ?? "agent-1",
             String(url.searchParams.get("taskId")),
           ));
+        case "/bench/basedb": {
+          await env.ARTIFACTS.put("bench/tau2-db.json", request.body!);
+          return Response.json({ ok: true });
+        }
+        case "/bench/start": {
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchStart(String(b.taskId), String(b.policy ?? ""), b.offload !== false));
+        }
+        case "/bench/say": {
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSay(String(b.taskId), String(b.text)));
+        }
+        case "/bench/poll":
+          return Response.json(await stub.benchPoll(String(url.searchParams.get("taskId"))));
+        case "/bench/activity":
+          return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
+        case "/bench/activity/reset": return Response.json(await stub.resetActivity());
+        case "/bench/diag":
+          return Response.json(await stub.benchDiag());
+        case "/bench/purge":
+          return Response.json(await stub.benchPurge());
+        case "/bench/debug":
+          return Response.json(await stub.benchDebug(String(url.searchParams.get("taskId"))));
+        case "/bench/result":
+          return Response.json(await stub.benchResult(String(url.searchParams.get("taskId"))));
+        case "/agent/activity":
+          return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
+        case "/agent/activity/reset": return Response.json(await stub.resetActivity());
+        case "/isolation": {
+          // Proves the property rather than asserting it: two tenants, two
+          // objects, and an object that refuses an identity that is not its own.
+          const out: Record<string, unknown> = {};
+          const nameA = agentObjectName("tenant-a", "agent-1");
+          const nameB = agentObjectName("tenant-b", "agent-1");
+          out.distinctNames = nameA !== nameB;
+          const idA = env.AGENT.idFromName(nameA);
+          const idB = env.AGENT.idFromName(nameB);
+          out.distinctObjects = idA.toString() !== idB.toString();
+
+          const a = env.AGENT.get(idA);
+          const b = env.AGENT.get(idB);
+          await a.startTask("tenant-a", "agent-1", `iso_a_${Date.now()}`, "hello from a");
+          await b.startTask("tenant-b", "agent-1", `iso_b_${Date.now()}`, "hello from b");
+          out.ownerA = await a.owner();
+          out.ownerB = await b.owner();
+
+          // Same agent id, different tenant: the object must refuse.
+          try {
+            await a.startTask("tenant-b", "agent-1", "iso_x", "wrong tenant");
+            out.crossTenantRefused = false;
+          } catch (e: any) {
+            out.crossTenantRefused = true;
+            out.refusal = String(e?.message ?? e).slice(0, 160);
+          }
+          // Each object's storage holds only its own tenant's rows.
+          out.tasksA = (await a.listTenants());
+          out.tasksB = (await b.listTenants());
+          return Response.json(out);
+        }
         case "/latency": return Response.json({ colo: request.cf?.colo ?? null, ...(await latency(env)) });
         case "/sandbox": return Response.json(await stub.verifySandbox());
         case "/sandbox/cpu": return Response.json(await stub.verifyCpuLimit(Number(url.searchParams.get("ms") ?? 50)));
