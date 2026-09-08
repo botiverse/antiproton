@@ -51,6 +51,9 @@ interface CodegenState {
   promptTokens: number;
   compactions: number;
   modelFailures?: number;
+  /** Times the model was told to use a code block instead of some other
+   *  tool-call syntax. Bounded, so a model that cannot comply still answers. */
+  formatNudges?: number;
 }
 
 export interface CompactionConfig {
@@ -83,6 +86,72 @@ export function finalText(text: string): string {
     .replace(/<\/?(?:pre|code)>/g, "")
     .trim();
   return stripped || "I ran out of execution turns before I could answer. Ask again and I will start fresh.";
+}
+
+/**
+ * A reply that is plainly an attempted tool call, just not in this harness's
+ * syntax. Models drift into whatever convention they were trained on —
+ * `<tool_calls><invoke name=...>`, `<function_call>`, a bare JSON call object —
+ * and the harness used to treat every one of them as the final answer, so the
+ * task "completed" having done nothing and the page showed markup to the user.
+ */
+export function looksLikeToolAttempt(text: string): boolean {
+  return /<\s*(tool_calls?|invoke|function_calls?|antml:invoke)\b/i.test(text)
+    || /\btool_call\b\s*[:{]/.test(text)
+    || /```(?:json|xml)\s*\n\s*[{<][^`]*"(?:tool|name|function)"/.test(text);
+}
+
+/**
+ * Translate an attempted tool call in someone else's syntax into this harness's.
+ *
+ * Cheaper and more reliable than asking the model to rewrite it: the call it
+ * meant is fully determined by the markup, so a round trip buys nothing. The
+ * output is ordinary code that goes through `js.execute` like any other, so
+ * policy, approvals and quota still apply — this changes the syntax accepted,
+ * not what is allowed.
+ *
+ * Handles the two shapes that actually turn up: `<invoke name="alias.tool">`
+ * with `<parameter>` children, and `<tool_call>` with a JSON `<arguments>`.
+ */
+export function codeFromToolAttempt(text: string): string | null {
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+
+  const invoke = /<(?:antml:)?invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/(?:antml:)?invoke\s*>/gi;
+  for (let m = invoke.exec(text); m; m = invoke.exec(text)) {
+    const args: Record<string, unknown> = {};
+    const param = /<(?:antml:)?parameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/(?:antml:)?parameter\s*>/gi;
+    for (let q = param.exec(m[2]!); q; q = param.exec(m[2]!)) args[q[1]!] = coerce(q[2]!.trim());
+    calls.push({ name: m[1]!.trim(), args });
+  }
+
+  const pair = /<tool_call[^>]*>([\s\S]*?)<\/tool_call\s*>/gi;
+  for (let m = pair.exec(text); m; m = pair.exec(text)) {
+    const name = /<tool_name\s*>([\s\S]*?)<\/tool_name\s*>/i.exec(m[1]!)?.[1]?.trim();
+    if (!name) continue;
+    const raw = /<arguments\s*>([\s\S]*?)<\/arguments\s*>/i.exec(m[1]!)?.[1]?.trim() ?? "{}";
+    let args: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed;
+    } catch { /* an unparseable argument block is not a call we can honour */ continue; }
+    calls.push({ name, args });
+  }
+
+  if (!calls.length) return null;
+  // A dotted name is a mount alias plus a tool; anything else the gateway will
+  // reject by its own rules, which is where that judgement belongs.
+  return calls
+    .map(({ name, args }) =>
+      `const res = await tool\`${name} \${ ${JSON.stringify(args)} }\`;\noutput(res);`)
+    .join("\n");
+}
+
+/** `"3"` and `"true"` mean the scalar, not the string, when they parse as one. */
+function coerce(v: string): unknown {
+  if (/^(-?\d+(\.\d+)?|true|false|null|\{[\s\S]*\}|\[[\s\S]*\])$/.test(v)) {
+    try { return JSON.parse(v); } catch { /* it was text after all */ }
+  }
+  return v;
 }
 
 export function extractCode(text: string): string | null {
@@ -205,6 +274,7 @@ export class CodegenHarness implements HarnessAdapter {
           // is what left a real session unable to do anything but apologise.
           state.turns = 0;
           state.finalizing = false;
+          state.formatNudges = 0;
           break;
         case "model.failed":
           state.modelFailures = (state.modelFailures ?? 0) + 1;
@@ -241,7 +311,9 @@ export class CodegenHarness implements HarnessAdapter {
     }
 
     if (sawModelReply !== null) {
-      const code = extractCode(sawModelReply);
+      // Accept the harness's own syntax first, then translate a call written in
+      // another convention rather than discarding it.
+      const code = extractCode(sawModelReply) ?? codeFromToolAttempt(sawModelReply);
       // A spent budget must not discard the work already done: ask for a final
       // answer from what is in context instead of blocking the task.
       if (state.finalizing) {
@@ -273,6 +345,25 @@ export class CodegenHarness implements HarnessAdapter {
           state,
           status: "waiting",
           commands: [{ kind: "js.execute", payload: { source: code } }],
+          waits: [],
+        };
+      }
+      // No code, but visibly an attempt to call something: correct the syntax
+      // rather than accept markup as the answer.
+      const nudges = state.formatNudges ?? 0;
+      if (looksLikeToolAttempt(sawModelReply) && nudges < 2) {
+        messages.push({
+          role: "user",
+          tag: "note",
+          content:
+            "That is not how you call a tool here, so nothing ran. The only way to act is a " +
+            "```js code block, using await tool`alias.name ${args}` and output(...). " +
+            "Rewrite your last step as one code block, or answer in plain prose if you are done.",
+        });
+        return {
+          state: { ...state, formatNudges: nudges + 1 },
+          status: "waiting",
+          commands: [{ kind: "model.request", payload: { messages: plain(messages) } }],
           waits: [],
         };
       }

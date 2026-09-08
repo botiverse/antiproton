@@ -134,6 +134,41 @@ await check("预算耗尽时不会把代码当答案抛出", async () => {
   if (!finalText("```js\na();\n```").trim()) throw new Error("an all-code reply produced an empty answer");
 });
 
+await check("XML 工具调用被翻译成真正的调用", async () => {
+  const { codeFromToolAttempt, looksLikeToolAttempt } = await import("../src/harness/codegen.ts");
+  const xml = '<tool_calls>\n<invoke name="web.get">\n<parameter name="url">https://example.com</parameter>\n</invoke>\n</tool_calls>';
+  const code = codeFromToolAttempt(xml);
+  if (!code || !code.includes("web.get") || !code.includes("https://example.com")) {
+    throw new Error(`not translated: ${code}`);
+  }
+  if (codeFromToolAttempt("这个项目是一个 Rust 哈希库。")) throw new Error("prose translated as a call");
+  if (!looksLikeToolAttempt(xml)) throw new Error("XML not recognised as an attempt");
+
+  const h = new CodegenHarness({ maxTurns: 10 });
+  const state: any = await h.initialize({ tenantId: "t", agentId: "a", taskId: "k", prompt: "go" } as any);
+  const r = await h.advance({ state, events: [{ kind: "model.response", payload: { text: xml } }] } as any);
+  if (r.status === "completed") throw new Error("markup was accepted as the final answer");
+  if (r.commands[0]?.kind !== "js.execute") {
+    throw new Error(`expected the call to run, got ${r.commands[0]?.kind}`);
+  }
+});
+
+await check("无法翻译的调用会被要求重写，且有次数上限", async () => {
+  // Recognisably an attempt, but nothing a call can be built from.
+  const bad = '<function_calls>\n  something the parser cannot read\n</function_calls>';
+  const h = new CodegenHarness({ maxTurns: 10 });
+  let st: any = await h.initialize({ tenantId: "t", agentId: "a", taskId: "k", prompt: "go" } as any);
+  const first = await h.advance({ state: st, events: [{ kind: "model.response", payload: { text: bad } }] } as any);
+  if (first.commands[0]?.kind !== "model.request") throw new Error("the model was not asked again");
+  st = first.state;
+  let last = first;
+  for (let i = 0; i < 4; i++) {
+    last = await h.advance({ state: st, events: [{ kind: "model.response", payload: { text: bad } }] } as any);
+    st = last.state;
+  }
+  if (last.status !== "completed") throw new Error("the nudge never gives up");
+});
+
 console.log(`\n  Strand contract\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

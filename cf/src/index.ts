@@ -474,6 +474,9 @@ export class AgentDO extends DurableObject<Env> {
       modelBinding: await rt.store.getModelBinding(tenantId, agentId),
       mounts: (await rt.store.listMounts(tenantId, agentId)).map((m) => ({
         alias: m.alias, plugin: m.plugin, policy: m.policy,
+        // A mount created before a config field existed keeps the old config
+        // for ever, and the symptom shows up somewhere else entirely.
+        config: m.publicConfig,
       })),
       eventKinds: kinds,
       lastEvents: events.slice(-6).map((e) => ({
@@ -718,63 +721,54 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("uiEnsure", async () => {
       const rt = this.runtime();
       await rt.ready();
-      const existing = await rt.store.getMountByAlias(tenantId, agentId, "ops");
-      // Reconcile, do not merely notice: a run that created the mount and then
-      // failed to set its policy would otherwise stay permissive forever.
-      if (existing && !existing.policy) {
-        await rt.store.updateMountPolicy(tenantId, agentId, "ops", { write: "approval" });
+      // Declared once, then reconciled. Creation-only provisioning cements
+      // whatever the first deploy happened to write: `ops` was left without its
+      // approval policy by a half-finished run, and `web` kept a 48 KB
+      // `maxBytes` long after the code said 24 KB — above the offload
+      // threshold, so every page the agent fetched came back as a reference to
+      // storage instead of as text. Both were invisible until something else
+      // broke. Config and policy are now compared, not merely defaulted.
+      const desired = [
+        { alias: "tools", plugin: "tools", config: { account: "builtin" },
+          secretRef: null, policy: null },
+        // Without this a parked result is a reference the agent cannot open.
+        { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
+          secretRef: null, policy: null },
+        // Writes that need a person: the policy is what the page exists to show.
+        { alias: "ops", plugin: "demo", config: { account: "demo-fleet" },
+          secretRef: null, policy: { write: "approval" as const } },
+        // Open on purpose: the agent holds no credential and writes need a
+        // human. maxBytes stays under the offload threshold so an ordinary page
+        // reaches the model directly rather than via a round trip to storage.
+        { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
+          secretRef: null, policy: null },
+        // A real container, for tasks that need one. Its tools describe
+        // themselves as a last resort so the agent reaches for free in-process
+        // JS first, and the framework releases the box when the task ends.
+        { alias: "node", plugin: "run9", config: { account: "sandbox" },
+          secretRef: OPERATOR_RUN9_REF, policy: null },
+      ];
+      for (const d of desired) {
+        const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
+        if (!have) {
+          await rt.store.addMount({
+            tenantId, agentId, alias: d.alias, plugin: d.plugin,
+            installationId: `inst-${d.alias}`, connectionId: null, toolVersion: "1.0.0",
+            publicConfig: d.config, secretRef: d.secretRef, policy: d.policy,
+          });
+          continue;
+        }
+        if (JSON.stringify(have.publicConfig) !== JSON.stringify(d.config)) {
+          await rt.store.updateMountConfig(tenantId, agentId, d.alias, d.config);
+        }
+        if (JSON.stringify(have.policy ?? null) !== JSON.stringify(d.policy ?? null)) {
+          await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy);
+        }
       }
-      // Outbound HTTP, allowlisted. Adding it separately for the same reason as
-      // `ops`: it carries configuration, and provision only makes plain mounts.
-      // Reconcile agents provisioned before these mounts existed.
-      if (!(await rt.store.getMountByAlias(tenantId, agentId, "artifacts"))) {
-        await rt.store.addMount({
-          tenantId, agentId, alias: "artifacts", plugin: "artifacts",
-          installationId: "inst-artifacts", connectionId: null, toolVersion: "1.0.0",
-          publicConfig: { account: "builtin" }, secretRef: null, policy: null,
-        });
-      }
-      // A real container, for the tasks that need one. Deliberately not
-      // provisioned by `provision`: it carries a credential, and the tools
-      // describe themselves as a last resort so the agent reaches for the free
-      // in-process JS first. The framework releases the box when the task ends.
-      if (!(await rt.store.getMountByAlias(tenantId, agentId, "node"))) {
-        await rt.store.addMount({
-          tenantId, agentId, alias: "node", plugin: "run9",
-          installationId: "inst-node", connectionId: null, toolVersion: "1.0.0",
-          publicConfig: { account: "sandbox" },
-          secretRef: OPERATOR_RUN9_REF, policy: null,
-        });
-      }
-      if (!(await rt.store.getMountByAlias(tenantId, agentId, "web"))) {
-        await rt.store.addMount({
-          tenantId, agentId, alias: "web", plugin: "http",
-          installationId: "inst-web", connectionId: null, toolVersion: "1.0.0",
-          // Open: the demo is more useful reachable, and the damage is bounded
-          // by the agent holding no credential and writes needing a human.
-          // Set allowedHosts here to restrict a mount.
-          // Under the 32KB offload threshold on purpose: an ordinary page
-          // should reach the agent directly rather than via a round trip
-          // through storage.
-          publicConfig: { account: "open web", maxBytes: 24_000 },
-          secretRef: null, policy: null,
-        });
-      }
-      if (!existing) {
-        // provision creates plain mounts; `ops` is added separately because it
-        // carries a policy, and creating it twice is a primary-key conflict.
-        await rt.provision(tenantId, agentId, [
-          { alias: "tools", plugin: "tools", account: "builtin" },
-          // Without this a parked result is a reference the agent cannot open —
-          // it is handed an r2:// ref and no way to read it.
-          { alias: "artifacts", plugin: "artifacts", account: "builtin" },
-        ]);
-        await rt.store.addMount({
-          tenantId, agentId, alias: "ops", plugin: "demo",
-          installationId: "inst-ops", connectionId: null, toolVersion: "1.0.0",
-          publicConfig: { account: "demo-fleet" }, secretRef: null,
-          policy: { write: "approval" },
-        });
+      // Tied to the binding's own absence, not to whether a mount happened to
+      // be created in this pass: an agent that gains a new mount already has a
+      // model, and one provisioned by a half-finished run may not.
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) {
         await rt.bindOperatorModel(tenantId, agentId);
       }
       if (!(await rt.store.loadTask(tenantId, taskId))) {

@@ -847,6 +847,13 @@ export class SqliteStore implements StorageAdapter {
     return Number(r.changes) > 0;
   }
 
+  async updateMountConfig(tenantId: string, agentId: string, alias: string, publicConfig: Json) {
+    const r = this.#db
+      .prepare("UPDATE mounts SET public_config=? WHERE tenant_id=? AND agent_id=? AND alias=?")
+      .run(j(publicConfig), tenantId, agentId, alias);
+    return Number(r.changes) > 0;
+  }
+
   async getMountByAlias(tenantId: string, agentId: string, alias: string) {
     const r = this.#db
       .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?")

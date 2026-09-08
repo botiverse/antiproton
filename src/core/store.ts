@@ -205,6 +205,16 @@ export interface StorageAdapter {
   updateMountPolicy(
     tenantId: string, agentId: string, alias: string, policy: MountPolicy | null,
   ): Promise<boolean>;
+  /**
+   * Config drifts the same way policy does, and more quietly. A `web` mount
+   * created before `maxBytes` was lowered kept the old 48 KB for ever, which is
+   * above the offload threshold — so every page the agent fetched was parked to
+   * storage and came back as a reference it could not use. Creation-only
+   * reconciliation cements whatever the first deploy happened to write.
+   */
+  updateMountConfig(
+    tenantId: string, agentId: string, alias: string, publicConfig: Json,
+  ): Promise<boolean>;
   getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;
   findMountsByPlugin(tenantId: string, agentId: string, plugin: string): Promise<MountRecord[]>;
   listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;
