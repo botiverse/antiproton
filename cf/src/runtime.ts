@@ -18,7 +18,8 @@ import {
 import { CodegenHarness } from "../../src/harness/codegen.ts";
 import { HybridHarness, qualifyMountedTools } from "../../src/harness/hybrid.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
-import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
+import { ModelResolver } from "../../src/runtime/model-resolver.ts";
+import { envSecrets } from "../../src/runtime/gateway.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
@@ -64,15 +65,23 @@ class BoundArtifacts {
   }
 }
 
+/** The one reference that maps to the operator's configured key. A tenant that
+ *  wants its own account uses its own reference instead. */
+export const OPERATOR_SECRET_REF = "operator:model";
+
 export interface RuntimeDeps {
   ctx: any;
   bucketName: string;
   bucket: R2Bucket;
   loader: any;
   makeToolBinding: (execId: string) => unknown;
-  modelBaseUrl: string;
-  modelApiKey: string;
-  modelName: string;
+  /**
+   * The operator's own model account. Used only to seed a binding on request
+   * (`bindOperatorModel`), never as a fallback: an agent whose tenant has no
+   * binding is refused, because the alternative is every tenant silently
+   * spending this key.
+   */
+  operatorModel?: { baseUrl: string; apiKey: string; model: string };
   /**
    * Durable Objects bill wall clock, Workers bill CPU — and a model call is
    * ~94% waiting. Handing `model.request` to a Worker lets the object go idle
@@ -96,7 +105,7 @@ export class AgentRuntime {
   #gateway: ToolGateway;
   #harness: CodegenHarness | HybridHarness;
   #executor: DynamicWorkerExecutor;
-  #model: OpenAiCompatibleModel;
+  #models: ModelResolver;
   #artifacts: BoundArtifacts;
   #ready = false;
 
@@ -120,10 +129,13 @@ export class AgentRuntime {
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
     });
-    this.#model = new OpenAiCompatibleModel({
-      baseUrl: deps.modelBaseUrl,
-      apiKey: deps.modelApiKey,
-      model: deps.modelName,
+    // Credentials come from the same resolver mounts use, so a model key is
+    // dereferenced server-side and never travels with the binding.
+    this.#models = new ModelResolver(this.store, {
+      resolve: async (ref) =>
+        ref === OPERATOR_SECRET_REF
+          ? (deps.operatorModel?.apiKey ?? null)
+          : envSecrets.resolve(ref),
     });
   }
 
@@ -188,6 +200,24 @@ export class AgentRuntime {
       });
     }
     return { agentId, created: true };
+  }
+
+  /**
+   * Point a tenant at the operator's model account, explicitly.
+   *
+   * This exists so a demo or a benchmark can be set up in one call. It is a
+   * deliberate act with a visible binding row behind it, not a default that
+   * quietly applies to everyone who forgot to configure one.
+   */
+  async bindOperatorModel(tenantId: string, agentId: string | null = null) {
+    await this.ready();
+    const m = this.#deps.operatorModel;
+    if (!m) throw new Error("no operator model configured on this deployment");
+    await this.store.setModelBinding({
+      tenantId, agentId, provider: "openai-compatible",
+      model: m.model, baseUrl: m.baseUrl, secretRef: OPERATOR_SECRET_REF,
+    });
+    return { tenantId, agentId, model: m.model };
   }
 
   async openTask(tenantId: string, agentId: string, taskId: string) {
@@ -298,7 +328,7 @@ export class AgentRuntime {
         if (!task) continue;
         const callCtx = { tenantId, agentId: task.agentId, taskId };
         const commands = new CommandExecutor(
-          this.store, this.#model, this.#host(callCtx), this.#executor,
+          this.store, (caller) => this.#models.resolve(caller), this.#host(callCtx), this.#executor,
           undefined, this.#offload(),
         );
         const kernel = new Kernel(this.store, this.#harness, {

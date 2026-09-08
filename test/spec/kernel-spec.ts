@@ -402,7 +402,11 @@ export async function kernelSpec(
     // Two calls under one key: the first records the attempt, the second must
     // not repeat it. `unknown` is the honest answer — it may already have
     // landed, which is precisely why it is not retried blindly.
-    const opId = (k: string) => `op_${k}`;
+    // Run-unique, because a persistent backend keeps rows between runs and a
+    // fixed id would collide with the previous run's — which is exactly how
+    // this case first failed on Durable Objects while passing on in-memory
+    // sqlite.
+    const opId = (k: string) => `${TASK}-${k}`;
     await store.recordOperation({
       operationId: opId("k1"), tenantId: TENANT, agentId: AGENT, taskId: TASK,
       mountAlias: "gh", tool: "github.issues.create", toolVersion: "1.0.0",
@@ -413,7 +417,7 @@ export async function kernelSpec(
       mountAlias: "gh", tool: "github.issues.create", toolVersion: "1.0.0",
     });
     const ops = await store.getOperation(TENANT, opId("k1"));
-    assert(ops, "the operation exists");
+    assert(ops, `the operation exists (tenant=${TENANT} id=${opId("k1")})`);
     eq(ops!.status, "pending", "the first record stands; the replay did not reset it");
     await store.completeOperation(TENANT, opId("k1"), "succeeded", null);
     await store.recordOperation({

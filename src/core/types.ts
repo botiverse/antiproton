@@ -97,6 +97,24 @@ export interface OperationRecord {
   resultRef: string | null;
 }
 
+/**
+ * Which provider, which model, and whose key.
+ *
+ * Per tenant, with an optional per-agent override. The credential is a
+ * reference resolved server-side exactly as a mount's is: the binding that
+ * leaves the store never carries it, so it cannot reach a prompt, a
+ * checkpoint or a trajectory by accident.
+ */
+export interface ModelBinding {
+  tenantId: string;
+  /** null is the tenant's default; a row with an agentId overrides it. */
+  agentId: string | null;
+  provider: string;
+  model: string;
+  baseUrl: string;
+  secretRef: string;
+}
+
 /** Config-time binding. The agent addresses `alias`, never a connection id. */
 export interface MountRecord {
   tenantId: string;

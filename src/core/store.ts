@@ -3,6 +3,7 @@ import type {
   CommitResult,
   Json,
   Lease,
+  ModelBinding,
   OperationRecord,
   OperationStatus,
   RuntimeEvent,
@@ -128,6 +129,15 @@ export interface StorageAdapter {
     state: Json,
     expiresAt?: number | null,
   ): Promise<void>;
+
+  /**
+   * Whose model account this agent spends. A tenant with no binding cannot run:
+   * refusing is the only safe default, because the alternative is every tenant
+   * quietly spending the operator's own key.
+   */
+  setModelBinding(b: ModelBinding): Promise<void>;
+  /** Agent override first, then the tenant default, then null. */
+  getModelBinding(tenantId: string, agentId: string): Promise<ModelBinding | null>;
 
   addMount(m: MountRecord): Promise<void>;
   getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;

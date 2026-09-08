@@ -276,9 +276,11 @@ export class AgentDO extends DurableObject<Env> {
       loader: this.env.LOADER,
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
-      modelBaseUrl: this.env.DEEPSEEK_BASE_URL,
-      modelApiKey: this.env.DEEPSEEK_API_KEY,
-      modelName: this.env.HARNESS_MODEL,
+      operatorModel: {
+        baseUrl: this.env.DEEPSEEK_BASE_URL,
+        apiKey: this.env.DEEPSEEK_API_KEY,
+        model: this.env.HARNESS_MODEL,
+      },
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#runtime;
@@ -439,6 +441,13 @@ export class AgentDO extends DurableObject<Env> {
     if (res.status !== 202) throw new Error(`dispatcher refused: ${res.status}`);
   }
 
+  /** The binding, credential-free, so an operator can see whose key is in use. */
+  async modelBinding(tenantId: string, agentId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    return rt.store.getModelBinding(tenantId, agentId);
+  }
+
   /** Exposed so the eviction check can read the persisted decision. */
   async readOffload(): Promise<boolean> {
     return this.#offloadOn();
@@ -500,9 +509,11 @@ export class AgentDO extends DurableObject<Env> {
       loader: this.env.LOADER,
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
-      modelBaseUrl: this.env.DEEPSEEK_BASE_URL,
-      modelApiKey: this.env.DEEPSEEK_API_KEY,
-      modelName: this.env.HARNESS_MODEL,
+      operatorModel: {
+        baseUrl: this.env.DEEPSEEK_BASE_URL,
+        apiKey: this.env.DEEPSEEK_API_KEY,
+        model: this.env.HARNESS_MODEL,
+      },
       extraPlugins: [this.#benchState().plugin()],
       // Matches bench/tau2/compare.ts's hybrid arm, so CF numbers sit alongside
       // the Node ones instead of measuring a different harness.
@@ -524,6 +535,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.#benchState().reset(taskId);
       // Only what the Node bench mounts: github/artifacts would change the tool
       // catalogue and make the two runners incomparable.
+      await rt.bindOperatorModel("bench", agentId);
       await rt.provision("bench", agentId, [
         { alias: "tools", plugin: "tools", account: "builtin" },
         { alias: "retail", plugin: "retail", account: "benchmark" },
@@ -642,6 +654,7 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("startTask", async () => {
       const rt = this.runtime();
       await rt.provision(tenantId, agentId);
+      await rt.bindOperatorModel(tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, taskId, text);
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.ctx.storage.setAlarm(Date.now());
@@ -979,6 +992,22 @@ export default {
         case "/agent/activity":
           return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
         case "/agent/activity/reset": return Response.json(await stub.resetActivity());
+        case "/model-binding": {
+          // Whether an agent can run at all now depends on a binding existing.
+          const stub3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName("tenant-nokey", "agent-1")));
+          const out: Record<string, unknown> = {};
+          try {
+            await stub3.startTask("tenant-nokey", "agent-1", `nk_${Date.now()}`, "hello");
+            // startTask binds explicitly, so clear it and try to advance.
+            out.provisionedWithBinding = true;
+          } catch (e: any) {
+            out.provisionedWithBinding = false;
+            out.error = String(e?.message ?? e).slice(0, 160);
+          }
+          out.binding = await stub3.modelBinding("tenant-nokey", "agent-1");
+          out.unboundTenant = await stub3.modelBinding("tenant-never-configured", "agent-1");
+          return Response.json(out);
+        }
         case "/eviction": {
           // Configuration set before an eviction must still be in force after
           // it, without the caller restating anything.

@@ -1,6 +1,7 @@
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json } from "../core/types.ts";
 import type { ModelAdapter, ModelResponse } from "../model/types.ts";
+import { asModelSource, type ModelSource } from "./model-resolver.ts";
 import { DEFAULT_LIMITS } from "../core/execution.ts";
 import type { ExecutionLimits, ExecutorHost, JsExecutor } from "../core/execution.ts";
 
@@ -84,7 +85,7 @@ async function charge(store: StorageAdapter, tenantId: string, resource: string,
 
 export class CommandExecutor {
   #store: StorageAdapter;
-  #model: ModelAdapter;
+  #model: (caller: { tenantId: string; agentId: string }) => Promise<ModelAdapter>;
   #host: ExecutorHost;
   #executor: JsExecutor;
   #limits: ExecutionLimits;
@@ -93,7 +94,7 @@ export class CommandExecutor {
 
   constructor(
     store: StorageAdapter,
-    model: ModelAdapter,
+    model: ModelSource,
     host: ExecutorHost,
     /** Injected, not constructed: QuickJS in Node, Dynamic Workers at the edge. */
     executor: JsExecutor,
@@ -103,7 +104,7 @@ export class CommandExecutor {
     offload: CommandOffload | null = null,
   ) {
     this.#store = store;
-    this.#model = model;
+    this.#model = asModelSource(model);
     this.#host = host;
     this.#executor = executor;
     this.#limits = limits;
@@ -118,7 +119,10 @@ export class CommandExecutor {
     }
     switch (cmd.kind) {
       case "model.request": {
-        const res = await runModelCommand(this.#model, cmd.payload);
+        // Resolved per call, so a re-bound key takes effect immediately and a
+        // tenant without a binding is refused rather than billed to us.
+        const model = await this.#model({ tenantId: ctx.tenantId, agentId: ctx.agentId });
+        const res = await runModelCommand(model, cmd.payload);
         await charge(this.#store, ctx.tenantId, "model_tokens",
           (res.usage.promptTokens ?? 0) + (res.usage.completionTokens ?? 0));
         this.trace.push({

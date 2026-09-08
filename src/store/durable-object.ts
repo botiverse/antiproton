@@ -45,7 +45,12 @@ const SCHEMA = [
      mount_alias TEXT NOT NULL, tool TEXT NOT NULL, tool_version TEXT NOT NULL, status TEXT NOT NULL,
      result_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS operations_task ON operations(tenant_id, task_id, status)`,
-`CREATE TABLE IF NOT EXISTS quotas (
+`CREATE TABLE IF NOT EXISTS model_bindings (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL, model TEXT NOT NULL, base_url TEXT NOT NULL,
+  secret_ref TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, agent_id));`,
+  `CREATE TABLE IF NOT EXISTS quotas (
   tenant_id TEXT NOT NULL, resource TEXT NOT NULL,
   limit_value INTEGER, window_ms INTEGER,
   used INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0,
@@ -396,6 +401,30 @@ export class DurableObjectStore implements StorageAdapter {
          state=excluded.state, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
       tenantId, agentId, alias, JSON.stringify(state ?? null), expiresAt, this.#now(),
     );
+  }
+
+  async setModelBinding(b: ModelBinding) {
+    this.#sql.exec(
+      `INSERT INTO model_bindings(tenant_id, agent_id, provider, model, base_url, secret_ref, updated_at)
+       VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(tenant_id, agent_id) DO UPDATE SET
+         provider=excluded.provider, model=excluded.model, base_url=excluded.base_url,
+         secret_ref=excluded.secret_ref, updated_at=excluded.updated_at`,
+      b.tenantId, b.agentId ?? "", b.provider, b.model, b.baseUrl, b.secretRef, this.#now(),
+    );
+  }
+
+  async getModelBinding(tenantId: string, agentId: string): Promise<ModelBinding | null> {
+    // Most specific wins: the agent's own row, else the tenant default.
+    const rows = this.#all(
+      "SELECT * FROM model_bindings WHERE tenant_id=? AND (agent_id=? OR agent_id='')", tenantId, agentId
+    ) as any[];
+    const pick = rows.find((r: any) => r.agent_id === agentId) ?? rows.find((r: any) => r.agent_id === "");
+    if (!pick) return null;
+    return {
+      tenantId: pick.tenant_id, agentId: pick.agent_id === "" ? null : pick.agent_id,
+      provider: pick.provider, model: pick.model, baseUrl: pick.base_url, secretRef: pick.secret_ref,
+    };
   }
 
   async addMount(m: MountRecord) {
