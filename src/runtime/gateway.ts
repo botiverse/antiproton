@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
-import type { Json, MountRecord } from "../core/types.ts";
+import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin } from "../plugins/types.ts";
@@ -24,6 +24,25 @@ export interface CallContext {
 }
 
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
+
+/**
+ * What a mount may do without a human.
+ *
+ * Per-tool beats the side-effect default, and an absent policy allows — a mount
+ * the operator has just deliberately created should work. The check lives here,
+ * at the same choke point that holds credentials, so no harness and no sandbox
+ * can route around it.
+ */
+export function policyFor(
+  policy: MountPolicy | null | undefined,
+  tool: string,
+  sideEffects: "read" | "write",
+): PolicyDecision {
+  if (!policy) return "allow";
+  const perTool = policy.tools?.[tool];
+  if (perTool) return perTool;
+  return (sideEffects === "write" ? policy.write : policy.read) ?? "allow";
+}
 
 export class ToolGateway {
   #store: StorageAdapter;
@@ -78,11 +97,47 @@ export class ToolGateway {
    * executed again: it answers `unknown`, which is exactly what that status
    * means — the request may already have landed.
    */
+  /**
+   * Apply a human decision to a held call.
+   *
+   * Deciding is atomic and happens once, so one approval can never authorise
+   * two executions. On approval the recorded request is executed exactly as it
+   * was recorded — an approver approved that request, not whatever the agent
+   * might ask for next — and the result rides the completion event back to the
+   * task, which the store wakes.
+   */
+  async applyApproval(
+    tenantId: string,
+    operationId: string,
+    decision: "approved" | "denied",
+    approver: string,
+  ): Promise<{ ok: false; reason: string } | { ok: true; executed: boolean; result?: ToolResult }> {
+    const decided = await this.#store.decideApproval(tenantId, operationId, decision, approver);
+    if (!decided.ok) return { ok: false, reason: decided.reason };
+
+    const a = decided.record;
+    if (decision === "denied") {
+      await this.#store.completeOperation(tenantId, operationId, "cancelled", null, {
+        denied: true, approver,
+      });
+      return { ok: true, executed: false };
+    }
+
+    const req = a.request as { tool: string; args: Json };
+    const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
+    // `approved` bypasses the policy check for this one recorded call only.
+    const result = await this.invoke(ctx, req.tool, req.args, { approved: true, operationId });
+    await this.#store.completeOperation(
+      tenantId, operationId, result.status === "succeeded" ? "succeeded" : "failed", null, result as Json,
+    );
+    return { ok: true, executed: true, result };
+  }
+
   async invoke(
     ctx: CallContext,
     raw: string,
     args: Json,
-    opts: { idempotencyKey?: string } = {},
+    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string } = {},
   ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
     if ("error" in r) return { status: "rejected", error: r.error };
@@ -107,9 +162,9 @@ export class ToolGateway {
     }
 
     const schema = plugin.tools.find((t) => t.name === r.tool)!;
-    const operationId = opts.idempotencyKey
+    const operationId = opts.operationId ?? (opts.idempotencyKey
       ? `op_${createHash("sha256").update(`${ctx.tenantId}|${ctx.taskId}|${opts.idempotencyKey}`).digest("hex").slice(0, 20)}`
-      : `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+      : `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`);
 
     if (opts.idempotencyKey) {
       const prior = await this.#store.getOperation(ctx.tenantId, operationId);
@@ -137,6 +192,31 @@ export class ToolGateway {
       tool: `${r.mount.plugin}.${r.tool}`,
       toolVersion: r.mount.toolVersion,
     });
+
+    const verdict = opts.approved ? "allow" : policyFor(r.mount.policy, r.tool, schema.sideEffects);
+    if (verdict === "deny") {
+      return {
+        status: "rejected",
+        error: { code: "policy_denied", message: `${r.mount.alias}.${r.tool} is denied by policy` },
+      };
+    }
+    if (verdict === "approval") {
+      // Recorded, not executed, and not blocking a thread: the approver may
+      // take hours and nothing should hold a process for them. The task parks
+      // on the operation and is woken by the decision.
+      await this.#store.requireApproval({
+        tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
+        mountAlias: r.mount.alias, tool: r.tool, request: { tool: raw, args },
+      });
+      return {
+        status: "pending",
+        operationId,
+        error: {
+          code: "awaiting_approval",
+          message: `${r.mount.alias}.${r.tool} is held for approval`,
+        },
+      } as ToolResult;
+    }
 
     const credential = r.mount.secretRef ? await this.#secrets.resolve(r.mount.secretRef) : null;
     try {

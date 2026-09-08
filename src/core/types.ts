@@ -120,6 +120,41 @@ export interface ModelBinding {
   secretRef: string;
 }
 
+/**
+ * What a mount is allowed to do without a human.
+ *
+ * Evaluated at the gateway, the same choke point that holds credentials, so a
+ * policy cannot be bypassed by any harness or any sandbox. `approval` does not
+ * block a thread: the call is recorded and the task parks, because in a service
+ * the approver may take hours and nothing should be holding a process for them.
+ */
+export type PolicyDecision = "allow" | "deny" | "approval";
+
+export interface MountPolicy {
+  /** Applied to tools declaring `sideEffects: "read"`. Default allow. */
+  read?: PolicyDecision;
+  /** Applied to tools declaring `sideEffects: "write"`. Default allow. */
+  write?: PolicyDecision;
+  /** Per-tool override, by bare tool name. Beats the side-effect default. */
+  tools?: Record<string, PolicyDecision>;
+}
+
+/** A call held back pending a human decision. */
+export interface ApprovalRecord {
+  tenantId: string;
+  operationId: string;
+  agentId: string;
+  taskId: string;
+  mountAlias: string;
+  tool: string;
+  /** Exactly what was asked for — this is what an approver is approving. */
+  request: Json;
+  state: "pending" | "approved" | "denied";
+  approver: string | null;
+  decidedAt: number | null;
+  createdAt: number;
+}
+
 /** Config-time binding. The agent addresses `alias`, never a connection id. */
 export interface MountRecord {
   tenantId: string;
@@ -131,4 +166,7 @@ export interface MountRecord {
   toolVersion: string;
   publicConfig: Record<string, Json>;
   secretRef: string | null;
+  /** Absent means allow everything, which is the only sane default for a
+   *  mount the operator has just deliberately created. */
+  policy?: MountPolicy | null;
 }

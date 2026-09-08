@@ -6,6 +6,7 @@ import type {
   CommitResult,
   Json,
   Lease,
+  ApprovalRecord,
   ModelBinding,
   MountRecord,
   OperationRecord,
@@ -96,6 +97,13 @@ CREATE TABLE IF NOT EXISTS model_bindings (
   secret_ref TEXT NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, agent_id));
 
+CREATE TABLE IF NOT EXISTS approvals (
+  tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  task_id TEXT NOT NULL, mount_alias TEXT NOT NULL, tool TEXT NOT NULL,
+  request TEXT NOT NULL, state TEXT NOT NULL, approver TEXT, decided_at INTEGER,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, operation_id));
+
 CREATE TABLE IF NOT EXISTS snapshots (
   tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, through_sequence INTEGER NOT NULL,
   state TEXT NOT NULL, state_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
@@ -115,11 +123,19 @@ CREATE TABLE IF NOT EXISTS connections (
 CREATE TABLE IF NOT EXISTS mounts (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
-  tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT,
+  tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT, policy TEXT,
   PRIMARY KEY (tenant_id, agent_id, alias));
 `;
 
 const now = () => Date.now();
+
+const mapApproval = (r: any): ApprovalRecord => ({
+  tenantId: r.tenant_id, operationId: r.operation_id, agentId: r.agent_id,
+  taskId: r.task_id, mountAlias: r.mount_alias, tool: r.tool,
+  request: JSON.parse(r.request), state: r.state, approver: r.approver ?? null,
+  decidedAt: r.decided_at == null ? null : Number(r.decided_at),
+  createdAt: Number(r.created_at),
+});
 const j = (v: Json) => JSON.stringify(v ?? null);
 
 export class SqliteStore implements StorageAdapter {
@@ -134,8 +150,12 @@ export class SqliteStore implements StorageAdapter {
     this.#db.exec(SCHEMA);
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
-    try { this.#db.exec("ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"); }
-    catch { /* already present */ }
+    for (const alter of [
+      "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE mounts ADD COLUMN policy TEXT",
+    ]) {
+      try { this.#db.exec(alter); } catch { /* already present */ }
+    }
     this.#db
       .prepare("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)")
       .run();
@@ -544,6 +564,7 @@ export class SqliteStore implements StorageAdapter {
     operationId: string,
     status: OperationStatus,
     resultRef: string | null,
+    result?: Json,
   ) {
     this.#tx(() => {
       this.#db
@@ -566,7 +587,7 @@ export class SqliteStore implements StorageAdapter {
           agentId: op.agent_id,
           taskId: op.task_id,
           kind: "operation.completed",
-          payload: { operationId, status, resultRef },
+          payload: { operationId, status, resultRef, ...(result === undefined ? {} : { result }) },
           dedupKey: `op:${operationId}:completed`,
         });
       }
@@ -631,6 +652,7 @@ export class SqliteStore implements StorageAdapter {
       connectionId: r.connection_id,
       toolVersion: r.tool_version,
       publicConfig: JSON.parse(r.public_config),
+      policy: r.policy ? JSON.parse(r.policy) : null,
       secretRef: r.secret_ref,
     };
   }
@@ -743,16 +765,59 @@ export class SqliteStore implements StorageAdapter {
     };
   }
 
+  async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">) {
+    this.#db
+      .prepare(
+        `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
+           request, state, approver, decided_at, created_at)
+         VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+         ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
+      )
+      .run(a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool, j(a.request), now());
+  }
+
+  async getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null> {
+    const r = this.#db
+      .prepare("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?")
+      .get(tenantId, operationId) as any;
+    return r ? mapApproval(r) : null;
+  }
+
+  async decideApproval(
+    tenantId: string, operationId: string, decision: "approved" | "denied", approver: string,
+  ) {
+    return this.#tx(() => {
+      const r = this.#db
+        .prepare("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?")
+        .get(tenantId, operationId) as any;
+      if (!r) return { ok: false as const, reason: "not_found" as const };
+      // Deciding twice would let one approval authorise two executions.
+      if (r.state !== "pending") return { ok: false as const, reason: "already_decided" as const };
+      this.#db
+        .prepare("UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?")
+        .run(decision, approver, now(), tenantId, operationId);
+      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: now() }) };
+    });
+  }
+
+  async listApprovals(tenantId: string, state?: "pending" | "approved" | "denied") {
+    const rows = state
+      ? this.#db.prepare("SELECT * FROM approvals WHERE tenant_id=? AND state=? ORDER BY created_at ASC").all(tenantId, state)
+      : this.#db.prepare("SELECT * FROM approvals WHERE tenant_id=? ORDER BY created_at ASC").all(tenantId);
+    return (rows as any[]).map(mapApproval);
+  }
+
   async addMount(m: MountRecord) {
     this.#db
       .prepare(
         `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id,
-           plugin, tool_version, public_config, secret_ref)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
+           plugin, tool_version, public_config, secret_ref, policy)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId,
         m.plugin, m.toolVersion, j(m.publicConfig), m.secretRef,
+        m.policy ? j(m.policy) : null,
       );
   }
 

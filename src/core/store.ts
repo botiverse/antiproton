@@ -2,6 +2,7 @@ import type {
   AdvanceTxn,
   CommitResult,
   Json,
+  ApprovalRecord,
   Lease,
   ModelBinding,
   OperationRecord,
@@ -92,6 +93,9 @@ export interface StorageAdapter {
     operationId: string,
     status: OperationStatus,
     resultRef: string | null,
+    /** Carried on the wakeup event. An operation that finished long after the
+     *  execution that started it still has to deliver what it produced. */
+    result?: Json,
   ): Promise<void>;
 
   /** Registers a wait, resolving it immediately if the operation already finished. */
@@ -162,6 +166,21 @@ export interface StorageAdapter {
   setModelBinding(b: ModelBinding): Promise<void>;
   /** Agent override first, then the tenant default, then null. */
   getModelBinding(tenantId: string, agentId: string): Promise<ModelBinding | null>;
+
+  /** Hold a call for a human. The request is stored verbatim: an approver has
+   *  to be able to see exactly what they are approving. */
+  requireApproval(
+    a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">,
+  ): Promise<void>;
+  getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null>;
+  /** Decide once. A second decision is refused rather than applied, so an
+   *  approval cannot be replayed into a second execution. */
+  decideApproval(
+    tenantId: string, operationId: string, decision: "approved" | "denied", approver: string,
+  ): Promise<{ ok: true; record: ApprovalRecord } | { ok: false; reason: "not_found" | "already_decided" }>;
+  listApprovals(
+    tenantId: string, state?: "pending" | "approved" | "denied",
+  ): Promise<ApprovalRecord[]>;
 
   addMount(m: MountRecord): Promise<void>;
   getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;

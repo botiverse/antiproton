@@ -1,7 +1,7 @@
 import type { StorageAdapter } from "../core/store.ts";
 import type {
-  AdvanceTxn, CommitResult, Json, Lease, MountRecord, OperationRecord,
-  OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
+  AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountRecord,
+  OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
 } from "../core/types.ts";
 
 /**
@@ -50,6 +50,12 @@ const SCHEMA = [
   provider TEXT NOT NULL, model TEXT NOT NULL, base_url TEXT NOT NULL,
   secret_ref TEXT NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, agent_id));`,
+  `CREATE TABLE IF NOT EXISTS approvals (
+  tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  task_id TEXT NOT NULL, mount_alias TEXT NOT NULL, tool TEXT NOT NULL,
+  request TEXT NOT NULL, state TEXT NOT NULL, approver TEXT, decided_at INTEGER,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, operation_id));`,
   `CREATE TABLE IF NOT EXISTS snapshots (
   tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, through_sequence INTEGER NOT NULL,
   state TEXT NOT NULL, state_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
@@ -66,10 +72,18 @@ const SCHEMA = [
     `CREATE TABLE IF NOT EXISTS mounts (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL,
      connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL,
-     secret_ref TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
+     secret_ref TEXT, policy TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
 ];
 
 const j = (v: Json) => JSON.stringify(v ?? null);
+
+const mapApproval = (r: any): ApprovalRecord => ({
+  tenantId: r.tenant_id, operationId: r.operation_id, agentId: r.agent_id,
+  taskId: r.task_id, mountAlias: r.mount_alias, tool: r.tool,
+  request: JSON.parse(r.request), state: r.state, approver: r.approver ?? null,
+  decidedAt: r.decided_at == null ? null : Number(r.decided_at),
+  createdAt: Number(r.created_at),
+});
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 type Ctx = { storage: { sql: Sql; transactionSync<T>(cb: () => T): T } };
@@ -88,10 +102,15 @@ export class DurableObjectStore implements StorageAdapter {
 
   async init() {
     for (const stmt of SCHEMA) this.#sql.exec(stmt);
-    // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
-    // the column, so an object created before this change would never get it.
-    try { this.#sql.exec("ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"); }
-    catch { /* already present */ }
+    // Columns added after a table already exists are invisible to
+    // CREATE TABLE IF NOT EXISTS; each ALTER is idempotent by trial.
+    for (const alter of [
+      "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE mounts ADD COLUMN policy TEXT",
+    ]) {
+      try { this.#sql.exec(alter); } catch { /* already present */ }
+    }
+
     this.#sql.exec("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)");
   }
 
@@ -331,7 +350,10 @@ export class DurableObjectStore implements StorageAdapter {
     };
   }
 
-  async completeOperation(tenantId: string, operationId: string, status: OperationStatus, resultRef: string | null) {
+  async completeOperation(
+    tenantId: string, operationId: string, status: OperationStatus, resultRef: string | null,
+    result?: Json,
+  ) {
     this.#tx(() => {
       this.#sql.exec(
         "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
@@ -343,7 +365,7 @@ export class DurableObjectStore implements StorageAdapter {
       if (op) {
         this.#insertEvent({
           tenantId, agentId: op.agent_id, taskId: op.task_id, kind: "operation.completed",
-          payload: { operationId, status, resultRef }, dedupKey: `op:${operationId}:completed`,
+          payload: { operationId, status, resultRef, ...(result === undefined ? {} : { result }) }, dedupKey: `op:${operationId}:completed`,
         });
       }
     });
@@ -381,7 +403,8 @@ export class DurableObjectStore implements StorageAdapter {
     return {
       tenantId: r.tenant_id, agentId: r.agent_id, alias: r.alias, plugin: r.plugin,
       installationId: r.installation_id, connectionId: r.connection_id, toolVersion: r.tool_version,
-      publicConfig: JSON.parse(r.public_config), secretRef: r.secret_ref,
+      publicConfig: JSON.parse(r.public_config),
+      policy: r.policy ? JSON.parse(r.policy) : null, secretRef: r.secret_ref,
     };
   }
 
@@ -476,12 +499,50 @@ export class DurableObjectStore implements StorageAdapter {
     };
   }
 
+  async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">) {
+    this.#sql.exec(
+      `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
+         request, state, approver, decided_at, created_at)
+       VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+       ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
+      a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool,
+      j(a.request), this.#now());
+  }
+
+  async getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null> {
+    const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+    return r ? mapApproval(r) : null;
+  }
+
+  async decideApproval(
+    tenantId: string, operationId: string, decision: "approved" | "denied", approver: string,
+  ) {
+    return this.#tx(() => {
+      const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+      if (!r) return { ok: false as const, reason: "not_found" as const };
+      // Deciding twice would let one approval authorise two executions.
+      if (r.state !== "pending") return { ok: false as const, reason: "already_decided" as const };
+      const at = this.#now();
+      this.#sql.exec(
+        "UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?",
+        decision, approver, at, tenantId, operationId);
+      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at }) };
+    });
+  }
+
+  async listApprovals(tenantId: string, state?: "pending" | "approved" | "denied") {
+    const rows = state
+      ? this.#all("SELECT * FROM approvals WHERE tenant_id=? AND state=? ORDER BY created_at ASC", tenantId, state)
+      : this.#all("SELECT * FROM approvals WHERE tenant_id=? ORDER BY created_at ASC", tenantId);
+    return (rows as any[]).map(mapApproval);
+  }
+
   async addMount(m: MountRecord) {
     this.#sql.exec(
       `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id, plugin,
-         tool_version, public_config, secret_ref) VALUES (?,?,?,?,?,?,?,?,?)`,
+         tool_version, public_config, secret_ref, policy) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId, m.plugin, m.toolVersion,
-      j(m.publicConfig), m.secretRef);
+      j(m.publicConfig), m.secretRef, m.policy ? j(m.policy) : null);
   }
 
   async getMountByAlias(tenantId: string, agentId: string, alias: string) {

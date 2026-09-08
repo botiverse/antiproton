@@ -6,6 +6,7 @@
  */
 import { Kernel, commandId, type HarnessAdapter } from "../../src/runtime/kernel.ts";
 import { rebuildState } from "../../src/runtime/replay.ts";
+import { ToolGateway } from "../../src/runtime/gateway.ts";
 import type { StorageAdapter } from "../../src/core/store.ts";
 import type { Json } from "../../src/core/types.ts";
 
@@ -550,6 +551,120 @@ export async function kernelSpec(
     // The log is untouched by snapshotting.
     eq((await store.taskEvents(TENANT, TASK)).filter((e) => e.kind === "message").length, 6,
        "every event is still in the log");
+    await store.close().catch(() => {});
+  });
+
+  test("审批闸门", "a write held for approval is not performed, then is performed exactly once", async () => {
+    const store = await fixture();
+    let performed = 0;
+    const plugin = {
+      id: "prod", version: "1.0.0",
+      tools: [
+        { name: "deploy", summary: "", parameters: {}, sideEffects: "write" as const, idempotency: "none" as const },
+        { name: "status", summary: "", parameters: {}, sideEffects: "read" as const, idempotency: "native" as const },
+      ],
+      async invoke(tool: string) { if (tool === "deploy") performed++; return { tool }; },
+    };
+    await store.addMount({
+      tenantId: TENANT, agentId: AGENT, alias: "prod", plugin: "prod",
+      installationId: "i", connectionId: null, toolVersion: "1.0.0",
+      publicConfig: {}, secretRef: null, policy: { write: "approval" },
+    });
+    const gw = new ToolGateway(store, [plugin], { async resolve() { return null; } });
+    const ctx = { tenantId: TENANT, agentId: AGENT, taskId: TASK };
+
+    // Reads are untouched by a write policy.
+    eq((await gw.invoke(ctx, "prod.status", {})).status, "succeeded", "read allowed");
+
+    const held = await gw.invoke(ctx, "prod.deploy", { env: "production" });
+    eq(held.status, "pending", "the write is held, not executed");
+    eq(performed, 0, "nothing happened yet");
+
+    const opId = (held as any).operationId;
+    const rec = await store.getApproval(TENANT, opId);
+    eq(rec!.state, "pending", "recorded as pending");
+    eq((rec!.request as any).args.env, "production", "the request is stored verbatim for the approver");
+
+    const ok = await gw.applyApproval(TENANT, opId, "approved", "alice");
+    assert(ok.ok && ok.executed, "approving executed it");
+    eq(performed, 1, "performed once");
+
+    // One approval must never authorise a second execution.
+    const again = await gw.applyApproval(TENANT, opId, "approved", "mallory");
+    assert(!again.ok, "a second decision is refused");
+    eq(performed, 1, "still performed only once");
+
+    // And the decision woke the task.
+    const evts = await store.taskEvents(TENANT, TASK);
+    assert(evts.some((e) => e.kind === "operation.completed"), "completion event was appended");
+    await store.close().catch(() => {});
+  });
+
+  test("拒绝即不执行", "a denied call is never executed and the task is still woken", async () => {
+    const store = await fixture();
+    let performed = 0;
+    const plugin = {
+      id: "prod", version: "1.0.0",
+      tools: [{ name: "drop", summary: "", parameters: {}, sideEffects: "write" as const, idempotency: "none" as const }],
+      async invoke() { performed++; return {}; },
+    };
+    await store.addMount({
+      tenantId: TENANT, agentId: AGENT, alias: "prod", plugin: "prod",
+      installationId: "i", connectionId: null, toolVersion: "1.0.0",
+      publicConfig: {}, secretRef: null, policy: { write: "approval" },
+    });
+    const gw = new ToolGateway(store, [plugin], { async resolve() { return null; } });
+    const held = await gw.invoke({ tenantId: TENANT, agentId: AGENT, taskId: TASK }, "prod.drop", {});
+    const opId = (held as any).operationId;
+    const out = await gw.applyApproval(TENANT, opId, "denied", "alice");
+    assert(out.ok && !out.executed, "denied without executing");
+    eq(performed, 0, "never ran");
+    eq((await store.getOperation(TENANT, opId))!.status, "cancelled", "operation is cancelled");
+    await store.close().catch(() => {});
+  });
+
+  test("策略按 mount 生效", "policy is per mount, so two accounts of one plugin can differ", async () => {
+    const store = await fixture();
+    let performed = 0;
+    const plugin = {
+      id: "prod", version: "1.0.0",
+      tools: [{ name: "deploy", summary: "", parameters: {}, sideEffects: "write" as const, idempotency: "none" as const }],
+      async invoke() { performed++; return {}; },
+    };
+    for (const [alias, policy] of [["staging", null], ["production", { write: "approval" as const }]] as const) {
+      await store.addMount({
+        tenantId: TENANT, agentId: AGENT, alias, plugin: "prod",
+        installationId: `i-${alias}`, connectionId: null, toolVersion: "1.0.0",
+        publicConfig: {}, secretRef: null, policy,
+      });
+    }
+    const gw = new ToolGateway(store, [plugin], { async resolve() { return null; } });
+    const ctx = { tenantId: TENANT, agentId: AGENT, taskId: TASK };
+    eq((await gw.invoke(ctx, "staging.deploy", {})).status, "succeeded", "staging runs freely");
+    eq(performed, 1, "staging executed");
+    eq((await gw.invoke(ctx, "production.deploy", {})).status, "pending", "production is held");
+    eq(performed, 1, "production did not execute");
+    await store.close().catch(() => {});
+  });
+
+  test("策略拒绝", "a denied tool never reaches the plugin", async () => {
+    const store = await fixture();
+    let performed = 0;
+    const plugin = {
+      id: "prod", version: "1.0.0",
+      tools: [{ name: "nuke", summary: "", parameters: {}, sideEffects: "write" as const, idempotency: "none" as const }],
+      async invoke() { performed++; return {}; },
+    };
+    await store.addMount({
+      tenantId: TENANT, agentId: AGENT, alias: "prod", plugin: "prod",
+      installationId: "i", connectionId: null, toolVersion: "1.0.0",
+      publicConfig: {}, secretRef: null, policy: { tools: { nuke: "deny" } },
+    });
+    const gw = new ToolGateway(store, [plugin], { async resolve() { return null; } });
+    const r = await gw.invoke({ tenantId: TENANT, agentId: AGENT, taskId: TASK }, "prod.nuke", {});
+    eq(r.status, "rejected", "refused");
+    eq((r as any).error.code, "policy_denied", "and says why");
+    eq(performed, 0, "the plugin was never called");
     await store.close().catch(() => {});
   });
 
