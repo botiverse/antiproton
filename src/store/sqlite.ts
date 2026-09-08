@@ -89,6 +89,17 @@ CREATE INDEX IF NOT EXISTS operations_task ON operations(tenant_id, task_id, sta
 
 -- Config-time binding (alias -> installation + connection). The agent addresses
 -- a mount; credentials never reach it.
+CREATE TABLE IF NOT EXISTS quotas (
+  tenant_id TEXT NOT NULL, resource TEXT NOT NULL,
+  limit_value INTEGER, window_ms INTEGER,
+  used INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tenant_id, resource));
+
+CREATE TABLE IF NOT EXISTS connections (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
+  state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, agent_id, alias));
+
 CREATE TABLE IF NOT EXISTS mounts (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
@@ -557,6 +568,89 @@ export class SqliteStore implements StorageAdapter {
       publicConfig: JSON.parse(r.public_config),
       secretRef: r.secret_ref,
     };
+  }
+
+  #quotaRow(tenantId: string, resource: string) {
+    return this.#db
+      .prepare("SELECT * FROM quotas WHERE tenant_id=? AND resource=?")
+      .get(tenantId, resource) as any;
+  }
+
+  async setQuota(tenantId: string, resource: string, limit: number | null, windowMs: number | null = null) {
+    this.#db
+      .prepare(
+        `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+         VALUES (?,?,?,?,0,?)
+         ON CONFLICT(tenant_id, resource) DO UPDATE SET
+           limit_value=excluded.limit_value, window_ms=excluded.window_ms`,
+      )
+      .run(tenantId, resource, limit, windowMs, now());
+  }
+
+  async consumeQuota(tenantId: string, resource: string, amount: number) {
+    return this.#tx(() => {
+      const own = this.#quotaRow(tenantId, resource);
+      const fallback = own?.limit_value != null ? null : this.#quotaRow("*", resource);
+      const limit: number | null = own?.limit_value ?? fallback?.limit_value ?? null;
+      const windowMs: number | null = own?.window_ms ?? fallback?.window_ms ?? null;
+      const t = now();
+
+      let used = Number(own?.used ?? 0);
+      let windowStart = Number(own?.window_start ?? t);
+      // A window that has elapsed starts over; a lifetime cap never does.
+      if (windowMs != null && t - windowStart >= windowMs) { used = 0; windowStart = t; }
+
+      if (limit != null && used + amount > limit) {
+        this.#db
+          .prepare(
+            `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+             VALUES (?,?,?,?,?,?)
+             ON CONFLICT(tenant_id, resource) DO UPDATE SET used=excluded.used, window_start=excluded.window_start`,
+          )
+          .run(tenantId, resource, own?.limit_value ?? null, own?.window_ms ?? null, used, windowStart);
+        return { allowed: false, used, limit };
+      }
+      used += amount;
+      this.#db
+        .prepare(
+          `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(tenant_id, resource) DO UPDATE SET used=excluded.used, window_start=excluded.window_start`,
+        )
+        .run(tenantId, resource, own?.limit_value ?? null, own?.window_ms ?? null, used, windowStart);
+      return { allowed: true, used, limit };
+    });
+  }
+
+  async usage(tenantId: string) {
+    return (this.#db.prepare("SELECT * FROM quotas WHERE tenant_id=?").all(tenantId) as any[]).map((r) => ({
+      resource: r.resource, used: Number(r.used),
+      limit: r.limit_value == null ? null : Number(r.limit_value),
+      windowStart: Number(r.window_start),
+    }));
+  }
+
+  async getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null> {
+    const r = this.#db
+      .prepare("SELECT state, expires_at FROM connections WHERE tenant_id=? AND agent_id=? AND alias=?")
+      .get(tenantId, agentId, alias) as any;
+    // An expired session is not a session: returning it would send the plugin
+    // out with a token the far side has already rejected.
+    if (!r || (r.expires_at != null && Number(r.expires_at) <= now())) return null;
+    return JSON.parse(r.state);
+  }
+
+  async putConnection(
+    tenantId: string, agentId: string, alias: string, state: Json, expiresAt: number | null = null,
+  ) {
+    this.#db
+      .prepare(
+        `INSERT INTO connections(tenant_id, agent_id, alias, state, expires_at, updated_at)
+         VALUES (?,?,?,?,?,?)
+         ON CONFLICT(tenant_id, agent_id, alias) DO UPDATE SET
+           state=excluded.state, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
+      )
+      .run(tenantId, agentId, alias, j(state), expiresAt, now());
   }
 
   async addMount(m: MountRecord) {

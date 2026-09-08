@@ -45,7 +45,16 @@ const SCHEMA = [
      mount_alias TEXT NOT NULL, tool TEXT NOT NULL, tool_version TEXT NOT NULL, status TEXT NOT NULL,
      result_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS operations_task ON operations(tenant_id, task_id, status)`,
-  `CREATE TABLE IF NOT EXISTS mounts (
+`CREATE TABLE IF NOT EXISTS quotas (
+  tenant_id TEXT NOT NULL, resource TEXT NOT NULL,
+  limit_value INTEGER, window_ms INTEGER,
+  used INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tenant_id, resource));`,
+  `CREATE TABLE IF NOT EXISTS connections (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
+  state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, agent_id, alias));`,
+    `CREATE TABLE IF NOT EXISTS mounts (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL,
      connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL,
      secret_ref TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
@@ -232,7 +241,12 @@ export class DurableObjectStore implements StorageAdapter {
         ? this.#all("SELECT * FROM outbox WHERE state='pending' AND tenant_id=? ORDER BY created_at ASC LIMIT ?",
             tenantId, limit)
         : this.#all("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at ASC LIMIT ?", limit);
-      for (const r of rows) this.#sql.exec("UPDATE outbox SET state='claimed' WHERE command_id=?", r.command_id);
+      // Stamp the claim too: a dispatch that throws leaves the row 'claimed'
+      // for ever, and claimOutbox only ever looks at 'pending'.
+      for (const r of rows) {
+        this.#sql.exec("UPDATE outbox SET state='claimed', dispatched_at=? WHERE command_id=?",
+          this.#now(), r.command_id);
+      }
       return rows.map((r) => ({
         commandId: r.command_id, taskId: r.task_id, kind: r.kind, payload: JSON.parse(r.payload),
       }));
@@ -316,6 +330,73 @@ export class DurableObjectStore implements StorageAdapter {
     };
   }
 
+  #quotaRow(tenantId: string, resource: string) {
+    return this.#all("SELECT * FROM quotas WHERE tenant_id=? AND resource=?", tenantId, resource)[0] as any;
+  }
+
+  async setQuota(tenantId: string, resource: string, limit: number | null, windowMs: number | null = null) {
+    this.#sql.exec(
+      `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+       VALUES (?,?,?,?,0,?)
+       ON CONFLICT(tenant_id, resource) DO UPDATE SET
+         limit_value=excluded.limit_value, window_ms=excluded.window_ms`,
+      tenantId, resource, limit, windowMs, this.#now(),
+    );
+  }
+
+  async consumeQuota(tenantId: string, resource: string, amount: number) {
+    return this.#tx(() => {
+      const own = this.#quotaRow(tenantId, resource);
+      const fallback = own?.limit_value != null ? null : this.#quotaRow("*", resource);
+      const limit: number | null = own?.limit_value ?? fallback?.limit_value ?? null;
+      const windowMs: number | null = own?.window_ms ?? fallback?.window_ms ?? null;
+      const t = this.#now();
+
+      let used = Number(own?.used ?? 0);
+      let windowStart = Number(own?.window_start ?? t);
+      if (windowMs != null && t - windowStart >= windowMs) { used = 0; windowStart = t; }
+
+      const allowed = limit == null || used + amount <= limit;
+      if (allowed) used += amount;
+      this.#sql.exec(
+        `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+         VALUES (?,?,?,?,?,?)
+         ON CONFLICT(tenant_id, resource) DO UPDATE SET used=excluded.used, window_start=excluded.window_start`,
+        tenantId, resource, own?.limit_value ?? null, own?.window_ms ?? null, used, windowStart,
+      );
+      return { allowed, used, limit };
+    });
+  }
+
+  async usage(tenantId: string) {
+    return (this.#all("SELECT * FROM quotas WHERE tenant_id=?", tenantId) as any[]).map((r) => ({
+      resource: r.resource, used: Number(r.used),
+      limit: r.limit_value == null ? null : Number(r.limit_value),
+      windowStart: Number(r.window_start),
+    }));
+  }
+
+  async getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null> {
+    const r = this.#all(
+      "SELECT state, expires_at FROM connections WHERE tenant_id=? AND agent_id=? AND alias=?",
+      tenantId, agentId, alias,
+    )[0] as any;
+    if (!r || (r.expires_at != null && Number(r.expires_at) <= this.#now())) return null;
+    return JSON.parse(r.state);
+  }
+
+  async putConnection(
+    tenantId: string, agentId: string, alias: string, state: Json, expiresAt: number | null = null,
+  ) {
+    this.#sql.exec(
+      `INSERT INTO connections(tenant_id, agent_id, alias, state, expires_at, updated_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(tenant_id, agent_id, alias) DO UPDATE SET
+         state=excluded.state, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
+      tenantId, agentId, alias, JSON.stringify(state ?? null), expiresAt, this.#now(),
+    );
+  }
+
   async addMount(m: MountRecord) {
     this.#sql.exec(
       `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id, plugin,
@@ -352,6 +433,97 @@ export class DurableObjectStore implements StorageAdapter {
         LIMIT ?`,
       limit,
     ).map((r) => ({ tenantId: r.tenant_id, taskId: r.task_id }));
+  }
+
+  /**
+   * Commands that were handed to something outside this object and never came
+   * back. Offloading trades the object's billed wall clock for a failure mode
+   * the inline path did not have: if the dispatcher dies mid-flight the outbox
+   * row says "dispatched" and the task waits forever. Re-dispatch is safe
+   * because the result event's dedup key is derived from the command id.
+   *
+   * Not on StorageAdapter: only the offloading backend has this problem.
+   */
+  async staleDispatched(olderThanMs: number, limit = 10, kinds: string[] = ["model.request"]) {
+    // The kind filter is load-bearing, not a refinement. `:response` is the
+    // reply key for model.request alone; tool.call and js.execute answer under
+    // `:result` and message.out answers not at all. Without the filter every
+    // such row looks permanently un-answered, which made "is anything still in
+    // flight?" always true — alarms re-armed for ever, and the sweeper re-sent
+    // tool calls to the *model* dispatcher.
+    const marks = kinds.map(() => "?").join(",");
+    return this.#all(
+      `SELECT o.command_id, o.tenant_id, o.task_id, o.kind, o.payload, o.dispatched_at,
+              t.agent_id
+         FROM outbox o
+         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
+        WHERE o.state = 'dispatched'
+          AND o.kind IN (${marks})
+          AND t.status NOT IN ('completed','failed')
+          AND o.dispatched_at < ?
+          AND NOT EXISTS (
+                SELECT 1 FROM events e
+                 WHERE e.tenant_id = o.tenant_id
+                   AND e.dedup_key = 'cmd:' || o.command_id || ':response')
+        ORDER BY o.dispatched_at ASC LIMIT ?`,
+      ...kinds,
+      this.#now() - olderThanMs,
+      limit,
+    ).map((r) => ({
+      commandId: r.command_id, tenantId: r.tenant_id, agentId: r.agent_id,
+      taskId: r.task_id, kind: r.kind, payload: JSON.parse(r.payload),
+      dispatchedAt: Number(r.dispatched_at),
+    }));
+  }
+
+  /**
+   * A finished task that gets another message is not finished. The scheduler
+   * skips terminal tasks (see tasksWithPendingWork), so without this the reply
+   * is appended, nothing ever wakes, and the caller keeps reading the previous
+   * answer — which is exactly what the benchmark saw: six identical turns.
+   *
+   * `failed` is deliberately not reopened: that is a permanent state.
+   */
+  async reopenTask(tenantId: string, taskId: string): Promise<boolean> {
+    const r = this.#all("SELECT status FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId)[0] as any;
+    if (!r || !["completed", "blocked"].includes(r.status)) return false;
+    this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
+      this.#now(), tenantId, taskId);
+    return true;
+  }
+
+  /**
+   * Retrying for ever is not resilience. A command whose reply can never arrive
+   * — the task finished without it, the dispatcher is permanently broken — must
+   * eventually be given up on, or "is anything in flight?" never goes false and
+   * the object re-arms its alarm indefinitely.
+   */
+  async abandonStale(olderThanMs: number, kinds: string[] = ["model.request"]): Promise<number> {
+    const marks = kinds.map(() => "?").join(",");
+    const doomed = this.#all(
+      `SELECT command_id FROM outbox
+        WHERE state='dispatched' AND kind IN (${marks}) AND dispatched_at < ?
+          AND NOT EXISTS (SELECT 1 FROM events e
+                           WHERE e.tenant_id = outbox.tenant_id
+                             AND e.dedup_key = 'cmd:' || outbox.command_id || ':response')`,
+      ...kinds, this.#now() - olderThanMs,
+    );
+    for (const r of doomed) {
+      this.#sql.exec("UPDATE outbox SET state='abandoned' WHERE command_id=?", (r as any).command_id);
+    }
+    return doomed.length;
+  }
+
+  /** A claim whose dispatch threw is invisible to claimOutbox; hand it back. */
+  async reclaimStuckClaims(olderThanMs: number): Promise<number> {
+    const stuck = this.#all(
+      "SELECT command_id FROM outbox WHERE state='claimed' AND dispatched_at < ?",
+      this.#now() - olderThanMs,
+    );
+    for (const r of stuck) {
+      this.#sql.exec("UPDATE outbox SET state='pending' WHERE command_id=?", (r as any).command_id);
+    }
+    return stuck.length;
   }
 
   async listTasks(tenantId: string, agentId: string) {

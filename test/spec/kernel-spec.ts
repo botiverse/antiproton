@@ -1,8 +1,8 @@
 /**
  * Kernel conformance CONTRACT. Implementation-agnostic on purpose: the same
- * assertions run against sqlite, against db9 over pgwire, and against Durable
- * Object storage. A backend that passes this is a candidate; one that does not
- * is not, whatever else it offers.
+ * assertions run against sqlite in Node and against Durable Object storage at
+ * the edge. A backend that passes this is a candidate; one that does not is
+ * not, whatever else it offers.
  */
 import { Kernel, commandId, type HarnessAdapter } from "../../src/runtime/kernel.ts";
 import type { StorageAdapter } from "../../src/core/store.ts";
@@ -285,6 +285,117 @@ export async function kernelSpec(
     await store.close().catch(() => {});
   });
 
+
+  test("凭据派生的会话态", "connection state is per mount, survives calls, and expires", async () => {
+    const store = await fixture();
+    // Two mounts of the same plugin: different accounts of one service. Their
+    // sessions must not be able to see each other, or a token leaks sideways.
+    for (const alias of ["gh_work", "gh_personal"]) {
+      await store.addMount({
+        tenantId: TENANT, agentId: AGENT, alias, plugin: "github",
+        installationId: `inst-${alias}`, connectionId: null, toolVersion: "1.0.0",
+        publicConfig: {}, secretRef: `env:TOKEN_${alias}`,
+      });
+    }
+    eq(await store.getConnection(TENANT, AGENT, "gh_work"), null, "absent before first exchange");
+
+    await store.putConnection(TENANT, AGENT, "gh_work", { token: "work-1" });
+    eq((await store.getConnection(TENANT, AGENT, "gh_work") as any).token, "work-1", "readable again");
+    eq(await store.getConnection(TENANT, AGENT, "gh_personal"), null, "sibling mount unaffected");
+    eq(await store.getConnection(OTHER, AGENT, "gh_work"), null, "another tenant sees nothing");
+
+    await store.putConnection(TENANT, AGENT, "gh_work", { token: "work-2" });
+    eq((await store.getConnection(TENANT, AGENT, "gh_work") as any).token, "work-2", "refresh overwrites");
+
+    // An expired session must read as absent: handing it back sends the plugin
+    // out with a token the far side has already rejected.
+    await store.putConnection(TENANT, AGENT, "gh_personal", { token: "old" }, Date.now() - 1000);
+    eq(await store.getConnection(TENANT, AGENT, "gh_personal"), null, "expired reads as absent");
+    await store.close().catch(() => {});
+  });
+
+  test("检查点体积上限", "an oversized checkpoint is refused, not silently billed", async () => {
+    const store = await fixture();
+    const fat: HarnessAdapter = {
+      kind: "fat", stateVersion: 1,
+      async initialize() { return {}; },
+      async migrate(s: Json) { return s; },
+      async advance() {
+        // A harness that puts static configuration in its state.
+        return { state: { blob: "x".repeat(400_000) }, status: "runnable", commands: [], waits: [] };
+      },
+    };
+    await msg(store, "go");
+    const k = new Kernel(store, fat, { holder: "w1", maxCheckpointBytes: 256 * 1024 });
+    const r = await k.step(TENANT, TASK, null, async () => {});
+    eq(r.outcome, "rejected", "oversized checkpoint refused");
+    assert(String(r.reason).startsWith("checkpoint_too_large"), `reason: ${r.reason}`);
+    eq((await store.loadTask(TENANT, TASK))!.checkpointVersion, 0, "nothing was written");
+    await store.close().catch(() => {});
+  });
+
+  test("预算耗尽", "an exhausted tenant stops advancing instead of spending on", async () => {
+    const store = await fixture();
+    await store.setQuota(TENANT, "steps", 2);
+    const k = new Kernel(store, echoHarness, { holder: "w1" });
+
+    await msg(store, "one");
+    eq((await k.step(TENANT, TASK, null, async () => {})).outcome, "committed", "first step runs");
+    await msg(store, "two");
+    eq((await k.step(TENANT, TASK, null, async () => {})).outcome, "committed", "second step runs");
+
+    await msg(store, "three");
+    const r = await k.step(TENANT, TASK, null, async () => {});
+    eq(r.outcome, "rejected", "third step refused");
+    assert(String(r.reason).startsWith("quota_exceeded"), `reason: ${r.reason}`);
+    // Refusal must park the task, not leave it spinning on the same events.
+    eq((await store.loadTask(TENANT, TASK))!.status, "blocked", "task parked");
+    await store.close().catch(() => {});
+  });
+
+  test("预算跨租户隔离", "one tenant exhausting its budget does not touch another's", async () => {
+    const store = await fixture();
+    await store.setQuota(TENANT, "tool_calls", 1);
+    eq((await store.consumeQuota(TENANT, "tool_calls", 1)).allowed, true, "first allowed");
+    eq((await store.consumeQuota(TENANT, "tool_calls", 1)).allowed, false, "second refused");
+    // A different tenant has its own ledger, and no limit configured.
+    eq((await store.consumeQuota(OTHER, "tool_calls", 50)).allowed, true, "other tenant unaffected");
+    await store.close().catch(() => {});
+  });
+
+  test("账户级默认预算", "a tenant with no budget of its own inherits the account default", async () => {
+    const store = await fixture();
+    await store.setQuota("*", "model_tokens", 100);
+    eq((await store.consumeQuota(TENANT, "model_tokens", 60)).allowed, true, "within default");
+    eq((await store.consumeQuota(TENANT, "model_tokens", 60)).allowed, false, "default enforced");
+    // An explicit tenant budget overrides the account default.
+    await store.setQuota(OTHER, "model_tokens", 1000);
+    eq((await store.consumeQuota(OTHER, "model_tokens", 900)).allowed, true, "own budget wins");
+    await store.close().catch(() => {});
+  });
+
+  test("并发扣费不超支", "concurrent charges cannot both spend the last of a budget", async () => {
+    const store = await fixture();
+    await store.setQuota(TENANT, "tool_calls", 10);
+    const rs = await Promise.all(
+      Array.from({ length: 20 }, () => store.consumeQuota(TENANT, "tool_calls", 1)),
+    );
+    const granted = rs.filter((r) => r.allowed).length;
+    eq(granted, 10, "exactly the budget was granted");
+    const [u] = await store.usage(TENANT);
+    eq(u!.used, 10, "ledger agrees with what was granted");
+    await store.close().catch(() => {});
+  });
+
+  test("预算窗口重置", "a windowed budget refills, a lifetime cap does not", async () => {
+    const store = await fixture();
+    await store.setQuota(TENANT, "steps", 1, 50);
+    eq((await store.consumeQuota(TENANT, "steps", 1)).allowed, true, "first allowed");
+    eq((await store.consumeQuota(TENANT, "steps", 1)).allowed, false, "refused inside the window");
+    await new Promise((r) => setTimeout(r, 70));
+    eq((await store.consumeQuota(TENANT, "steps", 1)).allowed, true, "refilled after the window");
+    await store.close().catch(() => {});
+  });
 
   const results: SpecResult[] = [];
   for (const t of tests) {

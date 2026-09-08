@@ -101,10 +101,30 @@ export class ToolGateway {
 
     const credential = r.mount.secretRef ? await this.#secrets.resolve(r.mount.secretRef) : null;
     try {
+      const store = this.#store;
+      const secrets = this.#secrets;
+      const mount = r.mount;
+      const connectionFor = (alias: string) => ({
+        get: () => store.getConnection(ctx.tenantId, ctx.agentId, alias),
+        set: (state: Json, expiresAt?: number | null) =>
+          store.putConnection(ctx.tenantId, ctx.agentId, alias, state, expiresAt ?? null),
+      });
       const result = await plugin.invoke(r.tool, args, {
         caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
         credential,
-        publicConfig: r.mount.publicConfig,
+        publicConfig: mount.publicConfig,
+        // Scoped to the mount, not the plugin: two accounts of the same service
+        // must never see each other's session.
+        connection: connectionFor(mount.alias),
+        async sibling(alias: string) {
+          // Only this agent's own mounts: never a lookup by tenant or by plugin.
+          const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+          if (!other) return null;
+          return {
+            credential: other.secretRef ? await secrets.resolve(other.secretRef) : null,
+            connection: connectionFor(other.alias),
+          };
+        },
       });
       await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null);
       return { status: "succeeded", operationId, result };

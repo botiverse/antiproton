@@ -40,6 +40,20 @@ export function commandId(
 
 export type CrashPoint = "before_commit" | "after_commit" | null;
 
+/**
+ * A checkpoint is written on every advance, by every task, for every tenant, so
+ * its size is the framework's cost and not the harness's choice. One harness put
+ * a static 447-tool catalogue in its state and rewrote 211 KB per step; nothing
+ * refused it. Configuration belongs in the adapter, state belongs here, and the
+ * boundary needs enforcing rather than documenting.
+ */
+export const DEFAULT_MAX_CHECKPOINT_BYTES = 256 * 1024;
+
+/** Resources a tenant can exhaust. Charged where they are actually spent. */
+export const QUOTA_STEPS = "steps";
+export const QUOTA_MODEL_TOKENS = "model_tokens";
+export const QUOTA_TOOL_CALLS = "tool_calls";
+
 export interface StepResult {
   outcome:
     | "committed"
@@ -56,12 +70,12 @@ export class Kernel {
   // Explicit fields: node's strip-only TS mode rejects parameter properties.
   #store: StorageAdapter;
   #harness: HarnessAdapter;
-  #opts: { holder: string; leaseTtlMs?: number };
+  #opts: { holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number };
 
   constructor(
     store: StorageAdapter,
     harness: HarnessAdapter,
-    opts: { holder: string; leaseTtlMs?: number } = { holder: "worker-1" },
+    opts: { holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number } = { holder: "worker-1" },
   ) {
     this.#store = store;
     this.#harness = harness;
@@ -88,6 +102,20 @@ export class Kernel {
     const events = await this.#store.pendingEvents(tenantId, taskId, "harness");
     if (events.length === 0) return { outcome: "no_work" };
 
+    // The gate sits before the work, not after it. A tenant that is out of
+    // budget stops advancing at all, rather than being stopped later by
+    // whichever call happens to notice — which is how a runaway loop keeps
+    // spending while something downstream refuses it.
+    const gate = await this.#store.consumeQuota(tenantId, QUOTA_STEPS, 1);
+    if (!gate.allowed) {
+      await this.#store.commitAdvance({
+        tenantId, taskId, generation: task.generation, fencingToken: lease.fencingToken,
+        expectedCheckpointVersion: task.checkpointVersion, checkpoint: task.checkpoint,
+        status: "blocked", consumedThrough: null, waits: [], commands: [],
+      });
+      return { outcome: "rejected", reason: `quota_exceeded: ${QUOTA_STEPS} ${gate.used}/${gate.limit}` };
+    }
+
     const out = await this.#harness.advance({
       state: task.checkpoint,
       events,
@@ -104,6 +132,17 @@ export class Kernel {
       kind: c.kind,
       payload: c.payload,
     }));
+
+    // Refuse before committing, so an oversized checkpoint is a loud rejection
+    // rather than a per-step storage bill nobody notices.
+    const limit = this.#opts.maxCheckpointBytes ?? DEFAULT_MAX_CHECKPOINT_BYTES;
+    const size = JSON.stringify(out.state ?? null).length;
+    if (size > limit) {
+      return {
+        outcome: "rejected",
+        reason: `checkpoint_too_large: ${size} bytes exceeds ${limit}`,
+      };
+    }
 
     if (crashAt === "before_commit") return { outcome: "crashed_before_commit" };
 

@@ -12,9 +12,12 @@ import type {
 } from "./types.ts";
 
 /**
- * The seam the plan (§7.1 / §15 risk #1) requires: business state may live in
- * db9, but the Runtime's transactional path must be swappable. Any backend that
- * passes test/conformance.ts is a candidate.
+ * The seam the plan (§7.1 / §15 risk #1) requires: the Runtime's transactional
+ * path must be swappable, and a backend that does not pass the contract in
+ * test/spec/kernel-spec.ts is not a candidate, whatever else it offers.
+ *
+ * Two implementations keep the seam honest: SqliteStore in Node and
+ * DurableObjectStore at the edge.
  */
 export interface StorageAdapter {
   readonly name: string;
@@ -75,6 +78,56 @@ export interface StorageAdapter {
   ): Promise<"registered" | "already_satisfied">;
 
   interrupt(tenantId: string, taskId: string): Promise<number>;
+
+  /**
+   * Per-mount session state: what a plugin derives from a credential and needs
+   * again next call — an access token, a session cookie, a cursor.
+   *
+   * Not the credential itself (that stays behind secret_ref) and never visible
+   * to the model. Any integration whose auth is an exchange rather than a
+   * static header needs somewhere to put the result; without it every call has
+   * to re-authenticate, or the token ends up in the agent's context, which is
+   * exactly what config-time binding exists to prevent.
+   */
+  /**
+   * Atomic check-and-charge against a tenant's budget.
+   *
+   * A runaway loop costs real money and, in a shared service, starves everyone
+   * else — so this has to be durable (it survives a restart), atomic (two
+   * workers cannot both spend the last of it) and enforced at a choke point
+   * rather than trusted to callers.
+   *
+   * A tenant with no row of its own falls back to the row for "*", so a
+   * deployment sets one account-wide default instead of remembering to
+   * provision every tenant. No "*" row and no tenant row means unlimited,
+   * which is a deployment choice and is reported by `usage`.
+   */
+  consumeQuota(
+    tenantId: string,
+    resource: string,
+    amount: number,
+  ): Promise<{ allowed: boolean; used: number; limit: number | null }>;
+
+  /** Configure a budget. `limit: null` removes it. `windowMs: null` is a lifetime cap. */
+  setQuota(
+    tenantId: string,
+    resource: string,
+    limit: number | null,
+    windowMs?: number | null,
+  ): Promise<void>;
+
+  usage(tenantId: string): Promise<
+    Array<{ resource: string; used: number; limit: number | null; windowStart: number }>
+  >;
+
+  getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null>;
+  putConnection(
+    tenantId: string,
+    agentId: string,
+    alias: string,
+    state: Json,
+    expiresAt?: number | null,
+  ): Promise<void>;
 
   addMount(m: MountRecord): Promise<void>;
   getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;

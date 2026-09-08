@@ -9,12 +9,31 @@ export interface ToolSchema {
   idempotency: "native" | "key" | "none";
 }
 
+/** Where a plugin keeps what it derived from a credential. Scoped to one mount,
+ *  so two mounts of the same plugin never share a session. */
+export interface ConnectionState {
+  get(): Promise<Json | null>;
+  set(state: Json, expiresAt?: number | null): Promise<void>;
+}
+
 export interface PluginContext {
   /** Read-only identity of the caller. Plugins cannot use it to escalate. */
   caller: { tenantId: string; agentId: string; taskId: string };
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
   publicConfig: Record<string, Json>;
+  /** Survives across calls and across executions; never reaches the model. */
+  connection: ConnectionState;
+  /**
+   * Another mount of the same agent, by alias.
+   *
+   * Some actions genuinely need two connected accounts — "file this receipt
+   * into my drive" touches the store and the drive. Without this the plugin
+   * would have to ask the model for the second credential, which is the leak
+   * config-time binding exists to prevent. Scoped to this agent's own mounts,
+   * so it grants nothing the agent was not already configured to use.
+   */
+  sibling(alias: string): Promise<{ credential: string | null; connection: ConnectionState } | null>;
 }
 
 export interface Plugin {
