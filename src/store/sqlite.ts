@@ -8,6 +8,7 @@ import type {
   Lease,
   ApprovalRecord,
   ModelBinding,
+  MountPolicy,
   MountRecord,
   OperationRecord,
   OperationStatus,
@@ -219,6 +220,22 @@ export class SqliteStore implements StorageAdapter {
            state=excluded.state, state_version=excluded.state_version`,
       )
       .run(tenantId, taskId, throughSequence, j(state), stateVersion, now());
+  }
+
+  async pruneSnapshots(tenantId: string, taskId: string, keep: number) {
+    return this.#tx(() => {
+      const rows = this.#db
+        .prepare("SELECT through_sequence FROM snapshots WHERE tenant_id=? AND task_id=? ORDER BY through_sequence ASC")
+        .all(tenantId, taskId) as any[];
+      if (rows.length <= keep + 1) return 0;
+      const doomed = rows.slice(1, rows.length - keep);
+      for (const r of doomed) {
+        this.#db
+          .prepare("DELETE FROM snapshots WHERE tenant_id=? AND task_id=? AND through_sequence=?")
+          .run(tenantId, taskId, r.through_sequence);
+      }
+      return doomed.length;
+    });
   }
 
   async getSnapshot(tenantId: string, taskId: string, atOrBefore = Number.MAX_SAFE_INTEGER) {
@@ -819,6 +836,15 @@ export class SqliteStore implements StorageAdapter {
         m.plugin, m.toolVersion, j(m.publicConfig), m.secretRef,
         m.policy ? j(m.policy) : null,
       );
+  }
+
+  async updateMountPolicy(
+    tenantId: string, agentId: string, alias: string, policy: MountPolicy | null,
+  ) {
+    const r = this.#db
+      .prepare("UPDATE mounts SET policy=? WHERE tenant_id=? AND agent_id=? AND alias=?")
+      .run(policy ? j(policy) : null, tenantId, agentId, alias);
+    return Number(r.changes) > 0;
   }
 
   async getMountByAlias(tenantId: string, agentId: string, alias: string) {

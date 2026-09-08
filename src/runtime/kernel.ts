@@ -70,6 +70,10 @@ export const DEFAULT_MAX_CHECKPOINT_BYTES = 256 * 1024;
  */
 export const DEFAULT_SNAPSHOT_EVERY = 50;
 
+/** Snapshots to keep besides the first. Each holds the whole conversation, so
+ *  keeping them all is quadratic; keeping a few bounds rebuild just as well. */
+export const DEFAULT_SNAPSHOTS_KEPT = 3;
+
 /** Resources a tenant can exhaust. Charged where they are actually spent. */
 export const QUOTA_STEPS = "steps";
 export const QUOTA_MODEL_TOKENS = "model_tokens";
@@ -92,14 +96,16 @@ export class Kernel {
   #store: StorageAdapter;
   #harness: HarnessAdapter;
   #opts: {
-    holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number; snapshotEvery?: number;
+    holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number;
+    snapshotEvery?: number; snapshotsKept?: number;
   };
 
   constructor(
     store: StorageAdapter,
     harness: HarnessAdapter,
     opts: {
-      holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number; snapshotEvery?: number;
+      holder: string; leaseTtlMs?: number; maxCheckpointBytes?: number;
+      snapshotEvery?: number; snapshotsKept?: number;
     } = { holder: "worker-1" },
   ) {
     this.#store = store;
@@ -207,6 +213,9 @@ export class Kernel {
       try {
         await this.#store.putSnapshot(
           tenantId, taskId, consumed, out.state, this.#harness.stateVersion,
+        );
+        await this.#store.pruneSnapshots(
+          tenantId, taskId, this.#opts.snapshotsKept ?? DEFAULT_SNAPSHOTS_KEPT,
         );
       } catch { /* a missing snapshot only makes rebuild slower */ }
     }

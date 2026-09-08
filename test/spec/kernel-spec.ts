@@ -668,6 +668,29 @@ export async function kernelSpec(
     await store.close().catch(() => {});
   });
 
+  test("快照修剪", "snapshots are pruned without losing the ability to rewind", async () => {
+    const store = await fixture();
+    const k = new Kernel(store, echoHarness, { holder: "w1", snapshotEvery: 1, snapshotsKept: 2 });
+    const seqs: number[] = [];
+    for (const t of ["1", "2", "3", "4", "5", "6"]) {
+      seqs.push((await msg(store, t)).sequence);
+      await k.step(TENANT, TASK, null, async () => {});
+    }
+    // Each snapshot holds the whole conversation, so keeping every one is
+    // quadratic. Keeping a few bounds rebuild just as well.
+    const kept = await store.getSnapshot(TENANT, TASK);
+    assert(kept, "a recent snapshot survives");
+    // The oldest is kept, so a full rewind never starts from nothing.
+    const oldest = await store.getSnapshot(TENANT, TASK, 0);
+    assert(oldest && oldest.throughSequence === 0, "the first snapshot is never pruned");
+    // And the earliest point is still reachable through the log.
+    const early = await rebuildState(store, echoHarness, TENANT, TASK, seqs[0]!);
+    eq((early.state as any).log.length, 1, "rewind still works after pruning");
+    const now2 = await rebuildState(store, echoHarness, TENANT, TASK);
+    eq((now2.state as any).log.length, 6, "and so does the present");
+    await store.close().catch(() => {});
+  });
+
   const results: SpecResult[] = [];
   for (const t of tests) {
     try { await t.fn(); results.push({ row: t.row, name: t.name, ok: true }); }

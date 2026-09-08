@@ -21,6 +21,7 @@ import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
+import { demoPlugin } from "../../src/plugins/demo.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
@@ -116,6 +117,7 @@ export class AgentRuntime {
     const plugins: Plugin[] = [];
     plugins.push(
       githubPlugin,
+      demoPlugin,
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),
@@ -179,6 +181,11 @@ export class AgentRuntime {
     { alias: "artifacts", plugin: "artifacts", account: "builtin" },
     { alias: "gh_public", plugin: "github", account: "unauthenticated" },
   ];
+
+  /** The gateway, so an approval decided outside a task can act on it. */
+  gateway() {
+    return this.#gateway;
+  }
 
   async provision(
     tenantId: string,

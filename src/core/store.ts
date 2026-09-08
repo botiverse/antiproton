@@ -8,6 +8,7 @@ import type {
   OperationRecord,
   OperationStatus,
   RuntimeEvent,
+  MountPolicy,
   MountRecord,
   TaskRecord,
   WaitSpec,
@@ -40,6 +41,16 @@ export interface StorageAdapter {
   putSnapshot(
     tenantId: string, taskId: string, throughSequence: number, state: Json, stateVersion: number,
   ): Promise<void>;
+  /**
+   * Keep the oldest snapshot and the newest `keep`, drop the rest.
+   *
+   * Snapshots exist to bound rebuild cost, not to be a second history — the
+   * log is the history. Keeping every one is quadratic in a long task, because
+   * each holds the whole conversation and they are written at a fixed cadence.
+   * The oldest is kept so a full rewind never has to start from nothing.
+   */
+  pruneSnapshots(tenantId: string, taskId: string, keep: number): Promise<number>;
+
   /** The newest snapshot at or before `atOrBefore`. */
   getSnapshot(
     tenantId: string, taskId: string, atOrBefore?: number,
@@ -183,6 +194,17 @@ export interface StorageAdapter {
   ): Promise<ApprovalRecord[]>;
 
   addMount(m: MountRecord): Promise<void>;
+  /**
+   * Change a mount's policy after it exists.
+   *
+   * Needed because provisioning is not atomic: a run that created the mount and
+   * then failed to set its policy left a permanently permissive mount, and an
+   * "already exists" guard cemented it. Configuration has to be reconcilable,
+   * not just creatable.
+   */
+  updateMountPolicy(
+    tenantId: string, agentId: string, alias: string, policy: MountPolicy | null,
+  ): Promise<boolean>;
   getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;
   findMountsByPlugin(tenantId: string, agentId: string, plugin: string): Promise<MountRecord[]>;
   listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;

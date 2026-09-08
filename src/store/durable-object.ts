@@ -1,6 +1,6 @@
 import type { StorageAdapter } from "../core/store.ts";
 import type {
-  AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountRecord,
+  AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
 } from "../core/types.ts";
 
@@ -153,6 +153,21 @@ export class DurableObjectStore implements StorageAdapter {
        ON CONFLICT(tenant_id, task_id, through_sequence) DO UPDATE SET
          state=excluded.state, state_version=excluded.state_version`,
       tenantId, taskId, throughSequence, j(state), stateVersion, this.#now());
+  }
+
+  async pruneSnapshots(tenantId: string, taskId: string, keep: number) {
+    return this.#tx(() => {
+      const rows = this.#all(
+        "SELECT through_sequence FROM snapshots WHERE tenant_id=? AND task_id=? ORDER BY through_sequence ASC",
+        tenantId, taskId) as any[];
+      if (rows.length <= keep + 1) return 0;
+      const doomed = rows.slice(1, rows.length - keep);
+      for (const r of doomed) {
+        this.#sql.exec("DELETE FROM snapshots WHERE tenant_id=? AND task_id=? AND through_sequence=?",
+          tenantId, taskId, r.through_sequence);
+      }
+      return doomed.length;
+    });
   }
 
   async getSnapshot(tenantId: string, taskId: string, atOrBefore = Number.MAX_SAFE_INTEGER) {
@@ -543,6 +558,15 @@ export class DurableObjectStore implements StorageAdapter {
          tool_version, public_config, secret_ref, policy) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId, m.plugin, m.toolVersion,
       j(m.publicConfig), m.secretRef, m.policy ? j(m.policy) : null);
+  }
+
+  async updateMountPolicy(
+    tenantId: string, agentId: string, alias: string, policy: MountPolicy | null,
+  ) {
+    this.#sql.exec("UPDATE mounts SET policy=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+      policy ? j(policy) : null, tenantId, agentId, alias);
+    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+      tenantId, agentId, alias);
   }
 
   async getMountByAlias(tenantId: string, agentId: string, alias: string) {

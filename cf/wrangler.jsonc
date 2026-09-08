@@ -17,7 +17,9 @@
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     "HARNESS_MODEL": "deepseek-v4-pro",
-    "ARTIFACT_BUCKET": "harness-p0-artifacts"
+    "ARTIFACT_BUCKET": "harness-p0-artifacts",
+    // Flip to "0" once Cloudflare Access is in front of harness.botiverse.dev.
+    "UI_ALLOW_ANONYMOUS": "1"
   },
   "observability": { "enabled": true }
 }

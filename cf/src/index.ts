@@ -20,6 +20,7 @@ import { AgentRuntime, type ModelJob } from "./runtime.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
+import { page, transcript, approvals } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -28,6 +29,8 @@ export interface Env {
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   ARTIFACT_BUCKET: string;
+  /** "1" opens the demo UI with no Access identity. Off by default. */
+  UI_ALLOW_ANONYMOUS?: string;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
@@ -649,6 +652,80 @@ export class AgentDO extends DurableObject<Env> {
     return { ok: true };
   }
 
+  // -------------------------------------------------------------------- ui
+  //
+  // Everything the page needs, read straight from the store, so a panel can
+  // never disagree with the runtime.
+
+  /** Provisions the demo agent once: a read-only fleet tool plus writes that
+   *  need a human. The policy is what the whole page exists to show. */
+  async uiEnsure(tenantId: string, agentId: string, taskId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiEnsure", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      const existing = await rt.store.getMountByAlias(tenantId, agentId, "ops");
+      // Reconcile, do not merely notice: a run that created the mount and then
+      // failed to set its policy would otherwise stay permissive forever.
+      if (existing && !existing.policy) {
+        await rt.store.updateMountPolicy(tenantId, agentId, "ops", { write: "approval" });
+      }
+      if (!existing) {
+        // provision creates plain mounts; `ops` is added separately because it
+        // carries a policy, and creating it twice is a primary-key conflict.
+        await rt.provision(tenantId, agentId, [
+          { alias: "tools", plugin: "tools", account: "builtin" },
+        ]);
+        await rt.store.addMount({
+          tenantId, agentId, alias: "ops", plugin: "demo",
+          installationId: "inst-ops", connectionId: null, toolVersion: "1.0.0",
+          publicConfig: { account: "demo-fleet" }, secretRef: null,
+          policy: { write: "approval" },
+        });
+        await rt.bindOperatorModel(tenantId, agentId);
+      }
+      if (!(await rt.store.loadTask(tenantId, taskId))) {
+        await rt.openTask(tenantId, agentId, taskId);
+      }
+      return { ok: true };
+    });
+  }
+
+  async uiSay(tenantId: string, agentId: string, taskId: string, text: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiSay", async () => {
+      const rt = this.runtime();
+      const r = await rt.postMessage(tenantId, agentId, taskId, text);
+      await this.ctx.storage.setAlarm(Date.now());
+      return r;
+    });
+  }
+
+  async uiTranscript(tenantId: string, agentId: string, taskId: string) {
+    const rt = this.runtime();
+    await rt.ready();
+    return (await rt.store.taskEvents(tenantId, taskId)).map((e) => ({
+      sequence: e.sequence, kind: e.kind, payload: e.payload,
+    }));
+  }
+
+  async uiApprovals(tenantId: string, taskId: string) {
+    const rt = this.runtime();
+    await rt.ready();
+    return (await rt.store.listApprovals(tenantId)).filter((a) => a.taskId === taskId);
+  }
+
+  async uiDecide(tenantId: string, operationId: string, decision: "approved" | "denied", approver: string) {
+    return this.#busy("uiDecide", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      const out = await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
+      // The decision produced a completion event; let the agent pick it up.
+      await this.ctx.storage.setAlarm(Date.now());
+      return out;
+    });
+  }
+
   async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("startTask", async () => {
@@ -882,6 +959,42 @@ export class AgentDO extends DurableObject<Env> {
   }
 }
 
+const html = (body: string) =>
+  new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
+
+/**
+ * Who is signed in, according to Cloudflare Access.
+ *
+ * Access verifies the identity and passes it in a header; the app must not
+ * accept an identity from anywhere the caller controls. If the header is
+ * missing the deployment is unprotected, and that is worth showing on the page
+ * rather than hiding behind a default.
+ */
+function viewer(request: Request): string | null {
+  return request.headers.get("cf-access-authenticated-user-email");
+}
+
+/**
+ * The demo drives a real agent against the operator's own model account, so an
+ * open endpoint is an open cheque. It fails closed: without an Access identity
+ * the UI refuses, unless the deployment has explicitly said otherwise. A demo
+ * that quietly spends money is worse than no demo.
+ */
+function requireViewer(request: Request, env: Env): { who: string } | Response {
+  const who = viewer(request);
+  if (who) return { who };
+  if (env.UI_ALLOW_ANONYMOUS === "1") return { who: "anonymous (UNPROTECTED)" };
+  return new Response(
+    `<!doctype html><meta charset="utf-8"><title>agent-harness</title>` +
+    `<body style="font:14px ui-monospace,monospace;background:#0f1115;color:#d8dee9;padding:40px;max-width:44em">` +
+    `<h1 style="font-size:16px">not signed in</h1>` +
+    `<p>This page drives a real agent against the operator's model account, so it will not` +
+    ` run without an identity. Reach it through the Cloudflare Access–protected hostname,` +
+    ` or set <code>UI_ALLOW_ANONYMOUS=1</code> on the Worker to open it deliberately.</p>`,
+    { status: 401, headers: { "content-type": "text/html; charset=utf-8" } },
+  );
+}
+
 /** Stable serialisation so two databases compare by value, not key order.
  *  Must match bench/tau2/run.ts's `canon`, or the two runners disagree. */
 function canonJson(v: unknown): string {
@@ -932,7 +1045,19 @@ export default {
     let name: string;
     if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
     else if (url.pathname.startsWith("/bench")) name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
-    else if (url.pathname.startsWith("/agent")) {
+    else if (url.pathname.startsWith("/ui")) {
+      // One demo agent per signed-in person, so two people trying it at once
+      // do not share a conversation — and so the isolation is real, not a demo
+      // shortcut.
+      const gate = requireViewer(request, env);
+      if (gate instanceof Response) return gate;
+      const who = gate.who;
+      try {
+        name = agentObjectName("demo", `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`);
+      } catch (e: any) {
+        return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
+      }
+    } else if (url.pathname.startsWith("/agent")) {
       const body = request.method === "POST" ? await request.clone().json().catch(() => ({})) : {};
       const tenantId = String((body as any).tenantId ?? url.searchParams.get("tenantId") ?? "tenant-a");
       const agentId = String((body as any).agentId ?? url.searchParams.get("agentId") ?? "agent-1");
@@ -1029,6 +1154,63 @@ export default {
             out.guardSurvived = false;
           } catch { out.guardSurvived = true; }
           return Response.json(out);
+        }
+        // Confirms what Access actually injects, rather than trusting the
+        // header name. Also demonstrates that a client-supplied identity does
+        // not survive: Cloudflare strips cf-access-* from inbound requests.
+        case "/ui/whoami":
+          return Response.json({
+            viewer: viewer(request),
+            anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
+            cfHeaders: Object.fromEntries(
+              [...request.headers].filter(([k]) => k.startsWith("cf-")),
+            ),
+          });
+        case "/ui": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const who = gate.who;
+          const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
+          await stub.uiEnsure("demo", agentId, taskId);
+          return new Response(page(taskId, who), {
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
+        case "/ui/transcript": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const who = gate.who;
+          const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const taskId = String(url.searchParams.get("taskId"));
+          return html(transcript(await stub.uiTranscript("demo", agentId, taskId)));
+        }
+        case "/ui/approvals": {
+          const taskId = String(url.searchParams.get("taskId"));
+          return html(approvals(await stub.uiApprovals("demo", taskId)));
+        }
+        case "/ui/message": {
+          const form = await request.formData();
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const who = gate.who;
+          const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const taskId = String(form.get("taskId"));
+          const text = String(form.get("text") ?? "").trim();
+          if (text) await stub.uiSay("demo", agentId, taskId, text);
+          return html(transcript(await stub.uiTranscript("demo", agentId, taskId)));
+        }
+        case "/ui/decide": {
+          const form = await request.formData();
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const who = gate.who;
+          const decision = String(form.get("decision")) === "approved" ? "approved" : "denied";
+          // The approver is whoever Access says is signed in — an audit record
+          // with a name the caller chose would be worth nothing.
+          await stub.uiDecide("demo", String(form.get("operationId")), decision, who);
+          const taskId = `t_u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          return html(approvals(await stub.uiApprovals("demo", taskId)));
         }
         case "/isolation": {
           // Proves the property rather than asserting it: two tenants, two
