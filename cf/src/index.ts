@@ -485,6 +485,21 @@ export class AgentDO extends DurableObject<Env> {
       })),
       pendingWork: (await rt.store.tasksWithPendingWork(5)).length,
       alarm: await this.ctx.storage.getAlarm(),
+      alarmFailures: this.#alarmFailures(),
+      // The table exists only once an alarm has failed; diagnose must not be
+      // the thing that throws while explaining why something else did.
+      alarmErrors: (this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)"),
+        [...this.sql.exec(
+        "SELECT at, message FROM alarm_errors ORDER BY at DESC LIMIT 3")].map((r: any) => r.message)),
+      // Which commands are still out, and in what state. A task that stops for
+      // no visible reason is nearly always a row here that nothing is watching.
+      outbox: [...this.sql.exec(
+        `SELECT command_id, kind, state, created_at, dispatched_at FROM outbox
+          WHERE tenant_id=? AND task_id=? AND state != 'done' ORDER BY created_at DESC LIMIT 10`,
+        tenantId, taskId)].map((r: any) => ({
+          kind: r.kind, state: r.state,
+          ageMs: Date.now() - Number(r.dispatched_at ?? r.created_at),
+        })),
       // What the panel actually renders. "It is not replying" and "the reply is
       // not being drawn" look identical from outside, so show the rendering.
       rendered: await (async () => {
@@ -941,29 +956,71 @@ export class AgentDO extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + delayMs);
     return { armedAt: this.alarmSetAt, delayMs };
   }
+  /**
+   * Arm the next alarm *before* doing the work, not after.
+   *
+   * Re-arming at the end assumes the handler reaches the end. It does not
+   * always: an offloaded model call that outlives its `waitUntil` budget is
+   * cancelled by the platform, and the invocation that was going to schedule
+   * the next sweep dies with it. The task is then `waiting` with an unanswered
+   * command, no alarm, and nothing in existence that could ever wake it — the
+   * sweeper that was designed to rescue exactly this case never runs again.
+   *
+   * So the safety net goes up first and comes down only on a clean, idle pass.
+   * A handler that keeps throwing is bounded by #alarmFailures rather than
+   * retried for ever.
+   */
   async alarm() {
-    return this.#busy("alarm", async () => {
-      this.alarmFiredAt = Date.now();
-      this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-      this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
-      // The object may have been evicted since the alarm was armed, so this
-      // instance can be brand new: build the runtime rather than assuming it.
-      const rt = this.#activeRuntime();
-      // Offloaded commands whose dispatcher never reported back. Cheap query,
-      // and it is the only thing standing between a dead Worker and a task that
-      // waits forever.
-      const resent = await rt.sweepStale();
-      const { more } = await rt.drain(3);
-      await this.broadcast();
-      // Bounded work per invocation; if there is more, come back rather than
-      // holding one alarm open until the platform ends it.
-      if (more) await this.ctx.storage.setAlarm(Date.now() + 50);
-      // A task waiting on an offloaded model call has no pending work and would
-      // arm no alarm, so nothing would ever sweep it. Re-check later.
-      else if (resent > 0 || (await rt.hasOffloadInFlight())) {
-        await this.ctx.storage.setAlarm(Date.now() + 30_000);
-      }
-    });
+    const failures = this.#alarmFailures();
+    if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
+    try {
+      await this.#busy("alarm", async () => {
+        this.alarmFiredAt = Date.now();
+        this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
+        this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
+        // The object may have been evicted since the alarm was armed, so this
+        // instance can be brand new: build the runtime rather than assuming it.
+        const rt = this.#activeRuntime();
+        // Offloaded commands whose dispatcher never reported back. Cheap query,
+        // and it is the only thing standing between a dead Worker and a task
+        // that waits forever.
+        const resent = await rt.sweepStale();
+        const { more } = await rt.drain(3);
+        await this.broadcast();
+        // Bounded work per invocation; if there is more, come back rather than
+        // holding one alarm open until the platform ends it.
+        if (more) await this.ctx.storage.setAlarm(Date.now() + 50);
+        else if (resent > 0 || (await rt.hasOffloadInFlight())) {
+          await this.ctx.storage.setAlarm(Date.now() + 30_000);
+        } else {
+          // Genuinely idle: stand down rather than wake every 30s for ever.
+          await this.ctx.storage.deleteAlarm();
+        }
+      });
+      this.#alarmFailures(0);
+    } catch (e: any) {
+      // Recorded, not swallowed: a handler failing silently is how the last
+      // two stalls stayed invisible. The fallback alarm above means the next
+      // pass still happens.
+      this.#alarmFailures(failures + 1);
+      this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)");
+      this.sql.exec("INSERT INTO alarm_errors VALUES (?,?)",
+        Date.now(), String(e?.message ?? e).slice(0, 300));
+      throw e;
+    }
+  }
+
+  /** Consecutive alarm failures, so a permanently broken object stops retrying
+   *  instead of waking every 30 seconds until someone notices the bill. */
+  #alarmFailures(set?: number): number {
+    this.sql.exec("CREATE TABLE IF NOT EXISTS counters2(k TEXT PRIMARY KEY, v INTEGER)");
+    if (set !== undefined) {
+      this.sql.exec("INSERT INTO counters2(k,v) VALUES ('alarmFailures',?) " +
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v", set);
+      return set;
+    }
+    const r = this.sql.exec("SELECT v FROM counters2 WHERE k='alarmFailures'").toArray()[0] as any;
+    return Number(r?.v ?? 0);
   }
   async alarmStatus() {
     this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");

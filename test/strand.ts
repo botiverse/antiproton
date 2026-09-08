@@ -169,6 +169,35 @@ await check("无法翻译的调用会被要求重写，且有次数上限", asyn
   if (last.status !== "completed") throw new Error("the nudge never gives up");
 });
 
+await check("刚派发的命令不会被当成空闲", async () => {
+  const { store } = newStore();
+  await store.init();
+  await stranded(store, "k4");           // dispatched in this very millisecond
+  const n = await (store as any).outstandingCommands();
+  if (n !== 1) throw new Error(`a command dispatched now looked idle: ${n}`);
+});
+
+await check("本地执行掉了也会被重新排队", async () => {
+  const { store, clock } = newStore();
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k5", {});
+  const lease = (await store.acquireLease("t", "k5", "w1", 60_000))!;
+  await store.commitAdvance({
+    tenantId: "t", taskId: "k5", generation: 0, fencingToken: lease.fencingToken,
+    expectedCheckpointVersion: 0, checkpoint: {}, stateVersion: 1, status: "waiting",
+    consumedThrough: null, waits: [],
+    commands: [{ commandId: "cmd-js", kind: "js.execute", payload: { source: "output(1)" } }],
+  } as any);
+  for (const c of await store.claimOutbox(5)) await store.markDispatched(c.commandId);
+  clock.t += 60_000;
+  // model.request-only recovery leaves it stranded; js.execute must be covered.
+  const n = await (store as any).requeueStale(30_000, ["js.execute", "tool.call"]);
+  if (n !== 1) throw new Error(`a dead local command was not requeued: ${n}`);
+  const again = await store.claimOutbox(5);
+  if (!again.some((c) => c.commandId === "cmd-js")) throw new Error("requeued but not claimable");
+});
+
 console.log(`\n  Strand contract\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

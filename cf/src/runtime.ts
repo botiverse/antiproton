@@ -353,6 +353,8 @@ export class AgentRuntime {
   async sweepStale(olderThanMs = 45_000, giveUpAfterMs = 900_000): Promise<number> {
     if (!this.#deps.offloadModel) return 0;
     await this.ready();
+    // Retire what has already been answered, so "still dispatched" means it.
+    await this.store.settleAnswered();
     // Order matters: give up on the hopeless first, so a permanently broken
     // command cannot be re-sent on every alarm for the object's lifetime.
     // Turn each abandonment into a failure the harness can see. It already has
@@ -368,6 +370,9 @@ export class AgentRuntime {
       await this.store.reopenTask(c.tenantId, c.taskId);
     }
     await this.store.reclaimStuckClaims(olderThanMs);
+    // Work that runs inside this object can be lost too — the platform cancels
+    // the invocation and the row keeps saying `dispatched` for ever.
+    await this.store.requeueStale(olderThanMs, ["js.execute", "tool.call"]);
     const stale = await this.store.staleDispatched(olderThanMs, 5, OFFLOADABLE);
     for (const c of stale) {
       await this.#deps.offloadModel({
@@ -381,9 +386,11 @@ export class AgentRuntime {
   /** True while some command is out with a dispatcher. Such a task has no
    *  pending events, so nothing else would schedule the sweep. */
   async hasOffloadInFlight(): Promise<boolean> {
-    if (!this.#deps.offloadModel) return false;
     await this.ready();
-    return (await this.store.staleDispatched(0, 1, OFFLOADABLE)).length > 0;
+    // Every kind, not just the offloaded ones: a `js.execute` that died with
+    // the invocation running it needs the alarm just as much, and it is the
+    // alarm that requeues it.
+    return (await this.store.outstandingCommands()) > 0;
   }
 
   /**

@@ -720,6 +720,83 @@ export class DurableObjectStore implements StorageAdapter {
     }));
   }
 
+  /**
+   * Retire rows whose reply has already arrived. Nothing did this, so every
+   * command a task ever issued stayed `dispatched` for the life of the object:
+   * the table grew without bound and the state told you nothing, because the
+   * only thing distinguishing a finished command from a lost one was a
+   * subquery. Keeping the row's state true makes a stall visible at a glance.
+   */
+  async settleAnswered(): Promise<number> {
+    const done = this.#all(
+      `SELECT command_id FROM outbox
+        WHERE state IN ('pending','claimed','dispatched')
+          AND EXISTS (SELECT 1 FROM events e
+                       WHERE e.tenant_id = outbox.tenant_id
+                         AND e.dedup_key IN ('cmd:' || outbox.command_id || ':response',
+                                             'cmd:' || outbox.command_id || ':result'))`);
+    for (const r of done) {
+      this.#sql.exec("UPDATE outbox SET state='done' WHERE command_id=?", (r as any).command_id);
+    }
+    return done.length;
+  }
+
+  /**
+   * Is anything still out, at any age?
+   *
+   * The in-flight check used to reuse the age-based query with `olderThanMs: 0`,
+   * which compares `dispatched_at < now` — false for a command dispatched in the
+   * same millisecond as the check. Offloading a model request takes microseconds
+   * (the dispatcher answers 202 immediately), so the alarm handler regularly
+   * asked "is anything in flight?" in the very millisecond it had put something
+   * there, got "no", and deleted its own alarm. Age has no business in this
+   * question.
+   */
+  async outstandingCommands(kinds?: string[]): Promise<number> {
+    const filter = kinds?.length ? `AND o.kind IN (${kinds.map(() => "?").join(",")})` : "";
+    const rows = this.#all(
+      `SELECT COUNT(*) AS n FROM outbox o
+         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
+        WHERE o.state IN ('pending','claimed','dispatched') ${filter}
+          AND t.status NOT IN ('completed','failed')
+          AND NOT EXISTS (SELECT 1 FROM events e
+                           WHERE e.tenant_id = o.tenant_id
+                             AND e.dedup_key IN ('cmd:' || o.command_id || ':response',
+                                                 'cmd:' || o.command_id || ':result'))`,
+      ...(kinds ?? []));
+    return Number((rows[0] as any)?.n ?? 0);
+  }
+
+  /**
+   * Hand a command that died mid-flight back to the queue.
+   *
+   * Only offloaded model requests were ever recovered. A `js.execute` runs
+   * inside this object, so it seemed safe — until the invocation running it was
+   * cancelled by the platform, and the row sat `dispatched` with no result and
+   * nothing in existence that would run it again. Re-running is safe for the
+   * same reason re-dispatching is: the result event's dedup key is derived from
+   * the command id, and a replayed write answers `unknown` rather than
+   * executing twice.
+   */
+  async requeueStale(olderThanMs: number, kinds: string[]): Promise<number> {
+    const marks = kinds.map(() => "?").join(",");
+    const doomed = this.#all(
+      `SELECT o.command_id FROM outbox o
+         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
+        WHERE o.state = 'dispatched' AND o.kind IN (${marks})
+          AND t.status NOT IN ('completed','failed')
+          AND o.dispatched_at < ?
+          AND NOT EXISTS (SELECT 1 FROM events e
+                           WHERE e.tenant_id = o.tenant_id
+                             AND e.dedup_key = 'cmd:' || o.command_id || ':result')`,
+      ...kinds, this.#now() - olderThanMs);
+    for (const r of doomed) {
+      this.#sql.exec("UPDATE outbox SET state='pending', dispatched_at=NULL WHERE command_id=?",
+        (r as any).command_id);
+    }
+    return doomed.length;
+  }
+
   /** A claim whose dispatch threw is invisible to claimOutbox; hand it back. */
   async reclaimStuckClaims(olderThanMs: number): Promise<number> {
     const stuck = this.#all(
