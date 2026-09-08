@@ -175,11 +175,24 @@ export class HybridHarness implements HarnessAdapter {
   #offer(state: HybridState): { tools: ToolDefinition[]; addresses: Record<string, string> } {
     const tools: ToolDefinition[] = [];
     const addresses: Record<string, string> = {};
+    const missing: string[] = [];
     for (const name of state.offered) {
       const t = this.#byName.get(name);
-      if (!t) continue;
+      // A checkpoint naming tools this runtime cannot provide is a real
+      // inconsistency — the mounts changed under a running task. Skipping it
+      // quietly hands the agent a smaller toolset with no signal anywhere,
+      // which is the silent-degradation shape this codebase keeps being bitten
+      // by. Reconciling a deliberate catalogue change is what migrate() is for.
+      if (!t) { missing.push(name); continue; }
       tools.push({ name: t.name, description: t.description, parameters: t.parameters });
       addresses[t.name] = t.address;
+    }
+    if (missing.length) {
+      throw new Error(
+        `checkpoint offers ${missing.length} tool(s) this runtime does not have ` +
+        `(${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}); ` +
+        `reconcile the catalogue change in migrate()`,
+      );
     }
     tools.push(RUN_JS);
     return { tools, addresses };
@@ -244,6 +257,12 @@ export class HybridHarness implements HarnessAdapter {
 
   async migrate(state: Json): Promise<Json> {
     const s = state as any;
+    // Deliberate reconciliation: names the current catalogue no longer has are
+    // dropped here, where it is an explicit decision rather than a silent one.
+    if (Array.isArray(s?.offered) && this.#byName.size) {
+      const kept = s.offered.filter((n: string) => this.#byName.has(n));
+      if (kept.length !== s.offered.length) return { ...s, offered: kept };
+    }
     // v1 kept the catalogue in the checkpoint; v2 keeps only the names.
     if (Array.isArray(s?.tools) && !Array.isArray(s?.offered)) {
       return { ...s, offered: s.tools.map((t: any) => t.name).filter((n: string) => n !== "run_js"),

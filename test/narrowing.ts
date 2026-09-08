@@ -162,6 +162,30 @@ await test("名字冲突报错 — two mounts claiming one name is refused, not 
   eq(new Set(fixed.map((t) => t.name)).size, 2, "qualifier resolves it");
 });
 
+await test("目录不匹配响亮失败 — a checkpoint naming absent tools is an error, not a smaller toolset", async () => {
+  const cat = [...mk(10), ...DISCOVERY];
+  const h = new HybridHarness({ catalogue: cat });
+  const st: any = await h.initialize({});
+  st.offered.push("tool_from_a_mount_that_is_gone");
+  let threw = "";
+  try {
+    await h.advance({ state: st, events: [ev("message", { text: "hi" })] } as any);
+  } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("does not have"), `expected a loud failure, got: ${threw || "no error"}`);
+  assert(threw.includes("migrate"), "the error should say where to reconcile it");
+});
+
+await test("migrate 是和解的地方 — migrate drops names the catalogue no longer has", async () => {
+  const cat = [...mk(10), ...DISCOVERY];
+  const h = new HybridHarness({ catalogue: cat });
+  const st: any = await h.initialize({});
+  const m: any = await h.migrate({ ...st, offered: [...st.offered, "gone_tool"] });
+  assert(!m.offered.includes("gone_tool"), "unknown name dropped");
+  assert(m.offered.includes("tool_1"), "known names kept");
+  // And the reconciled state advances without throwing.
+  await h.advance({ state: m, events: [ev("message", { text: "hi" })] } as any);
+});
+
 console.log(`\n  progressive tool disclosure\n  ${"─".repeat(66)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
