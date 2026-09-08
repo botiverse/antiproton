@@ -23,6 +23,7 @@ import { envSecrets } from "../../src/runtime/gateway.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
+import { run9Plugin } from "../../src/plugins/run9.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
@@ -106,6 +107,9 @@ class BoundArtifacts {
 /** The one reference that maps to the operator's configured key. A tenant that
  *  wants its own account uses its own reference instead. */
 export const OPERATOR_SECRET_REF = "operator:model";
+/** Same idea for the sandbox account. Kept distinct so a tenant can be moved
+ *  onto its own run9 project without touching its model binding. */
+export const OPERATOR_RUN9_REF = "operator:run9";
 
 export interface RuntimeDeps {
   ctx: any;
@@ -120,6 +124,10 @@ export interface RuntimeDeps {
    * spending this key.
    */
   operatorModel?: { baseUrl: string; apiKey: string; model: string };
+  /** The operator's sandbox account, behind OPERATOR_RUN9_REF. Absent means the
+   *  `node` mount resolves to no credential and its tools refuse to run, which
+   *  is the right failure: a deployment without keys should not start boxes. */
+  operatorRun9?: { ak: string; sk: string };
   /**
    * Durable Objects bill wall clock, Workers bill CPU — and a model call is
    * ~94% waiting. Handing `model.request` to a Worker lets the object go idle
@@ -156,12 +164,18 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
+      run9Plugin,
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),
     );
     this.#plugins = plugins;
-    this.#gateway = new ToolGateway(this.store, plugins);
+    this.#gateway = new ToolGateway(this.store, plugins, {
+      resolve: async (ref) =>
+        ref === OPERATOR_RUN9_REF
+          ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
+          : envSecrets.resolve(ref),
+    });
     this.#harness = deps.harnessMode === "hybrid"
       ? new HybridHarness({ maxTurns: deps.maxTurns ?? 40 })
       : new CodegenHarness({ maxTurns: deps.maxTurns ?? 10 });

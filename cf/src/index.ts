@@ -16,7 +16,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { kernelSpec } from "../../test/spec/kernel-spec.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
-import { AgentRuntime, type ModelJob } from "./runtime.ts";
+import { AgentRuntime, OPERATOR_RUN9_REF, type ModelJob } from "./runtime.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
@@ -29,6 +29,9 @@ export interface Env {
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   ARTIFACT_BUCKET: string;
+  /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
+   *  mount exists but cannot start a container. */
+  RUN9?: string;
   /** "1" opens the demo UI with no Access identity. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
   /** Lets automation reach the endpoints that spend money, since Access sits
@@ -287,6 +290,7 @@ export class AgentDO extends DurableObject<Env> {
         apiKey: this.env.DEEPSEEK_API_KEY,
         model: this.env.HARNESS_MODEL,
       },
+      operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#runtime;
@@ -566,6 +570,7 @@ export class AgentDO extends DurableObject<Env> {
         apiKey: this.env.DEEPSEEK_API_KEY,
         model: this.env.HARNESS_MODEL,
       },
+      operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       extraPlugins: [this.#benchState().plugin()],
       // Matches bench/tau2/compare.ts's hybrid arm, so CF numbers sit alongside
       // the Node ones instead of measuring a different harness.
@@ -727,6 +732,18 @@ export class AgentDO extends DurableObject<Env> {
           tenantId, agentId, alias: "artifacts", plugin: "artifacts",
           installationId: "inst-artifacts", connectionId: null, toolVersion: "1.0.0",
           publicConfig: { account: "builtin" }, secretRef: null, policy: null,
+        });
+      }
+      // A real container, for the tasks that need one. Deliberately not
+      // provisioned by `provision`: it carries a credential, and the tools
+      // describe themselves as a last resort so the agent reaches for the free
+      // in-process JS first. The framework releases the box when the task ends.
+      if (!(await rt.store.getMountByAlias(tenantId, agentId, "node"))) {
+        await rt.store.addMount({
+          tenantId, agentId, alias: "node", plugin: "run9",
+          installationId: "inst-node", connectionId: null, toolVersion: "1.0.0",
+          publicConfig: { account: "sandbox" },
+          secretRef: OPERATOR_RUN9_REF, policy: null,
         });
       }
       if (!(await rt.store.getMountByAlias(tenantId, agentId, "web"))) {
