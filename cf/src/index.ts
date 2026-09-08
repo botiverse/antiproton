@@ -31,6 +31,9 @@ export interface Env {
   ARTIFACT_BUCKET: string;
   /** "1" opens the demo UI with no Access identity. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
+  /** Lets automation reach the endpoints that spend money, since Access sits
+   *  on the custom hostname and scripts cannot sign in through it. */
+  AUTOMATION_TOKEN?: string;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
@@ -995,6 +998,25 @@ function requireViewer(request: Request, env: Env): { who: string } | Response {
   );
 }
 
+/**
+ * Guards the endpoints that spend the operator's model account.
+ *
+ * Access protects the custom hostname, but the workers.dev address bypasses it
+ * entirely, and several routes there start a real agent. Either a Cloudflare
+ * identity or the automation secret is required; anything else is refused. The
+ * diagnostics (conformance, isolation, eviction) stay open because they call no
+ * provider and cost nothing.
+ */
+function guardSpending(request: Request, env: Env): Response | null {
+  if (viewer(request)) return null;
+  const supplied = request.headers.get("x-harness-token");
+  if (env.AUTOMATION_TOKEN && supplied === env.AUTOMATION_TOKEN) return null;
+  return Response.json(
+    { error: "this endpoint starts a real agent; sign in through Access or present x-harness-token" },
+    { status: 401 },
+  );
+}
+
 /** Stable serialisation so two databases compare by value, not key order.
  *  Must match bench/tau2/run.ts's `canon`, or the two runners disagree. */
 function canonJson(v: unknown): string {
@@ -1074,6 +1096,8 @@ export default {
         case "/conformance/kernel": return Response.json(await stub.runKernelSpec());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/agent/message": {
+          const g = guardSpending(request, env);
+          if (g) return g;
           const body = (await request.json()) as any;
           await stub.setOffload(String(body.offload ?? "1") !== "0");
           return Response.json(await stub.startTask(
@@ -1094,10 +1118,14 @@ export default {
           return Response.json({ ok: true });
         }
         case "/bench/start": {
+          const g = guardSpending(request, env);
+          if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchStart(String(b.taskId), String(b.policy ?? ""), b.offload !== false));
         }
         case "/bench/say": {
+          const g = guardSpending(request, env);
+          if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSay(String(b.taskId), String(b.text)));
         }
