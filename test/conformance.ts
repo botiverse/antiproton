@@ -1,17 +1,16 @@
-/** Runs the kernel contract against a Node-hosted backend.
- *  HARNESS_STORE=sqlite (default) | postgres */
+/** Runs the kernel contract against the Node-hosted backend.
+ *
+ *  There used to be a db9-over-pgwire backend here as well. It passed, but at
+ *  61s for twelve cases against sqlite's 162ms and the Durable Object's 0ms,
+ *  and without SERIALIZABLE it raised 40001 on plain concurrent inserts. Two
+ *  backends that both pass the contract is enough to keep the seam honest, and
+ *  the two that earn their place are sqlite and Durable Objects. */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { kernelSpec } from "./spec/kernel-spec.ts";
 import type { StorageAdapter } from "../src/core/store.ts";
 
-const BACKEND = process.env.HARNESS_STORE ?? "sqlite";
-const newStore = async (): Promise<StorageAdapter> => {
-  if (BACKEND === "postgres") {
-    const { PostgresStore } = await import("../src/store/postgres.ts");
-    return new PostgresStore({ connectionString: process.env.DB9_DSN!, max: 6 });
-  }
-  return new SqliteStore(":memory:");
-};
+const BACKEND = "sqlite";
+const newStore = async (): Promise<StorageAdapter> => new SqliteStore(":memory:");
 
 const t0 = Date.now();
 const results = await kernelSpec(newStore);
