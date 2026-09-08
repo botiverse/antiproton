@@ -441,7 +441,8 @@ export class SqliteStore implements StorageAdapter {
       .prepare(
         `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias,
            tool, tool_version, status, result_ref, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?, 'pending', NULL, ?, ?)`,
+         VALUES (?,?,?,?,?,?,?, 'pending', NULL, ?, ?)
+         ON CONFLICT(operation_id) DO NOTHING`,
       )
       .run(
         op.operationId,

@@ -108,7 +108,7 @@ async function runTask(taskId: string) {
   };
   const gw = new ToolGateway(store, plugins, secrets);
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
-  const host = { invoke: (c: { tool: string; args: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args) };
+  const host = { invoke: (c: { tool: string; args: any; opts?: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
 
   const every: MountedTool[] = qualifyMountedTools(
     plugins.flatMap((p) =>

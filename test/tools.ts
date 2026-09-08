@@ -135,6 +135,50 @@ test("unknown 语义", "a possibly-landed request is unknown, not failed", async
   await store.close();
 });
 
+test("写操作重放", "a replayed write is not performed twice", async () => {
+  let performed = 0;
+  const writer: Plugin = {
+    id: "github", version: "1.0.0",
+    tools: [{ name: "issues.create", summary: "", parameters: {}, sideEffects: "write", idempotency: "none" }],
+    async invoke() { performed++; return { ok: true }; },
+  };
+  const { store } = await fixture([["gh_work", null, "work"]]);
+  const gw2 = new ToolGateway(store, [writer], secrets);
+
+  const first = await gw2.invoke(ctx, "gh_work.issues.create", { title: "x" }, { idempotencyKey: "cmd1:0" });
+  eq(first.status, "succeeded", "first attempt runs");
+  eq(performed, 1, "performed once");
+
+  // The crash-and-replay case: same command, same call index, same key.
+  const replay = await gw2.invoke(ctx, "gh_work.issues.create", { title: "x" }, { idempotencyKey: "cmd1:0" });
+  eq(replay.status, "unknown", "a possibly-landed write is unknown, not repeated");
+  eq((replay as any).error.code, "already_attempted", "and says why");
+  eq(performed, 1, "the side effect did not happen twice");
+  eq((replay as any).operationId, (first as any).operationId, "same derived operation id");
+
+  // A different call index within the same command is a different operation.
+  await gw2.invoke(ctx, "gh_work.issues.create", { title: "y" }, { idempotencyKey: "cmd1:1" });
+  eq(performed, 2, "a genuinely different call still runs");
+  await store.close();
+});
+
+test("读操作重放", "a replayed read is simply re-executed", async () => {
+  let performed = 0;
+  const reader: Plugin = {
+    id: "github", version: "1.0.0",
+    tools: [{ name: "issues.list", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+    async invoke() { performed++; return []; },
+  };
+  const { store } = await fixture([["gh_work", null, "work"]]);
+  const gw2 = new ToolGateway(store, [reader], secrets);
+  const a = await gw2.invoke(ctx, "gh_work.issues.list", {}, { idempotencyKey: "cmd2:0" });
+  const b = await gw2.invoke(ctx, "gh_work.issues.list", {}, { idempotencyKey: "cmd2:0" });
+  eq(a.status, "succeeded", "first read succeeds");
+  eq(b.status, "succeeded", "replayed read succeeds too");
+  eq(performed, 2, "re-reading is harmless, so it is allowed");
+  await store.close();
+});
+
 let pass = 0, fail = 0;
 console.log(`\n  Tool gateway & mount addressing\n  ${"─".repeat(62)}`);
 for (const t of tests) {

@@ -69,8 +69,8 @@ async function runTask(task: any, verbose: boolean) {
   const gw = new ToolGateway(store, plugins);
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
   const host = {
-    async invoke(call: { tool: string; args: any }): Promise<ToolResult> {
-      return gw.invoke(ctx, call.tool, call.args);
+    async invoke(call: { tool: string; args: any; opts?: any }): Promise<ToolResult> {
+      return gw.invoke(ctx, call.tool, call.args, call.opts);
     },
   };
   const harness = new CodegenHarness({ maxTurns: 60 });

@@ -138,7 +138,11 @@ export class CommandExecutor {
       case "tool.call": {
         // A native tool call is dispatched through the very same host the sandbox
         // uses, so permission, budget and the operation record are identical.
-        const res = await this.#host.invoke({ tool: String(p.tool), args: p.args, opts: {} });
+        const res = await this.#host.invoke({
+          tool: String(p.tool), args: p.args,
+          // A native tool call is one command, so the command id is the key.
+          opts: { idempotencyKey: cmd.commandId },
+        });
         await charge(this.#store, ctx.tenantId, "tool_calls", 1);
         this.trace.push({ kind: "tool", detail: { tool: p.tool, status: (res as any).status } });
         await this.#store.appendEvent({
@@ -150,7 +154,18 @@ export class CommandExecutor {
         break;
       }
       case "js.execute": {
-        const r = await this.#executor.execute(String(p.source), this.#host, this.#limits);
+        // Each tool call inside one execution gets a stable key, so re-running
+        // this command after a crash reaches the same operation ids instead of
+        // minting new ones and repeating whatever they did.
+        let n = 0;
+        const host: ExecutorHost = {
+          invoke: (call) =>
+            this.#host.invoke({
+              ...call,
+              opts: { ...call.opts, idempotencyKey: `${cmd.commandId}:${n++}` },
+            }),
+        };
+        const r = await this.#executor.execute(String(p.source), host, this.#limits);
         await charge(this.#store, ctx.tenantId, "tool_calls", r.hostCalls);
         this.trace.push({
           kind: "js",

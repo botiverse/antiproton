@@ -69,7 +69,7 @@ async function codegenAgent(db: RetailDB, performed: any[]): Promise<Agent> {
   }
   const gw = new ToolGateway(store, plugins);
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
-  const host = { invoke: (c: { tool: string; args: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args) };
+  const host = { invoke: (c: { tool: string; args: any; opts?: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
   const compaction = process.env.COMPACTION === "cycles"
     ? { ...DEFAULT_COMPACTION, triggerTokens: Number(process.env.TRIGGER ?? 24000), keepCycles: Number(process.env.KEEP ?? 3) }
     : NO_COMPACTION;
@@ -119,7 +119,7 @@ async function hybridAgent(db: RetailDB, performed: any[]): Promise<Agent> {
   }
   const gw = new ToolGateway(store, plugins);
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
-  const host = { invoke: (c: { tool: string; args: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args) };
+  const host = { invoke: (c: { tool: string; args: any; opts?: any }): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
   const harness = new HybridHarness({ maxTurns: 40 });
   await store.createTask(T, AGENT, TASK, await harness.initialize({
     tools: retail.tools.map((x) => ({

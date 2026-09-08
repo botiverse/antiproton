@@ -261,7 +261,8 @@ export class DurableObjectStore implements StorageAdapter {
   async recordOperation(op: Omit<OperationRecord, "status" | "resultRef">) {
     this.#sql.exec(
       `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias, tool, tool_version,
-         status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?)`,
+         status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?)
+       ON CONFLICT(operation_id) DO NOTHING`,
       op.operationId, op.tenantId, op.agentId, op.taskId, op.mountAlias, op.tool, op.toolVersion,
       this.#now(), this.#now());
   }

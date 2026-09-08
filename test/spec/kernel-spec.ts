@@ -397,6 +397,34 @@ export async function kernelSpec(
     await store.close().catch(() => {});
   });
 
+  test("重放不重复副作用", "a replayed write is answered unknown, not performed twice", async () => {
+    const store = await fixture();
+    // Two calls under one key: the first records the attempt, the second must
+    // not repeat it. `unknown` is the honest answer — it may already have
+    // landed, which is precisely why it is not retried blindly.
+    const opId = (k: string) => `op_${k}`;
+    await store.recordOperation({
+      operationId: opId("k1"), tenantId: TENANT, agentId: AGENT, taskId: TASK,
+      mountAlias: "gh", tool: "github.issues.create", toolVersion: "1.0.0",
+    });
+    // A derived id is written once; a replay must not raise or duplicate.
+    await store.recordOperation({
+      operationId: opId("k1"), tenantId: TENANT, agentId: AGENT, taskId: TASK,
+      mountAlias: "gh", tool: "github.issues.create", toolVersion: "1.0.0",
+    });
+    const ops = await store.getOperation(TENANT, opId("k1"));
+    assert(ops, "the operation exists");
+    eq(ops!.status, "pending", "the first record stands; the replay did not reset it");
+    await store.completeOperation(TENANT, opId("k1"), "succeeded", null);
+    await store.recordOperation({
+      operationId: opId("k1"), tenantId: TENANT, agentId: AGENT, taskId: TASK,
+      mountAlias: "gh", tool: "github.issues.create", toolVersion: "1.0.0",
+    });
+    eq((await store.getOperation(TENANT, opId("k1")))!.status, "succeeded",
+       "a replay cannot roll a completed operation back to pending");
+    await store.close().catch(() => {});
+  });
+
   const results: SpecResult[] = [];
   for (const t of tests) {
     try { await t.fn(); results.push({ row: t.row, name: t.name, ok: true }); }

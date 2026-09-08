@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountRecord } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
@@ -65,7 +65,25 @@ export class ToolGateway {
     };
   }
 
-  async invoke(ctx: CallContext, raw: string, args: Json): Promise<ToolResult> {
+  /**
+   * `idempotencyKey` makes a call replayable.
+   *
+   * A command that crashed after dispatch is re-sent by the outbox, and the
+   * sandbox re-runs the same source — but every tool call inside it used to
+   * mint a fresh random operation id, so a write simply happened twice with
+   * nothing able to notice. Deriving the id from the key (the same trick the
+   * outbox already uses for command ids) makes the replay recognisable.
+   *
+   * A repeated read is re-executed, which is harmless. A repeated write is not
+   * executed again: it answers `unknown`, which is exactly what that status
+   * means — the request may already have landed.
+   */
+  async invoke(
+    ctx: CallContext,
+    raw: string,
+    args: Json,
+    opts: { idempotencyKey?: string } = {},
+  ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
     if ("error" in r) return { status: "rejected", error: r.error };
 
@@ -88,7 +106,28 @@ export class ToolGateway {
       return { status: "rejected", error: { code: "unknown_tool", message: r.tool } };
     }
 
-    const operationId = `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+    const schema = plugin.tools.find((t) => t.name === r.tool)!;
+    const operationId = opts.idempotencyKey
+      ? `op_${createHash("sha256").update(`${ctx.tenantId}|${ctx.taskId}|${opts.idempotencyKey}`).digest("hex").slice(0, 20)}`
+      : `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+
+    if (opts.idempotencyKey) {
+      const prior = await this.#store.getOperation(ctx.tenantId, operationId);
+      if (prior && schema.sideEffects === "write") {
+        return {
+          status: "unknown",
+          operationId,
+          error: {
+            code: "already_attempted",
+            message:
+              `${r.mount.alias}.${r.tool} was already attempted under this key ` +
+              `(status ${prior.status}); it may have landed, so it is not repeated`,
+          },
+        };
+      }
+      // A read is safe to redo; recordOperation below is a no-op on conflict.
+    }
+
     await this.#store.recordOperation({
       operationId,
       tenantId: ctx.tenantId,

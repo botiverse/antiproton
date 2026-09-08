@@ -140,8 +140,8 @@ export class AgentRuntime {
     const store = this.store;
     const artifacts = this.#artifacts;
     return {
-      async invoke(call: { tool: string; args: any }): Promise<ToolResult> {
-        const res = await gw.invoke(ctx, call.tool, call.args);
+      async invoke(call: { tool: string; args: any; opts?: any }): Promise<ToolResult> {
+        const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
         if (body.length <= OFFLOAD_BYTES) return res;
