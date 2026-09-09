@@ -974,10 +974,38 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
-  async uiTranscript(tenantId: string, agentId: string, taskId: string) {
+  /**
+   * @param tail how many of the most recent events to render, 0 for all.
+   *
+   * A long conversation is genuinely long: one here reached 2,362 events, which
+   * rendered to 1.31 MB of HTML that the page re-fetched and re-parsed every
+   * couple of seconds. Nobody reads the top of that, and the object pays to
+   * produce it each time.
+   */
+  /**
+   * Has anything changed?
+   *
+   * Cheap on purpose: the highest sequence plus whether the task is still
+   * moving. The panels poll every couple of seconds, and re-rendering a long
+   * conversation to discover that it is identical costs the object real time
+   * and the browser a full re-parse of a megabyte.
+   */
+  async uiVersion(tenantId: string, agentId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
-    const events = (await rt.store.taskEvents(tenantId, taskId)).map((e) => ({
+    const row = this.sql.exec(
+      "SELECT MAX(sequence) AS s, COUNT(*) AS n FROM events WHERE tenant_id=? AND task_id=?",
+      tenantId, taskId).toArray()[0] as any;
+    const task = await rt.store.loadTask(tenantId, taskId);
+    return `${row?.s ?? 0}.${row?.n ?? 0}.${task?.status ?? "none"}.${task?.checkpointVersion ?? 0}`;
+  }
+
+  async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0) {
+    const rt = this.runtime();
+    await rt.ready();
+    const all = await rt.store.taskEvents(tenantId, taskId);
+    const total = all.length;
+    const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
       sequence: e.sequence, kind: e.kind, payload: e.payload, createdAt: e.createdAt,
     }));
     const task = await rt.store.loadTask(tenantId, taskId);
@@ -996,7 +1024,8 @@ export class AgentDO extends DurableObject<Env> {
         byOp[a.operationId] = { state: a.state, approver: a.approver, tool: `${a.mountAlias}.${a.tool}`, request: a.request };
       }
     }
-    return { events, byOp, busy };
+    return {
+      total, shown: events.length, events, byOp, busy };
   }
 
   async uiApprovals(tenantId: string, taskId: string) {
@@ -1291,7 +1320,17 @@ export class AgentDO extends DurableObject<Env> {
 }
 
 const html = (body: string) =>
-  new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
+  new Response(body, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      // Set by notModified for this request, so the next poll can be answered
+      // with a 304 instead of a re-render.
+      // Not `etag`: Cloudflare strips that one on the way out, so a
+      // conditional request could never match. Measured, not assumed — the
+      // same value survives under a name the edge does not manage.
+      ...(lastEtag ? { "x-ap-version": lastEtag } : {}),
+    },
+  });
 
 /**
  * Who is signed in, according to Cloudflare Access.
@@ -1311,6 +1350,38 @@ function viewer(request: Request): string | null {
  * the UI refuses, unless the deployment has explicitly said otherwise. A demo
  * that quietly spends money is worse than no demo.
  */
+/**
+ * 304 for a panel whose task has not moved.
+ *
+ * htmx swaps only on a 2xx, so a 304 leaves the DOM alone: an unchanged panel
+ * costs one small query instead of rendering a megabyte and re-parsing it in
+ * the browser every couple of seconds.
+ *
+ * The version travels in a header of our own rather than `ETag` /
+ * `If-None-Match`, because Cloudflare strips `ETag` on the way out and the
+ * condition could then never match. That was found by sending both and seeing
+ * which arrived.
+ */
+async function notModified(
+  request: Request,
+  stub: { uiVersion(t: string, a: string, k: string): Promise<string> },
+  agentId: string,
+  taskId: string,
+): Promise<Response | null> {
+  if (!taskId || taskId === "null" || taskId === "undefined") return null;
+  const etag = await stub.uiVersion("demo", agentId, taskId);
+  if (request.headers.get("x-ap-version") === etag) {
+    return new Response(null, { status: 304, headers: { "x-ap-version": etag } });
+  }
+  // Stashed for the response below; the routes set it via the html() helper.
+  lastEtag = etag;
+  return null;
+}
+
+/** Set by notModified for the response that follows it. Single-threaded per
+ *  request in a Worker, so this cannot interleave. */
+let lastEtag: string | null = null;
+
 /** One identity, one agent. Was repeated at every route that needed it. */
 function uiAgent(who: string): string {
   return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
@@ -1594,8 +1665,19 @@ export default {
           const who = gate.who;
           const agentId = uiAgent(who);
           const taskId = String(url.searchParams.get("taskId"));
-          const t = await stub.uiTranscript("demo", agentId, taskId);
+          const unchanged = await notModified(request, stub, agentId, taskId);
+          if (unchanged) return unchanged;
+          const tail = url.searchParams.get("all") === "1" ? 0 : 120;
+          const t = await stub.uiTranscript("demo", agentId, taskId, tail);
           return html(
+            (t.total > t.shown
+              ? `<div class="hint" style="padding:0 0 8px">Showing the last ${t.shown} of
+                 ${t.total} events. <a href="?taskId=${encodeURIComponent(taskId)}&all=1"
+                 hx-get="/ui/transcript?taskId=${encodeURIComponent(taskId)}&all=1" hx-target="#panel"
+                 hx-swap="innerHTML" style="color:var(--accent);cursor:pointer">show all</a>
+                 — a long conversation renders to megabytes, and the page re-reads it
+                 every few seconds.</div>`
+              : "") +
             `<h3>where the time went</h3>${timeline(t.events)}` +
             `<h3>prompt cache, per model call</h3>${tokens(t.events)}` +
             `<h3>trajectory</h3>${trajectory(t.events, t.byOp, t.busy)}`);
@@ -1606,7 +1688,10 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
           const taskId = String(url.searchParams.get("taskId"));
-          const t = await stub.uiTranscript("demo", agentId, taskId);
+          const unchanged = await notModified(request, stub, agentId, taskId);
+          if (unchanged) return unchanged;
+          const tail = url.searchParams.get("all") === "1" ? 0 : 120;
+          const t = await stub.uiTranscript("demo", agentId, taskId, tail);
           return html(url.pathname === "/ui/chat"
             // The conversation alone; everything else about the run is in the
             // panels on the right.
@@ -1621,6 +1706,8 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
           const taskId = String(url.searchParams.get("taskId"));
+          const unchanged = await notModified(request, stub, agentId, taskId);
+          if (unchanged) return unchanged;
           const d = await stub.uiStorage("demo", agentId, taskId);
           return html(url.pathname === "/ui/storage" ? storage(d)
             : url.pathname === "/ui/memory" ? memoryPanel(d)

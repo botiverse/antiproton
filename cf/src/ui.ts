@@ -230,6 +230,20 @@ export function page(taskId: string, who: string, agentId: string): string {
     const p = window.__panel; if (!p) return;
     htmx.ajax('GET', p + '?taskId=${t}', { target: '#panel', swap: 'innerHTML' });
   }, 3000);
+
+  // Poll without re-rendering. Each panel remembers the version it last drew;
+  // the server answers 304 when nothing has moved, and htmx leaves the DOM
+  // alone. Without this a long conversation re-parses megabytes every few
+  // seconds and the page stops responding to scrolling.
+  window.__ver = {};
+  document.body.addEventListener('htmx:configRequest', (e) => {
+    const v = window.__ver[e.detail.path];
+    if (v) e.detail.headers['x-ap-version'] = v;
+  });
+  document.body.addEventListener('htmx:afterRequest', (e) => {
+    const v = e.detail.xhr && e.detail.xhr.getResponseHeader('x-ap-version');
+    if (v) window.__ver[e.detail.pathInfo.requestPath.split('?')[0]] = v;
+  });
 </script>
 </body></html>`;
 }
