@@ -34,7 +34,7 @@
   },
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
-    "HARNESS_MODEL": "deepseek-v4-pro",
+    "HARNESS_MODEL": "deepseek-v4.1-flash-expires-on-0910",
     "ARTIFACT_BUCKET": "antiproton-artifacts",
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.

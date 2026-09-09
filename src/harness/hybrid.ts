@@ -147,6 +147,16 @@ export class HybridHarness implements HarnessAdapter {
     if (opts.catalogue) this.#setCatalogue(opts.catalogue);
   }
 
+  /**
+    * The catalogue is configuration, not state, so it has to be reinstated
+    * whenever this object is rebuilt — after an eviction, on a fresh alarm —
+    * and not only when a task is opened. Without that, a resumed task carries a
+    * checkpoint naming tools the harness no longer knows, and `#offer` throws.
+    * It refuses rather than degrades on purpose; the caller's job is to keep it
+    * supplied.
+    */
+  setCatalogue(mounted: MountedTool[]) { this.#setCatalogue(mounted); }
+
   #setCatalogue(mounted: MountedTool[]) {
     for (const t of mounted) {
       // Silently overwriting would route ten apps' show_profile to whichever

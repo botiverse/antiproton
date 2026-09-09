@@ -186,6 +186,32 @@ await test("migrate 是和解的地方 — migrate drops names the catalogue no 
   await h.advance({ state: m, events: [ev("message", { text: "hi" })] } as any);
 });
 
+await test("a rebuilt harness must be given its catalogue again before advancing", async () => {
+  const catalogue = [
+    { name: "get", description: "fetch", parameters: { type: "object", properties: {} }, address: "web.get" },
+  ];
+  const first = new HybridHarness({ maxTurns: 10 });
+  const state = await first.initialize({ tools: catalogue });
+
+  // What an eviction leaves behind: the checkpoint survives, the instance does
+  // not. Advancing on a fresh harness that was never told the catalogue must
+  // refuse rather than quietly offer nothing.
+  const rebuilt = new HybridHarness({ maxTurns: 10 });
+  let refused = false;
+  try {
+    await rebuilt.advance({ state, events: [ev("message", { text: "go" })] } as any);
+  } catch (e) {
+    refused = /does not have/.test(String((e as Error).message));
+  }
+  assert(refused, "a harness without its catalogue must refuse, not degrade");
+
+  // Which is what the runtime reinstates before every advance.
+  rebuilt.setCatalogue(catalogue as any);
+  const out = await rebuilt.advance({ state, events: [ev("message", { text: "go" })] } as any);
+  const offered = (out.commands[0] as any)?.payload?.tools ?? [];
+  assert(offered.some((t: any) => t.name === "get"), "the catalogue is back");
+});
+
 console.log(`\n  progressive tool disclosure\n  ${"─".repeat(66)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

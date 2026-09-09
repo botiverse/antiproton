@@ -16,7 +16,9 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { kernelSpec } from "../../test/spec/kernel-spec.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
-import { AgentRuntime, OPERATOR_RUN9_REF, type ModelJob } from "./runtime.ts";
+import {
+  AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, type ModelJob,
+} from "./runtime.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
@@ -35,6 +37,8 @@ export interface Env {
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
    *  mount exists but cannot start a container. */
   RUN9?: string;
+  /** "codegen" to go back to the fenced-code convention; native otherwise. */
+  HARNESS_MODE?: string;
   /** "1" opens the demo UI with no Access identity. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
   /** Lets automation reach the endpoints that spend money, since Access sits
@@ -306,6 +310,13 @@ export class AgentDO extends DurableObject<Env> {
         model: this.env.HARNESS_MODEL,
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
+      // Native tool calling by default. The alternative asks the model to
+      // reply in a convention invented here, and a model under any pressure
+      // falls back to the one it was trained on — four different markups
+      // turned up in two days, each of which the harness mistook for a final
+      // answer. Providers have a channel for this; using it is not a
+      // preference.
+      harnessMode: this.env.HARNESS_MODE === "codegen" ? "codegen" : "hybrid",
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#runtime;
@@ -842,12 +853,16 @@ export class AgentDO extends DurableObject<Env> {
           await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy);
         }
       }
-      // Tied to the binding's own absence, not to whether a mount happened to
-      // be created in this pass: an agent that gains a new mount already has a
-      // model, and one provisioned by a half-finished run may not.
-      if (!(await rt.store.getModelBinding(tenantId, agentId))) {
-        await rt.bindOperatorModel(tenantId, agentId);
-      }
+      // Reconciled, not merely defaulted. The binding is written when an agent
+      // is provisioned and was then never touched again, so changing the
+      // deployment's model would silently apply to new agents only — the same
+      // creation-only drift that left a mount on a stale config twice already.
+      // An agent that brought its own credential is left alone; only the
+      // operator's own binding follows the operator's choice.
+      const binding = await rt.store.getModelBinding(tenantId, agentId);
+      const stale = binding?.secretRef === OPERATOR_SECRET_REF &&
+        (binding.model !== this.env.HARNESS_MODEL || binding.baseUrl !== this.env.DEEPSEEK_BASE_URL);
+      if (!binding || stale) await rt.bindOperatorModel(tenantId, agentId);
       if (!(await rt.store.loadTask(tenantId, taskId))) {
         await rt.openTask(tenantId, agentId, taskId);
       }

@@ -284,20 +284,37 @@ export class AgentRuntime {
     return { tenantId, agentId, model: m.model };
   }
 
-  async openTask(tenantId: string, agentId: string, taskId: string) {
+  /** Mounts as the model sees them: a plain name, plus the mount-qualified
+   *  address the harness dispatches to, because providers restrict name
+   *  charsets. */
+  async #catalogueFor(tenantId: string, agentId: string) {
     const records = await this.store.listMounts(tenantId, agentId);
-    const mounts = records.map((m) => ({
-      alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
-    }));
-    // The model sees a plain name; the harness keeps the mount-qualified address
-    // it dispatches to, because providers restrict tool-name charsets.
     const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
-    const tools = qualifyMountedTools(records.flatMap((m) =>
-      (byId.get(m.plugin)?.tools ?? []).map((t) => ({
-        name: t.name, description: t.summary, parameters: t.parameters,
-        address: `${m.alias}.${t.name}`,
+    return {
+      records,
+      mounts: records.map((m) => ({
+        alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
       })),
-    ));
+      tools: qualifyMountedTools(records.flatMap((m) =>
+        (byId.get(m.plugin)?.tools ?? []).map((t) => ({
+          name: t.name, description: t.summary, parameters: t.parameters,
+          address: `${m.alias}.${t.name}`,
+        })),
+      )),
+    };
+  }
+
+  /** Reinstate what a rebuilt harness lost. Configuration, not state: it is
+   *  derived from the mounts and must be there before any advance, not only
+   *  when a task is opened. */
+  async #reinstateCatalogue(tenantId: string, agentId: string) {
+    const h = this.#harness as { setCatalogue?: (t: unknown[]) => void };
+    if (typeof h.setCatalogue !== "function") return;
+    h.setCatalogue((await this.#catalogueFor(tenantId, agentId)).tools);
+  }
+
+  async openTask(tenantId: string, agentId: string, taskId: string) {
+    const { mounts, tools } = await this.#catalogueFor(tenantId, agentId);
     const policy = this.#deps.policy ? { policy: this.#deps.policy } : {};
     // What this agent wrote down on earlier tasks. Read here rather than in the
     // harness so the harness keeps holding no I/O of its own.
@@ -418,6 +435,7 @@ export class AgentRuntime {
         const task = await this.store.loadTask(tenantId, taskId);
         if (!task) continue;
         const callCtx = { tenantId, agentId: task.agentId, taskId };
+        await this.#reinstateCatalogue(tenantId, task.agentId);
         const commands = new CommandExecutor(
           this.store, (caller) => this.#models.resolve(caller), this.#host(callCtx), this.#executor,
           undefined, this.#offload(),
