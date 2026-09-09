@@ -12,7 +12,7 @@ import { R2Artifacts } from "../src/store/artifacts.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import type { ToolResult } from "../src/core/tools.ts";
 
-for (const line of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const line of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }
@@ -34,7 +34,7 @@ const artifacts = new R2Artifacts({
   endpoint: process.env.R2_ENDPOINT!,
   accessKeyId: process.env.R2_ACCESS_KEY_ID!,
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
-  bucket: "harness-p0-artifacts",
+  bucket: "antiproton-artifacts",
 });
 
 const OFFLOAD_BYTES = 8 * 1024;

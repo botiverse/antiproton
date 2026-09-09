@@ -83,11 +83,11 @@ border:1px solid var(--line);color:var(--dim)}
 export function page(taskId: string, who: string): string {
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>agent-harness</title>
+<title>antiproton</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
 <style>${CSS}</style></head><body>
 <header>
-  <h1>agent-harness</h1>
+  <h1>antiproton</h1>
   <span class="sub">durable · multi-tenant · the agent never holds a credential</span>
   <span class="sub" style="margin-left:auto">${esc(who)}</span>
 </header>

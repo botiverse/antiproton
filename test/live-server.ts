@@ -17,11 +17,11 @@ import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import type { ToolResult } from "../src/core/tools.ts";
 
-for (const line of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const line of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }
-const KEY = "demo-key", TENANT = "tenant-a", BUCKET = "harness-p0-artifacts";
+const KEY = "demo-key", TENANT = "tenant-a", BUCKET = "antiproton-artifacts";
 
 const store = new SqliteStore(":memory:");
 await store.init();

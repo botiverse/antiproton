@@ -1,4 +1,4 @@
-# agent-harness
+# antiproton
 
 A durable, multi-tenant runtime for agents that act on real systems.
 
@@ -157,7 +157,7 @@ test/             suites; test/spec/ is backend-agnostic
 
 ## Try it
 
-<https://harness.botiverse.dev/ui> — behind Cloudflare Access, owner only.
+<https://antiproton.botiverse.dev/ui> — behind Cloudflare Access, owner only.
 
 Ask it to change something (`Deploy version 2.0.0 to api-01`). Reads run
 freely; the write stops at the gate, the panel shows the request verbatim, and
@@ -167,9 +167,9 @@ Everything that starts a real agent fails closed: the demo needs an Access
 identity, and the workers.dev address — which bypasses Access entirely —
 requires an automation secret instead. The read-only diagnostics stay open
 because they call no provider and cost nothing:
-[`/conformance/kernel`](https://agent-harness-p0.botiverse.workers.dev/conformance/kernel),
-[`/isolation`](https://agent-harness-p0.botiverse.workers.dev/isolation),
-[`/eviction`](https://agent-harness-p0.botiverse.workers.dev/eviction).
+[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel),
+[`/isolation`](https://antiproton.botiverse.workers.dev/isolation),
+[`/eviction`](https://antiproton.botiverse.workers.dev/eviction).
 
 ## Running
 

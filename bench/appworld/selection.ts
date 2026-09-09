@@ -18,7 +18,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { appworldPlugins, type Catalogue } from "../../src/plugins/appworld.ts";
 import { qualifyMountedTools, type MountedTool } from "../../src/harness/hybrid.ts";
 
-for (const l of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }

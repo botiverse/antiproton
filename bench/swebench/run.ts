@@ -28,7 +28,7 @@ import { run9Plugin } from "../../src/plugins/run9.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 
-for (const l of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }

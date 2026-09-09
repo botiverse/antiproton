@@ -18,7 +18,7 @@ import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import type { ToolResult } from "../src/core/tools.ts";
 
-for (const line of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const line of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }
@@ -47,7 +47,7 @@ for (const m of [
 
 const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
 
-const BUCKET = "harness-p0-artifacts";
+const BUCKET = "antiproton-artifacts";
 const artifacts = new R2Artifacts({
   endpoint: process.env.R2_ENDPOINT!,
   accessKeyId: process.env.R2_ACCESS_KEY_ID!,

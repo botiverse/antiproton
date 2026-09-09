@@ -190,7 +190,7 @@ export const run9Plugin: Plugin = {
       await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
         box_id: boxId, source_image_ref: cfg.image,
         ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
-        description: `agent-harness ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
+        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
       });
       state = { boxId, createdAt: Date.now(), lastUsedAt: Date.now() };
       await ctx.connection.set(state as unknown as Json);

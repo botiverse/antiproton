@@ -14,12 +14,12 @@ import { createHash } from "node:crypto";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 
-for (const l of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }
 
-const BASE = process.env.CF_BASE ?? "https://agent-harness-p0.botiverse.workers.dev";
+const BASE = process.env.CF_BASE ?? "https://antiproton.botiverse.workers.dev";
 const here = new URL("./data/", import.meta.url).pathname;
 const BASE_DB: RetailDB = JSON.parse(readFileSync(here + "db.json", "utf8"));
 const TASKS: any[] = JSON.parse(readFileSync(here + "tasks.json", "utf8"));

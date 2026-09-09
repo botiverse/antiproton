@@ -21,7 +21,7 @@ import { retailPlugin, applyRetailAction, WRITE_TOOLS, type RetailDB } from "./r
 import type { ModelMessage, ToolDefinition } from "../../src/model/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 
-for (const l of readFileSync(`${homedir()}/.secrets/agent-harness.env`, "utf8").split("\n")) {
+for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }

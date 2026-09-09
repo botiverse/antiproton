@@ -1,4 +1,4 @@
-const BASE = process.env.CF_BASE ?? "https://agent-harness-p0.botiverse.workers.dev";
+const BASE = process.env.CF_BASE ?? "https://antiproton.botiverse.workers.dev";
 const TEXT = process.argv[2] ??
   "查一下 nodejs/node 仓库当前 open 的 issue，把标题以 'deps:' 开头的挑出来，给我编号和标题。你需要先自己发现有哪些可用工具。";
 

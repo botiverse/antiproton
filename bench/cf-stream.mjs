@@ -1,4 +1,4 @@
-const BASE = process.env.CF_BASE ?? "https://agent-harness-p0.botiverse.workers.dev";
+const BASE = process.env.CF_BASE ?? "https://antiproton.botiverse.workers.dev";
 const WS = BASE.replace(/^http/, "ws");
 const TEXT = process.argv[2] ?? "nodejs/node 最新 5 个 open issue 的编号和标题，简短列出即可。";
 

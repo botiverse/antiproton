@@ -1,4 +1,4 @@
-const BASE = process.env.CF_BASE ?? "https://agent-harness-p0.botiverse.workers.dev";
+const BASE = process.env.CF_BASE ?? "https://antiproton.botiverse.workers.dev";
 const show = (title, d) => {
   console.log(`\n  ${title}\n  ${"─".repeat(66)}`);
   if (!d.results) { console.log("  " + JSON.stringify(d).slice(0, 400)); return; }

@@ -145,7 +145,7 @@ export const httpPlugin: Plugin = {
         redirect: "manual",
         headers: {
           accept: a.accept ?? "text/plain, text/html;q=0.9, application/json;q=0.9, */*;q=0.1",
-          "user-agent": "agent-harness/0.1",
+          "user-agent": "antiproton/0.1",
         },
         signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
       });

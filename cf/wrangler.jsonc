@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/wrangler/config-schema.json",
-  "name": "agent-harness-p0",
+  "name": "antiproton",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat"],
@@ -10,16 +10,16 @@
     "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
-  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "harness-p0-artifacts" }],
+  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "antiproton-artifacts" }],
   // The only construct on this platform that owns work across invocations.
   // `waitUntil` does not: it is a promise attached to an invocation that has
   // already returned, and the platform cancels it when its budget runs out —
   // which stranded tasks with an unanswered model call and no way back.
   "queues": {
-    "producers": [{ "binding": "MODEL_QUEUE", "queue": "harness-model" }],
+    "producers": [{ "binding": "MODEL_QUEUE", "queue": "antiproton-model" }],
     "consumers": [
       {
-        "queue": "harness-model",
+        "queue": "antiproton-model",
         // One model call per invocation: batching would make a slow call hold
         // its neighbours, and the wait is the whole cost here.
         "max_batch_size": 1,
@@ -27,16 +27,16 @@
         // Then it stops being retried and becomes visible in the dead letter
         // queue, rather than being retried until someone notices the bill.
         "max_retries": 3,
-        "dead_letter_queue": "harness-model-dlq"
+        "dead_letter_queue": "antiproton-model-dlq"
       },
-      { "queue": "harness-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
+      { "queue": "antiproton-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
     ]
   },
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     "HARNESS_MODEL": "deepseek-v4-pro",
-    "ARTIFACT_BUCKET": "harness-p0-artifacts",
-    // Access now sits in front of harness.botiverse.dev; the UI fails closed
+    "ARTIFACT_BUCKET": "antiproton-artifacts",
+    // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.
     "UI_ALLOW_ANONYMOUS": "0"
   },

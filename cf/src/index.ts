@@ -1191,7 +1191,7 @@ function requireViewer(request: Request, env: Env): { who: string } | Response {
   }
   if (env.UI_ALLOW_ANONYMOUS === "1") return { who: "anonymous (UNPROTECTED)" };
   return new Response(
-    `<!doctype html><meta charset="utf-8"><title>agent-harness</title>` +
+    `<!doctype html><meta charset="utf-8"><title>antiproton</title>` +
     `<body style="font:14px ui-monospace,monospace;background:#0f1115;color:#d8dee9;padding:40px;max-width:44em">` +
     `<h1 style="font-size:16px">not signed in</h1>` +
     `<p>This page drives a real agent against the operator's model account, so it will not` +
@@ -1250,7 +1250,7 @@ async function latency(env: Env) {
     await time("r2.get 200B", () => env.ARTIFACTS.get("bench/small.bin").then((o) => o?.arrayBuffer())),
     await time("r2.put 1MB", () => env.ARTIFACTS.put("bench/big.bin", big)),
     await time("r2.get 1MB", () => env.ARTIFACTS.get("bench/big.bin").then((o) => o?.arrayBuffer())),
-    await time("fetch api.github.com", () => fetch("https://api.github.com/repos/nodejs/node", { headers: { "user-agent": "agent-harness/0.1" } }).then((r) => r.text())),
+    await time("fetch api.github.com", () => fetch("https://api.github.com/repos/nodejs/node", { headers: { "user-agent": "antiproton/0.1" } }).then((r) => r.text())),
     await time("fetch api.deepseek.com (unauth RTT)", () => fetch("https://api.deepseek.com/models").then((r) => r.text())),
   ]) out[r[0]] = r[1];
   return out;

@@ -6,7 +6,7 @@ const API = "https://api.github.com";
 async function get(path: string, ctx: PluginContext): Promise<Json> {
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
-    "user-agent": "agent-harness/0.1",
+    "user-agent": "antiproton/0.1",
   };
   // Credential injection happens here, at dispatch, never in the JS sandbox.
   if (ctx.credential) headers.authorization = `Bearer ${ctx.credential}`;
