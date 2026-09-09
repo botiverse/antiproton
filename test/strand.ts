@@ -205,6 +205,27 @@ await check("本地执行掉了也会被重新排队", async () => {
   if (!again.some((c) => c.commandId === "cmd-js")) throw new Error("requeued but not claimable");
 });
 
+await check("没有回复的命令也会销账", async () => {
+  const { store } = newStore();
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k6", {});
+  const lease = (await store.acquireLease("t", "k6", "w1", 60_000))!;
+  await store.commitAdvance({
+    tenantId: "t", taskId: "k6", generation: 0, fencingToken: lease.fencingToken,
+    expectedCheckpointVersion: 0, checkpoint: {}, stateVersion: 1, status: "waiting",
+    consumedThrough: null, waits: [],
+    commands: [{ commandId: "cmd-out", kind: "message.out", payload: { text: "done" } }],
+  } as any);
+  for (const c of await store.claimOutbox(5)) await store.markDispatched(c.commandId);
+  await (store as any).settleAnswered();
+  if ((await (store as any).outstandingCommands()) !== 0) {
+    throw new Error("a command that answers nothing counted as in flight for ever");
+  }
+  // And so it cannot block a message from rescuing the task.
+  if (!(await store.reopenTask("t", "k6"))) throw new Error("it still blocked the reopen");
+});
+
 console.log(`\n  Strand contract\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

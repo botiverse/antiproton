@@ -724,10 +724,19 @@ export class DurableObjectStore implements StorageAdapter {
     const done = this.#all(
       `SELECT command_id FROM outbox
         WHERE state IN ('pending','claimed','dispatched')
-          AND EXISTS (SELECT 1 FROM events e
-                       WHERE e.tenant_id = outbox.tenant_id
-                         AND e.dedup_key IN ('cmd:' || outbox.command_id || ':response',
-                                             'cmd:' || outbox.command_id || ':result'))`);
+          AND (
+            -- A reply arrived.
+            EXISTS (SELECT 1 FROM events e
+                     WHERE e.tenant_id = outbox.tenant_id
+                       AND e.dedup_key IN ('cmd:' || outbox.command_id || ':response',
+                                           'cmd:' || outbox.command_id || ':result'))
+            -- Or none was ever coming. message.out answers nothing by design,
+            -- so nothing retired it: the row said dispatched for the life of
+            -- the object, the console reported a command still in flight, and
+            -- worse, it counted as outstanding, which would stop a message
+            -- from rescuing a stranded task.
+            OR (kind = 'message.out' AND state = 'dispatched')
+          )`);
     for (const r of done) {
       this.#sql.exec("UPDATE outbox SET state='done' WHERE command_id=?", (r as any).command_id);
     }

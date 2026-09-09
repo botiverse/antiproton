@@ -20,7 +20,9 @@ import { AgentRuntime, OPERATOR_RUN9_REF, type ModelJob } from "./runtime.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
-import { page, trajectory, approvals } from "./ui.ts";
+import {
+  page, trajectory, approvals, eventList, storage, memoryPanel, runtimePanel, timeline, tokens,
+} from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -852,6 +854,64 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Everything this object is holding, for the debugging console.
+   *
+   * Reads the tables directly rather than through the storage adapter. The
+   * adapter is the seam two backends must both satisfy; a console that exists
+   * to show what *this* object contains has no business widening it, and every
+   * accessor added for the console alone would be one more thing to keep in
+   * parity for no reason.
+   */
+  async uiStorage(tenantId: string, agentId: string, taskId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const rows = (q: string, ...b: unknown[]) => [...this.sql.exec(q, ...b)] as any[];
+    const count = (t: string) => {
+      try { return Number((rows(`SELECT COUNT(*) AS n FROM ${t}`)[0] ?? {}).n ?? 0); }
+      catch { return 0; }
+    };
+    const tables = ["agents", "agent_state", "approvals", "connections", "counters", "cursors",
+      "events", "leases", "model_bindings", "mounts", "operations", "outbox", "quotas",
+      "snapshots", "tasks", "waits"];
+    return {
+      tenantId, agentId, taskId,
+      counts: Object.fromEntries(tables.map((t) => [t, count(t)])),
+      tasks: rows("SELECT * FROM tasks WHERE tenant_id=? AND agent_id=? ORDER BY updated_at DESC LIMIT 20",
+        tenantId, agentId),
+      outbox: rows(`SELECT command_id, kind, state, created_at, dispatched_at FROM outbox
+                     WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 40`, tenantId, taskId),
+      waits: rows("SELECT * FROM waits WHERE tenant_id=? AND task_id=? ORDER BY wait_id LIMIT 40",
+        tenantId, taskId),
+      cursors: rows("SELECT * FROM cursors WHERE tenant_id=? AND task_id=?", tenantId, taskId),
+      leases: rows("SELECT * FROM leases WHERE tenant_id=? AND task_id=?", tenantId, taskId),
+      operations: rows(`SELECT operation_id, tool, status, result_ref, created_at FROM operations
+                         WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 40`,
+        tenantId, taskId),
+      approvals: rows("SELECT * FROM approvals WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 20",
+        tenantId, taskId),
+      snapshots: rows(`SELECT through_sequence, LENGTH(state) AS bytes, state_version, created_at
+                         FROM snapshots WHERE tenant_id=? AND task_id=?
+                        ORDER BY through_sequence DESC LIMIT 20`, tenantId, taskId),
+      mounts: rows("SELECT alias, plugin, tool_version, public_config, secret_ref, policy FROM mounts WHERE tenant_id=? AND agent_id=?",
+        tenantId, agentId),
+      connections: rows("SELECT alias, state, expires_at, updated_at FROM connections WHERE tenant_id=? AND agent_id=?",
+        tenantId, agentId),
+      modelBinding: rows("SELECT * FROM model_bindings WHERE tenant_id=? AND agent_id=?", tenantId, agentId)[0] ?? null,
+      quotas: rows("SELECT * FROM quotas WHERE tenant_id=?", tenantId),
+      // The agent's own memory, whole rather than sampled: seeing what it
+      // believes is most of what this console is for.
+      state: (await rt.store.listState(tenantId, agentId, "", 50)).map((k) => ({ ...k })),
+      stateDocs: rows("SELECT key, value, ref, bytes, updated_at FROM agent_state WHERE tenant_id=? AND agent_id=? ORDER BY key LIMIT 20",
+        tenantId, agentId),
+      runtime: {
+        alarm: await this.ctx.storage.getAlarm(),
+        alarmFailures: this.#alarmFailures(),
+        activity: await this.activity(),
+      },
+    };
+  }
+
   async uiSay(tenantId: string, agentId: string, taskId: string, text: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiSay", async () => {
@@ -1199,6 +1259,11 @@ function viewer(request: Request): string | null {
  * the UI refuses, unless the deployment has explicitly said otherwise. A demo
  * that quietly spends money is worse than no demo.
  */
+/** One identity, one agent. Was repeated at every route that needed it. */
+function uiAgent(who: string): string {
+  return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+}
+
 function requireViewer(request: Request, env: Env): { who: string } | Response {
   const who = viewer(request);
   if (who) return { who };
@@ -1318,7 +1383,7 @@ export default {
       if (gate instanceof Response) return gate;
       const who = gate.who;
       try {
-        name = agentObjectName("demo", `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`);
+        name = agentObjectName("demo", uiAgent(who));
       } catch (e: any) {
         return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
       }
@@ -1451,10 +1516,10 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const agentId = uiAgent(who);
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
           await stub.uiEnsure("demo", agentId, taskId);
-          return new Response(page(taskId, who), {
+          return new Response(page(taskId, who, agentId), {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         }
@@ -1462,10 +1527,41 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const agentId = uiAgent(who);
           const taskId = String(url.searchParams.get("taskId"));
           const t = await stub.uiTranscript("demo", agentId, taskId);
-          return html(trajectory(t.events, t.byOp, t.busy));
+          return html(
+            `<h3>where the time went</h3>${timeline(t.events)}` +
+            `<h3>prompt cache, per model call</h3>${tokens(t.events)}` +
+            `<h3>trajectory</h3>${trajectory(t.events, t.byOp, t.busy)}`);
+        }
+        case "/ui/chat":
+        case "/ui/events": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          const taskId = String(url.searchParams.get("taskId"));
+          const t = await stub.uiTranscript("demo", agentId, taskId);
+          return html(url.pathname === "/ui/chat"
+            // The conversation alone: what a person said and what came back.
+            // Everything else about the run lives in the panels.
+            ? trajectory(t.events.filter((e: any) =>
+                e.kind === "message" || e.kind === "message.out" ||
+                (e.kind === "model.response" && !/```/.test(String(e.payload?.text ?? "")))),
+              t.byOp, t.busy)
+            : eventList(t.events));
+        }
+        case "/ui/storage":
+        case "/ui/memory":
+        case "/ui/runtime": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          const taskId = String(url.searchParams.get("taskId"));
+          const d = await stub.uiStorage("demo", agentId, taskId);
+          return html(url.pathname === "/ui/storage" ? storage(d)
+            : url.pathname === "/ui/memory" ? memoryPanel(d)
+            : runtimePanel(d));
         }
         case "/ui/approvals": {
           const taskId = String(url.searchParams.get("taskId"));
@@ -1476,7 +1572,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const agentId = uiAgent(who);
           const taskId = String(form.get("taskId"));
           const text = String(form.get("text") ?? "").trim();
           if (text) await stub.uiSay("demo", agentId, taskId, text);
@@ -1492,7 +1588,7 @@ export default {
           // The approver is whoever Access says is signed in — an audit record
           // with a name the caller chose would be worth nothing.
           await stub.uiDecide("demo", String(form.get("operationId")), decision, who);
-          const taskId = `t_u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+          const taskId = `t_${uiAgent(who)}`;
           return html(approvals(await stub.uiApprovals("demo", taskId)));
         }
         case "/isolation": {
