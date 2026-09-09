@@ -606,46 +606,6 @@ export class DurableObjectStore implements StorageAdapter {
     ).map((r) => ({ tenantId: r.tenant_id, taskId: r.task_id }));
   }
 
-  /**
-   * Commands that were handed to something outside this object and never came
-   * back. Offloading trades the object's billed wall clock for a failure mode
-   * the inline path did not have: if the dispatcher dies mid-flight the outbox
-   * row says "dispatched" and the task waits forever. Re-dispatch is safe
-   * because the result event's dedup key is derived from the command id.
-   *
-   * Not on StorageAdapter: only the offloading backend has this problem.
-   */
-  async staleDispatched(olderThanMs: number, limit = 10, kinds: string[] = ["model.request"]) {
-    // The kind filter is load-bearing, not a refinement. `:response` is the
-    // reply key for model.request alone; tool.call and js.execute answer under
-    // `:result` and message.out answers not at all. Without the filter every
-    // such row looks permanently un-answered, which made "is anything still in
-    // flight?" always true — alarms re-armed for ever, and the sweeper re-sent
-    // tool calls to the *model* dispatcher.
-    const marks = kinds.map(() => "?").join(",");
-    return this.#all(
-      `SELECT o.command_id, o.tenant_id, o.task_id, o.kind, o.payload, o.dispatched_at,
-              t.agent_id
-         FROM outbox o
-         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
-        WHERE o.state = 'dispatched'
-          AND o.kind IN (${marks})
-          AND t.status NOT IN ('completed','failed')
-          AND o.dispatched_at < ?
-          AND NOT EXISTS (
-                SELECT 1 FROM events e
-                 WHERE e.tenant_id = o.tenant_id
-                   AND e.dedup_key = 'cmd:' || o.command_id || ':response')
-        ORDER BY o.dispatched_at ASC LIMIT ?`,
-      ...kinds,
-      this.#now() - olderThanMs,
-      limit,
-    ).map((r) => ({
-      commandId: r.command_id, tenantId: r.tenant_id, agentId: r.agent_id,
-      taskId: r.task_id, kind: r.kind, payload: JSON.parse(r.payload),
-      dispatchedAt: Number(r.dispatched_at),
-    }));
-  }
 
   /**
    * A finished task that gets another message is not finished. The scheduler
@@ -689,36 +649,6 @@ export class DurableObjectStore implements StorageAdapter {
     return appr.length > 0;
   }
 
-  /**
-   * Retrying for ever is not resilience. A command whose reply can never arrive
-   * — the task finished without it, the dispatcher is permanently broken — must
-   * eventually be given up on, or "is anything in flight?" never goes false and
-   * the object re-arms its alarm indefinitely.
-   */
-  async abandonStale(
-    olderThanMs: number,
-    kinds: string[] = ["model.request"],
-  ): Promise<Array<{ tenantId: string; agentId: string; taskId: string; commandId: string }>> {
-    const marks = kinds.map(() => "?").join(",");
-    const doomed = this.#all(
-      `SELECT o.command_id, o.tenant_id, o.task_id, t.agent_id FROM outbox o
-         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
-        WHERE o.state='dispatched' AND o.kind IN (${marks}) AND o.dispatched_at < ?
-          AND NOT EXISTS (SELECT 1 FROM events e
-                           WHERE e.tenant_id = o.tenant_id
-                             AND e.dedup_key = 'cmd:' || o.command_id || ':response')`,
-      ...kinds, this.#now() - olderThanMs,
-    );
-    for (const r of doomed) {
-      this.#sql.exec("UPDATE outbox SET state='abandoned' WHERE command_id=?", (r as any).command_id);
-    }
-    // The caller turns each of these into a failure event. Giving up quietly is
-    // what stranded a task for two hours: the alarm stopped, the status stayed
-    // `waiting`, and nothing was left that could ever wake it.
-    return doomed.map((r: any) => ({
-      tenantId: r.tenant_id, agentId: r.agent_id, taskId: r.task_id, commandId: r.command_id,
-    }));
-  }
 
   /**
    * Retire rows whose reply has already arrived. Nothing did this, so every

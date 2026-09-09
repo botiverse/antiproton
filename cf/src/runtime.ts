@@ -347,50 +347,36 @@ export class AgentRuntime {
   }
 
   /**
-   * Re-hands commands whose dispatcher never reported back. Safe to run on every
-   * alarm: the result event's dedup key collapses a duplicate reply.
+   * What is left for this object to look after now that the queue owns the
+   * model call.
+   *
+   * Everything that used to be here — re-dispatching a model request whose
+   * reply never came, giving up on it after fifteen minutes, keeping an alarm
+   * alive so that sweep could happen at all — was a reimplementation of
+   * "redeliver until acked". The queue does that, and does it whether or not
+   * this object is awake. What it cannot do is recover work that runs *inside*
+   * the object: a `js.execute` whose invocation the platform cancelled leaves a
+   * row saying `dispatched` with no result and nothing that would run it again.
+   * That, and only that, is swept here.
    */
-  async sweepStale(olderThanMs = 45_000, giveUpAfterMs = 900_000): Promise<number> {
-    if (!this.#deps.offloadModel) return 0;
+  async sweepStale(olderThanMs = 45_000): Promise<number> {
     await this.ready();
     // Retire what has already been answered, so "still dispatched" means it.
     await this.store.settleAnswered();
-    // Order matters: give up on the hopeless first, so a permanently broken
-    // command cannot be re-sent on every alarm for the object's lifetime.
-    // Turn each abandonment into a failure the harness can see. It already has
-    // a bounded retry for `model.failed`, so the task recovers or gives a real
-    // answer; before this it simply stopped, still reading "working".
-    for (const c of await this.store.abandonStale(giveUpAfterMs, OFFLOADABLE)) {
-      await appendModelFailure(
-        this.store,
-        { tenantId: c.tenantId, agentId: c.agentId, taskId: c.taskId },
-        c.commandId,
-        `no reply after ${Math.round(giveUpAfterMs / 1000)}s; the request was abandoned`,
-      );
-      await this.store.reopenTask(c.tenantId, c.taskId);
-    }
     await this.store.reclaimStuckClaims(olderThanMs);
-    // Work that runs inside this object can be lost too — the platform cancels
-    // the invocation and the row keeps saying `dispatched` for ever.
-    await this.store.requeueStale(olderThanMs, ["js.execute", "tool.call"]);
-    const stale = await this.store.staleDispatched(olderThanMs, 5, OFFLOADABLE);
-    for (const c of stale) {
-      await this.#deps.offloadModel({
-        tenantId: c.tenantId, agentId: c.agentId, taskId: c.taskId,
-        commandId: c.commandId, payload: c.payload,
-      });
-    }
-    return stale.length;
+    return this.store.requeueStale(olderThanMs, ["js.execute", "tool.call"]);
   }
 
   /** True while some command is out with a dispatcher. Such a task has no
    *  pending events, so nothing else would schedule the sweep. */
+  /**
+   * Local work still outstanding — the only reason this object now needs an
+   * alarm of its own. A task waiting on a model call needs no alarm at all: the
+   * queue will deliver the reply, and delivering it wakes the object.
+   */
   async hasOffloadInFlight(): Promise<boolean> {
     await this.ready();
-    // Every kind, not just the offloaded ones: a `js.execute` that died with
-    // the invocation running it needs the alarm just as much, and it is the
-    // alarm that requeues it.
-    return (await this.store.outstandingCommands()) > 0;
+    return (await this.store.outstandingCommands(["js.execute", "tool.call"])) > 0;
   }
 
   /**

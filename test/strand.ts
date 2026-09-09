@@ -65,37 +65,44 @@ async function stranded(store: DurableObjectStore, taskId: string) {
   return claimed;
 }
 
-await check("给up 的命令会变成可见的失败", async () => {
-  const { store, clock } = newStore();
+/** End a command the way a reply from the queue's consumer does. */
+async function answer(store: DurableObjectStore, taskId: string, commandId: string) {
+  await store.appendEvent({
+    tenantId: "t", agentId: "a", taskId, kind: "model.failed",
+    payload: { error: "gave up" }, dedupKey: `cmd:${commandId}:response`,
+  });
+  await (store as any).settleAnswered();
+}
+
+await check("已答复的命令不再算在途", async () => {
+  const { store } = newStore();
   await store.init();
   const claimed = await stranded(store, "k1");
-  const gone = await (clock.t += 60_000, (store as any).abandonStale(30_000, ["model.request"]));
-  if (gone.length !== 1) throw new Error(`expected 1 abandoned, got ${gone.length}`);
-  const c = gone[0];
-  if (c.tenantId !== "t" || c.agentId !== "a" || c.taskId !== "k1") {
-    throw new Error(`abandonment lost its context: ${JSON.stringify(c)}`);
+  if ((await (store as any).outstandingCommands()) !== 1) throw new Error("a dispatched command was not counted");
+  await answer(store, "k1", claimed[0]!.commandId);
+  if ((await (store as any).outstandingCommands()) !== 0) {
+    throw new Error("an answered command still counts as in flight");
   }
-  if (c.commandId !== claimed[0]!.commandId) throw new Error("wrong command reported");
 });
 
 await check("搁浅的任务可被消息救活", async () => {
-  const { store, clock } = newStore();
+  const { store } = newStore();
   await store.init();
-  await stranded(store, "k2");
+  const c2 = await stranded(store, "k2");
   // While the command is still out, a message must NOT restart the task: the
   // reply is coming and restarting would double the work.
   if (await store.reopenTask("t", "k2")) throw new Error("reopened while a command was in flight");
-  await (clock.t += 60_000, (store as any).abandonStale(30_000, ["model.request"]));
+  await answer(store, "k2", c2[0]!.commandId);
   if (!(await store.reopenTask("t", "k2"))) throw new Error("a stranded task stayed unreachable");
   const t = await store.loadTask("t", "k2");
   if (t?.status !== "runnable") throw new Error(`expected runnable, got ${t?.status}`);
 });
 
 await check("等待审批的任务不会被消息绕过", async () => {
-  const { store, clock } = newStore();
+  const { store } = newStore();
   await store.init();
-  await stranded(store, "k3");
-  await (clock.t += 60_000, (store as any).abandonStale(30_000, ["model.request"]));
+  const c3 = await stranded(store, "k3");
+  await answer(store, "k3", c3[0]!.commandId);
   await store.requireApproval({
     tenantId: "t", agentId: "a", taskId: "k3", operationId: "op1",
     mountAlias: "ops", tool: "restart", request: {},

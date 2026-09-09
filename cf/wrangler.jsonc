@@ -10,10 +10,28 @@
     "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
-  // Self, via a named entrypoint: reachable from this Worker's own code but not
-  // routable over HTTP, so offloaded model jobs need no shared secret.
-  "services": [{ "binding": "DISPATCH", "service": "agent-harness-p0", "entrypoint": "ModelDispatcher" }],
   "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "harness-p0-artifacts" }],
+  // The only construct on this platform that owns work across invocations.
+  // `waitUntil` does not: it is a promise attached to an invocation that has
+  // already returned, and the platform cancels it when its budget runs out —
+  // which stranded tasks with an unanswered model call and no way back.
+  "queues": {
+    "producers": [{ "binding": "MODEL_QUEUE", "queue": "harness-model" }],
+    "consumers": [
+      {
+        "queue": "harness-model",
+        // One model call per invocation: batching would make a slow call hold
+        // its neighbours, and the wait is the whole cost here.
+        "max_batch_size": 1,
+        "max_batch_timeout": 0,
+        // Then it stops being retried and becomes visible in the dead letter
+        // queue, rather than being retried until someone notices the bill.
+        "max_retries": 3,
+        "dead_letter_queue": "harness-model-dlq"
+      },
+      { "queue": "harness-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
+    ]
+  },
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     "HARNESS_MODEL": "deepseek-v4-pro",

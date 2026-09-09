@@ -41,9 +41,11 @@ export interface Env {
     load(code: WorkerCode): WorkerStub;
     get(id: string, cb: () => Promise<WorkerCode> | WorkerCode): WorkerStub;
   };
-  /** Self, via a named entrypoint. Named entrypoints are not routable over
-   *  HTTP, so this needs no shared secret to keep the public internet out. */
-  DISPATCH: { fetch(request: Request): Promise<Response> };
+  /** Where a model call goes to be waited on. A queue, because a queue is the
+   *  only thing here that owns work across invocations: it redelivers until the
+   *  consumer acks, and gives up into a dead letter queue rather than silently.
+   *  The message carries ids only — the transcript stays in the object. */
+  MODEL_QUEUE: { send(body: unknown): Promise<void> };
 }
 type WorkerCode = {
   compatibilityDate: string;
@@ -94,50 +96,60 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
  * to waitUntil. If this runtime ever stops honouring waitUntil past the return,
  * the fallback is to await inline: slower and no cheaper, but never a lost task.
  */
-export class ModelDispatcher extends WorkerEntrypoint<Env> {
-  /**
-   * Entered over a service binding as a *fetch*, not an RPC method.
-   *
-   * Measured, not assumed: with an RPC method the reply took a mean of 59.3s
-   * against a ~6s provider call — `ctx.waitUntil` did not keep the work moving
-   * once the RPC session closed, so the completion only progressed when some
-   * later event happened to wake the Worker. A fetch handler's waitUntil does
-   * outlive its response, which is the whole mechanism this depends on.
-   *
-   * Named entrypoints are not routable over HTTP, so this still needs no shared
-   * secret to keep the public internet out.
-   */
-  async fetch(request: Request): Promise<Response> {
-    const { job, doId } = (await request.json()) as { job: ModelJob; doId: string };
-    this.ctx.waitUntil(this.#run(job, doId));
-    return new Response(null, { status: 202 });
-  }
-
-  async #run(job: ModelJob, doId: string) {
-    const stub = this.env.AGENT.get(this.env.AGENT.idFromString(doId));
-    try {
-      // Defence in depth: a job that is not a model request must never reach a
-      // provider. It would fail confusingly and write a model.failed event
-      // under another command's key.
-      if (!Array.isArray((job.payload as any)?.messages)) {
-        throw new Error(`not a model request: ${JSON.stringify(job.payload).slice(0, 80)}`);
-      }
-      const model = new OpenAiCompatibleModel({
-        baseUrl: this.env.DEEPSEEK_BASE_URL,
-        apiKey: this.env.DEEPSEEK_API_KEY,
-        model: this.env.HARNESS_MODEL,
-      });
-      const t0 = Date.now();
-      const res = await runModelCommand(model, job.payload);
-      const modelMs = Date.now() - t0;
-      await stub.deliverModel(job, { ok: true, res, modelMs });
-    } catch (e: any) {
-      // A model call that produced nothing still has to wake the task, or the
-      // agent parks forever waiting for a reply that will never come.
-      await stub.deliverModel(job, { ok: false, error: String(e?.message ?? e) });
-    }
-  }
+/**
+ * The model call, waited on where waiting is free.
+ *
+ * A Worker bills CPU, not wall clock, so a sixty-second provider call costs
+ * almost nothing here; the same wait inside the Durable Object is billed by
+ * duration, which is the entire reason the call leaves the object at all.
+ *
+ * What changed is who owns the work while it is out. This used to be
+ * `ctx.waitUntil` in a fetch handler — a promise attached to an invocation that
+ * had already returned 202, which the platform cancels once its budget is
+ * spent. When that happened the provider call died, `deliverModel` was never
+ * reached, and the task sat `waiting` on a reply that no longer existed. The
+ * sweeper, the give-up timer and the requeue logic were all attempts to notice
+ * that from the outside. A queue does not need noticing: the message is not
+ * acked until this returns, so a cancelled invocation is simply redelivered.
+ */
+interface QueuedModelCall {
+  doId: string;
+  tenantId: string;
+  agentId: string;
+  taskId: string;
+  commandId: string;
 }
+
+async function runQueuedModelCall(m: QueuedModelCall, env: Env) {
+  const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
+  const job = await stub.takeModelJob(m.commandId);
+  // Already answered — a redelivery after success, which must not call the
+  // provider again.
+  if (!job) return;
+  if (!Array.isArray((job.payload as any)?.messages)) {
+    throw new Error(`not a model request: ${JSON.stringify(job.payload).slice(0, 80)}`);
+  }
+  const model = new OpenAiCompatibleModel({
+    baseUrl: env.DEEPSEEK_BASE_URL,
+    apiKey: env.DEEPSEEK_API_KEY,
+    model: env.HARNESS_MODEL,
+  });
+  const t0 = Date.now();
+  const res = await runModelCommand(model, job.payload);
+  await stub.deliverModel(job, { ok: true, res, modelMs: Date.now() - t0 });
+}
+
+/** Out of retries. The task has to hear about it, or it waits for ever. */
+async function failLoudly(m: QueuedModelCall, env: Env) {
+  const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
+  const job = await stub.takeModelJob(m.commandId);
+  if (!job) return;
+  await stub.deliverModel(job, {
+    ok: false,
+    error: "the model call failed repeatedly and was given up on",
+  });
+}
+
 
 /**
  * One Durable Object per (tenant, agent).
@@ -365,7 +377,7 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  /** Called by ModelDispatcher when the completion lands. */
+  /** Called by the queue consumer once the completion lands. */
   async deliverModel(
     job: ModelJob,
     outcome: { ok: true; res: any; modelMs?: number } | { ok: false; error: string },
@@ -440,15 +452,43 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
+  /**
+   * Hand the model call to the queue and forget it.
+   *
+   * Only the ids travel. The payload is a whole transcript — well past the
+   * 128 KB message limit on a long task — and it is already durable in this
+   * object, so sending it would be duplicating the log into a channel that
+   * cannot hold it.
+   */
   async #dispatch(job: ModelJob): Promise<void> {
-    const res = await this.env.DISPATCH.fetch(
-      new Request("https://dispatch.internal/model", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ job, doId: this.ctx.id.toString() }),
-      }),
-    );
-    if (res.status !== 202) throw new Error(`dispatcher refused: ${res.status}`);
+    await this.env.MODEL_QUEUE.send({
+      doId: this.ctx.id.toString(),
+      tenantId: job.tenantId, agentId: job.agentId, taskId: job.taskId,
+      commandId: job.commandId,
+    });
+  }
+
+  /**
+   * The payload behind a queued command, read back by the consumer.
+   *
+   * Returns null once the reply is in: a redelivery after a successful call
+   * must not run the provider a second time. The dedup key on the result event
+   * makes that safe rather than merely unlikely.
+   */
+  async takeModelJob(commandId: string): Promise<ModelJob | null> {
+    const row = this.sql.exec(
+      `SELECT o.tenant_id, o.task_id, o.payload, t.agent_id FROM outbox o
+         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
+        WHERE o.command_id = ?
+          AND NOT EXISTS (SELECT 1 FROM events e
+                           WHERE e.tenant_id = o.tenant_id
+                             AND e.dedup_key = 'cmd:' || o.command_id || ':response')`,
+      commandId).toArray()[0] as any;
+    if (!row) return null;
+    return {
+      tenantId: row.tenant_id, agentId: row.agent_id, taskId: row.task_id,
+      commandId, payload: JSON.parse(row.payload),
+    };
   }
 
   /**
@@ -981,9 +1021,8 @@ export class AgentDO extends DurableObject<Env> {
         // The object may have been evicted since the alarm was armed, so this
         // instance can be brand new: build the runtime rather than assuming it.
         const rt = this.#activeRuntime();
-        // Offloaded commands whose dispatcher never reported back. Cheap query,
-        // and it is the only thing standing between a dead Worker and a task
-        // that waits forever.
+        // Only work that runs inside this object; the queue looks after the
+        // model call, awake or not.
         const resent = await rt.sweepStale();
         const { more } = await rt.drain(3);
         await this.broadcast();
@@ -1218,6 +1257,27 @@ async function latency(env: Env) {
 }
 
 export default {
+  /** Where a model call is actually waited on; see runQueuedModelCall. */
+  async queue(batch: MessageBatch<QueuedModelCall>, env: Env) {
+    for (const message of batch.messages) {
+      if (batch.queue.endsWith("-dlq")) {
+        await failLoudly(message.body, env);
+        message.ack();
+        continue;
+      }
+      try {
+        await runQueuedModelCall(message.body, env);
+        message.ack();
+      } catch (e) {
+        // Deliberately not acked: the queue redelivers, and after max_retries
+        // the message lands in the dead letter queue, where it becomes a
+        // visible failure on the task rather than a silence.
+        console.error("model call failed", String((e as Error)?.message ?? e));
+        message.retry();
+      }
+    }
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     // Conformance gets its own object: the P0 probe created an incompatible
