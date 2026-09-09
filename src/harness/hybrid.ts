@@ -1,6 +1,10 @@
 import type { HarnessAdapter, AdvanceOutput } from "../runtime/kernel.ts";
 import type { Json, RuntimeEvent } from "../core/types.ts";
 import type { ModelMessage, ToolDefinition } from "../model/types.ts";
+import {
+  keepFrom, summaryRequest, isContextOverflow, DEFAULT_COMPACTION, NO_COMPACTION,
+  ASSUMED_CONTEXT_WINDOW, CHARS_PER_TOKEN, type CompactionConfig,
+} from "./codegen.ts";
 
 /**
  * Tools are called natively; JavaScript is one of the tools.
@@ -84,6 +88,14 @@ export function qualifyMountedTools(tools: MountedTool[]): MountedTool[] {
 
 interface HybridState {
   harness?: "hybrid";
+  /** @see CodegenHarness — a summarisation in flight; the next reply is it. */
+  compacting?: { keptFrom: number };
+  /** Asked for, rather than reached: a person pressed compact, or a model call
+   *  came back saying the context is too long. Either way the next advance
+   *  summarises before doing anything else. */
+  forceCompact?: boolean;
+  /** The rolling handover, so a second pass updates rather than restarts. */
+  summary?: string;
   messages: ModelMessage[];
   /** Names currently offered to the model, not their schemas. The catalogue is
    *  static configuration; keeping it here rewrote 210 KB of unchanging text
@@ -120,6 +132,9 @@ export const DEFAULT_MAX_OFFERED = Number.MAX_SAFE_INTEGER;
 
 export interface HybridOptions {
   maxTurns?: number;
+  compaction?: CompactionConfig;
+  /** @see CodegenHarness — what the bound model can hold. */
+  contextWindow?: number;
   /** The agent's whole catalogue. Configuration, never checkpoint state. */
   catalogue?: MountedTool[];
   /** Offer everything at or below this size; narrow above it. */
@@ -135,6 +150,8 @@ export class HybridHarness implements HarnessAdapter {
   readonly kind = "hybrid";
   readonly stateVersion = 2;
   #maxTurns: number;
+  #compaction: CompactionConfig;
+  #contextWindow: number;
   #catalogue: MountedTool[] = [];
   #byName = new Map<string, MountedTool>();
   #byAddress = new Map<string, MountedTool>();
@@ -143,6 +160,8 @@ export class HybridHarness implements HarnessAdapter {
 
   constructor(opts: HybridOptions = {}) {
     this.#maxTurns = opts.maxTurns ?? 20;
+    this.#compaction = opts.compaction ?? NO_COMPACTION;
+    this.#contextWindow = opts.contextWindow ?? ASSUMED_CONTEXT_WINDOW;
     this.#maxOffered = opts.maxOffered ?? DEFAULT_MAX_OFFERED;
     this.#isPinned = opts.isPinned ?? DEFAULT_PINNED;
     if (opts.catalogue) this.#setCatalogue(opts.catalogue);
@@ -348,9 +367,21 @@ export class HybridHarness implements HarnessAdapter {
         // had: a reply that never arrives. Falling through to the tail below
         // retries it, which is right — but unbounded retry of a call that costs
         // money is not, so it is counted and eventually given up on.
-        case "model.failed":
+        case "model.failed": {
+          const err = String(p.error ?? "model call failed");
+          // @see CodegenHarness — the provider saying the prompt does not fit
+          // is a compaction trigger, not something to retry.
+          if (isContextOverflow(err)) {
+            state.forceCompact = true;
+            state.compacting = undefined;
+            break;
+          }
           state.modelFailures = (state.modelFailures ?? 0) + 1;
-          lastFailure = String(p.error ?? "model call failed");
+          lastFailure = err;
+          break;
+        }
+        case "compact.requested":
+          state.forceCompact = true;
           break;
         case "tool.result": {
           for (const id of (p.heldOperationIds ?? []) as string[]) held.push(id);
@@ -380,6 +411,29 @@ export class HybridHarness implements HarnessAdapter {
           });
           break;
       }
+    }
+
+    // A reply arriving while a summarisation is out is the handover, not a
+    // turn. Without this branch it would have no tool calls, and a reply with
+    // no tool calls is how this harness recognises a finished answer — so
+    // compacting would end the task.
+    if (state.compacting && sawReply) {
+      const { keptFrom } = state.compacting;
+      const summary = sawReply.text.trim();
+      state.messages = [
+        msgs[0]!,
+        { role: "user",
+          content: `[compacted] Everything before this point has been summarised.\n\n${summary}` },
+        ...msgs.slice(1).filter((m) => !String(m.content ?? "").startsWith("[compacted")),
+      ];
+      state.summary = summary;
+      state.compacting = undefined;
+      return {
+        state, status: "waiting",
+        commands: [{ kind: "model.request",
+                     payload: { messages: state.messages, tools: this.#offer(state).tools } }],
+        waits: [],
+      };
     }
 
     if (sawReply) {
@@ -446,10 +500,51 @@ export class HybridHarness implements HarnessAdapter {
         waits: [],
       };
     }
+    if (this.#shouldSummarise(state)) {
+      const keptFrom = keepFrom(
+        state.messages,
+        this.#contextWindow * this.#compaction.keepRecentFraction * CHARS_PER_TOKEN,
+      );
+      if (keptFrom > 1) {
+        const request = summaryRequest(
+          state.messages.slice(1, keptFrom)
+            .map((m) => ({ role: m.role, content: String(m.content ?? "") })),
+          state.summary,
+        );
+        // @see CodegenHarness — trimmed now, so the checkpoint is small enough
+        // to commit the compaction itself.
+        state.messages = [state.messages[0]!, ...state.messages.slice(keptFrom)];
+        state.compacting = { keptFrom };
+        state.forceCompact = undefined;
+        return {
+          state, status: "waiting",
+          commands: [{
+            kind: "model.request",
+            payload: {
+              messages: request,
+              purpose: "compaction",
+              keptFrom,
+              summarised: keptFrom - 1,
+            },
+          }],
+          waits: [],
+        };
+      }
+    }
+
     return {
       state, status: "waiting",
       commands: [{ kind: "model.request", payload: { messages: msgs, tools: this.#offer(state).tools } }],
       waits: [],
     };
+  }
+
+  /** @see CodegenHarness — the cost wall and the checkpoint wall. */
+  #shouldSummarise(state: HybridState): boolean {
+    if (this.#compaction.mode !== "summarise" || state.compacting) return false;
+    if (state.forceCompact) return true;
+    if (state.finalizing) return false;
+    if (state.promptTokens >= this.#contextWindow * this.#compaction.triggerFraction) return true;
+    return JSON.stringify(state).length >= this.#compaction.maxCheckpointBytes / 2;
   }
 }

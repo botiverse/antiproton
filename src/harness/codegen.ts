@@ -85,6 +85,10 @@ interface CodegenState {
    * summary, and folding it in is what clears this.
    */
   compacting?: { keptFrom: number; prior?: string };
+  /** Asked for, rather than reached: a person pressed compact, or a model call
+   *  came back saying the context is too long. Either way the next advance
+   *  summarises before doing anything else. */
+  forceCompact?: boolean;
   /** The rolling handover, so a second compaction updates rather than restarts. */
   summary?: string;
   messages: TaggedMessage[];
@@ -112,25 +116,55 @@ export interface CompactionConfig {
    * reason, and so does this.
    */
   mode: "none" | "cycles" | "summarise";
-  /** Compact once the measured prompt exceeds this. */
-  triggerTokens: number;
-  /** Execution cycles kept verbatim after a compaction. */
+  /**
+   * Compact once the measured prompt passes this share of the model's context
+   * window. A fraction rather than a token count, because the number that
+   * matters differs by an order of magnitude between models — 24k tokens is
+   * most of a small window and a rounding error in a large one. pi expresses
+   * the same thing as `contextWindow - reserveTokens`.
+   */
+  triggerFraction: number;
+  /** Execution cycles kept verbatim after a compaction (the "cycles" mode). */
   keepCycles: number;
   /**
-   * How much of the tail to keep verbatim, in characters.
+   * The share of the window kept verbatim as the recent tail.
    *
    * pi walks backward accumulating tokens to a budget; without a tokeniser here
-   * the same walk counts characters, at roughly four per token. The default is
-   * sized against the checkpoint limit rather than a context window, because
-   * that is the wall this actually hits.
+   * the walk counts characters, at roughly four per token.
    */
-  keepRecentChars: number;
+  keepRecentFraction: number;
+  /**
+   * The other wall, and this one is genuinely absolute: past it the kernel
+   * cannot commit the checkpoint at all, whatever model is in use. Compaction
+   * starts at half.
+   */
+  maxCheckpointBytes: number;
 }
 
-export const NO_COMPACTION: CompactionConfig =
-  { mode: "none", triggerTokens: Infinity, keepCycles: 0, keepRecentChars: Infinity };
-export const DEFAULT_COMPACTION: CompactionConfig =
-  { mode: "summarise", triggerTokens: 24_000, keepCycles: 3, keepRecentChars: 60_000 };
+/** Roughly, and only for turning a token budget into a character budget. */
+export const CHARS_PER_TOKEN = 4;
+
+export const NO_COMPACTION: CompactionConfig = {
+  mode: "none", triggerFraction: Infinity, keepCycles: 0,
+  keepRecentFraction: 1, maxCheckpointBytes: Infinity,
+};
+export const DEFAULT_COMPACTION: CompactionConfig = {
+  mode: "summarise",
+  // Leaves room for the reply and for the growth of one more turn.
+  triggerFraction: 0.6,
+  keepCycles: 3,
+  keepRecentFraction: 0.25,
+  maxCheckpointBytes: 256 * 1024,
+};
+
+/**
+ * What a model can hold, when nobody has said.
+ *
+ * Deliberately small: guessing high means the first sign of trouble is the
+ * provider refusing the call, and guessing low costs one early compaction. The
+ * real number belongs in configuration next to the model it describes.
+ */
+export const ASSUMED_CONTEXT_WINDOW = 32_000;
 
 /**
  * What the summary must contain, taken from pi's template because it was
@@ -155,6 +189,55 @@ const SUMMARY_UPDATE =
   "one document with the same sections, keeping everything from the old summary that is " +
   "still true, correcting what is not, and folding in the new work. Do not simply append. " +
   "Output the markdown and nothing else.";
+
+/**
+ * Where the verbatim tail begins.
+ *
+ * pi walks backward from the newest message accumulating tokens to a budget and
+ * summarises everything before that point. The same walk here counts
+ * characters, at roughly four per token. Index 0 is the system message and is
+ * never summarised — it is instructions, not history.
+ *
+ * Shared by both harnesses on purpose: two copies of a retention rule drift,
+ * and the one that drifts is the one nobody is looking at.
+ */
+/**
+ * A model call that failed because the context is too long.
+ *
+ * pi treats this as a compaction trigger rather than an error, and it is the
+ * only trigger that is certain: the thresholds are estimates, this is the
+ * provider saying it outright. Retrying the same prompt cannot help, so the
+ * bounded retry must not be what handles it.
+ */
+export function isContextOverflow(error: string): boolean {
+  return /context.{0,20}(length|window|limit)|too many tokens|maximum context|prompt is too long|reduce the length/i
+    .test(error);
+}
+
+export function keepFrom(messages: Array<{ content?: unknown }>, budget: number): number {
+  let used = 0;
+  for (let i = messages.length - 1; i > 0; i--) {
+    used += String(messages[i]!.content ?? "").length;
+    if (used > budget) return Math.min(i + 1, messages.length - 1);
+  }
+  return 1;
+}
+
+/** The request that produces the handover: its own instructions, not part of
+ *  the conversation, and iterative when a handover already exists. */
+export function summaryRequest(
+  history: Array<{ role: string; content: string }>,
+  prior?: string,
+): ModelMessage[] {
+  const text = history.map((m) => `${m.content}`).join("\n\n");
+  return [
+    { role: "system", content: prior ? SUMMARY_UPDATE : SUMMARY_INITIAL },
+    {
+      role: "user",
+      content: (prior ? `# The handover so far\n\n${prior}\n\n# What has happened since\n\n` : "") + text,
+    },
+  ];
+}
 
 const fence = /```(?:js|javascript)\s*\n([\s\S]*?)```/;
 
@@ -263,12 +346,25 @@ export class CodegenHarness implements HarnessAdapter {
   readonly stateVersion = 2;
   #maxTurns: number;
   #compaction: CompactionConfig;
+  #contextWindow: number;
   /** Set by the last compaction, for reporting. */
   lastCompaction: { dropped: number; from: number } | null = null;
 
-  constructor(opts: { maxTurns?: number; compaction?: CompactionConfig } = {}) {
+  constructor(opts: {
+    maxTurns?: number;
+    compaction?: CompactionConfig;
+    /** What the bound model can hold. Configuration, because only the operator
+     *  knows which model is bound and what its window is. */
+    contextWindow?: number;
+  } = {}) {
     this.#maxTurns = opts.maxTurns ?? 8;
     this.#compaction = opts.compaction ?? NO_COMPACTION;
+    this.#contextWindow = opts.contextWindow ?? ASSUMED_CONTEXT_WINDOW;
+  }
+
+  /** The budget the tail is measured against, in characters. */
+  get #keepRecentChars(): number {
+    return this.#contextWindow * this.#compaction.keepRecentFraction * CHARS_PER_TOKEN;
   }
 
   /**
@@ -319,12 +415,7 @@ export class CodegenHarness implements HarnessAdapter {
    * summarised — it is instructions, not history.
    */
   #keepFrom(state: CodegenState): number {
-    let used = 0;
-    for (let i = state.messages.length - 1; i > 0; i--) {
-      used += String(state.messages[i]!.content ?? "").length;
-      if (used > this.#compaction.keepRecentChars) return Math.min(i + 1, state.messages.length - 1);
-    }
-    return 1;
+    return keepFrom(state.messages, this.#keepRecentChars);
   }
 
   /**
@@ -345,16 +436,15 @@ export class CodegenHarness implements HarnessAdapter {
   /** The request that produces the handover. Not a tool call and not part of
    *  the conversation: a separate ask, with its own instructions. */
   #summaryRequest(state: CodegenState, keptFrom: number): ModelMessage[] {
-    const history = this.#serialize(state.messages.slice(1, keptFrom));
-    const prior = state.summary;
-    return [
-      { role: "system", content: prior ? SUMMARY_UPDATE : SUMMARY_INITIAL },
-      {
-        role: "user",
-        content: (prior ? `# The handover so far\n\n${prior}\n\n# What has happened since\n\n` : "") +
-          history,
-      },
-    ];
+    return summaryRequest(
+      state.messages.slice(1, keptFrom).map((m) => ({
+        role: m.role,
+        content: `[${m.tag === "customer" ? "User" : m.tag === "agent" ? "Assistant"
+          : m.tag === "execution" ? "Tool result" : "Note"}]: ` +
+          (m.tag === "execution" ? String(m.content).slice(0, 2000) : String(m.content)),
+      })),
+      state.summary,
+    );
   }
 
   #compact(state: CodegenState): boolean {
@@ -362,7 +452,7 @@ export class CodegenHarness implements HarnessAdapter {
     // "summarise" replaces this rather than running alongside it. Left in, the
     // drop went first and ate the history the summariser was about to be given,
     // so compaction quietly degraded back to forgetting.
-    if (c.mode !== "cycles" || state.promptTokens < c.triggerTokens) return false;
+    if (c.mode !== "cycles" || state.promptTokens < this.#contextWindow * c.triggerFraction) return false;
 
     const msgs = state.messages;
     // Index execution cycles: an agent reply followed by its execution result.
@@ -450,6 +540,10 @@ export class CodegenHarness implements HarnessAdapter {
     for (const e of input.events) {
       const p = e.payload as any;
       switch (e.kind) {
+        // Asked for by a person, through the console.
+        case "compact.requested":
+          state.forceCompact = true;
+          break;
         case "message":
           messages.push({ role: "user", tag: "customer", content: String(p.text) });
           // A new request from the person gets a fresh execution budget. The
@@ -461,10 +555,19 @@ export class CodegenHarness implements HarnessAdapter {
           state.finalizing = false;
           state.formatNudges = 0;
           break;
-        case "model.failed":
+        case "model.failed": {
+          const err = String(p.error ?? "model call failed");
+          // Not a failure to retry: a statement that the prompt does not fit.
+          // Retrying it sends the same prompt again and burns the budget.
+          if (isContextOverflow(err)) {
+            state.forceCompact = true;
+            state.compacting = undefined;
+            break;
+          }
           state.modelFailures = (state.modelFailures ?? 0) + 1;
-          lastFailure = String(p.error ?? "model call failed");
+          lastFailure = err;
           break;
+        }
         case "model.response":
           messages.push({ role: "assistant", tag: "agent", content: String(p.text) });
           sawModelReply = String(p.text);
@@ -502,7 +605,9 @@ export class CodegenHarness implements HarnessAdapter {
     if (state.compacting && sawModelReply !== null) {
       const { keptFrom } = state.compacting;
       const summary = sawModelReply.trim();
-      const tail = messages.slice(keptFrom)
+      // The middle is already gone; the handover takes its place. Any previous
+      // handover goes with it, because this one supersedes it.
+      const tail = messages.slice(1)
         .filter((m) => !(m.tag === "note" && String(m.content).startsWith("[compacted")));
       state.messages = [
         messages[0]!,
@@ -621,14 +726,22 @@ export class CodegenHarness implements HarnessAdapter {
     if (this.#shouldSummarise(state)) {
       const keptFrom = this.#keepFrom(state);
       if (keptFrom > 1) {
+        const request = this.#summaryRequest(state, keptFrom);
+        // Trimmed now, not when the handover comes back. The middle has already
+        // been serialised into the request, so keeping it costs the very bytes
+        // the compaction exists to reclaim — and when the checkpoint is what is
+        // over budget, a compaction that only shrinks later cannot be committed
+        // at all. The events are untouched; this is the model's view.
+        state.messages = [state.messages[0]!, ...state.messages.slice(keptFrom)];
         state.compacting = { keptFrom, prior: state.summary };
+        state.forceCompact = undefined;
         return {
           state,
           status: "waiting",
           commands: [{
             kind: "model.request",
             payload: {
-              messages: this.#summaryRequest(state, keptFrom),
+              messages: request,
               // Carried through to the event, so the log says a compaction
               // happened here and where the kept window starts. Nothing is
               // destroyed — the whole history is still in the log — but without
@@ -661,8 +774,14 @@ export class CodegenHarness implements HarnessAdapter {
    * a deadlock that stopped a real session for hours.
    */
   #shouldSummarise(state: CodegenState): boolean {
-    if (this.#compaction.mode !== "summarise" || state.compacting || state.finalizing) return false;
-    if (state.promptTokens >= this.#compaction.triggerTokens) return true;
-    return JSON.stringify(state).length >= this.#compaction.keepRecentChars * 2;
+    if (this.#compaction.mode !== "summarise" || state.compacting) return false;
+    // Asked for outright, so neither the finalizing guard nor a threshold
+    // applies: a person pressed it, or the provider said the prompt does not fit.
+    if (state.forceCompact) return true;
+    if (state.finalizing) return false;
+    // Relative to what this model can hold, not to a number picked once.
+    if (state.promptTokens >= this.#contextWindow * this.#compaction.triggerFraction) return true;
+    // And the wall that belongs to this runtime rather than to the model.
+    return JSON.stringify(state).length >= this.#compaction.maxCheckpointBytes / 2;
   }
 }

@@ -39,6 +39,8 @@ export interface Env {
   RUN9?: string;
   /** "codegen" to go back to the fenced-code convention; native otherwise. */
   HARNESS_MODE?: string;
+  /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
+  HARNESS_CONTEXT_WINDOW?: string;
   /** "1" opens the demo UI with no Access identity. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
   /** Lets automation reach the endpoints that spend money, since Access sits
@@ -317,6 +319,9 @@ export class AgentDO extends DurableObject<Env> {
       // answer. Providers have a channel for this; using it is not a
       // preference.
       harnessMode: this.env.HARNESS_MODE === "codegen" ? "codegen" : "hybrid",
+      // Belongs beside the model it describes: change HARNESS_MODEL and this
+      // goes with it, or compaction is calibrated for the wrong model.
+      contextWindow: Number(this.env.HARNESS_CONTEXT_WINDOW) || undefined,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#runtime;
@@ -936,6 +941,15 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
+  async uiCompact(tenantId: string, agentId: string, taskId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiCompact", async () => {
+      const r = await this.runtime().requestCompaction(tenantId, agentId, taskId);
+      await this.ctx.storage.setAlarm(Date.now());
+      return r;
+    });
+  }
+
   async uiSay(
     tenantId: string, agentId: string, taskId: string, text: string,
     mode: "steer" | "followUp" = "steer",
@@ -1521,6 +1535,19 @@ export default {
         // Confirms what Access actually injects, rather than trusting the
         // header name. Also demonstrates that a client-supplied identity does
         // not survive: Cloudflare strips cf-access-* from inbound requests.
+        case "/admin/compact": {
+          // The operator's way in, alongside /admin/diagnose. The UI button
+          // derives the agent from whoever is signed in, which is right for a
+          // person and useless for unsticking someone else's task.
+          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId"));
+          const k = url.searchParams.get("taskId") ?? `t_${a}`;
+          const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          return Response.json(await s2.uiCompact(t, a, k));
+        }
         case "/admin/diagnose": {
           if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
             return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -1605,6 +1632,16 @@ export default {
           if (text) await stub.uiSay("demo", agentId, taskId, text, mode);
           const t = await stub.uiTranscript("demo", agentId, taskId);
           return html(trajectory(t.events, t.byOp, t.busy));
+        }
+        case "/ui/compact": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          const form = await request.formData();
+          const taskId = String(form.get("taskId"));
+          await stub.uiCompact("demo", agentId, taskId);
+          const t = await stub.uiTranscript("demo", agentId, taskId);
+          return html(trajectory(conversation(t.events), t.byOp, t.busy));
         }
         case "/ui/decide": {
           const form = await request.formData();

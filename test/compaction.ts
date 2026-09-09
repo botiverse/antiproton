@@ -8,7 +8,14 @@
  * some turns were removed. These cases are about what survives.
  */
 import { CodegenHarness, DEFAULT_COMPACTION } from "../src/harness/codegen.ts";
+
 import type { RuntimeEvent } from "../src/core/types.ts";
+
+/** A small window, so the fixtures stay small. The point of the config is
+ *  that this number is the only thing that has to change per model. */
+const WINDOW = 32_000;
+const over = Math.ceil(WINDOW * DEFAULT_COMPACTION.triggerFraction) + 1;
+
 
 let seq = 0;
 const ev = (kind: string, payload: unknown): RuntimeEvent => ({
@@ -48,9 +55,9 @@ async function loaded(h: CodegenHarness) {
 }
 
 await check("超过阈值时先要一份交接，而不是继续问", async () => {
-  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION });
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
   const st = await loaded(h);
-  st.promptTokens = 30_000; // past triggerTokens
+  st.promptTokens = over; // past the trigger for this window
   const out = await h.advance({ state: st, events: [ev("message", { text: "继续" })], context: ctx });
   assert((out.state as any).compacting, "a summarisation is in flight");
   eq(out.commands.length, 1, "one command");
@@ -61,11 +68,16 @@ await check("超过阈值时先要一份交接，而不是继续问", async () =
 });
 
 await check("交接回来后历史变短，但发现留下", async () => {
-  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION });
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
   const st = await loaded(h);
-  st.promptTokens = 30_000;
+  st.promptTokens = over;
+  // Measured before the request, because the trim happens when the handover is
+  // asked for rather than when it comes back: the middle is already in the
+  // outgoing request, and a compaction that only shrinks afterwards cannot be
+  // committed when the checkpoint is what is over budget.
+  const before = JSON.stringify(st).length;
   const asked = await h.advance({ state: st, events: [ev("message", { text: "继续" })], context: ctx });
-  const before = JSON.stringify(asked.state).length;
+  assert(JSON.stringify(asked.state).length < before / 2, "the request itself trims");
 
   const summary = "## Goal\n调研 hashcrew\n\n## Critical context\nstargazers_count 是 4";
   const done = await h.advance({
@@ -82,9 +94,9 @@ await check("交接回来后历史变短，但发现留下", async () => {
 });
 
 await check("第二次压缩是更新，不是重写", async () => {
-  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION });
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
   let st: any = await loaded(h);
-  st.promptTokens = 30_000;
+  st.promptTokens = over;
   st = (await h.advance({ state: st, events: [ev("message", { text: "继续" })], context: ctx })).state;
   st = (await h.advance({
     state: st, events: [ev("model.response", { text: "## Goal\n第一份交接" })], context: ctx,
@@ -94,7 +106,7 @@ await check("第二次压缩是更新，不是重写", async () => {
   for (let i = 0; i < 40; i++) {
     st.messages.push({ role: "user", tag: "execution", content: `more ${i} ` + "x".repeat(4000) });
   }
-  st.promptTokens = 30_000;
+  st.promptTokens = over;
   const again = await h.advance({ state: st, events: [ev("message", { text: "再继续" })], context: ctx });
   const sent = JSON.stringify((again.commands[0] as any).payload.messages);
   assert(sent.includes("Do not simply append"), "the update prompt is used the second time");
@@ -102,19 +114,19 @@ await check("第二次压缩是更新，不是重写", async () => {
 });
 
 await check("工具输出被截断，否则摘要的是网页而不是工作", async () => {
-  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION });
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
   const st: any = await loaded(h);
   st.messages.push({ role: "user", tag: "execution", content: "PAGE" + "y".repeat(50_000) });
-  st.promptTokens = 30_000;
+  st.promptTokens = over;
   const out = await h.advance({ state: st, events: [ev("message", { text: "继续" })], context: ctx });
   const sent = String((out.commands[0] as any).payload.messages[1].content);
   assert(!sent.includes("y".repeat(3000)), "a huge tool result is not sent whole to the summariser");
 });
 
 await check("收尾阶段不压缩", async () => {
-  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION });
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
   const st: any = await loaded(h);
-  st.promptTokens = 30_000;
+  st.promptTokens = over;
   st.finalizing = true;
   // Not a message: a new request deliberately clears `finalizing` and refills
   // the turn budget, so it would undo the very state being tested.
@@ -125,9 +137,9 @@ await check("收尾阶段不压缩", async () => {
 });
 
 await check("压缩在库里是可见的记录，历史不丢", async () => {
-  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION });
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
   const st = await loaded(h);
-  st.promptTokens = 30_000;
+  st.promptTokens = over;
   const asked = await h.advance({ state: st, events: [ev("message", { text: "继续" })], context: ctx });
   const payload = (asked.commands[0] as any).payload;
 
@@ -146,6 +158,105 @@ await check("压缩在库里是可见的记录，历史不丢", async () => {
   const shown = JSON.stringify((done.state as any).messages);
   assert(!shown.includes("page 5 xxxx"), "the bulk is out of the model's view");
   assert((done.state as any).summary, "and represented by a handover instead");
+});
+
+await check("hybrid 也会压缩，且默认是开着的", async () => {
+  const { HybridHarness } = await import("../src/harness/hybrid.ts");
+  const h = new HybridHarness({ maxTurns: 40, compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
+  const st: any = await h.initialize({ tools: [] });
+  for (let i = 0; i < 40; i++) {
+    st.messages.push({ role: "user", content: `page ${i} ` + "x".repeat(4000) });
+  }
+  st.promptTokens = over;
+  const out = await h.advance({ state: st, events: [ev("message", { text: "继续" })] } as any);
+  eq((out.commands[0] as any).payload.purpose, "compaction", "hybrid asks for a handover too");
+
+  // A handover has no tool calls, and a reply with no tool calls is how this
+  // harness recognises a finished answer — so without its own branch, compacting
+  // would end the task.
+  const done = await h.advance({
+    state: out.state, events: [ev("model.response", { text: "## Goal\nx", toolCalls: [] })],
+  } as any);
+  assert(done.status !== "completed", "the handover did not end the task");
+  assert((done.state as any).summary, "and became the summary");
+
+  // Built and left unconfigured is the same as not built. The default the
+  // deployment uses must be the one that actually compacts.
+  eq(DEFAULT_COMPACTION.mode, "summarise", "the shipped default summarises");
+});
+
+await check("上下文溢出会触发压缩，而不是重试同一个 prompt", async () => {
+  const { isContextOverflow } = await import("../src/harness/codegen.ts");
+  for (const err of [
+    "This model's maximum context length is 65536 tokens",
+    "context_length_exceeded",
+    "prompt is too long: 210000 tokens",
+  ]) assert(isContextOverflow(err), `should be recognised: ${err}`);
+  for (const err of ["429 rate limit", "connection reset", "invalid api key"]) {
+    assert(!isContextOverflow(err), `should not be: ${err}`);
+  }
+
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
+  const st: any = await loaded(h);
+  st.promptTokens = 100; // nowhere near the threshold
+  const out = await h.advance({
+    state: st,
+    events: [ev("model.failed", { error: "This model's maximum context length is 65536 tokens" })],
+    context: ctx,
+  });
+  eq((out.commands[0] as any).payload.purpose, "compaction", "it compacts instead");
+  // Retrying a prompt that does not fit cannot help, so it must not count
+  // against the retry budget either.
+  eq((out.state as any).modelFailures ?? 0, 0, "and it is not counted as a failure");
+});
+
+await check("可以手动要求压缩", async () => {
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW });
+  const st: any = await loaded(h);
+  st.promptTokens = 100;
+  const out = await h.advance({
+    state: st, events: [ev("compact.requested", {})], context: ctx,
+  });
+  eq((out.commands[0] as any).payload.purpose, "compaction", "asked for, so it happens");
+
+  // Even while finalizing, because a person asking outranks the guard that
+  // exists only to avoid interrupting an answer.
+  const st2: any = await loaded(h);
+  st2.promptTokens = 100;
+  st2.finalizing = true;
+  const out2 = await h.advance({
+    state: st2, events: [ev("compact.requested", {})], context: ctx,
+  });
+  eq((out2.commands[0] as any).payload.purpose, "compaction", "a request wins over finalizing");
+});
+
+await check("阈值随模型窗口走，不是写死的 token 数", async () => {
+  const st = await loaded(new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW }));
+  const prompt = 25_000;
+
+  // The same prompt is most of a small window and a fraction of a large one, so
+  // it must compact in one and not the other. A fixed token threshold cannot
+  // express that, and would be wrong for every model but the one it was picked
+  // against.
+  const small = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: 32_000 });
+  const large = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: 1_000_000 });
+
+  const inSmall = await small.advance({
+    state: { ...structuredClone(st), promptTokens: prompt },
+    events: [ev("message", { text: "继续" })], context: ctx,
+  });
+  const inLarge = await large.advance({
+    state: { ...structuredClone(st), promptTokens: prompt },
+    events: [ev("message", { text: "继续" })], context: ctx,
+  });
+  eq((inSmall.commands[0] as any).payload.purpose, "compaction", "a small window compacts");
+  assert(!(inLarge.commands[0] as any).payload.purpose, "a large one has no reason to");
+
+  // The tail kept verbatim scales with the window too.
+  assert(
+    JSON.stringify(inLarge.state).length >= JSON.stringify(inSmall.state).length,
+    "a larger window keeps at least as much",
+  );
 });
 
 console.log(`\n  Compaction\n  ${"─".repeat(56)}`);

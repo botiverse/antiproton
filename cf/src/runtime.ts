@@ -15,7 +15,9 @@ import {
   appendModelResponse,
   type CommandOffload,
 } from "../../src/runtime/commands.ts";
-import { CodegenHarness } from "../../src/harness/codegen.ts";
+import {
+  CodegenHarness, DEFAULT_COMPACTION, ASSUMED_CONTEXT_WINDOW,
+} from "../../src/harness/codegen.ts";
 import { HybridHarness, qualifyMountedTools } from "../../src/harness/hybrid.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
@@ -141,6 +143,16 @@ export interface RuntimeDeps {
   /** §18.2.1 measured hybrid best (8/8 vs 7/8 vs 5/8); codegen stays selectable
    *  so the mode remains an ablation variable rather than a hard-coded choice. */
   harnessMode?: "codegen" | "hybrid";
+  /**
+   * What the bound model can hold, in tokens.
+   *
+   * Configuration rather than a constant, because it is the one number here
+   * that changes by an order of magnitude between models: a threshold that is
+   * most of a small window is a rounding error in a large one. Unset means the
+   * conservative assumption, which compacts early rather than discovering the
+   * limit from a refused call.
+   */
+  contextWindow?: number;
   /** Domain policy handed to the harness at task initialisation. */
   policy?: string;
 }
@@ -187,11 +199,19 @@ export class AgentRuntime {
     // so swapping under a live task makes every reply look like a final answer
     // and the task "completes" mid-job. That is not hypothetical — it happened
     // to every task open when the default changed.
-    this.#hybrid = new HybridHarness({ maxTurns: deps.maxTurns ?? 40 });
+    // Compaction on by default, or none of the above happens. It was built and
+    // left unconfigured once already, which is the failure this codebase warns
+    // about in its own migrate() comment: declared, never reached, still green.
+    const contextWindow = deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW;
+    this.#hybrid = new HybridHarness({
+      maxTurns: deps.maxTurns ?? 40, compaction: DEFAULT_COMPACTION, contextWindow,
+    });
     // 60, the number the tau2 runner uses, not 10. The budget bounds a single
     // request now that a new message refills it, so a low cap bought nothing
     // and cost the agent the ability to finish anything multi-step.
-    this.#codegen = new CodegenHarness({ maxTurns: deps.maxTurns ?? 60 });
+    this.#codegen = new CodegenHarness({
+      maxTurns: deps.maxTurns ?? 60, compaction: DEFAULT_COMPACTION, contextWindow,
+    });
     this.#harness = deps.harnessMode === "hybrid" ? this.#hybrid : this.#codegen;
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
@@ -357,6 +377,22 @@ export class AgentRuntime {
     * written to the log yet, because an event here means something happened to
     * the conversation and this has not happened until it is delivered.
     */
+  /**
+   * Compact on demand, the way pi's /compact does.
+   *
+   * An event rather than a poke at the checkpoint, so it goes through the same
+   * lease and version the rest of the loop does. It is also the way back for a
+   * task already blocked by its own size: reopenTask accepts `blocked`, and the
+   * next advance summarises before doing anything else.
+   */
+  async requestCompaction(tenantId: string, agentId: string, taskId: string) {
+    await this.ready();
+    await this.store.appendEvent({
+      tenantId, agentId, taskId, kind: "compact.requested", payload: {},
+    });
+    return { taskId, reopened: await this.store.reopenTask(tenantId, taskId) };
+  }
+
   async postMessage(
     tenantId: string, agentId: string, taskId: string, text: string,
     mode: "steer" | "followUp" = "steer",

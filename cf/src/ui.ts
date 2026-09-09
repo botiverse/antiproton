@@ -194,6 +194,11 @@ export function page(taskId: string, who: string, agentId: string): string {
       <button type="submit" name="mode" value="followUp" class="ghost"
               title="Held back until the agent has finished everything it is doing">after</button>
     </form>
+    <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding-top:0">
+      <input type="hidden" name="taskId" value="${t}">
+      <button type="submit" class="ghost"
+              title="Summarise the older part of this conversation now, keeping the recent part">compact now</button>
+    </form>
     <div class="hint">Sending while it works steers it: the message reaches the model
       before its next call, and nothing in flight is stopped. <b>after</b> holds the message
       until it has finished.</div>
