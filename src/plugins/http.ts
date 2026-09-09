@@ -216,19 +216,43 @@ export const httpPlugin: Plugin = {
       const q = String((args as any)?.query ?? "").trim();
       if (!q) throw new Error("query is required");
       const limit = Math.min(Math.max(Number((args as any)?.limit ?? 8), 1), 20);
-      const endpoint = cfg.searchEndpoint ?? "https://html.duckduckgo.com/html/?q=";
-      const res = await fetch(endpoint + encodeURIComponent(q), {
-        headers: {
-          // Without a browser-shaped agent the endpoint answers with a page
-          // that has no results in it.
-          "user-agent":
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-          accept: "text/html",
-        },
-        signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
-      });
-      if (!res.ok) throw new Error(`search returned ${res.status}`);
-      const page = await res.text();
+      // Two endpoints, because a keyless one is a keyless one: it answers a
+      // few queries and then starts serving a captcha. An operator who wants
+      // reliability points searchEndpoint at an API with a key.
+      const endpoints = cfg.searchEndpoint
+        ? [cfg.searchEndpoint]
+        : ["https://html.duckduckgo.com/html/?q=", "https://lite.duckduckgo.com/lite/?q="];
+      let page = "";
+      let refused = "";
+      for (const endpoint of endpoints) {
+        const res = await fetch(endpoint + encodeURIComponent(q), {
+          headers: {
+            // Without a browser-shaped agent the endpoint answers with a page
+            // that has no results in it.
+            "user-agent":
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+            accept: "text/html",
+          },
+          signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
+        });
+        if (!res.ok) { refused = `HTTP ${res.status}`; continue; }
+        const body = await res.text();
+        // A challenge page is not an empty result set, and reporting it as one
+        // tells the agent the thing it asked about does not exist. It comes
+        // back as HTTP 202 with a captcha in it, so the status is no help.
+        if (/complete the following challenge|bots use DuckDuckGo|captcha/i.test(body)) {
+          refused = "the search endpoint served a bot challenge";
+          continue;
+        }
+        page = body;
+        break;
+      }
+      if (!page) {
+        throw new Error(
+          `search is unavailable: ${refused}. This is a rate limit, not an empty result — ` +
+          `do not conclude the subject does not exist. Try again, or fetch a likely url directly.`,
+        );
+      }
       const results: Array<{ title: string; url: string; snippet: string }> = [];
       const link = /result__a"\s+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
       const snips = [...page.matchAll(/result__snippet"[^>]*>([\s\S]*?)<\/a>/g)]
@@ -242,6 +266,17 @@ export const httpPlugin: Plugin = {
         // search its way around its own allowlist.
         if (!checkUrl(url, allowed).ok) continue;
         results.push({ title: stripTags(m[2]!), url, snippet: snips[results.length] ?? "" });
+      }
+      // Zero results has two very different causes, and reporting them the same
+      // way is how an agent concludes a subject does not exist. A real results
+      // page says so itself; a page this parser cannot read says nothing, and
+      // that is the one that must not be called "no results". Endpoint markup
+      // changes, so this is a guard against the future as much as the present.
+      if (!results.length && !/no results|did not match|result__a|result-link/i.test(page)) {
+        throw new Error(
+          "search could not read the results page — the endpoint's format may have changed. " +
+          "This is not an empty result: do not conclude the subject does not exist.",
+        );
       }
       return { query: q, count: results.length, results };
     }
