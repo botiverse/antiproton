@@ -9,6 +9,7 @@
  * having never seen a credential.
  */
 import type { ApprovalRecord } from "../../src/core/types.ts";
+import { md } from "./md.ts";
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -78,6 +79,29 @@ border:1px solid var(--line);color:var(--dim)}
 .tag.ok{color:var(--ok);border-color:var(--ok)}
 .tag.bad{color:var(--bad);border-color:var(--bad)}
 .hint{color:var(--dim);font-size:12px;padding:0 13px 13px}
+
+/* --- rendered markdown ------------------------------------------------- */
+/* white-space is normal here: the renderer produced real blocks, so keeping
+   pre-wrap would double every gap the markup already makes. */
+.md{white-space:normal}
+.md p{margin:0 0 7px}
+.md p:last-child{margin-bottom:0}
+.md .mdh{font-weight:600;margin:12px 0 5px;line-height:1.35}
+.md .mdh:first-child{margin-top:0}
+.md .h1{font-size:16px}.md .h2{font-size:14px}
+.md .h3,.md .h4{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+.md ul,.md ol{margin:0 0 7px;padding-left:20px}
+.md li{margin:1px 0}
+.md code{background:#0a0c10;border:1px solid var(--line);border-radius:4px;
+padding:0 4px;font-size:12px;color:#9ece6a}
+.md pre{white-space:pre-wrap;word-break:break-word}
+.md pre code{background:0;border:0;padding:0;color:inherit}
+.md table{margin:6px 0 9px}
+.md th,.md td{padding:3px 10px 3px 0}
+.md blockquote{margin:6px 0;padding-left:10px;border-left:2px solid var(--line);color:var(--dim)}
+.md hr{border:0;border-top:1px solid var(--line);margin:10px 0}
+.md a{color:var(--accent)}
+.md strong{color:#fff;font-weight:600}
 
 /* --- debugging console ------------------------------------------------- */
 .tabs{display:flex;gap:2px;padding:0 8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -242,7 +266,7 @@ export function trajectory(
 
     if (s.kind === "message") {
       out.push(`<div class="step user"><div class="lbl">you ${rel}</div>
-        <div class="msg">${esc(p.text ?? "")}</div></div>`);
+        <div class="msg md">${md(String(p.text ?? ""))}</div></div>`);
       continue;
     }
 
@@ -263,7 +287,7 @@ export function trajectory(
         : "";
       const calls = (p.toolCalls ?? []) as any[];
       out.push(`<div class="step agent"><div class="lbl">turn ${turn} ${rel} ${badge}</div>
-        ${prose.trim() ? `<div class="msg">${esc(prose.trim())}</div>` : ""}
+        ${prose.trim() ? `<div class="msg md">${md(prose.trim())}</div>` : ""}
         ${blocks.map((b) => `<pre class="code">${esc(b)}</pre>`).join("")}
         ${calls.length ? `<div class="calls">${calls.map((c) =>
           `<span class="chip">${esc(c.name)}</span>`).join("")}</div>` : ""}
