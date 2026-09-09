@@ -428,6 +428,35 @@ export function tokens(
     </div>`;
 }
 
+/**
+ * The conversation: what a person said, and what the agent said back.
+ *
+ * The rule is not "does this reply contain a code fence". That was the first
+ * attempt and it hid a real answer, because a reply written *to the user* may
+ * quote code — the one that broke this quoted the error it was explaining. What
+ * separates a working turn from a spoken one is whether it ran: a reply the
+ * harness took code out of is followed by a `js.result` before the next reply.
+ * That is in the log, so it does not have to be guessed from the prose.
+ */
+export function conversation(
+  events: Array<{ sequence: number; kind: string; payload: any; createdAt: number }>,
+): typeof events {
+  const out: typeof events = [];
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i]!;
+    if (e.kind === "message") { out.push(e); continue; }
+    if (e.kind !== "model.response") continue;
+    let executed = false;
+    for (let j = i + 1; j < events.length; j++) {
+      const n = events[j]!;
+      if (n.kind === "model.response" || n.kind === "message") break;
+      if (n.kind === "js.result") { executed = true; break; }
+    }
+    if (!executed) out.push(e);
+  }
+  return out;
+}
+
 /** The raw log. The trajectory is a reading of this; when they disagree, this wins. */
 export function eventList(
   events: Array<{ sequence: number; kind: string; payload: any; createdAt: number }>,

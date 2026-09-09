@@ -21,8 +21,8 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
 import {
-  page, trajectory, approvals, eventList, storage, memoryPanel, sandboxPanel, runtimePanel,
-  timeline, tokens,
+  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
+  runtimePanel, timeline, tokens,
 } from "./ui.ts";
 
 export interface Env {
@@ -1549,12 +1549,9 @@ export default {
           const taskId = String(url.searchParams.get("taskId"));
           const t = await stub.uiTranscript("demo", agentId, taskId);
           return html(url.pathname === "/ui/chat"
-            // The conversation alone: what a person said and what came back.
-            // Everything else about the run lives in the panels.
-            ? trajectory(t.events.filter((e: any) =>
-                e.kind === "message" || e.kind === "message.out" ||
-                (e.kind === "model.response" && !/```/.test(String(e.payload?.text ?? "")))),
-              t.byOp, t.busy)
+            // The conversation alone; everything else about the run is in the
+            // panels on the right.
+            ? trajectory(conversation(t.events), t.byOp, t.busy)
             : eventList(t.events));
         }
         case "/ui/storage":
