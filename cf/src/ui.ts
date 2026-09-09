@@ -173,6 +173,7 @@ export function page(taskId: string, who: string, agentId: string): string {
       ${tab("events", "events", "/ui/events")}
       ${tab("storage", "storage", "/ui/storage")}
       ${tab("memory", "memory", "/ui/memory")}
+      ${tab("sandbox", "sandbox", "/ui/sandbox")}
       ${tab("runtime", "runtime", "/ui/runtime")}
     </div>
     <div class="body" id="panel" style="max-height:78vh"
@@ -563,48 +564,86 @@ export function runtimePanel(d: any): string {
 <h3>invocations</h3>
 ${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]))}
 
-${sandbox(d)}`;
+<div class="hint" style="padding:10px 0 0">Container time is billed separately and by the
+  second — see the <b>sandbox</b> tab.</div>`;
 }
 
 
 /**
- * How long a container was alive.
+ * The container, which is the only thing here billed for merely existing.
  *
- * The one thing here billed for merely existing, and the only cost that keeps
- * running while nothing is happening — so it gets its own meter rather than a
- * row among the invocations. A live box is drawn against the sessions that
- * came before it, which is what makes "still running" look wrong.
+ * It gets a panel rather than a row because three different questions are asked
+ * of it and none is answered by a number: is one running right now (the
+ * expensive mistake), how long did each one live, and what came out of it. The
+ * last is the point of the sandbox at all — a box is destroyed with everything
+ * in it, so the references saved out of it are the only thing that survived,
+ * and they were invisible until now.
  */
-export function sandbox(d: any): string {
+export function sandboxPanel(d: any): string {
   const conn = (d.connections ?? []).find((c: any) => c.alias === "node");
   let st: any = null;
   try { st = conn ? JSON.parse(conn.state) : null; } catch { st = null; }
   const sessions: Array<{ boxId: string; startedAt: number; endedAt: number; execs: number; saved: string[] }> =
     st?.sessions ?? [];
-  const liveMs = st?.boxId ? Date.now() - Number(st.createdAt) : 0;
-  if (!sessions.length && !st?.boxId) {
-    return `<h3>sandbox</h3><div class="empty">no container has been started</div>`;
+  const live = st?.boxId ? { boxId: st.boxId, since: Number(st.createdAt),
+    execs: Number(st.execs ?? 0), saved: (st.saved ?? []) as string[] } : null;
+
+  if (!sessions.length && !live) {
+    return `<div class="empty">no container has ever been started for this agent</div>
+      <div class="hint" style="padding:8px 0">The <span class="chip">node</span> mount is a real
+      machine and the most expensive thing the agent can reach — billed for every second it
+      exists, not per call. It is meant to stay unused.</div>`;
   }
+
+  const liveMs = live ? Date.now() - live.since : 0;
   const total = sessions.reduce((a, x) => a + (x.endedAt - x.startedAt), 0) + liveMs;
   const widest = Math.max(liveMs, ...sessions.map((x) => x.endedAt - x.startedAt), 1);
-  const row = (label: string, ms: number, extra: string, colour: string) =>
+  const when = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19) + "Z";
+
+  const bar = (ms: number, right: string, colour: string) =>
     `<div class="bar"><span class="n"></span><span class="t2">
        <span style="width:${(ms / widest * 100).toFixed(2)}%;background:${colour}"></span>
-     </span><span class="v">${esc(secs(ms))} ${extra}</span></div>`;
-  return `<h3>sandbox — billed while it exists</h3>
-    <div class="bars">
-      ${st?.boxId
-        ? row("live", liveMs,
-            `<span class="tag bad">still running</span> ${esc(String(st.boxId).slice(-12))}`,
-            "var(--bad)")
-        : ""}
-      ${sessions.map((x) => row("", x.endedAt - x.startedAt,
-          `${x.execs} call(s)${x.saved?.length ? ` · ${x.saved.length} saved` : ""}`,
-          "var(--ok)")).join("")}
-    </div>
-    <div class="hint" style="padding:6px 0">${esc(secs(total))} of container time across
-      ${sessions.length + (st?.boxId ? 1 : 0)} session(s).
-      ${st?.boxId
-        ? "A box is alive now — it is costing money whether or not anything is running in it."
-        : "Nothing is running; this costs nothing until the next one starts."}</div>`;
+     </span><span class="v">${esc(secs(ms))} ${right}</span></div>`;
+
+  // A reference is only useful if you can see what it was.
+  const artifact = (ref: string) => {
+    const path = "/" + String(ref).split("/sandbox/").slice(1).join("/").split("/").slice(1).join("/");
+    return `<div class="ev"><div class="k">${esc(path)}</div>
+      <div class="msg" style="color:var(--dim);font-size:11px">${esc(ref)}</div></div>`;
+  };
+  const allSaved = [...(live?.saved ?? []), ...sessions.flatMap((x) => x.saved ?? [])];
+
+  return `
+<h3>right now</h3>
+${live
+    ? `<div class="card"><div class="tool">a container is running</div>
+       <div class="kv" style="margin-top:6px">
+         <div>box</div><div>${esc(live.boxId)}</div>
+         <div>alive for</div><div>${esc(secs(liveMs))} <span class="tag bad">still billing</span></div>
+         <div>calls so far</div><div>${esc(live.execs)}</div>
+         <div>saved so far</div><div>${esc(live.saved.length)}</div>
+       </div>
+       <div class="hint" style="padding:8px 0 0">It costs the same whether or not anything is
+       running inside it. If the agent has finished with the machine and not released it,
+       that is the bug to look at.</div></div>`
+    : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
+
+<h3>sessions — ${esc(secs(total))} of container time across ${sessions.length + (live ? 1 : 0)}</h3>
+<div class="bars">
+  ${live ? bar(liveMs, `<span class="tag bad">live</span> ${esc(live.execs)} call(s)`, "var(--bad)") : ""}
+  ${sessions.map((x) => bar(x.endedAt - x.startedAt,
+      `${x.execs} call(s)${x.saved?.length ? ` · ${x.saved.length} saved` : ""}`,
+      "var(--ok)")).join("")}
+</div>
+${table(["started", "lived", "calls", "saved", "box"], sessions.map((x) =>
+    [when(x.startedAt), secs(x.endedAt - x.startedAt), x.execs, (x.saved ?? []).length,
+     String(x.boxId).slice(-14)]))}
+
+<h3>what came out — ${allSaved.length} artifact(s)</h3>
+${allSaved.length
+    ? allSaved.map(artifact).join("") +
+      `<div class="hint" style="padding:8px 0">Everything else in those boxes is gone. These
+       survived because the agent called <span class="chip">node.save</span>; they are readable
+       with <span class="chip">artifacts.read</span>.</div>`
+    : `<div class="empty">nothing was saved out — everything those containers produced is gone</div>`}`;
 }

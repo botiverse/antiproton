@@ -21,7 +21,8 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
 import {
-  page, trajectory, approvals, eventList, storage, memoryPanel, runtimePanel, timeline, tokens,
+  page, trajectory, approvals, eventList, storage, memoryPanel, sandboxPanel, runtimePanel,
+  timeline, tokens,
 } from "./ui.ts";
 
 export interface Env {
@@ -1558,6 +1559,7 @@ export default {
         }
         case "/ui/storage":
         case "/ui/memory":
+        case "/ui/sandbox":
         case "/ui/runtime": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
@@ -1566,6 +1568,7 @@ export default {
           const d = await stub.uiStorage("demo", agentId, taskId);
           return html(url.pathname === "/ui/storage" ? storage(d)
             : url.pathname === "/ui/memory" ? memoryPanel(d)
+            : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
             : runtimePanel(d));
         }
         case "/ui/approvals": {
