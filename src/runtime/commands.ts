@@ -197,6 +197,15 @@ export class CommandExecutor {
           payload: {
             callId: p.callId, status: r.status, outputs: r.outputs, error: r.error,
             acceptedOperationIds: r.acceptedOperationIds,
+            // What actually ran, not what was asked for. Commands live in the
+            // outbox rather than the log — they are derived from state, so
+            // replay does not need them — but that left one question the log
+            // could not answer: when the harness translates a reply written in
+            // another calling syntax, the code it synthesised appeared nowhere.
+            // The trajectory showed the markup the model wrote and nothing
+            // showed what was executed. Bounded, because this log is never
+            // trimmed.
+            source: String(p.source).slice(0, 4000),
             ...(heldOps.length ? { heldOperationIds: heldOps } : {}),
           },
           dedupKey: `cmd:${cmd.commandId}:result`,

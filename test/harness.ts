@@ -47,6 +47,26 @@ test("思考不回灌", "a reasoning trace is recorded but never sent back to th
   assert(sent.includes("output(1)"), "the reply itself is still carried");
 });
 
+test("检查点自带 harness 标记", "a checkpoint says which harness wrote it, so a swapped default cannot reinterpret it", async () => {
+  const { HybridHarness } = await import("../src/harness/hybrid.ts");
+  const cg = await new CodegenHarness().initialize({});
+  const hy = await new HybridHarness({}).initialize({ tools: [] });
+  eq((cg as any).harness, "codegen", "codegen stamps itself");
+  eq((hy as any).harness, "hybrid", "hybrid stamps itself");
+
+  // The two read the same reply in opposite ways: a fenced block is work to
+  // codegen and prose to hybrid. Swapping under a live task therefore ends it
+  // mid-job, which is why the stamp exists and why an unstamped checkpoint must
+  // read as codegen — everything written before the stamp was.
+  const fenced = ev("model.response", { text: "```js\noutput(1);\n```" });
+  const byCodegen = await new CodegenHarness().advance({ state: cg, events: [fenced], context: ctx });
+  eq(byCodegen.status, "waiting", "codegen keeps working on a fenced reply");
+  eq(byCodegen.commands[0]!.kind, "js.execute", "and runs it");
+
+  const asHybrid = await new HybridHarness({}).advance({ state: cg as any, events: [fenced] } as any);
+  eq(asHybrid.status, "completed", "hybrid would call the very same reply finished");
+});
+
 test("消息转命令", "an inbound message produces exactly one model request", async () => {
   const h = new CodegenHarness();
   const state = await h.initialize({ mounts: [{ alias: "gh", plugin: "github", version: "1.0.0", config: {} }] });

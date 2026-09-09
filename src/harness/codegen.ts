@@ -77,6 +77,8 @@ interface TaggedMessage extends ModelMessage {
 }
 
 interface CodegenState {
+  /** @see initialize — the harness that owns this checkpoint. */
+  harness?: "codegen";
   messages: TaggedMessage[];
   turns: number;
   done: boolean;
@@ -292,6 +294,11 @@ export class CodegenHarness implements HarnessAdapter {
     // transcript as a tool result.
     const known = (config as any)?.workingSet ? String((config as any).workingSet) : "";
     return {
+      // Which harness wrote this. Two harnesses read the same reply in opposite
+      // ways — one wants a fenced block, the other native tool calls — so a
+      // task must keep the one it started with, whatever the deployment now
+      // defaults to. stateVersion cannot carry this: both are version 2.
+      harness: "codegen",
       messages: [{ role: "system", tag: "system", content: SYSTEM + preamble + rules + known }],
       turns: 0, done: false, finalizing: false, promptTokens: 0, compactions: 0,
     } satisfies CodegenState;

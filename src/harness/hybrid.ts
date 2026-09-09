@@ -83,6 +83,7 @@ export function qualifyMountedTools(tools: MountedTool[]): MountedTool[] {
 }
 
 interface HybridState {
+  harness?: "hybrid";
   messages: ModelMessage[];
   /** Names currently offered to the model, not their schemas. The catalogue is
    *  static configuration; keeping it here rewrote 210 KB of unchanging text
@@ -259,6 +260,8 @@ export class HybridHarness implements HarnessAdapter {
       ? this.#catalogue.filter(this.#isPinned).map((t) => t.name)
       : this.#catalogue.map((t) => t.name);
     return {
+      /** @see CodegenHarness.initialize — a task keeps the harness it began with. */
+      harness: "hybrid",
       messages: [{ role: "system", content: SYSTEM + (policy ? `\n\n# Domain policy you must follow\n${policy}` : "") }],
       offered,
       turns: 0, done: false, finalizing: false, promptTokens: 0,

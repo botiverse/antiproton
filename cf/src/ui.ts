@@ -324,6 +324,9 @@ export function trajectory(
       const held = heldText.includes("awaiting_approval");
       out.push(`<div class="step ${held ? "held" : bad ? "fail" : "run"}">
         <div class="lbl">${esc(label)} ${rel}${held ? ` <span class="badge warn">held for approval</span>` : ""}</div>
+        ${p.source
+          ? `<details><summary>what ran</summary><pre class="code">${esc(String(p.source))}</pre></details>`
+          : ""}
         <details><summary>${esc(s.kind === "js.result" ? String(p.status ?? "") : "result")}</summary>
         <pre>${esc(typeof body === "string" ? body.slice(0, 4000) : pretty(body))}</pre></details>
       </div>`);

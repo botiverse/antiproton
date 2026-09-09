@@ -4,6 +4,8 @@
  * so a call carries business arguments only.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
+import { CommandExecutor } from "../src/runtime/commands.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
 import { ToolGateway, type SecretResolver } from "../src/runtime/gateway.ts";
 import { parseTemplateCall } from "../src/core/tools.ts";
 import type { Plugin } from "../src/plugins/types.ts";
@@ -180,6 +182,30 @@ test("读操作重放", "a replayed read is simply re-executed", async () => {
 });
 
 let pass = 0, fail = 0;
+test("执行留痕", "the log records the code that actually ran, not only its result", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k", {});
+  const exec = new CommandExecutor(
+    store,
+    { id: "m", async complete() { throw new Error("not used"); } } as any,
+    { async invoke() { return { status: "succeeded", operationId: "op1", result: {} }; } },
+    new QuickJsExecutor(),
+  );
+  const source = "output(6 * 7);";
+  await exec.dispatch({ tenantId: "t", agentId: "a", taskId: "k" }, {
+    commandId: "c1", kind: "js.execute", payload: { source },
+  } as any);
+  const ev = (await store.taskEvents("t", "k")).find((e) => e.kind === "js.result");
+  assert(ev, "an execution produces a result event");
+  // Commands live in the outbox, not the log — so without this the log cannot
+  // say what ran, which matters most when the harness translated the reply into
+  // code the model never wrote.
+  eq((ev!.payload as any).source, source, "the executed source is on the record");
+  await store.close();
+});
+
 console.log(`\n  Tool gateway & mount addressing\n  ${"─".repeat(62)}`);
 for (const t of tests) {
   try {

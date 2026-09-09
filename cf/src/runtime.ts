@@ -150,7 +150,10 @@ export class AgentRuntime {
   #deps: RuntimeDeps;
   #plugins: Plugin[];
   #gateway: ToolGateway;
+  /** The default for tasks opened from now on. */
   #harness: CodegenHarness | HybridHarness;
+  #hybrid: HybridHarness;
+  #codegen: CodegenHarness;
   #executor: DynamicWorkerExecutor;
   #models: ModelResolver;
   #artifacts: BoundArtifacts;
@@ -178,12 +181,18 @@ export class AgentRuntime {
           ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
           : envSecrets.resolve(ref),
     });
-    this.#harness = deps.harnessMode === "hybrid"
-      ? new HybridHarness({ maxTurns: deps.maxTurns ?? 40 })
-      // 60, the number the tau2 runner uses, not 10. The budget bounds a single
-      // request now that a new message refills it, so a low cap bought nothing
-      // and cost the agent the ability to finish anything multi-step.
-      : new CodegenHarness({ maxTurns: deps.maxTurns ?? 60 });
+    // Both are built, because a task keeps whichever one opened it. Changing
+    // the deployment default must not change how a running task's replies are
+    // read: one harness wants a fenced block and the other native tool calls,
+    // so swapping under a live task makes every reply look like a final answer
+    // and the task "completes" mid-job. That is not hypothetical — it happened
+    // to every task open when the default changed.
+    this.#hybrid = new HybridHarness({ maxTurns: deps.maxTurns ?? 40 });
+    // 60, the number the tau2 runner uses, not 10. The budget bounds a single
+    // request now that a new message refills it, so a low cap bought nothing
+    // and cost the agent the ability to finish anything multi-step.
+    this.#codegen = new CodegenHarness({ maxTurns: deps.maxTurns ?? 60 });
+    this.#harness = deps.harnessMode === "hybrid" ? this.#hybrid : this.#codegen;
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -302,6 +311,16 @@ export class AgentRuntime {
         })),
       )),
     };
+  }
+
+  /**
+   * The harness that owns this checkpoint.
+   *
+   * Absent means it predates the stamp, and everything written before it was
+   * codegen — so that is the safe reading, not the current default.
+   */
+  #harnessFor(checkpoint: unknown): CodegenHarness | HybridHarness {
+    return (checkpoint as any)?.harness === "hybrid" ? this.#hybrid : this.#codegen;
   }
 
   /** Reinstate what a rebuilt harness lost. Configuration, not state: it is
@@ -435,12 +454,13 @@ export class AgentRuntime {
         const task = await this.store.loadTask(tenantId, taskId);
         if (!task) continue;
         const callCtx = { tenantId, agentId: task.agentId, taskId };
-        await this.#reinstateCatalogue(tenantId, task.agentId);
+        const harness = this.#harnessFor(task.checkpoint);
+        if (harness === this.#hybrid) await this.#reinstateCatalogue(tenantId, task.agentId);
         const commands = new CommandExecutor(
           this.store, (caller) => this.#models.resolve(caller), this.#host(callCtx), this.#executor,
           undefined, this.#offload(),
         );
-        const kernel = new Kernel(this.store, this.#harness, {
+        const kernel = new Kernel(this.store, harness, {
           holder: "do-worker", leaseTtlMs: 120_000,
         });
         await kernel.step(tenantId, taskId, null, (cmd) => commands.dispatch(callCtx, cmd));
