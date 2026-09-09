@@ -32,7 +32,7 @@ the wait; that one distinction drives most of the design.
 |---|---|
 | Model call awaited inside the object | 128.2s of billed object time |
 | The same work, awaited off it | **0.7s** |
-| One agent, 19 model calls | 9.4s billed inside vs **163.5s waited outside** (144.8s of it the provider) |
+| One agent, 79 model calls | 40.8s billed inside vs **709.2s waited outside** (582.5s of it the provider) |
 | Idle agent | no invocations, no armed alarm, no container |
 
 Three things had to be true for the last row, and each was a bug first:
@@ -54,6 +54,10 @@ hit rate. Measured here: editing the system message drops it from **84.9% to
 the agent's memory is injected once when a task opens rather than before every
 turn, which is where a local harness would put it. The console draws the cache
 hit per call, so losing it is visible rather than merely expensive.
+
+The cache is not the whole story, though: on a long investigation it sits above
+99% and the bill still climbs, because each fetched page is re-sent on every
+subsequent turn. That is what compaction is for, below.
 
 ## The security claim
 
@@ -182,6 +186,63 @@ advance after a crash produces the same ids and the insert collapses. Operation
 ids are derived the same way, so a replayed *write* is answered `unknown` — it
 may already have landed — instead of being performed twice.
 
+### Tools are called the provider's way
+
+The harness offers the mounted tools through the provider's own tool-calling
+channel and reads `tool_calls` back. That sounds like a detail and is not.
+
+The alternative — asking the model, in prose, to reply in a convention invented
+here — was the default until a model change broke it in public. A model under
+any pressure falls back to the format it was trained on, and every provider
+trains a different one. Four turned up in two days: `<tool_call>`, `<invoke>`,
+an invented `<system name="...">`, and DeepSeek's DSML written with full-width
+bars. Each arrived as another branch in a regex, and each time the harness had
+read the markup as a finished answer and ended the task mid-job.
+
+Measured on the same model, prompt and task: through the invented convention,
+16s, one model call and no tool calls at all — it emitted markup, the harness
+took it for an answer, and it replied from memory against an explicit
+instruction not to. Through the provider's channel: 91s, twelve model calls,
+thirty tool results, and an answer that had read the repository.
+
+The pattern-matching survives, demoted, under the other harness: an unreadable
+reply must still not be mistaken for a finished one.
+
+## Keeping the context small enough to think in
+
+A long investigation outgrows any context window, and what it has learned is
+the part worth keeping. Dropping old turns keeps the task alive and throws the
+findings away.
+
+So, following [pi][pi]: walk back from the newest message to a budget and keep
+that tail verbatim; summarise everything before it into a handover with fixed
+sections — goal, constraints, progress, decisions, next steps; truncate tool
+output hard, or the summariser summarises a fetched page instead of the work;
+and on a second pass feed the previous handover back with an update prompt that
+says to merge rather than append.
+
+Four triggers, two of them estimates and two facts. A share of the model's
+context window, and a share of the checkpoint budget — both estimates, and both
+expressed as fractions, because the same token count is most of a small window
+and a rounding error in a large one. Then the two certain ones: the provider
+refusing the call because the prompt does not fit, which forces a compaction
+rather than a retry that cannot succeed; and a person pressing **compact now**.
+
+It fits here better than it fits pi, because the harness holds no I/O:
+compaction is a command like any other. The request declares its purpose, so
+the reply is a record in the log of where a compaction happened and what was
+folded up.
+
+Nothing is destroyed. `state = fold(events)`, the log is untouched, and only
+what the model is shown gets shorter — the console says so where it happened.
+
+Demonstrated end to end: compaction fired on its own, produced a handover with
+the goal and per-page progress intact, and the agent then answered two questions
+whose answers had been fetched *before* the compaction, without going back to
+re-read anything.
+
+[pi]: https://github.com/badlogic/pi-mono
+
 ## Remembering
 
 An agent that cannot write anything down re-derives everything on every task,
@@ -215,8 +276,8 @@ One contract, two implementations, no third:
 
 | Backend | Where | Kernel contract |
 |---|---|---|
-| `SqliteStore` | in-process (Node) | 30/30 |
-| `DurableObjectStore` | Cloudflare | 30/30 |
+| `SqliteStore` | in-process (Node) | 31/31 |
+| `DurableObjectStore` | Cloudflare | 31/31 |
 
 A db9/Postgres backend also passed, and was removed: 61,219 ms against sqlite's
 162 ms, no `SERIALIZABLE`, and `40001` on plain concurrent inserts. A backend
@@ -230,19 +291,21 @@ backend and every sandbox.
 
 | Suite | Cases | Covers |
 |---|---|---|
-| `spec/kernel-spec` | 30 | crash before/after commit, fencing, stale generation, lost wakeup, duplicate delivery, cross-tenant, connection state, checkpoint budget, quotas (incl. no double-spend under concurrency), replay, snapshots and pruning, policy per mount, approval held then performed exactly once |
+| `spec/kernel-spec` | 31 | crash before/after commit, fencing, stale generation, lost wakeup, duplicate delivery, cross-tenant, connection state, quotas (incl. no double-spend under concurrency), replay, snapshots and pruning, policy per mount, approval held then performed exactly once, and an oversized checkpoint shrunk before it is refused |
 | `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
-| `tools` | 10 | mount addressing, ambiguity, version pinning, `unknown` semantics, replay |
-| `strand` | 10 | a waiting task is never unreachable: give-up is visible, a message rescues a stranded task but never bypasses an approval, the turn budget refills, foreign tool-call syntax is translated |
-| `narrowing` · `cache-invariants` | 17 | tool disclosure, prompt-prefix stability |
-| `api` · `harness` · `steering` | 29 | HTTP surface, compaction, interrupts |
+| `strand` | 11 | a waiting task is never unreachable: giving up is visible, a message rescues a stranded task but never bypasses an approval, the turn budget refills, foreign call syntax is translated, a command that answers nothing is still retired |
+| `compaction` | 10 | the handover is asked for and folded back, the second pass updates rather than restarts, tool output is truncated, the record survives in the log, thresholds scale with the model's window |
+| `api` · `harness` · `steering` | 32 | HTTP surface, harness decisions, steering and follow-up |
+| `narrowing` · `cache-invariants` | 18 | tool disclosure, prompt-prefix stability, a rebuilt harness refuses without its catalogue |
 | `executor` · `http-plugin` | 17 | sandbox contract in-process, fetch and HTML extraction |
+| `tools` | 11 | mount addressing, ambiguity, version pinning, `unknown` semantics, replay, the executed source on the record |
 | `state` | 7 | memory that survives a task, byte budgets, per-agent isolation |
+| `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 | `appworld` | 9 | credential custody at 457 APIs (needs a licensed install) |
 
 Live on the deployment, against the Durable Object rather than sqlite:
-[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel) 30/30 and
+[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel) 31/31 and
 [`/conformance/executor`](https://antiproton.botiverse.workers.dev/conformance/executor) 9/9,
 plus `/isolation`, `/eviction`, `/model-binding`.
 
@@ -251,7 +314,7 @@ plus `/isolation`, `/eviction`, `/model-binding`.
 ```
 src/core/         seams: store, execution, tools, types
 src/runtime/      kernel, gateway, command executor, sandbox, model resolver
-src/harness/      reference harnesses (replaceable — this is not the product)
+src/harness/      two harnesses; a task keeps the one that opened it
 src/plugins/      plugin contract; http, artifacts, agent state, run9 sandbox, AppWorld
 src/store/        sqlite, durable-object
 cf/               Cloudflare deployment: worker, durable object, queue consumer, console
@@ -264,17 +327,30 @@ test/             suites; test/spec/ is backend-agnostic
 <https://antiproton.botiverse.dev/ui> — behind Cloudflare Access, owner only.
 
 It is a debugging console, not a demo. The chat is one panel; the other half is
-an inspector with five tabs — the trajectory, the raw event log, every table
-this object holds, what the agent has written down, and the runtime. Three
-things are drawn rather than listed, because they are invisible in rows: a
-timeline that shows a stall as an empty stretch, a stacked bar per model call
-splitting cached prompt from fresh prompt from completion, and billed
-in-object time against the wait that was moved off the meter.
+an inspector: the trajectory, the raw event log beneath it (when the two
+disagree the log wins), every table this object holds, what the agent has
+written down, what the sandbox cost, and the runtime.
+
+Four things are drawn rather than listed, because they are invisible in rows. A
+timeline places every event by when it happened, so a stall reads as an empty
+stretch rather than two adjacent rows with distant timestamps — which is exactly
+how the stalls in this runtime kept hiding. A stacked bar per model call splits
+cached prompt from fresh prompt from completion, which is the number that
+decides what a task costs and appears nowhere else. A pair of bars puts billed
+in-object time against the wait moved off the meter. And container sessions are
+drawn with a live one in red against the finished ones, because "still running"
+is the thing that should look wrong.
+
+Steps show the gap since the previous step, not the time since the task began:
+a number that only grows answers nothing, and a pause is a gap.
 
 Ask it to change something (`Deploy version 2.0.0 to api-01`). Reads run
 freely; the write stops at the gate, the panel shows the request verbatim, and
 approving it resumes the agent — which never saw a credential at any point.
-Ask it to remember something, then open a new task and ask about it.
+Ask it to remember something, then open a new task and ask about it. Type while
+it is working and the message reaches the model before its next call without
+stopping anything in flight; **after** holds the same message until it has
+finished. Its own reasoning is folded away under each turn.
 
 Everything that starts a real agent fails closed: the demo needs an Access
 identity, and the workers.dev address — which bypasses Access entirely —
@@ -320,6 +396,11 @@ them:
   by the world; that is the remaining half of "long-running".
 - **One object per (tenant, agent).** That is what makes isolation structural,
   and it is also the ceiling: one agent's work does not shard.
+- **The context window is configuration.** Compaction is a share of it, so a
+  model change that forgets to bring `HARNESS_CONTEXT_WINDOW` with it calibrates
+  against the wrong number. Unset assumes a small window, which compacts early
+  rather than discovering the limit from a refused call — but nothing reads the
+  real value from the provider.
 - **Benchmarks are not scores.** The numbers here are single-trial ablations at
   n=3–8; τ²-bench scoring does not implement the official `NL_ASSERTION` axis,
   and the SWE-bench Verified runs are a handful of instances, not a submission.
