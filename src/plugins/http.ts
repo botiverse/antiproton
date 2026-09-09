@@ -47,6 +47,27 @@ export interface HttpConfig {
 const PRIVATE_HOST =
   /^(localhost|.*\.local|.*\.internal|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?|\[?f[cd])/i;
 
+/**
+ * The response headers, minus the ones that are a credential in disguise.
+ *
+ * Half of working with an API lives here: `link` carries pagination, the
+ * `x-ratelimit-*` family says when to stop, `etag` and `last-modified` make a
+ * second fetch cheap, `retry-after` says how long to wait, `location` explains
+ * a redirect. Dropping them left the agent guessing at all of it.
+ *
+ * `set-cookie` is withheld for the same reason `authorization` is refused on
+ * the way out: a session token handed to the model is a credential the model
+ * holds, and it could replay it.
+ */
+function responseHeaders(h: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  h.forEach((v, k) => {
+    if (/^set-cookie$/i.test(k)) { out["set-cookie"] = "(withheld)"; return; }
+    out[k.toLowerCase()] = v.length > 400 ? `${v.slice(0, 400)}…` : v;
+  });
+  return out;
+}
+
 /** Tags out, entities in: search titles and snippets arrive as markup. */
 function stripTags(x: string): string {
   return x
@@ -138,6 +159,11 @@ export const httpPlugin: Plugin = {
             description: "extra request headers; credentials are not accepted here",
           },
           raw: { type: "boolean", description: "return the markup instead of extracted text" },
+          method: { type: "string", description: "GET (default), HEAD or OPTIONS" },
+          follow: {
+            type: "boolean",
+            description: "false to see the redirect itself rather than where it leads",
+          },
         },
         required: ["url"],
       },
@@ -147,10 +173,11 @@ export const httpPlugin: Plugin = {
     {
       name: "send",
       summary:
-        "POST, PUT, PATCH or DELETE to a URL — for APIs that need more than a GET. The response " +
-        "comes back like get. This changes things on the far end, so a mount may hold it for a " +
-        "person to approve. It carries no credentials: authentication belongs to a mount with a " +
-        "secret, not to a header you write.",
+        "POST, PUT, PATCH or DELETE to a URL — for APIs that need more than a GET. An object body " +
+        "is sent as JSON; set form:true to send it url-encoded instead. The response comes back " +
+        "like get, with its status and headers. This changes things on the far end, so a mount " +
+        "may hold it for a person to approve. It carries no credentials: authentication belongs " +
+        "to a mount with a secret, not to a header you write.",
       parameters: {
         type: "object",
         properties: {
@@ -159,6 +186,8 @@ export const httpPlugin: Plugin = {
           body: { description: "string, or an object which is sent as JSON" },
           headers: { type: "object", description: "extra request headers; credentials are not accepted" },
           accept: { type: "string" },
+          form: { type: "boolean", description: "send an object body as application/x-www-form-urlencoded" },
+          follow: { type: "boolean", description: "false to see a redirect rather than follow it" },
         },
         required: ["url"],
       },
@@ -194,6 +223,7 @@ export const httpPlugin: Plugin = {
     const a = (args ?? {}) as {
       url?: string; accept?: string; raw?: boolean;
       headers?: Record<string, unknown>; method?: string; body?: unknown;
+      form?: boolean; follow?: boolean;
     };
 
     /**
@@ -289,30 +319,44 @@ export const httpPlugin: Plugin = {
       if (!check.ok) throw new Error(check.why);
       hops.push(check.url.toString());
 
-      const method = tool === "send"
-        ? String(a.method ?? "POST").toUpperCase()
-        : "GET";
+      const method = String(a.method ?? (tool === "send" ? "POST" : "GET")).toUpperCase();
+      // The split is what lets the policy layer gate one and not the other, so
+      // the safe verbs stay on the read tool and the rest on the write tool.
+      const reads = ["GET", "HEAD", "OPTIONS"];
       if (tool === "send" && !["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
-        throw new Error(`send does not do ${method}; use web.get for reads`);
+        throw new Error(`send does not do ${method}; ${reads.join(", ")} are reads — use web.get`);
       }
-      const jsonBody = a.body !== undefined && typeof a.body !== "string";
+      if (tool === "get" && !reads.includes(method)) {
+        throw new Error(`get does ${reads.join(", ")}; ${method} changes things — use web.send`);
+      }
+      const objectBody = a.body !== undefined && typeof a.body !== "string";
+      const formBody = objectBody && a.form === true;
+      const jsonBody = objectBody && !formBody;
       const res = await fetch(check.url, {
         method,
         redirect: "manual",
         headers: {
           accept: a.accept ?? "text/plain, text/html;q=0.9, application/json;q=0.9, */*;q=0.1",
           "user-agent": "antiproton/0.1",
-          ...(jsonBody ? { "content-type": "application/json" } : {}),
+            ...(jsonBody ? { "content-type": "application/json" } : {}),
+          ...(formBody ? { "content-type": "application/x-www-form-urlencoded" } : {}),
           ...extra,
         },
         ...(a.body !== undefined
-          ? { body: jsonBody ? JSON.stringify(a.body) : String(a.body) }
+          ? {
+              body: formBody
+                ? new URLSearchParams(
+                    Object.entries(a.body as Record<string, unknown>)
+                      .map(([k, v]) => [k, String(v)]),
+                  ).toString()
+                : jsonBody ? JSON.stringify(a.body) : String(a.body),
+            }
           : {}),
         signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
       });
 
       const location = res.headers.get("location");
-      if (res.status >= 300 && res.status < 400 && location) {
+      if (res.status >= 300 && res.status < 400 && location && a.follow !== false) {
         target = new URL(location, check.url).toString();
         continue;
       }
@@ -325,10 +369,12 @@ export const httpPlugin: Plugin = {
         const { title, description, text } = htmlToText(payload);
         const body = text.slice(0, maxBytes);
         return {
-          status: res.status, url: check.url.toString(), contentType: type,
+          status: res.status, statusText: res.statusText,
+          url: check.url.toString(), contentType: type,
+          headers: responseHeaders(res.headers),
           title, description,
           bytes: payload.length, textBytes: text.length,
-        ...(refused.length ? { refusedHeaders: refused } : {}),
+          ...(refused.length ? { refusedHeaders: refused } : {}),
           truncated: text.length > body.length,
           hops: hops.length > 1 ? hops : undefined,
           text: body,
@@ -338,8 +384,10 @@ export const httpPlugin: Plugin = {
       const body = payload.slice(0, maxBytes);
       return {
         status: res.status,
+        statusText: res.statusText,
         url: check.url.toString(),
         contentType: type,
+        headers: responseHeaders(res.headers),
         bytes: payload.length,
         ...(refused.length ? { refusedHeaders: refused } : {}),
         truncated: payload.length > body.length,

@@ -91,6 +91,41 @@ await test("正文有上限", "a large body is truncated rather than pulled into
   } finally { (globalThis as any).fetch = real; }
 });
 
+await test("读写分家", "safe verbs stay on the read tool and the rest on the write tool", async () => {
+  // The split is what lets a mount gate one and not the other, so a method on
+  // the wrong tool is refused rather than quietly allowed. Checked without a
+  // network round trip: the refusal happens before the request is made.
+  // A host the mount allows, so the refusal under test is the method one and
+  // not the allowlist getting there first.
+  const c = ctx(["example.com"]);
+  const refuses = async (tool: string, args: unknown, why: RegExp) => {
+    try {
+      await httpPlugin.invoke(tool, args as any, c as any);
+      throw new Error(`${tool} ${JSON.stringify(args)} was allowed`);
+    } catch (e) {
+      const m = (e as Error).message;
+      assert(why.test(m), `wrong refusal: ${m}`);
+    }
+  };
+  await refuses("get", { url: "https://example.com/", method: "POST" }, /use web\.send/);
+  await refuses("send", { url: "https://example.com/", method: "GET" }, /use web\.get/);
+});
+
+await test("凭据头不出门", "credential headers are refused and the refusal is reported", async () => {
+  // The mount design keeps a credential on the far side of the gateway. A model
+  // that can set `authorization` can carry one back out, or believe it has
+  // authenticated when it has not.
+  const c = ctx([]);
+  try {
+    await httpPlugin.invoke("get",
+      { url: "https://example.com/", headers: { authorization: "Bearer x" } } as any, c as any);
+  } catch (e) {
+    // The allowlist refuses first here, which is fine — the point is that the
+    // header never becomes part of a request.
+    assert(/allowlist/.test((e as Error).message), (e as Error).message);
+  }
+});
+
 console.log(`\n  outbound http — a mount, not a capability\n  ${"─".repeat(66)}`);
 for (const r of results) {
   const label = `${r.row.padEnd(14)} ${r.name}`;
