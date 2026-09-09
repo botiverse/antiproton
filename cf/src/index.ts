@@ -529,6 +529,17 @@ export class AgentDO extends DurableObject<Env> {
       // The budget a long conversation eventually runs into, and the number
       // that was invisible while a task span for ever refusing to commit.
       checkpointBytes: task ? JSON.stringify(task.checkpoint ?? null).length : 0,
+      // Whether this task has been compacted, and what it kept. Was only
+      // visible by reading a truncated event payload and guessing.
+      compaction: task ? (() => {
+        const c = task.checkpoint as any;
+        return {
+          compactions: c?.compactions ?? 0,
+          inFlight: !!c?.compacting,
+          messages: Array.isArray(c?.messages) ? c.messages.length : 0,
+          summary: typeof c?.summary === "string" ? c.summary.slice(0, 1200) : null,
+        };
+      })() : null,
       task: task && {
         status: task.status, generation: task.generation,
         checkpointVersion: task.checkpointVersion, stateVersion: task.stateVersion,

@@ -249,7 +249,24 @@ const pretty = (v: unknown, cap = 4000) => {
   catch { return String(v).slice(0, cap); }
 };
 
-const secs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
+/**
+ * A duration a person can read at a glance.
+ *
+ * It used to stop at seconds, so a conversation running for hours showed
+ * "+9938.2s" — arithmetically right and unreadable, and it looked like a bug
+ * rather than a long session.
+ */
+const secs = (ms: number) => {
+  const s = ms / 1000;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+  const h = Math.floor(s / 3600);
+  return `${h}h ${Math.round((s % 3600) / 60)}m`;
+};
+
+const clock = (at: number) =>
+  new Date(at).toISOString().slice(11, 19) + "Z";
 
 /**
  * The trajectory, not a log dump.
@@ -273,11 +290,19 @@ export function trajectory(
   if (!steps.length) return `<div class="empty">nothing yet — say something below.</div>`;
 
   const t0 = steps[0]!.at;
+  let prevAt = t0;
   const out: string[] = [];
   let turn = 0;
 
   for (const s of steps) {
-    const rel = `<span class="t">+${esc(secs(s.at - t0))}</span>`;
+    // The gap since the previous step, not the elapsed time since the task
+    // began. Time-since-start is a number that only grows and answers nothing;
+    // the gap is the thing worth seeing, because a stall is a large one. The
+    // wall-clock time is on the hover, for orientation.
+    const gap = s.at - prevAt;
+    const rel = `<span class="t" title="${esc(clock(s.at))} · +${esc(secs(s.at - t0))} into the task">` +
+      (gap >= 1000 ? `+${esc(secs(gap))}` : esc(clock(s.at))) + `</span>`;
+    prevAt = s.at;
     const p = s.payload;
 
     if (s.kind === "message") {
@@ -525,7 +550,7 @@ export function eventList(
   return `<h3>timeline</h3>${timeline(events)}
     <h3>${events.length} events</h3>` + events.slice().reverse().map((e) =>
     `<div class="ev"><div class="k">#${e.sequence} · ${esc(e.kind)}
-       <span class="t">+${esc(secs(e.createdAt - t0))}</span></div>
+       <span class="t" title="${esc(clock(e.createdAt))}">+${esc(secs(e.createdAt - t0))}</span></div>
      <details><summary>${esc(pretty(e.payload, 160).replace(/\s+/g, " "))}</summary>
        <pre>${esc(pretty(e.payload, 6000))}</pre></details></div>`).join("");
 }

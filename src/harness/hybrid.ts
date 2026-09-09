@@ -107,6 +107,8 @@ interface HybridState {
   done: boolean;
   finalizing: boolean;
   promptTokens: number;
+  /** How many handovers this task has been through. */
+  compactions?: number;
   /** Only ever set when the model call is dispatched somewhere that can drop it. */
   modelFailures?: number;
 }
@@ -428,6 +430,9 @@ export class HybridHarness implements HarnessAdapter {
       ];
       state.summary = summary;
       state.compacting = undefined;
+      // Counted, or the console reports a task that has never been compacted
+      // while holding the handover that proves otherwise.
+      state.compactions = (state.compactions ?? 0) + 1;
       return {
         state, status: "waiting",
         commands: [{ kind: "model.request",
