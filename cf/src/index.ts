@@ -525,6 +525,20 @@ export class AgentDO extends DurableObject<Env> {
       })),
       pendingWork: (await rt.store.tasksWithPendingWork(5)).length,
       alarm: await this.ctx.storage.getAlarm(),
+      // What the agent believes, in the operator's own view. The tools tell the
+      // agent this is readable by the person running it; that has to be true,
+      // or a wrong memory is only discoverable by watching it act on one.
+      state: await (async () => {
+        const rt2 = this.#activeRuntime();
+        const keys = await rt2.store.listState(tenantId, agentId, "", 20);
+        const docs: Record<string, unknown> = {};
+        for (const k of keys.slice(0, 5)) {
+          const got = await rt2.store.getState(tenantId, agentId, k.key);
+          docs[k.key] = got?.ref ?? (typeof got?.value === "string"
+            ? got.value.slice(0, 600) : got?.value);
+        }
+        return { ...(await rt2.store.stateUsage(tenantId, agentId)), docs };
+      })(),
       alarmFailures: this.#alarmFailures(),
       // The table exists only once an alarm has failed; diagnose must not be
       // the thing that throws while explaining why something else did.
@@ -802,6 +816,11 @@ export class AgentDO extends DurableObject<Env> {
         // JS first, and the framework releases the box when the task ends.
         { alias: "node", plugin: "run9", config: { account: "sandbox" },
           secretRef: OPERATOR_RUN9_REF, policy: null },
+        // The agent's own store. Deliberately not behind approval: an agent
+        // that must ask a person before writing a note will not keep notes, and
+        // the blast radius is its own memory, scoped to this (tenant, agent).
+        { alias: "state", plugin: "state", config: { account: "agent memory" },
+          secretRef: null, policy: null },
       ];
       for (const d of desired) {
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);

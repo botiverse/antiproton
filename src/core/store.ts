@@ -14,6 +14,13 @@ import type {
   WaitSpec,
 } from "./types.ts";
 
+/** A stored value: inline when small, a reference to object storage when not. */
+export interface StateEntry {
+  value: Json | null;
+  ref: string | null;
+  bytes: number;
+}
+
 /**
  * The seam the plan (§7.1 / §15 risk #1) requires: the Runtime's transactional
  * path must be swappable, and a backend that does not pass the contract in
@@ -159,6 +166,33 @@ export interface StorageAdapter {
   usage(tenantId: string): Promise<
     Array<{ resource: string; used: number; limit: number | null; windowStart: number }>
   >;
+
+  /**
+   * The agent's own store, per (tenant, agent), outliving any one task.
+   *
+   * A long-running agent that cannot write anything down has to re-derive
+   * everything it learned on every task, and it knows it: asked to keep a note,
+   * it says it has nowhere to keep one. Values are JSON; a text document is a
+   * JSON string, so there is one type rather than two. Anything too large to
+   * sit in a row is spilled to object storage by the caller and referenced
+   * here, which is the same split the tool-result offload already makes.
+   */
+  putState(
+    tenantId: string, agentId: string, key: string, entry: StateEntry,
+  ): Promise<void>;
+  /** The cheap, additive write. A journal the agent has to read, edit and
+   *  rewrite to add a line is a journal it will stop writing. */
+  appendState(
+    tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
+  ): Promise<{ bytes: number; truncated: boolean }>;
+  getState(
+    tenantId: string, agentId: string, key: string,
+  ): Promise<(StateEntry & { updatedAt: number }) | null>;
+  deleteState(tenantId: string, agentId: string, key: string): Promise<boolean>;
+  listState(
+    tenantId: string, agentId: string, prefix?: string, limit?: number,
+  ): Promise<Array<{ key: string; bytes: number; ref: string | null; updatedAt: number }>>;
+  stateUsage(tenantId: string, agentId: string): Promise<{ keys: number; bytes: number }>;
 
   getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null>;
   putConnection(

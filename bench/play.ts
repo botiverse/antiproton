@@ -19,6 +19,7 @@ import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { run9Plugin } from "../src/plugins/run9.ts";
+import { statePlugin, workingSet } from "../src/plugins/state.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import type { ToolResult } from "../src/core/tools.ts";
 
@@ -28,16 +29,21 @@ for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").spl
 }
 
 const T = "play", AGENT = "a1", TASK = "t1";
-const store = new SqliteStore(":memory:");
+const store = new SqliteStore(process.env.STATE_DB ?? ":memory:");
 await store.init();
 await store.createAgent(T, AGENT);
 
-const plugins: Plugin[] = [demoPlugin, httpPlugin, run9Plugin, builtinToolsPlugin(store, () => plugins)];
+const plugins: Plugin[] = [
+  demoPlugin, httpPlugin, run9Plugin,
+  statePlugin(store, null, "local"),
+  builtinToolsPlugin(store, () => plugins),
+];
 for (const [alias, plugin, cfg, policy] of [
   ["tools", "tools", {}, null],
   ["ops", "demo", { account: "demo-fleet" }, { write: "approval" as const }],
   ["web", "http", { account: "open web", maxBytes: 24_000 }, null],
   ["node", "run9", { account: "sandbox" }, null],
+  ["state", "state", { account: "agent memory" }, null],
 ] as const) {
   await store.addMount({
     tenantId: T, agentId: AGENT, alias, plugin, installationId: `i-${alias}`,
@@ -66,6 +72,9 @@ await store.createTask(T, AGENT, TASK, await harness.initialize({
   mounts: (await store.listMounts(T, AGENT)).map((m) => ({
     alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
   })),
+  // What earlier runs wrote down. Set STATE_DB to a file to carry it between
+  // runs; the default in-memory store starts each run blank.
+  workingSet: await workingSet(store, T, AGENT),
 }), harness.stateVersion);
 
 const commands = new CommandExecutor(store, model, host, new QuickJsExecutor());

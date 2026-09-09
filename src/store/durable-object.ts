@@ -1,4 +1,4 @@
-import type { StorageAdapter } from "../core/store.ts";
+import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type {
   AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
@@ -65,6 +65,10 @@ const SCHEMA = [
   limit_value INTEGER, window_ms INTEGER,
   used INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (tenant_id, resource));`,
+  `CREATE TABLE IF NOT EXISTS agent_state (
+     tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, key TEXT NOT NULL,
+     value TEXT, ref TEXT, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+     PRIMARY KEY (tenant_id, agent_id, key))`,
   `CREATE TABLE IF NOT EXISTS connections (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
@@ -476,6 +480,65 @@ export class DurableObjectStore implements StorageAdapter {
     )[0] as any;
     if (!r || (r.expires_at != null && Number(r.expires_at) <= this.#now())) return null;
     return JSON.parse(r.state);
+  }
+
+  // ------------------------------------------------------------ agent state
+
+  async putState(tenantId: string, agentId: string, key: string, entry: StateEntry) {
+    this.#sql.exec(
+      `INSERT INTO agent_state(tenant_id, agent_id, key, value, ref, bytes, updated_at)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(tenant_id, agent_id, key) DO UPDATE SET
+           value=excluded.value, ref=excluded.ref, bytes=excluded.bytes,
+           updated_at=excluded.updated_at`,
+      tenantId, agentId, key, entry.value === null ? null : j(entry.value),
+      entry.ref, entry.bytes, this.#now());
+  }
+
+  async appendState(
+    tenantId: string, agentId: string, key: string, text: string, maxBytes: number,
+  ) {
+    const prior = await this.getState(tenantId, agentId, key);
+    // Appending to something that was spilled would mean fetching it back and
+    // rewriting it, which is exactly the read-modify-write this exists to avoid.
+    if (prior?.ref) throw new Error(`${key} is too large to append to; read it and put a new one`);
+    const before = typeof prior?.value === "string" ? prior.value : "";
+    const joined = before ? `${before}\n${text}` : text;
+    // Keep the tail: a journal's recent end is the part worth having.
+    const truncated = joined.length > maxBytes;
+    const kept = truncated ? joined.slice(joined.length - maxBytes) : joined;
+    await this.putState(tenantId, agentId, key, { value: kept, ref: null, bytes: kept.length });
+    return { bytes: kept.length, truncated };
+  }
+
+  async getState(tenantId: string, agentId: string, key: string) {
+    const r = this.#one("SELECT * FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key) as any;
+    if (!r) return null;
+    return {
+      value: r.value === null || r.value === undefined ? null : JSON.parse(r.value),
+      ref: r.ref ?? null, bytes: Number(r.bytes), updatedAt: Number(r.updated_at),
+    };
+  }
+
+  async deleteState(tenantId: string, agentId: string, key: string) {
+    const had = !!this.#one("SELECT * FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key) as any;
+    this.#sql.exec("DELETE FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key);
+    return had;
+  }
+
+  async listState(tenantId: string, agentId: string, prefix = "", limit = 100) {
+    return this.#all(
+      "SELECT key, bytes, ref, updated_at FROM agent_state WHERE tenant_id=? AND agent_id=? AND key LIKE ? ORDER BY key ASC LIMIT ?",
+      tenantId, agentId, `${prefix}%`, limit).map((r: any) => ({
+      key: r.key, bytes: Number(r.bytes), ref: r.ref ?? null, updatedAt: Number(r.updated_at),
+    }));
+  }
+
+  async stateUsage(tenantId: string, agentId: string) {
+    const r = this.#one(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS b FROM agent_state WHERE tenant_id=? AND agent_id=?",
+      tenantId, agentId) as any;
+    return { keys: Number(r?.n ?? 0), bytes: Number(r?.b ?? 0) };
   }
 
   async putConnection(

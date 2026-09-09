@@ -26,11 +26,29 @@ Rules that matter:
   not in your head.
 - Discovery: tool\`tools.mounts \${ {} }\`, tool\`tools.search \${ { query: "..." } }\`,
   tool\`tools.describe \${ { name: "alias.tool" } }\`.
-- Nothing persists between executions: no variables, no closures. Carry state via output and
-  the next code block.
+- The sandbox keeps nothing between executions: no variables, no closures. Carry values forward
+  with output and the next code block. That is about the sandbox, not about you — see below.
 
 Keep each code block small and purposeful. Prefer one or two calls per block, look at the
-result, then decide the next block.`;
+result, then decide the next block.
+
+# Remembering
+
+You outlive this task. If a \`state\` mount is listed above, it is your own store, kept per
+agent and readable by the person who runs you:
+
+  tool\`state.remember \${ { key: "memory", text: "the deploy window is Tuesdays 02:00 UTC" } }\`
+
+Three documents are shown back to you at the start of every task, so what you put in them you
+will see again without going to look: \`memory\` for facts worth having next time, \`todo\` for
+what is still open, \`journal\` for what happened. Use \`state.put\` / \`state.get\` for data
+rather than notes.
+
+- Write the fact, not the story. "Prefers a dry run first" is worth keeping; a retelling of
+  this conversation is not.
+- Wrong memory is worse than none, because you will act on it. When something you wrote turns
+  out to be false, fix it or \`state.forget\` it.
+- Never write a credential, token or key into memory, and do not copy one into output.`;
 
 /**
  * Messages carry a tag so compaction can distinguish requirements from scratch
@@ -244,8 +262,14 @@ export class CodegenHarness implements HarnessAdapter {
             .join("\n")}`
         : "";
     const rules = policy ? `\n\n# Domain policy you must follow\n${policy}` : "";
+    // Injected once, when the task opens, rather than before every turn the way
+    // a local harness can afford to: editing the system message costs 6.6x the
+    // uncached tokens here, so a working set that changed each turn would cost
+    // more than it is worth. Anything written during the task is already in the
+    // transcript as a tool result.
+    const known = (config as any)?.workingSet ? String((config as any).workingSet) : "";
     return {
-      messages: [{ role: "system", tag: "system", content: SYSTEM + preamble + rules }],
+      messages: [{ role: "system", tag: "system", content: SYSTEM + preamble + rules + known }],
       turns: 0, done: false, finalizing: false, promptTokens: 0, compactions: 0,
     } satisfies CodegenState;
   }

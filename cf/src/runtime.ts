@@ -23,6 +23,7 @@ import { envSecrets } from "../../src/runtime/gateway.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
+import { statePlugin, workingSet } from "../../src/plugins/state.ts";
 import { run9Plugin } from "../../src/plugins/run9.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
@@ -165,6 +166,7 @@ export class AgentRuntime {
       demoPlugin,
       httpPlugin,
       run9Plugin,
+      statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),
@@ -297,9 +299,12 @@ export class AgentRuntime {
       })),
     ));
     const policy = this.#deps.policy ? { policy: this.#deps.policy } : {};
+    // What this agent wrote down on earlier tasks. Read here rather than in the
+    // harness so the harness keeps holding no I/O of its own.
+    const workingSetText = await workingSet(this.store, tenantId, agentId);
     await this.store.createTask(
       tenantId, agentId, taskId,
-      await this.#harness.initialize({ mounts, tools, ...policy }),
+      await this.#harness.initialize({ mounts, tools, workingSet: workingSetText, ...policy }),
       this.#harness.stateVersion,
     );
   }
