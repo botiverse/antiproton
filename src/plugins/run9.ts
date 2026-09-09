@@ -43,11 +43,47 @@ export interface Run9Config {
    * grader can run the test suite.
    */
   shellPrefix?: string;
+  /**
+   * Credentials the container may use but not read. Declares the shape only —
+   * the values come from the mount's own credential.
+   */
+  secrets?: InjectedSecret[];
 }
 
-interface Run9Credential { ak: string; sk: string }
+interface Run9Credential {
+  ak: string;
+  sk: string;
+  /** Values for the injected secrets the mount declares, by name. Here rather
+   *  than in publicConfig because publicConfig is not a secret: it is shown in
+   *  the console and derived from configuration the operator can read. */
+  secrets?: Record<string, string>;
+}
+
+/**
+ * A credential the container may use without ever holding.
+ *
+ * run9 substitutes the real value into a named header on the way out, and only
+ * for the hosts listed — so a shell in the box writes the placeholder, the far
+ * end receives the credential, and the agent never sees it. That is the same
+ * bargain the gateway makes, enforced at run9's egress instead.
+ *
+ * Measured, because the documentation for it is a 404: injection happens only
+ * under `network_mode: "managed"`; `inject_header_name` is required; and a
+ * placeholder is unique across the project, so it is qualified per box.
+ */
+interface InjectedSecret {
+  /** Key in the mount's credential holding the value. */
+  name: string;
+  /** Header the value is injected into, e.g. "authorization". */
+  header: string;
+  /** Hosts it may be sent to. Everything else keeps the placeholder. */
+  hosts: string[];
+}
 /** A saved filesystem, under a name the agent chose rather than an id. */
 interface Env { name: string; snapId: string; savedAt: number; note?: string }
+
+/** Placeholders handed to the agent for this box, by credential name. */
+type Placeholders = Record<string, string>;
 
 interface Session {
   boxId: string;
@@ -67,6 +103,8 @@ interface BoxState {
   boxId: string;
   createdAt: number;
   lastUsedAt: number;
+  /** What the agent may write; never the values behind them. */
+  placeholders?: Placeholders;
   execs?: number;
   saved?: string[];
   /** Most recent first, capped: this is a meter, not a second event log. */
@@ -329,17 +367,38 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
       const from = state?.startFrom ?? (prior as any)?.startFrom;
+      const declared = cfg.secrets ?? [];
       await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
         box_id: boxId,
         // An environment kept earlier, or the bare image. Starting from a
         // snapshot is the whole point of having kept one.
         ...(from ? { source_snap_id: from } : { source_image_ref: cfg.image }),
+        // Injection happens on run9's egress proxy, which only exists in
+        // managed mode. Measured: under `normal` the placeholder goes out
+        // unchanged, which would look like a working credential and not be one.
+        ...(declared.length ? { network_mode: "managed" } : {}),
         ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
         description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
       });
+      // Register the declared credentials against the new box. The value never
+      // enters the box and never reaches the model: only the placeholder does.
+      const placeholders: Placeholders = {};
+      for (const d of declared) {
+        const value = cred.secrets?.[d.name];
+        if (!value) continue;
+        // Qualified by box, because a placeholder is unique across the project
+        // and two agents would otherwise collide on the same name.
+        const placeholder = `__AP_${d.name}_${boxId.slice(-8)}__`;
+        await api("POST", `/projects/${cfg.project}/workspace/boxes/${boxId}/secrets`, {
+          name: d.name, value, placeholder,
+          inject_header_name: d.header, allowed_hosts: d.hosts,
+        });
+        placeholders[d.name] = placeholder;
+      }
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
         sessions: history,
+        ...(Object.keys(placeholders).length ? { placeholders } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
     }
@@ -482,6 +541,18 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
           image: cfg.image,
           ...(state.envs?.length
             ? { kept: state.envs.map((e) => e.name) }
+            : {}),
+          ...(state.placeholders && Object.keys(state.placeholders).length
+            ? {
+                credentials: Object.entries(state.placeholders).map(([name, ph]) => ({
+                  name, writeThis: ph,
+                  toHosts: (cfg.secrets ?? []).find((d) => d.name === name)?.hosts ?? [],
+                  header: (cfg.secrets ?? []).find((d) => d.name === name)?.header,
+                })),
+                note: "write the placeholder where the credential would go; it is substituted " +
+                  "on the way out, only for those hosts. You cannot read the value, and neither " +
+                  "can anything running in this container.",
+              }
             : {}),
         };
       }

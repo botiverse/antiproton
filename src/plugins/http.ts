@@ -31,6 +31,12 @@ import type { Plugin, PluginContext } from "./types.ts";
  * by definition. The body is capped and returned as data, never as instructions.
  */
 export interface HttpConfig {
+  /**
+   * Where a search goes. Keyless by default, because a capability that needs an
+   * account before it works is a capability nobody turns on. An operator who
+   * wants a real search API points this at one; the shape is the same.
+   */
+  searchEndpoint?: string;
   /** Exact hostnames; no wildcards, since a wildcard is how an allowlist stops
    *  being one. Omit the field entirely to allow any public host. */
   allowedHosts?: string[];
@@ -40,6 +46,16 @@ export interface HttpConfig {
 
 const PRIVATE_HOST =
   /^(localhost|.*\.local|.*\.internal|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?|\[?f[cd])/i;
+
+/** Tags out, entities in: search titles and snippets arrive as markup. */
+function stripTags(x: string): string {
+  return x
+    .replace(/<[^>]*>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 export function checkUrl(
   raw: string,
@@ -151,10 +167,27 @@ export const httpPlugin: Plugin = {
       sideEffects: "write",
       idempotency: "none",
     },
+    {
+      name: "search",
+      summary:
+        "Search the web and get back titles, urls and snippets. Use it when you do not already " +
+        "know which page to read — guessing a url and fetching it is how a search becomes three " +
+        "wasted turns. Then read the ones that look right with web.get.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          limit: { type: "integer", description: "default 8, at most 20" },
+        },
+        required: ["query"],
+      },
+      sideEffects: "read",
+      idempotency: "native",
+    },
   ],
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-    if (tool !== "get" && tool !== "send") throw new Error(`unknown tool: ${tool}`);
+    if (!["get", "send", "search"].includes(tool)) throw new Error(`unknown tool: ${tool}`);
     const cfg = (ctx.publicConfig ?? {}) as HttpConfig;
     const allowed = cfg.allowedHosts;
     const maxBytes = cfg.maxBytes ?? 64 * 1024;
@@ -177,6 +210,40 @@ export const httpPlugin: Plugin = {
     for (const [k, v] of Object.entries(a.headers ?? {})) {
       if (FORBIDDEN.test(k)) { refused.push(k); continue; }
       if (typeof v === "string" || typeof v === "number") extra[k.toLowerCase()] = String(v);
+    }
+
+    if (tool === "search") {
+      const q = String((args as any)?.query ?? "").trim();
+      if (!q) throw new Error("query is required");
+      const limit = Math.min(Math.max(Number((args as any)?.limit ?? 8), 1), 20);
+      const endpoint = cfg.searchEndpoint ?? "https://html.duckduckgo.com/html/?q=";
+      const res = await fetch(endpoint + encodeURIComponent(q), {
+        headers: {
+          // Without a browser-shaped agent the endpoint answers with a page
+          // that has no results in it.
+          "user-agent":
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+          accept: "text/html",
+        },
+        signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
+      });
+      if (!res.ok) throw new Error(`search returned ${res.status}`);
+      const page = await res.text();
+      const results: Array<{ title: string; url: string; snippet: string }> = [];
+      const link = /result__a"\s+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+      const snips = [...page.matchAll(/result__snippet"[^>]*>([\s\S]*?)<\/a>/g)]
+        .map((m) => stripTags(m[1]!));
+      for (let m = link.exec(page); m && results.length < limit; m = link.exec(page)) {
+        // The href is a redirector; the real destination is a parameter on it.
+        const direct = /[?&]uddg=([^&"]+)/.exec(m[1]!);
+        const url = direct ? decodeURIComponent(direct[1]!) : m[1]!;
+        if (!/^https?:\/\//.test(url)) continue;
+        // The same rules as a fetch: an allowlisted mount does not get to
+        // search its way around its own allowlist.
+        if (!checkUrl(url, allowed).ok) continue;
+        results.push({ title: stripTags(m[2]!), url, snippet: snips[results.length] ?? "" });
+      }
+      return { query: q, count: results.length, results };
     }
 
     let target = String(a.url ?? "");
