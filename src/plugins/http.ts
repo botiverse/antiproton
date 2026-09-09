@@ -117,6 +117,10 @@ export const httpPlugin: Plugin = {
         properties: {
           url: { type: "string", description: "absolute http(s) url" },
           accept: { type: "string", description: "optional Accept header" },
+          headers: {
+            type: "object",
+            description: "extra request headers; credentials are not accepted here",
+          },
           raw: { type: "boolean", description: "return the markup instead of extracted text" },
         },
         required: ["url"],
@@ -124,14 +128,56 @@ export const httpPlugin: Plugin = {
       sideEffects: "read",
       idempotency: "native",
     },
+    {
+      name: "send",
+      summary:
+        "POST, PUT, PATCH or DELETE to a URL — for APIs that need more than a GET. The response " +
+        "comes back like get. This changes things on the far end, so a mount may hold it for a " +
+        "person to approve. It carries no credentials: authentication belongs to a mount with a " +
+        "secret, not to a header you write.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "absolute http(s) url" },
+          method: { type: "string", description: "POST | PUT | PATCH | DELETE (default POST)" },
+          body: { description: "string, or an object which is sent as JSON" },
+          headers: { type: "object", description: "extra request headers; credentials are not accepted" },
+          accept: { type: "string" },
+        },
+        required: ["url"],
+      },
+      // A write, so the policy layer can gate it: reads of the open web are one
+      // thing, changing something on the far end is another.
+      sideEffects: "write",
+      idempotency: "none",
+    },
   ],
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-    if (tool !== "get") throw new Error(`unknown tool: ${tool}`);
+    if (tool !== "get" && tool !== "send") throw new Error(`unknown tool: ${tool}`);
     const cfg = (ctx.publicConfig ?? {}) as HttpConfig;
     const allowed = cfg.allowedHosts;
     const maxBytes = cfg.maxBytes ?? 64 * 1024;
-    const a = (args ?? {}) as { url?: string; accept?: string; raw?: boolean };
+    const a = (args ?? {}) as {
+      url?: string; accept?: string; raw?: boolean;
+      headers?: Record<string, unknown>; method?: string; body?: unknown;
+    };
+
+    /**
+     * Headers the model asked for, minus the ones that carry identity.
+     *
+     * The whole point of the mount design is that a credential is dereferenced
+     * server-side and never reaches the model. A model that can set
+     * `authorization` can smuggle one back out, or fool itself into thinking it
+     * has authenticated. Those headers belong to a mount with a secret_ref.
+     */
+    const FORBIDDEN = /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key)$/i;
+    const extra: Record<string, string> = {};
+    const refused: string[] = [];
+    for (const [k, v] of Object.entries(a.headers ?? {})) {
+      if (FORBIDDEN.test(k)) { refused.push(k); continue; }
+      if (typeof v === "string" || typeof v === "number") extra[k.toLowerCase()] = String(v);
+    }
 
     let target = String(a.url ?? "");
     const hops: string[] = [];
@@ -141,12 +187,25 @@ export const httpPlugin: Plugin = {
       if (!check.ok) throw new Error(check.why);
       hops.push(check.url.toString());
 
+      const method = tool === "send"
+        ? String(a.method ?? "POST").toUpperCase()
+        : "GET";
+      if (tool === "send" && !["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+        throw new Error(`send does not do ${method}; use web.get for reads`);
+      }
+      const jsonBody = a.body !== undefined && typeof a.body !== "string";
       const res = await fetch(check.url, {
+        method,
         redirect: "manual",
         headers: {
           accept: a.accept ?? "text/plain, text/html;q=0.9, application/json;q=0.9, */*;q=0.1",
           "user-agent": "antiproton/0.1",
+          ...(jsonBody ? { "content-type": "application/json" } : {}),
+          ...extra,
         },
+        ...(a.body !== undefined
+          ? { body: jsonBody ? JSON.stringify(a.body) : String(a.body) }
+          : {}),
         signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
       });
 
@@ -167,6 +226,7 @@ export const httpPlugin: Plugin = {
           status: res.status, url: check.url.toString(), contentType: type,
           title, description,
           bytes: payload.length, textBytes: text.length,
+        ...(refused.length ? { refusedHeaders: refused } : {}),
           truncated: text.length > body.length,
           hops: hops.length > 1 ? hops : undefined,
           text: body,
@@ -179,6 +239,7 @@ export const httpPlugin: Plugin = {
         url: check.url.toString(),
         contentType: type,
         bytes: payload.length,
+        ...(refused.length ? { refusedHeaders: refused } : {}),
         truncated: payload.length > body.length,
         hops: hops.length > 1 ? hops : undefined,
         body,

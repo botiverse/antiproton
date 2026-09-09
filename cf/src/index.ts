@@ -842,12 +842,15 @@ export class AgentDO extends DurableObject<Env> {
         // Open on purpose: the agent holds no credential and writes need a
         // human. maxBytes stays under the offload threshold so an ordinary page
         // reaches the model directly rather than via a round trip to storage.
+        // Reads of the open web run freely; anything that changes something on
+        // the far end stops for a person. The mount holds no credential either
+        // way, so this is about effects, not authority.
         { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
-          secretRef: null, policy: null },
+          secretRef: null, policy: { write: "approval" as const } },
         // A real container, for tasks that need one. Its tools describe
         // themselves as a last resort so the agent reaches for free in-process
         // JS first, and the framework releases the box when the task ends.
-        { alias: "node", plugin: "run9", config: { account: "sandbox" },
+        { alias: "node", plugin: "run9", config: { account: "container" },
           secretRef: OPERATOR_RUN9_REF, policy: null },
         // The agent's own store. Deliberately not behind approval: an agent
         // that must ask a person before writing a note will not keep notes, and

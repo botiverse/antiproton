@@ -232,6 +232,10 @@ await check("可以手动要求压缩", async () => {
 
 await check("阈值随模型窗口走，不是写死的 token 数", async () => {
   const st = await loaded(new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: WINDOW }));
+  // Trimmed so the byte rule cannot fire: this case is about the token rule,
+  // and the fixture is otherwise large enough to trip the other one, which
+  // would make both harnesses compact for the same uninteresting reason.
+  st.messages = st.messages.slice(0, 12);
   const prompt = 25_000;
 
   // The same prompt is most of a small window and a fraction of a large one, so
@@ -256,6 +260,46 @@ await check("阈值随模型窗口走，不是写死的 token 数", async () => 
   assert(
     JSON.stringify(inLarge.state).length >= JSON.stringify(inSmall.state).length,
     "a larger window keeps at least as much",
+  );
+});
+
+await check("压缩必须收敛，不能压完又立刻满足条件", async () => {
+  const { keepRecentChars } = await import("../src/harness/codegen.ts");
+
+  // The tail is bounded by two things and has to satisfy both: the model's
+  // window, and the checkpoint size that triggers a compaction. Derived from
+  // the window alone, a 131,072-token model gave a 128 KB tail against a 128 KB
+  // trigger — so compaction summarised, kept a tail that was itself over the
+  // line, and qualified again on the very next advance. One agent did that
+  // twenty-nine times, paying for a model call each round.
+  for (const w of [24_000, 32_000, 131_072, 1_000_000]) {
+    const kept = keepRecentChars(w, DEFAULT_COMPACTION);
+    assert(
+      kept < DEFAULT_COMPACTION.maxCheckpointBytes / 2,
+      `a ${w}-token window keeps ${Math.round(kept)} chars against a ` +
+      `${DEFAULT_COMPACTION.maxCheckpointBytes / 2} byte trigger — it would compact for ever`,
+    );
+  }
+
+  // And end to end: after a compaction the state must no longer ask for one.
+  const h = new CodegenHarness({ compaction: DEFAULT_COMPACTION, contextWindow: 131_072 });
+  const st: any = await loaded(h);
+  for (let i = 0; i < 60; i++) {
+    st.messages.push({ role: "user", tag: "execution", content: `bulk ${i} ` + "x".repeat(4000) });
+  }
+  st.promptTokens = 100_000;
+  const asked = await h.advance({ state: st, events: [ev("message", { text: "继续" })], context: ctx });
+  eq((asked.commands[0] as any).payload.purpose, "compaction", "it compacts once");
+  const done = await h.advance({
+    state: asked.state, events: [ev("model.response", { text: "## Goal\nx", usage: { promptTokens: 3000 } })],
+    context: ctx,
+  });
+  const again = await h.advance({
+    state: done.state, events: [ev("js.result", { status: "completed", outputs: [1] })], context: ctx,
+  });
+  assert(
+    (again.commands[0] as any)?.payload?.purpose !== "compaction",
+    "and does not immediately compact again",
   );
 });
 

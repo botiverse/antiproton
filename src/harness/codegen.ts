@@ -26,8 +26,9 @@ Rules that matter:
   not in your head.
 - Discovery: tool\`tools.mounts \${ {} }\`, tool\`tools.search \${ { query: "..." } }\`,
   tool\`tools.describe \${ { name: "alias.tool" } }\`.
-- The sandbox keeps nothing between executions: no variables, no closures. Carry values forward
-  with output and the next code block. That is about the sandbox, not about you — see below.
+- Each code block runs in a fresh isolate: no variables, no closures, nothing carried from the
+  last one. Carry values forward with output and the next code block. This is about the isolate
+  your code runs in — not about you, and not about the container below, which does persist.
 
 Keep each code block small and purposeful. Prefer one or two calls per block, look at the
 result, then decide the next block.
@@ -58,6 +59,10 @@ one — installing packages, building, running a test suite, anything needing a 
 for arithmetic, string work or JSON, all of which your ordinary code block does instantly and
 for nothing.
 
+It is not the isolate your code blocks run in. **The container persists between calls** until
+you release it: packages you install, files you write and processes you leave running are all
+still there on the next call. Do not reinstall something you already installed.
+
 When you do need it:
 
 - Do the work in as few calls as you can. The calls are not the cost; the wall clock between
@@ -65,7 +70,11 @@ When you do need it:
 - Anything worth keeping — a build output, a report, a diff — save it with \`node.save\` the
   moment it exists. Everything inside the box is destroyed with the box.
 - Release it as soon as the work that needed a machine is done, not at the end of the task.
-  \`node.release \${ { save: ["/work/report.md"] } }\` does both at once.`;
+  \`node.release \${ { save: ["/work/report.md"] } }\` does both at once.
+- Setting a machine up is usually the slowest part of using one. When you have installed an
+  interpreter, a toolchain or a repository, keep it: \`node.keep \${ { name: "py-scipy" } }\`.
+  A later task starts from it with \`node.start_from\` instead of installing everything again.
+  Keep the environment, not the results — results go to \`node.save\`.`;
 
 /**
  * Messages carry a tag so compaction can distinguish requirements from scratch
@@ -214,6 +223,28 @@ export function isContextOverflow(error: string): boolean {
     .test(error);
 }
 
+/**
+ * How much of the tail to keep, in characters.
+ *
+ * Two constraints, and the tail has to satisfy both. It must fit the model's
+ * window, which is what `keepRecentFraction` expresses. It must also leave the
+ * checkpoint comfortably under the size that triggers a compaction — otherwise
+ * compaction cannot make progress: it summarises, keeps a tail that is itself
+ * over the threshold, and immediately qualifies again.
+ *
+ * That is not hypothetical. With a 131,072-token window the first rule alone
+ * gave a 128 KB tail against a 128 KB trigger, and one agent compacted twenty-
+ * nine times, paying for a model call each time and never getting below the
+ * line. Taking the smaller of the two is what makes the operation terminate.
+ */
+export function keepRecentChars(contextWindow: number, c: CompactionConfig): number {
+  const fitsTheModel = contextWindow * c.keepRecentFraction * CHARS_PER_TOKEN;
+  // 0.35 of the budget against a trigger at 0.5, so a compacted checkpoint
+  // lands well clear of the line rather than just under it.
+  const fitsTheStore = c.maxCheckpointBytes * 0.35;
+  return Math.min(fitsTheModel, fitsTheStore);
+}
+
 export function keepFrom(messages: Array<{ content?: unknown }>, budget: number): number {
   let used = 0;
   for (let i = messages.length - 1; i > 0; i--) {
@@ -266,6 +297,26 @@ export function finalText(text: string): string {
  * and the harness used to treat every one of them as the final answer, so the
  * task "completed" having done nothing and the page showed markup to the user.
  */
+/**
+ * A reply with nothing in it.
+ *
+ * Chasing calling syntaxes one at a time is a losing game — five turned up —
+ * but they share a shape that does not need recognising: once the markup is
+ * stripped there is no text. A model that meant to act and mis-said it leaves
+ * an empty tag; a model that has finished leaves an answer. So an empty reply
+ * is never a finished one, whatever tag it came wrapped in.
+ *
+ * The two that cost real work: `<semdoc style="display:none"></semdoc>`, which
+ * ended a SWE-bench instance after one turn while the reasoning trace showed
+ * the model had planned the fix correctly, and `<USER></USER>`.
+ */
+export function isEmptyReply(text: string): boolean {
+  // "No content", not "short content": `Done.` is a real answer and must not be
+  // second-guessed. What an empty tag leaves behind is nothing at all.
+  const visible = String(text ?? "").replace(/<[^>]*>/g, "");
+  return !/[\p{L}\p{N}]/u.test(visible);
+}
+
 export function looksLikeToolAttempt(text: string): boolean {
   return /<\s*(tool_calls?|invoke|function_calls?|antml:invoke)\b/i.test(text)
     || /\btool_call\b\s*[:{]/.test(text)
@@ -362,9 +413,9 @@ export class CodegenHarness implements HarnessAdapter {
     this.#contextWindow = opts.contextWindow ?? ASSUMED_CONTEXT_WINDOW;
   }
 
-  /** The budget the tail is measured against, in characters. */
+  /** @see keepRecentChars */
   get #keepRecentChars(): number {
-    return this.#contextWindow * this.#compaction.keepRecentFraction * CHARS_PER_TOKEN;
+    return keepRecentChars(this.#contextWindow, this.#compaction);
   }
 
   /**
@@ -668,14 +719,15 @@ export class CodegenHarness implements HarnessAdapter {
       // No code, but visibly an attempt to call something: correct the syntax
       // rather than accept markup as the answer.
       const nudges = state.formatNudges ?? 0;
-      if (looksLikeToolAttempt(sawModelReply) && nudges < 2) {
+      if ((looksLikeToolAttempt(sawModelReply) || isEmptyReply(sawModelReply)) && nudges < 2) {
         messages.push({
           role: "user",
           tag: "note",
           content:
-            "That is not how you call a tool here, so nothing ran. The only way to act is a " +
-            "```js code block, using await tool`alias.name ${args}` and output(...). " +
-            "Rewrite your last step as one code block, or answer in plain prose if you are done.",
+            "Your last reply contained nothing that could be acted on, so nothing ran. The only " +
+            "way to act is a ```js code block, using await tool`alias.name ${args}` and " +
+            "output(...). Write your next step as one code block, or answer in plain prose if you " +
+            "are genuinely finished — but an empty or markup-only reply is neither.",
         });
         return {
           state: { ...state, formatNudges: nudges + 1 },

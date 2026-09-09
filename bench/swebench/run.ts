@@ -20,7 +20,8 @@ import { SqliteStore } from "../../src/store/sqlite.ts";
 import { Kernel } from "../../src/runtime/kernel.ts";
 import { CommandExecutor } from "../../src/runtime/commands.ts";
 import { QuickJsExecutor } from "../../src/runtime/executor.ts";
-import { CodegenHarness } from "../../src/harness/codegen.ts";
+import { CodegenHarness, DEFAULT_COMPACTION } from "../../src/harness/codegen.ts";
+import { HybridHarness, qualifyMountedTools } from "../../src/harness/hybrid.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
@@ -36,6 +37,13 @@ for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").spl
 const N = Number(process.env.N ?? 1);
 const OFFSET = Number(process.env.OFFSET ?? 0);
 const MAX_TURNS = Number(process.env.MAX_TURNS ?? 30);
+/**
+ * Which harness to measure. The deployment defaults to native tool calling, so
+ * a benchmark that only ever exercises the other one is measuring a path
+ * nobody runs. Fixed model, fixed instances, one variable.
+ */
+const HARNESS = process.env.HARNESS === "hybrid" ? "hybrid" : "codegen";
+const CONTEXT_WINDOW = Number(process.env.HARNESS_CONTEXT_WINDOW ?? 131072);
 
 interface Instance {
   instance_id: string; repo: string; base_commit: string;
@@ -102,10 +110,27 @@ async function runOne(inst: Instance) {
   const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
   const host = { invoke: (c: any): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
 
-  const harness = new CodegenHarness({ maxTurns: MAX_TURNS });
+  const harness = HARNESS === "hybrid"
+    ? new HybridHarness({
+        maxTurns: MAX_TURNS, compaction: DEFAULT_COMPACTION, contextWindow: CONTEXT_WINDOW,
+      })
+    : new CodegenHarness({
+        maxTurns: MAX_TURNS, compaction: DEFAULT_COMPACTION, contextWindow: CONTEXT_WINDOW,
+      });
+  const mounted = await store.listMounts(T, AGENT);
+  const byId = new Map(plugins.map((pl) => [pl.id, pl]));
   await store.createTask(T, AGENT, TASK, await harness.initialize({
-    mounts: (await store.listMounts(T, AGENT)).map((m) => ({
+    mounts: mounted.map((m) => ({
       alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: {} })),
+    // The native harness needs the catalogue; the other ignores it. Supplied the
+    // same way the deployment supplies it, so the benchmark measures the code
+    // that runs rather than a second wiring of its own.
+    tools: qualifyMountedTools(mounted.flatMap((m) =>
+      (byId.get(m.plugin)?.tools ?? []).map((t) => ({
+        name: t.name, description: t.summary, parameters: t.parameters,
+        address: `${m.alias}.${t.name}`,
+      })),
+    )),
     policy: SYSTEM_EXTRA,
   }), harness.stateVersion);
 
@@ -125,6 +150,21 @@ async function runOne(inst: Instance) {
     if (t && ["completed", "failed", "blocked"].includes(t.status)) break;
   }
   const agentSeconds = Math.round((Date.now() - t0) / 1000);
+
+  // A run that ends in one turn is not a model being bad at the task, it is the
+  // loop stopping — and without this the benchmark reports a failed instance
+  // and no reason. Set TRACE=1 to see what was actually said.
+  const evs = await store.taskEvents(T, TASK);
+  const modelTurns = evs.filter((e) => e.kind === "model.response").length;
+  if (process.env.TRACE === "1" || modelTurns <= 2) {
+    const t = await store.loadTask(T, TASK);
+    console.log(`  \x1b[33m[trace] ${inst.instance_id}: ${modelTurns} model turn(s), ` +
+      `task ended ${t?.status}\x1b[0m`);
+    for (const e of evs.slice(-6)) {
+      const d = JSON.stringify(e.payload).slice(0, 300).replace(/\\n/g, " ");
+      console.log(`    ${e.sequence} ${e.kind}: ${d}`);
+    }
+  }
 
   // Grade with SWE-bench's own criterion, in the same box the agent worked in.
   const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
@@ -164,7 +204,7 @@ async function runOne(inst: Instance) {
 }
 
 console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), model ` +
-  `${process.env.HARNESS_MODEL ?? "deepseek-v4-pro"}\n  ${"─".repeat(80)}`);
+  `${process.env.HARNESS_MODEL ?? "deepseek-v4-pro"}, harness ${HARNESS}\n  ${"─".repeat(80)}`);
 const out: any[] = [];
 for (const inst of instances) {
   console.log(`  ${inst.instance_id}  (${inst.repo})`);

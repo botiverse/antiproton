@@ -2,8 +2,8 @@ import type { HarnessAdapter, AdvanceOutput } from "../runtime/kernel.ts";
 import type { Json, RuntimeEvent } from "../core/types.ts";
 import type { ModelMessage, ToolDefinition } from "../model/types.ts";
 import {
-  keepFrom, summaryRequest, isContextOverflow, DEFAULT_COMPACTION, NO_COMPACTION,
-  ASSUMED_CONTEXT_WINDOW, CHARS_PER_TOKEN, type CompactionConfig,
+  keepFrom, keepRecentChars, summaryRequest, isContextOverflow, DEFAULT_COMPACTION,
+  NO_COMPACTION, ASSUMED_CONTEXT_WINDOW, type CompactionConfig,
 } from "./codegen.ts";
 
 /**
@@ -508,7 +508,7 @@ export class HybridHarness implements HarnessAdapter {
     if (this.#shouldSummarise(state)) {
       const keptFrom = keepFrom(
         state.messages,
-        this.#contextWindow * this.#compaction.keepRecentFraction * CHARS_PER_TOKEN,
+        keepRecentChars(this.#contextWindow, this.#compaction),
       );
       if (keptFrom > 1) {
         const request = summaryRequest(

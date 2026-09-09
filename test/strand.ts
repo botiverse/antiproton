@@ -181,6 +181,30 @@ await check("模型自创的调用通道也算尝试，不会被当成答案", a
   if (r.status === "completed") throw new Error("the task ended on an invented tool call");
 });
 
+await check("空回复永远不算完成", async () => {
+  const { isEmptyReply } = await import("../src/harness/codegen.ts");
+  // Chasing calling syntaxes one at a time lost: five turned up. These share a
+  // shape that needs no recognising — strip the markup and nothing is left.
+  for (const t of ['<semdoc style="display:none"></semdoc>', "<USER>\n</USER>", "", "   ", "..."]) {
+    if (!isEmptyReply(t)) throw new Error(`should read as empty: ${JSON.stringify(t)}`);
+  }
+  // And a short real answer is still an answer.
+  for (const t of ["Done.", "4", "鸡23只，兔12只。"]) {
+    if (isEmptyReply(t)) throw new Error(`should not: ${JSON.stringify(t)}`);
+  }
+
+  const h = new CodegenHarness({ maxTurns: 10 });
+  const state: any = await h.initialize({ tenantId: "t", agentId: "a", taskId: "k", prompt: "go" } as any);
+  const r = await h.advance({
+    state,
+    events: [{ kind: "model.response", payload: { text: '<semdoc style="display:none"></semdoc>' } }],
+  } as any);
+  // This exact reply ended a SWE-bench instance after one turn, while the
+  // reasoning trace showed the model had planned the fix correctly.
+  if (r.status === "completed") throw new Error("an empty reply was taken as the final answer");
+  if (r.commands[0]?.kind !== "model.request") throw new Error("the model was not asked again");
+});
+
 await check("无法翻译的调用会被要求重写，且有次数上限", async () => {
   // Recognisably an attempt, but nothing a call can be built from.
   const bad = '<function_calls>\n  something the parser cannot read\n</function_calls>';

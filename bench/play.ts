@@ -42,7 +42,7 @@ for (const [alias, plugin, cfg, policy] of [
   ["tools", "tools", {}, null],
   ["ops", "demo", { account: "demo-fleet" }, { write: "approval" as const }],
   ["web", "http", { account: "open web", maxBytes: 24_000 }, null],
-  ["node", "run9", { account: "sandbox" }, null],
+  ["node", "run9", { account: "container" }, null],
   ["state", "state", { account: "agent memory" }, null],
 ] as const) {
   await store.addMount({

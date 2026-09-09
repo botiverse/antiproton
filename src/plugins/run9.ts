@@ -46,6 +46,9 @@ export interface Run9Config {
 }
 
 interface Run9Credential { ak: string; sk: string }
+/** A saved filesystem, under a name the agent chose rather than an id. */
+interface Env { name: string; snapId: string; savedAt: number; note?: string }
+
 interface Session {
   boxId: string;
   startedAt: number;
@@ -68,6 +71,17 @@ interface BoxState {
   saved?: string[];
   /** Most recent first, capped: this is a meter, not a second event log. */
   sessions?: Session[];
+  /**
+   * Environments this agent has kept, by name.
+   *
+   * A container starts from a bare image, so every task that needs Python,
+   * a toolchain or a cloned repository pays for that setup again. run9 can fork
+   * a stopped box's filesystem into a snapshot and boot a new box from it, which
+   * turns "install everything" into "start from what I had".
+   */
+  envs?: Env[];
+  /** Set by restore: the next box starts from this snapshot rather than the image. */
+  startFrom?: string;
 }
 
 const SESSIONS_KEPT = 20;
@@ -125,6 +139,10 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
   await ctx.connection.set({
     boxId: "", createdAt: 0, lastUsedAt: 0,
     sessions: [session, ...(state.sessions ?? [])].slice(0, SESSIONS_KEPT),
+    // Kept environments outlive the container by construction — a forked
+    // snapshot is independent of the box it came from — so losing the record of
+    // them here would strand real storage under ids nobody can name any more.
+    ...(state.envs?.length ? { envs: state.envs } : {}),
   } as unknown as Json);
   return { boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt };
 }
@@ -140,8 +158,10 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
         "starts a container that is billed for every second it exists, and it cannot call your other " +
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
-        "few seconds of compute — and when you do, work in as few calls as you can, save what matters " +
-        "with node.save, and release it. Everything inside the box is destroyed with it.",
+        "few seconds of compute. The container is NOT the per-execution sandbox: it persists between " +
+        "calls until you release it, so installs and files survive from one call to the next — do not " +
+        "reinstall. Work in as few calls as you can, save what matters with node.save, and release it. " +
+        "Everything inside is destroyed when it is released.",
       parameters: {
         type: "object",
         properties: {
@@ -161,7 +181,8 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     {
       name: "shell",
       summary:
-        "Shell in the same billed-by-the-second container as node.run — only for what needs a real " +
+        "Shell in the same billed-by-the-second container as node.run, and the same one across calls " +
+        "— state, installed packages and files carry over. Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
@@ -193,10 +214,42 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       idempotency: "none",
     },
     {
+      name: "keep",
+      summary:
+        "Save this container's filesystem under a name, so a later task can start from it instead " +
+        "of installing everything again. Use it once the environment is set up — interpreter, " +
+        "packages, a cloned repository — not for the results, which belong in node.save. The " +
+        "container keeps running; the snapshot is independent of it and survives its release.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "short name you will recognise later, e.g. 'py-scipy'" },
+          note: { type: "string", description: "one line on what is in it" },
+        },
+        required: ["name"],
+      },
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
+      name: "start_from",
+      summary:
+        "Begin from an environment kept earlier instead of a bare image. Releases the current " +
+        "container if there is one; the next run or shell starts from the snapshot. Call with no " +
+        "name to see what has been kept. Setting up a machine is usually the slowest and most " +
+        "expensive part of using one, and this is how you stop paying for it twice.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string" } },
+      },
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
       name: "release",
       summary:
         "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-        "first, in the same call. Do this as soon as you no longer need the sandbox — not at the end " +
+        "first, in the same call. Do this as soon as you no longer need the machine — not at the end " +
         "of the task, at the end of the work that needed a machine.",
       parameters: {
         type: "object",
@@ -220,10 +273,33 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
   },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-    // Checked before anything else: releasing must never be the thing that
-    // starts a container.
-    if (tool === "release" && !((await ctx.connection.get()) as BoxState | null)?.boxId) {
+    // Checked before anything else: neither releasing nor choosing an
+    // environment should be the thing that starts a container.
+    const prior = (await ctx.connection.get()) as BoxState | null;
+    if (tool === "release" && !prior?.boxId) {
       return { released: false, note: "nothing was running" };
+    }
+    if (tool === "start_from") {
+      const envs = prior?.envs ?? [];
+      const want = String((args as any)?.name ?? "");
+      if (!want) {
+        return {
+          kept: envs.map((e) => ({ name: e.name, note: e.note, savedAt: e.savedAt })),
+          note: envs.length ? "pass one of these as name" : "nothing kept yet; node.keep saves one",
+        };
+      }
+      const env = envs.find((e) => e.name === want);
+      if (!env) throw new Error(`no environment named ${want}; kept: ${envs.map((e) => e.name).join(", ") || "none"}`);
+      // Releasing first, because the choice applies to the next container and
+      // silently leaving the old one running is how a machine gets forgotten.
+      const released = prior?.boxId ? await stopBox(ctx) : null;
+      const after = (await ctx.connection.get()) as BoxState | null;
+      await ctx.connection.set({ ...(after ?? { boxId: "", createdAt: 0, lastUsedAt: 0 }),
+        startFrom: env.snapId } as unknown as Json);
+      return {
+        startingFrom: env.name, note: "the next run or shell starts from this environment",
+        ...(released ? { releasedPrevious: released.boxId } : {}),
+      };
     }
     const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
     if (!ctx.credential) throw new Error("run9 mount has no credential");
@@ -252,8 +328,12 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     if (!state) {
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
+      const from = state?.startFrom ?? (prior as any)?.startFrom;
       await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
-        box_id: boxId, source_image_ref: cfg.image,
+        box_id: boxId,
+        // An environment kept earlier, or the bare image. Starting from a
+        // snapshot is the whole point of having kept one.
+        ...(from ? { source_snap_id: from } : { source_image_ref: cfg.image }),
         ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
         description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
       });
@@ -288,6 +368,40 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       await ctx.connection.set(state as unknown as Json);
       return { path, ref: stored.ref, bytes: body.length };
     };
+
+    if (tool === "keep") {
+      const name = String((args as any)?.name ?? "").trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+        throw new Error("name must be short, and letters, digits, dot, dash or underscore");
+      }
+      // run9 will not fork a box's filesystem while the box is awake: "the Box
+      // must already be stopped with persistence settled; this operation never
+      // stops it implicitly". So stop, fork, and let the next call wake it —
+      // waking preserves the filesystem, so the agent does not lose its machine
+      // by keeping a copy of it.
+      await api("POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/stop`);
+      const box = (await api("GET", `/projects/${cfg.project}/workspace/boxes`))
+        .find((b: any) => b.box_id === state!.boxId);
+      const source = box?.box_snap_id;
+      if (!source) throw new Error("the container reports no filesystem to keep");
+      const forked = await api("POST", `/projects/${cfg.project}/workspace/snaps/${source}/fork`, {
+        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId} ${name}`,
+      });
+      const snapId = forked?.snap_id;
+      if (!snapId) throw new Error(`fork returned no snapshot: ${JSON.stringify(forked).slice(0, 160)}`);
+      const env: Env = {
+        name, snapId, savedAt: Date.now(),
+        ...(typeof (args as any)?.note === "string" ? { note: String((args as any).note).slice(0, 200) } : {}),
+      };
+      const envs = [env, ...(state!.envs ?? []).filter((e) => e.name !== name)].slice(0, 20);
+      state = { ...state!, envs, lastUsedAt: Date.now() };
+      await ctx.connection.set(state as unknown as Json);
+      return {
+        kept: name, snapshot: snapId,
+        note: "independent of this container and survives its release; " +
+          "start a later one from it with node.start_from",
+      };
+    }
 
     if (tool === "save") {
       const r = await saveOut(String((args as any)?.path ?? ""), (args as any)?.archive === true);
@@ -355,13 +469,20 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         return {
           state: rec.state,
           exitCode: rec.exit_code ?? null,
-          reminder: "call run9.release when you no longer need the sandbox",
+          // "container", never "sandbox": the harness already calls the per-execution
+          // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
+          // nothing between executions" concluded this box was volatile too — which
+          // would have it reinstalling packages on every call.
+          reminder: "this container persists between calls; run9.release destroys it",
           output: out.slice(0, cfg.maxOutputBytes),
           truncated: out.length > cfg.maxOutputBytes,
           box: state.boxId,
           // So the agent learns the environment from a result it already has,
           // instead of spending turns probing for an interpreter.
           image: cfg.image,
+          ...(state.envs?.length
+            ? { kept: state.envs.map((e) => e.name) }
+            : {}),
         };
       }
       if (Date.now() > deadline) {
