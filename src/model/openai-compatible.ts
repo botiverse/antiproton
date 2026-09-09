@@ -70,8 +70,12 @@ export class OpenAiCompatibleModel implements ModelAdapter {
         const u = data.usage ?? {};
         const finishReason = choice?.finish_reason ?? "unknown";
         const rawCalls = choice?.message?.tool_calls ?? [];
+        // Bounded: a reasoning trace can run to thousands of tokens, and this
+        // goes into an append-only log that is never trimmed.
+        const reasoning = String(choice?.message?.reasoning_content ?? "").slice(0, 8000);
         return {
           text: choice?.message?.content ?? "",
+          ...(reasoning ? { reasoning } : {}),
           toolCalls: rawCalls.length
             ? rawCalls.map((c: any) => ({
                 id: c.id,

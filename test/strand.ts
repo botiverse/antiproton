@@ -160,6 +160,27 @@ await check("XML 工具调用被翻译成真正的调用", async () => {
   }
 });
 
+await check("模型自创的调用通道也算尝试，不会被当成答案", async () => {
+  const { looksLikeToolAttempt } = await import("../src/harness/codegen.ts");
+  // Seen live: the model invented a channel, nothing recognised it as a call,
+  // and the harness ended the task in the middle of the job.
+  const invented = '<system name="tools.search">query: "http get fetch url"</system>';
+  if (!looksLikeToolAttempt(invented)) throw new Error("an invented channel was not recognised");
+  // Narration and ordinary prose must not be mistaken for one.
+  for (const prose of [
+    "<system_warning>No more tool calls are possible</system_warning>",
+    "这个项目由 IANA 维护，见表格里的 name 字段。",
+    "用 config.yaml 里的 name 配置即可。",
+  ]) {
+    if (looksLikeToolAttempt(prose)) throw new Error(`prose misread as a call: ${prose.slice(0, 40)}`);
+  }
+
+  const h = new CodegenHarness({ maxTurns: 10 });
+  const state: any = await h.initialize({ tenantId: "t", agentId: "a", taskId: "k", prompt: "go" } as any);
+  const r = await h.advance({ state, events: [{ kind: "model.response", payload: { text: invented } }] } as any);
+  if (r.status === "completed") throw new Error("the task ended on an invented tool call");
+});
+
 await check("无法翻译的调用会被要求重写，且有次数上限", async () => {
   // Recognisably an attempt, but nothing a call can be built from.
   const bad = '<function_calls>\n  something the parser cannot read\n</function_calls>';

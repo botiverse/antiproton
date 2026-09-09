@@ -102,6 +102,12 @@ padding:0 4px;font-size:12px;color:#9ece6a}
 .md hr{border:0;border-top:1px solid var(--line);margin:10px 0}
 .md a{color:var(--accent)}
 .md strong{color:#fff;font-weight:600}
+/* The model's own reasoning: present, and folded away, because it is context
+   for a person debugging rather than part of what the agent said. */
+.think{margin:0 0 7px}
+.think summary{color:#6b7690;font-size:11px;text-transform:uppercase;letter-spacing:.07em}
+.think[open] summary{color:var(--dim);margin-bottom:5px}
+.think>.md{border-left:2px solid #2a3142;padding-left:10px;color:#8b95a6;font-size:13px}
 
 /* --- debugging console ------------------------------------------------- */
 .tabs{display:flex;gap:2px;padding:0 8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -184,8 +190,13 @@ export function page(taskId: string, who: string, agentId: string): string {
           hx-on::after-request="this.reset()">
       <input type="hidden" name="taskId" value="${t}">
       <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
-      <button type="submit">send</button>
+      <button type="submit" name="mode" value="steer">send</button>
+      <button type="submit" name="mode" value="followUp" class="ghost"
+              title="Held back until the agent has finished everything it is doing">after</button>
     </form>
+    <div class="hint">Sending while it works steers it: the message reaches the model
+      before its next call, and nothing in flight is stopped. <b>after</b> holds the message
+      until it has finished.</div>
     <h2 style="border-top:1px solid var(--line)">awaiting approval</h2>
     <div class="body" id="approvals" style="max-height:22vh"
          hx-get="/ui/approvals?taskId=${t}"
@@ -286,7 +297,10 @@ export function trajectory(
           `</span>`
         : "";
       const calls = (p.toolCalls ?? []) as any[];
+      const think = String(p.reasoning ?? "");
       out.push(`<div class="step agent"><div class="lbl">turn ${turn} ${rel} ${badge}</div>
+        ${think ? `<details class="think"><summary>thinking · ${esc(u.reasoningTokens ?? 0)} tokens</summary>
+          <div class="msg md">${md(think)}</div></details>` : ""}
         ${prose.trim() ? `<div class="msg md">${md(prose.trim())}</div>` : ""}
         ${blocks.map((b) => `<pre class="code">${esc(b)}</pre>`).join("")}
         ${calls.length ? `<div class="calls">${calls.map((c) =>

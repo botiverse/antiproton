@@ -121,6 +121,10 @@ CREATE TABLE IF NOT EXISTS agent_state (
   value TEXT, ref TEXT, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, agent_id, key));
 
+CREATE TABLE IF NOT EXISTS follow_ups (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  text TEXT NOT NULL, created_at INTEGER NOT NULL);
+
 CREATE TABLE IF NOT EXISTS connections (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
@@ -806,6 +810,52 @@ export class SqliteStore implements StorageAdapter {
       "SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS b FROM agent_state WHERE tenant_id=? AND agent_id=?",
     ).get(tenantId, agentId) as any;
     return { keys: Number(r?.n ?? 0), bytes: Number(r?.b ?? 0) };
+  }
+
+  // ---------------------------------------------------------- follow-ups
+
+  async reopenTask(tenantId: string, taskId: string): Promise<boolean> {
+    const r = this.#db
+      .prepare("SELECT status FROM tasks WHERE tenant_id=? AND task_id=?")
+      .get(tenantId, taskId) as any;
+    if (!r) return false;
+    const runnable = () => {
+      this.#db
+        .prepare("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?")
+        .run(now(), tenantId, taskId);
+      return true;
+    };
+    if (["completed", "blocked"].includes(r.status)) return runnable();
+    if (r.status !== "waiting") return false;
+    const cmds = this.#db
+      .prepare(`SELECT 1 FROM outbox WHERE tenant_id=? AND task_id=?
+                  AND state IN ('pending','claimed','dispatched') LIMIT 1`)
+      .get(tenantId, taskId);
+    if (cmds) return false;
+    const appr = this.#db
+      .prepare("SELECT 1 FROM approvals WHERE tenant_id=? AND task_id=? AND state='pending' LIMIT 1")
+      .get(tenantId, taskId);
+    return appr ? false : runnable();
+  }
+
+  async queueFollowUp(tenantId: string, agentId: string, taskId: string, text: string) {
+    this.#db.prepare(
+      "INSERT INTO follow_ups(tenant_id, agent_id, task_id, text, created_at) VALUES (?,?,?,?,?)",
+    ).run(tenantId, agentId, taskId, text, now());
+  }
+
+  async flushFollowUps(tenantId: string, agentId: string, taskId: string) {
+    const rows = this.#db.prepare(
+      "SELECT rowid, text FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=? ORDER BY created_at ASC, rowid ASC",
+    ).all(tenantId, agentId, taskId) as any[];
+    for (const r of rows) {
+      await this.appendEvent({
+        tenantId, agentId, taskId, kind: "message",
+        payload: { text: (r as any).text, followUp: true },
+      });
+    }
+    if (rows.length) this.#db.prepare("DELETE FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=?").run(tenantId, agentId, taskId);
+    return rows.length;
   }
 
   async putConnection(

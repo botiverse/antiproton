@@ -23,6 +23,30 @@ test("代码提取", "a fenced js block is extracted, prose is not", async () =>
   eq(extractCode("no code at all"), null, "prose returns null");
 });
 
+test("思考不回灌", "a reasoning trace is recorded but never sent back to the model", async () => {
+  const h = new CodegenHarness();
+  const state = await h.initialize({});
+  const secret = "PRIVATE-CHAIN-OF-THOUGHT";
+  const out = await h.advance({
+    state,
+    events: [ev("model.response", {
+      text: "```js\noutput(1);\n```",
+      reasoning: `the user probably wants X. ${secret}`,
+      usage: { promptTokens: 10, completionTokens: 5, reasoningTokens: 40 },
+    })],
+    context: ctx,
+  });
+  // Next it will execute; the request after that carries the messages.
+  const after = await h.advance({
+    state: out.state,
+    events: [ev("js.result", { status: "completed", outputs: [1] })],
+    context: ctx,
+  });
+  const sent = JSON.stringify((after.commands[0] as any)?.payload?.messages ?? []);
+  assert(!sent.includes(secret), "reasoning must not reach the provider");
+  assert(sent.includes("output(1)"), "the reply itself is still carried");
+});
+
 test("消息转命令", "an inbound message produces exactly one model request", async () => {
   const h = new CodegenHarness();
   const state = await h.initialize({ mounts: [{ alias: "gh", plugin: "github", version: "1.0.0", config: {} }] });

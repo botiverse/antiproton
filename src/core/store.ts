@@ -194,6 +194,36 @@ export interface StorageAdapter {
   ): Promise<Array<{ key: string; bytes: number; ref: string | null; updatedAt: number }>>;
   stateUsage(tenantId: string, agentId: string): Promise<{ keys: number; bytes: number }>;
 
+  /**
+   * A message the person wants delivered only once the agent has finished.
+   *
+   * Deliberately not an event yet. An event in this log means something
+   * happened to the conversation, and a follow-up has not happened until it is
+   * delivered — writing it early would make it visible to the harness, which is
+   * exactly what "wait until the work is done" excludes. It is durable here and
+   * moves into the log on completion.
+   *
+   * The default remains steering: a message typed while the agent works reaches
+   * the model before its next call, without stopping the tool call in flight.
+   */
+  /**
+   * Make a task runnable again because something new arrived for it.
+   *
+   * Was implemented on the Durable Object alone, which held until a follow-up
+   * message needed delivering through the same path on both backends. A seam
+   * one backend satisfies is not a seam.
+   *
+   * `completed` and `blocked` reopen; `failed` is permanent. `waiting` reopens
+   * only when nothing is outstanding — no unanswered command, no pending
+   * decision — so a genuine approval gate cannot be stepped around by typing,
+   * while a task stranded by a reply that will never come can still be rescued.
+   */
+  reopenTask(tenantId: string, taskId: string): Promise<boolean>;
+
+  queueFollowUp(tenantId: string, agentId: string, taskId: string, text: string): Promise<void>;
+  /** Move any waiting follow-ups into the log, oldest first. Returns how many. */
+  flushFollowUps(tenantId: string, agentId: string, taskId: string): Promise<number>;
+
   getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null>;
   putConnection(
     tenantId: string,

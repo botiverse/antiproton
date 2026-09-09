@@ -309,10 +309,29 @@ export class AgentRuntime {
     );
   }
 
-  async postMessage(tenantId: string, agentId: string, taskId: string, text: string) {
+  /**
+    * The two gestures pi distinguishes, and the reason they are different.
+    *
+    * `steer` is the default and the one that matters: a message typed while the
+    * agent is working reaches the model before its next call, without stopping
+    * the tool call in flight. Nothing is aborted; the current turn finishes and
+    * the new instruction is simply there when the next one is composed.
+    *
+    * `followUp` waits until the agent has finished everything. It is not
+    * written to the log yet, because an event here means something happened to
+    * the conversation and this has not happened until it is delivered.
+    */
+  async postMessage(
+    tenantId: string, agentId: string, taskId: string, text: string,
+    mode: "steer" | "followUp" = "steer",
+  ) {
     await this.ready();
     const existing = await this.store.loadTask(tenantId, taskId);
     if (!existing) await this.openTask(tenantId, agentId, taskId);
+    if (mode === "followUp" && existing && !["completed", "failed"].includes(existing.status)) {
+      await this.store.queueFollowUp(tenantId, agentId, taskId, text);
+      return { taskId, queued: true, reopened: false, checkpointVersion: existing.checkpointVersion };
+    }
     const ev = await this.store.appendEvent({
       tenantId, agentId, taskId, kind: "message", payload: { text },
     });
@@ -412,6 +431,11 @@ export class AgentRuntime {
         const after = await this.store.loadTask(tenantId, taskId);
         if (after && ["completed", "failed"].includes(after.status)) {
           await this.#gateway.releaseTask(callCtx);
+          // Now that the work is done, anything held back for exactly this
+          // moment is delivered and the task picks it up.
+          if (await this.store.flushFollowUps(tenantId, task.agentId, taskId)) {
+            await this.store.reopenTask(tenantId, taskId);
+          }
         }
       }
     }

@@ -133,6 +133,12 @@ export function finalText(text: string): string {
 export function looksLikeToolAttempt(text: string): boolean {
   return /<\s*(tool_calls?|invoke|function_calls?|antml:invoke)\b/i.test(text)
     || /\btool_call\b\s*[:{]/.test(text)
+    // Any tag naming something that looks like a mount address. The one that
+    // slipped through was `<system name="tools.search">query: "..."</system>` —
+    // a channel the model invented — and because nothing recognised it as an
+    // attempt, the harness took the markup for a final answer and ended the
+    // task mid-job. The dotted name is the tell, and prose does not have one.
+    || /<\s*[a-z_][a-z0-9_]*\s+name\s*=\s*["'][a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*["']/i.test(text)
     || /```(?:json|xml)\s*\n\s*[{<][^`]*"(?:tool|name|function)"/.test(text);
 }
 

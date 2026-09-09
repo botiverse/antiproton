@@ -30,6 +30,15 @@ export interface ModelResponse {
   truncated: boolean;
   /** Present only when the caller offered tools and the provider used them. */
   toolCalls?: ToolCall[];
+  /**
+   * The provider's reasoning trace, when it returns one.
+   *
+   * Recorded so a person can see why the agent did what it did, and never fed
+   * back: the next request carries the reply, not the thinking behind it.
+   * Sending it back would grow every prompt for no gain, and the provider does
+   * not expect it.
+   */
+  reasoning?: string;
 }
 
 /** Provider-native tool definition, normalised. */

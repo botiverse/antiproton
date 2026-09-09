@@ -36,6 +36,9 @@ export async function appendModelResponse(
     payload: {
       text: res.text, truncated: res.truncated, usage: res.usage,
       ...(res.toolCalls ? { toolCalls: res.toolCalls } : {}),
+      // Kept in the log, deliberately not in the harness's messages: the next
+      // prompt carries the reply, not the thinking behind it.
+      ...(res.reasoning ? { reasoning: res.reasoning } : {}),
     },
     dedupKey: `cmd:${commandId}:response`,
   });

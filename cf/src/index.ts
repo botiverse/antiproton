@@ -918,11 +918,14 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
-  async uiSay(tenantId: string, agentId: string, taskId: string, text: string) {
+  async uiSay(
+    tenantId: string, agentId: string, taskId: string, text: string,
+    mode: "steer" | "followUp" = "steer",
+  ) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiSay", async () => {
       const rt = this.runtime();
-      const r = await rt.postMessage(tenantId, agentId, taskId, text);
+      const r = await rt.postMessage(tenantId, agentId, taskId, text, mode);
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
@@ -1580,7 +1583,8 @@ export default {
           const agentId = uiAgent(who);
           const taskId = String(form.get("taskId"));
           const text = String(form.get("text") ?? "").trim();
-          if (text) await stub.uiSay("demo", agentId, taskId, text);
+          const mode = String(form.get("mode")) === "followUp" ? "followUp" as const : "steer" as const;
+          if (text) await stub.uiSay("demo", agentId, taskId, text, mode);
           const t = await stub.uiTranscript("demo", agentId, taskId);
           return html(trajectory(t.events, t.byOp, t.busy));
         }

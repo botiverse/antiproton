@@ -102,6 +102,40 @@ test("消息不依赖执行边界", "messages land while no worker holds the tas
   await store.close();
 });
 
+test("follow-up 在任务结束前不可见", "a follow-up is withheld from the harness until the work is done", async () => {
+  const { store, model, step } = await fixture([
+    "```js\noutput('working');\n```",
+    "first answer",
+    "second answer",
+  ]);
+  await say(store, "do the job");
+  await step(); // message -> model.request
+  await step(); // model.response -> js.execute
+
+  // Queued mid-work. Unlike a steering message it must NOT reach the model now.
+  await store.queueFollowUp(T, AGENT, TASK, "and afterwards, summarise it");
+  await step(); // js.result -> model.request
+  const midPrompt = model.seen.at(-1)!;
+  assert(
+    !midPrompt.some((m) => m.content.includes("afterwards, summarise")),
+    "a follow-up must not steer the turn in progress",
+  );
+
+  await step(); // "first answer" -> completed
+  eq((await store.loadTask(T, TASK))!.status, "completed", "task finished before delivery");
+
+  // Delivered now, which is what the gesture promised.
+  eq(await store.flushFollowUps(T, AGENT, TASK), 1, "one follow-up delivered");
+  assert(await store.reopenTask(T, TASK), "delivery makes the task runnable again");
+  await step();
+  assert(
+    model.seen.at(-1)!.some((m) => m.content.includes("afterwards, summarise")),
+    "the follow-up reaches the model once the work is done",
+  );
+  eq(await store.flushFollowUps(T, AGENT, TASK), 0, "delivered exactly once");
+  await store.close();
+});
+
 test("中断范围", "an interrupt bumps generation and stale work cannot advance", async () => {
   const { store, kernel, step } = await fixture(["```js\noutput('long job');\n```", "done"]);
   await say(store, "start");

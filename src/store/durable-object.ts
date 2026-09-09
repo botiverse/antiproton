@@ -69,6 +69,9 @@ const SCHEMA = [
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, key TEXT NOT NULL,
      value TEXT, ref TEXT, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL,
      PRIMARY KEY (tenant_id, agent_id, key))`,
+  `CREATE TABLE IF NOT EXISTS follow_ups (
+     tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+     text TEXT NOT NULL, created_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS connections (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
@@ -539,6 +542,28 @@ export class DurableObjectStore implements StorageAdapter {
       "SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS b FROM agent_state WHERE tenant_id=? AND agent_id=?",
       tenantId, agentId) as any;
     return { keys: Number(r?.n ?? 0), bytes: Number(r?.b ?? 0) };
+  }
+
+  // ---------------------------------------------------------- follow-ups
+
+  async queueFollowUp(tenantId: string, agentId: string, taskId: string, text: string) {
+    this.#sql.exec(
+      "INSERT INTO follow_ups(tenant_id, agent_id, task_id, text, created_at) VALUES (?,?,?,?,?)",
+      tenantId, agentId, taskId, text, this.#now());
+  }
+
+  async flushFollowUps(tenantId: string, agentId: string, taskId: string) {
+    const rows = this.#all(
+      "SELECT rowid, text FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=? ORDER BY created_at ASC, rowid ASC",
+      tenantId, agentId, taskId);
+    for (const r of rows) {
+      await this.appendEvent({
+        tenantId, agentId, taskId, kind: "message",
+        payload: { text: (r as any).text, followUp: true },
+      });
+    }
+    if (rows.length) this.#sql.exec("DELETE FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=?", tenantId, agentId, taskId);
+    return rows.length;
   }
 
   async putConnection(
