@@ -139,7 +139,13 @@ test("预算耗尽不丢工作", "a spent budget asks for a final answer instead
 });
 
 test("上下文压缩", "compaction drops scratch work, keeps every customer turn", async () => {
-  const h = new CodegenHarness({ maxTurns: 40, compaction: { ...DEFAULT_COMPACTION, triggerTokens: 100, keepCycles: 2 } });
+  // Explicitly the dropping mode. The default is now "summarise", which keeps
+  // the findings instead of only the customer turns; this case is about the
+  // cheap mode that remains available when no model call can be spared.
+  const h = new CodegenHarness({
+    maxTurns: 40,
+    compaction: { ...DEFAULT_COMPACTION, mode: "cycles", triggerTokens: 100, keepCycles: 2 },
+  });
   let state = await h.initialize({});
   // Five cycles: customer asks, agent writes code, execution reports back.
   for (let i = 0; i < 5; i++) {

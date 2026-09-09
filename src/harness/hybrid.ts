@@ -268,6 +268,25 @@ export class HybridHarness implements HarnessAdapter {
     } satisfies HybridState;
   }
 
+  /** @see CodegenHarness.shrink — the same knife, for the same deadlock. */
+  async shrink(state: Json, targetBytes: number): Promise<Json | null> {
+    const s = structuredClone(state) as HybridState;
+    if (!Array.isArray(s.messages) || s.messages.length < 4) return null;
+    const size = () => JSON.stringify(s).length;
+    let dropped = 0;
+    while (size() > targetBytes && s.messages.length > 4) {
+      s.messages.splice(1, 1);
+      dropped++;
+    }
+    if (!dropped) return null;
+    s.messages.splice(1, 0, {
+      role: "user",
+      content: `[${dropped} earlier step(s) dropped to fit the checkpoint budget. ` +
+        `Anything you still need from them, read back with state.get or re-derive.]`,
+    });
+    return size() > targetBytes ? null : (s as unknown as Json);
+  }
+
   async migrate(state: Json, _from = 0): Promise<Json> {
     const s = state as any;
     // Deliberate reconciliation: names the current catalogue no longer has are

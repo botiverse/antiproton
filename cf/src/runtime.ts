@@ -402,7 +402,15 @@ export class AgentRuntime {
   async deliverModel(job: ModelJob, outcome: { ok: true; res: ModelResponse } | { ok: false; error: string }) {
     await this.ready();
     const ctx = { tenantId: job.tenantId, agentId: job.agentId, taskId: job.taskId };
-    if (outcome.ok) await appendModelResponse(this.store, ctx, job.commandId, outcome.res);
+    // The offloaded path is the one production actually takes, so it has to
+    // carry the same record as the inline one; a marker that only survives the
+    // fallback is a marker that is never there.
+    const about = job.payload as any;
+    if (outcome.ok) {
+      await appendModelResponse(this.store, ctx, job.commandId, outcome.res, {
+        purpose: about?.purpose, keptFrom: about?.keptFrom, summarised: about?.summarised,
+      });
+    }
     else await appendModelFailure(this.store, ctx, job.commandId, outcome.error);
   }
 

@@ -687,7 +687,13 @@ export class DurableObjectStore implements StorageAdapter {
          JOIN events e ON e.tenant_id = t.tenant_id AND e.task_id = t.task_id
          LEFT JOIN cursors c ON c.tenant_id = t.tenant_id AND c.task_id = t.task_id
                             AND c.consumer = 'harness'
-        WHERE t.status NOT IN ('completed','failed')
+        -- blocked is excluded for the same reason completed is: a blocked task
+        -- cannot consume its events, so leaving it here made the drain pick it
+        -- up, fail the same way, and pick it up again -- a loop that feeds
+        -- itself, since the record of being blocked is itself an event.
+        -- Something outside has to unblock it (a decision, a message), which is
+        -- what reopenTask does.
+        WHERE t.status NOT IN ('completed','failed','blocked')
           AND e.sequence > COALESCE(c.consumed_through, 0)
         LIMIT ?`,
       limit,

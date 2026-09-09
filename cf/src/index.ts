@@ -521,6 +521,9 @@ export class AgentDO extends DurableObject<Env> {
     for (const e of events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
     return {
       owner: await this.owner(),
+      // The budget a long conversation eventually runs into, and the number
+      // that was invisible while a task span for ever refusing to commit.
+      checkpointBytes: task ? JSON.stringify(task.checkpoint ?? null).length : 0,
       task: task && {
         status: task.status, generation: task.generation,
         checkpointVersion: task.checkpointVersion, stateVersion: task.stateVersion,

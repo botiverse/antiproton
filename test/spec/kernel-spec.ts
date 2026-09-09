@@ -332,7 +332,44 @@ export async function kernelSpec(
     const r = await k.step(TENANT, TASK, null, async () => {});
     eq(r.outcome, "rejected", "oversized checkpoint refused");
     assert(String(r.reason).startsWith("checkpoint_too_large"), `reason: ${r.reason}`);
-    eq((await store.loadTask(TENANT, TASK))!.checkpointVersion, 0, "nothing was written");
+
+    // The oversized state itself is never committed — that is the point of the
+    // budget. What changed is that the refusal is now visible: writing nothing
+    // at all left the events unconsumed, the alarm re-arming on work that could
+    // never be done, and the page reading "working" for ever. A task that
+    // cannot advance has to say so.
+    const t = (await store.loadTask(TENANT, TASK))!;
+    eq(t.status, "blocked", "a task that cannot advance says so");
+    assert(!JSON.stringify(t.checkpoint).includes("x".repeat(1000)), "the fat state was not stored");
+    const blocked = (await store.taskEvents(TENANT, TASK)).filter((e) => e.kind === "task.blocked");
+    eq(blocked.length, 1, "and records why");
+    eq((blocked[0]!.payload as any).reason, "checkpoint_too_large", "with the reason");
+    await store.close().catch(() => {});
+  });
+
+  test("检查点先压缩再拒绝", "a harness that can shrink is asked to, before being refused", async () => {
+    const store = await fixture();
+    let asked = 0;
+    const fat: HarnessAdapter = {
+      kind: "fat", stateVersion: 1,
+      async initialize() { return {}; },
+      async migrate(s: Json) { return s; },
+      async shrink(_s: Json, target: number) {
+        asked++;
+        return { blob: "x".repeat(Math.floor(target / 2)) };
+      },
+      async advance() {
+        return { state: { blob: "x".repeat(400_000) }, status: "runnable", commands: [], waits: [] };
+      },
+    };
+    await msg(store, "go");
+    const k = new Kernel(store, fat, { holder: "w1", maxCheckpointBytes: 256 * 1024 });
+    const r = await k.step(TENANT, TASK, null, async () => {});
+    // Refusing without asking is a deadlock: what would make the state smaller
+    // runs inside advance, and advance is what the size is stopping.
+    eq(asked, 1, "the harness was asked to shrink");
+    eq(r.outcome, "committed", "and the smaller state committed");
+    eq((await store.loadTask(TENANT, TASK))!.status, "runnable", "the task keeps going");
     await store.close().catch(() => {});
   });
 

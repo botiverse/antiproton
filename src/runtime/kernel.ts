@@ -22,6 +22,13 @@ export interface HarnessAdapter {
    * to it, and its test called the function directly so it stayed green.
    */
   migrate(state: Json, from: number): Promise<Json>;
+  /**
+   * Shrink a checkpoint that has outgrown its budget, or return null if it
+   * cannot. Called by the kernel *before* refusing, because refusing alone is a
+   * deadlock: the only thing that would make the state smaller runs inside
+   * advance, and advance is what the size is stopping.
+   */
+  shrink?(state: Json, targetBytes: number): Promise<Json | null>;
   /** Versions start at 1; 0 is reserved for "never recorded". */
   advance(input: {
     state: Json;
@@ -175,11 +182,42 @@ export class Kernel {
       payload: c.payload,
     }));
 
-    // Refuse before committing, so an oversized checkpoint is a loud rejection
-    // rather than a per-step storage bill nobody notices.
+    // A checkpoint that outgrows its budget used to be refused here and
+    // nowhere else: nothing committed, so the events stayed unconsumed, the
+    // alarm kept re-arming on work that could never be done, and the page read
+    // "working" for ever. The comment claimed a loud rejection; the caller
+    // discarded the outcome, so it was the quietest failure in the system.
+    //
+    // It is also a deadlock on its own terms. What would make the state smaller
+    // lives inside advance, and advance is exactly what the size is stopping.
+    // So the harness is asked to shrink first, and only a harness that cannot
+    // is refused — visibly, as a blocked task rather than a silent spin.
     const limit = this.#opts.maxCheckpointBytes ?? DEFAULT_MAX_CHECKPOINT_BYTES;
-    const size = JSON.stringify(out.state ?? null).length;
+    let finalState = out.state;
+    let size = JSON.stringify(finalState ?? null).length;
+    if (size > limit && this.#harness.shrink) {
+      const smaller = await this.#harness.shrink(finalState, Math.floor(limit * 0.7));
+      if (smaller) {
+        finalState = smaller;
+        size = JSON.stringify(finalState ?? null).length;
+      }
+    }
     if (size > limit) {
+      await this.#store.appendEvent({
+        tenantId, agentId: task.agentId, taskId,
+        kind: "task.blocked",
+        payload: { reason: "checkpoint_too_large", bytes: size, limit },
+        // Once per generation, not once per attempt: without this the record of
+        // being stuck becomes more work, which is more attempts, which is more
+        // records.
+        dedupKey: `blocked:${taskId}:${task.generation}:checkpoint_too_large`,
+      });
+      await this.#store.commitAdvance({
+        tenantId, taskId, generation: task.generation, fencingToken: lease.fencingToken,
+        expectedCheckpointVersion: task.checkpointVersion, checkpoint: task.checkpoint,
+        stateVersion: task.stateVersion, status: "blocked", consumedThrough: null,
+        waits: [], commands: [],
+      });
       return {
         outcome: "rejected",
         reason: `checkpoint_too_large: ${size} bytes exceeds ${limit}`,
@@ -194,7 +232,7 @@ export class Kernel {
       generation: task.generation,
       fencingToken: lease.fencingToken,
       expectedCheckpointVersion: task.checkpointVersion,
-      checkpoint: out.state,
+      checkpoint: finalState,
       stateVersion: this.#harness.stateVersion,
       status: out.status,
       consumedThrough: events[events.length - 1]!.sequence,
@@ -212,7 +250,7 @@ export class Kernel {
     if (!prior || consumed - prior.throughSequence >= every) {
       try {
         await this.#store.putSnapshot(
-          tenantId, taskId, consumed, out.state, this.#harness.stateVersion,
+          tenantId, taskId, consumed, finalState, this.#harness.stateVersion,
         );
         await this.#store.pruneSnapshots(
           tenantId, taskId, this.#opts.snapshotsKept ?? DEFAULT_SNAPSHOTS_KEPT,

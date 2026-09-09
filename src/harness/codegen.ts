@@ -79,6 +79,14 @@ interface TaggedMessage extends ModelMessage {
 interface CodegenState {
   /** @see initialize — the harness that owns this checkpoint. */
   harness?: "codegen";
+  /**
+   * Set while a summarisation request is out. The harness holds no I/O of its
+   * own, so compaction is a command like any other: the next model reply is the
+   * summary, and folding it in is what clears this.
+   */
+  compacting?: { keptFrom: number; prior?: string };
+  /** The rolling handover, so a second compaction updates rather than restarts. */
+  summary?: string;
   messages: TaggedMessage[];
   turns: number;
   done: boolean;
@@ -94,16 +102,59 @@ interface CodegenState {
 }
 
 export interface CompactionConfig {
-  /** "none" keeps everything; "cycles" drops old execution cycles. */
-  mode: "none" | "cycles";
+  /**
+   * "none" keeps everything; "cycles" drops old execution cycles; "summarise"
+   * asks the model to write down what happened before dropping them.
+   *
+   * Dropping is cheap and loses the findings, which is the wrong trade for a
+   * long investigation: the agent spends twenty turns learning something and
+   * then throws away the part that was worth having. pi summarises for this
+   * reason, and so does this.
+   */
+  mode: "none" | "cycles" | "summarise";
   /** Compact once the measured prompt exceeds this. */
   triggerTokens: number;
   /** Execution cycles kept verbatim after a compaction. */
   keepCycles: number;
+  /**
+   * How much of the tail to keep verbatim, in characters.
+   *
+   * pi walks backward accumulating tokens to a budget; without a tokeniser here
+   * the same walk counts characters, at roughly four per token. The default is
+   * sized against the checkpoint limit rather than a context window, because
+   * that is the wall this actually hits.
+   */
+  keepRecentChars: number;
 }
 
-export const NO_COMPACTION: CompactionConfig = { mode: "none", triggerTokens: Infinity, keepCycles: 0 };
-export const DEFAULT_COMPACTION: CompactionConfig = { mode: "cycles", triggerTokens: 24_000, keepCycles: 3 };
+export const NO_COMPACTION: CompactionConfig =
+  { mode: "none", triggerTokens: Infinity, keepCycles: 0, keepRecentChars: Infinity };
+export const DEFAULT_COMPACTION: CompactionConfig =
+  { mode: "summarise", triggerTokens: 24_000, keepCycles: 3, keepRecentChars: 60_000 };
+
+/**
+ * What the summary must contain, taken from pi's template because it was
+ * arrived at by watching agents lose the wrong things: the goal survives, the
+ * constraints survive, and what is still open survives. Prose alone does not.
+ */
+const SUMMARY_SECTIONS = [
+  "## Goal", "## Constraints and preferences", "## Progress",
+  "## Key decisions", "## Next steps", "## Critical context",
+].join("\n");
+
+const SUMMARY_INITIAL =
+  "You are compacting a working session so it can continue in a smaller context. " +
+  "Write a handover in markdown with exactly these sections:\n\n" + SUMMARY_SECTIONS +
+  "\n\nUnder Progress use Done / In progress / Blocked. Record findings, not narration: " +
+  "concrete values, identifiers, URLs, file paths and decisions, so the work does not have " +
+  "to be redone. Say what was tried and failed, because that is what stops it being tried " +
+  "again. Do not include credentials. Output the markdown and nothing else.";
+
+const SUMMARY_UPDATE =
+  "You are updating an existing handover with what has happened since. Merge the two into " +
+  "one document with the same sections, keeping everything from the old summary that is " +
+  "still true, correcting what is not, and folding in the new work. Do not simply append. " +
+  "Output the markdown and nothing else.";
 
 const fence = /```(?:js|javascript)\s*\n([\s\S]*?)```/;
 
@@ -229,9 +280,89 @@ export class CodegenHarness implements HarnessAdapter {
    * agent must not lose is the requirements, which live in customer turns; the
    * code it wrote three cycles ago is scratch work.
    */
+  /**
+   * Drop execution cycles until the checkpoint fits, oldest first.
+   *
+   * The ordinary compaction is driven by measured prompt size and runs inside
+   * advance. That is no help when the *checkpoint* is what is too large,
+   * because then advance is the thing being refused. This is the same knife
+   * held by the kernel instead, and it keeps the system message and the most
+   * recent cycles because those are what the next turn actually needs.
+   */
+  async shrink(state: Json, targetBytes: number): Promise<Json | null> {
+    const s = structuredClone(state) as CodegenState;
+    if (!Array.isArray(s.messages) || s.messages.length < 4) return null;
+    const size = () => JSON.stringify(s).length;
+    let dropped = 0;
+    // Never the system message, and never the last few turns.
+    while (size() > targetBytes && s.messages.length > 4) {
+      const i = s.messages.findIndex((m, idx) => idx > 0 && idx < s.messages.length - 3);
+      if (i < 0) break;
+      s.messages.splice(i, 1);
+      dropped++;
+    }
+    if (!dropped) return null;
+    s.messages.splice(1, 0, {
+      role: "user", tag: "note",
+      content: `[${dropped} earlier step(s) dropped to fit the checkpoint budget. ` +
+        `Anything you still need from them, read back with state.get or re-derive.]`,
+    });
+    return size() > targetBytes ? null : (s as unknown as Json);
+  }
+
+  /**
+   * Where the verbatim tail starts.
+   *
+   * pi walks backward from the newest message accumulating tokens until a
+   * budget is reached; everything before that point is summarised. The same
+   * walk here counts characters. Index 0 is the system message and is never
+   * summarised — it is instructions, not history.
+   */
+  #keepFrom(state: CodegenState): number {
+    let used = 0;
+    for (let i = state.messages.length - 1; i > 0; i--) {
+      used += String(state.messages[i]!.content ?? "").length;
+      if (used > this.#compaction.keepRecentChars) return Math.min(i + 1, state.messages.length - 1);
+    }
+    return 1;
+  }
+
+  /**
+   * The history to be summarised, as plain text.
+   *
+   * Tool output is truncated hard, the way pi truncates it: a summariser given
+   * a megabyte of fetched page will summarise the page instead of the work.
+   */
+  #serialize(msgs: TaggedMessage[]): string {
+    return msgs.map((m) => {
+      const who = m.tag === "customer" ? "User" : m.tag === "agent" ? "Assistant"
+        : m.tag === "execution" ? "Tool result" : "Note";
+      const body = String(m.content ?? "");
+      return `[${who}]: ${m.tag === "execution" ? body.slice(0, 2000) : body}`;
+    }).join("\n\n");
+  }
+
+  /** The request that produces the handover. Not a tool call and not part of
+   *  the conversation: a separate ask, with its own instructions. */
+  #summaryRequest(state: CodegenState, keptFrom: number): ModelMessage[] {
+    const history = this.#serialize(state.messages.slice(1, keptFrom));
+    const prior = state.summary;
+    return [
+      { role: "system", content: prior ? SUMMARY_UPDATE : SUMMARY_INITIAL },
+      {
+        role: "user",
+        content: (prior ? `# The handover so far\n\n${prior}\n\n# What has happened since\n\n` : "") +
+          history,
+      },
+    ];
+  }
+
   #compact(state: CodegenState): boolean {
     const c = this.#compaction;
-    if (c.mode === "none" || state.promptTokens < c.triggerTokens) return false;
+    // "summarise" replaces this rather than running alongside it. Left in, the
+    // drop went first and ate the history the summariser was about to be given,
+    // so compaction quietly degraded back to forgetting.
+    if (c.mode !== "cycles" || state.promptTokens < c.triggerTokens) return false;
 
     const msgs = state.messages;
     // Index execution cycles: an agent reply followed by its execution result.
@@ -364,6 +495,33 @@ export class CodegenHarness implements HarnessAdapter {
       }
     }
 
+    // A reply arriving while a summarisation is out is the handover itself, not
+    // a turn of the conversation. Fold it in and carry on from where the tail
+    // begins; the full history stays in the event log, so shortening what the
+    // model is shown destroys nothing.
+    if (state.compacting && sawModelReply !== null) {
+      const { keptFrom } = state.compacting;
+      const summary = sawModelReply.trim();
+      const tail = messages.slice(keptFrom)
+        .filter((m) => !(m.tag === "note" && String(m.content).startsWith("[compacted")));
+      state.messages = [
+        messages[0]!,
+        { role: "user", tag: "note",
+          content: `[compacted] Everything before this point has been summarised.\n\n${summary}` },
+        ...tail,
+      ];
+      state.summary = summary;
+      state.compacting = undefined;
+      state.compactions++;
+      this.lastCompaction = { dropped: keptFrom - 1, from: state.promptTokens };
+      return {
+        state,
+        status: "waiting",
+        commands: [{ kind: "model.request", payload: { messages: plain(state.messages) } }],
+        waits: [],
+      };
+    }
+
     if (sawModelReply !== null) {
       // Accept the harness's own syntax first, then translate a call written in
       // another convention rather than discarding it.
@@ -457,11 +615,54 @@ export class CodegenHarness implements HarnessAdapter {
       };
     }
 
+    // Before asking the model to do more work, check whether it can still be
+    // asked at all. Dropping old turns keeps the task alive and loses what it
+    // learned; summarising keeps the findings and costs one model call.
+    if (this.#shouldSummarise(state)) {
+      const keptFrom = this.#keepFrom(state);
+      if (keptFrom > 1) {
+        state.compacting = { keptFrom, prior: state.summary };
+        return {
+          state,
+          status: "waiting",
+          commands: [{
+            kind: "model.request",
+            payload: {
+              messages: this.#summaryRequest(state, keptFrom),
+              // Carried through to the event, so the log says a compaction
+              // happened here and where the kept window starts. Nothing is
+              // destroyed — the whole history is still in the log — but without
+              // this the handover is indistinguishable from an ordinary reply
+              // and the seam is invisible.
+              purpose: "compaction",
+              keptFrom,
+              summarised: keptFrom - 1,
+            },
+          }],
+          waits: [],
+        };
+      }
+    }
+
     return {
       state,
       status: "waiting",
       commands: [{ kind: "model.request", payload: { messages: plain(state.messages) } }],
       waits: [],
     };
+  }
+
+  /**
+   * Two thresholds, because there are two different walls.
+   *
+   * The measured prompt is the cost wall and moves first. The checkpoint size
+   * is the hard one: past it the kernel cannot commit at all, and the only
+   * thing that would shrink the state runs inside the advance being refused —
+   * a deadlock that stopped a real session for hours.
+   */
+  #shouldSummarise(state: CodegenState): boolean {
+    if (this.#compaction.mode !== "summarise" || state.compacting || state.finalizing) return false;
+    if (state.promptTokens >= this.#compaction.triggerTokens) return true;
+    return JSON.stringify(state).length >= this.#compaction.keepRecentChars * 2;
   }
 }

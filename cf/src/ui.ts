@@ -281,6 +281,17 @@ export function trajectory(
       continue;
     }
 
+    if (s.kind === "model.response" && p.purpose === "compaction") {
+      out.push(`<div class="step decided"><div class="lbl">compacted ${rel}
+        <span class="badge">${esc(p.summarised ?? 0)} earlier step(s) summarised</span></div>
+        <details><summary>the handover the agent kept</summary>
+        <div class="msg md">${md(String(p.text ?? ""))}</div></details>
+        <div class="hint" style="padding:6px 0 0">Only what the model is shown was shortened.
+          Every event before this is still in the log and on the events tab.</div>
+      </div>`);
+      continue;
+    }
+
     if (s.kind === "model.response") {
       turn++;
       const text = String(p.text ?? "");
@@ -487,6 +498,8 @@ export function conversation(
     const e = events[i]!;
     if (e.kind === "message") { out.push(e); continue; }
     if (e.kind !== "model.response") continue;
+    // A compaction is bookkeeping, not something the agent said.
+    if ((e.payload as any)?.purpose === "compaction") continue;
     let executed = false;
     for (let j = i + 1; j < events.length; j++) {
       const n = events[j]!;

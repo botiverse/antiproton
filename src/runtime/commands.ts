@@ -29,12 +29,16 @@ export async function appendModelResponse(
   ctx: CommandContext,
   commandId: string,
   res: ModelResponse,
+  /** What the request was for, when it was not an ordinary turn. */
+  about?: { purpose?: string; keptFrom?: number; summarised?: number },
 ): Promise<void> {
   await store.appendEvent({
     tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
     kind: "model.response",
     payload: {
       text: res.text, truncated: res.truncated, usage: res.usage,
+      ...(about?.purpose ? { purpose: about.purpose, keptFrom: about.keptFrom,
+                             summarised: about.summarised } : {}),
       ...(res.toolCalls ? { toolCalls: res.toolCalls } : {}),
       // Kept in the log, deliberately not in the harness's messages: the next
       // prompt carries the reply, not the thinking behind it.
@@ -139,7 +143,10 @@ export class CommandExecutor {
             reasoning: res.usage.reasoningTokens,
           },
         });
-        await appendModelResponse(this.#store, ctx, cmd.commandId, res);
+        await appendModelResponse(this.#store, ctx, cmd.commandId, res, {
+          purpose: (p as any).purpose, keptFrom: (p as any).keptFrom,
+          summarised: (p as any).summarised,
+        });
         break;
       }
       case "tool.call": {
