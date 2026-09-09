@@ -144,13 +144,23 @@ export async function executorSpec(exec: JsExecutor): Promise<SpecResult[]> {
   test("工具期间中断", "cancelling mid-call reports accepted operations rather than losing them", async () => {
     calls = [];
     const ac = new AbortController();
+    // Cancel once the call has actually been made, not after a fixed 40ms.
+    // Loading a fresh isolate on the deployed sandbox can take longer than
+    // that, and then the abort landed before any call existed — so the case
+    // failed about one run in three while testing the scheduler rather than
+    // the invariant, which is that an operation the host already accepted
+    // survives the cancellation.
+    let entered!: () => void;
+    const called = new Promise<void>((r) => { entered = r; });
     const slow = host(
-      async () =>
-        new Promise<ToolResult>((res) =>
+      async () => {
+        entered();
+        return new Promise<ToolResult>((res) =>
           setTimeout(() => res({ status: "succeeded", operationId: "op_slow", result: {} }), 250),
-        ),
+        );
+      },
     );
-    setTimeout(() => ac.abort(), 40);
+    void called.then(() => ac.abort());
     const r = await exec.execute(
       `const res = await tool\`m.slow \${ {} }\`; output(res.status);`,
       slow,
