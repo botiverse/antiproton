@@ -547,8 +547,7 @@ export function runtimePanel(d: any): string {
       ? `<span class="tag ok">armed</span> ${esc(ago(Number(d.runtime.alarm)))}`
       : `<span class="tag">none</span> — correct while it waits on the queue`}</div>
   <div>alarm failures</div><div>${esc(d.runtime?.alarmFailures ?? 0)}</div>
-  <div>still out</div><div>${(d.outbox ?? []).filter((o: any) =>
-      ["pending", "claimed", "dispatched"].includes(o.state)).length} command(s)</div>
+  <div>still out</div><div>${esc(d.runtime?.outstanding ?? 0)} command(s) awaiting a reply</div>
 </div>
 
 <h3>where the time goes</h3>

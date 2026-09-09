@@ -905,6 +905,11 @@ export class AgentDO extends DurableObject<Env> {
       stateDocs: rows("SELECT key, value, ref, bytes, updated_at FROM agent_state WHERE tenant_id=? AND agent_id=? ORDER BY key LIMIT 20",
         tenantId, agentId),
       runtime: {
+        // Asked of the runtime, not re-derived from the rows. A console that
+        // computes "is anything still out" its own way will disagree with the
+        // thing it is meant to explain — and it did: it counted a `message.out`
+        // that answers nothing as a command in flight.
+        outstanding: await rt.store.outstandingCommands(),
         alarm: await this.ctx.storage.getAlarm(),
         alarmFailures: this.#alarmFailures(),
         activity: await this.activity(),
