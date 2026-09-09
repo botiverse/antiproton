@@ -561,5 +561,50 @@ export function runtimePanel(d: any): string {
   stopped working.</div>
 
 <h3>invocations</h3>
-${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]))}`;
+${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]))}
+
+${sandbox(d)}`;
+}
+
+
+/**
+ * How long a container was alive.
+ *
+ * The one thing here billed for merely existing, and the only cost that keeps
+ * running while nothing is happening — so it gets its own meter rather than a
+ * row among the invocations. A live box is drawn against the sessions that
+ * came before it, which is what makes "still running" look wrong.
+ */
+export function sandbox(d: any): string {
+  const conn = (d.connections ?? []).find((c: any) => c.alias === "node");
+  let st: any = null;
+  try { st = conn ? JSON.parse(conn.state) : null; } catch { st = null; }
+  const sessions: Array<{ boxId: string; startedAt: number; endedAt: number; execs: number; saved: string[] }> =
+    st?.sessions ?? [];
+  const liveMs = st?.boxId ? Date.now() - Number(st.createdAt) : 0;
+  if (!sessions.length && !st?.boxId) {
+    return `<h3>sandbox</h3><div class="empty">no container has been started</div>`;
+  }
+  const total = sessions.reduce((a, x) => a + (x.endedAt - x.startedAt), 0) + liveMs;
+  const widest = Math.max(liveMs, ...sessions.map((x) => x.endedAt - x.startedAt), 1);
+  const row = (label: string, ms: number, extra: string, colour: string) =>
+    `<div class="bar"><span class="n"></span><span class="t2">
+       <span style="width:${(ms / widest * 100).toFixed(2)}%;background:${colour}"></span>
+     </span><span class="v">${esc(secs(ms))} ${extra}</span></div>`;
+  return `<h3>sandbox — billed while it exists</h3>
+    <div class="bars">
+      ${st?.boxId
+        ? row("live", liveMs,
+            `<span class="tag bad">still running</span> ${esc(String(st.boxId).slice(-12))}`,
+            "var(--bad)")
+        : ""}
+      ${sessions.map((x) => row("", x.endedAt - x.startedAt,
+          `${x.execs} call(s)${x.saved?.length ? ` · ${x.saved.length} saved` : ""}`,
+          "var(--ok)")).join("")}
+    </div>
+    <div class="hint" style="padding:6px 0">${esc(secs(total))} of container time across
+      ${sessions.length + (st?.boxId ? 1 : 0)} session(s).
+      ${st?.boxId
+        ? "A box is alive now — it is costing money whether or not anything is running in it."
+        : "Nothing is running; this costs nothing until the next one starts."}</div>`;
 }

@@ -34,7 +34,7 @@ await store.init();
 await store.createAgent(T, AGENT);
 
 const plugins: Plugin[] = [
-  demoPlugin, httpPlugin, run9Plugin,
+  demoPlugin, httpPlugin, run9Plugin(null, "local"),
   statePlugin(store, null, "local"),
   builtinToolsPlugin(store, () => plugins),
 ];

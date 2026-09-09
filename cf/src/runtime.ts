@@ -165,7 +165,7 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
-      run9Plugin,
+      run9Plugin(this.#artifacts as any, deps.bucketName),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),

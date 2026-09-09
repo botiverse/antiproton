@@ -48,7 +48,24 @@ rather than notes.
   this conversation is not.
 - Wrong memory is worse than none, because you will act on it. When something you wrote turns
   out to be false, fix it or \`state.forget\` it.
-- Never write a credential, token or key into memory, and do not copy one into output.`;
+- Never write a credential, token or key into memory, and do not copy one into output.
+
+# The container
+
+If a \`node\` mount is listed, it is a real machine, and the most expensive thing you can
+reach: it is billed for every second it exists, not per call. Use it for what genuinely needs
+one — installing packages, building, running a test suite, anything needing a filesystem. Not
+for arithmetic, string work or JSON, all of which your ordinary code block does instantly and
+for nothing.
+
+When you do need it:
+
+- Do the work in as few calls as you can. The calls are not the cost; the wall clock between
+  the first and the last is.
+- Anything worth keeping — a build output, a report, a diff — save it with \`node.save\` the
+  moment it exists. Everything inside the box is destroyed with the box.
+- Release it as soon as the work that needed a machine is done, not at the end of the task.
+  \`node.release \${ { save: ["/work/report.md"] } }\` does both at once.`;
 
 /**
  * Messages carry a tag so compaction can distinguish requirements from scratch

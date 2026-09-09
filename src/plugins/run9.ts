@@ -1,5 +1,6 @@
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext } from "./types.ts";
+import type { R2Artifacts } from "../store/artifacts.ts";
 
 /**
  * A real Node runtime, as a mount.
@@ -45,7 +46,31 @@ export interface Run9Config {
 }
 
 interface Run9Credential { ak: string; sk: string }
-interface BoxState { boxId: string; createdAt: number; lastUsedAt: number }
+interface Session {
+  boxId: string;
+  startedAt: number;
+  endedAt: number;
+  execs: number;
+  saved: string[];
+}
+
+/**
+ * The mount's connection state. `sessions` is what makes the meter readable:
+ * a container is the most expensive thing here and the only one billed for
+ * simply existing, so how long each one lived is worth keeping even after it
+ * is gone.
+ */
+interface BoxState {
+  boxId: string;
+  createdAt: number;
+  lastUsedAt: number;
+  execs?: number;
+  saved?: string[];
+  /** Most recent first, capped: this is a meter, not a second event log. */
+  sessions?: Session[];
+}
+
+const SESSIONS_KEPT = 20;
 
 const DEFAULTS = {
   /** Installs and scripts share one directory, or Node resolves modules from
@@ -89,22 +114,34 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
   } catch (e) {
     error = String((e as Error)?.message ?? e).slice(0, 160);
   }
-  // The record goes either way: keeping a pointer to a box we failed to delete
-  // only means the next call tries to reuse something that may not be there.
-  await ctx.connection.set(null);
-  return { boxId: state.boxId, freed: !error, error };
+  // The box record goes either way — keeping a pointer to one we failed to
+  // delete only means the next call tries to reuse something that may not be
+  // there — but the session survives it. A container is the one thing here
+  // billed for merely existing, so how long it lived outlives the box.
+  const session: Session = {
+    boxId: state.boxId, startedAt: state.createdAt, endedAt: Date.now(),
+    execs: state.execs ?? 0, saved: state.saved ?? [],
+  };
+  await ctx.connection.set({
+    boxId: "", createdAt: 0, lastUsedAt: 0,
+    sessions: [session, ...(state.sessions ?? [])].slice(0, SESSIONS_KEPT),
+  } as unknown as Json);
+  return { boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt };
 }
 
-export const run9Plugin: Plugin = {
+export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
+  return {
   id: "run9",
   version: "1.0.0",
   tools: [
     {
       name: "run",
       summary:
-        "LAST RESORT for JavaScript. Prefer run_js, which is instant and free; this starts a metered " +
-        "container and cannot call your other tools. Use it only when you genuinely need npm packages, " +
-        "a real filesystem, or more than a few seconds of compute. Call release when you are done with it.",
+        "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
+        "starts a container that is billed for every second it exists, and it cannot call your other " +
+        "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
+        "few seconds of compute — and when you do, work in as few calls as you can, save what matters " +
+        "with node.save, and release it. Everything inside the box is destroyed with it.",
       parameters: {
         type: "object",
         properties: {
@@ -124,11 +161,11 @@ export const run9Plugin: Plugin = {
     {
       name: "shell",
       summary:
-        "Shell in the same metered container as node.run — only for what needs a real machine " +
-        "(builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
+        "Shell in the same billed-by-the-second container as node.run — only for what needs a real " +
+        "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
-        "that instead of probing for it. Call release when finished.",
+        "that instead of probing for it. Save anything worth keeping, then release.",
       parameters: {
         type: "object",
         properties: { command: { type: "string" } },
@@ -138,11 +175,38 @@ export const run9Plugin: Plugin = {
       idempotency: "none",
     },
     {
+      name: "save",
+      summary:
+        "Copy a file out of the container into durable storage before it is destroyed. Returns an " +
+        "r2:// reference you can read later with artifacts.read, and that outlives the box. Set " +
+        "archive for a directory. Do this for anything worth keeping — a build output, a report, a " +
+        "diff — the moment it exists, not at the end.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "absolute path inside the box" },
+          archive: { type: "boolean", description: "true to take a directory as a tar" },
+        },
+        required: ["path"],
+      },
+      sideEffects: "read",
+      idempotency: "none",
+    },
+    {
       name: "release",
       summary:
-        "Destroy the container and everything in it, freeing its compute and storage. Safe to call " +
-        "any time; the next run starts a fresh one. Call it as soon as you no longer need the sandbox.",
-      parameters: { type: "object", properties: {} },
+        "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+        "first, in the same call. Do this as soon as you no longer need the sandbox — not at the end " +
+        "of the task, at the end of the work that needed a machine.",
+      parameters: {
+        type: "object",
+        properties: {
+          save: {
+            type: "array", items: { type: "string" },
+            description: "absolute paths to keep before destroying the box",
+          },
+        },
+      },
       sideEffects: "read",
       idempotency: "native",
     },
@@ -156,12 +220,10 @@ export const run9Plugin: Plugin = {
   },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-    if (tool === "release") {
-      const r = await stopBox(ctx);
-      if (!r) return { released: false, note: "nothing was running" };
-      return r.freed
-        ? { released: true, box: r.boxId, note: "the container and its files are gone; the next run starts fresh" }
-        : { released: false, box: r.boxId, error: r.error };
+    // Checked before anything else: releasing must never be the thing that
+    // starts a container.
+    if (tool === "release" && !((await ctx.connection.get()) as BoxState | null)?.boxId) {
+      return { released: false, note: "nothing was running" };
     }
     const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
     if (!ctx.credential) throw new Error("run9 mount has no credential");
@@ -184,6 +246,9 @@ export const run9Plugin: Plugin = {
 
     // One box per mount, remembered, so an install survives to the next call.
     let state = (await ctx.connection.get()) as BoxState | null;
+    // An emptied record keeps the session history but has no box.
+    const history = state?.sessions ?? [];
+    if (state && !state.boxId) state = null;
     if (!state) {
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
@@ -192,8 +257,56 @@ export const run9Plugin: Plugin = {
         ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
         description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
       });
-      state = { boxId, createdAt: Date.now(), lastUsedAt: Date.now() };
+      state = {
+        boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        sessions: history,
+      };
       await ctx.connection.set(state as unknown as Json);
+    }
+
+    /**
+     * Take something out of the box. Everything in a container dies with it,
+     * and the file it produced is usually the reason the container existed.
+     */
+    const saveOut = async (path: string, archive: boolean) => {
+      if (!path.startsWith("/")) throw new Error(`path must be absolute inside the box: ${path}`);
+      if (!artifacts) throw new Error("no object storage is mounted, so nothing can be saved out");
+      const url = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state!.boxId}` +
+        `/files/download?box_abs_path=${encodeURIComponent(path)}${archive ? "&archive=tar" : ""}`;
+      const res = await fetch(url, {
+        headers: { authorization: auth }, signal: AbortSignal.timeout(cfg.timeoutMs),
+      });
+      if (!res.ok) {
+        throw new Error(`could not read ${path}: ${res.status} ${(await res.text()).slice(0, 160)}`);
+      }
+      const body = new Uint8Array(await res.arrayBuffer());
+      const name = path.replace(/^\//, "").replace(/[^A-Za-z0-9._/-]/g, "_") + (archive ? ".tar" : "");
+      const stored = await artifacts.put(
+        `t/${ctx.caller.tenantId}/${ctx.caller.agentId}/sandbox/${state!.boxId}/${name}`,
+        body, archive ? "application/x-tar" : "application/octet-stream");
+      state = { ...state!, saved: [...(state!.saved ?? []), stored.ref], lastUsedAt: Date.now() };
+      await ctx.connection.set(state as unknown as Json);
+      return { path, ref: stored.ref, bytes: body.length };
+    };
+
+    if (tool === "save") {
+      const r = await saveOut(String((args as any)?.path ?? ""), (args as any)?.archive === true);
+      return { ...r, note: "kept outside the box; it survives release" };
+    }
+
+    if (tool === "release") {
+      // Saving first, in the same call, so "keep this and hand the machine
+      // back" does not depend on the agent remembering to do it in two.
+      const kept: unknown[] = [];
+      for (const path of ((args as any)?.save ?? []) as string[]) {
+        kept.push(await saveOut(path, false));
+      }
+      const r = await stopBox(ctx);
+      if (!r) return { released: false, note: "nothing was running", saved: kept };
+      return r.freed
+        ? { released: true, box: r.boxId, liveMs: r.liveMs, saved: kept,
+            note: "the container and its files are gone; anything saved above is not" }
+        : { released: false, box: r.boxId, error: r.error, saved: kept };
     }
 
     const wd = cfg.workdir;
@@ -236,7 +349,9 @@ export const run9Plugin: Plugin = {
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${execId}`);
       if (["succeeded", "failed", "killed", "cancelled", "timeout"].includes(rec.state)) {
         const out = String(rec.output_summary ?? "");
-        await ctx.connection.set({ ...state, lastUsedAt: Date.now() } as unknown as Json);
+        await ctx.connection.set({
+          ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1,
+        } as unknown as Json);
         return {
           state: rec.state,
           exitCode: rec.exit_code ?? null,
@@ -257,4 +372,5 @@ export const run9Plugin: Plugin = {
       await new Promise((r) => setTimeout(r, 1200));
     }
   },
-};
+  };
+}

@@ -74,7 +74,7 @@ async function runOne(inst: Instance) {
   await store.init();
   await store.createAgent(T, AGENT);
 
-  const plugins: Plugin[] = [run9Plugin, builtinToolsPlugin(store, () => plugins)];
+  const plugins: Plugin[] = [run9Plugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
   await store.addMount({
     tenantId: T, agentId: AGENT, alias: "node", plugin: "run9",
     installationId: "i-node", connectionId: null, toolVersion: "1.0.0",
