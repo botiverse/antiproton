@@ -251,6 +251,24 @@ console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.leng
   `db-only ${results.filter((r) => r.dbMatch).length}   ` +
   `action-only ${results.filter((r) => r.actionMatch).length}   ` +
   `${results.reduce((a, r) => a + r.seconds, 0)}s`);
+/**
+ * Why the runs that failed ended.
+ *
+ * A pass rate alone cannot tell an agent that got the task wrong from a
+ * conversation that never happened. The customer here is a second model, and it
+ * can emit its stop token on the first turn — one task in this set carries a
+ * `task_instructions` of "." and the simulator gave up in six seconds, before
+ * the agent had done anything. Counting those against the loop would be
+ * measuring the benchmark's user simulator and calling it a harness score.
+ */
+const endings: Record<string, number> = {};
+for (const r of results.filter((x) => !x.reward)) {
+  endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;
+}
+if (Object.keys(endings).length) {
+  console.log(`  failures by ending: ${Object.entries(endings)
+    .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ")}`);
+}
 console.log(`  ${prompt} prompt tokens (${prompt ? Math.round((cached / prompt) * 100) : 0}% cached)   ` +
   `tools: ${Object.entries(allTools).sort((a: any, b: any) => b[1] - a[1])
     .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}\n`);
