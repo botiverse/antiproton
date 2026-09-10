@@ -14,3 +14,18 @@ deliberately differ from upstream and why.
 The short version: the pin is exact on purpose, `node_modules` is never edited
 in place, and an upgrade is not finished until pi's own conformance suite and a
 benchmark have both run.
+
+## Which document is authoritative
+
+[`README.md`](README.md) describes the system as it is; its numbers are measured
+and it is the only doc kept in step with the code. Everything else is history or
+reference:
+
+- [`docs/pi-upstream.md`](docs/pi-upstream.md) — how to stay in sync with pi.
+- [`docs/服务端Antiproton-完整计划书.md`](docs/服务端Antiproton-完整计划书.md) and
+  [`docs/本地自托管Antiproton-计划书.md`](docs/本地自托管Antiproton-计划书.md) —
+  the pre-implementation design docs, **frozen on purpose**. They record the
+  reasoning and the evidence of their moment, including mechanisms since
+  deleted (the self-built kernel's leases, fencing and outbox). Do not read them
+  as the current design, and do not update them to match: their value is that
+  they were written before the code, and current facts belong in the README.
