@@ -178,12 +178,25 @@ async function runOne(inst: Instance) {
   // measures the code that runs rather than a second wiring of its own.
   const mounted = await store.listMounts(T, AGENT);
   const byId = new Map(plugins.map((pl) => [pl.id, pl]));
+  /**
+   * The catalogue, minus the one tool that can destroy the evidence.
+   *
+   * `run9.release` says it destroys the container and stops the meter, so an
+   * agent tidying up at the end of a task calls it — and it is right to, in
+   * production. Here the grader runs *after* the agent, in the same box, so a
+   * released container means grading a fresh one from the base image: no diff,
+   * every test still failing, and a spurious zero that looks exactly like the
+   * model being wrong. It cost one instance before it was noticed.
+   *
+   * The runner owns the container's lifetime, so the agent is not offered it.
+   */
+  const OWNED_BY_THE_RUNNER = new Set(["node.release"]);
   const tools: MountedTool[] = mounted.flatMap((m) =>
     (byId.get(m.plugin)?.tools ?? []).map((t) => ({
       name: t.name, description: t.summary, parameters: t.parameters,
       address: `${m.alias}.${t.name}`,
       sideEffects: t.sideEffects, idempotency: t.idempotency,
-    })));
+    }))).filter((t) => !OWNED_BY_THE_RUNNER.has(t.address));
 
   const holder: { agent?: PiAgent } = {};
   const w = nodeWorker(() => holder.agent!);
