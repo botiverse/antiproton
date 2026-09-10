@@ -233,58 +233,55 @@ footer a{color:var(--accent)}
 
   <div class="delta">
     <div class="minus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^1 &middot; run C &middot; 15/24</span></div>
-    <div class="minus"><span class="num">79.2&thinsp;%</span><span class="cap">pass^1 &middot; run D &middot; 19/24</span></div>
-    <div class="plus"><span class="num">87.5&thinsp;%</span><span class="cap">pass^1 &middot; run B &middot; 21/24</span></div>
-    <div class="plus"><span class="num">4&thinsp;%</span><span class="cap">of wall clock billed</span></div>
+    <div class="minus"><span class="num">75&thinsp;%</span><span class="cap">pass^1 &middot; run E &middot; 18/24</span></div>
+    <div class="plus"><span class="num">79.2&thinsp;%</span><span class="cap">pass^1 &middot; run D &middot; 19/24</span></div>
+    <div class="plus"><span class="num">5&thinsp;%</span><span class="cap">of wall clock billed</span></div>
   </div>
 
   <div class="col">
-    <p><b>Three on-object runs of the same benchmark and model, and the first thing to publish is that they disagree</b> &mdash; 21/24, 19/24 and 15/24. Eight tasks &times; three trials each, on <code>deepseek-flash</code>, in a deployed object. The newer two carry their evidence and share no failing task; the oldest does not, and says so:</p>
-    <p>Run <b>B</b> &mdash; <b>21/24</b> on object <code>do1</code>, all three zeros in trial one, written by <code>88a5b1d</code>, <b>raw output not retained</b>. Its task-level vector exists only in the page text that commit wrote, from a log nobody kept, so it is given as a labelled line and not as a checkable row. Runs <b>C</b> (<code>verado1</code>, 15/24) and <b>D</b> (<code>veratools1</code>, 19/24) carry full output and archived transcripts.</p>
+    <p><b>Four on-object runs of the same benchmark and model, and the first thing to publish is that they disagree</b> &mdash; pass^1 from 62.5&thinsp;% to 87.5&thinsp;%. Eight tasks &times; three trials each, on <code>deepseek-flash</code>, in a deployed object. The disagreement is the finding: one run cannot say how good the loop is.</p>
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>run</th><th>object</th><th>grader</th><th>pass^1</th><th>pass^2</th><th>pass^3</th><th>evidence</th></tr></thead>
+    <tbody>
+      <tr><td class="k">B</td><td class="k">do1</td><td class="k">old</td><td class="n">87.5&thinsp;%</td><td class="n">62.5&thinsp;%</td><td class="n">62.5&thinsp;%</td><td class="k">commit message only</td></tr>
+      <tr><td class="k">C</td><td class="k">verado1</td><td class="k">old</td><td class="n">62.5&thinsp;%</td><td class="n">50&thinsp;%</td><td class="n">50&thinsp;%</td><td class="k">full output + transcripts</td></tr>
+      <tr><td class="k">D</td><td class="k">veratools1</td><td class="k">old</td><td class="n">79.2&thinsp;%</td><td class="n">75&thinsp;%</td><td class="n">75&thinsp;%</td><td class="k">full output + transcripts</td></tr>
+      <tr><td class="k">E</td><td class="k">verafixed1</td><td class="k">fixed</td><td class="n">75&thinsp;%</td><td class="n">62.5&thinsp;%</td><td class="n">50&thinsp;%</td><td class="k">full output + transcripts</td></tr>
+    </tbody>
+  </table>
   </div>
 
   <div class="col">
-    <p><b>One of D's failures is not the agent's, and it is the newest finding.</b> Task 2 failed all three trials with the database in the <i>gold</i> state: the agent returned the right three items in a different order, and the grader compared the list positionally. The domain sorts that list when it applies the write &mdash; the field is a set &mdash; so the action was right and the check was wrong. Fixed in <code>c7aa888</code>; re-graded under it the same performed writes score <b>22/24</b>. That is a re-grade of the same evidence, not a new measurement, and the run as run printed 19/24.</p>
-    <p><b>The runs disagree on the aggregate and on the shape.</b> Six tasks separate B from C, three separate C from D, and no two share a failing task. One run cannot say how good the loop is; the spread is the finding.</p>
+    <p><b>B is a labelled line, not a checkable row.</b> Its aggregate is in a commit message; its task numbers (1, 5, 6 in trial one) exist only in the page text that commit wrote, from a log nobody kept, and the object holds no archived task for it. A run whose vector cannot be re-derived is recorded and marked, not promoted to a peer of the runs that can be. <b>C, D and E carry full evidence</b> and their per-task vectors are below.</p>
+    <p><b>A grader bug was found, mid-sequence, and fixed.</b> In D, task 2 failed all three trials with the database in the <i>gold</i> state: the agent returned the right three items in a different order, and the check compared the list positionally. The domain sorts that list when it applies the write &mdash; the field is a set &mdash; so the action was right and the check was wrong. Fixed in <code>c7aa888</code> (which runs on the driver, so it needed no deploy). D printed 19/24 and stays printed; E is the next run under the fixed grader, and it shows <b>zero</b> ordering-artifact failures. Note what the fix did <i>not</i> do: it did not recover task 2's three points, because the agent does not repeat itself &mdash; E simply lost different trials. A corrected grader changes which trials fail; it does not add a fixed number of passes.</p>
+    <p><b>The runs disagree on the aggregate and on the shape.</b> No two of C, D and E share a failing task, and their pass^1 spans 62.5&thinsp;% to 79.2&thinsp;% &mdash; wider than any difference the page could claim between loops.</p>
     <p><b>pass^k is the number that matters.</b> pass^1 asks how often this works; pass^3 asks whether the same task survives three attempts, which is the question a deployment actually has. Reporting only the first is how a benchmark flatters a loop. It is reported here as a summary under the vectors, not as the lede.</p>
-    <p>Every failure is the agent's, not the substrate's, with the two stated exceptions: no call was lost, no run stalled, no object failed to wake. In B one failure was the benchmark's own user simulator quitting after six seconds, and in D one task's three failures are the grader's as above.</p>
-    <p><code>run_js</code> <b>went unused on the object.</b> The page once said no benchmark had ever triggered the sandbox; that was true of SWE-bench and wrong for &tau;&sup2;. The honest statement after the tool tally landed: <b>zero</b> on object in both benchmarks &mdash; SWE-bench 49 calls, &tau;&sup2; 24 trials &mdash; and the <i>twice</i> that the page used to cite comes from the earlier in-process matrix alone, which is not on-object evidence. So the sandbox is not shown to have a shape of problem here; that claim would need an on-object run that reaches for it.</p>
+    <p><code>run_js</code> <b>went unused on the object, in two independent runs.</b> The page once said no benchmark had ever triggered the sandbox; that was true of SWE-bench and unproven for &tau;&sup2;. The tally has now printed for &tau;&sup2; twice &mdash; 24 trials each, no <code>run_js</code> &mdash; so the <i>twice</i> the page used to cite is in-process only, and the sandbox is not shown to have a shape of problem here. That claim would need an on-object run that reaches for it.</p>
   </div>
 
   <div class="scroll">
   <table>
-    <thead><tr><th>run C &middot; task</th><th>t1</th><th>t2</th><th>t3</th><th>what the zeros were</th></tr></thead>
+    <thead><tr><th>task</th><th colspan="3">C &middot; verado1</th><th colspan="3">D &middot; veratools1</th></tr>
+    <tr><th></th><th>t1</th><th>t2</th><th>t3</th><th>t1</th><th>t2</th><th>t3</th></tr></thead>
     <tbody>
-      <tr><td class="k">0</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">1</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">2</td><td>✗</td><td>✗</td><td>✗</td><td><b>The benchmark gave up, not the agent.</b> The user simulator ended on the first turn &mdash; that task's instructions are a single full stop &mdash; before any write could happen.</td></tr>
-      <tr><td class="k">3</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">4</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">5</td><td>✗</td><td>✗</td><td>✗</td><td><b>The agent was wrong.</b> Asked to return an item, it exchanged it &mdash; the same mistake run B made on this task.</td></tr>
-      <tr><td class="k">6</td><td>✓</td><td>✗</td><td>✗</td><td><b>The agent stopped short.</b> A confident close with no action taken.</td></tr>
-      <tr><td class="k">7</td><td>✗</td><td>✓</td><td>✓</td><td><b>The agent stopped short.</b> It read the order and the products and never submitted a write &mdash; and got it right on the next two attempts.</td></tr>
-    </tbody>
-  </table>
-  </div>
-
-  <div class="scroll">
-  <table>
-    <thead><tr><th>run D &middot; task</th><th>t1</th><th>t2</th><th>t3</th><th>what the zeros were</th></tr></thead>
-    <tbody>
-      <tr><td class="k">0</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">1</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">2</td><td>✗</td><td>✗</td><td>✗</td><td><b>The grader was wrong, not the agent.</b> The same three items in a different order; the field is a set and was compared as a list. Fixed in <code>c7aa888</code>; these three become passes under it.</td></tr>
-      <tr><td class="k">3</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">4</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">5</td><td>✗</td><td>✗</td><td>✓</td><td><b>The agent was wrong twice, then right.</b> The same return-vs-exchange mistake as C, self-corrected on the third trial.</td></tr>
-      <tr><td class="k">6</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">7</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">0</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+      <tr><td class="k">1</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+      <tr><td class="k">2</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td></tr>
+      <tr><td class="k">3</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+      <tr><td class="k">4</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+      <tr><td class="k">5</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td></tr>
+      <tr><td class="k">6</td><td>✓</td><td>✗</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td></tr>
+      <tr><td class="k">7</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p><b>Every figure names its run, and the run names its object.</b> B has a source but no evidence and is marked as such; C and D have both. A fourth matrix from the same session is not shown at all: it ran in process, before the on-object runner existed, so it does not belong in this table. It is, however, the only run that ever used <code>run_js</code>.</p>
+    <p><b>What the zeros were.</b> In C: task 2 ended in the benchmark's own user simulator quitting on the first turn (that task's instructions are a single full stop), task 5 the agent returned an item it should have exchanged, and tasks 6 and 7 it stopped short of the write. In D: task 2 is the grader bug above, task 5 the same return-vs-exchange mistake, self-corrected on the third trial. E's failures are in the summary table above and in its own run log; its per-trial vector is not reproduced here yet. Every failure in every run is the agent's or the grader's, never the substrate's: no call was lost, no run stalled, no object failed to wake.</p>
+    <p><b>Every figure names its run, and the run names its object.</b> A fifth matrix from the same session is not shown at all: it ran in process, before the on-object runner existed, so it does not belong in this table. It is, however, the only run that ever used <code>run_js</code>.</p>
   </div>
 </section>
 
@@ -364,8 +361,8 @@ footer a{color:var(--accent)}
         <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
       <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
         <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused on object in both benchmarks (SWE-bench 49 calls, &tau;&sup2; 24 trials), and the only run that reached for it was an earlier in-process matrix that is not on-object evidence. So there is no evidence yet that the sandbox pays on this substrate, in either direction.</td></tr>
-      <tr><td>Sample size</td><td><span class="pill open">3 runs &times; 8 &times; 3</span></td>
-        <td>Three on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;%, 79.2&thinsp;% and 62.5&thinsp;%. But only two carry full evidence (C, D); the 87.5&thinsp;% is run B, whose record is a commit message and whose vector has no source, so "no shared failing task" is checkable only between C and D. That spread is still the finding &mdash; one run cannot say how good the loop is &mdash; but the aggregate must not promote B to a peer of the two that can be re-derived.</td></tr>
+      <tr><td>Sample size</td><td><span class="pill open">4 runs &times; 8 &times; 3</span></td>
+        <td>Four on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;%, 79.2&thinsp;%, 75&thinsp;% and 62.5&thinsp;%. Three carry full evidence (C, D, E); the 87.5&thinsp;% is run B, whose record is a commit message and whose vector has no source. That spread is itself the finding &mdash; one run cannot say how good the loop is, and no figure here should be read as a trend.</td></tr>
       <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
         <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
       <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
