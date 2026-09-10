@@ -7,7 +7,8 @@
   },
   "scripts": {
     "conformance": "node test/conformance.ts",
-    "pi-storage": "node test/pi-storage.ts"
+    "pi-storage": "node test/pi-storage.ts",
+    "pi-storage:do": "bash test/pi-storage-do.sh"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.85.1",

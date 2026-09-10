@@ -292,7 +292,7 @@ backend and every sandbox.
 |---|---|---|
 | `spec/kernel-spec` | 31 | crash before/after commit, fencing, stale generation, lost wakeup, duplicate delivery, cross-tenant, connection state, quotas (incl. no double-spend under concurrency), replay, snapshots and pruning, policy per mount, approval held then performed exactly once, and an oversized checkpoint shrunk before it is refused |
 | `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
-| `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite and on Durable Object storage: mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
+| `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
 | `strand` | 11 | a waiting task is never unreachable: giving up is visible, a message rescues a stranded task but never bypasses an approval, the turn budget refills, foreign call syntax is translated, a command that answers nothing is still retired |
 | `compaction` | 10 | the handover is asked for and folded back, the second pass updates rather than restarts, tool output is truncated, the record survives in the log, thresholds scale with the model's window |
 | `api` · `harness` · `steering` | 32 | HTTP surface, harness decisions, steering and follow-up |
@@ -421,8 +421,11 @@ secrets before anything is written down.
   hardest to test honestly: mixed-write atomicity, rollback across four tables,
   cursor-before-limit ordering, admission order under concurrent commits. Our
   own tests encode our own assumptions, which is exactly why they would not have
-  caught these. The usage arithmetic in that file is derived from pi's
-  `harness/utils/usage.js`, which its export map does not publish.
+  caught these. The suite runs in a worker that is never deployed: bundling it
+  into the real one grew the production binary by 58 KB, of which the storage
+  implementation itself is 500 bytes. A multi-tenant Worker should not pay for a
+  test suite on every cold start. The usage arithmetic in that file is derived
+  from pi's `harness/utils/usage.js`, which its export map does not publish.
 
 That last item revises what this section used to say. It claimed the shape of
 the agent loop was deliberately not borrowed, because pi was a local,
