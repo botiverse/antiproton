@@ -13,30 +13,9 @@
  * same two are built over node:sqlite, so the class under test is the class that
  * runs in production rather than a port of it.
  */
-import { DatabaseSync } from "node:sqlite";
 import { createStorageConformance } from "@earendil-works/pi-agent-core/harness/session/testing";
-import { PiSqliteStorage, type SqlHost } from "../src/store/pi-storage.ts";
-
-function sqliteHost(): SqlHost & { dispose(): void } {
-  const db = new DatabaseSync(":memory:");
-  return {
-    sql: {
-      exec(query: string, ...bindings: unknown[]) {
-        const rows = db.prepare(query).all(...(bindings as any[]));
-        return { toArray: () => rows };
-      },
-    },
-    // node:sqlite has no transaction helper, so the three statements are the
-    // helper. Nothing nests here: a commit is the only writer, and commits are
-    // serialised by the storage itself.
-    transactionSync<T>(cb: () => T): T {
-      db.exec("BEGIN");
-      try { const result = cb(); db.exec("COMMIT"); return result; }
-      catch (e) { db.exec("ROLLBACK"); throw e; }
-    },
-    dispose() { db.close(); },
-  };
-}
+import { PiSqliteStorage } from "../src/store/pi-storage.ts";
+import { sqliteHost } from "./sqlite-host.ts";
 
 const cases = createStorageConformance(async () => {
   const host = sqliteHost();
