@@ -823,6 +823,25 @@ export class AgentDO extends DurableObject<Env> {
    *  apart from `benchPurge` because that also drops the meter, and the meter
    *  has to survive the task boundary to measure a run. */
   #clearTranscript() {
+    // Kept before it is cleared. Running on the object rather than in memory is
+    // supposed to leave a trace, and a task that wipes the previous task's
+    // transcript leaves exactly as little as the in-process runner did — the
+    // three failures in the last matrix were all in trial one, and by the time
+    // they were worth reading, trials two and three had overwritten them.
+    //
+    // The owner row still names the task being replaced: it is rewritten after
+    // this runs, not before.
+    try {
+      this.sql.exec(
+        "CREATE TABLE IF NOT EXISTS bench_archive(agent_id TEXT, seq INTEGER, body TEXT)");
+      const prev = this.sql.exec(
+        "SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+      if (prev?.agent_id) {
+        this.sql.exec(
+          "INSERT INTO bench_archive(agent_id, seq, body) SELECT ?, seq, body FROM pi_entries",
+          prev.agent_id);
+      }
+    } catch { /* nothing to keep is not a failure */ }
     for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
       try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
     }
@@ -844,11 +863,32 @@ export class AgentDO extends DurableObject<Env> {
     // Tolerant on purpose: purge is what you reach for when an object is in a
     // state you do not understand, and it failing because a table was never
     // created is the least useful moment for it to be strict.
-    for (const t of ["bench_tasks", "do_activity"]) {
+    for (const t of ["bench_tasks", "do_activity", "bench_archive"]) {
       try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* never created */ }
     }
     this.#benchRuntime = null;
     return { purged: true };
+  }
+
+  /** A finished task's transcript, after the next one has taken the object.
+   *  Without a task, what there is to ask for — an archive you cannot
+   *  enumerate is one you have to already know the answer to use. */
+  async benchTrajectory(taskId: string) {
+    if (!taskId || taskId === "null") {
+      try {
+        return {
+          archived: this.sql.exec(
+            "SELECT agent_id, COUNT(*) AS entries FROM bench_archive" +
+            " GROUP BY agent_id ORDER BY MIN(rowid) DESC").toArray(),
+        };
+      } catch { return { archived: [] }; }
+    }
+    try {
+      const rows = this.sql.exec(
+        "SELECT body FROM bench_archive WHERE agent_id=? ORDER BY seq ASC", `b_${taskId}`)
+        .toArray() as any[];
+      return { taskId, entries: entriesToEvents(rows.map((r) => JSON.parse(r.body))) };
+    } catch { return { taskId, entries: [] }; }
   }
 
   async benchResult(taskId: string) {
@@ -1721,6 +1761,8 @@ export default {
           return Response.json(await stub.benchPurge());
         case "/bench/debug":
           return Response.json(await stub.benchDebug(String(url.searchParams.get("taskId"))));
+        case "/bench/trajectory":
+          return Response.json(await stub.benchTrajectory(String(url.searchParams.get("taskId"))));
         case "/bench/result":
           return Response.json(await stub.benchResult(String(url.searchParams.get("taskId"))));
         case "/agent/activity":
