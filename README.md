@@ -352,9 +352,12 @@ that — each turn adds to the tail and leaves the prefix untouched, which is th
 shape a provider cache rewards.
 
 Across all three instances, in the in-process run (53 tool calls) and the
-on-object one (49), `run_js` was used **zero** times.
-This task is shell work inside a container, and the sandbox earns its place by
-replacing several calls with one; the benchmark is not the shape that tests it.
+on-object one (49), `run_js` was used **zero** times. The same is true of τ²:
+on the object it went unused across 24 trials. The one run that reached for it
+— twice — was an in-process matrix, which is not on-object evidence. This task
+is shell work inside a container, and the sandbox earns its place by replacing
+several calls with one; neither benchmark is the shape that tests it, and the
+sandbox is not yet shown to pay on this substrate.
 
 Two runs of the same commit on the same model scored 3/3 both times and differed
 by a third in cost — 1,071 s / 813 k against 690 s / 550 k. That is the size of
