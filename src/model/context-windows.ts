@@ -17,10 +17,13 @@
  */
 export const ASSUMED_CONTEXT_WINDOW = 131_072;
 
+/**
+ * Only models this deployment has actually seen. A dated variant that the
+ * provider has since withdrawn is worse than absent: it looks configured, and
+ * every call 404s. One was left here until the day it expired.
+ */
 export const CONTEXT_WINDOWS: Record<string, number> = {
   "deepseek-v4-pro": 1_000_000,
-  "deepseek-v4-flash": 1_000_000,
-  "deepseek-v4.1-flash-expires-on-0910": 1_000_000,
 };
 
 export function contextWindowFor(
