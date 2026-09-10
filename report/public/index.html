@@ -347,9 +347,9 @@ footer a{color:var(--accent)}
       <tr><td>AppWorld on the current loop</td><td><span class="pill open">unported</span></td>
         <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
       <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
-        <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused across SWE-bench&rsquo;s 298 tool calls, but &tau;&sup2; reached for it twice (run A, both in turns combining several query results), so it has a shape of problem even though SWE-bench is not it. The ablation has a non-zero arm to compare against.</td></tr>
-      <tr><td>Sample size</td><td><span class="pill open">3 runs &times; 8 &times; 3</span></td>
-        <td>Three on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;% twice and 62.5&thinsp;% once, with no two runs sharing a failing task. That spread is itself the finding &mdash; one run cannot say how good the loop is, and no figure here should be read as a trend.</td></tr>
+        <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused across SWE-bench&rsquo;s 298 tool calls, but &tau;&sup2; reached for it twice, in the in-process matrix (which kept a per-tool breakdown; neither on-object run did), so it has a shape of problem even though SWE-bench is not it. The ablation has a non-zero arm to compare against.</td></tr>
+      <tr><td>Sample size</td><td><span class="pill open">2 runs &times; 8 &times; 3</span></td>
+        <td>Two on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;% and 62.5&thinsp;%, sharing no failing task. That spread is itself the finding &mdash; one run cannot say how good the loop is, and no figure here should be read as a trend.</td></tr>
       <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
         <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
       <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
