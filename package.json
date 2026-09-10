@@ -11,7 +11,9 @@
     "pi-storage:do": "bash test/pi-storage-do.sh",
     "pi-loop": "node test/pi-loop.ts",
     "pi-offload": "node test/pi-offload.ts",
-    "pi-tools": "node test/pi-tools.ts"
+    "pi-tools": "node test/pi-tools.ts",
+    "pi-bridge": "node test/pi-bridge.ts",
+    "pi-agent": "node test/pi-agent.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.85.1",
