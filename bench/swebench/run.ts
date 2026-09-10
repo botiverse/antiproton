@@ -262,17 +262,9 @@ async function runOne(inst: Instance) {
   // starts one per instance. Silence here is how thirteen of them were once
   // found alive.
   const release = await gw.releaseTask(ctx);
-  // Read after release: a session is written into the mount's connection state
-  // when the box is handed back, precisely so the meter outlives the box.
-  const meter = await readMeter(store, T, AGENT, ["node"], Date.now() - t0, {
-    promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
-  });
   for (const f of release.failed) {
     console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
   }
-  await agent.close();
-  await store.close();
-
   // A suspended turn is recorded as an assistant message carrying the handle
   // and no content, so counting every message with a `usage` field counts each
   // model call once for the answer and once for every poll that found it not
@@ -302,6 +294,17 @@ async function runOne(inst: Instance) {
     const name = e.message?.role === "toolResult" ? e.message.toolName : null;
     if (name) byTool[name] = (byTool[name] ?? 0) + 1;
   }
+
+  // Read after release: a session is written into the mount's connection state
+  // when the box is handed back, precisely so the meter outlives the box.
+  const meter = await readMeter(store, T, AGENT, ["node"], Date.now() - t0, {
+    promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
+  });
+
+  // Closed last, and after the meter: the container's session lives in the
+  // store, so closing it first threw the measurement away.
+  await agent.close();
+  await store.close();
 
   return {
     id: inst.instance_id, resolved: fail.ok && pass.ok,
