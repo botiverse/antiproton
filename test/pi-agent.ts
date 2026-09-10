@@ -78,12 +78,13 @@ await check("空闲时发 steer 也会启动一轮,而不是石沉大海", async
   if (out.open !== 1) throw new Error("a steer on an idle lane started nothing");
   if (f.w.pending(f.host).length !== 1) throw new Error("no model call was made");
 
-  // And while a run is in flight it really does steer rather than start a second.
-  await f.agent.say("also this", "steer");
-  const info = await f.agent.lane.inspectExecution(CTX);
-  if (info.lastOperationId && info.current?.id !== info.lastOperationId) {
-    // one operation, not two
-  }
+  // And while a run is in flight a second message joins it rather than
+  // starting a rival run — the lane refuses, and that refusal is the signal.
+  const before = (await f.agent.lane.inspectExecution(CTX)).current?.id;
+  await f.agent.say("also this", "prompt");
+  const after = (await f.agent.lane.inspectExecution(CTX)).current?.id;
+  if (!before || after !== before) throw new Error("a message during a run started a second run");
+
   f.w.answer(f.w.pending(f.host)[0]!.id, { text: "ok" });
   await f.agent.step();
   await f.agent.close();

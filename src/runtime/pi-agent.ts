@@ -21,6 +21,7 @@
 import { createModels } from "@earendil-works/pi-ai";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentHarness } from "@earendil-works/pi-agent-core";
+import { LaneBusy } from "@earendil-works/pi-agent-core";
 import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -234,9 +235,15 @@ export class PiAgent {
    */
   async say(text: string, mode: "prompt" | "steer" | "followUp" = "prompt") {
     if (mode === "followUp") return this.#lane.followUp(text, undefined, CTX);
-    const running = (await this.#lane.inspectExecution(CTX)).current !== null;
-    if (running) return this.#lane.steer(text, undefined, CTX);
-    return this.#lane.accept({ kind: "prompt", prompt: text }, CTX);
+    // Try to start a run and steer only if the lane says it is already busy,
+    // rather than asking first and then acting on the answer. Two requests can
+    // arrive at once here — the page has no lock on the agent — and a run
+    // beginning between the question and the act would lose the message the
+    // same way it was being lost before.
+    const started: any = await this.#lane.accept({ kind: "prompt", prompt: text }, CTX);
+    if (started?.ok !== false) return started;
+    if (LaneBusy.is(started.error)) return this.#lane.steer(text, undefined, CTX);
+    return started;
   }
 
   async compact() {

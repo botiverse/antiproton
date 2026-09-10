@@ -394,11 +394,10 @@ export class AgentRuntime {
     mode: "prompt" | "steer" | "followUp" = "prompt",
   ) {
     const agent = await this.agent(tenantId, agentId);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
     const res: any = await agent.say(text, mode);
-    // What actually happened, not what was asked for: `say` decides from the
-    // lane's state, and the page shows the difference.
-    const landed = mode === "followUp" ? "followUp" : running ? "steer" : "prompt";
+    // What actually happened rather than what was asked for: a run admitted
+    // carries an operation id, a queued message carries an entry id.
+    const landed = res?.value?.operationId ? "prompt" : mode === "followUp" ? "followUp" : "steer";
     return { mode: landed, queued: landed !== "prompt", result: res };
   }
 
