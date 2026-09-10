@@ -1,24 +1,33 @@
 /**
  * The agent runtime, assembled inside a Durable Object.
  *
- * Nothing here is Cloudflare-specific except the wiring: the kernel, harness,
- * gateway and plugins are the same modules the Node build uses. What changes is
- * that storage is local, wakeup is an alarm instead of a poll, and the sandbox
- * is a Dynamic Worker instead of QuickJS.
+ * Nothing here is Cloudflare-specific except the wiring: the harness, gateway
+ * and plugins are the same modules the Node build uses. What changes is that
+ * storage is local, wakeup is an alarm instead of a poll, and the sandbox is a
+ * Dynamic Worker instead of QuickJS.
+ *
+ * The loop is pi's. What this class still owns is everything pi has no opinion
+ * about and never will: which tenant is asking, which mounts they have, which
+ * credential each mount resolves to, and who is allowed to spend what.
  */
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
-import { Kernel } from "../../src/runtime/kernel.ts";
+import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import {
-  CommandExecutor,
-  appendModelFailure,
-  appendModelResponse,
-  type CommandOffload,
-} from "../../src/runtime/commands.ts";
-import {
-  CodegenHarness, DEFAULT_COMPACTION, ASSUMED_CONTEXT_WINDOW,
-} from "../../src/harness/codegen.ts";
-import { HybridHarness, qualifyMountedTools } from "../../src/harness/hybrid.ts";
+  bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
+} from "../../src/runtime/pi-tools.ts";
+import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
+import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
+
+export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
+
+/**
+ * pi has no task id: a run is an operation and the conversation is a lane.
+ * The gateway, quotas and approvals still address a task, so one constant
+ * stands where the identifier used to be until those follow.
+ */
+const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
@@ -140,9 +149,6 @@ export interface RuntimeDeps {
   /** Domain plugins beyond the built-ins (the benchmark mounts `retail` here). */
   extraPlugins?: Plugin[];
   maxTurns?: number;
-  /** §18.2.1 measured hybrid best (8/8 vs 7/8 vs 5/8); codegen stays selectable
-   *  so the mode remains an ablation variable rather than a hard-coded choice. */
-  harnessMode?: "codegen" | "hybrid";
   /**
    * What the bound model can hold, in tokens.
    *
@@ -155,6 +161,18 @@ export interface RuntimeDeps {
   contextWindow?: number;
   /** Domain policy handed to the harness at task initialisation. */
   policy?: string;
+  /**
+   * Whether this agent is offered `run_js`.
+   *
+   * On by default, because the deployed console has a sandbox. It is a switch
+   * rather than a constant so the benchmark can hold it fixed: the Node τ²
+   * runner never offered the sandbox, and running the object arm with it on
+   * meant the two arms differed by a tool and two paragraphs of prompt while
+   * being reported as the same measurement. It is also the only way to ask
+   * whether a sandbox helps on a task whose every action is one domain call —
+   * a question SWE-bench cannot answer, because there it obviously does.
+   */
+  sandbox?: boolean;
 }
 
 export class AgentRuntime {
@@ -162,10 +180,8 @@ export class AgentRuntime {
   #deps: RuntimeDeps;
   #plugins: Plugin[];
   #gateway: ToolGateway;
-  /** The default for tasks opened from now on. */
-  #harness: CodegenHarness | HybridHarness;
-  #hybrid: HybridHarness;
-  #codegen: CodegenHarness;
+  #agent: PiAgent | null = null;
+  #agentKey = "";
   #executor: DynamicWorkerExecutor;
   #models: ModelResolver;
   #artifacts: BoundArtifacts;
@@ -193,26 +209,6 @@ export class AgentRuntime {
           ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
           : envSecrets.resolve(ref),
     });
-    // Both are built, because a task keeps whichever one opened it. Changing
-    // the deployment default must not change how a running task's replies are
-    // read: one harness wants a fenced block and the other native tool calls,
-    // so swapping under a live task makes every reply look like a final answer
-    // and the task "completes" mid-job. That is not hypothetical — it happened
-    // to every task open when the default changed.
-    // Compaction on by default, or none of the above happens. It was built and
-    // left unconfigured once already, which is the failure this codebase warns
-    // about in its own migrate() comment: declared, never reached, still green.
-    const contextWindow = deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW;
-    this.#hybrid = new HybridHarness({
-      maxTurns: deps.maxTurns ?? 40, compaction: DEFAULT_COMPACTION, contextWindow,
-    });
-    // 60, the number the tau2 runner uses, not 10. The budget bounds a single
-    // request now that a new message refills it, so a low cap bought nothing
-    // and cost the agent the ability to finish anything multi-step.
-    this.#codegen = new CodegenHarness({
-      maxTurns: deps.maxTurns ?? 60, compaction: DEFAULT_COMPACTION, contextWindow,
-    });
-    this.#harness = deps.harnessMode === "hybrid" ? this.#hybrid : this.#codegen;
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -267,6 +263,12 @@ export class AgentRuntime {
     { alias: "artifacts", plugin: "artifacts", account: "builtin" },
     { alias: "gh_public", plugin: "github", account: "unauthenticated" },
   ];
+
+  /** What is installed, for a console that wants to show settings rather than
+   *  guess them from whichever mounts happen to exist. */
+  plugins(): Plugin[] {
+    return this.#plugins;
+  }
 
   /** The gateway, so an approval decided outside a task can act on it. */
   gateway() {
@@ -328,200 +330,127 @@ export class AgentRuntime {
         (byId.get(m.plugin)?.tools ?? []).map((t) => ({
           name: t.name, description: t.summary, parameters: t.parameters,
           address: `${m.alias}.${t.name}`,
+          // Carried through so replay policy and exclusivity are decided by the
+          // plugin that knows, not guessed at the point of use.
+          sideEffects: t.sideEffects, idempotency: t.idempotency,
+          exclusive: byId.get(m.plugin)?.exclusive,
         })),
       )),
     };
   }
 
   /**
-   * The harness that owns this checkpoint.
+   * The agent, built from storage.
    *
-   * Absent means it predates the stamp, and everything written before it was
-   * codegen — so that is the safe reading, not the current default.
+   * Rebuilt whenever the object is asked about a different agent, and on every
+   * wake, because the object may have been evicted since the last one. Building
+   * it starts no timers and no provider work — it reads the transcript and
+   * reports what was left open.
    */
-  #harnessFor(checkpoint: unknown): CodegenHarness | HybridHarness {
-    return (checkpoint as any)?.harness === "hybrid" ? this.#hybrid : this.#codegen;
-  }
-
-  /** Reinstate what a rebuilt harness lost. Configuration, not state: it is
-   *  derived from the mounts and must be there before any advance, not only
-   *  when a task is opened. */
-  async #reinstateCatalogue(tenantId: string, agentId: string) {
-    const h = this.#harness as { setCatalogue?: (t: unknown[]) => void };
-    if (typeof h.setCatalogue !== "function") return;
-    h.setCatalogue((await this.#catalogueFor(tenantId, agentId)).tools);
-  }
-
-  async openTask(tenantId: string, agentId: string, taskId: string) {
-    const { mounts, tools } = await this.#catalogueFor(tenantId, agentId);
-    const policy = this.#deps.policy ? { policy: this.#deps.policy } : {};
-    // What this agent wrote down on earlier tasks. Read here rather than in the
-    // harness so the harness keeps holding no I/O of its own.
-    const workingSetText = await workingSet(this.store, tenantId, agentId);
-    await this.store.createTask(
-      tenantId, agentId, taskId,
-      await this.#harness.initialize({ mounts, tools, workingSet: workingSetText, ...policy }),
-      this.#harness.stateVersion,
-    );
-  }
-
-  /**
-    * The two gestures pi distinguishes, and the reason they are different.
-    *
-    * `steer` is the default and the one that matters: a message typed while the
-    * agent is working reaches the model before its next call, without stopping
-    * the tool call in flight. Nothing is aborted; the current turn finishes and
-    * the new instruction is simply there when the next one is composed.
-    *
-    * `followUp` waits until the agent has finished everything. It is not
-    * written to the log yet, because an event here means something happened to
-    * the conversation and this has not happened until it is delivered.
-    */
-  /**
-   * Compact on demand, the way pi's /compact does.
-   *
-   * An event rather than a poke at the checkpoint, so it goes through the same
-   * lease and version the rest of the loop does. It is also the way back for a
-   * task already blocked by its own size: reopenTask accepts `blocked`, and the
-   * next advance summarises before doing anything else.
-   */
-  async requestCompaction(tenantId: string, agentId: string, taskId: string) {
+  async agent(tenantId: string, agentId: string): Promise<PiAgent> {
     await this.ready();
-    await this.store.appendEvent({
-      tenantId, agentId, taskId, kind: "compact.requested", payload: {},
+    const key = `${tenantId}/${agentId}`;
+    if (this.#agent && this.#agentKey === key) return this.#agent;
+
+    const binding = await this.store.getModelBinding(tenantId, agentId);
+    if (!binding) throw new Error(`no model binding for ${key}`);
+    const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const sandbox = this.#deps.sandbox ?? true;
+    const host = this.#host({ tenantId, agentId, taskId: LEGACY_TASK });
+    const store = this.store;
+
+    const agent = await PiAgent.open({
+      host: this.#deps.ctx.storage,
+      sessionId: key,
+      // Read here rather than inside the harness, so the harness keeps holding
+      // no I/O of its own.
+      systemPrompt: systemPrompt({
+        workingSet: await workingSet(this.store, tenantId, agentId),
+        policy: this.#deps.policy,
+        // Each paragraph appears only where the thing it describes is really
+        // there. Telling an agent to read a result back "with the artifacts
+        // tool" when no artifacts tool is mounted is not a hint, it is a wrong
+        // instruction competing with the ones that matter.
+        sandbox,
+        artifacts: (tools as MountedTool[]).some((t) => t.address.startsWith("artifacts.")),
+      }),
+      model: {
+        provider: binding.provider,
+        id: binding.model,
+        contextWindow: this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW,
+      },
+      tools: tools as MountedTool[],
+      toolHost: host,
+      dispatch: async (jobId) => {
+        const send = this.#deps.offloadModel;
+        if (!send) throw new Error("no dispatcher configured");
+        await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
+      },
     });
-    return { taskId, reopened: await this.store.reopenTask(tenantId, taskId) };
+    // The tools the model is offered are the mounts plus the sandbox. run_js is
+    // not a mount — it is the one tool whose body is this object rather than a
+    // plugin — so it is added here rather than resolved through the gateway.
+    agent.harness.setTools([
+      ...bridgeTools(tools as MountedTool[], host),
+      ...(sandbox
+        ? [runJsTool(this.#executor as any, host, {
+            onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+          })]
+        : []),
+    ] as any, BACKGROUND_CONTEXT);
+
+    this.#agent = agent;
+    this.#agentKey = key;
+    return agent;
   }
 
+  /** Compact on demand, the way pi's /compact does: an operation like any
+   *  other, so it is admitted, durable, and drives on the same pass. */
+  async requestCompaction(tenantId: string, agentId: string) {
+    return (await this.agent(tenantId, agentId)).compact();
+  }
+
+  /**
+   * The two gestures pi distinguishes, and the reason they are different.
+   *
+   * `steer` is the default and the one that matters: a message typed while the
+   * agent is working reaches the model before its next call, without stopping
+   * the tool call in flight. Nothing is aborted; the current turn finishes and
+   * the new instruction is simply there when the next one is composed.
+   *
+   * `followUp` waits until the agent has finished everything.
+   */
   async postMessage(
-    tenantId: string, agentId: string, taskId: string, text: string,
-    mode: "steer" | "followUp" = "steer",
+    tenantId: string, agentId: string, text: string,
+    mode: "prompt" | "steer" | "followUp" = "prompt",
   ) {
-    await this.ready();
-    const existing = await this.store.loadTask(tenantId, taskId);
-    if (!existing) await this.openTask(tenantId, agentId, taskId);
-    if (mode === "followUp" && existing && !["completed", "failed"].includes(existing.status)) {
-      await this.store.queueFollowUp(tenantId, agentId, taskId, text);
-      return { taskId, queued: true, reopened: false, checkpointVersion: existing.checkpointVersion };
+    const agent = await this.agent(tenantId, agentId);
+    const res: any = await agent.say(text, mode);
+    // What actually happened rather than what was asked for: a run admitted
+    // carries an operation id, a queued message carries an entry id.
+    const landed = res?.value?.operationId ? "prompt" : mode === "followUp" ? "followUp" : "steer";
+    return { mode: landed, queued: landed !== "prompt", result: res };
+  }
+
+  /** One pass, which is all an alarm should ever do. */
+  async step(tenantId: string, agentId: string) {
+    const agent = await this.agent(tenantId, agentId);
+    const out = await agent.step();
+    // A finished run should not still be holding a metered container.
+    let releaseFailed: Array<{ alias: string; error: string }> = [];
+    if (out.open === 0 && out.settled.length) {
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
+      releaseFailed = r.failed;
     }
-    const ev = await this.store.appendEvent({
-      tenantId, agentId, taskId, kind: "message", payload: { text },
-    });
-    // Order matters: append first, then reopen. The reverse briefly exposes a
-    // runnable task with nothing to consume.
-    const reopened = await this.store.reopenTask(tenantId, taskId);
-    return {
-      taskId, sequence: ev.sequence, reopened,
-      checkpointVersion: existing?.checkpointVersion ?? 0,
-    };
+    return { ...out, releaseFailed };
   }
 
-  #offload(): CommandOffload | null {
-    const send = this.#deps.offloadModel;
-    if (!send) return null;
-    return async (ctx, cmd) => {
-      // Only network-bound commands are worth offloading. `js.execute` needs the
-      // host bridge that lives in this object, and `tool.call` is short.
-      if (!OFFLOADABLE.includes(cmd.kind)) return false;
-      try {
-        await send({ ...ctx, commandId: cmd.commandId, payload: cmd.payload });
-        return true;
-      } catch {
-        // A dispatcher that will not accept the job is not a reason to strand
-        // the task: fall back to running it here.
-        return false;
-      }
-    };
+  /** What the worker asks for, and what it hands back. */
+  async takeJob(tenantId: string, agentId: string, jobId: string) {
+    return (await this.agent(tenantId, agentId)).takeJob(jobId);
   }
 
-  /** Called back by the dispatcher once the model answered (or failed). */
-  async deliverModel(job: ModelJob, outcome: { ok: true; res: ModelResponse } | { ok: false; error: string }) {
-    await this.ready();
-    const ctx = { tenantId: job.tenantId, agentId: job.agentId, taskId: job.taskId };
-    // The offloaded path is the one production actually takes, so it has to
-    // carry the same record as the inline one; a marker that only survives the
-    // fallback is a marker that is never there.
-    const about = job.payload as any;
-    if (outcome.ok) {
-      await appendModelResponse(this.store, ctx, job.commandId, outcome.res, {
-        purpose: about?.purpose, keptFrom: about?.keptFrom, summarised: about?.summarised,
-      });
-    }
-    else await appendModelFailure(this.store, ctx, job.commandId, outcome.error);
-  }
-
-  /**
-   * What is left for this object to look after now that the queue owns the
-   * model call.
-   *
-   * Everything that used to be here — re-dispatching a model request whose
-   * reply never came, giving up on it after fifteen minutes, keeping an alarm
-   * alive so that sweep could happen at all — was a reimplementation of
-   * "redeliver until acked". The queue does that, and does it whether or not
-   * this object is awake. What it cannot do is recover work that runs *inside*
-   * the object: a `js.execute` whose invocation the platform cancelled leaves a
-   * row saying `dispatched` with no result and nothing that would run it again.
-   * That, and only that, is swept here.
-   */
-  async sweepStale(olderThanMs = 45_000): Promise<number> {
-    await this.ready();
-    // Retire what has already been answered, so "still dispatched" means it.
-    await this.store.settleAnswered();
-    await this.store.reclaimStuckClaims(olderThanMs);
-    return this.store.requeueStale(olderThanMs, ["js.execute", "tool.call"]);
-  }
-
-  /** True while some command is out with a dispatcher. Such a task has no
-   *  pending events, so nothing else would schedule the sweep. */
-  /**
-   * Local work still outstanding — the only reason this object now needs an
-   * alarm of its own. A task waiting on a model call needs no alarm at all: the
-   * queue will deliver the reply, and delivering it wakes the object.
-   */
-  async hasOffloadInFlight(): Promise<boolean> {
-    await this.ready();
-    return (await this.store.outstandingCommands(["js.execute", "tool.call"])) > 0;
-  }
-
-  /**
-   * One bounded slice of work. An alarm invocation must end; if there is more to
-   * do it re-arms rather than looping until the platform cuts it off.
-   */
-  async drain(maxSteps = 4) {
-    await this.ready();
-    const trace: unknown[] = [];
-    let steps = 0;
-    for (; steps < maxSteps; steps++) {
-      const pending = await this.store.tasksWithPendingWork(5);
-      if (!pending.length) break;
-      for (const { tenantId, taskId } of pending) {
-        const task = await this.store.loadTask(tenantId, taskId);
-        if (!task) continue;
-        const callCtx = { tenantId, agentId: task.agentId, taskId };
-        const harness = this.#harnessFor(task.checkpoint);
-        if (harness === this.#hybrid) await this.#reinstateCatalogue(tenantId, task.agentId);
-        const commands = new CommandExecutor(
-          this.store, (caller) => this.#models.resolve(caller), this.#host(callCtx), this.#executor,
-          undefined, this.#offload(),
-        );
-        const kernel = new Kernel(this.store, harness, {
-          holder: "do-worker", leaseTtlMs: 120_000,
-        });
-        await kernel.step(tenantId, taskId, null, (cmd) => commands.dispatch(callCtx, cmd));
-        trace.push(...commands.trace);
-        // A finished task should not still be holding a metered container.
-        const after = await this.store.loadTask(tenantId, taskId);
-        if (after && ["completed", "failed"].includes(after.status)) {
-          await this.#gateway.releaseTask(callCtx);
-          // Now that the work is done, anything held back for exactly this
-          // moment is delivered and the task picks it up.
-          if (await this.store.flushFollowUps(tenantId, task.agentId, taskId)) {
-            await this.store.reopenTask(tenantId, taskId);
-          }
-        }
-      }
-    }
-    const more = (await this.store.tasksWithPendingWork(1)).length > 0;
-    return { steps, more, trace };
+  async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
+    return (await this.agent(tenantId, agentId)).deliver(jobId, answer as any);
   }
 }

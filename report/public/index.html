@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Every benchmark antiproton has run, what each measures, and the gaps.">
+<title>Antiproton Benchmarks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#F5F8F7; --surface:#FFFFFF; --sunk:#EDF2F1;
+  --ink:#131C1B; --muted:#586866; --faint:#7C8C8A;
+  --line:#D9E2E0; --line-strong:#BFCCC9;
+  --accent:#0E6E63; --accent-soft:#D7EBE7;
+  --good:#2F6B45; --warn:#8F5D0C; --bad:#9A2E2E;
+  --good-soft:#DEEDE2; --warn-soft:#F6E9D2; --bad-soft:#F3DEDC;
+  --measure:34rem;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1413; --surface:#151D1C; --sunk:#111817;
+    --ink:#E1EAE8; --muted:#93A6A3; --faint:#748784;
+    --line:#232F2D; --line-strong:#31403D;
+    --accent:#4FC9B7; --accent-soft:#16302C;
+    --good:#79C494; --warn:#D6A559; --bad:#DE8A85;
+    --good-soft:#16281D; --warn-soft:#2A2114; --bad-soft:#2C1A19;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1413; --surface:#151D1C; --sunk:#111817;
+  --ink:#E1EAE8; --muted:#93A6A3; --faint:#748784;
+  --line:#232F2D; --line-strong:#31403D;
+  --accent:#4FC9B7; --accent-soft:#16302C;
+  --good:#79C494; --warn:#D6A559; --bad:#DE8A85;
+  --good-soft:#16281D; --warn-soft:#2A2114; --bad-soft:#2C1A19;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:"Source Serif 4",Georgia,"Times New Roman",serif;
+  font-size:17px; line-height:1.62;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:60rem; margin:0 auto; padding:0 1.5rem 6rem}
+.col{max-width:var(--measure)}
+
+h1,h2,h3,.lbl,.num,.pill,th{font-family:"Familjen Grotesk",system-ui,sans-serif}
+.mono,code,pre,.fig{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* ---- masthead ---------------------------------------------------- */
+.mast{border-bottom:1px solid var(--line-strong); padding:3.5rem 0 2rem; display:flex; flex-direction:column; gap:1.25rem}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace; font-size:.72rem; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--accent); font-weight:500;
+}
+h1{
+  font-size:clamp(2.1rem,5.5vw,3.1rem); line-height:1.05; margin:0; font-weight:600;
+  letter-spacing:-.022em; text-wrap:balance; max-width:20ch;
+}
+.standfirst{color:var(--muted); font-size:1.075rem; max-width:46ch; margin:0}
+.mast-meta{display:flex; flex-wrap:wrap; gap:.5rem 1.75rem; font-family:"IBM Plex Mono",monospace; font-size:.76rem; color:var(--faint)}
+.mast-meta b{color:var(--muted); font-weight:500}
+
+/* ---- the one fact ------------------------------------------------ */
+.thesis{
+  margin:2.5rem 0 0; padding:1.5rem 1.6rem; background:var(--surface);
+  border:1px solid var(--line); border-left:3px solid var(--accent);
+}
+.thesis p{margin:0; max-width:52ch}
+.thesis p + p{margin-top:.8rem}
+.thesis .fig{color:var(--accent); font-weight:600; font-size:.95em}
+
+section{padding-top:3.25rem}
+h2{
+  font-size:1.35rem; font-weight:600; letter-spacing:-.012em; margin:0 0 .3rem;
+  text-wrap:balance;
+}
+.sec-note{color:var(--faint); font-size:.86rem; margin:0 0 1.5rem; max-width:52ch;
+  font-family:"IBM Plex Mono",monospace}
+p{margin:0 0 1rem}
+a{color:var(--accent)}
+
+/* ---- ownership split --------------------------------------------- */
+.own{display:grid; gap:1px; background:var(--line); border:1px solid var(--line); margin:1.5rem 0}
+@media(min-width:46rem){.own{grid-template-columns:repeat(4,1fr)}}
+.own div{background:var(--surface); padding:1.05rem 1.15rem; display:flex; flex-direction:column; gap:.35rem}
+.own .who{font-family:"IBM Plex Mono",monospace; font-size:.72rem; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--accent)}
+.own .what{font-size:.95rem; line-height:1.45}
+
+/* ---- tables ------------------------------------------------------ */
+.scroll{overflow-x:auto; margin:1.4rem 0; border:1px solid var(--line); background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:.88rem}
+th{
+  text-align:left; font-size:.7rem; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--faint); font-weight:600; padding:.7rem .9rem; border-bottom:1px solid var(--line-strong);
+  white-space:nowrap;
+}
+td{padding:.62rem .9rem; border-bottom:1px solid var(--line); vertical-align:top;
+   font-family:"Source Serif 4",serif}
+tr:last-child td{border-bottom:none}
+td.n,th.n{text-align:right; font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+  white-space:nowrap}
+td.k{font-family:"IBM Plex Mono",monospace; font-size:.82rem; white-space:nowrap}
+tr.total td{border-top:1px solid var(--line-strong); font-weight:600; background:var(--sunk)}
+
+/* ---- severity list ----------------------------------------------- */
+.tiers{display:flex; flex-direction:column; gap:1px; background:var(--line);
+  border:1px solid var(--line); margin:1.5rem 0}
+.tier{background:var(--surface); padding:1.15rem 1.25rem 1.25rem; border-left:3px solid var(--line-strong)}
+.tier.loud{border-left-color:var(--good)}
+.tier.quiet{border-left-color:var(--warn)}
+.tier.worst{border-left-color:var(--bad)}
+.tier h3{margin:0 0 .15rem; font-size:1rem; font-weight:600}
+.tier .how{font-family:"IBM Plex Mono",monospace; font-size:.7rem; letter-spacing:.09em;
+  text-transform:uppercase; margin:0 0 .6rem}
+.tier.loud .how{color:var(--good)} .tier.quiet .how{color:var(--warn)} .tier.worst .how{color:var(--bad)}
+.tier p{margin:0; font-size:.92rem; max-width:58ch; color:var(--muted)}
+.tier ul{margin:.6rem 0 0; padding-left:1.1rem; font-size:.9rem; color:var(--muted)}
+.tier li{margin:.25rem 0}
+.tier li code{color:var(--ink)}
+
+code{background:var(--sunk); padding:.08em .34em; border-radius:2px; font-size:.86em;
+  border:1px solid var(--line)}
+
+/* ---- pills ------------------------------------------------------- */
+.pill{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:.68rem;
+  letter-spacing:.06em; text-transform:uppercase; padding:.16em .5em; border-radius:2px;
+  border:1px solid transparent; font-weight:500}
+.pill.ok{background:var(--good-soft); color:var(--good); border-color:var(--good)}
+.pill.open{background:var(--warn-soft); color:var(--warn); border-color:var(--warn)}
+
+/* ---- suite grid -------------------------------------------------- */
+.suites{display:grid; gap:1px; background:var(--line); border:1px solid var(--line); margin:1.4rem 0}
+@media(min-width:38rem){.suites{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:56rem){.suites{grid-template-columns:repeat(4,1fr)}}
+.suite{background:var(--surface); padding:.85rem 1rem; display:flex; align-items:baseline;
+  justify-content:space-between; gap:.75rem}
+.suite .nm{font-family:"IBM Plex Mono",monospace; font-size:.8rem}
+.suite .ct{font-family:"IBM Plex Mono",monospace; font-size:.95rem; font-weight:600;
+  font-variant-numeric:tabular-nums; color:var(--accent)}
+
+/* ---- deltas ------------------------------------------------------ */
+.delta{display:flex; flex-wrap:wrap; gap:1px; background:var(--line);
+  border:1px solid var(--line); margin:1.4rem 0}
+.delta div{background:var(--surface); padding:1rem 1.25rem; flex:1 1 9rem}
+.delta .num{display:block; font-family:"IBM Plex Mono",monospace; font-size:1.5rem;
+  font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-.02em}
+.delta .cap{display:block; font-family:"IBM Plex Mono",monospace; font-size:.7rem;
+  letter-spacing:.09em; text-transform:uppercase; color:var(--faint); margin-top:.2rem}
+.delta .minus .num{color:var(--good)}
+.delta .plus .num{color:var(--muted)}
+
+footer{margin-top:4rem; padding-top:1.5rem; border-top:1px solid var(--line);
+  font-family:"IBM Plex Mono",monospace; font-size:.74rem; color:var(--faint); line-height:1.7}
+footer a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+@media (prefers-reduced-motion:no-preference){
+  .thesis{animation:rise .5s ease-out both}
+  @keyframes rise{from{opacity:.5;transform:translateY(4px)}to{opacity:1;transform:none}}
+}
+</style>
+</head>
+<body>
+
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow">Antiproton &middot; measurement record &middot; 10 September 2026</div>
+  <h1>What has actually been measured</h1>
+  <p class="standfirst">Every benchmark this project has run, what each one can tell you, and the three it cannot answer yet. Numbers are measured, never estimated.</p>
+  <div class="mast-meta">
+    <span><b>harness</b> pi-agent-core 0.85.1</span>
+    <span><b>model</b> deepseek-flash</span>
+    <span><b>substrate</b> Cloudflare Durable Objects</span>
+  </div>
+</header>
+
+<div class="thesis">
+  <p><b>Read the noise before reading the numbers.</b></p>
+  <p>Two runs of the same commit, on the same model, over the same three instances both scored 3&thinsp;/&thinsp;3 and differed by a third in cost: <span class="fig">1,071&thinsp;s / 813&thinsp;k</span> against <span class="fig">690&thinsp;s / 550&thinsp;k</span>. Nothing changed between them but the reporting code. A single instance is a coin flip &mdash; <span class="fig">astropy-12907</span> has passed alone, failed in a slice, and passed twice since, all on the same commit.</p>
+  <p>Three instances measure that the loop runs. They do not measure how good it is, and no figure on this page should be read as a trend.</p>
+</div>
+
+<section>
+  <h2>SWE-bench Verified</h2>
+  <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr>
+      <th>instance</th><th class="n"></th><th class="n">wall</th><th class="n">calls</th>
+      <th class="n">prompt tok</th><th class="n">cached</th><th class="n">container</th><th>patch</th>
+    </tr></thead>
+    <tbody>
+      <tr><td class="k">12907</td><td class="n">✓</td><td class="n">240&thinsp;s</td><td class="n">17</td><td class="n">171,071</td><td class="n">94&thinsp;%</td><td class="n">99&thinsp;%</td><td class="k">1 file, 1 ins(+), 1 del(-)</td></tr>
+      <tr><td class="k">13033</td><td class="n">✓</td><td class="n">197&thinsp;s</td><td class="n">10</td><td class="n">94,023</td><td class="n">92&thinsp;%</td><td class="n">98&thinsp;%</td><td class="k">1 file, 11 inss(+), 3 dels(-)</td></tr>
+      <tr><td class="k">13236</td><td class="n">✓</td><td class="n">445&thinsp;s</td><td class="n">49</td><td class="n">906,452</td><td class="n">98&thinsp;%</td><td class="n">100&thinsp;%</td><td class="k">2 files, 4 inss(+), 8 dels(-)</td></tr>
+      <tr><td class="k">13398</td><td class="n">✗</td><td class="n">357&thinsp;s</td><td class="n">39</td><td class="n">1,387,655</td><td class="n">97&thinsp;%</td><td class="n">80&thinsp;%</td><td class="k">7 files, 129 inss(+), 32 dels(-)</td></tr>
+      <tr><td class="k">13453</td><td class="n">✓</td><td class="n">732&thinsp;s</td><td class="n">40</td><td class="n">873,333</td><td class="n">97&thinsp;%</td><td class="n">89&thinsp;%</td><td class="k">1 file, 2 inss(+)</td></tr>
+      <tr><td class="k">13579</td><td class="n">✓</td><td class="n">314&thinsp;s</td><td class="n">24</td><td class="n">367,644</td><td class="n">97&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 5 inss(+), 1 del(-)</td></tr>
+      <tr><td class="k">13977</td><td class="n">✓</td><td class="n">298&thinsp;s</td><td class="n">34</td><td class="n">892,987</td><td class="n">97&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 56 inss(+), 39 dels(-)</td></tr>
+      <tr><td class="k">14096</td><td class="n">✓</td><td class="n">193&thinsp;s</td><td class="n">15</td><td class="n">106,644</td><td class="n">95&thinsp;%</td><td class="n">62&thinsp;%</td><td class="k">1 file, 2 inss(+), 4 dels(-)</td></tr>
+      <tr><td class="k">14182</td><td class="n">✗</td><td class="n">374&thinsp;s</td><td class="n">37</td><td class="n">749,501</td><td class="n">97&thinsp;%</td><td class="n">78&thinsp;%</td><td class="k">1 file, 4 inss(+), 3 dels(-)</td></tr>
+      <tr><td class="k">14309</td><td class="n">✓</td><td class="n">140&thinsp;s</td><td class="n">10</td><td class="n">89,897</td><td class="n">85&thinsp;%</td><td class="n">47&thinsp;%</td><td class="k">2 files, 4 inss(+)</td></tr>
+      <tr class="total"><td>8&thinsp;/&thinsp;10</td><td class="n"></td><td class="n">3,290&thinsp;s</td>
+        <td class="n">275</td><td class="n">5,639,207</td><td class="n">97&thinsp;%</td>
+        <td class="n">&mdash;</td><td class="k">shell&times;298 run&times;5</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="col">
+    <p><b>97&thinsp;% of prompt tokens came from cache</b>, so the gross figure overstates the bill by more than ten times &mdash; of 5.6&nbsp;M, roughly 190&nbsp;k were actually re-read. But a cache rate is not a cost measure on its own: the instance at 97&thinsp;% re-read 42&nbsp;k tokens, six times what the instance at 92&thinsp;% did.</p>
+    <p><b>The container is alive for 47&ndash;100&thinsp;% of wall clock</b>, and nearly all of that is spent waiting on the model rather than running anything. The task does not require that &mdash; a machine billed by the second is simply held open across every model call. Whether stopping it between calls pays depends on run9's compute-versus-storage rates, which we do not have. The meter is here so that question can be answered rather than guessed.</p>
+    <p>Both failures over-reached: one rewrote seven files and 129 lines, the other made a four-line change that raised a <code>ValueError</code>. Every success but one landed a patch of five lines or fewer.</p>
+  </div>
+</section>
+
+<section>
+  <h2>&tau;&sup2;-bench retail</h2>
+  <p class="sec-note">does it follow a written policy while a person changes their mind &middot; 8 tasks &times; 3 trials, inside a deployed Durable Object</p>
+
+  <div class="col">
+    <p>The domain is a mounted plugin, the customer is a second model, and the score is the database &mdash; whether the agent left the world in the state the annotated solution leaves it in. The agent's own account of what it did is not evidence.</p>
+    <p><b>This run happened inside the deployment.</b> The agent runs in the object, the model call goes out through the same queue production uses, and the transcript stays in the object afterwards. The earlier figures on this page came from a Node process driving the same loop over an in-memory database &mdash; a configuration nobody deploys, which also left nothing behind to read. Only the customer is still local, because &tau;&sup2;'s user is a second model with no access to the domain.</p>
+  </div>
+
+  <div class="delta">
+    <div class="plus"><span class="num">87.5&thinsp;%</span><span class="cap">pass^1 &middot; 21/24</span></div>
+    <div class="minus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^2 &middot; 5/8</span></div>
+    <div class="minus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^3 &middot; 5/8</span></div>
+    <div class="plus"><span class="num">3.9&thinsp;%</span><span class="cap">of wall clock billed</span></div>
+  </div>
+
+  <div class="col">
+    <p><b>pass^k is the number that matters.</b> pass^1 asks how often this works; pass^3 asks whether the same task survives three attempts, which is the question a deployment actually has. Reporting only the first is how a benchmark flatters a loop.</p>
+    <p>All three zeros landed in the first trial. Trials two and three were 8&thinsp;/&thinsp;8 each, which is why pass^2 and pass^3 are equal &mdash; they are computed over the first <i>k</i> trials in order, so a task that failed once at the start never recovers the metric. That is the honest reading and also a caution: three failures falling in one trial out of three happens by chance about one time in twelve.</p>
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>task</th><th>t1</th><th>t2</th><th>t3</th><th>what the zero was</th></tr></thead>
+    <tbody>
+      <tr><td class="k">0</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">1</td><td>✗</td><td>✓</td><td>✓</td><td>Ended in a <b>transfer to a human</b> with nothing performed. The customer gave up before the exchange was submitted.</td></tr>
+      <tr><td class="k">2</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">3</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">4</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">5</td><td>✗</td><td>✓</td><td>✓</td><td><b>The agent was wrong.</b> Asked to return an item, it exchanged it &mdash; the one failure here where a write happened and was the wrong write.</td></tr>
+      <tr><td class="k">6</td><td>✗</td><td>✓</td><td>✓</td><td><b>The agent stopped short.</b> Three turns, seven calls, a confident close, and no action taken.</td></tr>
+      <tr><td class="k">7</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="col">
+    <p>Every failure is the agent's, not the substrate's: no call was lost, no run stalled, no object failed to wake. Two of the three are the same shape &mdash; the conversation ended without the write that was the point of it &mdash; which is the failure mode the system prompt was rewritten to address and has not eliminated.</p>
+  </div>
+</section>
+
+<section>
+  <h2>What the object was billed for</h2>
+  <p class="sec-note">the number the in-process runner could not produce &middot; measured over the same 24 tasks</p>
+
+  <div class="col">
+    <p>Cloudflare bills a Durable Object for the wall clock during which it is active, with no exemption for waiting on the network. So the question is not how long the run took but how much of that the object was awake for &mdash; and a completion is almost entirely waiting.</p>
+  </div>
+
+  <div class="delta">
+    <div class="plus"><span class="num">951&thinsp;s</span><span class="cap">wall clock</span></div>
+    <div class="minus"><span class="num">37.1&thinsp;s</span><span class="cap">object active</span></div>
+    <div class="plus"><span class="num">436&thinsp;s</span><span class="cap">spent in the provider</span></div>
+    <div class="plus"><span class="num">168&thinsp;ms</span><span class="cap">object time per model call</span></div>
+  </div>
+
+  <div class="col">
+    <p>The 436 seconds of provider latency are billed as Workers CPU in the queue consumer, not as object duration &mdash; which is the whole reason the model call leaves the object. The remaining wall clock is the benchmark's own customer simulator, running here.</p>
+    <p><b>Two things were paid for and did not need to be.</b> The alarm rearmed on the deferred handle's poll interval, one second, so it woke roughly five times per model call to ask whether an answer had arrived &mdash; an answer the queue delivers and wakes the object for. And the sweep that re-sends unanswered jobs could not tell <i>never sent</i> from <i>still running</i>, so it re-sent calls that were in flight: one conversation dispatched eleven calls fifty-one times, and a duplicate is not free, because a second worker asks the provider again and the losing answer's tokens are billed the same.</p>
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>per &tau;&sup2; task</th><th>before</th><th>after</th></tr></thead>
+    <tbody>
+      <tr><td class="k">object wakeups</td><td>64</td><td>27</td></tr>
+      <tr><td class="k">alarm passes per model call</td><td>5.0</td><td>1.4</td></tr>
+      <tr><td class="k">dispatches per model call</td><td>4.6</td><td>1.0</td></tr>
+      <tr><td class="k">object duration billed</td><td>4.7&thinsp;s</td><td>1.5&thinsp;s</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="col">
+    <p>The benchmark waits the way the console waits. Polling would have measured the poller &mdash; every poll is a request that wakes the object &mdash; so it listens on the same hibernation-API socket the console uses, which costs the object nothing while it waits.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Everything measured, and what it measures</h2>
+  <p class="sec-note">grouped by the question each one answers</p>
+  <div class="tiers">
+    <div class="tier loud">
+      <h3>SWE-bench Verified</h3>
+      <p class="how">answered &middot; 3 instances &middot; 5 runs</p>
+      <p>Whether the loop can carry a multi-turn task on a real machine to a graded result. Currently 3&thinsp;/&thinsp;3 on the deployed model. Three instances is a sample, not a submission.</p>
+    </div>
+    <div class="tier loud">
+      <h3>pi storage conformance</h3>
+      <p class="how">answered &middot; 21 / 21, two backends</p>
+      <p>Not ours: <code>createStorageConformance</code> ships inside pi and runs unchanged on node:sqlite and on real Durable Object storage. It covers what our own tests would not, because ours encode our own assumptions &mdash; mixed-write atomicity, rollback across four tables, cursor before limit, admission order under concurrent commits. A contract, not a benchmark.</p>
+    </div>
+    <div class="tier loud">
+      <h3>Substrate probes</h3>
+      <p class="how">answered &middot; on real infrastructure</p>
+      <p>Measured on Cloudflare rather than read from documentation. The load-bearing one: a Durable Object is billed for wall clock with no exemption for network I/O, and a completion is ~94&thinsp;% waiting. That single fact is why the model call leaves the object &mdash; <span class="fig">40.8&thinsp;s billed against 709.2&thinsp;s waited</span> over 79 calls.</p>
+    </div>
+    <div class="tier quiet">
+      <h3>AppWorld &mdash; credential custody</h3>
+      <p class="how">a property, not a score &middot; needs a licensed install</p>
+      <p>9 apps, 457 APIs, <b>362 of them (79&thinsp;%) behind an access token</b>. Nine end-to-end cases assert that no schema mentions <code>access_token</code>, the credential-reading tool is not mounted, an authenticated call succeeds without the agent ever logging in, and the token never appears in a tool result. It measures what the model <i>cannot</i> see, so there is no pass rate to report.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>What these numbers do not cover</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>gap</th><th>state</th><th>why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>SWE-bench on the deployed object</td><td><span class="pill open">in process</span></td>
+        <td>&tau;&sup2; runs in the object now; SWE-bench does not, because grading needs an endpoint the object does not have. Its cost figures are therefore still a Node process&rsquo;s, not a deployment&rsquo;s.</td></tr>
+      <tr><td>AppWorld on the current loop</td><td><span class="pill open">unported</span></td>
+        <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
+      <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
+        <td>The sandbox is now a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused across SWE-bench&rsquo;s 298 tool calls, and the &tau;&sup2; arm here was run without it so the two runners would match.</td></tr>
+      <tr><td>Sample size</td><td><span class="pill open">n = 8 &times; 3</span></td>
+        <td>Enough to see a task flip between trials, which it did three times. Not enough to separate a better loop from a luckier one, and no figure here should be read as a trend.</td></tr>
+      <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
+        <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
+      <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
+        <td>The one figure this project ever recorded for &tau;&sup2; under a domain policy on the prior harnesses &mdash; 8&thinsp;/&thinsp;8 vs 7&thinsp;/&thinsp;8 vs 5&thinsp;/&thinsp;8 over 8 tasks &mdash; is not a measurement of the current loop. It survives only as a comment in the deleted driver, and is kept here so it is not mistaken for one.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>Reproducing this</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>what</th><th>command</th></tr></thead>
+    <tbody>
+      <tr><td>SWE-bench, deployed model</td><td class="k">HARNESS_MODEL=deepseek-flash N=3 node bench/swebench/run.ts</td></tr>
+      <tr><td>&hellip; a single instance, with a trace</td><td class="k">N=1 TRACE=1 node bench/swebench/run.ts</td></tr>
+      <tr><td>&tau;&sup2;, inside the deployed object</td><td class="k">OBJ=do1 N=8 TRIALS=3 node bench/tau2/cf.ts</td></tr>
+      <tr><td>&hellip; waiting by polling instead of push</td><td class="k">WAIT=poll node bench/tau2/cf.ts</td></tr>
+      <tr><td>&hellip; a finished task&rsquo;s transcript, after the fact</td><td class="k">curl &quot;$BASE/bench/trajectory?obj=do1&amp;taskId=&hellip;&quot;</td></tr>
+      <tr><td>Storage contract, in process</td><td class="k">npm run pi-storage</td></tr>
+      <tr><td>&hellip; on real Durable Object storage</td><td class="k">npm run pi-storage:do</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="col">
+    <p>The benchmark starts one container per instance and hands it back when the run ends. If a release fails it now says so per instance &mdash; silence there is how two boxes were once found still running, one of them from an instance that had finished cleanly.</p>
+  </div>
+</section>
+
+<footer>
+  Measured between 9 and 10 September 2026 against the commit deployed at
+  antiproton.botiverse.dev. Where a figure is a single sample the page says so.<br>
+  SWE-bench Verified &copy; Princeton NLP &middot; AppWorld &copy; Stony Brook NLP &middot;
+  pi is MIT, &copy; 2025 Mario Zechner.
+</footer>
+
+</div>
+
+</body>
+</html>

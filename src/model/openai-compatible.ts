@@ -26,9 +26,17 @@ export class OpenAiCompatibleModel implements ModelAdapter {
       tools?: ToolDefinition[]; toolChoice?: "auto" | "required" | "none";
     } = {},
   ): Promise<ModelResponse> {
-    // Reasoning tokens are billed against max_tokens: a tight cap silently
-    // yields empty content with finish_reason=length.
-    const maxTokens = opts.maxTokens ?? 8192;
+    // Reasoning tokens are billed against max_tokens, so the cap is a budget for
+    // thinking and answering together, not for the answer. 8192 was the default
+    // here and it was not enough: on a τ² turn seven tool calls deep the model
+    // spent all 8192 on reasoning, returned empty content with
+    // finish_reason=length, and the conversation simply stopped — an agent that
+    // had done the work and had nothing left to say it with.
+    //
+    // The provider accepts 65536. This is half of that: high enough that the
+    // budget is not the thing that ends a turn, low enough to still be a bound
+    // on a reasoning trace that has run away.
+    const maxTokens = opts.maxTokens ?? 32_768;
     let lastErr: Error | null = null;
 
     for (let attempt = 0; attempt < 3; attempt++) {

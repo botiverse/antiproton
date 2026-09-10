@@ -75,6 +75,11 @@ export function statePlugin(
 ): Plugin {
   return {
     id: "state",
+    config: [
+      { name: "maxValueBytes", type: "number", summary: "Largest single value. Anything bigger must go to object storage." },
+      { name: "maxDocumentBytes", type: "number", summary: "Largest working-set document before its head is trimmed." },
+      { name: "maxTotalBytes", type: "number", summary: "How much this agent may keep in total." },
+    ],
     version: "1.0.0",
     tools: [
       {

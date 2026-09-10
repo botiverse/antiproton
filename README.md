@@ -102,10 +102,10 @@ flowchart TB
 
     subgraph object["Durable Object — one per (tenant, agent)"]
         direction TB
-        kernel["<b>Kernel</b><br/>lease · fencing · generation<br/>checkpoint version · quota gate"]
-        harness["<b>Harness</b> <i>(replaceable adapter)</i><br/>state + events → commands"]
-        cmd["<b>Command executor</b>"]
-        store[("<b>Store</b><br/>tasks · events · waits<br/>outbox · operations · quotas")]
+        lane["<b>Lane</b> <i>(pi's harness)</i><br/>accept = a durable write<br/>drive = one I/O pass"]
+        harness["<b>Tools</b><br/>mounts + the sandbox,<br/>as functions the lane calls"]
+        cmd["<b>Model jobs</b><br/><i>written before dispatched</i>"]
+        store[("<b>Session</b><br/>entries · values · usage<br/>operations · quotas")]
         memory[("<b>Agent state</b><br/>memory · todo · journal<br/><i>outlives the task</i>")]
     end
 
@@ -121,9 +121,9 @@ flowchart TB
     provider([Model provider]):::ext
 
     client -->|"message · steer · interrupt"| router
-    router --> kernel
-    kernel <--> store
-    kernel --> harness
+    router --> lane
+    lane <--> store
+    lane --> harness
     harness -->|commands| cmd
     cmd -->|model.request| queue
     queue --> consumer
@@ -173,18 +173,27 @@ how two accounts of the same SaaS get different authority.
 
 ### The step
 
-Every advance passes four gates before anything is written:
+Admission and work are separate calls, and that separation is the design:
 
 ```
-lease (fencing token)  →  generation  →  checkpoint version  →  tenant quota
-     fenced              stale_generation   version_conflict     quota_exceeded
+accept()   a pure write — the message is durable before anything is answered
+drive()    one I/O pass — returns `waiting` rather than blocking
+resume     the next alarm picks up whatever was left open
 ```
 
-Commands go to a transactional outbox with **derived, not random** ids
-(`sha256(taskId|generation|version|index|kind|payload)`), so replaying an
-advance after a crash produces the same ids and the insert collapses. Operation
-ids are derived the same way, so a replayed *write* is answered `unknown` — it
-may already have landed — instead of being performed twice.
+`accept` returns at once, so a person's message survives a crash that happens
+before the model is even asked. `drive` never waits for a model: the provider
+here answers `deferred` with a handle, the operation suspends durably, and the
+object stops being active while the queue does the waiting. Nothing needs a
+lease or a fencing token, because a Durable Object is single-threaded and pi's
+mutation line serialises the writes — there was never a second writer for them
+to protect against.
+
+Effects the object cannot re-run safely are marked. A tool declares
+`sideEffects` and `idempotency`, which becomes pi's `replay: "never" | "safe"`:
+a read repeats freely, a write repeats only if the plugin can make it
+idempotent, and everything else is answered `unknown` rather than performed
+twice.
 
 ### Tools are called the provider's way
 
@@ -205,8 +214,9 @@ took it for an answer, and it replied from memory against an explicit
 instruction not to. Through the provider's channel: 91s, twelve model calls,
 thirty tool results, and an answer that had read the repository.
 
-The pattern-matching survives, demoted, under the other harness: an unreadable
-reply must still not be mistaken for a finished one.
+The invented convention is gone with the harness that used it: pi's loop calls
+tools through the provider's channel and nothing else, so there is no regex left
+to teach.
 
 ## Keeping the context small enough to think in
 
@@ -273,10 +283,10 @@ unprompted, and formatted the reply the way it had been asked to.
 
 One contract, two implementations, no third:
 
-| Backend | Where | Kernel contract |
+| Backend | Where | pi storage conformance |
 |---|---|---|
-| `SqliteStore` | in-process (Node) | 31/31 |
-| `DurableObjectStore` | Cloudflare | 31/31 |
+| `PiSqliteStorage` on node:sqlite | in-process (Node) | 21/21 |
+| `PiSqliteStorage` on DO SQLite | Cloudflare | 21/21 |
 
 A db9/Postgres backend also passed, and was removed: 61,219 ms against sqlite's
 162 ms, no `SERIALIZABLE`, and `40001` on plain concurrent inserts. A backend
@@ -285,97 +295,56 @@ on every seam change while nobody exercises it.
 
 ## What is verified
 
-Contracts, not assertions in prose. `test/spec/` runs unchanged against every
-backend and every sandbox.
+Contracts, not assertions in prose. The storage contract runs unchanged against
+both backends, and it is not ours — it ships with pi, which is the point of
+implementing pi's interface rather than copying its design.
 
 | Suite | Cases | Covers |
 |---|---|---|
-| `spec/kernel-spec` | 31 | crash before/after commit, fencing, stale generation, lost wakeup, duplicate delivery, cross-tenant, connection state, quotas (incl. no double-spend under concurrency), replay, snapshots and pruning, policy per mount, approval held then performed exactly once, and an oversized checkpoint shrunk before it is refused |
-| `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
-| `strand` | 11 | a waiting task is never unreachable: giving up is visible, a message rescues a stranded task but never bypasses an approval, the turn budget refills, foreign call syntax is translated, a command that answers nothing is still retired |
-| `compaction` | 10 | the handover is asked for and folded back, the second pass updates rather than restarts, tool output is truncated, the record survives in the log, thresholds scale with the model's window |
-| `api` · `harness` · `steering` | 32 | HTTP surface, harness decisions, steering and follow-up |
-| `narrowing` · `cache-invariants` | 18 | tool disclosure, prompt-prefix stability, a rebuilt harness refuses without its catalogue |
-| `executor` · `http-plugin` | 17 | sandbox contract in-process, fetch and HTML extraction |
-| `tools` | 11 | mount addressing, ambiguity, version pinning, `unknown` semantics, replay, the executed source on the record |
+| `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
+| `pi-agent` | 8 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, and a run interrupted by eviction is reported open and finished |
+| `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
+| `pi-tools` | 7 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept |
+| `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
+| `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
+| `executor` · `http-plugin` | 19 | sandbox contract in-process (`executor` 9 runs the `spec/executor-spec` rows), fetch and HTML extraction (`http-plugin` 10) |
 | `state` | 7 | memory that survives a task, byte budgets, per-agent isolation |
 | `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
-| `appworld` | 9 | credential custody at 457 APIs (needs a licensed install) |
 
-Live on the deployment, against the Durable Object rather than sqlite:
-[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel) 31/31 and
-[`/conformance/executor`](https://antiproton.botiverse.workers.dev/conformance/executor) 9/9,
-plus `/isolation`, `/eviction`, `/model-binding`.
+Benchmarks are not tests and are reported separately, because they measure a
+model as much as a harness. SWE-bench Verified, the same three astropy
+instances each time:
 
-## Layout
+| | model | resolved | wall clock | prompt tokens |
+|---|---|---|---|---|
+| the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k |
+| pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k |
+| pi's loop | **deepseek-flash** *(deployed)* | **3/3** | 690 s | 550 k (94% cached) |
 
-```
-src/core/         seams: store, execution, tools, types
-src/runtime/      kernel, gateway, command executor, sandbox, model resolver
-src/harness/      two harnesses; a task keeps the one that opened it
-src/plugins/      plugin contract; http, artifacts, agent state, run9 sandbox, AppWorld
-src/store/        sqlite, durable-object
-cf/               Cloudflare deployment: worker, durable object, queue consumer, console
-bench/            τ²-bench, AppWorld, SWE-bench Verified, cache and selection probes
-test/             suites; test/spec/ is backend-agnostic
-```
+Only the first two rows compare loops; the third changes the model as well, and
+is here because it is what the deployment actually runs.
 
-## Try it
+Prompt tokens alone overstate the bill by more than ten times: of the 550 k in
+the last row, about 33 k were actually re-read. An append-only transcript earns
+that — each turn adds to the tail and leaves the prefix untouched, which is the
+shape a provider cache rewards.
 
-<https://antiproton.botiverse.dev/ui> — behind Cloudflare Access, owner only.
+Across all three instances and 53 tool calls, `run_js` was used **zero** times.
+This task is shell work inside a container, and the sandbox earns its place by
+replacing several calls with one; the benchmark is not the shape that tests it.
 
-It is a debugging console, not a demo. The chat is one panel; the other half is
-an inspector: the trajectory, the raw event log beneath it (when the two
-disagree the log wins), every table this object holds, what the agent has
-written down, what the sandbox cost, and the runtime.
+Two runs of the same commit on the same model scored 3/3 both times and differed
+by a third in cost — 1,071 s / 813 k against 690 s / 550 k. That is the size of
+the noise, and it is worth knowing before reading any single figure as a trend.
 
-Four things are drawn rather than listed, because they are invisible in rows. A
-timeline places every event by when it happened, so a stall reads as an empty
-stretch rather than two adjacent rows with distant timestamps — which is exactly
-how the stalls in this runtime kept hiding. A stacked bar per model call splits
-cached prompt from fresh prompt from completion, which is the number that
-decides what a task costs and appears nowhere else. A pair of bars puts billed
-in-object time against the wait moved off the meter. And container sessions are
-drawn with a live one in red against the finished ones, because "still running"
-is the thing that should look wrong.
+The score is not the interesting number. Both instances the old loop failed
+ended after **one model call** — it was not the model failing the task, it was
+the loop stopping. The new one works them for eleven to fifty-nine turns.
 
-Steps show the gap since the previous step, not the time since the task began:
-a number that only grows answers nothing, and a pause is a gap.
-
-Ask it to change something (`Deploy version 2.0.0 to api-01`). Reads run
-freely; the write stops at the gate, the panel shows the request verbatim, and
-approving it resumes the agent — which never saw a credential at any point.
-Ask it to remember something, then open a new task and ask about it. Type while
-it is working and the message reaches the model before its next call without
-stopping anything in flight; **after** holds the same message until it has
-finished. Its own reasoning is folded away under each turn.
-
-Everything that starts a real agent fails closed: the demo needs an Access
-identity, and the workers.dev address — which bypasses Access entirely —
-requires an automation secret instead. The read-only diagnostics stay open
-because they call no provider and cost nothing:
-[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel),
-[`/isolation`](https://antiproton.botiverse.workers.dev/isolation),
-[`/eviction`](https://antiproton.botiverse.workers.dev/eviction).
-
-## Running
-
-```bash
-npm run conformance                                   # kernel contract, sqlite — 30 cases
-node --experimental-strip-types test/tools.ts         # gateway and mount addressing
-node --experimental-strip-types test/strand.ts        # a waiting task is never unreachable
-node --experimental-strip-types test/state.ts         # memory that survives a task
-node --experimental-strip-types test/executor.ts      # sandbox contract, in-process
-cd cf && npx wrangler deploy                          # Cloudflare
-```
-
-The same kernel and executor contracts run against the Durable Object rather
-than sqlite by fetching `/conformance/kernel` and `/conformance/executor` on the
-deployment; nothing about them is Node-specific.
-
-AppWorld needs a licensed local install; see [`bench/appworld/README.md`](bench/appworld/README.md).
-Its catalogue is **not** committed — that data may only be redistributed encrypted.
+A single instance is a coin flip: `astropy-12907` passed alone, failed in a
+slice, and passed again on another model, all with the same code. Three
+instances measure that the loop runs, not how good it is.
 
 ## What was taken from elsewhere
 
@@ -412,10 +381,29 @@ specific rather than atmospheric:
 memory — `AGENTS.md` is configuration and does not learn — and for redacting
 secrets before anything is written down.
 
-What is deliberately *not* borrowed is the shape of the agent loop itself.
-These are local, single-tenant tools where a shell is a reasonable thing to
-hand a model; almost everything in `src/runtime/` exists because this one is
-neither.
+- **The durable storage contract.** `src/store/pi-storage.ts` implements pi's
+  `Storage` interface on SQLite, and `test/pi-storage.ts` runs pi's own
+  `createStorageConformance` suite against it — 21 cases, unchanged, on both
+  node:sqlite and Durable Object storage. Implementing someone else's interface
+  buys an executable specification for the part of a session store that is
+  hardest to test honestly: mixed-write atomicity, rollback across four tables,
+  cursor-before-limit ordering, admission order under concurrent commits. Our
+  own tests encode our own assumptions, which is exactly why they would not have
+  caught these. The suite runs in a worker that is never deployed: bundling it
+  into the real one grew the production binary by 58 KB, of which the storage
+  implementation itself is 500 bytes. A multi-tenant Worker should not pay for a
+  test suite on every cold start. The usage arithmetic in that file is derived
+  from pi's `harness/utils/usage.js`, which its export map does not publish.
+
+That last item revises what this section used to say. It claimed the shape of
+the agent loop was deliberately not borrowed, because pi was a local,
+single-tenant tool where a shell is a reasonable thing to hand a model. As of
+0.85 that is no longer true: `pi-agent-core` splits durable admission
+(`accept`) from an I/O pass (`drive`), and describes its unit of change as "one
+effect-free decision made on a lane's serialized mutation line" — the same split
+this project's own kernel arrived at independently, before that kernel was
+deleted in favour of pi's loop. The storage layer came first; the loop above it
+followed, and both are pi's now.
 
 [pi]: https://github.com/badlogic/pi-mono
 [codex]: https://developers.openai.com/codex

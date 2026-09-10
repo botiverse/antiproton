@@ -1,0 +1,14 @@
+// A dev-only worker. `workers_dev: false` and no route: nothing here is meant
+// to be deployed, and the production config does not reference it.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-conformance",
+  "main": "src/conformance.ts",
+  "compatibility_date": "2026-09-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["StorageProbe"] }],
+  "durable_objects": {
+    "bindings": [{ "name": "PROBE", "class_name": "StorageProbe" }]
+  }
+}

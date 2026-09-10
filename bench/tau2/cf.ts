@@ -1,55 +1,86 @@
 /**
- * τ²-bench retail against the Cloudflare deployment.
+ * τ²-bench retail, against a real Durable Object.
  *
- * Same tasks, same user simulator, same scoring as bench/tau2/run.ts — the only
- * difference is that the agent runs in a Durable Object instead of in-process.
- * That makes it an instrument for Cloudflare-specific ablations: set OFFLOAD=0
- * or 1 and the only thing that changes is where the model call is awaited.
+ * The Node runner drives `PiAgent` over node:sqlite in this process. That is a
+ * loop nobody deploys: the object owns the storage, the queue owns the model
+ * call, and neither is present in-process. It also leaves nothing behind — the
+ * transcript is an in-memory database that vanishes when the run ends, so
+ * explaining a failure means reproducing it.
  *
- *   OFFLOAD=1 N=6 node --experimental-strip-types bench/tau2/cf.ts
+ * This one talks to the deployment. The agent runs inside the object, the model
+ * call goes through the queue that production uses, and the transcript stays in
+ * the object afterwards where the console can read it. What is measured is the
+ * thing that ships.
+ *
+ * The customer stays here. τ²'s user is a second model with no access to the
+ * domain, so running it locally changes nothing about what is under test and
+ * keeps the simulator's tokens out of the agent's own accounting.
+ *
+ *   N=8 TRIALS=3 node bench/tau2/cf.ts
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
+import { createHash } from "node:crypto";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
   if (m) process.env[m[1]!] = m[2]!;
 }
 
-const BASE = process.env.CF_BASE ?? "https://antiproton.botiverse.workers.dev";
+// The custom hostname sits behind Cloudflare Access, which answers a benchmark
+// run with a login redirect. The workers.dev address is the same Worker and the
+// same objects without the interactive gate; the endpoints that spend the model
+// account are guarded there by `x-harness-token` instead.
+const BASE = process.env.BENCH_BASE ?? "https://antiproton.botiverse.workers.dev";
+const TOKEN = process.env.HARNESS_AUTOMATION_TOKEN ?? "";
+const MODEL_ID = process.env.HARNESS_MODEL ?? "deepseek-flash";
+const TRIALS = Number(process.env.TRIALS ?? 1);
+const N = Number(process.env.N ?? 5);
+const OFFSET = Number(process.env.OFFSET ?? 0);
+const VERBOSE = !!process.env.VERBOSE;
+
 const here = new URL("./data/", import.meta.url).pathname;
 const BASE_DB: RetailDB = JSON.parse(readFileSync(here + "db.json", "utf8"));
 const TASKS: any[] = JSON.parse(readFileSync(here + "tasks.json", "utf8"));
 const POLICY = readFileSync(here + "policy.md", "utf8");
 const GUIDELINES = readFileSync(here + "simulation_guidelines.md", "utf8");
 
-const MODEL = process.env.HARNESS_MODEL ?? "deepseek-v4-pro";
 const model = new OpenAiCompatibleModel({
-  baseUrl: process.env.DEEPSEEK_BASE_URL!, apiKey: process.env.DEEPSEEK_API_KEY!, model: MODEL,
+  baseUrl: process.env.DEEPSEEK_BASE_URL!, apiKey: process.env.DEEPSEEK_API_KEY!, model: MODEL_ID,
 });
 
-const canon = (v: unknown): string => {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
-  return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canon((v as any)[k])}`).join(",")}}`;
-};
-const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+// Each arm gets its own object, so one arm's activity is never read as
+// another's — the meter is per object and it does not reset itself.
+const OBJ = process.env.OBJ ?? "v1";
+const withObj = (path: string) => path + (path.includes("?") ? "&" : "?") + `obj=${OBJ}`;
 
-/** Set per arm: every bench call is addressed to that arm's own object. */
-let OBJ = "v1";
-async function api(path: string, init?: RequestInit): Promise<any> {
-  const sep = path.includes("?") ? "&" : "?";
-  const url = path.startsWith("/bench") ? `${BASE}${path}${sep}obj=${OBJ}` : BASE + path;
-  const r = await fetch(url, init);
-  const t = await r.text();
-  try { return JSON.parse(t); } catch { throw new Error(`${path} -> ${r.status} ${t.slice(0, 200)}`); }
+async function api(path: string, init: RequestInit = {}): Promise<any> {
+  const r = await fetch(BASE + withObj(path), {
+    ...init,
+    headers: { "x-harness-token": TOKEN, ...(init.headers ?? {}) },
+    signal: AbortSignal.timeout(120_000),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`${path} → ${r.status}: ${text.slice(0, 200)}`);
+  return text ? JSON.parse(text) : null;
 }
 const post = (path: string, body: unknown) =>
   api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
+/** Stable serialisation so two databases compare by value, not key order. */
+const canon = (v: unknown): string => {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
+  return `{${Object.keys(v as object).sort()
+    .map((k) => `${JSON.stringify(k)}:${canon((v as any)[k])}`).join(",")}}`;
+};
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** The database the annotated solution leaves behind, hashed the same way the
+ *  object hashes its own — the comparison is a hash because the database is
+ *  2.8 MB and no part of it needs to travel. */
 function gold(task: any) {
   const db = structuredClone(BASE_DB);
   const applied: Array<{ name: string; args: any }> = [];
@@ -58,13 +89,101 @@ function gold(task: any) {
     applyRetailAction(db, a.name, a.arguments);
     applied.push({ name: a.name, args: a.arguments });
   }
-  return { hash: sha(canon(db)), expected: applied };
+  return { hash: sha256(canon(db)), expected: applied };
 }
 
-async function runTask(task: any, offload: boolean, tag: string, verbose: boolean) {
-  const taskId = `${task.id}_${offload ? "on" : "off"}_${tag}`;
+/**
+ * Wait for the object to finish a turn.
+ *
+ * Two ways, because the difference is the measurement. Polling asks the object
+ * whether it is done, and every ask is a request that wakes it — so a benchmark
+ * that polls is partly measuring its own poller. The deployed console does not
+ * poll: the object pushes over a socket it accepted with the hibernation API,
+ * and while it waits it holds nothing and is billed nothing.
+ *
+ * WAIT=poll switches back, so the cost of the difference can be read off the
+ * same benchmark rather than argued.
+ */
+const WAIT = process.env.WAIT ?? "push";
+const TURN_TIMEOUT_MS = 300_000;
+
+function waitForAnswer(taskId: string): Promise<string | null> {
+  return WAIT === "poll" ? pollForAnswer(taskId) : pushForAnswer(taskId);
+}
+
+async function pollForAnswer(taskId: string): Promise<string | null> {
+  const deadline = Date.now() + TURN_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const s = await api(`/bench/poll?taskId=${taskId}`);
+    if (s.status === "idle" && s.answer) return s.answer;
+    await new Promise((r) => setTimeout(r, 1_500));
+  }
+  return null;
+}
+
+/** The turn is over when the model replies with text and no tool call — which
+ *  is the same rule the object applies, read from the same event stream the
+ *  console reads.
+ *
+ *  Reconnects rather than gives up. A socket that drops mid-turn is not an
+ *  agent that stalled, and scoring it as one would blame the harness for the
+ *  network; the cursor means a reconnect resumes where it left off instead of
+ *  replaying the previous turn's answer and ending the conversation early. */
+async function pushForAnswer(taskId: string): Promise<string | null> {
+  const deadline = Date.now() + TURN_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const answer = await oneSocket(taskId, deadline);
+    if (answer !== null) return answer;
+  }
+  return null;
+}
+
+function oneSocket(taskId: string, deadline: number): Promise<string | null> {
+  const ws = new WebSocket(BASE.replace(/^http/, "ws") + withObj(
+    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`));
+  return new Promise<string | null>((resolve) => {
+    const stop = (v: string | null) => {
+      clearInterval(keepalive); clearTimeout(timer);
+      try { ws.close(); } catch { /* already gone */ }
+      resolve(v);
+    };
+    // The object answers a ping, which is the only thing keeping an idle
+    // connection from being closed underneath a slow model call.
+    const keepalive = setInterval(() => { try { ws.send("ping"); } catch { /* closing */ } }, 20_000);
+    const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
+    ws.onerror = () => stop(null);
+    ws.onclose = () => stop(null);
+    ws.onmessage = (ev: MessageEvent) => {
+      let e: any;
+      try { e = JSON.parse(String(ev.data)); } catch { return; }
+      if (e.kind === "pong") return;
+      // A failed model call ends the turn as surely as an answer does, and
+      // waiting out the timeout would report it as a stall — which blames the
+      // wrong thing.
+      if (e.kind === "model.failed") {
+        failed.set(taskId, String(e.payload?.error ?? "the model call failed"));
+        stop(null);
+        return;
+      }
+      if (typeof e.id === "number") seen.set(taskId, e.id);
+      if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) {
+        stop(String(e.payload.text));
+      }
+    };
+  });
+}
+
+/** How far each task's stream has been read, so a reconnect does not replay a
+ *  previous turn's answer and end the conversation a turn early. */
+const seen = new Map<string, number>();
+
+/** Why a turn ended without an answer, when the object said why. */
+const failed = new Map<string, string>();
+
+async function runTask(task: any) {
   const t0 = Date.now();
-  await post("/bench/start", { taskId, policy: POLICY, offload });
+  const taskId = `t_${task.id}_${Date.now().toString(36)}`;
+  await post("/bench/start", { taskId, policy: POLICY, offload: true });
 
   const instr = task.user_scenario?.instructions ?? {};
   const scenario = [
@@ -83,107 +202,118 @@ async function runTask(task: any, offload: boolean, tag: string, verbose: boolea
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
     const u = await model.complete(sim, { maxTokens: 2000 });
-    simCalls++;
+    simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
     const stop = /###(STOP|TRANSFER|OUT-OF-SCOPE)###/.exec(u.text);
-    if (verbose) console.log(`    user  > ${u.text.replace(/\s+/g, " ").slice(0, 120)}`);
+    if (VERBOSE) console.log(`    user  > ${u.text.replace(/\s+/g, " ").slice(0, 130)}`);
     if (stop) { ended = stop[1]!.toLowerCase(); break; }
 
-    const said = await post("/bench/say", { taskId, text: u.text });
-    // A stale answer looks exactly like a fresh one, so wait for the checkpoint
-    // to move past the version that existed when we spoke.
-    const before = said.checkpointVersion ?? 0;
-    let answered: string | null = null;
-    const deadline = Date.now() + 300_000;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const s = await api(`/bench/poll?taskId=${taskId}`);
-      if (s.answer && s.checkpointVersion > before) { answered = s.answer; break; }
+    await post("/bench/say", { taskId, text: u.text });
+
+    const answered = await waitForAnswer(taskId);
+    if (!answered) {
+      ended = failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled";
+      break;
     }
-    if (!answered) { ended = "timeout"; console.log(`    [stalled task ${taskId} on object ${OBJ}]`); break; }
     agentSaid = answered;
-    if (verbose) console.log(`    agent > ${answered.replace(/\s+/g, " ").slice(0, 120)}`);
+    if (VERBOSE) console.log(`    agent > ${answered.replace(/\s+/g, " ").slice(0, 130)}`);
   }
 
   const res = await api(`/bench/result?taskId=${taskId}`);
-  const g = gold(task);
-  const dbMatch = res.dbHash === g.hash;
-  const actionMatch = g.expected.every((e) =>
-    (res.writes ?? []).some((w: any) => w.name === e.name && canon(w.args) === canon(e.args)));
+  const { hash, expected } = gold(task);
+  const writes = (res.writes ?? []).filter((w: any) => WRITE_TOOLS.has(w.name));
+  const dbMatch = res.dbHash === hash;
+  const actionMatch = expected.every((e) =>
+    writes.some((w: any) => w.name === e.name && canon(w.args) === canon(e.args)));
+
   return {
-    id: task.id, offload, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
-    turns: turns - 1, seconds: Math.round((Date.now() - t0) / 1000),
-    modelCalls: res.usage?.calls ?? 0, simCalls,
-    prompt: res.usage?.prompt ?? 0, completion: res.usage?.completion ?? 0,
-    expectedWrites: g.expected.map((e) => e.name),
-    performedWrites: (res.writes ?? []).map((w: any) => w.name),
+    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
+    turns: turns - 1, simCalls,
+    usage: res.usage ?? {}, kinds: res.kinds ?? {},
+    seconds: Math.round((Date.now() - t0) / 1000),
+    expectedWrites: expected.map((e) => e.name),
+    performedWrites: writes.map((w: any) => w.name),
   };
 }
 
-// ---------------------------------------------------------------------- main
-const N = Number(process.env.N ?? 4);
-const OFFSET = Number(process.env.OFFSET ?? 0);
-const verbose = !!process.env.VERBOSE;
-const modes = (process.env.MODES ?? "off,on").split(",");
-const tag = process.env.TAG ?? Math.random().toString(36).slice(2, 6);
-const selected = TASKS.slice(OFFSET, OFFSET + N);
-
-console.log(`\n  τ²-bench retail on Cloudflare — ${selected.length} tasks, model ${MODEL}`);
-console.log(`  variable: where the model call is awaited (DO vs Worker)\n  ${"─".repeat(76)}`);
-
-const all: any[] = [];
-for (const mode of modes) {
-  const offload = mode === "on";
-  OBJ = `${tag}-${mode}`;
-  await api("/bench/activity/reset");
-  const t0 = Date.now();
-  const rows: any[] = [];
-  for (const task of selected) {
-    let r;
-    try { r = await runTask(task, offload, tag, verbose); }
-    catch (e) {
-      r = { id: task.id, offload, reward: 0, dbMatch: false, actionMatch: false,
-            ended: `error: ${(e as Error).message.slice(0, 70)}`, turns: 0, seconds: 0,
-            modelCalls: 0, simCalls: 0, prompt: 0, completion: 0,
-            expectedWrites: [], performedWrites: [] };
-    }
-    rows.push(r); all.push(r);
-    const mark = r.reward ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-    console.log(`  [${mode.padEnd(3)}] ${mark} task ${String(r.id).padEnd(4)} db=${r.dbMatch ? "ok " : "NO "} ` +
-      `act=${r.actionMatch ? "ok " : "NO "} ${String(r.ended).padEnd(12)} ${r.turns}t / ${r.modelCalls}c / ${r.seconds}s`);
+function passAtK(rows: any[], k: number) {
+  const byTask = new Map<string, any[]>();
+  for (const r of rows) byTask.set(String(r.id), [...(byTask.get(String(r.id)) ?? []), r]);
+  let all = 0, counted = 0;
+  for (const [, rs] of byTask) {
+    if (rs.length < k) continue;
+    counted += 1;
+    if (rs.slice(0, k).every((r) => r.reward)) all += 1;
   }
-  const act = await api("/bench/activity");
-  const wall = Date.now() - t0;
-  (rows as any).meta = { mode, act, wall };
-  const kind = (k: string) => (act.byKind ?? []).find((x: any) => x.kind === k) ?? { n: 0, ms: 0 };
-  all.push({ _meta: true, mode, activeMs: act.activeMs, invocations: act.invocations,
-             byKind: act.byKind, wallMs: wall,
-             // Guard against the arm silently running in the other mode.
-             delivered: kind("deliverModel").n, alarmMs: kind("alarm").ms,
-             alarms: kind("alarm").n,
-             pass: rows.filter((r) => r.reward).length, n: rows.length,
-             prompt: rows.reduce((a, r) => a + r.prompt, 0),
-             completion: rows.reduce((a, r) => a + r.completion, 0) });
+  return { passed: all, of: counted };
 }
 
-console.log(`  ${"─".repeat(76)}\n`);
-console.log("  mode  pass   DO active(s)  alarms  alarm(s)  offloaded  wall(s)   prompt tok");
-for (const m of all.filter((r) => r._meta)) {
-  console.log(`  ${m.mode.padEnd(5)} ${String(m.pass + "/" + m.n).padEnd(6)} ` +
-    `${(m.activeMs / 1000).toFixed(1).padStart(11)} ${String(m.alarms).padStart(7)} ` +
-    `${(m.alarmMs / 1000).toFixed(1).padStart(9)} ${String(m.delivered).padStart(10)} ` +
-    `${(m.wallMs / 1000).toFixed(0).padStart(8)} ${String(m.prompt).padStart(12)}`);
+// The base database has to be where the object can read it, and it is 2.8 MB,
+// so it is uploaded once rather than carried in every request.
+await api("/bench/basedb", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: readFileSync(here + "db.json", "utf8"),
+});
+await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
+
+const selected = TASKS.slice(OFFSET, OFFSET + N);
+console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s), ` +
+  `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
+
+const results: any[] = [];
+for (let trial = 1; trial <= TRIALS; trial++) {
+  for (const task of selected) {
+    if (VERBOSE) console.log(`\n  task ${task.id} (trial ${trial})`);
+    let r;
+    try { r = await runTask(task); }
+    catch (e) {
+      r = { id: task.id, reward: 0, dbMatch: false, actionMatch: false,
+            ended: `error: ${(e as Error).message.slice(0, 80)}`, turns: 0, simCalls: 0,
+            usage: {}, kinds: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
+    }
+    results.push({ ...r, trial });
+    const mark = r.reward ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
+    console.log(`  ${mark} task ${String(r.id).padEnd(4)} db=${r.dbMatch ? "ok " : "NO "}` +
+      `act=${r.actionMatch ? "ok " : "NO "} ${String(r.ended).padEnd(13)} ` +
+      `${r.turns} turns / ${r.usage?.calls ?? "?"} calls / ${r.usage?.prompt ?? "?"} tok / ${r.seconds}s`);
+    if (!r.reward && (r.expectedWrites.length || r.performedWrites.length)) {
+      console.log(`      expected: [${r.expectedWrites.join(", ")}]  performed: [${r.performedWrites.join(", ")}]`);
+    }
+  }
 }
-// An "off" arm that offloaded, or an "on" arm that did not, is not a control.
-for (const m of all.filter((r) => r._meta)) {
-  const bad = (m.mode === "off" && m.delivered > 0) || (m.mode === "on" && m.delivered === 0);
-  if (bad) console.log(`\n  \x1b[31mCONTAMINATED\x1b[0m: mode "${m.mode}" recorded ${m.delivered} offloaded deliveries`);
+
+const pass = results.filter((r) => r.reward).length;
+console.log(`  ${"─".repeat(84)}`);
+if (TRIALS > 1) {
+  for (let k = 1; k <= TRIALS; k++) {
+    const { passed, of } = passAtK(results, k);
+    console.log(`  pass^${k} = ${passed}/${of} = ${of ? (100 * passed / of).toFixed(1) : "0.0"}%`);
+  }
 }
-const off = all.find((r) => r._meta && r.mode === "off");
-const on = all.find((r) => r._meta && r.mode === "on");
-if (off && on) {
-  console.log(`\n  DO active wall clock: ${(off.activeMs / 1000).toFixed(1)}s -> ${(on.activeMs / 1000).toFixed(1)}s ` +
-    `(${(100 * (off.activeMs - on.activeMs) / off.activeMs).toFixed(1)}% less, ${(off.activeMs / Math.max(on.activeMs, 1)).toFixed(1)}x)`);
-  console.log(`  billed DO duration @ 128MB: $${(off.activeMs / 1000 * 0.125 * 12.5e-6).toFixed(6)} -> ` +
-    `$${(on.activeMs / 1000 * 0.125 * 12.5e-6).toFixed(6)} per ${off.n} tasks\n`);
+console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.length).toFixed(1)}%   ` +
+  `${results.reduce((a, r) => a + r.seconds, 0)}s wall`);
+
+const endings: Record<string, number> = {};
+for (const r of results.filter((x) => !x.reward)) endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;
+if (Object.keys(endings).length) {
+  console.log(`  failures by ending: ${Object.entries(endings)
+    .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ")}`);
 }
+
+/**
+ * What the object was billed for.
+ *
+ * This is the number the in-process runner could not produce at all, and the
+ * reason for running here: Durable Objects are billed for wall clock while
+ * active, so the gap between this and the wall clock above is the part of the
+ * run that cost nothing because the object was asleep waiting on the queue.
+ */
+const act = await api("/bench/activity").catch(() => null);
+if (act) {
+  const wall = results.reduce((a, r) => a + r.seconds, 0);
+  console.log(`  object billed ${(act.activeMs / 1000).toFixed(1)}s of ${wall}s wall ` +
+    `(${wall ? Math.round((act.activeMs / 1000 / wall) * 100) : 0}%)` +
+    (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
+}
+console.log();

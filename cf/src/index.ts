@@ -14,18 +14,21 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
-import { kernelSpec } from "../../test/spec/kernel-spec.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, type ModelJob,
+  AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF,
 } from "./runtime.ts";
-import { contextWindowFor } from "../../src/harness/codegen.ts";
+import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { runModelCommand } from "../../src/runtime/commands.ts";
+import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
+import { entriesToEvents } from "./pi-view.ts";
+import { ensureAgentTables } from "../../src/runtime/pi-agent.ts";
+import { validateMount } from "../../src/runtime/mount-config.ts";
 import { BenchState } from "./bench.ts";
+import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens,
+  runtimePanel, timeline, tokens, plugins,
 } from "./ui.ts";
 
 export interface Env {
@@ -38,7 +41,6 @@ export interface Env {
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
    *  mount exists but cannot start a container. */
   RUN9?: string;
-  /** "codegen" to go back to the fenced-code convention; native otherwise. */
   HARNESS_MODE?: string;
   /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
   HARNESS_CONTEXT_WINDOW?: string;
@@ -126,40 +128,52 @@ interface QueuedModelCall {
   doId: string;
   tenantId: string;
   agentId: string;
-  taskId: string;
-  commandId: string;
+  jobId: string;
 }
 
+/**
+ * The model call, waited on where waiting is free.
+ *
+ * A Worker bills CPU, not wall clock, so a sixty-second provider call costs
+ * almost nothing here; the same wait inside the Durable Object is billed by
+ * duration, which is the entire reason the call leaves the object at all.
+ *
+ * The request arrives in pi's shape and is converted here rather than by
+ * importing pi's own provider implementations, which would drag four vendor
+ * SDKs into a binary shipped to every tenant.
+ */
 async function runQueuedModelCall(m: QueuedModelCall, env: Env) {
   const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
-  const job = await stub.takeModelJob(m.commandId);
+  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId) as any;
   // Already answered — a redelivery after success, which must not call the
   // provider again.
   if (!job) return;
-  if (!Array.isArray((job.payload as any)?.messages)) {
-    throw new Error(`not a model request: ${JSON.stringify(job.payload).slice(0, 80)}`);
-  }
+
   const model = new OpenAiCompatibleModel({
     baseUrl: env.DEEPSEEK_BASE_URL,
     apiKey: env.DEEPSEEK_API_KEY,
     model: env.HARNESS_MODEL,
   });
+  const { messages, tools } = toRequest(job.context);
   const t0 = Date.now();
-  const res = await runModelCommand(model, job.payload);
-  await stub.deliverModel(job, { ok: true, res, modelMs: Date.now() - t0 });
+  const res = await model.complete(messages, tools ? { tools } : {});
+  const identity = {
+    api: String(job.model?.api ?? "offloaded"),
+    provider: String(job.model?.provider ?? "openai-compatible"),
+    id: String(job.model?.id ?? env.HARNESS_MODEL),
+  };
+  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, fromResponse(res, identity), Date.now() - t0);
 }
 
-/** Out of retries. The task has to hear about it, or it waits for ever. */
+/** Out of retries. The agent has to hear about it, or it waits for ever. */
 async function failLoudly(m: QueuedModelCall, env: Env) {
   const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
-  const job = await stub.takeModelJob(m.commandId);
+  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId) as any;
   if (!job) return;
-  await stub.deliverModel(job, {
-    ok: false,
-    error: "the model call failed repeatedly and was given up on",
-  });
+  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, errorMessage(
+    "the model call failed repeatedly and was given up on",
+    { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }), 0);
 }
-
 
 /**
  * One Durable Object per (tenant, agent).
@@ -246,6 +260,13 @@ export class AgentDO extends DurableObject<Env> {
       checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
     // What Cloudflare bills this object for: wall clock while it is active.
     this.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
+    // Created here rather than on first claim: the alarm reads it, and an alarm
+    // can fire on an object nothing has claimed yet.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
+    // Everything an agent keeps, from this object's first breath. The console
+    // reads some of it directly for its change check, which happens long
+    // before anyone opens an agent.
+    ensureAgentTables(this.sql as any);
     // The bench runtime has to survive eviction: an alarm on a fresh instance
     // must rebuild the same harness, not fall back to the default one.
     this.sql.exec("CREATE TABLE IF NOT EXISTS bench_config(k TEXT PRIMARY KEY, v TEXT)");
@@ -289,16 +310,6 @@ export class AgentDO extends DurableObject<Env> {
     return results;
   }
 
-  /** The kernel contract, unchanged, against Durable Object storage. */
-  async runKernelSpec() {
-    const t0 = Date.now();
-    const results = await kernelSpec(async () => {
-      const store = new DurableObjectStore(this.ctx as any);
-      return store;
-    });
-    return { backend: "durable-object", ms: Date.now() - t0, results };
-  }
-
   runtime(): AgentRuntime {
     this.#runtime ??= new AgentRuntime({
       ctx: this.ctx,
@@ -319,7 +330,6 @@ export class AgentDO extends DurableObject<Env> {
       // turned up in two days, each of which the harness mistook for a final
       // answer. Providers have a channel for this; using it is not a
       // preference.
-      harnessMode: this.env.HARNESS_MODE === "codegen" ? "codegen" : "hybrid",
       // Looked up from the model's own name, so changing HARNESS_MODEL brings
       // the right window with it. The variable stays as an override for a model
       // the table does not know.
@@ -383,9 +393,14 @@ export class AgentDO extends DurableObject<Env> {
     } catch { return []; }
   }
 
-  /** Who this object serves, once claimed. */
+  /** Who this object serves, once claimed. Absent until something claims it —
+   *  and absent is an answer, not a failure: an object whose alarm fires before
+   *  anything has claimed it has nothing to step. Reading it used to throw
+   *  `no such table: owner`, which the alarm handler caught and counted as a
+   *  failure, so the object rearmed every 30s and never advanced anything. */
   async owner() {
-    const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+    const row = this.sql.exec(
+      "SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     return row ? { tenantId: row.tenant_id, agentId: row.agent_id } : null;
   }
 
@@ -399,33 +414,30 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  /** Called by the queue consumer once the completion lands. */
-  async deliverModel(
-    job: ModelJob,
-    outcome: { ok: true; res: any; modelMs?: number } | { ok: false; error: string },
-  ) {
-    // How long the round trip out of this object actually took. If offloading
-    // buys cheap duration but costs seconds per call, that is the trade being
-    // made, and it should be visible rather than inferred from wall clock.
-    try {
-      const row = this.sql
-        .exec("SELECT dispatched_at FROM outbox WHERE command_id=?", job.commandId).toArray()[0] as any;
-      if (row?.dispatched_at) {
-        this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)",
-          Number(row.dispatched_at), Date.now() - Number(row.dispatched_at), "offload_rtt");
-        // Split the round trip: how much was the provider, how much was us.
-        const mms = (outcome as any).modelMs;
-        if (typeof mms === "number") {
-          this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", Number(row.dispatched_at), mms, "offload_provider");
-        }
-      }
-    } catch { /* measurement must never break delivery */ }
-    return this.#busy("deliverModel", async () => {
-      await this.#activeRuntime().deliverModel(job, outcome);
-      await this.broadcast();
-      await this.ctx.storage.setAlarm(Date.now());
-      return { ok: true };
-    });
+  /**
+   * Record a span this object did not spend being active.
+   *
+   * If offloading buys cheap duration but costs seconds per call, that is the
+   * trade being made and it should be visible rather than inferred from wall
+   * clock. Measurement must never break delivery, so it cannot throw.
+   */
+  #note(at: number, ms: number, kind: string) {
+    try { this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", at, ms, kind); }
+    catch { /* a missing measurement is not a failure */ }
+  }
+
+  /**
+   * The transcript, as rows.
+   *
+   * pi has no task id — a run is an operation and the conversation is a lane —
+   * so the `taskId` still threaded through the console's routes addresses
+   * nothing here. It is kept on the signatures because the page's URLs carry
+   * it, and ignored.
+   */
+  async #entries(tenantId: string, agentId: string, fromSeq?: number) {
+    const agent = await this.#activeRuntime().agent(tenantId, agentId);
+    return agent.storage.scanEntries(
+      { order: "asc", ...(fromSeq === undefined ? {} : { fromSeq }) }, BACKGROUND_CONTEXT);
   }
 
   /**
@@ -482,35 +494,41 @@ export class AgentDO extends DurableObject<Env> {
    * object, so sending it would be duplicating the log into a channel that
    * cannot hold it.
    */
-  async #dispatch(job: ModelJob): Promise<void> {
+  async #dispatch(job: { tenantId: string; agentId: string; commandId: string }): Promise<void> {
     await this.env.MODEL_QUEUE.send({
       doId: this.ctx.id.toString(),
-      tenantId: job.tenantId, agentId: job.agentId, taskId: job.taskId,
-      commandId: job.commandId,
+      tenantId: job.tenantId, agentId: job.agentId, jobId: job.commandId,
     });
+    this.#note(Date.now(), 0, "offload_dispatch");
   }
 
   /**
-   * The payload behind a queued command, read back by the consumer.
+   * What the worker asks for, and what it hands back.
    *
    * Returns null once the reply is in: a redelivery after a successful call
-   * must not run the provider a second time. The dedup key on the result event
-   * makes that safe rather than merely unlikely.
+   * must not run the provider a second time.
    */
-  async takeModelJob(commandId: string): Promise<ModelJob | null> {
-    const row = this.sql.exec(
-      `SELECT o.tenant_id, o.task_id, o.payload, t.agent_id FROM outbox o
-         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
-        WHERE o.command_id = ?
-          AND NOT EXISTS (SELECT 1 FROM events e
-                           WHERE e.tenant_id = o.tenant_id
-                             AND e.dedup_key = 'cmd:' || o.command_id || ':response')`,
-      commandId).toArray()[0] as any;
-    if (!row) return null;
-    return {
-      tenantId: row.tenant_id, agentId: row.agent_id, taskId: row.task_id,
-      commandId, payload: JSON.parse(row.payload),
-    };
+  async takeJob(tenantId: string, agentId: string, jobId: string) {
+    return this.#activeRuntime().takeJob(tenantId, agentId, jobId);
+  }
+
+  async deliverAnswer(
+    tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs = 0,
+  ) {
+    const rt = this.#activeRuntime();
+    const wrote = await this.#busy("deliver", () =>
+      rt.deliverAnswer(tenantId, agentId, jobId, answer));
+    if (wrote && modelMs > 0) {
+      this.#note(Date.now() - modelMs, modelMs, "offload_provider");
+      this.#note(Date.now() - modelMs, modelMs, "offload_rtt");
+    }
+    if (wrote) {
+      await this.broadcast();
+      // The answer is what makes the next pass finish, so wake now rather than
+      // waiting for the safety-net alarm.
+      await this.ctx.storage.setAlarm(Date.now());
+    }
+    return wrote;
   }
 
   /**
@@ -523,29 +541,28 @@ export class AgentDO extends DurableObject<Env> {
   async diagnose(tenantId: string, agentId: string, taskId: string) {
     const rt = this.#activeRuntime();
     await rt.ready();
-    const task = await rt.store.loadTask(tenantId, taskId);
-    const events = await rt.store.taskEvents(tenantId, taskId);
+    const agent = await rt.agent(tenantId, agentId);
+    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+    const events = entriesToEvents(entries);
     const kinds: Record<string, number> = {};
     for (const e of events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
+    const execution = await agent.lane.inspectExecution(BACKGROUND_CONTEXT);
+    const compactions = entries.filter((e) => e.type === "compaction");
     return {
       owner: await this.owner(),
-      // The budget a long conversation eventually runs into, and the number
-      // that was invisible while a task span for ever refusing to commit.
-      checkpointBytes: task ? JSON.stringify(task.checkpoint ?? null).length : 0,
-      // Whether this task has been compacted, and what it kept. Was only
-      // visible by reading a truncated event payload and guessing.
-      compaction: task ? (() => {
-        const c = task.checkpoint as any;
-        return {
-          compactions: c?.compactions ?? 0,
-          inFlight: !!c?.compacting,
-          messages: Array.isArray(c?.messages) ? c.messages.length : 0,
-          summary: typeof c?.summary === "string" ? c.summary.slice(0, 1200) : null,
-        };
-      })() : null,
-      task: task && {
-        status: task.status, generation: task.generation,
-        checkpointVersion: task.checkpointVersion, stateVersion: task.stateVersion,
+      // There is no checkpoint any more — the log is the state, so the size a
+      // long conversation eventually runs into is the transcript itself.
+      entries: entries.length,
+      compaction: {
+        compactions: compactions.length,
+        messages: entries.filter((e) => e.type === "message").length,
+        summary: (compactions.at(-1) as any)?.summary?.slice(0, 1200) ?? null,
+      },
+      // What the lane is doing right now, asked of the lane rather than
+      // inferred from rows that might disagree with it.
+      execution: {
+        tip: execution.tipId, model: execution.configuredModel,
+        current: execution.current, lastOperationId: execution.lastOperationId,
       },
       modelBinding: await rt.store.getModelBinding(tenantId, agentId),
       mounts: (await rt.store.listMounts(tenantId, agentId)).map((m) => ({
@@ -559,7 +576,7 @@ export class AgentDO extends DurableObject<Env> {
         seq: e.sequence, kind: e.kind,
         detail: JSON.stringify(e.payload).slice(0, 220),
       })),
-      pendingWork: (await rt.store.tasksWithPendingWork(5)).length,
+      pendingWork: execution.current ? 1 : 0,
       alarm: await this.ctx.storage.getAlarm(),
       // What the agent believes, in the operator's own view. The tools tell the
       // agent this is readable by the person running it; that has to be true,
@@ -576,19 +593,22 @@ export class AgentDO extends DurableObject<Env> {
         return { ...(await rt2.store.stateUsage(tenantId, agentId)), docs };
       })(),
       alarmFailures: this.#alarmFailures(),
+      // What is still being billed because it could not be handed back.
+      releaseErrors: (this.sql.exec(
+        "CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)"),
+        [...this.sql.exec("SELECT at, alias, message FROM release_errors ORDER BY at DESC LIMIT 5")]
+          .map((r: any) => ({ at: r.at, alias: r.alias, message: r.message }))),
       // The table exists only once an alarm has failed; diagnose must not be
       // the thing that throws while explaining why something else did.
       alarmErrors: (this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)"),
         [...this.sql.exec(
         "SELECT at, message FROM alarm_errors ORDER BY at DESC LIMIT 3")].map((r: any) => r.message)),
-      // Which commands are still out, and in what state. A task that stops for
-      // no visible reason is nearly always a row here that nothing is watching.
-      outbox: [...this.sql.exec(
-        `SELECT command_id, kind, state, created_at, dispatched_at FROM outbox
-          WHERE tenant_id=? AND task_id=? AND state != 'done' ORDER BY created_at DESC LIMIT 10`,
-        tenantId, taskId)].map((r: any) => ({
-          kind: r.kind, state: r.state,
-          ageMs: Date.now() - Number(r.dispatched_at ?? r.created_at),
+      // Which model calls are still out. An agent that stops for no visible
+      // reason is nearly always a row here that nothing is watching.
+      modelJobs: [...this.sql.exec(
+        `SELECT id, created_at FROM pi_model_jobs
+          WHERE answer IS NULL ORDER BY created_at DESC LIMIT 10`)].map((r: any) => ({
+          id: r.id, ageMs: Date.now() - Number(r.created_at),
         })),
       // What the panel actually renders. "It is not replying" and "the reply is
       // not being drawn" look identical from outside, so show the rendering.
@@ -680,11 +700,13 @@ export class AgentDO extends DurableObject<Env> {
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       extraPlugins: [this.#benchState().plugin()],
-      // Matches bench/tau2/compare.ts's hybrid arm, so CF numbers sit alongside
-      // the Node ones instead of measuring a different harness.
-      harnessMode: "hybrid",
       maxTurns: 40,
       policy,
+      // What the Node runner offers, and nothing else. The deployed console has
+      // a sandbox; the Node τ² arm never did, and running the object arm with
+      // one meant the two arms differed by a tool and a page of prompt while
+      // being reported as the same measurement.
+      sandbox: false,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#benchRuntime;
@@ -695,17 +717,40 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("benchStart", async () => {
       this.sql.exec(
         "INSERT INTO bench_config(k,v) VALUES ('policy',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", policy);
-      const rt = this.#benchRt(policy);
       const agentId = `b_${taskId}`;
-      await this.#benchState().reset(taskId);
+      await this.#benchState().reset(agentId);
+      // A task starts on an empty transcript, because in production it would.
+      //
+      // pi's tables are object-local and carry no agent column, which is right
+      // when one object is one agent — the invariant this whole design rests on.
+      // A bench object breaks it deliberately: it hosts each task in turn so the
+      // meter stays in one place. Without this, it also hosts each task's
+      // conversation on top of the last one's. Task 7 of a run opened with 67
+      // user messages already in context, the first of them task 0's, and the
+      // agent was answering a customer from six conversations ago — 821k tokens
+      // for an eight-turn task, and four failures scored against a harness that
+      // was working exactly as designed.
+      this.#clearTranscript();
+      const rt = this.#benchRt(policy);
+      // The alarm is what advances a run, and it asks the object who it serves.
+      // Without this the bench agent existed, held a prompt and was never
+      // stepped: 303s of the runner polling an object that had nothing to do.
+      //
+      // Retargeted rather than claimed. `#claim` refuses a second identity,
+      // which is the right rule for a tenant's object and the wrong one here —
+      // a bench object is deliberately reused, one task at a time, and each
+      // task is its own agent.
+      this.sql.exec(
+        "INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self',?,?) " +
+        "ON CONFLICT(k) DO UPDATE SET tenant_id=excluded.tenant_id, agent_id=excluded.agent_id",
+        "bench", agentId);
+      await rt.bindOperatorModel("bench", agentId);
       // Only what the Node bench mounts: github/artifacts would change the tool
       // catalogue and make the two runners incomparable.
-      await rt.bindOperatorModel("bench", agentId);
       await rt.provision("bench", agentId, [
         { alias: "tools", plugin: "tools", account: "builtin" },
         { alias: "retail", plugin: "retail", account: "benchmark" },
       ]);
-      await rt.openTask("bench", agentId, taskId);
       return { taskId, agentId, offload: this.#offloadOn() };
     });
   }
@@ -713,7 +758,7 @@ export class AgentDO extends DurableObject<Env> {
   async benchSay(taskId: string, text: string) {
     return this.#busy("benchSay", async () => {
       const rt = this.#activeRuntime();
-      const r = await rt.postMessage("bench", `b_${taskId}`, taskId, text);
+      const r = await rt.postMessage("bench", `b_${taskId}`, text);
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
@@ -725,79 +770,133 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   async #benchPollInner(taskId: string) {
-    const rt = this.#activeRuntime();
-    await rt.ready();
-    const task = await rt.store.loadTask("bench", taskId);
-    const done = task && ["completed", "failed", "blocked"].includes(task.status);
+    const agent = await this.#activeRuntime().agent("bench", `b_${taskId}`);
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const events = entriesToEvents(
+      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
+    const last = [...events].reverse()
+      .find((e) => e.kind === "model.response" && !(e.payload as any).toolCalls);
     return {
-      status: task?.status ?? null,
-      checkpointVersion: task?.checkpointVersion ?? 0,
-      answer: done ? (task!.checkpoint as any).messages.at(-1).content : null,
+      status: running ? "running" : "idle",
+      entries: events.length,
+      answer: running ? null : ((last?.payload as any)?.text ?? null),
     };
   }
 
   /** What the harness actually handed the provider. Guessing at this cost two
    *  bench runs; it is cheaper to be able to look. */
   async benchDebug(taskId: string) {
-    const rt = this.#activeRuntime();
-    await rt.ready();
-    const task = await rt.store.loadTask("bench", taskId);
-    const cp = (task?.checkpoint ?? {}) as any;
+    const agent = await this.#activeRuntime().agent("bench", `b_${taskId}`);
+    const tools = await agent.harness.getTools(BACKGROUND_CONTEXT);
+    const entries = await agent.storage.scanEntries({ order: "desc", limit: 4 }, BACKGROUND_CONTEXT);
+    const execution = await agent.lane.inspectExecution(BACKGROUND_CONTEXT);
     return {
-      status: task?.status ?? null,
-      harness: this.#benchPolicy ? "hybrid" : "hybrid",
-      toolCount: Array.isArray(cp.tools) ? cp.tools.length : null,
-      toolNames: Array.isArray(cp.tools) ? cp.tools.map((t: any) => t.name) : null,
-      addresses: cp.addresses ?? null,
-      systemHead: String(cp.messages?.[0]?.content ?? "").slice(0, 400),
-      lastMessages: (cp.messages ?? []).slice(-4).map((m: any) => ({
-        role: m.role, content: String(m.content ?? "").slice(0, 300),
-        toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls).slice(0, 200) : undefined,
+      status: execution.current ? "running" : "idle",
+      model: execution.configuredModel,
+      toolCount: tools.length,
+      toolNames: tools.map((t: any) => t.name),
+      lastMessages: entries.reverse().map((e: any) => ({
+        type: e.type, role: e.message?.role,
+        content: JSON.stringify(e.message?.content ?? e.summary ?? null).slice(0, 300),
       })),
     };
   }
 
   /** Why is this object busy? Answers the only question that matters when an
-   *  alarm loop will not settle: which tasks still claim to have work. */
+   *  alarm loop will not settle: what the lane still thinks it is doing. */
   async benchDiag() {
     const rt = this.#activeRuntime();
     await rt.ready();
-    const pending = await rt.store.tasksWithPendingWork(20);
-    const rows: any[] = [];
-    for (const { tenantId, taskId } of pending) {
-      const t = await rt.store.loadTask(tenantId, taskId);
-      const evs = this.sql
-        .exec(`SELECT e.kind, e.sequence FROM events e WHERE e.tenant_id=? AND e.task_id=?
-               ORDER BY e.sequence DESC LIMIT 5`, tenantId, taskId).toArray();
-      const cur = this.sql
-        .exec("SELECT consumer, consumed_through FROM cursors WHERE tenant_id=? AND task_id=?", tenantId, taskId)
-        .toArray();
-      rows.push({ taskId, status: t?.status, generation: t?.generation,
-                  checkpointVersion: t?.checkpointVersion, cursors: cur,
-                  lastEvents: evs.map((e: any) => `${e.sequence}:${e.kind}`) });
+    const who = await this.owner();
+    const jobs = this.sql.exec(
+      "SELECT id, created_at, answered_at FROM pi_model_jobs ORDER BY created_at DESC LIMIT 10")
+      .toArray();
+    let execution: unknown = null;
+    if (who) {
+      execution = await (await rt.agent(who.tenantId, who.agentId))
+        .lane.inspectExecution(BACKGROUND_CONTEXT);
     }
-    const ob = this.sql.exec("SELECT kind, state, COUNT(*) n FROM outbox GROUP BY kind, state").toArray();
-    return { pendingCount: pending.length, pending: rows, outbox: ob,
-             alarm: await this.ctx.storage.getAlarm() };
+    return { owner: who, execution, modelJobs: jobs, alarm: await this.ctx.storage.getAlarm() };
+  }
+
+  /** The agent tables, which a bench object reuses one task at a time. Kept
+   *  apart from `benchPurge` because that also drops the meter, and the meter
+   *  has to survive the task boundary to measure a run. */
+  #clearTranscript() {
+    // Kept before it is cleared. Running on the object rather than in memory is
+    // supposed to leave a trace, and a task that wipes the previous task's
+    // transcript leaves exactly as little as the in-process runner did — the
+    // three failures in the last matrix were all in trial one, and by the time
+    // they were worth reading, trials two and three had overwritten them.
+    //
+    // The owner row still names the task being replaced: it is rewritten after
+    // this runs, not before.
+    try {
+      this.sql.exec(
+        "CREATE TABLE IF NOT EXISTS bench_archive(agent_id TEXT, seq INTEGER, body TEXT)");
+      const prev = this.sql.exec(
+        "SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+      if (prev?.agent_id) {
+        this.sql.exec(
+          "INSERT INTO bench_archive(agent_id, seq, body) SELECT ?, seq, body FROM pi_entries",
+          prev.agent_id);
+      }
+    } catch { /* nothing to keep is not a failure */ }
+    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
+      try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
+    }
+    // The cached runtime holds a built session over the rows just deleted.
+    this.#benchRuntime = null;
   }
 
   /** Bench state is disposable; contaminated state is worse than none. */
   async benchPurge() {
     await this.ctx.storage.deleteAlarm();
-    for (const t of ["events", "cursors", "waits", "outbox", "operations", "leases", "tasks", "mounts", "agents"]) {
+    for (const t of ["operations", "mounts", "agents", "agent_state", "approvals"]) {
       try { this.sql.exec(`DELETE FROM ${t} WHERE tenant_id='bench'`); } catch { /* table may lack the column */ }
     }
-    try { this.sql.exec("DELETE FROM leases"); } catch { /* no tenant column */ }
-    this.sql.exec("DELETE FROM bench_tasks");
-    this.sql.exec("DELETE FROM do_activity");
+    // The transcript is object-local and has no tenant column: a bench object
+    // holds nothing else, so clearing it is clearing the run.
+    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
+      try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
+    }
+    // Tolerant on purpose: purge is what you reach for when an object is in a
+    // state you do not understand, and it failing because a table was never
+    // created is the least useful moment for it to be strict.
+    for (const t of ["bench_tasks", "do_activity", "bench_archive"]) {
+      try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* never created */ }
+    }
     this.#benchRuntime = null;
     return { purged: true };
+  }
+
+  /** A finished task's transcript, after the next one has taken the object.
+   *  Without a task, what there is to ask for — an archive you cannot
+   *  enumerate is one you have to already know the answer to use. */
+  async benchTrajectory(taskId: string) {
+    if (!taskId || taskId === "null") {
+      try {
+        return {
+          archived: this.sql.exec(
+            "SELECT agent_id, COUNT(*) AS entries FROM bench_archive" +
+            " GROUP BY agent_id ORDER BY MIN(rowid) DESC").toArray(),
+        };
+      } catch { return { archived: [] }; }
+    }
+    try {
+      const rows = this.sql.exec(
+        "SELECT body FROM bench_archive WHERE agent_id=? ORDER BY seq ASC", `b_${taskId}`)
+        .toArray() as any[];
+      return { taskId, entries: entriesToEvents(rows.map((r) => JSON.parse(r.body))) };
+    } catch { return { taskId, entries: [] }; }
   }
 
   async benchResult(taskId: string) {
     const rt = this.#activeRuntime();
     await rt.ready();
-    const events = await rt.store.eventsSince("bench", `b_${taskId}`, 0, 500);
+    const agent = await rt.agent("bench", `b_${taskId}`);
+    const events = entriesToEvents(
+      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)) as any[];
     const usage = events.reduce(
       (a: any, e: any) => {
         const u = e.payload?.usage;
@@ -805,7 +904,7 @@ export class AgentDO extends DurableObject<Env> {
         return a;
       }, { prompt: 0, completion: 0, calls: 0 });
     const kinds = events.reduce((m: any, e: any) => ((m[e.kind] = (m[e.kind] ?? 0) + 1), m), {});
-    const r = await this.#benchState().result(taskId);
+    const r = await this.#benchState().result(`b_${taskId}`);
     return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds };
   }
 
@@ -894,9 +993,10 @@ export class AgentDO extends DurableObject<Env> {
       const stale = binding?.secretRef === OPERATOR_SECRET_REF &&
         (binding.model !== this.env.HARNESS_MODEL || binding.baseUrl !== this.env.DEEPSEEK_BASE_URL);
       if (!binding || stale) await rt.bindOperatorModel(tenantId, agentId);
-      if (!(await rt.store.loadTask(tenantId, taskId))) {
-        await rt.openTask(tenantId, agentId, taskId);
-      }
+      // The lane is the conversation, and this is where it comes into being:
+      // opening the agent reads the transcript back and reports anything the
+      // last eviction interrupted.
+      await rt.agent(tenantId, agentId);
       return { ok: true };
     });
   }
@@ -918,28 +1018,25 @@ export class AgentDO extends DurableObject<Env> {
       try { return Number((rows(`SELECT COUNT(*) AS n FROM ${t}`)[0] ?? {}).n ?? 0); }
       catch { return 0; }
     };
-    const tables = ["agents", "agent_state", "approvals", "connections", "counters", "cursors",
-      "events", "leases", "model_bindings", "mounts", "operations", "outbox", "quotas",
-      "snapshots", "tasks", "waits"];
+    const tables = ["agents", "agent_state", "approvals", "connections", "counters",
+      "model_bindings", "mounts", "operations", "quotas",
+      "pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"];
     return {
       tenantId, agentId, taskId,
       counts: Object.fromEntries(tables.map((t) => [t, count(t)])),
-      tasks: rows("SELECT * FROM tasks WHERE tenant_id=? AND agent_id=? ORDER BY updated_at DESC LIMIT 20",
-        tenantId, agentId),
-      outbox: rows(`SELECT command_id, kind, state, created_at, dispatched_at FROM outbox
-                     WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 40`, tenantId, taskId),
-      waits: rows("SELECT * FROM waits WHERE tenant_id=? AND task_id=? ORDER BY wait_id LIMIT 40",
-        tenantId, taskId),
-      cursors: rows("SELECT * FROM cursors WHERE tenant_id=? AND task_id=?", tenantId, taskId),
-      leases: rows("SELECT * FROM leases WHERE tenant_id=? AND task_id=?", tenantId, taskId),
+      // What the lane is doing, and what it is still owed. Leases, cursors and
+      // an outbox are gone: the object is single-threaded and pi's mutation
+      // line serialises, so there was never anything for them to protect here.
+      lane: rows("SELECT namespace, key, seq FROM pi_values WHERE namespace LIKE 'pi.%' LIMIT 40"),
+      modelJobs: rows(`SELECT id, created_at, answered_at, LENGTH(request) AS request_bytes
+                         FROM pi_model_jobs ORDER BY created_at DESC LIMIT 20`),
       operations: rows(`SELECT operation_id, tool, status, result_ref, created_at FROM operations
                          WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 40`,
         tenantId, taskId),
       approvals: rows("SELECT * FROM approvals WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 20",
         tenantId, taskId),
-      snapshots: rows(`SELECT through_sequence, LENGTH(state) AS bytes, state_version, created_at
-                         FROM snapshots WHERE tenant_id=? AND task_id=?
-                        ORDER BY through_sequence DESC LIMIT 20`, tenantId, taskId),
+      compactions: rows(`SELECT id, seq, timestamp, LENGTH(body) AS bytes FROM pi_entries
+                          WHERE type='compaction' ORDER BY seq DESC LIMIT 20`),
       mounts: rows("SELECT alias, plugin, tool_version, public_config, secret_ref, policy FROM mounts WHERE tenant_id=? AND agent_id=?",
         tenantId, agentId),
       connections: rows("SELECT alias, state, expires_at, updated_at FROM connections WHERE tenant_id=? AND agent_id=?",
@@ -956,7 +1053,7 @@ export class AgentDO extends DurableObject<Env> {
         // computes "is anything still out" its own way will disagree with the
         // thing it is meant to explain — and it did: it counted a `message.out`
         // that answers nothing as a command in flight.
-        outstanding: await rt.store.outstandingCommands(),
+        outstanding: Number((rows("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL")[0] ?? {}).n ?? 0),
         alarm: await this.ctx.storage.getAlarm(),
         alarmFailures: this.#alarmFailures(),
         activity: await this.activity(),
@@ -964,10 +1061,74 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
+  /**
+   * What is installed, what this agent has mounted, and which of it is real.
+   *
+   * Two different questions that the console used to answer by mixing: a
+   * plugin is code that is present, a mount is an authority this agent has
+   * been given. The same plugin mounted twice against two accounts is two
+   * mounts and one plugin, and a page that shows only one of the two cannot
+   * explain why a tool call was refused.
+   */
+  async uiPlugins(tenantId: string, agentId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const installed = rt.plugins();
+    const byId = new Map(installed.map((p) => [p.id, p]));
+    const mounts = await rt.store.listMounts(tenantId, agentId);
+
+    // Which tools this agent has actually reached for. A catalogue says what is
+    // possible; this says what happened.
+    const used: Record<string, number> = {};
+    try {
+      const agent = await rt.agent(tenantId, agentId);
+      const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+      for (const e of entries as any[]) {
+        const n = e.message?.role === "toolResult" ? e.message.toolName : null;
+        if (n) used[n] = (used[n] ?? 0) + 1;
+      }
+    } catch { /* an agent with no transcript yet has used nothing */ }
+
+    return {
+      installed: installed.map((p) => ({
+        id: p.id,
+        version: p.version,
+        credential: p.credential ?? null,
+        config: p.config ?? [],
+        tools: p.tools.map((t) => ({
+          name: t.name, summary: t.summary,
+          sideEffects: t.sideEffects, idempotency: t.idempotency,
+        })),
+      })),
+      mounts: await Promise.all(mounts.map(async (m) => {
+        const plugin = byId.get(m.plugin);
+        const conn = await rt.store.getConnection(tenantId, agentId, m.alias).catch(() => null);
+        return {
+          alias: m.alias,
+          plugin: m.plugin,
+          version: m.toolVersion,
+          account: (m.publicConfig as any)?.account ?? null,
+          // Whether an account is attached, never which one and never its value.
+          connected: !!m.secretRef,
+          needsAccount: plugin?.credential?.required ?? false,
+          optionalAccount: plugin?.credential ? !plugin.credential.required : false,
+          policy: m.policy ?? null,
+          config: m.publicConfig ?? {},
+          session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
+          problems: plugin
+            ? validateMount(plugin, m.publicConfig as any, m.secretRef).map((x) => x.message)
+            : [`no plugin named ${m.plugin} is installed`],
+          tools: (plugin?.tools ?? []).map((t) => `${m.alias}.${t.name}`),
+        };
+      })),
+      used,
+    };
+  }
+
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiCompact", async () => {
-      const r = await this.runtime().requestCompaction(tenantId, agentId, taskId);
+      const r = await this.runtime().requestCompaction(tenantId, agentId);
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
@@ -980,7 +1141,7 @@ export class AgentDO extends DurableObject<Env> {
     this.#claim(tenantId, agentId);
     return this.#busy("uiSay", async () => {
       const rt = this.runtime();
-      const r = await rt.postMessage(tenantId, agentId, taskId, text, mode);
+      const r = await rt.postMessage(tenantId, agentId, text, mode);
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
@@ -1005,36 +1166,35 @@ export class AgentDO extends DurableObject<Env> {
   async uiVersion(tenantId: string, agentId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
-    const row = this.sql.exec(
-      "SELECT MAX(sequence) AS s, COUNT(*) AS n FROM events WHERE tenant_id=? AND task_id=?",
-      tenantId, taskId).toArray()[0] as any;
-    const task = await rt.store.loadTask(tenantId, taskId);
-    return `${row?.s ?? 0}.${row?.n ?? 0}.${task?.status ?? "none"}.${task?.checkpointVersion ?? 0}`;
+    const row = this.sql.exec("SELECT MAX(seq) AS s, COUNT(*) AS n FROM pi_entries")
+      .toArray()[0] as any;
+    const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL")
+      .toArray()[0] as any;
+    return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}`;
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0) {
     const rt = this.runtime();
     await rt.ready();
-    const all = await rt.store.taskEvents(tenantId, taskId);
+    const agent = await rt.agent(tenantId, agentId);
+    const all = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
     const total = all.length;
     const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
-      sequence: e.sequence, kind: e.kind, payload: e.payload, createdAt: e.createdAt,
+      sequence: e.sequence, kind: e.kind, payload: e.payload,
+      createdAt: Number((e.payload as any)?.at ?? 0),
     }));
-    const task = await rt.store.loadTask(tenantId, taskId);
-    const pendingApproval = (await rt.store.listApprovals(tenantId, "pending"))
-      .some((a) => a.taskId === taskId);
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const pendingApproval = (await rt.store.listApprovals(tenantId, "pending")).length > 0;
     const busy: "thinking" | "waiting-for-approval" | null = pendingApproval
       ? "waiting-for-approval"
-      : task && !["completed", "failed"].includes(task.status)
-        ? "thinking"
-        : null;
+      : running ? "thinking" : null;
     // Approvals are keyed by operation so the trajectory can show a held call
     // where it happened, with who signed it, instead of in a separate panel.
     const byOp: Record<string, any> = {};
     for (const a of await rt.store.listApprovals(tenantId)) {
-      if (a.taskId === taskId) {
-        byOp[a.operationId] = { state: a.state, approver: a.approver, tool: `${a.mountAlias}.${a.tool}`, request: a.request };
-      }
+      byOp[a.operationId] = {
+        state: a.state, approver: a.approver, tool: `${a.mountAlias}.${a.tool}`, request: a.request,
+      };
     }
     return {
       total, shown: events.length, events, byOp, busy };
@@ -1043,7 +1203,7 @@ export class AgentDO extends DurableObject<Env> {
   async uiApprovals(tenantId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
-    return (await rt.store.listApprovals(tenantId)).filter((a) => a.taskId === taskId);
+    return rt.store.listApprovals(tenantId);
   }
 
   async uiDecide(tenantId: string, operationId: string, decision: "approved" | "denied", approver: string) {
@@ -1063,32 +1223,29 @@ export class AgentDO extends DurableObject<Env> {
       const rt = this.runtime();
       await rt.provision(tenantId, agentId);
       await rt.bindOperatorModel(tenantId, agentId);
-      const r = await rt.postMessage(tenantId, agentId, taskId, text);
+      const r = await rt.postMessage(tenantId, agentId, text);
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
   }
 
-  async taskState(tenantId: string, agentId: string, taskId: string) {
+  async taskState(tenantId: string, agentId: string, _taskId: string) {
     this.#claim(tenantId, agentId);
-    const rt = this.runtime();
-    await rt.ready();
-    const task = await rt.store.loadTask(tenantId, taskId);
-    const events = await rt.store.eventsSince(tenantId, agentId, 0, 200);
-    const answer = task && (task.checkpoint as any)?.done
-      ? (task.checkpoint as any).messages.at(-1).content
-      : null;
+    const agent = await this.runtime().agent(tenantId, agentId);
+    const events = entriesToEvents(
+      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const last = [...events].reverse()
+      .find((e) => e.kind === "model.response" && !(e.payload as any).toolCalls);
     return {
-      status: task?.status ?? null,
-      generation: task?.generation ?? null,
-      checkpointVersion: task?.checkpointVersion ?? null,
-      answer,
+      status: running ? "running" : "idle",
+      answer: running ? null : ((last?.payload as any)?.text ?? null),
       events: events.map((e) => ({
         sequence: e.sequence, kind: e.kind,
         usage: (e.payload as any)?.usage ?? undefined,
         jsStatus: (e.payload as any)?.status ?? undefined,
-        ops: (e.payload as any)?.acceptedOperationIds ?? undefined,
+        ops: (e.payload as any)?.operations ?? undefined,
       })),
     };
   }
@@ -1126,9 +1283,16 @@ export class AgentDO extends DurableObject<Env> {
       | { after: number; tenantId: string; agentId: string }
       | null;
     if (!cur) return;
-    const rt = this.runtime();
+    // The bench object has its own runtime; readying the tenant one would build
+    // a second harness over the same store and push from the wrong catalogue.
+    const rt = this.#activeRuntime();
     await rt.ready();
-    const events = await rt.store.eventsSince(cur.tenantId, cur.agentId, cur.after, 200);
+    // Asked for by cursor rather than read whole and filtered: a projection
+    // keeps the entry's own seq, so the database can do the skipping. On a long
+    // conversation the old form read the entire transcript on every push, and
+    // every push happens inside the object, which is billed for it.
+    const events = entriesToEvents(
+      await this.#entries(cur.tenantId, cur.agentId, cur.after + 1)).slice(0, 200);
     for (const e of events) {
       ws.send(JSON.stringify({ id: e.sequence, kind: e.kind, payload: e.payload }));
     }
@@ -1195,14 +1359,23 @@ export class AgentDO extends DurableObject<Env> {
         const rt = this.#activeRuntime();
         // Only work that runs inside this object; the queue looks after the
         // model call, awake or not.
-        const resent = await rt.sweepStale();
-        const { more } = await rt.drain(3);
+        // One object is one agent, so there is no sweep across tasks: the
+        // object either has a run in flight or it does not.
+        const who = await this.owner();
+        if (!who) { await this.ctx.storage.deleteAlarm(); return; }
+        const out = await rt.step(who.tenantId, who.agentId);
+        // A container that could not be handed back is billed for merely
+        // existing, so it is written down where diagnose can find it rather
+        // than left to be noticed on an invoice.
+        for (const f of out.releaseFailed ?? []) {
+          this.sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
+          this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", Date.now(), f.alias, f.error);
+        }
         await this.broadcast();
-        // Bounded work per invocation; if there is more, come back rather than
-        // holding one alarm open until the platform ends it.
-        if (more) await this.ctx.storage.setAlarm(Date.now() + 50);
-        else if (resent > 0 || (await rt.hasOffloadInFlight())) {
-          await this.ctx.storage.setAlarm(Date.now() + 30_000);
+        if (out.wakeInMs !== null) {
+          // The pass said when to come back — a retry has a time, a model call
+          // has a poll interval. Nothing here waits for either.
+          await this.ctx.storage.setAlarm(Date.now() + Math.max(50, out.wakeInMs));
         } else {
           // Genuinely idle: stand down rather than wake every 30s for ever.
           await this.ctx.storage.deleteAlarm();
@@ -1536,7 +1709,6 @@ export default {
     try {
       switch (url.pathname) {
         case "/storage": return Response.json(await stub.verifyStorage());
-        case "/conformance/kernel": return Response.json(await stub.runKernelSpec());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/agent/message": {
           const g = guardSpending(request, env);
@@ -1549,6 +1721,12 @@ export default {
           ));
         }
         case "/agent/events":
+        // The same stream, addressed to the benchmark's object. A benchmark
+        // that polls measures the poller: every poll is a request that wakes
+        // the object, and the deployed console does not poll — it is pushed to
+        // over a hibernatable socket, which costs the object nothing while it
+        // waits. Measuring the shipped path means using the shipped path.
+        case "/bench/events":
           return stub.fetch(request);
         case "/agent/state":
           return Response.json(await stub.taskState(
@@ -1583,6 +1761,8 @@ export default {
           return Response.json(await stub.benchPurge());
         case "/bench/debug":
           return Response.json(await stub.benchDebug(String(url.searchParams.get("taskId"))));
+        case "/bench/trajectory":
+          return Response.json(await stub.benchTrajectory(String(url.searchParams.get("taskId"))));
         case "/bench/result":
           return Response.json(await stub.benchResult(String(url.searchParams.get("taskId"))));
         case "/agent/activity":
@@ -1709,6 +1889,12 @@ export default {
             // panels on the right.
             ? trajectory(conversation(t.events), t.byOp, t.busy)
             : eventList(t.events));
+        }
+        case "/ui/plugins": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          return html(plugins(await stub.uiPlugins("demo", agentId)));
         }
         case "/ui/storage":
         case "/ui/memory":

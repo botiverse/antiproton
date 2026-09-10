@@ -139,8 +139,11 @@ export class ToolGateway {
    * Errors are swallowed on purpose: this runs after the work, and a mount that
    * cannot tidy up must not turn a finished task into a failed one.
    */
-  async releaseTask(ctx: CallContext): Promise<{ released: string[] }> {
+  async releaseTask(
+    ctx: CallContext,
+  ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
     const released: string[] = [];
+    const failed: Array<{ alias: string; error: string }> = [];
     for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
       const plugin = this.#plugins.get(mount.plugin);
       if (!plugin?.release) continue;
@@ -159,9 +162,14 @@ export class ToolGateway {
         // Only report what was actually holding something: a release log that
         // names every mount tells you nothing about what was costing anything.
         if (did !== false) released.push(mount.alias);
-      } catch { /* tidying up is best effort */ }
+      } catch (e) {
+        // Best effort, but not silent. Swallowing this is how a metered
+        // container stays alive with nothing left that would notice — the
+        // same failure, one layer up, that stopBox was fixed for.
+        failed.push({ alias: mount.alias, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      }
     }
-    return { released };
+    return { released, failed };
   }
 
   async invoke(

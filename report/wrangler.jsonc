@@ -1,0 +1,18 @@
+// The status report, served as a static page.
+//
+// A separate Worker on purpose. The production one sits behind Cloudflare
+// Access and its bundle is kept deliberately small; a public document has no
+// business widening either. Nothing here has a binding, a secret, or a route
+// into the agent.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-report",
+  "compatibility_date": "2026-09-05",
+  "workers_dev": true,
+  // A custom domain as well as workers.dev, because workers.dev is not reachable
+  // from every network the readers are on — which is the same reason the console
+  // sits on this zone rather than that one. Additive: a new subdomain, nothing
+  // touched that already exists.
+  "routes": [{ "pattern": "report.botiverse.dev", "custom_domain": true }],
+  "assets": { "directory": "./public" }
+}

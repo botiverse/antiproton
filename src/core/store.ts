@@ -24,7 +24,7 @@ export interface StateEntry {
 /**
  * The seam the plan (§7.1 / §15 risk #1) requires: the Runtime's transactional
  * path must be swappable, and a backend that does not pass the contract in
- * test/spec/kernel-spec.ts is not a candidate, whatever else it offers.
+ * the storage conformance suite is not a candidate, whatever else it offers.
  *
  * Two implementations keep the seam honest: SqliteStore in Node and
  * DurableObjectStore at the edge.

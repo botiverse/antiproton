@@ -3,31 +3,42 @@
  *
  * The first benchmark here that needs a real machine: a repository, its
  * dependencies, and its test suite. That is what the run9 mount is for, and it
- * is deliberately the only way the agent gets one — the QuickJS sandbox it
- * normally works in has no filesystem and no network, and nothing about that
- * changes for this benchmark. The box runs on someone else's machine and holds
- * none of our credentials, so an agent editing a repo there cannot reach the
- * gateway, the tenant's tokens, or anything else we hold.
+ * is deliberately the only way the agent gets one — the sandbox it normally
+ * works in has no filesystem and no network, and nothing about that changes for
+ * this benchmark. The box runs on someone else's machine and holds none of our
+ * credentials, so an agent editing a repo there cannot reach the gateway, the
+ * tenant's tokens, or anything else we hold.
  *
  * Scoring is SWE-bench's own: apply the official test patch, run the tests that
- * were failing, and require the ones that were passing to still pass.
+ * were failing, and require the ones that were passing to still pass. The
+ * agent's own claim that it fixed something is not evidence.
  *
- *   N=1 node --experimental-strip-types bench/swebench/run.ts
+ * What is different since the loop was replaced: there is no kernel to step and
+ * no command executor. The object-side runtime is `PiAgent`, driven exactly as
+ * an alarm drives it, and the model call goes through the same deferred port
+ * production uses — with a plain Node function where Cloudflare has a queue.
+ * The point of that is to measure the code that ships.
+ *
+ *   N=1 node bench/swebench/run.ts
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { SqliteStore } from "../../src/store/sqlite.ts";
-import { Kernel } from "../../src/runtime/kernel.ts";
-import { CommandExecutor } from "../../src/runtime/commands.ts";
+import { sqliteHost } from "../../src/store/sqlite-host.ts";
+import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { QuickJsExecutor } from "../../src/runtime/executor.ts";
-import { CodegenHarness, DEFAULT_COMPACTION } from "../../src/harness/codegen.ts";
-import { HybridHarness, qualifyMountedTools } from "../../src/harness/hybrid.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
+import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
+import { contextWindowFor } from "../../src/model/context-windows.ts";
+import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
+import { runJsTool, bridgeTools, type MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { run9Plugin } from "../../src/plugins/run9.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
+import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
+import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -36,14 +47,10 @@ for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").spl
 
 const N = Number(process.env.N ?? 1);
 const OFFSET = Number(process.env.OFFSET ?? 0);
-const MAX_TURNS = Number(process.env.MAX_TURNS ?? 30);
-/**
- * Which harness to measure. The deployment defaults to native tool calling, so
- * a benchmark that only ever exercises the other one is measuring a path
- * nobody runs. Fixed model, fixed instances, one variable.
- */
-const HARNESS = process.env.HARNESS === "hybrid" ? "hybrid" : "codegen";
-const CONTEXT_WINDOW = Number(process.env.HARNESS_CONTEXT_WINDOW ?? 131072);
+/** Wall clock, not turns. pi's harness stops when the model stops asking for
+ *  tools, so the guard that matters is how long one instance may take. */
+const BUDGET_MS = Number(process.env.BUDGET_MS ?? 900_000);
+const MODEL_ID = process.env.HARNESS_MODEL ?? "deepseek-v4-pro";
 
 interface Instance {
   instance_id: string; repo: string; base_commit: string;
@@ -78,10 +85,10 @@ const imageFor = (id: string) =>
 
 const model = new OpenAiCompatibleModel({
   baseUrl: process.env.DEEPSEEK_BASE_URL!, apiKey: process.env.DEEPSEEK_API_KEY!,
-  model: process.env.HARNESS_MODEL ?? "deepseek-v4-pro",
+  model: MODEL_ID,
 });
 
-const SYSTEM_EXTRA = `
+const POLICY = `
 You are fixing a bug in a Python repository checked out at /testbed.
 Use node.shell to explore and edit it — that is a real machine with git, python and the test suite.
 Work in small steps: read the failing code first, then make the smallest change that fixes it.
@@ -89,9 +96,52 @@ Do not modify test files; the graders supply their own.
 When the fix is in place, say so and stop.
 `.trim();
 
+/**
+ * What the queue does in production, as a function.
+ *
+ * The shape that matters is preserved, and it is the reason this is not simply
+ * an inline call: `dispatch` returns immediately, so `step()` is never blocked
+ * on the provider, and the answer arrives later through `deliver()` exactly as
+ * it does when a Worker hands it back. On Cloudflare the waiting happens in a
+ * Worker billed for CPU; here it happens on a promise nobody is awaiting.
+ */
+function nodeWorker(agentOf: () => PiAgent) {
+  let inFlight = 0;
+  let calls = 0;
+  return {
+    get inFlight() { return inFlight; },
+    get calls() { return calls; },
+    dispatch(jobId: string) {
+      const agent = agentOf();
+      const job = agent.takeJob(jobId) as any;
+      // Null means it was already answered — a second dispatch of the same job
+      // must not call the provider again.
+      if (!job) return;
+      inFlight += 1;
+      calls += 1;
+      const identity = {
+        api: String(job.model?.api ?? "offloaded"),
+        provider: String(job.model?.provider ?? "openai-compatible"),
+        id: String(job.model?.id ?? MODEL_ID),
+      };
+      void (async () => {
+        try {
+          const { messages, tools } = toRequest(job.context);
+          const r = await model.complete(messages, tools ? { tools } : {});
+          agent.deliver(jobId, fromResponse(r, identity));
+        } catch (e: any) {
+          agent.deliver(jobId, errorMessage(String(e?.message ?? e).slice(0, 300), identity));
+        } finally { inFlight -= 1; }
+      })();
+    },
+  };
+}
+
 async function runOne(inst: Instance) {
   const t0 = Date.now();
-  const T = "swe", AGENT = `a_${inst.instance_id}`.slice(0, 60), TASK = "t1";
+  const T = "swe", AGENT = `a_${inst.instance_id}`.slice(0, 60);
+
+  // The domain store: mounts, quotas, approvals. Unchanged by the new loop.
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent(T, AGENT);
@@ -121,62 +171,83 @@ async function runOne(inst: Instance) {
         : null;
     },
   });
-  const ctx = { tenantId: T, agentId: AGENT, taskId: TASK };
+  const ctx = { tenantId: T, agentId: AGENT, taskId: "main" };
   const host = { invoke: (c: any): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
 
-  const harness = HARNESS === "hybrid"
-    ? new HybridHarness({
-        maxTurns: MAX_TURNS, compaction: DEFAULT_COMPACTION, contextWindow: CONTEXT_WINDOW,
-      })
-    : new CodegenHarness({
-        maxTurns: MAX_TURNS, compaction: DEFAULT_COMPACTION, contextWindow: CONTEXT_WINDOW,
-      });
+  // The catalogue, built the way the deployment builds it, so the benchmark
+  // measures the code that runs rather than a second wiring of its own.
   const mounted = await store.listMounts(T, AGENT);
   const byId = new Map(plugins.map((pl) => [pl.id, pl]));
-  await store.createTask(T, AGENT, TASK, await harness.initialize({
-    mounts: mounted.map((m) => ({
-      alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: {} })),
-    // The native harness needs the catalogue; the other ignores it. Supplied the
-    // same way the deployment supplies it, so the benchmark measures the code
-    // that runs rather than a second wiring of its own.
-    tools: qualifyMountedTools(mounted.flatMap((m) =>
-      (byId.get(m.plugin)?.tools ?? []).map((t) => ({
-        name: t.name, description: t.summary, parameters: t.parameters,
-        address: `${m.alias}.${t.name}`,
-      })),
-    )),
-    policy: SYSTEM_EXTRA,
-  }), harness.stateVersion);
+  /**
+   * The catalogue, minus the one tool that can destroy the evidence.
+   *
+   * `run9.release` says it destroys the container and stops the meter, so an
+   * agent tidying up at the end of a task calls it — and it is right to, in
+   * production. Here the grader runs *after* the agent, in the same box, so a
+   * released container means grading a fresh one from the base image: no diff,
+   * every test still failing, and a spurious zero that looks exactly like the
+   * model being wrong. It cost one instance before it was noticed.
+   *
+   * The runner owns the container's lifetime, so the agent is not offered it.
+   */
+  const OWNED_BY_THE_RUNNER = new Set(["node.release"]);
+  const tools: MountedTool[] = mounted.flatMap((m) =>
+    (byId.get(m.plugin)?.tools ?? []).map((t) => ({
+      name: t.name, description: t.summary, parameters: t.parameters,
+      address: `${m.alias}.${t.name}`,
+      sideEffects: t.sideEffects, idempotency: t.idempotency,
+      exclusive: byId.get(m.plugin)?.exclusive,
+    }))).filter((t) => !OWNED_BY_THE_RUNNER.has(t.address));
 
-  const commands = new CommandExecutor(store, model, host, new QuickJsExecutor());
-  const kernel = new Kernel(store, harness, { holder: "swe", leaseTtlMs: 900_000 });
-
-  await store.appendEvent({
-    tenantId: T, agentId: AGENT, taskId: TASK, kind: "message",
-    payload: { text: `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}` },
+  const holder: { agent?: PiAgent } = {};
+  const w = nodeWorker(() => holder.agent!);
+  const agent = await PiAgent.open({
+    host: sqliteHost(),
+    sessionId: `${T}/${AGENT}`,
+    systemPrompt: systemPrompt({ policy: POLICY, sandbox: true }),
+    model: { provider: "openai-compatible", id: MODEL_ID, contextWindow: contextWindowFor(MODEL_ID) },
+    tools,
+    toolHost: host,
+    dispatch: async (jobId) => { w.dispatch(jobId); },
   });
+  holder.agent = agent;
+  // The sandbox is a tool like any other, added the same way the object adds
+  // it: run_js is the one tool whose body is the runtime rather than a plugin.
+  agent.harness.setTools([
+    ...bridgeTools(tools, host),
+    runJsTool(new QuickJsExecutor() as any, host),
+  ] as any, CTX);
 
-  let steps = 0;
-  for (; steps < 200; steps++) {
-    const r = await kernel.step(T, TASK, null, (cmd) => commands.dispatch(ctx, cmd));
-    if (r.outcome === "no_work") break;
-    const t = await store.loadTask(T, TASK);
-    if (t && ["completed", "failed", "blocked"].includes(t.status)) break;
+  await agent.say(
+    `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}`);
+
+  // Exactly the alarm's job: one pass, then come back when it said to.
+  let passes = 0;
+  while (Date.now() - t0 < BUDGET_MS) {
+    const out = await agent.step();
+    passes += 1;
+    // Idle only counts when nothing is still out: a pass can find no open
+    // operation while the provider is mid-answer.
+    if (out.wakeInMs === null && w.inFlight === 0) break;
+    await new Promise((r) => setTimeout(r, Math.max(200, Math.min(out.wakeInMs, 2_000))));
   }
   const agentSeconds = Math.round((Date.now() - t0) / 1000);
 
+  const entries = await agent.storage.scanEntries({ order: "asc" }, CTX);
+  const modelTurns = entries.filter((e: any) =>
+    e.type === "message" && e.message?.role === "assistant" && e.message?.stopReason !== "deferred").length;
+  const toolTurns = entries.filter((e: any) =>
+    e.type === "message" && e.message?.role === "toolResult").length;
+
   // A run that ends in one turn is not a model being bad at the task, it is the
   // loop stopping — and without this the benchmark reports a failed instance
-  // and no reason. Set TRACE=1 to see what was actually said.
-  const evs = await store.taskEvents(T, TASK);
-  const modelTurns = evs.filter((e) => e.kind === "model.response").length;
+  // and no reason.
   if (process.env.TRACE === "1" || modelTurns <= 2) {
-    const t = await store.loadTask(T, TASK);
     console.log(`  \x1b[33m[trace] ${inst.instance_id}: ${modelTurns} model turn(s), ` +
-      `task ended ${t?.status}\x1b[0m`);
-    for (const e of evs.slice(-6)) {
-      const d = JSON.stringify(e.payload).slice(0, 300).replace(/\\n/g, " ");
-      console.log(`    ${e.sequence} ${e.kind}: ${d}`);
+      `${toolTurns} tool result(s), ${passes} passes\x1b[0m`);
+    for (const e of entries.slice(-6) as any[]) {
+      const d = JSON.stringify(e.message ?? e.summary ?? e).slice(0, 300).replace(/\\n/g, " ");
+      console.log(`    ${e.seq} ${e.type}: ${d}`);
     }
   }
 
@@ -184,8 +255,6 @@ async function runOne(inst: Instance) {
   const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
   const f2p: string[] = JSON.parse(inst.FAIL_TO_PASS);
   const p2p: string[] = JSON.parse(inst.PASS_TO_PASS);
-  // Passing means the named tests pass and pytest reports no failures; the
-  // agent's own claim that it fixed something is not evidence.
   const grade = async (ids: string[]) => {
     if (!ids.length) return { ok: true, out: "(none)" };
     const res: any = await gw.invoke(ctx, "node.shell", {
@@ -199,40 +268,99 @@ async function runOne(inst: Instance) {
     const tail = out.split("\n").slice(-3).join(" ");
     return { ok: /\d+ passed/.test(tail) && !/\d+ (failed|error)/.test(tail), out };
   };
-  const diffRes: any = await gw.invoke(ctx, "node.shell", { command: "cd /testbed && git diff --stat | tail -3" });
+  const diffRes: any = await gw.invoke(ctx, "node.shell",
+    { command: "cd /testbed && git diff --stat | tail -3" });
   const fail = await grade(f2p.slice(0, 12));
   const pass = await grade(p2p.slice(0, 12));
-  await gw.releaseTask(ctx);
+  // A box that outlives its run is billed for existing, and this benchmark
+  // starts one per instance. Silence here is how thirteen of them were once
+  // found alive.
+  const release = await gw.releaseTask(ctx);
+  for (const f of release.failed) {
+    console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
+  }
+  // A suspended turn is recorded as an assistant message carrying the handle
+  // and no content, so counting every message with a `usage` field counts each
+  // model call once for the answer and once for every poll that found it not
+  // ready — 85 where there were 17.
+  const usage = entries.reduce((a: any, e: any) => {
+    const m = e.message;
+    if (m?.role !== "assistant" || m.stopReason === "deferred") return a;
+    a.calls += 1;
+    a.prompt += m.usage?.input ?? 0;
+    a.out += m.usage?.output ?? 0;
+    // What the provider served from cache rather than re-read. It is the
+    // number that decides what a long run actually costs, and reporting
+    // prompt tokens without it overstates the bill several times over.
+    a.cached += m.usage?.cacheRead ?? 0;
+    return a;
+  }, { calls: 0, prompt: 0, out: 0, cached: 0 });
+
+  /**
+   * Which tools were used, and how often.
+   *
+   * `run_js` earns its place only by replacing several calls with one, so a
+   * total that lumps it in with everything else cannot say whether it did.
+   * Reported separately for that reason, not for completeness.
+   */
+  const byTool: Record<string, number> = {};
+  for (const e of entries as any[]) {
+    const name = e.message?.role === "toolResult" ? e.message.toolName : null;
+    if (name) byTool[name] = (byTool[name] ?? 0) + 1;
+  }
+
+  // Read after release: a session is written into the mount's connection state
+  // when the box is handed back, precisely so the meter outlives the box.
+  const meter = await readMeter(store, T, AGENT, ["node"], Date.now() - t0, {
+    promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
+  });
+
+  // Closed last, and after the meter: the container's session lives in the
+  // store, so closing it first threw the measurement away.
+  await agent.close();
   await store.close();
 
-  const usage = commands.trace.filter((x) => x.kind === "model")
-    .reduce((a: any, x: any) => ({ calls: a.calls + 1, prompt: a.prompt + (x.detail.prompt ?? 0),
-                                   out: a.out + (x.detail.completion ?? 0) }), { calls: 0, prompt: 0, out: 0 });
   return {
     id: inst.instance_id, resolved: fail.ok && pass.ok,
     failToPass: fail.ok, passToPass: pass.ok,
     diff: String(diffRes.result?.output ?? "").trim().split("\n").pop() ?? "",
-    seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, ...usage,
+    seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, modelTurns, toolTurns,
+    modelCalls: w.calls, byTool, meter, ...usage,
     failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
   };
 }
 
-console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), model ` +
-  `${process.env.HARNESS_MODEL ?? "deepseek-v4-pro"}, harness ${HARNESS}\n  ${"─".repeat(80)}`);
+console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), model ${MODEL_ID}, ` +
+  `harness pi\n  ${"─".repeat(80)}`);
 const out: any[] = [];
 for (const inst of instances) {
   console.log(`  ${inst.instance_id}  (${inst.repo})`);
   let r;
   try { r = await runOne(inst); }
-  catch (e) { r = { id: inst.instance_id, resolved: false, error: (e as Error).message.slice(0, 200),
-                    seconds: 0, calls: 0, prompt: 0, out: 0 }; }
+  catch (e) {
+    r = { id: inst.instance_id, resolved: false, error: (e as Error).message.slice(0, 200),
+          seconds: 0, calls: 0, prompt: 0, out: 0 };
+  }
   out.push(r);
   const mark = r.resolved ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-  console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.prompt} tok` +
+  const tools = Object.entries(r.byTool ?? {})
+    .sort((a: any, b: any) => b[1] - a[1]).map(([n, c]) => `${n}×${c}`).join(" ");
+  const cachePct = r.prompt ? Math.round((r.cached / r.prompt) * 100) : 0;
+  const RATES = ratesFromEnv();
+  console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.prompt} tok ` +
+    `(${cachePct}% cached)` + (tools ? `  [${tools}]` : "") +
     (r.diff ? `  diff: ${r.diff}` : "") + (r.error ? `  ERROR ${r.error}` : ""));
+  if (r.meter) console.log(`      ${meterLine(r.meter, RATES)}`);
   if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
 }
 const solved = out.filter((r) => r.resolved).length;
+const totals = out.reduce((a: any, r: any) => {
+  for (const [n, c] of Object.entries(r.byTool ?? {})) a.tools[n] = (a.tools[n] ?? 0) + (c as number);
+  return { ...a, prompt: a.prompt + (r.prompt ?? 0), cached: a.cached + (r.cached ?? 0) };
+}, { prompt: 0, cached: 0, tools: {} as Record<string, number> });
 console.log(`  ${"─".repeat(80)}\n  resolved ${solved}/${out.length}   ` +
   `${out.reduce((a, r) => a + r.seconds, 0)}s total   ` +
-  `${out.reduce((a, r) => a + (r.prompt ?? 0), 0)} prompt tokens\n`);
+  `${totals.prompt} prompt tokens ` +
+  `(${totals.prompt ? Math.round((totals.cached / totals.prompt) * 100) : 0}% served from cache)\n` +
+  `  tools: ${Object.entries(totals.tools).sort((a: any, b: any) => b[1] - a[1])
+    .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}\n`);

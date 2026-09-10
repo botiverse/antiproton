@@ -72,7 +72,16 @@ export class BenchState {
     );
   }
 
-  /** The domain plugin, resolved per task from the caller's identity. */
+  /**
+   * The domain plugin, resolved per task from the caller's identity.
+   *
+   * Keyed by agent, not by task. The pi loop reports one lane per agent and
+   * names it `main` in every plugin context, so keying on `taskId` filed every
+   * task's writes under the same row while the runner asked for its own — the
+   * agent processed both exchanges, said so, and scored zero writes. One bench
+   * agent is one task here, so the agent id is the identity that is actually
+   * per-task.
+   */
   plugin(): Plugin {
     const shape = retailPlugin({ products: {}, users: {}, orders: {} } as RetailDB, []);
     return {
@@ -80,10 +89,10 @@ export class BenchState {
       version: shape.version,
       tools: shape.tools,
       invoke: async (tool, args, ctx) => {
-        const st = await this.state(ctx.caller.taskId);
+        const st = await this.state(ctx.caller.agentId);
         const before = st.performed.length;
         const out = await retailPlugin(st.db, st.performed).invoke(tool, args, ctx);
-        if (st.performed.length !== before) this.#persist(ctx.caller.taskId, st);
+        if (st.performed.length !== before) this.#persist(ctx.caller.agentId, st);
         return out;
       },
     };

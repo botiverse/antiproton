@@ -5,7 +5,12 @@ This product includes design work derived from pi (pi-mono), specifically the
 structure of context compaction, the practice of pushing an agent's working set
 into the prompt rather than relying on recall, the separation of steering from
 aborting, and per-model configuration of context windows and provider quirks.
-No source code has been copied; where that changes, the notice below covers it.
+
+It also includes source derived from pi: the usage arithmetic in
+src/store/pi-storage.ts (emptyUsage, addUsage) follows pi's
+harness/utils/usage.js, which its export map does not publish. The same file
+implements pi's durable Storage contract, and test/pi-storage.ts runs pi's own
+storage conformance suite against it.
 
   pi — https://github.com/badlogic/pi-mono
   MIT License, Copyright (c) 2025 Mario Zechner
