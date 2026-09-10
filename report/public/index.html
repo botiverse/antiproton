@@ -1,4 +1,4 @@
-<title>Antiproton Harness Status</title>
+<title>Antiproton Benchmarks</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
@@ -161,215 +161,165 @@ footer a{color:var(--accent)}
 <div class="wrap">
 
 <header class="mast">
-  <div class="eyebrow">Harness status &middot; 10 September 2026</div>
-  <h1>The loop is pi&rsquo;s now</h1>
-  <p class="standfirst">The agent loop was replaced with pi&rsquo;s harness and the machinery it replaced was deleted. This is what the thing is, what has been verified, and what is still open.</p>
+  <div class="eyebrow">Antiproton &middot; measurement record &middot; 10 September 2026</div>
+  <h1>What has actually been measured</h1>
+  <p class="standfirst">Every benchmark this project has run, what each one can tell you, and the three it cannot answer yet. Numbers are measured, never estimated.</p>
   <div class="mast-meta">
-    <span><b>deployed</b> antiproton.botiverse.dev</span>
+    <span><b>harness</b> pi-agent-core 0.85.1</span>
     <span><b>model</b> deepseek-flash</span>
-    <span><b>upstream</b> pi-agent-core 0.85.1</span>
-    <span><b>branch</b> pi-storage &middot; PR #1</span>
+    <span><b>substrate</b> Cloudflare Durable Objects</span>
   </div>
 </header>
 
 <div class="thesis">
-  <p>Cloudflare bills a Durable Object for <b>wall clock</b>, with no exemption for time spent awaiting network I/O. A model completion is roughly 94&thinsp;% waiting.</p>
-  <p>That single fact decides the architecture. The model call has to leave the object, which is why the queue exists and why it stayed. pi&rsquo;s <span class="fig">drive()</span> calls the model itself &mdash; the two look incompatible until you notice pi already has a protocol for work it is not doing: answer <span class="fig">stopReason:&nbsp;"deferred"</span> with a durable handle, suspend, come back for it. It was built for provider batch APIs. Here the thing holding the work is our queue, and the harness cannot tell.</p>
+  <p><b>Read the noise before reading the numbers.</b></p>
+  <p>Two runs of the same commit, on the same model, over the same three instances both scored 3&thinsp;/&thinsp;3 and differed by a third in cost: <span class="fig">1,071&thinsp;s / 813&thinsp;k</span> against <span class="fig">690&thinsp;s / 550&thinsp;k</span>. Nothing changed between them but the reporting code. A single instance is a coin flip &mdash; <span class="fig">astropy-12907</span> has passed alone, failed in a slice, and passed twice since, all on the same commit.</p>
+  <p>Three instances measure that the loop runs. They do not measure how good it is, and no figure on this page should be read as a trend.</p>
 </div>
 
 <section>
-  <h2>Who owns what</h2>
-  <p class="sec-note">the split the system already ran on; pi&rsquo;s API is cut along the same lines</p>
-  <div class="own">
-    <div><span class="who">the object</span><span class="what">State and order. One Durable Object per <code>(tenant, agent)</code>, its SQLite object-local.</span></div>
-    <div><span class="who">the alarm</span><span class="what">Time. It calls <code>step()</code> once and comes back when <code>drive()</code> said to.</span></div>
-    <div><span class="who">the queue</span><span class="what">Work in flight. It holds the model call so the object is not billed for the wait.</span></div>
-    <div><span class="who">the worker</span><span class="what">Waiting. Billed for CPU, and awaiting I/O costs none.</span></div>
-  </div>
+  <h2>SWE-bench Verified</h2>
+  <p class="sec-note">does the loop work a real problem end to end &middot; 3 astropy instances, official scoring</p>
   <div class="col">
-    <p><code>accept()</code> is a pure write: a person&rsquo;s message is durable before anything is answered. <code>drive()</code> is the pass that does I/O, and it returns <code>waiting</code> rather than blocking. Nothing needs a lease or a fencing token &mdash; a Durable Object is single-threaded and pi&rsquo;s mutation line serialises the writes, so there was never a second writer for them to protect against.</p>
+    <p>The only benchmark here that needs a real machine: a repository, its dependencies and its test suite. The agent gets one through the run9 mount, which is deliberately the only way it can &mdash; the sandbox it normally works in has no filesystem and no network. Scoring is SWE-bench&rsquo;s own: apply the official test patch, require the failing tests to pass and the passing ones to still pass. The agent&rsquo;s claim to have fixed something is not evidence.</p>
   </div>
-</section>
 
-<section>
-  <h2>What it cost in code</h2>
-  <p class="sec-note">measured against master, counting src/ cf/src/ test/ bench/</p>
-  <div class="delta">
-    <div class="minus"><span class="num">&minus;3,934</span><span class="cap">net lines</span></div>
-    <div class="plus"><span class="num">+2,888</span><span class="cap">added</span></div>
-    <div class="minus"><span class="num">&minus;6,822</span><span class="cap">deleted</span></div>
-    <div class="plus"><span class="num">85</span><span class="cap">cases, 12 suites</span></div>
-  </div>
   <div class="scroll">
   <table>
-    <thead><tr><th>deleted</th><th class="n">lines</th><th>why it is gone</th></tr></thead>
+    <thead><tr>
+      <th>run</th><th>loop</th><th>model</th><th class="n">resolved</th>
+      <th class="n">wall</th><th class="n">prompt tok</th><th>note</th>
+    </tr></thead>
     <tbody>
-      <tr><td class="k">src/runtime/kernel.ts</td><td class="n">280</td><td>Leases, fencing, generations, checkpoint versions &mdash; protecting against a second writer that never existed.</td></tr>
-      <tr><td class="k">src/harness/codegen.ts</td><td class="n">889</td><td>Our compaction, and six rounds of patches teaching a model to stop inventing tool-call syntax.</td></tr>
-      <tr><td class="k">src/harness/hybrid.ts</td><td class="n">555</td><td>The harness those fed.</td></tr>
-      <tr><td class="k">src/runtime/commands.ts</td><td class="n">229</td><td>A transactional outbox for work that is now a function call.</td></tr>
-      <tr><td class="k">src/runtime/replay.ts</td><td class="n">57</td><td>Folding an event log the state no longer needs.</td></tr>
-      <tr><td class="k">13 test suites</td><td class="n">3,361</td><td>They tested the mechanism above.</td></tr>
-      <tr><td class="k">6 benchmark drivers</td><td class="n">1,135</td><td>They drove the kernel directly.</td></tr>
+      <tr><td class="n">1</td><td>codegen</td><td class="k">v4-pro</td><td class="n">1&thinsp;/&thinsp;3</td>
+        <td class="n">699&thinsp;s</td><td class="n">307&thinsp;k</td>
+        <td>Both failures ended after <b>one model call</b>.</td></tr>
+      <tr><td class="n">2</td><td>pi</td><td class="k">v4-pro</td><td class="n">1&thinsp;/&thinsp;1</td>
+        <td class="n">262&thinsp;s</td><td class="n">167&thinsp;k</td>
+        <td>Single instance &mdash; the one run&nbsp;1 failed in one call.</td></tr>
+      <tr><td class="n">3</td><td>pi</td><td class="k">v4-pro</td><td class="n">2&thinsp;/&thinsp;3</td>
+        <td class="n">1,044&thinsp;s</td><td class="n">1,647&thinsp;k</td>
+        <td>The clean loop comparison: one variable against run&nbsp;1.</td></tr>
+      <tr><td class="n">4</td><td>pi</td><td class="k">flash</td><td class="n">3&thinsp;/&thinsp;3</td>
+        <td class="n">1,071&thinsp;s</td><td class="n">813&thinsp;k</td>
+        <td>First run on the deployed model.</td></tr>
+      <tr class="total"><td class="n">5</td><td>pi</td><td class="k">flash <span class="pill ok">deployed</span></td>
+        <td class="n">3&thinsp;/&thinsp;3</td><td class="n">690&thinsp;s</td><td class="n">550&thinsp;k</td>
+        <td>Same commit as run&nbsp;4. Instrumented.</td></tr>
     </tbody>
   </table>
   </div>
+
   <div class="col">
-    <p>The transcript is the state now. A step used to rewrite the whole conversation as one JSON blob; one harness put a 447-tool catalogue in it and rewrote 211&nbsp;KB of unchanging text per step. An entry is a row, and a step writes one.</p>
+    <p>Only runs&nbsp;1 and&nbsp;3 compare loops &mdash; same model, one variable, 1&thinsp;/&thinsp;3 to 2&thinsp;/&thinsp;3. The score is not the interesting part of that. Both instances the old loop failed ended after a <b>single model call</b>: the model never got to attempt the task, the loop simply stopped. That was the failure mode six rounds of patches in the old harness had been papering over, and it is why the token cost rose &mdash; the new loop is doing work the old one was not.</p>
   </div>
-</section>
 
-<section>
-  <h2>What we depend on, by how it fails</h2>
-  <p class="sec-note">pi is pre-1.0 &middot; the pin is exact &middot; docs/pi-upstream.md</p>
-  <div class="tiers">
-    <div class="tier loud">
-      <h3>Imported symbols</h3>
-      <p class="how">fails at the build</p>
-      <p>Four entry points: the package root, <code>harness/session</code>, <code>harness/context</code>, and <code>harness/session/testing</code> for tests, plus <code>pi-ai</code> for the provider contract. If one moves, nothing compiles.</p>
-    </div>
-    <div class="tier quiet">
-      <h3>Copied source</h3>
-      <p class="how">fails silently</p>
-      <p>Two pieces, both re-diffed on every upgrade because neither would fail to compile:</p>
-      <ul>
-        <li><code>emptyUsage</code> / <code>addUsage</code>, from a module pi&rsquo;s export map does not publish.</li>
-        <li>Scan, cursor and stop-order semantics, written against pi&rsquo;s in-memory reference.</li>
-      </ul>
-    </div>
-    <div class="tier worst">
-      <h3>Behavioural contracts</h3>
-      <p class="how">fails silently, and worst</p>
-      <p>Nothing imports these. Nothing types them. Everything rests on them &mdash; so each one now has a test, and an upgrade that changes one fails here rather than on a tenant.</p>
-      <ul>
-        <li><code>drive()</code> returns rather than blocks on a deferred response. This is the cost model.</li>
-        <li>A not-ready <code>fetchDeferred</code> answers with the same handle.</li>
-        <li>The inbox drains at <code>accept()</code> &mdash; not on a timer, not on <code>drive()</code>.</li>
-        <li><code>create()</code> starts no timers and reports what the last process left open. This is the whole of crash recovery; there is no sweeper any more.</li>
-        <li><code>Storage.commit</code> is all-or-nothing across entries, values, lists and usage.</li>
-      </ul>
-    </div>
-  </div>
-</section>
-
-<section>
-  <h2>Where we differ from pi on purpose</h2>
-  <p class="sec-note">not drift &mdash; each has a reason and a test</p>
-  <div class="scroll">
-  <table>
-    <thead><tr><th>divergence</th><th>why</th><th>pinned by</th></tr></thead>
-    <tbody>
-      <tr><td>The provider has no non-deferred path.</td><td>An object that awaits a completion pays for the provider&rsquo;s latency.</td><td class="k">pi-offload</td></tr>
-      <tr><td><code>step()</code> polls only when an answer already exists.</td><td>pi records what the provider says, and &ldquo;not ready&rdquo; is something it said &mdash; right for a batch API. Ours is a table in the same object, so asking cost a transcript row for nothing.</td><td class="k">pi-agent</td></tr>
-      <tr><td>A <code>steer</code> on an idle lane starts a run.</td><td>pi&rsquo;s front end is a TUI that knows the lane&rsquo;s state. An HTTP request does not, and the page sends every message as a steer.</td><td class="k">pi-agent</td></tr>
-    </tbody>
-  </table>
-  </div>
-</section>
-
-<section>
-  <h2>What is verified</h2>
-  <p class="sec-note">contract, then behaviour, then quality &mdash; each can hold while the next fails</p>
-  <div class="col">
-    <p><b>The storage contract is not ours.</b> <code>createStorageConformance</code> ships inside pi as runner-independent cases, and all 21 run unchanged on node:sqlite and on real Durable Object storage. They cover what our own tests would not have, because our own tests encode our own assumptions: mixed-write atomicity, rollback across four tables, cursor before limit, admission order under concurrent commits, and a <code>close</code> that seals admission while still draining what it admitted. That last one failed first &mdash; the implementation re-checked the closed flag inside work it had already accepted, which is the opposite of the promise <code>close</code> makes.</p>
-  </div>
-  <div class="suites" id="suites"></div>
-  <div class="col">
-    <p>The load-bearing loop cases are negative, because the properties that matter are things that must <i>not</i> happen: a pass never waits for a model, twenty passes while an answer is out add nothing to the transcript, and a run interrupted by eviction is reported open on the next <code>open()</code> and driven to completion.</p>
-  </div>
-</section>
-
-<section id="bench-section">
-  <h2>What it does on real work</h2>
-  <p class="sec-note">SWE-bench Verified &middot; same three astropy instances each time</p>
+  <h3 style="font-size:1.05rem;font-weight:600;margin:2.25rem 0 .2rem">Run 5, per instance</h3>
+  <p class="sec-note">the only run with tool and cache instrumentation</p>
   <div class="scroll">
   <table>
     <thead><tr>
       <th>instance</th><th class="n">wall</th><th class="n">model calls</th>
-      <th class="n">prompt tok</th><th class="n">cached</th><th>tools</th>
+      <th class="n">prompt tok</th><th class="n">cached</th><th>tools</th><th>patch</th>
     </tr></thead>
     <tbody>
       <tr><td class="k">astropy-12907</td><td class="n">205&thinsp;s</td><td class="n">10</td>
-        <td class="n">62,422</td><td class="n">91&thinsp;%</td><td class="k">shell&times;9</td></tr>
+        <td class="n">62,422</td><td class="n">91&thinsp;%</td><td class="k">shell&times;9</td>
+        <td class="k">1 file, +1 &minus;1</td></tr>
       <tr><td class="k">astropy-13033</td><td class="n">222&thinsp;s</td><td class="n">14</td>
-        <td class="n">134,336</td><td class="n">93&thinsp;%</td><td class="k">shell&times;16</td></tr>
+        <td class="n">134,336</td><td class="n">93&thinsp;%</td><td class="k">shell&times;16</td>
+        <td class="k">1 file, +11 &minus;3</td></tr>
       <tr><td class="k">astropy-13236</td><td class="n">263&thinsp;s</td><td class="n">22</td>
-        <td class="n">353,057</td><td class="n">95&thinsp;%</td><td class="k">shell&times;28</td></tr>
-      <tr class="total"><td>3&thinsp;/&thinsp;3 resolved</td><td class="n">690&thinsp;s</td><td class="n">46</td>
-        <td class="n">549,815</td><td class="n">94&thinsp;%</td><td class="k">shell&times;53</td></tr>
+        <td class="n">353,057</td><td class="n">95&thinsp;%</td><td class="k">shell&times;28</td>
+        <td class="k">2 files, +4 &minus;8</td></tr>
+      <tr class="total"><td>3&thinsp;/&thinsp;3</td><td class="n">690&thinsp;s</td><td class="n">46</td>
+        <td class="n">549,815</td><td class="n">94&thinsp;%</td><td class="k">shell&times;53</td><td></td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p><b>Two figures matter more than the score.</b></p>
-    <p>The first is <b>cache</b>. Reporting prompt tokens alone overstates the bill by more than ten times: of 549,815 tokens, about 33,000 were actually re-read. An append-only transcript is what earns that &mdash; each turn adds to the tail and leaves the prefix untouched, which is exactly the shape a provider cache rewards. It was not measured until this run.</p>
-    <p>The second is <b>zero <code>run_js</code></b>, across all three instances and 53 tool calls. The sandbox is offered every turn and the agent never reached for it. The honest reading is not that it is useless: this task is shell work inside a container, and <code>run_js</code> earns its place by replacing several calls with one. This benchmark is not the shape that tests it, and nothing here says whether it pays elsewhere.</p>
-  </div>
-
-  <h3 style="font-size:1.05rem;font-weight:600;margin:2rem 0 .2rem">How much of this is noise</h3>
-  <p class="sec-note">two runs, identical code, identical model</p>
-  <div class="scroll">
-  <table>
-    <thead><tr><th>run</th><th class="n">resolved</th><th class="n">wall</th><th class="n">model calls</th><th class="n">prompt tok</th></tr></thead>
-    <tbody>
-      <tr><td>first</td><td class="n">3&thinsp;/&thinsp;3</td><td class="n">1,071&thinsp;s</td><td class="n">57</td><td class="n">813&thinsp;k</td></tr>
-      <tr><td>second</td><td class="n">3&thinsp;/&thinsp;3</td><td class="n">690&thinsp;s</td><td class="n">46</td><td class="n">550&thinsp;k</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <div class="col">
-    <p>Same commit, same model, only the reporting changed between them. The score held; the cost did not, by a third. That is the size of the noise, and it is worth knowing before reading any single number on this page as a trend.</p>
-  </div>
-
-  <h3 style="font-size:1.05rem;font-weight:600;margin:2rem 0 .2rem">Against the loop it replaced</h3>
-  <div class="scroll">
-  <table>
-    <thead><tr><th>loop</th><th>model</th><th class="n">resolved</th><th class="n">wall</th><th class="n">prompt tok</th></tr></thead>
-    <tbody>
-      <tr><td>the previous harness</td><td class="k">deepseek-v4-pro</td><td class="n">1&thinsp;/&thinsp;3</td><td class="n">699&thinsp;s</td><td class="n">307&thinsp;k</td></tr>
-      <tr><td>pi&rsquo;s loop</td><td class="k">deepseek-v4-pro</td><td class="n">2&thinsp;/&thinsp;3</td><td class="n">1,044&thinsp;s</td><td class="n">1,647&thinsp;k</td></tr>
-      <tr class="total"><td>pi&rsquo;s loop</td><td class="k">deepseek-flash <span class="pill ok">deployed</span></td><td class="n">3&thinsp;/&thinsp;3</td><td class="n">690&thinsp;s</td><td class="n">550&thinsp;k</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <div class="col">
-    <p>Only the first two rows compare loops &mdash; one variable, same model. The third changes the model as well, and is here because it is what the deployment runs.</p>
-    <p>The score is not the interesting number either. Both instances the old loop failed ended after <b>one model call</b>: it was not the model failing the task, it was the loop stopping. The new one works them for ten to twenty-two turns.</p>
-    <p>A single instance is a coin flip. <code>astropy-12907</code> has passed alone, failed in a slice, and passed twice since &mdash; all with the same code. Three instances measure that the loop runs, not how good it is.</p>
+    <p><b>94&thinsp;% of prompt tokens came from the provider&rsquo;s cache.</b> Reporting the gross figure overstates the bill by more than ten times &mdash; of 549,815 tokens, roughly 33,000 were actually re-read. An append-only transcript is what earns it: a turn adds to the tail and leaves the prefix untouched, which is the shape a cache rewards. Every token figure recorded before run&nbsp;5 is a gross number.</p>
+    <p><b><code>run_js</code> was used zero times</b>, across three instances and 53 tool calls. The sandbox is offered on every turn and the agent never reached for it. The honest reading is not that it is useless: this task is shell work inside a container, and <code>run_js</code> earns its place by replacing several calls with one. It says this benchmark does not test it, and nothing here says whether it pays elsewhere.</p>
   </div>
 </section>
 
 <section>
-  <h2>Still open</h2>
+  <h2>Everything measured, and what it measures</h2>
+  <p class="sec-note">grouped by the question each one answers</p>
+  <div class="tiers">
+    <div class="tier loud">
+      <h3>SWE-bench Verified</h3>
+      <p class="how">answered &middot; 3 instances &middot; 5 runs</p>
+      <p>Whether the loop can carry a multi-turn task on a real machine to a graded result. Currently 3&thinsp;/&thinsp;3 on the deployed model. Three instances is a sample, not a submission.</p>
+    </div>
+    <div class="tier loud">
+      <h3>pi storage conformance</h3>
+      <p class="how">answered &middot; 21 / 21, two backends</p>
+      <p>Not ours: <code>createStorageConformance</code> ships inside pi and runs unchanged on node:sqlite and on real Durable Object storage. It covers what our own tests would not, because ours encode our own assumptions &mdash; mixed-write atomicity, rollback across four tables, cursor before limit, admission order under concurrent commits. A contract, not a benchmark.</p>
+    </div>
+    <div class="tier loud">
+      <h3>Substrate probes</h3>
+      <p class="how">answered &middot; on real infrastructure</p>
+      <p>Measured on Cloudflare rather than read from documentation. The load-bearing one: a Durable Object is billed for wall clock with no exemption for network I/O, and a completion is ~94&thinsp;% waiting. That single fact is why the model call leaves the object &mdash; <span class="fig">40.8&thinsp;s billed against 709.2&thinsp;s waited</span> over 79 calls.</p>
+    </div>
+    <div class="tier quiet">
+      <h3>AppWorld &mdash; credential custody</h3>
+      <p class="how">a property, not a score &middot; needs a licensed install</p>
+      <p>9 apps, 457 APIs, <b>362 of them (79&thinsp;%) behind an access token</b>. Nine end-to-end cases assert that no schema mentions <code>access_token</code>, the credential-reading tool is not mounted, an authenticated call succeeds without the agent ever logging in, and the token never appears in a tool result. It measures what the model <i>cannot</i> see, so there is no pass rate to report.</p>
+    </div>
+    <div class="tier worst">
+      <h3>&tau;&sup2;-bench</h3>
+      <p class="how">not run on this loop</p>
+      <p>Tool calling under a domain policy. The only figure this project ever recorded &mdash; <span class="fig">8&thinsp;/&thinsp;8 vs 7&thinsp;/&thinsp;8 vs 5&thinsp;/&thinsp;8</span> over 8 tasks &mdash; compared the <i>old</i> harnesses and survives only in a code comment. The driver has been deleted rather than left broken, and nothing on this page says how the current loop behaves under a policy.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>What these numbers do not cover</h2>
   <div class="scroll">
   <table>
-    <thead><tr><th>what</th><th>state</th><th>note</th></tr></thead>
+    <thead><tr><th>gap</th><th>state</th><th>why it matters</th></tr></thead>
     <tbody>
-      <tr><td>&tau;&sup2;-bench, AppWorld</td><td><span class="pill open">unported</span></td><td>They drove the old harness directly and measure tool-calling breadth rather than the loop.</td></tr>
-      <tr><td>Existing conversations</td><td><span class="pill open">not carried over</span></td><td>The old rows are untouched; the console reads pi entries now.</td></tr>
-      <tr><td>Stale model bindings</td><td><span class="pill open">harmless</span></td><td>Agents bound before the switch still name the withdrawn model, which the provider aliases to <code>deepseek-flash</code>. An alias is not a contract.</td></tr>
-      <tr><td>Merge</td><td><span class="pill open">PR #1 open</span></td><td>Production runs the branch. <code>git checkout master &amp;&amp; wrangler deploy</code> is the way back.</td></tr>
+      <tr><td>&tau;&sup2;-bench on the current loop</td><td><span class="pill open">unported</span></td>
+        <td>Nothing measures tool calling under a domain policy, which is the shape most real deployments have.</td></tr>
+      <tr><td>AppWorld on the current loop</td><td><span class="pill open">unported</span></td>
+        <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
+      <tr><td>Anything that exercises <code>run_js</code></td><td><span class="pill open">no benchmark</span></td>
+        <td>The sandbox went unused in 53 tool calls. Whether it pays is untested either way.</td></tr>
+      <tr><td>Sample size</td><td><span class="pill open">n = 3</span></td>
+        <td>Run-to-run cost varies by a third at this size. Scores at n = 3 cannot separate a better loop from a luckier one.</td></tr>
+      <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
+        <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
     </tbody>
   </table>
   </div>
 </section>
 
+<section>
+  <h2>Reproducing this</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>what</th><th>command</th></tr></thead>
+    <tbody>
+      <tr><td>SWE-bench, deployed model</td><td class="k">HARNESS_MODEL=deepseek-flash N=3 node bench/swebench/run.ts</td></tr>
+      <tr><td>&hellip; a single instance, with a trace</td><td class="k">N=1 TRACE=1 node bench/swebench/run.ts</td></tr>
+      <tr><td>Storage contract, in process</td><td class="k">npm run pi-storage</td></tr>
+      <tr><td>&hellip; on real Durable Object storage</td><td class="k">npm run pi-storage:do</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="col">
+    <p>The benchmark starts one container per instance and hands it back when the run ends. If a release fails it now says so per instance &mdash; silence there is how two boxes were once found still running, one of them from an instance that had finished cleanly.</p>
+  </div>
+</section>
+
 <footer>
-  Generated from the repository at the commit deployed on 10 September 2026.
-  Numbers are measured, not estimated; where a figure is a single sample it says so.<br>
-  pi is MIT, &copy; 2025 Mario Zechner &mdash; see <code>NOTICE</code> and <code>docs/pi-upstream.md</code>.
+  Measured between 9 and 10 September 2026 against the commit deployed at
+  antiproton.botiverse.dev. Where a figure is a single sample the page says so.<br>
+  SWE-bench Verified &copy; Princeton NLP &middot; AppWorld &copy; Stony Brook NLP &middot;
+  pi is MIT, &copy; 2025 Mario Zechner.
 </footer>
 
 </div>
-
-<script>
-const SUITES = [
-  ["pi-storage",21],["executor",9],["http-plugin",10],["markdown",7],
-  ["state",7],["model-binding",6],["pi-agent",6],["pi-tools",6],
-  ["pi-bridge",4],["pi-loop",3],["pi-offload",3],["release",3],
-];
-document.getElementById("suites").innerHTML = SUITES.map(
-  ([n,c]) => `<div class="suite"><span class="nm">${n}</span><span class="ct">${c}</span></div>`
-).join("");
-</script>
