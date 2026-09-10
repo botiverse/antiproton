@@ -313,97 +313,25 @@ implementing pi's interface rather than copying its design.
 | `model-binding` | 6 | whose key an agent spends |
 
 Benchmarks are not tests and are reported separately, because they measure a
-model as much as a harness. SWE-bench Verified, same three astropy instances,
-same model (`deepseek-v4-pro`), one variable — the loop:
+model as much as a harness. SWE-bench Verified, the same three astropy
+instances each time:
 
-| | resolved | wall clock | prompt tokens |
-|---|---|---|---|
-| the previous harness | 1/3 | 699 s | 307 k |
-| pi's loop | **2/3** | 1,044 s | 1,647 k |
+| | model | resolved | wall clock | prompt tokens |
+|---|---|---|---|---|
+| the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k |
+| pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k |
+| pi's loop | **deepseek-flash** *(deployed)* | **3/3** | 1,071 s | 813 k |
 
-The interesting number is not the score. Both instances the old loop failed
+Only the first two rows compare loops; the third changes the model as well, and
+is here because it is what the deployment actually runs.
+
+The score is not the interesting number. Both instances the old loop failed
 ended after **one model call** — it was not the model failing the task, it was
-the loop stopping. The new one works them for 17 and 59 turns, which is why it
-costs five times the tokens: it is doing five times the work. On the one
-instance both solved, it is cheaper — 282 s and 174 k against 489 s and 304 k.
+the loop stopping. The new one works them for eleven to fifty-nine turns.
 
-A single instance is a coin flip: `astropy-12907` passed on its own and failed
-in the slice, same code, same model. Three instances measure that the loop
-runs, not how good it is.
-| `appworld` | 9 | credential custody at 457 APIs (needs a licensed install) |
-
-Live on the deployment, against the Durable Object rather than sqlite:
-[`/conformance/executor`](https://antiproton.botiverse.workers.dev/conformance/executor) 9/9,
-plus `/isolation`, `/eviction`, `/model-binding`.
-
-## Layout
-
-```
-src/core/         seams: store, execution, tools, types
-src/runtime/      kernel, gateway, command executor, sandbox, model resolver
-src/harness/      two harnesses; a task keeps the one that opened it
-src/plugins/      plugin contract; http, artifacts, agent state, run9 sandbox, AppWorld
-src/store/        sqlite, durable-object
-cf/               Cloudflare deployment: worker, durable object, queue consumer, console
-bench/            SWE-bench Verified
-test/             suites; test/spec/ is backend-agnostic
-```
-
-## Try it
-
-<https://antiproton.botiverse.dev/ui> — behind Cloudflare Access, owner only.
-
-It is a debugging console, not a demo. The chat is one panel; the other half is
-an inspector: the trajectory, the raw event log beneath it (when the two
-disagree the log wins), every table this object holds, what the agent has
-written down, what the sandbox cost, and the runtime.
-
-Four things are drawn rather than listed, because they are invisible in rows. A
-timeline places every event by when it happened, so a stall reads as an empty
-stretch rather than two adjacent rows with distant timestamps — which is exactly
-how the stalls in this runtime kept hiding. A stacked bar per model call splits
-cached prompt from fresh prompt from completion, which is the number that
-decides what a task costs and appears nowhere else. A pair of bars puts billed
-in-object time against the wait moved off the meter. And container sessions are
-drawn with a live one in red against the finished ones, because "still running"
-is the thing that should look wrong.
-
-Steps show the gap since the previous step, not the time since the task began:
-a number that only grows answers nothing, and a pause is a gap.
-
-Ask it to change something (`Deploy version 2.0.0 to api-01`). Reads run
-freely; the write stops at the gate, the panel shows the request verbatim, and
-approving it resumes the agent — which never saw a credential at any point.
-Ask it to remember something, then open a new task and ask about it. Type while
-it is working and the message reaches the model before its next call without
-stopping anything in flight; **after** holds the same message until it has
-finished. Its own reasoning is folded away under each turn.
-
-Everything that starts a real agent fails closed: the demo needs an Access
-identity, and the workers.dev address — which bypasses Access entirely —
-requires an automation secret instead. The read-only diagnostics stay open
-because they call no provider and cost nothing:
-[`/isolation`](https://antiproton.botiverse.workers.dev/isolation),
-[`/eviction`](https://antiproton.botiverse.workers.dev/eviction).
-
-## Running
-
-```bash
-npm run pi-storage          # pi's storage conformance, node:sqlite — 21 cases
-npm run pi-storage:do       # the same 21, on real Durable Object storage
-npm run pi-agent            # the object-side loop, end to end against a fake worker
-npm run pi-offload          # the object never waits for the model
-node test/executor.ts       # sandbox contract, in-process
-node test/state.ts          # memory that survives a task
-cd cf && npx wrangler deploy
-```
-
-The executor contract runs against the Durable Object rather than in-process by
-fetching `/conformance/executor` on the
-deployment; nothing about them is Node-specific.
-
-AppWorld needs a licensed local install; see [`bench/appworld/README.md`](bench/appworld/README.md).
-Its catalogue is **not** committed — that data may only be redistributed encrypted.
+A single instance is a coin flip: `astropy-12907` passed alone, failed in a
+slice, and passed again on another model, all with the same code. Three
+instances measure that the loop runs, not how good it is.
 
 ## What was taken from elsewhere
 
