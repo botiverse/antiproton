@@ -9,5 +9,8 @@ sits behind Cloudflare Access, and a public document should not be the thing
 that widens either its bundle or its auth surface. This one has no bindings, no
 secrets and no route into the agent.
 
-Every figure on the page is measured. Where a number is a single sample, the
-page says so.
+Every figure on the page is measured, and "measured" means on the real
+serverless environment — the Durable Object — not a Node process or in-memory
+SQLite. Where a figure came from anywhere else it is labelled as in-process,
+and not presented in place of an on-object one. Where a number is a single
+sample, the page says so.
