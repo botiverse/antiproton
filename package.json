@@ -6,9 +6,11 @@
     "node": ">=24"
   },
   "scripts": {
-    "conformance": "node test/conformance.ts"
+    "conformance": "node test/conformance.ts",
+    "pi-storage": "node test/pi-storage.ts"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.85.1",
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {

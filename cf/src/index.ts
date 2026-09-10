@@ -16,6 +16,8 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { kernelSpec } from "../../test/spec/kernel-spec.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
+import { createStorageConformance } from "@earendil-works/pi-agent-core/harness/session/testing";
+import { PiSqliteStorage } from "../../src/store/pi-storage.ts";
 import {
   AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, type ModelJob,
 } from "./runtime.ts";
@@ -287,6 +289,47 @@ export class AgentDO extends DurableObject<Env> {
       ms: Date.now() - t0,
     };
     return results;
+  }
+
+  /**
+   * pi's own storage conformance, against Durable Object storage.
+   *
+   * The suite is written by the people who defined the interface, and it runs
+   * here for the same reason the kernel spec does: the Node run proves the
+   * class is correct, and only this one proves it is correct on the storage it
+   * will actually live on. Each case gets an empty session — the object owns
+   * one database, so a fresh fixture means dropping the tables rather than
+   * opening a new file.
+   */
+  async runPiStorageSpec() {
+    const t0 = Date.now();
+    const wipe = () => {
+      for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"]) {
+        this.sql.exec(`DROP TABLE IF EXISTS ${t}`);
+      }
+    };
+    const cases = createStorageConformance(async () => {
+      wipe();
+      return {
+        storage: new PiSqliteStorage(this.ctx.storage as any),
+        async [Symbol.asyncDispose]() { wipe(); },
+      };
+    });
+    const results: Array<{ group: string; name: string; ok: boolean; error?: string }> = [];
+    for (const c of cases) {
+      try { await c.run(); results.push({ group: c.group, name: c.name, ok: true }); }
+      catch (e: any) {
+        results.push({ group: c.group, name: c.name, ok: false, error: String(e?.message ?? e) });
+      }
+    }
+    wipe();
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
   }
 
   /** The kernel contract, unchanged, against Durable Object storage. */
@@ -1538,6 +1581,7 @@ export default {
         case "/storage": return Response.json(await stub.verifyStorage());
         case "/conformance/kernel": return Response.json(await stub.runKernelSpec());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
+        case "/conformance/pi-storage": return Response.json(await stub.runPiStorageSpec());
         case "/agent/message": {
           const g = guardSpending(request, env);
           if (g) return g;

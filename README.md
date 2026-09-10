@@ -292,6 +292,7 @@ backend and every sandbox.
 |---|---|---|
 | `spec/kernel-spec` | 31 | crash before/after commit, fencing, stale generation, lost wakeup, duplicate delivery, cross-tenant, connection state, quotas (incl. no double-spend under concurrency), replay, snapshots and pruning, policy per mount, approval held then performed exactly once, and an oversized checkpoint shrunk before it is refused |
 | `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
+| `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite and on Durable Object storage: mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
 | `strand` | 11 | a waiting task is never unreachable: giving up is visible, a message rescues a stranded task but never bypasses an approval, the turn budget refills, foreign call syntax is translated, a command that answers nothing is still retired |
 | `compaction` | 10 | the handover is asked for and folded back, the second pass updates rather than restarts, tool output is truncated, the record survives in the log, thresholds scale with the model's window |
 | `api` · `harness` · `steering` | 32 | HTTP surface, harness decisions, steering and follow-up |
@@ -412,10 +413,26 @@ specific rather than atmospheric:
 memory — `AGENTS.md` is configuration and does not learn — and for redacting
 secrets before anything is written down.
 
-What is deliberately *not* borrowed is the shape of the agent loop itself.
-These are local, single-tenant tools where a shell is a reasonable thing to
-hand a model; almost everything in `src/runtime/` exists because this one is
-neither.
+- **The durable storage contract.** `src/store/pi-storage.ts` implements pi's
+  `Storage` interface on SQLite, and `test/pi-storage.ts` runs pi's own
+  `createStorageConformance` suite against it — 21 cases, unchanged, on both
+  node:sqlite and Durable Object storage. Implementing someone else's interface
+  buys an executable specification for the part of a session store that is
+  hardest to test honestly: mixed-write atomicity, rollback across four tables,
+  cursor-before-limit ordering, admission order under concurrent commits. Our
+  own tests encode our own assumptions, which is exactly why they would not have
+  caught these. The usage arithmetic in that file is derived from pi's
+  `harness/utils/usage.js`, which its export map does not publish.
+
+That last item revises what this section used to say. It claimed the shape of
+the agent loop was deliberately not borrowed, because pi was a local,
+single-tenant tool where a shell is a reasonable thing to hand a model. As of
+0.85 that is no longer true: `pi-agent-core` splits durable admission
+(`accept`) from an I/O pass (`drive`), and describes its unit of change as "one
+effect-free decision made on a lane's serialized mutation line" — the same split
+`src/runtime/kernel.ts` arrived at independently. The storage layer is adopted;
+whether the loop above it follows is open, and is not settled by borrowing the
+layer beneath it.
 
 [pi]: https://github.com/badlogic/pi-mono
 [codex]: https://developers.openai.com/codex
