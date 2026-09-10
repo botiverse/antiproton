@@ -299,6 +299,12 @@ Contracts, not assertions in prose. The storage contract runs unchanged against
 both backends, and it is not ours — it ships with pi, which is the point of
 implementing pi's interface rather than copying its design.
 
+**The measurement standard: a figure counts as measured only when it was taken
+on the real serverless environment** — the Durable Object, not a Node process
+and not in-memory SQLite. A number from anywhere else is reported only if it is
+labelled as in-process, and never in place of an on-object one. This is why the
+SWE-bench rows below say which environment produced them.
+
 | Suite | Cases | Covers |
 |---|---|---|
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
@@ -313,17 +319,24 @@ implementing pi's interface rather than copying its design.
 | `model-binding` | 6 | whose key an agent spends |
 
 Benchmarks are not tests and are reported separately, because they measure a
-model as much as a harness. SWE-bench Verified, the same three astropy
+model as much as a harness. Each row says which environment produced it: only
+the on-object ones meet the standard above, and the in-process ones are marked
+as such. SWE-bench Verified, the same three astropy
 instances each time:
 
-| | model | resolved | wall clock | prompt tokens |
-|---|---|---|---|---|
-| the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k |
-| pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k |
-| pi's loop | **deepseek-flash** *(deployed)* | **3/3** | 690 s | 550 k (94% cached) |
+| | model | resolved | wall clock | prompt tokens | measured in |
+|---|---|---|---|---|---|
+| the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k | Node process, in-memory SQLite |
+| pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k | Node process, in-memory SQLite |
+| pi's loop | **deepseek-flash** *(deployed model)* | **3/3** | 690 s | 550 k (94% cached) | Node process, in-memory SQLite |
+
+All three rows are **in-process**: SWE-bench grades through an endpoint the
+object does not yet expose, so none of them meet the measurement standard above
+and none is a deployment figure. Moving them onto the object is the next
+change; until then they detect direction, not cost.
 
 Only the first two rows compare loops; the third changes the model as well, and
-is here because it is what the deployment actually runs.
+is here because it is the model the deployment runs.
 
 Prompt tokens alone overstate the bill by more than ten times: of the 550 k in
 the last row, about 33 k were actually re-read. An append-only transcript earns
