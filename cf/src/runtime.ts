@@ -394,12 +394,12 @@ export class AgentRuntime {
     mode: "prompt" | "steer" | "followUp" = "prompt",
   ) {
     const agent = await this.agent(tenantId, agentId);
-    const busy = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
-    // A message while nothing is running starts a run; while something is
-    // running it joins the one in flight rather than racing it.
-    const effective = mode === "prompt" && busy ? "steer" : mode;
-    const res: any = await agent.say(text, effective);
-    return { mode: effective, queued: effective !== "prompt", result: res };
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const res: any = await agent.say(text, mode);
+    // What actually happened, not what was asked for: `say` decides from the
+    // lane's state, and the page shows the difference.
+    const landed = mode === "followUp" ? "followUp" : running ? "steer" : "prompt";
+    return { mode: landed, queued: landed !== "prompt", result: res };
   }
 
   /** One pass, which is all an alarm should ever do. */

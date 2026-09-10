@@ -70,6 +70,21 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS pi_meta (name TEXT PRIMARY KEY, body TEXT NOT NULL)`,
 ];
 
+/**
+ * Create the tables if they are not there yet.
+ *
+ * Exported because the object reads some of them directly — the console's
+ * change check is one cheap `MAX(seq)` rather than building a session — and
+ * those reads happen before anyone has opened an agent. Leaving creation to
+ * this class's constructor made the console's first load depend on the order
+ * two unrelated things happened in, which is not a dependency worth having:
+ * every panel answered 500 on an agent that had not yet spoken, and the page
+ * simply spun.
+ */
+export function ensurePiTables(sql: SqlHost["sql"]) {
+  for (const stmt of SCHEMA) sql.exec(stmt);
+}
+
 const CLOSED = "pi storage is closed";
 
 /**
@@ -121,7 +136,7 @@ export class PiSqliteStorage implements Storage {
   constructor(host: SqlHost, opts: { now?: () => number } = {}) {
     this.#host = host;
     this.#now = opts.now ?? (() => Date.now());
-    for (const stmt of SCHEMA) host.sql.exec(stmt);
+    ensurePiTables(host.sql);
   }
 
   #all(q: string, ...b: unknown[]): any[] { return this.#host.sql.exec(q, ...b).toArray(); }

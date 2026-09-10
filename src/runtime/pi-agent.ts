@@ -24,13 +24,28 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
-import { PiSqliteStorage, type SqlHost } from "../store/pi-storage.ts";
+import { PiSqliteStorage, ensurePiTables, type SqlHost } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort } from "../model/pi-offloaded.ts";
 import { bridgeTools, type MountedTool, type ToolHost } from "./pi-tools.ts";
 
 const JOBS = `CREATE TABLE IF NOT EXISTS pi_model_jobs (
   id TEXT PRIMARY KEY, request TEXT NOT NULL, answer TEXT,
   created_at INTEGER NOT NULL, answered_at INTEGER)`;
+
+/**
+ * Every table an agent keeps, created together.
+ *
+ * The console reads some of them directly, because its change check should be
+ * one cheap `MAX(seq)` and not a whole session build — and those reads happen
+ * before anyone has opened an agent. Creating them lazily made the first page
+ * load depend on the order two unrelated things happened in, and the page
+ * simply spun: every panel answered 500. Fixing one table found the second, so
+ * they are now one call with one home.
+ */
+export function ensureAgentTables(sql: SqlHost["sql"]) {
+  ensurePiTables(sql);
+  sql.exec(JOBS);
+}
 
 export const LANE = "main";
 
@@ -91,7 +106,7 @@ export class PiAgent {
    * the whole recovery mechanism.
    */
   static async open(opts: PiAgentOptions): Promise<PiAgent> {
-    opts.host.sql.exec(JOBS);
+    ensureAgentTables(opts.host.sql);
     const storage = new PiSqliteStorage(opts.host, opts.now ? { now: opts.now } : {});
     const session = new StorageBackedSession(
       { id: opts.sessionId, createdAt: (opts.now ?? Date.now)(), storageVersion: 1 },
@@ -204,10 +219,23 @@ export class PiAgent {
 
   // ---- the two things a request handler and an alarm actually do -----------
 
-  /** A person's message. A pure write: durable before anything is answered. */
+  /**
+   * A person's message. A pure write: durable before anything is answered.
+   *
+   * Steering means "reach the model before its next call", which is only a
+   * thing to do while there is a next call. On an idle lane a steer is a
+   * message queued against a run that will never start, and from the page —
+   * where every message is sent as a steer, because usually the agent is
+   * working — that made the first thing anyone typed vanish silently.
+   *
+   * So the lane decides, not the caller: join the run in flight if there is
+   * one, start a run if there is not. `followUp` is the one mode that means
+   * something on an idle lane and is left alone.
+   */
   async say(text: string, mode: "prompt" | "steer" | "followUp" = "prompt") {
-    if (mode === "steer") return this.#lane.steer(text, undefined, CTX);
     if (mode === "followUp") return this.#lane.followUp(text, undefined, CTX);
+    const running = (await this.#lane.inspectExecution(CTX)).current !== null;
+    if (running) return this.#lane.steer(text, undefined, CTX);
     return this.#lane.accept({ kind: "prompt", prompt: text }, CTX);
   }
 

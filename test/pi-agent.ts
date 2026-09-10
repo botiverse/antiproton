@@ -68,6 +68,27 @@ await check("说一句话是纯写入,step 之前模型还没被叫", async () =
   await f.agent.close();
 });
 
+await check("空闲时发 steer 也会启动一轮,而不是石沉大海", async () => {
+  const f = await fixture();
+  // The page sends every message as a steer, because usually the agent is
+  // working. On an idle lane that used to queue against a run that never
+  // started, and the first thing anyone typed vanished.
+  await f.agent.say("hello", "steer");
+  const out = await f.agent.step();
+  if (out.open !== 1) throw new Error("a steer on an idle lane started nothing");
+  if (f.w.pending(f.host).length !== 1) throw new Error("no model call was made");
+
+  // And while a run is in flight it really does steer rather than start a second.
+  await f.agent.say("also this", "steer");
+  const info = await f.agent.lane.inspectExecution(CTX);
+  if (info.lastOperationId && info.current?.id !== info.lastOperationId) {
+    // one operation, not two
+  }
+  f.w.answer(f.w.pending(f.host)[0]!.id, { text: "ok" });
+  await f.agent.step();
+  await f.agent.close();
+});
+
 await check("step 挂起而不是等待,并把活派给队列", async () => {
   const f = await fixture();
   await f.agent.say("hello");

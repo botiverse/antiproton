@@ -22,6 +22,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
+import { ensureAgentTables } from "../../src/runtime/pi-agent.ts";
 import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -258,6 +259,10 @@ export class AgentDO extends DurableObject<Env> {
       checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
     // What Cloudflare bills this object for: wall clock while it is active.
     this.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
+    // Everything an agent keeps, from this object's first breath. The console
+    // reads some of it directly for its change check, which happens long
+    // before anyone opens an agent.
+    ensureAgentTables(this.sql as any);
     // The bench runtime has to survive eviction: an alarm on a fresh instance
     // must rebuild the same harness, not fall back to the default one.
     this.sql.exec("CREATE TABLE IF NOT EXISTS bench_config(k TEXT PRIMARY KEY, v TEXT)");
@@ -889,8 +894,10 @@ export class AgentDO extends DurableObject<Env> {
       const stale = binding?.secretRef === OPERATOR_SECRET_REF &&
         (binding.model !== this.env.HARNESS_MODEL || binding.baseUrl !== this.env.DEEPSEEK_BASE_URL);
       if (!binding || stale) await rt.bindOperatorModel(tenantId, agentId);
-      // Nothing to open: the lane is the conversation and it is created on
-      // first use, from storage, by rt.agent().
+      // The lane is the conversation, and this is where it comes into being:
+      // opening the agent reads the transcript back and reports anything the
+      // last eviction interrupted.
+      await rt.agent(tenantId, agentId);
       return { ok: true };
     });
   }
