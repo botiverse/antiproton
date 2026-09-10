@@ -702,6 +702,11 @@ export class AgentDO extends DurableObject<Env> {
       extraPlugins: [this.#benchState().plugin()],
       maxTurns: 40,
       policy,
+      // What the Node runner offers, and nothing else. The deployed console has
+      // a sandbox; the Node τ² arm never did, and running the object arm with
+      // one meant the two arms differed by a tool and a page of prompt while
+      // being reported as the same measurement.
+      sandbox: false,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#benchRuntime;
@@ -712,9 +717,21 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("benchStart", async () => {
       this.sql.exec(
         "INSERT INTO bench_config(k,v) VALUES ('policy',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", policy);
-      const rt = this.#benchRt(policy);
       const agentId = `b_${taskId}`;
       await this.#benchState().reset(agentId);
+      // A task starts on an empty transcript, because in production it would.
+      //
+      // pi's tables are object-local and carry no agent column, which is right
+      // when one object is one agent — the invariant this whole design rests on.
+      // A bench object breaks it deliberately: it hosts each task in turn so the
+      // meter stays in one place. Without this, it also hosts each task's
+      // conversation on top of the last one's. Task 7 of a run opened with 67
+      // user messages already in context, the first of them task 0's, and the
+      // agent was answering a customer from six conversations ago — 821k tokens
+      // for an eight-turn task, and four failures scored against a harness that
+      // was working exactly as designed.
+      this.#clearTranscript();
+      const rt = this.#benchRt(policy);
       // The alarm is what advances a run, and it asks the object who it serves.
       // Without this the bench agent existed, held a prompt and was never
       // stepped: 303s of the runner polling an object that had nothing to do.
@@ -802,6 +819,17 @@ export class AgentDO extends DurableObject<Env> {
     return { owner: who, execution, modelJobs: jobs, alarm: await this.ctx.storage.getAlarm() };
   }
 
+  /** The agent tables, which a bench object reuses one task at a time. Kept
+   *  apart from `benchPurge` because that also drops the meter, and the meter
+   *  has to survive the task boundary to measure a run. */
+  #clearTranscript() {
+    for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
+      try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
+    }
+    // The cached runtime holds a built session over the rows just deleted.
+    this.#benchRuntime = null;
+  }
+
   /** Bench state is disposable; contaminated state is worse than none. */
   async benchPurge() {
     await this.ctx.storage.deleteAlarm();
@@ -813,8 +841,12 @@ export class AgentDO extends DurableObject<Env> {
     for (const t of ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"]) {
       try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* not created yet */ }
     }
-    this.sql.exec("DELETE FROM bench_tasks");
-    this.sql.exec("DELETE FROM do_activity");
+    // Tolerant on purpose: purge is what you reach for when an object is in a
+    // state you do not understand, and it failing because a table was never
+    // created is the least useful moment for it to be strict.
+    for (const t of ["bench_tasks", "do_activity"]) {
+      try { this.sql.exec(`DELETE FROM ${t}`); } catch { /* never created */ }
+    }
     this.#benchRuntime = null;
     return { purged: true };
   }

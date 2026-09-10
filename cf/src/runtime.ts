@@ -161,6 +161,18 @@ export interface RuntimeDeps {
   contextWindow?: number;
   /** Domain policy handed to the harness at task initialisation. */
   policy?: string;
+  /**
+   * Whether this agent is offered `run_js`.
+   *
+   * On by default, because the deployed console has a sandbox. It is a switch
+   * rather than a constant so the benchmark can hold it fixed: the Node τ²
+   * runner never offered the sandbox, and running the object arm with it on
+   * meant the two arms differed by a tool and two paragraphs of prompt while
+   * being reported as the same measurement. It is also the only way to ask
+   * whether a sandbox helps on a task whose every action is one domain call —
+   * a question SWE-bench cannot answer, because there it obviously does.
+   */
+  sandbox?: boolean;
 }
 
 export class AgentRuntime {
@@ -343,6 +355,7 @@ export class AgentRuntime {
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
     const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const sandbox = this.#deps.sandbox ?? true;
     const host = this.#host({ tenantId, agentId, taskId: LEGACY_TASK });
     const store = this.store;
 
@@ -354,10 +367,12 @@ export class AgentRuntime {
       systemPrompt: systemPrompt({
         workingSet: await workingSet(this.store, tenantId, agentId),
         policy: this.#deps.policy,
-        // The object mounts the sandbox itself, below, and parks large tool
-        // results — so both paragraphs describe something that is really there.
-        sandbox: true,
-        artifacts: true,
+        // Each paragraph appears only where the thing it describes is really
+        // there. Telling an agent to read a result back "with the artifacts
+        // tool" when no artifacts tool is mounted is not a hint, it is a wrong
+        // instruction competing with the ones that matter.
+        sandbox,
+        artifacts: (tools as MountedTool[]).some((t) => t.address.startsWith("artifacts.")),
       }),
       model: {
         provider: binding.provider,
@@ -377,9 +392,11 @@ export class AgentRuntime {
     // plugin — so it is added here rather than resolved through the gateway.
     agent.harness.setTools([
       ...bridgeTools(tools as MountedTool[], host),
-      runJsTool(this.#executor as any, host, {
-        onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
-      }),
+      ...(sandbox
+        ? [runJsTool(this.#executor as any, host, {
+            onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+          })]
+        : []),
     ] as any, BACKGROUND_CONTEXT);
 
     this.#agent = agent;
