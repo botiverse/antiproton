@@ -98,38 +98,42 @@ When the fix is in place, say so and stop.
 /**
  * What the queue does in production, as a function.
  *
- * The shape is the one that matters and it is preserved: `start` returns
- * without waiting, so the caller is never blocked on the provider, and `poll`
- * answers null until the reply is in. On Cloudflare the waiting happens in a
- * Worker; here it happens on a promise nobody is awaiting.
+ * The shape that matters is preserved, and it is the reason this is not simply
+ * an inline call: `dispatch` returns immediately, so `step()` is never blocked
+ * on the provider, and the answer arrives later through `deliver()` exactly as
+ * it does when a Worker hands it back. On Cloudflare the waiting happens in a
+ * Worker billed for CPU; here it happens on a promise nobody is awaiting.
  */
-function nodeWorker() {
-  const answers = new Map<string, any>();
-  const started: string[] = [];
+function nodeWorker(agentOf: () => PiAgent) {
   let inFlight = 0;
-  const port = {
-    async start({ model: m, context, options }: any) {
-      const id = `job_${started.length + 1}`;
-      started.push(id);
+  let calls = 0;
+  return {
+    get inFlight() { return inFlight; },
+    get calls() { return calls; },
+    dispatch(jobId: string) {
+      const agent = agentOf();
+      const job = agent.takeJob(jobId) as any;
+      // Null means it was already answered — a second dispatch of the same job
+      // must not call the provider again.
+      if (!job) return;
       inFlight += 1;
-      const { messages, tools } = toRequest(context);
-      const identity = { api: m.api, provider: m.provider, id: m.id };
+      calls += 1;
+      const identity = {
+        api: String(job.model?.api ?? "offloaded"),
+        provider: String(job.model?.provider ?? "openai-compatible"),
+        id: String(job.model?.id ?? MODEL_ID),
+      };
       void (async () => {
         try {
-          const r = await model.complete(messages, {
-            ...(tools ? { tools } : {}),
-            ...(options?.maxTokens ? { maxTokens: options.maxTokens } : {}),
-          });
-          answers.set(id, fromResponse(r, identity));
+          const { messages, tools } = toRequest(job.context);
+          const r = await model.complete(messages, tools ? { tools } : {});
+          agent.deliver(jobId, fromResponse(r, identity));
         } catch (e: any) {
-          answers.set(id, errorMessage(String(e?.message ?? e).slice(0, 300), identity));
+          agent.deliver(jobId, errorMessage(String(e?.message ?? e).slice(0, 300), identity));
         } finally { inFlight -= 1; }
       })();
-      return id;
     },
-    async poll(id: string) { return answers.get(id) ?? null; },
   };
-  return { port, started, get inFlight() { return inFlight; } };
 }
 
 async function runOne(inst: Instance) {
@@ -180,7 +184,8 @@ async function runOne(inst: Instance) {
       sideEffects: t.sideEffects, idempotency: t.idempotency,
     })));
 
-  const w = nodeWorker();
+  const holder: { agent?: PiAgent } = {};
+  const w = nodeWorker(() => holder.agent!);
   const agent = await PiAgent.open({
     host: sqliteHost(),
     sessionId: `${T}/${AGENT}`,
@@ -188,8 +193,9 @@ async function runOne(inst: Instance) {
     model: { provider: "openai-compatible", id: MODEL_ID, contextWindow: contextWindowFor(MODEL_ID) },
     tools,
     toolHost: host,
-    dispatch: async () => { /* the port already started it; nothing to wake */ },
+    dispatch: async (jobId) => { w.dispatch(jobId); },
   });
+  holder.agent = agent;
   // The sandbox is a tool like any other, added the same way the object adds
   // it: run_js is the one tool whose body is the runtime rather than a plugin.
   agent.harness.setTools([
@@ -205,7 +211,9 @@ async function runOne(inst: Instance) {
   while (Date.now() - t0 < BUDGET_MS) {
     const out = await agent.step();
     passes += 1;
-    if (out.wakeInMs === null) break;
+    // Idle only counts when nothing is still out: a pass can find no open
+    // operation while the provider is mid-answer.
+    if (out.wakeInMs === null && w.inFlight === 0) break;
     await new Promise((r) => setTimeout(r, Math.max(200, Math.min(out.wakeInMs, 2_000))));
   }
   const agentSeconds = Math.round((Date.now() - t0) / 1000);
@@ -263,7 +271,8 @@ async function runOne(inst: Instance) {
     id: inst.instance_id, resolved: fail.ok && pass.ok,
     failToPass: fail.ok, passToPass: pass.ok,
     diff: String(diffRes.result?.output ?? "").trim().split("\n").pop() ?? "",
-    seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, modelTurns, toolTurns, ...usage,
+    seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, modelTurns, toolTurns,
+    modelCalls: w.calls, ...usage,
     failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
   };
 }
