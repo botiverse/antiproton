@@ -260,6 +260,9 @@ export class AgentDO extends DurableObject<Env> {
       checkpoint_version INTEGER NOT NULL, fencing_token INTEGER NOT NULL, checkpoint TEXT NOT NULL)`);
     // What Cloudflare bills this object for: wall clock while it is active.
     this.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
+    // Created here rather than on first claim: the alarm reads it, and an alarm
+    // can fire on an object nothing has claimed yet.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
     // Everything an agent keeps, from this object's first breath. The console
     // reads some of it directly for its change check, which happens long
     // before anyone opens an agent.
@@ -390,9 +393,14 @@ export class AgentDO extends DurableObject<Env> {
     } catch { return []; }
   }
 
-  /** Who this object serves, once claimed. */
+  /** Who this object serves, once claimed. Absent until something claims it —
+   *  and absent is an answer, not a failure: an object whose alarm fires before
+   *  anything has claimed it has nothing to step. Reading it used to throw
+   *  `no such table: owner`, which the alarm handler caught and counted as a
+   *  failure, so the object rearmed every 30s and never advanced anything. */
   async owner() {
-    const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+    const row = this.sql.exec(
+      "SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     return row ? { tenantId: row.tenant_id, agentId: row.agent_id } : null;
   }
 
@@ -426,9 +434,10 @@ export class AgentDO extends DurableObject<Env> {
    * nothing here. It is kept on the signatures because the page's URLs carry
    * it, and ignored.
    */
-  async #entries(tenantId: string, agentId: string) {
+  async #entries(tenantId: string, agentId: string, fromSeq?: number) {
     const agent = await this.#activeRuntime().agent(tenantId, agentId);
-    return agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+    return agent.storage.scanEntries(
+      { order: "asc", ...(fromSeq === undefined ? {} : { fromSeq }) }, BACKGROUND_CONTEXT);
   }
 
   /**
@@ -705,10 +714,22 @@ export class AgentDO extends DurableObject<Env> {
         "INSERT INTO bench_config(k,v) VALUES ('policy',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", policy);
       const rt = this.#benchRt(policy);
       const agentId = `b_${taskId}`;
-      await this.#benchState().reset(taskId);
+      await this.#benchState().reset(agentId);
+      // The alarm is what advances a run, and it asks the object who it serves.
+      // Without this the bench agent existed, held a prompt and was never
+      // stepped: 303s of the runner polling an object that had nothing to do.
+      //
+      // Retargeted rather than claimed. `#claim` refuses a second identity,
+      // which is the right rule for a tenant's object and the wrong one here —
+      // a bench object is deliberately reused, one task at a time, and each
+      // task is its own agent.
+      this.sql.exec(
+        "INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self',?,?) " +
+        "ON CONFLICT(k) DO UPDATE SET tenant_id=excluded.tenant_id, agent_id=excluded.agent_id",
+        "bench", agentId);
+      await rt.bindOperatorModel("bench", agentId);
       // Only what the Node bench mounts: github/artifacts would change the tool
       // catalogue and make the two runners incomparable.
-      await rt.bindOperatorModel("bench", agentId);
       await rt.provision("bench", agentId, [
         { alias: "tools", plugin: "tools", account: "builtin" },
         { alias: "retail", plugin: "retail", account: "benchmark" },
@@ -811,7 +832,7 @@ export class AgentDO extends DurableObject<Env> {
         return a;
       }, { prompt: 0, completion: 0, calls: 0 });
     const kinds = events.reduce((m: any, e: any) => ((m[e.kind] = (m[e.kind] ?? 0) + 1), m), {});
-    const r = await this.#benchState().result(taskId);
+    const r = await this.#benchState().result(`b_${taskId}`);
     return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds };
   }
 
@@ -1190,10 +1211,16 @@ export class AgentDO extends DurableObject<Env> {
       | { after: number; tenantId: string; agentId: string }
       | null;
     if (!cur) return;
-    const rt = this.runtime();
+    // The bench object has its own runtime; readying the tenant one would build
+    // a second harness over the same store and push from the wrong catalogue.
+    const rt = this.#activeRuntime();
     await rt.ready();
-    const events = entriesToEvents(await this.#entries(cur.tenantId, cur.agentId))
-      .filter((e) => e.sequence > cur.after).slice(0, 200);
+    // Asked for by cursor rather than read whole and filtered: a projection
+    // keeps the entry's own seq, so the database can do the skipping. On a long
+    // conversation the old form read the entire transcript on every push, and
+    // every push happens inside the object, which is billed for it.
+    const events = entriesToEvents(
+      await this.#entries(cur.tenantId, cur.agentId, cur.after + 1)).slice(0, 200);
     for (const e of events) {
       ws.send(JSON.stringify({ id: e.sequence, kind: e.kind, payload: e.payload }));
     }
@@ -1622,6 +1649,12 @@ export default {
           ));
         }
         case "/agent/events":
+        // The same stream, addressed to the benchmark's object. A benchmark
+        // that polls measures the poller: every poll is a request that wakes
+        // the object, and the deployed console does not poll — it is pushed to
+        // over a hibernatable socket, which costs the object nothing while it
+        // waits. Measuring the shipped path means using the shipped path.
+        case "/bench/events":
           return stub.fetch(request);
         case "/agent/state":
           return Response.json(await stub.taskState(
