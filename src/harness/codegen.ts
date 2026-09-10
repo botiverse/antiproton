@@ -112,6 +112,8 @@ interface CodegenState {
   /** Times the model was told to use a code block instead of some other
    *  tool-call syntax. Bounded, so a model that cannot comply still answers. */
   formatNudges?: number;
+  /** Whether any code has actually run on this task. */
+  ran?: boolean;
 }
 
 export interface CompactionConfig {
@@ -174,6 +176,32 @@ export const DEFAULT_COMPACTION: CompactionConfig = {
  * real number belongs in configuration next to the model it describes.
  */
 export const ASSUMED_CONTEXT_WINDOW = 32_000;
+
+/**
+ * What each model can actually hold.
+ *
+ * A single deployment-wide number was wrong the moment two models were in play,
+ * and it was wrong by a factor of eight for the one we were running:
+ * `deepseek-v4-pro` holds a million tokens and compaction was firing at 79k.
+ * pi keeps this per model in `models.json` for the same reason, which is the
+ * shape borrowed here.
+ *
+ * A name not listed falls back to the conservative assumption: compacting early
+ * costs one summary, and guessing high means finding out from a refused call.
+ */
+export const CONTEXT_WINDOWS: Record<string, number> = {
+  "deepseek-v4-pro": 1_000_000,
+  "deepseek-v4-flash": 1_000_000,
+  "deepseek-v4.1-flash-expires-on-0910": 1_000_000,
+};
+
+export function contextWindowFor(model: string | undefined, fallback = ASSUMED_CONTEXT_WINDOW): number {
+  if (!model) return fallback;
+  if (CONTEXT_WINDOWS[model]) return CONTEXT_WINDOWS[model]!;
+  // Dated or suffixed variants of a known model share its window.
+  const base = Object.keys(CONTEXT_WINDOWS).find((k) => model.startsWith(k));
+  return base ? CONTEXT_WINDOWS[base]! : fallback;
+}
 
 /**
  * What the summary must contain, taken from pi's template because it was
@@ -318,8 +346,13 @@ export function isEmptyReply(text: string): boolean {
 }
 
 export function looksLikeToolAttempt(text: string): boolean {
-  return /<\s*(tool_calls?|invoke|function_calls?|antml:invoke)\b/i.test(text)
-    || /\btool_call\b\s*[:{]/.test(text)
+  // Not anchored to "<" immediately followed by the word. DeepSeek's DSML
+  // writes `<｜｜DSML｜｜tool_calls>` with full-width bars in between, and the
+  // anchor missed it — which ended three SWE-bench instances on their first
+  // turn each. The words themselves are the signal; prose does not say
+  // "tool_calls".
+  return /\b(tool_calls?|function_calls?)\b/i.test(text)
+    || /\binvoke\b[\s\S]{0,40}?\bname\s*=/i.test(text)
     // Any tag naming something that looks like a mount address. The one that
     // slipped through was `<system name="tools.search">query: "..."</system>` —
     // a channel the model invented — and because nothing recognised it as an
@@ -344,10 +377,15 @@ export function looksLikeToolAttempt(text: string): boolean {
 export function codeFromToolAttempt(text: string): string | null {
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
 
-  const invoke = /<(?:antml:)?invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/(?:antml:)?invoke\s*>/gi;
+  // Tolerant of whatever decorates the tag name. The anchor used to require
+  // "<" then "invoke"; DeepSeek writes `<｜｜DSML｜｜invoke name="shell">` with
+  // full-width bars between, and the call was legible to a person and invisible
+  // to this. What identifies it is the word and the name attribute, not the
+  // punctuation around them.
+  const invoke = /<[^>]*?\binvoke\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<[^>]*?\/\s*[^>]*?\binvoke\b[^>]*>/gi;
   for (let m = invoke.exec(text); m; m = invoke.exec(text)) {
     const args: Record<string, unknown> = {};
-    const param = /<(?:antml:)?parameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/(?:antml:)?parameter\s*>/gi;
+    const param = /<[^>]*?\bparameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<[^>]*?\/\s*[^>]*?\bparameter\b[^>]*>/gi;
     for (let q = param.exec(m[2]!); q; q = param.exec(m[2]!)) args[q[1]!] = coerce(q[2]!.trim());
     calls.push({ name: m[1]!.trim(), args });
   }
@@ -626,6 +664,7 @@ export class CodegenHarness implements HarnessAdapter {
           if (p.usage?.promptTokens) state.promptTokens = Number(p.usage.promptTokens);
           break;
         case "js.result": {
+          state.ran = true;
           for (const id of (p.heldOperationIds ?? []) as string[]) held.push(id);
           const left = Math.max(0, this.#maxTurns - state.turns);
           messages.push({
@@ -719,7 +758,18 @@ export class CodegenHarness implements HarnessAdapter {
       // No code, but visibly an attempt to call something: correct the syntax
       // rather than accept markup as the answer.
       const nudges = state.formatNudges ?? 0;
-      if ((looksLikeToolAttempt(sawModelReply) || isEmptyReply(sawModelReply)) && nudges < 2) {
+      // The backstop, and the only rule here that does not depend on
+      // recognising someone's markup. A task that was asked to do something
+      // and finishes before running anything has almost certainly not
+      // finished — it has failed to say what it meant, in a syntax nobody has
+      // seen yet. Six of those turned up in two days; loosening a pattern
+      // after each one is not a strategy. Bounded like the others, so a
+      // genuine one-line answer costs one extra round trip and no more.
+      const finishedWithoutWorking = !state.ran && state.turns <= 1;
+      if (
+        (looksLikeToolAttempt(sawModelReply) || isEmptyReply(sawModelReply) || finishedWithoutWorking)
+        && nudges < 2
+      ) {
         messages.push({
           role: "user",
           tag: "note",

@@ -19,6 +19,7 @@ import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
   AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, type ModelJob,
 } from "./runtime.ts";
+import { contextWindowFor } from "../../src/harness/codegen.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { runModelCommand } from "../../src/runtime/commands.ts";
 import { BenchState } from "./bench.ts";
@@ -319,9 +320,11 @@ export class AgentDO extends DurableObject<Env> {
       // answer. Providers have a channel for this; using it is not a
       // preference.
       harnessMode: this.env.HARNESS_MODE === "codegen" ? "codegen" : "hybrid",
-      // Belongs beside the model it describes: change HARNESS_MODEL and this
-      // goes with it, or compaction is calibrated for the wrong model.
-      contextWindow: Number(this.env.HARNESS_CONTEXT_WINDOW) || undefined,
+      // Looked up from the model's own name, so changing HARNESS_MODEL brings
+      // the right window with it. The variable stays as an override for a model
+      // the table does not know.
+      contextWindow: Number(this.env.HARNESS_CONTEXT_WINDOW)
+        || contextWindowFor(this.env.HARNESS_MODEL),
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#runtime;

@@ -214,7 +214,8 @@ A long investigation outgrows any context window, and what it has learned is
 the part worth keeping. Dropping old turns keeps the task alive and throws the
 findings away.
 
-So, following [pi][pi]: walk back from the newest message to a budget and keep
+So, following [pi][pi] — see [what was taken from elsewhere](#what-was-taken-from-elsewhere) —
+walk back from the newest message to a budget and keep
 that tail verbatim; summarise everything before it into a handover with fixed
 sections — goal, constraints, progress, decisions, next steps; truncate tool
 output hard, or the summariser summarises a fetched page instead of the work;
@@ -240,8 +241,6 @@ Demonstrated end to end: compaction fired on its own, produced a handover with
 the goal and per-page progress intact, and the agent then answered two questions
 whose answers had been fetched *before* the compaction, without going back to
 re-read anything.
-
-[pi]: https://github.com/badlogic/pi-mono
 
 ## Remembering
 
@@ -377,6 +376,49 @@ deployment; nothing about them is Node-specific.
 
 AppWorld needs a licensed local install; see [`bench/appworld/README.md`](bench/appworld/README.md).
 Its catalogue is **not** committed — that data may only be redistributed encrypted.
+
+## What was taken from elsewhere
+
+The harness is the commodity part of this, and the parts of it that are good
+were mostly worked out by other people. Naming what came from where, because a
+reader deserves to know which decisions were reasoned from first principles and
+which were copied from someone who had already made the mistake.
+
+**[pi][pi]** (MIT, © Mario Zechner) is the main source, and the debt is
+specific rather than atmospheric:
+
+- **Compaction.** Walk back from the newest message to a budget and keep that
+  tail verbatim; summarise everything before it into a handover with fixed
+  sections; truncate tool output hard so the summariser summarises the work
+  rather than a page it fetched; and on a second pass feed the previous
+  handover back with an *update* prompt that says to merge rather than append.
+  The prompts here are written fresh but the structure is theirs.
+- **Push the working set in rather than trusting recall.** Both pi-memory and
+  compaction rest on it: an agent that has to remember to go and look will not
+  look. What did not carry over is doing it before every turn, which the cache
+  economics here forbid.
+- **Separate documents for separate lifetimes** — durable facts, open items,
+  a running log — so the working set can be trimmed by priority.
+- **Steering as distinct from aborting.** A message sent while the agent works
+  reaches the model before its next call and stops nothing in flight; a
+  follow-up waits until it has finished. Two gestures, not one, and the default
+  is the first. I had these confused until pi's definition corrected me.
+- **Per-model configuration rather than one deployment-wide number.** pi keeps
+  context windows and provider quirks in `models.json`. The same shape is used
+  here, and adopting it immediately found a live misconfiguration: compaction
+  was calibrated for a 131k window on a model that holds a million.
+
+**[Codex][codex]** for the distinction between static instruction and learned
+memory — `AGENTS.md` is configuration and does not learn — and for redacting
+secrets before anything is written down.
+
+What is deliberately *not* borrowed is the shape of the agent loop itself.
+These are local, single-tenant tools where a shell is a reasonable thing to
+hand a model; almost everything in `src/runtime/` exists because this one is
+neither.
+
+[pi]: https://github.com/badlogic/pi-mono
+[codex]: https://developers.openai.com/codex
 
 ## What is not done
 

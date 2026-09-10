@@ -35,10 +35,9 @@
   "vars": {
     "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
     "HARNESS_MODEL": "deepseek-v4.1-flash-expires-on-0910",
-    // Beside the model, because compaction is a share of it rather than a
-    // fixed token count — the same threshold is most of a small window and
-    // nothing in a large one.
-    "HARNESS_CONTEXT_WINDOW": "131072",
+    // Only an override: the window is looked up from HARNESS_MODEL, and this
+    // was set to 131072 for a model that holds a million, so compaction fired
+    // at a twelfth of the context it had.
     "ARTIFACT_BUCKET": "antiproton-artifacts",
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.

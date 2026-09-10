@@ -90,11 +90,31 @@ test("代码转执行", "a reply containing code becomes a js.execute command", 
   eq((out.commands[0]!.payload as any).source, "output(1);", "source extracted");
 });
 
-test("无代码即终态", "a reply with no code ends the task", async () => {
+test("无代码即终态", "a reply with no code ends the task, once some work has been done", async () => {
   const h = new CodegenHarness();
   let state = await h.initialize({});
   state = (await h.advance({ state, events: [ev("message", { text: "go" })], context: ctx })).state;
-  const out = await h.advance({ state, events: [ev("model.response", { text: "The answer is 42." })], context: ctx });
+
+  // Finishing before running anything is asked about once rather than taken at
+  // face value. Six different invented calling syntaxes ended a task on its
+  // first turn this way, each one legible to a person and unrecognised here;
+  // loosening a pattern after each is not a strategy, so the backstop does not
+  // depend on recognising any of them.
+  const early = await h.advance({
+    state, events: [ev("model.response", { text: "The answer is 42." })], context: ctx,
+  });
+  eq(early.status, "waiting", "an answer before any work is queried, not accepted");
+
+  // Once something has actually run, a reply with no code is the answer.
+  state = (await h.advance({
+    state, events: [ev("model.response", { text: "```js\noutput(1);\n```" })], context: ctx,
+  })).state;
+  state = (await h.advance({
+    state, events: [ev("js.result", { status: "completed", outputs: [1] })], context: ctx,
+  })).state;
+  const out = await h.advance({
+    state, events: [ev("model.response", { text: "The answer is 42." })], context: ctx,
+  });
   eq(out.status, "completed", "completed");
   eq((out.commands[0]!.payload as any).text, "The answer is 42.", "answer emitted");
 });

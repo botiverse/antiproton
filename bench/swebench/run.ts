@@ -51,10 +51,24 @@ interface Instance {
   FAIL_TO_PASS: string; PASS_TO_PASS: string;
 }
 
-const rows = await (await fetch(
+const res = await fetch(
   "https://datasets-server.huggingface.co/rows?dataset=princeton-nlp%2FSWE-bench_Verified" +
   `&config=default&split=test&offset=${OFFSET}&length=${N}`,
-)).json();
+);
+// The dataset server rate-limits and answers with an HTML page, which used to
+// surface as `Unexpected token '<'` from JSON.parse — a benchmark that cannot
+// fetch its instances should say that, not produce a syntax error.
+const raw = await res.text();
+let rows: any;
+try {
+  rows = JSON.parse(raw);
+} catch {
+  console.error(
+    `\n  could not load SWE-bench instances: HTTP ${res.status}, ` +
+    `${raw.slice(0, 120).replace(/\s+/g, " ")}\n  (the dataset server rate-limits; try again shortly)\n`,
+  );
+  process.exit(1);
+}
 const instances: Instance[] = rows.rows.map((r: any) => r.row);
 
 /** The image SWE-bench publishes for an instance, already holding the repo,
