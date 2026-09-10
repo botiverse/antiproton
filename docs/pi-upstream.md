@@ -102,7 +102,7 @@ Prefer not to. If it is necessary, it is allowed, but:
 In order. Each step gates the next; the point is that the cheap checks run
 before the expensive one.
 
-1. Read what changed: the export maps, and the `.d.ts` of the four entry points
+1. Read what changed: the export maps, and the `.d.ts` of the five entry points
    we import.
 2. Bump the pin to an exact version.
 3. `npm run pi-storage` and `npm run pi-storage:do` — pi's own 21 conformance
