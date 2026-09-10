@@ -311,6 +311,25 @@ implementing pi's interface rather than copying its design.
 | `state` | 7 | memory that survives a task, byte budgets, per-agent isolation |
 | `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
+
+Benchmarks are not tests and are reported separately, because they measure a
+model as much as a harness. SWE-bench Verified, same three astropy instances,
+same model (`deepseek-v4-pro`), one variable — the loop:
+
+| | resolved | wall clock | prompt tokens |
+|---|---|---|---|
+| the previous harness | 1/3 | 699 s | 307 k |
+| pi's loop | **2/3** | 1,044 s | 1,647 k |
+
+The interesting number is not the score. Both instances the old loop failed
+ended after **one model call** — it was not the model failing the task, it was
+the loop stopping. The new one works them for 17 and 59 turns, which is why it
+costs five times the tokens: it is doing five times the work. On the one
+instance both solved, it is cheaper — 282 s and 174 k against 489 s and 304 k.
+
+A single instance is a coin flip: `astropy-12907` passed on its own and failed
+in the slice, same code, same model. Three instances measure that the loop
+runs, not how good it is.
 | `appworld` | 9 | credential custody at 457 APIs (needs a licensed install) |
 
 Live on the deployment, against the Durable Object rather than sqlite:
@@ -326,7 +345,7 @@ src/harness/      two harnesses; a task keeps the one that opened it
 src/plugins/      plugin contract; http, artifacts, agent state, run9 sandbox, AppWorld
 src/store/        sqlite, durable-object
 cf/               Cloudflare deployment: worker, durable object, queue consumer, console
-bench/            τ²-bench, AppWorld, SWE-bench Verified, cache and selection probes
+bench/            SWE-bench Verified
 test/             suites; test/spec/ is backend-agnostic
 ```
 
