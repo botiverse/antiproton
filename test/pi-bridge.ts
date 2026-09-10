@@ -67,6 +67,31 @@ check("停止原因:工具调用、截断、普通结束", () => {
   eq(plain.usage.totalTokens, 7, "total");
 });
 
+check("把预算烧光却没写出答案,记成失败而不是空回合", () => {
+  // What this looked like in production: the object idle, the transcript
+  // complete, the run settled, and the answer an empty string — indistinguishable
+  // from an agent that had chosen to say nothing. 8192 output tokens, all of
+  // them reasoning, finish_reason=length.
+  const m = fromResponse({
+    text: "", reasoning: "thinking".repeat(500), finishReason: "length", truncated: true,
+    usage: { promptTokens: 7313, completionTokens: 8192, reasoningTokens: 8192, cachedPromptTokens: 6272 },
+  } as any, model);
+  if (m.stopReason !== "error") throw new Error(`an unusable truncation → ${m.stopReason}`);
+  if (!String(m.errorMessage).includes("output limit")) {
+    throw new Error(`the reason is not readable: ${m.errorMessage}`);
+  }
+  if (!String(m.errorMessage).includes("8192")) throw new Error("what it was spent on is missing");
+  // The tokens were still billed, so they are still counted.
+  eq(m.usage.output, 8192, "the truncated call's output tokens");
+
+  // A truncation that still said something is a turn, and keeps its own reason.
+  const partial = fromResponse({
+    text: "here is what I fou", finishReason: "length", truncated: true,
+    usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 },
+  } as any, model);
+  if (partial.stopReason !== "length") throw new Error(`a partial answer → ${partial.stopReason}`);
+});
+
 check("推理痕迹被记下来,但不会当成回答文本", () => {
   const m = fromResponse(
     { text: "the answer", reasoning: "because", finishReason: "stop", truncated: false,

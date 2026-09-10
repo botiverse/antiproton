@@ -99,8 +99,23 @@ export function fromResponse(
     } as any);
   }
 
-  // A truncated reply is `length`, and the harness must not read it as a
-  // finished turn — that is the whole reason the flag exists.
+  // A truncated reply that still says something is usable, and `length` is how
+  // the harness is told it was cut off. A truncated reply that says nothing at
+  // all is not a turn — it is a failed call wearing the shape of one, and
+  // recording it as an assistant message ends the run with an empty answer that
+  // no caller can distinguish from silence. That is what happened: the object
+  // was idle, the transcript was complete, and the answer was "".
+  if (res.truncated && !res.text && !(res.toolCalls?.length)) {
+    return {
+      ...errorMessage(
+        "the model reached its output limit before writing an answer" +
+        (res.usage?.reasoningTokens ? ` (${res.usage.reasoningTokens} tokens of reasoning)` : ""),
+        model),
+      usage: usageOf(res),
+      rawStopReason: res.finishReason,
+    };
+  }
+
   const stopReason: AssistantMessage["stopReason"] =
     res.truncated ? "length"
       : (res.toolCalls?.length ? "toolUse" : "stop");
