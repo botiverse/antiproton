@@ -5,6 +5,7 @@ import {
   keepFrom, keepRecentChars, summaryRequest, isContextOverflow, DEFAULT_COMPACTION,
   NO_COMPACTION, ASSUMED_CONTEXT_WINDOW, type CompactionConfig,
 } from "./codegen.ts";
+import { qualifyMountedTools, type MountedTool } from "../runtime/pi-tools.ts";
 
 /**
  * Tools are called natively; JavaScript is one of the tools.
@@ -62,29 +63,7 @@ const RUN_JS: ToolDefinition = {
   },
 };
 
-/** Providers restrict tool names, so the model sees a plain name while the
- *  harness keeps the mount-qualified address it dispatches to. */
-export interface MountedTool extends ToolDefinition {
-  address: string;
-}
-
-/**
- * Model-facing names must be unique, because that is all the model can say.
- *
- * Bare API names are unique inside one service and collide across several:
- * `show_profile` exists in ten of AppWorld's apps. A bare name is friendlier, so
- * keep it where it is unambiguous and qualify only what actually clashes — the
- * same rule the gateway applies to mount resolution.
- */
-export function qualifyMountedTools(tools: MountedTool[]): MountedTool[] {
-  const counts = new Map<string, number>();
-  for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
-  return tools.map((t) => {
-    if ((counts.get(t.name) ?? 0) < 2) return t;
-    const prefix = t.address.split(".")[0]!.replace(/[^A-Za-z0-9_-]/g, "_");
-    return { ...t, name: `${prefix}__${t.name}`.slice(0, 64) };
-  });
-}
+export { qualifyMountedTools, type MountedTool };
 
 interface HybridState {
   harness?: "hybrid";
