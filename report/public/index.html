@@ -324,11 +324,6 @@ footer a{color:var(--accent)}
       <p class="how">a property, not a score &middot; needs a licensed install</p>
       <p>9 apps, 457 APIs, <b>362 of them (79&thinsp;%) behind an access token</b>. Nine end-to-end cases assert that no schema mentions <code>access_token</code>, the credential-reading tool is not mounted, an authenticated call succeeds without the agent ever logging in, and the token never appears in a tool result. It measures what the model <i>cannot</i> see, so there is no pass rate to report.</p>
     </div>
-    <div class="tier worst">
-      <h3>&tau;&sup2;-bench</h3>
-      <p class="how">not run on this loop</p>
-      <p>Tool calling under a domain policy. The only figure this project ever recorded &mdash; <span class="fig">8&thinsp;/&thinsp;8 vs 7&thinsp;/&thinsp;8 vs 5&thinsp;/&thinsp;8</span> over 8 tasks &mdash; compared the <i>old</i> harnesses and survives only in a code comment. The driver has been deleted rather than left broken, and nothing on this page says how the current loop behaves under a policy.</p>
-    </div>
   </div>
 </section>
 
@@ -348,6 +343,8 @@ footer a{color:var(--accent)}
         <td>Enough to see a task flip between trials, which it did three times. Not enough to separate a better loop from a luckier one, and no figure here should be read as a trend.</td></tr>
       <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
         <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
+      <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
+        <td>The one figure this project ever recorded for &tau;&sup2; under a domain policy on the prior harnesses &mdash; 8&thinsp;/&thinsp;8 vs 7&thinsp;/&thinsp;8 vs 5&thinsp;/&thinsp;8 over 8 tasks &mdash; is not a measurement of the current loop. It survives only as a comment in the deleted driver, and is kept here so it is not mistaken for one.</td></tr>
     </tbody>
   </table>
   </div>

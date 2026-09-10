@@ -26,12 +26,13 @@ The authoritative list is a command, not a table, because a table rots:
 grep -rhoE 'from "@earendil-works/[^"]+"' src cf/src test bench --include='*.ts' | sort -u
 ```
 
-At the time of writing that is four entry points: the package root
-(`AgentHarness`, `LaneBusy`), `harness/session` (`StorageBackedSession`),
-`harness/context` (`BACKGROUND_CONTEXT`), `harness/session/testing`
-(`createStorageConformance`, tests only), plus `@earendil-works/pi-ai` for the
-provider contract (`createProvider`, `createAssistantMessageEventStream`) and
-the faux provider in tests.
+At the time of writing that is five entry points: four from
+`@earendil-works/pi-agent-core` — the package root (`AgentHarness`,
+`LaneBusy`), `harness/session` (`StorageBackedSession`), `harness/context`
+(`BACKGROUND_CONTEXT`), `harness/session/testing` (`createStorageConformance`,
+tests only) — plus `@earendil-works/pi-ai` for the provider contract
+(`createProvider`, `createAssistantMessageEventStream`) and the faux provider
+in tests.
 
 ### 2. Copied source — this breaks silently
 
