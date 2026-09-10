@@ -78,6 +78,27 @@ const canon = (v: unknown): string => {
 };
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
+/**
+ * How two write actions compare: by name and by arguments, where an array of
+ * primitives is a set.
+ *
+ * `canon` keeps array order because the database hash must — a list in the
+ * domain is a list. A request's `item_ids` is not: `return_delivered_order_items`
+ * over the same three items in a different order is the same action, and the
+ * database agreed (db=ok) on every trial the positional comparison failed. The
+ * grader was asserting something the task does not require, three times in one
+ * matrix. Arrays of objects keep their order; only primitive arrays are sorted.
+ */
+const canonArgs = (v: unknown): string => {
+  if (Array.isArray(v) && v.every((x) => x === null || typeof x !== "object")) {
+    return `[${[...v].map((x) => JSON.stringify(x)).sort().join(",")}]`;
+  }
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonArgs).join(",")}]`;
+  return `{${Object.keys(v as object).sort()
+    .map((k) => `${JSON.stringify(k)}:${canonArgs((v as any)[k])}`).join(",")}}`;
+};
+
 /** The database the annotated solution leaves behind, hashed the same way the
  *  object hashes its own — the comparison is a hash because the database is
  *  2.8 MB and no part of it needs to travel. */
@@ -224,7 +245,7 @@ async function runTask(task: any) {
   const writes = (res.writes ?? []).filter((w: any) => WRITE_TOOLS.has(w.name));
   const dbMatch = res.dbHash === hash;
   const actionMatch = expected.every((e) =>
-    writes.some((w: any) => w.name === e.name && canon(w.args) === canon(e.args)));
+    writes.some((w: any) => w.name === e.name && canonArgs(w.args) === canonArgs(e.args)));
 
   return {
     id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
@@ -243,9 +264,9 @@ function argDiff(expected: Array<{ name: string; args: any }>, performed: Array<
   const out: string[] = [];
   for (const e of expected) {
     const same = performed.filter((p) => p.name === e.name);
-    if (same.some((p) => canon(p.args) === canon(e.args))) continue;
-    out.push(`${e.name} expected ${canon(e.args).slice(0, 160)}`);
-    for (const p of same) out.push(`${" ".repeat(e.name.length)} performed ${canon(p.args).slice(0, 160)}`);
+    if (same.some((p) => canonArgs(p.args) === canonArgs(e.args))) continue;
+    out.push(`${e.name} expected ${canonArgs(e.args).slice(0, 160)}`);
+    for (const p of same) out.push(`${" ".repeat(e.name.length)} performed ${canonArgs(p.args).slice(0, 160)}`);
     if (!same.length) out.push(`${" ".repeat(e.name.length)} performed (nothing by that name)`);
   }
   return out;
