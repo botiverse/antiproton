@@ -337,8 +337,8 @@ the standard: it was driven through the deployed Worker (`bench/swebench/cf.ts`)
 the agent ran inside the object with the instance's image mounted as its
 machine, the model calls went through the production queue, and the grader ran
 in the same container before the runner released it. Same score and wall clock
-as the in-process row, half the tokens, and one number the Node process could
-not produce at all: **the object was billed for 516 s of the 692 s wall clock
+as the in-process row, about a fifth fewer tokens, and one number the Node
+process could not produce at all: **the object was billed for 516 s of the 692 s wall clock
 (75 %)**, 28 s of it the runner grading. τ² bills the object for 3 % of wall
 clock; SWE-bench bills it for 75 %. The difference is where the waiting
 happens: a model call leaves the object through the queue, but a tool call runs
