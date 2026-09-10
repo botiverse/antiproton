@@ -239,7 +239,7 @@ footer a{color:var(--accent)}
   </div>
 
   <div class="col">
-    <p><b>Three on-object runs of the same benchmark and model, and the first thing to publish is that they disagree</b> &mdash; 21/24, 19/24 and 15/24, with no shared failing task. Eight tasks &times; three trials each, on <code>deepseek-flash</code>, in a deployed object. The newer two carry their evidence; the oldest does not, and says so:</p>
+    <p><b>Three on-object runs of the same benchmark and model, and the first thing to publish is that they disagree</b> &mdash; 21/24, 19/24 and 15/24. Eight tasks &times; three trials each, on <code>deepseek-flash</code>, in a deployed object. The newer two carry their evidence and share no failing task; the oldest does not, and says so:</p>
     <p>Run <b>B</b> &mdash; <b>21/24</b> on object <code>do1</code>, all three zeros in trial one, written by <code>88a5b1d</code>, <b>raw output not retained</b>. Its task-level vector exists only in the page text that commit wrote, from a log nobody kept, so it is given as a labelled line and not as a checkable row. Runs <b>C</b> (<code>verado1</code>, 15/24) and <b>D</b> (<code>veratools1</code>, 19/24) carry full output and archived transcripts.</p>
   </div>
 
@@ -365,7 +365,7 @@ footer a{color:var(--accent)}
       <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
         <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused on object in both benchmarks (SWE-bench 49 calls, &tau;&sup2; 24 trials), and the only run that reached for it was an earlier in-process matrix that is not on-object evidence. So there is no evidence yet that the sandbox pays on this substrate, in either direction.</td></tr>
       <tr><td>Sample size</td><td><span class="pill open">3 runs &times; 8 &times; 3</span></td>
-        <td>Three on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;%, 79.2&thinsp;% and 62.5&thinsp;%, sharing no failing task. Two of the three carry full evidence. That spread is itself the finding &mdash; one run cannot say how good the loop is, and no figure here should be read as a trend.</td></tr>
+        <td>Three on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;%, 79.2&thinsp;% and 62.5&thinsp;%. But only two carry full evidence (C, D); the 87.5&thinsp;% is run B, whose record is a commit message and whose vector has no source, so "no shared failing task" is checkable only between C and D. That spread is still the finding &mdash; one run cannot say how good the loop is &mdash; but the aggregate must not promote B to a peer of the two that can be re-derived.</td></tr>
       <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
         <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
       <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
