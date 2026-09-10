@@ -182,42 +182,43 @@ footer a{color:var(--accent)}
 
 <div class="thesis">
   <p><b>Read the noise before reading the numbers.</b></p>
-  <p>Two runs of the same commit, on the same model, over the same three instances both scored 3&thinsp;/&thinsp;3 and differed by a third in cost: <span class="fig">1,071&thinsp;s / 813&thinsp;k</span> against <span class="fig">690&thinsp;s / 550&thinsp;k</span>. Nothing changed between them but the reporting code. A single instance is a coin flip &mdash; <span class="fig">astropy-12907</span> has passed alone, failed in a slice, and passed twice since, all on the same commit.</p>
+  <p>Two in-process runs of the same commit, on the same model, over the same three instances both scored 3&thinsp;/&thinsp;3 and differed by a third in cost: <span class="fig">1,071&thinsp;s / 813&thinsp;k</span> against <span class="fig">690&thinsp;s / 550&thinsp;k</span>. Nothing changed between them but the reporting code. A single instance is a coin flip &mdash; <span class="fig">astropy-12907</span> has passed alone, failed in a slice, and passed twice since, all on the same commit.</p>
   <p>Three instances measure that the loop runs. They do not measure how good it is, and no figure on this page should be read as a trend.</p>
 </div>
 
 <section>
   <h2>SWE-bench Verified</h2>
-  <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring</p>
+  <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring, inside a deployed Durable Object</p>
+  <p class="how">object <code>bench-swe2</code> &middot; 2026-09-10 &middot; branch <code>swe-on-object</code> &middot; model deepseek-flash &middot; driver <code>bench/swebench/cf.ts</code> &middot; raw output retained</p>
 
   <div class="scroll">
   <table>
     <thead><tr>
       <th>instance</th><th class="n"></th><th class="n">wall</th><th class="n">calls</th>
-      <th class="n">prompt tok</th><th class="n">cached</th><th class="n">container</th><th>patch</th>
+      <th class="n">prompt tok</th><th class="n">cached</th><th class="n">container</th><th class="n">object</th><th>patch</th>
     </tr></thead>
     <tbody>
-      <tr><td class="k">12907</td><td class="n">✓</td><td class="n">240&thinsp;s</td><td class="n">17</td><td class="n">171,071</td><td class="n">94&thinsp;%</td><td class="n">99&thinsp;%</td><td class="k">1 file, 1 ins(+), 1 del(-)</td></tr>
-      <tr><td class="k">13033</td><td class="n">✓</td><td class="n">197&thinsp;s</td><td class="n">10</td><td class="n">94,023</td><td class="n">92&thinsp;%</td><td class="n">98&thinsp;%</td><td class="k">1 file, 11 inss(+), 3 dels(-)</td></tr>
-      <tr><td class="k">13236</td><td class="n">✓</td><td class="n">445&thinsp;s</td><td class="n">49</td><td class="n">906,452</td><td class="n">98&thinsp;%</td><td class="n">100&thinsp;%</td><td class="k">2 files, 4 inss(+), 8 dels(-)</td></tr>
-      <tr><td class="k">13398</td><td class="n">✗</td><td class="n">357&thinsp;s</td><td class="n">39</td><td class="n">1,387,655</td><td class="n">97&thinsp;%</td><td class="n">80&thinsp;%</td><td class="k">7 files, 129 inss(+), 32 dels(-)</td></tr>
-      <tr><td class="k">13453</td><td class="n">✓</td><td class="n">732&thinsp;s</td><td class="n">40</td><td class="n">873,333</td><td class="n">97&thinsp;%</td><td class="n">89&thinsp;%</td><td class="k">1 file, 2 inss(+)</td></tr>
-      <tr><td class="k">13579</td><td class="n">✓</td><td class="n">314&thinsp;s</td><td class="n">24</td><td class="n">367,644</td><td class="n">97&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 5 inss(+), 1 del(-)</td></tr>
-      <tr><td class="k">13977</td><td class="n">✓</td><td class="n">298&thinsp;s</td><td class="n">34</td><td class="n">892,987</td><td class="n">97&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 56 inss(+), 39 dels(-)</td></tr>
-      <tr><td class="k">14096</td><td class="n">✓</td><td class="n">193&thinsp;s</td><td class="n">15</td><td class="n">106,644</td><td class="n">95&thinsp;%</td><td class="n">62&thinsp;%</td><td class="k">1 file, 2 inss(+), 4 dels(-)</td></tr>
-      <tr><td class="k">14182</td><td class="n">✗</td><td class="n">374&thinsp;s</td><td class="n">37</td><td class="n">749,501</td><td class="n">97&thinsp;%</td><td class="n">78&thinsp;%</td><td class="k">1 file, 4 inss(+), 3 dels(-)</td></tr>
-      <tr><td class="k">14309</td><td class="n">✓</td><td class="n">140&thinsp;s</td><td class="n">10</td><td class="n">89,897</td><td class="n">85&thinsp;%</td><td class="n">47&thinsp;%</td><td class="k">2 files, 4 inss(+)</td></tr>
-      <tr class="total"><td>8&thinsp;/&thinsp;10</td><td class="n"></td><td class="n">3,290&thinsp;s</td>
-        <td class="n">275</td><td class="n">5,639,207</td><td class="n">97&thinsp;%</td>
-        <td class="n">&mdash;</td><td class="k">shell&times;298 run&times;5</td></tr>
+      <tr><td class="k">12907</td><td class="n">✓</td><td class="n">78&thinsp;s</td><td class="n">8</td><td class="n">56,424</td><td class="n">91&thinsp;%</td><td class="n">92&thinsp;%</td><td class="n">46&thinsp;%</td><td class="k">1 file, 1 ins(+), 1 del(-)</td></tr>
+      <tr><td class="k">13033</td><td class="n">✓</td><td class="n">84&thinsp;s</td><td class="n">13</td><td class="n">96,580</td><td class="n">93&thinsp;%</td><td class="n">96&thinsp;%</td><td class="n">57&thinsp;%</td><td class="k">1 file, 11 inss(+), 3 dels(-)</td></tr>
+      <tr><td class="k">13236</td><td class="n">✓</td><td class="n">150&thinsp;s</td><td class="n">24</td><td class="n">236,787</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">60&thinsp;%</td><td class="k">2 files, 4 inss(+), 8 dels(-)</td></tr>
+      <tr><td class="k">13398</td><td class="n">✗</td><td class="n">785&thinsp;s</td><td class="n">60</td><td class="n">2,567,617</td><td class="n">98&thinsp;%</td><td class="n">100&thinsp;%</td><td class="n">75&thinsp;%</td><td class="k">3 files, 57 inss(+), 13 dels(-)</td></tr>
+      <tr><td class="k">13453</td><td class="n">✓</td><td class="n">332&thinsp;s</td><td class="n">35</td><td class="n">689,372</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">74&thinsp;%</td><td class="k">1 file, 2 inss(+)</td></tr>
+      <tr><td class="k">13579</td><td class="n">✓</td><td class="n">330&thinsp;s</td><td class="n">23</td><td class="n">401,761</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 5 inss(+), 1 del(-)</td></tr>
+      <tr><td class="k">13977</td><td class="n">✓</td><td class="n">355&thinsp;s</td><td class="n">23</td><td class="n">497,231</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">82&thinsp;%</td><td class="k">1 file, 56 inss(+), 39 dels(-)</td></tr>
+      <tr><td class="k">14096</td><td class="n">✓</td><td class="n">213&thinsp;s</td><td class="n">12</td><td class="n">89,958</td><td class="n">91&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">84&thinsp;%</td><td class="k">1 file, 2 inss(+), 4 dels(-)</td></tr>
+      <tr><td class="k">14182</td><td class="n">✓</td><td class="n">248&thinsp;s</td><td class="n">16</td><td class="n">204,370</td><td class="n">90&thinsp;%</td><td class="n">98&thinsp;%</td><td class="n">74&thinsp;%</td><td class="k">1 file, 8 inss(+), 4 dels(-)</td></tr>
+      <tr><td class="k">14309</td><td class="n">✓</td><td class="n">294&thinsp;s</td><td class="n">24</td><td class="n">390,381</td><td class="n">95&thinsp;%</td><td class="n">97&thinsp;%</td><td class="n">67&thinsp;%</td><td class="k">3 files, 7 inss(+), 3 dels(-)</td></tr>
+      <tr class="total"><td>9&thinsp;/&thinsp;10</td><td class="n"></td><td class="n">2,869&thinsp;s</td>
+        <td class="n">238</td><td class="n">5,230,481</td><td class="n">96&thinsp;%</td>
+        <td class="n">&mdash;</td><td class="n">73&thinsp;%</td><td class="k">shell&times;247 run&times;2</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p><b>97&thinsp;% of prompt tokens came from cache</b>, so the gross figure overstates the bill by more than ten times &mdash; of 5.6&nbsp;M, roughly 190&nbsp;k were actually re-read. But a cache rate is not a cost measure on its own: the instance at 97&thinsp;% re-read 42&nbsp;k tokens, six times what the instance at 92&thinsp;% did.</p>
-    <p><b>The container is alive for 47&ndash;100&thinsp;% of wall clock</b>, and nearly all of that is spent waiting on the model rather than running anything. The task does not require that &mdash; a machine billed by the second is simply held open across every model call. Whether stopping it between calls pays depends on run9's compute-versus-storage rates, which we do not have. The meter is here so that question can be answered rather than guessed.</p>
-    <p>Both failures over-reached: one rewrote seven files and 129 lines, the other made a four-line change that raised a <code>ValueError</code>. Every success but one landed a patch of five lines or fewer.</p>
+    <p><b>This run happened inside the deployment.</b> The agent ran in the object with the instance&rsquo;s own image mounted as its machine, the model calls went out through the production queue, the grader ran in the same container before the runner released it, and the container was never offered to the agent to destroy. The previous version of this table came from a Node process over an in-memory database; it is gone, and the only change in outcome is that <span class="fig">14182</span> resolves here and failed there. <span class="fig">13398</span> is the one instance that failed in both runs, and it is the over-reaching one: 785&thinsp;s, sixty calls, three files. Every success landed in one to three files.</p>
+    <p><b>The object was billed for 73&thinsp;% of wall clock</b> &mdash; 2,105&thinsp;s of 2,869, 165&thinsp;s of it the runner grading. &tau;&sup2; bills the object for 3&ndash;5&thinsp;%. Same substrate, opposite bill, and the difference is where the waiting happens: a model call leaves the object through the queue, a tool call runs inside it, and this task is 247 shell commands in a container. On the three instances both runs share, wall clock is the same as in-process (692&thinsp;s against 690&thinsp;s): the cost moved onto a different meter, not onto more time. This is a property of what ships, measured, not something this change fixes.</p>
+    <p><b>96&thinsp;% of prompt tokens came from cache</b>, so the gross figure overstates the bill by more than twenty times &mdash; of 5.2&nbsp;M, roughly 204&nbsp;k were actually re-read. A cache rate is still not a cost measure on its own: the failed instance re-read the most at 98&thinsp;% cached. <b>The container is alive for 92&ndash;100&thinsp;% of wall clock</b>; whether stopping it between calls pays still depends on run9&rsquo;s compute-versus-storage rates, which we do not have. <code>run_js</code> was not used once in 247 tool calls; the two <code>run</code> calls are run9&rsquo;s JavaScript inside the container, not the sandbox.</p>
   </div>
 </section>
 
@@ -306,8 +307,8 @@ footer a{color:var(--accent)}
   <div class="tiers">
     <div class="tier loud">
       <h3>SWE-bench Verified</h3>
-      <p class="how">answered &middot; 3 instances &middot; 5 runs</p>
-      <p>Whether the loop can carry a multi-turn task on a real machine to a graded result. Currently 3&thinsp;/&thinsp;3 on the deployed model. Three instances is a sample, not a submission.</p>
+      <p class="how">answered &middot; 10 instances &middot; inside the deployed object</p>
+      <p>Whether the loop can carry a multi-turn task on a real machine to a graded result. 9&thinsp;/&thinsp;10 on the deployed model, measured in the deployed object with the grader in the agent&rsquo;s container. Ten instances is a sample, not a submission.</p>
     </div>
     <div class="tier loud">
       <h3>pi storage conformance</h3>
@@ -333,8 +334,8 @@ footer a{color:var(--accent)}
   <table>
     <thead><tr><th>gap</th><th>state</th><th>why it matters</th></tr></thead>
     <tbody>
-      <tr><td>SWE-bench on the deployed object</td><td><span class="pill open">in process</span></td>
-        <td>&tau;&sup2; runs in the object now; SWE-bench does not, because grading needs an endpoint the object does not have. Its cost figures are therefore still a Node process&rsquo;s, not a deployment&rsquo;s.</td></tr>
+      <tr><td>SWE-bench on the deployed object</td><td><span class="pill">measured</span></td>
+        <td>Both benchmarks run in the object now. SWE-bench&rsquo;s grader runs in the agent&rsquo;s container through the object (<code>bench/swebench/cf.ts</code>), so its cost figures are a deployment&rsquo;s: 73&thinsp;% of wall clock billed to the object, against &tau;&sup2;&rsquo;s 3&ndash;5&thinsp;%. What remains open is whether long tool calls should leave the object the way model calls do.</td></tr>
       <tr><td>AppWorld on the current loop</td><td><span class="pill open">unported</span></td>
         <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
       <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
