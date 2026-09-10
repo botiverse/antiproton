@@ -232,35 +232,43 @@ footer a{color:var(--accent)}
   </div>
 
   <div class="delta">
-    <div class="plus"><span class="num">87.5&thinsp;%</span><span class="cap">pass^1 &middot; 21/24</span></div>
-    <div class="minus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^2 &middot; 5/8</span></div>
-    <div class="minus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^3 &middot; 5/8</span></div>
-    <div class="plus"><span class="num">3.9&thinsp;%</span><span class="cap">of wall clock billed</span></div>
+    <div class="plus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^1 &middot; run C &middot; 15/24</span></div>
+    <div class="plus"><span class="num">87.5&thinsp;%</span><span class="cap">pass^1 &middot; run B &middot; 21/24</span></div>
+    <div class="minus"><span class="num">50&thinsp;%</span><span class="cap">pass^3 &middot; run C &middot; 4/8</span></div>
+    <div class="plus"><span class="num">3&thinsp;%</span><span class="cap">of wall clock billed</span></div>
   </div>
 
   <div class="col">
-    <p><b>pass^k is the number that matters.</b> pass^1 asks how often this works; pass^3 asks whether the same task survives three attempts, which is the question a deployment actually has. Reporting only the first is how a benchmark flatters a loop.</p>
-    <p>All three zeros landed in the first trial. Trials two and three were 8&thinsp;/&thinsp;8 each, which is why pass^2 and pass^3 are equal &mdash; they are computed over the first <i>k</i> trials in order, so a task that failed once at the start never recovers the metric. That is the honest reading and also a caution: three failures falling in one trial out of three happens by chance about one time in twelve.</p>
+    <p><b>Two on-object runs, and the first thing to publish is that they disagree.</b> Same benchmark, same model (<code>deepseek-flash</code>), same deployed object type, eight tasks &times; three trials each. The newest carries its evidence; the older one does not, and says so:</p>
+    <p>Run <b>B</b> &mdash; <b>21/24</b> on object <code>do1</code>, all three zeros in trial one, written by <code>88a5b1d</code>, <b>raw output not retained</b>. Its task-level vector exists only in the page text that commit wrote, from a log nobody kept, so it is given here as a labelled line and not as a checkable row. Run <b>C</b> &mdash; <b>15/24</b> on object <code>verado1</code>, measured after transcript archiving landed, so its run is stored in the object and its full per-task result is below.</p>
+  </div>
+
+  <div class="col">
+    <p><b>The two disagree on the aggregate and on the shape.</b> B saw three failures, all in trial one; C saw nine, with two tasks failing all three trials and two more flipping. Six failures separate them, and they share no failing task. One run cannot say how good the loop is.</p>
+    <p>So the honest form is the per-task vector, and the headline is the spread. A single number here &mdash; which one is the "real" &tau;&sup2; score &mdash; would be picking one of two samples and calling it the benchmark.</p>
+    <p><b>pass^k is the number that matters.</b> pass^1 asks how often this works; pass^3 asks whether the same task survives three attempts, which is the question a deployment actually has. Reporting only the first is how a benchmark flatters a loop. It is reported here as a summary under the vectors, not as the lede.</p>
+    <p>Every failure is the agent's, not the substrate's: no call was lost, no run stalled, no object failed to wake. In B one failure was the benchmark's own user simulator quitting after six seconds &mdash; counting it as a harness score would be measuring the simulator.</p>
+    <p><code>run_js</code> <b>was not unused.</b> The earlier claim that no benchmark ever triggered the sandbox was based on SWE-bench alone, where it really was used zero times across 298 tool calls. &tau;&sup2; reached for it &mdash; twice, both in turns combining several query results &mdash; so the sandbox has a shape of problem; SWE-bench just is not that shape. That count is from the in-process matrix, which kept a per-tool breakdown; neither on-object run above did.</p>
   </div>
 
   <div class="scroll">
   <table>
-    <thead><tr><th>task</th><th>t1</th><th>t2</th><th>t3</th><th>what the zero was</th></tr></thead>
+    <thead><tr><th>run C &middot; task</th><th>t1</th><th>t2</th><th>t3</th><th>what the zeros were</th></tr></thead>
     <tbody>
       <tr><td class="k">0</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">1</td><td>✗</td><td>✓</td><td>✓</td><td>Ended in a <b>transfer to a human</b> with nothing performed. The customer gave up before the exchange was submitted.</td></tr>
-      <tr><td class="k">2</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">1</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">2</td><td>✗</td><td>✗</td><td>✗</td><td><b>The benchmark gave up, not the agent.</b> The user simulator ended on the first turn &mdash; that task's instructions are a single full stop &mdash; before any write could happen.</td></tr>
       <tr><td class="k">3</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
       <tr><td class="k">4</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
-      <tr><td class="k">5</td><td>✗</td><td>✓</td><td>✓</td><td><b>The agent was wrong.</b> Asked to return an item, it exchanged it &mdash; the one failure here where a write happened and was the wrong write.</td></tr>
-      <tr><td class="k">6</td><td>✗</td><td>✓</td><td>✓</td><td><b>The agent stopped short.</b> Three turns, seven calls, a confident close, and no action taken.</td></tr>
-      <tr><td class="k">7</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">5</td><td>✗</td><td>✗</td><td>✗</td><td><b>The agent was wrong.</b> Asked to return an item, it exchanged it &mdash; the same mistake run B made on this task.</td></tr>
+      <tr><td class="k">6</td><td>✓</td><td>✗</td><td>✗</td><td><b>The agent stopped short.</b> A confident close with no action taken.</td></tr>
+      <tr><td class="k">7</td><td>✗</td><td>✓</td><td>✓</td><td><b>The agent stopped short.</b> It read the order and the products and never submitted a write &mdash; and got it right on the next two attempts.</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p>Every failure is the agent's, not the substrate's: no call was lost, no run stalled, no object failed to wake. Two of the three are the same shape &mdash; the conversation ended without the write that was the point of it &mdash; which is the failure mode the system prompt was rewritten to address and has not eliminated.</p>
+    <p><b>Every figure names its run, and the run names its object.</b> B has a source but no evidence and is marked as such; C has both. A third matrix from the same session is not shown at all: it ran in process, before the on-object runner existed, so it does not belong in this table &mdash; it is the run behind the <code>run_js</code> count above.</p>
   </div>
 </section>
 
@@ -339,9 +347,9 @@ footer a{color:var(--accent)}
       <tr><td>AppWorld on the current loop</td><td><span class="pill open">unported</span></td>
         <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
       <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
-        <td>The sandbox is now a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused across SWE-bench&rsquo;s 298 tool calls, and the &tau;&sup2; arm here was run without it so the two runners would match.</td></tr>
-      <tr><td>Sample size</td><td><span class="pill open">n = 8 &times; 3</span></td>
-        <td>Enough to see a task flip between trials, which it did three times. Not enough to separate a better loop from a luckier one, and no figure here should be read as a trend.</td></tr>
+        <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused across SWE-bench&rsquo;s 298 tool calls, but &tau;&sup2; reached for it twice (run A, both in turns combining several query results), so it has a shape of problem even though SWE-bench is not it. The ablation has a non-zero arm to compare against.</td></tr>
+      <tr><td>Sample size</td><td><span class="pill open">3 runs &times; 8 &times; 3</span></td>
+        <td>Three on-object runs of the same benchmark and model, and they disagree: pass^1 87.5&thinsp;% twice and 62.5&thinsp;% once, with no two runs sharing a failing task. That spread is itself the finding &mdash; one run cannot say how good the loop is, and no figure here should be read as a trend.</td></tr>
       <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
         <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
       <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
