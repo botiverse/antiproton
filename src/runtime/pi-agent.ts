@@ -51,6 +51,8 @@ export interface PiAgentOptions {
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
+  /** How long the alarm should wait before looking for an answer again. */
+  pollAfterMs?: number;
   now?: () => number;
 }
 
@@ -107,6 +109,9 @@ export class PiAgent {
     };
     models.setProvider(offloadedProvider({
       port,
+      // What the caller should wait before asking again. The alarm uses it as
+      // its own delay, so it is the agent's polling cadence.
+      pollAfterMs: opts.pollAfterMs ?? 1_000,
       id: opts.model.provider,
       models: [{
         id: opts.model.id,
@@ -159,6 +164,14 @@ export class PiAgent {
       catch { /* the row stays; the next pass tries again */ }
     }
     return sent;
+  }
+
+  /** How many model calls are still out. At most one per lane, but counting
+   *  is cheaper than asserting it. */
+  #unanswered(): number {
+    const row = this.#sql
+      .exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL").toArray()[0] as any;
+    return Number(row?.n ?? 0);
   }
 
   #pollJob(id: string): AssistantMessage | null {
@@ -219,8 +232,18 @@ export class PiAgent {
     let wake: number | null = null;
     const now = (this.#opts.now ?? Date.now)();
 
+    // Ask the provider only when there is something to collect.
+    //
+    // pi records the provider's answer, and "not ready yet" is an answer: ten
+    // polls of a call still in flight appended ten messages. That is right for
+    // a real batch API, where a poll is the only way to find out. Here the
+    // provider is a table in this object, so the question can be settled for
+    // free — and a long run stops paying for its own waiting, once in rows and
+    // again in every prompt built from them.
+    const collect = this.#unanswered() === 0;
+
     for (const operationId of ids) {
-      const res: any = await this.#lane.drive({ operationId, pollDeferred: true }, CTX);
+      const res: any = await this.#lane.drive({ operationId, pollDeferred: collect }, CTX);
       const out = res?.value ?? res;
       if (!out || out.kind === undefined) continue;
       if (out.kind === "settled") {

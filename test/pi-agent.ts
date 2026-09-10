@@ -103,6 +103,31 @@ await check("工具轮次:模型要工具,工具走 gateway,再问一次模型,�
   await f.agent.close();
 });
 
+await check("模型还没答完时,重复的 step 不会把 transcript 撑大", async () => {
+  const f = await fixture();
+  await f.agent.say("hello");
+  await f.agent.step();
+  const afterFirst = (await f.agent.storage.scanEntries({ order: "asc" }, CTX)).length;
+
+  // Twenty passes while the answer is still out. pi records what the provider
+  // says, and "not ready yet" is something it said — which is right for a real
+  // batch API, where asking is the only way to find out. Here the provider is a
+  // table in this object, so a pass that has nothing to collect must not ask,
+  // or a long run pays for its own waiting twice: once in rows, and again in
+  // every prompt built from them.
+  for (let i = 0; i < 20; i++) await f.agent.step();
+  const afterPolls = (await f.agent.storage.scanEntries({ order: "asc" }, CTX)).length;
+  if (afterPolls > afterFirst) throw new Error(`20 passes added ${afterPolls - afterFirst} entries`);
+
+  // And once the answer is in, the very next pass collects it.
+  f.w.answer(f.w.pending(f.host)[0]!.id, { text: "collected" });
+  const out = await f.agent.step();
+  if (out.open !== 0) throw new Error("the answer was not collected on the next pass");
+  const entries = await f.agent.storage.scanEntries({ order: "asc" }, CTX);
+  if (!JSON.stringify(entries).includes("collected")) throw new Error("the answer never landed");
+  await f.agent.close();
+});
+
 await check("对象被驱逐:重新 open 后接着跑完", async () => {
   const f = await fixture();
   await f.agent.say("hello");

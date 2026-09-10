@@ -261,9 +261,16 @@ async function runOne(inst: Instance) {
   await agent.close();
   await store.close();
 
+  // A suspended turn is recorded as an assistant message carrying the handle
+  // and no content, so counting every message with a `usage` field counts each
+  // model call once for the answer and once for every poll that found it not
+  // ready — 85 where there were 17.
   const usage = entries.reduce((a: any, e: any) => {
-    const u = e.message?.usage;
-    if (u) { a.calls += 1; a.prompt += u.input ?? 0; a.out += u.output ?? 0; }
+    const m = e.message;
+    if (m?.role !== "assistant" || m.stopReason === "deferred") return a;
+    a.calls += 1;
+    a.prompt += m.usage?.input ?? 0;
+    a.out += m.usage?.output ?? 0;
     return a;
   }, { calls: 0, prompt: 0, out: 0 });
 
@@ -290,7 +297,7 @@ for (const inst of instances) {
   }
   out.push(r);
   const mark = r.resolved ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-  console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.prompt} tok` +
+  console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.toolTurns ?? 0} tool calls  ${r.prompt} tok` +
     (r.diff ? `  diff: ${r.diff}` : "") + (r.error ? `  ERROR ${r.error}` : ""));
   if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
 }
