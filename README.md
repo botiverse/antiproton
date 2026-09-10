@@ -121,9 +121,9 @@ flowchart TB
     provider([Model provider]):::ext
 
     client -->|"message · steer · interrupt"| router
-    router --> kernel
-    kernel <--> store
-    kernel --> harness
+    router --> lane
+    lane <--> store
+    lane --> harness
     harness -->|commands| cmd
     cmd -->|model.request| queue
     queue --> consumer
@@ -214,8 +214,9 @@ took it for an answer, and it replied from memory against an explicit
 instruction not to. Through the provider's channel: 91s, twelve model calls,
 thirty tool results, and an answer that had read the repository.
 
-The pattern-matching survives, demoted, under the other harness: an unreadable
-reply must still not be mistaken for a finished one.
+The invented convention is gone with the harness that used it: pi's loop calls
+tools through the provider's channel and nothing else, so there is no regex left
+to teach.
 
 ## Keeping the context small enough to think in
 
@@ -301,13 +302,12 @@ implementing pi's interface rather than copying its design.
 | Suite | Cases | Covers |
 |---|---|---|
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
-| `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
-| `pi-agent` | 4 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, and a run interrupted by eviction is reported open and finished |
+| `pi-agent` | 8 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, and a run interrupted by eviction is reported open and finished |
 | `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
-| `pi-tools` | 6 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept |
+| `pi-tools` | 7 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept |
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
-| `pi-bridge` | 4 | pi's request shape against our provider client, both ways |
-| `executor` · `http-plugin` | 19 | sandbox contract in-process, fetch and HTML extraction |
+| `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
+| `executor` · `http-plugin` | 19 | sandbox contract in-process (`executor` 9 runs the `spec/executor-spec` rows), fetch and HTML extraction (`http-plugin` 10) |
 | `state` | 7 | memory that survives a task, byte budgets, per-agent isolation |
 | `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
@@ -401,9 +401,9 @@ single-tenant tool where a shell is a reasonable thing to hand a model. As of
 0.85 that is no longer true: `pi-agent-core` splits durable admission
 (`accept`) from an I/O pass (`drive`), and describes its unit of change as "one
 effect-free decision made on a lane's serialized mutation line" — the same split
-`src/runtime/kernel.ts` arrived at independently. The storage layer is adopted;
-whether the loop above it follows is open, and is not settled by borrowing the
-layer beneath it.
+this project's own kernel arrived at independently, before that kernel was
+deleted in favour of pi's loop. The storage layer came first; the loop above it
+followed, and both are pi's now.
 
 [pi]: https://github.com/badlogic/pi-mono
 [codex]: https://developers.openai.com/codex
