@@ -18,6 +18,7 @@ import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
   AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF,
 } from "./runtime.ts";
+import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
@@ -251,6 +252,7 @@ export class AgentDO extends DurableObject<Env> {
   #benchRuntime: AgentRuntime | null = null;
   #benchPolicy = "";
   #benchOffload = true;
+  #benchModeCached: "tau2" | "swe" = "tau2";
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -679,13 +681,24 @@ export class AgentDO extends DurableObject<Env> {
     return row ? this.#benchRt(String(row.v)) : this.runtime();
   }
 
+  /** Which benchmark this object is hosting. Persisted, because the alarm
+   *  that advances a run may be the first thing a rebuilt instance does. */
+  #benchMode(): "tau2" | "swe" {
+    const row = this.sql.exec("SELECT v FROM bench_config WHERE k='mode'").toArray()[0] as any;
+    return row?.v === "swe" ? "swe" : "tau2";
+  }
+
   #benchRt(policy: string): AgentRuntime {
     const off = this.#offloadOn();
-    if (this.#benchRuntime && this.#benchPolicy === policy && this.#benchOffload === off) {
+    const mode = this.#benchMode();
+    if (this.#benchRuntime && this.#benchPolicy === policy && this.#benchOffload === off
+        && this.#benchModeCached === mode) {
       return this.#benchRuntime;
     }
     this.#benchPolicy = policy;
     this.#benchOffload = off;
+    this.#benchModeCached = mode;
+    const swe = mode === "swe";
     this.#benchRuntime = new AgentRuntime({
       ctx: this.ctx,
       bucket: this.env.ARTIFACTS,
@@ -699,17 +712,148 @@ export class AgentDO extends DurableObject<Env> {
         model: this.env.HARNESS_MODEL,
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
-      extraPlugins: [this.#benchState().plugin()],
-      maxTurns: 40,
+      // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
+      // the runtime already has.
+      extraPlugins: swe ? [] : [this.#benchState().plugin()],
+      maxTurns: swe ? 120 : 40,
       policy,
       // What the Node runner offers, and nothing else. The deployed console has
       // a sandbox; the Node τ² arm never did, and running the object arm with
       // one meant the two arms differed by a tool and a page of prompt while
-      // being reported as the same measurement.
-      sandbox: false,
+      // being reported as the same measurement. The Node SWE-bench arm did
+      // offer it, so the object arm does too — same rule, opposite answer.
+      sandbox: swe,
+      // The grader runs after the agent, in the agent's container. So the
+      // agent is never offered the tool that destroys it, and a settled run
+      // does not hand the machine back on its own: the runner does, after
+      // grading, through benchSweRelease — and owns the bill if it forgets.
+      withholdTools: swe ? ["node.release"] : undefined,
+      autoRelease: !swe,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#benchRuntime;
+  }
+
+  #setBenchConfig(k: string, v: string) {
+    this.sql.exec(
+      "INSERT INTO bench_config(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", k, v);
+  }
+
+  /** A bench task's transcript is cleared and its owner row rewritten; shared
+   *  by both benchmarks. See benchStart for why each is needed. */
+  #takeBenchAgent(agentId: string) {
+    this.#clearTranscript();
+    this.sql.exec(
+      "INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self',?,?) " +
+      "ON CONFLICT(k) DO UPDATE SET tenant_id=excluded.tenant_id, agent_id=excluded.agent_id",
+      "bench", agentId);
+  }
+
+  // ------------------------------------------------------- SWE-bench, hosted
+
+  /**
+   * One SWE-bench instance, inside this object.
+   *
+   * The agent gets a real machine (the run9 mount, from the instance's own
+   * published image) and the tools plugin, nothing else — what the Node runner
+   * mounted. The container is held open past the agent's finish because the
+   * grader has to run in it; `benchSweShell` is the runner's way in and
+   * `benchSweRelease` is how the machine comes back. Nothing here polls.
+   */
+  async benchSweStart(taskId: string, o: {
+    policy: string; image: string; workdir?: string; shape?: string; timeoutMs?: number;
+    shell?: string; shellPrefix?: string; offload?: boolean;
+  }) {
+    await this.setOffload(o.offload !== false);
+    return this.#busy("benchSweStart", async () => {
+      const agentId = `b_${taskId}`;
+      this.#setBenchConfig("mode", "swe");
+      this.#setBenchConfig("policy", o.policy);
+      this.#benchRuntime = null;
+      this.#takeBenchAgent(agentId);
+      const rt = this.#benchRt(o.policy);
+      await rt.ready();
+      await rt.bindOperatorModel("bench", agentId);
+      await rt.provision("bench", agentId, [
+        { alias: "tools", plugin: "tools", account: "builtin" },
+      ]);
+      // The machine, from the instance's own image. Config is per mount, so a
+      // different repository is a different mount record, not different code.
+      await rt.store.addMount({
+        tenantId: "bench", agentId, alias: "node", plugin: "run9",
+        installationId: "inst-node", connectionId: null, toolVersion: "1.0.0",
+        publicConfig: {
+          account: "container",
+          image: o.image,
+          workdir: o.workdir ?? "/testbed",
+          shape: o.shape ?? "2c4g",
+          timeoutMs: o.timeoutMs ?? 300_000,
+          ...(o.shell ? { shell: o.shell } : {}),
+          ...(o.shellPrefix ? { shellPrefix: o.shellPrefix } : {}),
+        },
+        secretRef: OPERATOR_RUN9_REF, policy: null,
+      });
+      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe" };
+    });
+  }
+
+  /** The runner's shell in the agent's container: applying the official test
+   *  patch and running the tests. Metered as its own kind so the report can
+   *  separate the loop's cost from the grader's. */
+  async benchSweShell(taskId: string, command: string) {
+    return this.#busy("benchSweShell", async () => {
+      const rt = this.#activeRuntime();
+      await rt.ready();
+      return rt.gateway().invoke(
+        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, "node.shell", { command });
+    });
+  }
+
+  async benchSweRelease(taskId: string) {
+    return this.#busy("benchSweRelease", async () => {
+      const rt = this.#activeRuntime();
+      await rt.ready();
+      return rt.gateway().releaseTask({ tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" });
+    });
+  }
+
+  /**
+   * What the instance cost, read from the transcript and the mount.
+   *
+   * A suspended turn is an assistant message carrying the handle and no
+   * content, so counting every message with a usage field counts a model call
+   * once for the answer and once per poll that found it not ready; those are
+   * skipped. The container meter is read after release, from the session the
+   * run9 plugin writes into the mount's connection state when the box is
+   * handed back — written there precisely so it outlives the box.
+   */
+  async benchSweStats(taskId: string, wallMs: number) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const agentId = `b_${taskId}`;
+    const agent = await rt.agent("bench", agentId);
+    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[];
+    const usage = entries.reduce((a: any, e: any) => {
+      const m = e.message;
+      if (m?.role !== "assistant" || m.stopReason === "deferred") return a;
+      a.calls += 1;
+      a.prompt += m.usage?.input ?? 0;
+      a.out += m.usage?.output ?? 0;
+      a.cached += m.usage?.cacheRead ?? 0;
+      return a;
+    }, { calls: 0, prompt: 0, out: 0, cached: 0 });
+    const byTool: Record<string, number> = {};
+    for (const e of entries) {
+      const name = e.message?.role === "toolResult" ? e.message.toolName : null;
+      if (name) byTool[name] = (byTool[name] ?? 0) + 1;
+    }
+    const modelTurns = usage.calls;
+    const toolTurns = entries.filter((e: any) =>
+      e.type === "message" && e.message?.role === "toolResult").length;
+    const meter = await readMeter(rt.store as any, "bench", agentId, ["node"], wallMs, {
+      promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
+    });
+    return { taskId, usage, byTool, modelTurns, toolTurns, entries: entries.length, meter };
   }
 
   async benchStart(taskId: string, policy: string, offload: boolean) {
@@ -718,6 +862,7 @@ export class AgentDO extends DurableObject<Env> {
       this.sql.exec(
         "INSERT INTO bench_config(k,v) VALUES ('policy',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", policy);
       const agentId = `b_${taskId}`;
+      if (this.#benchMode() !== "tau2") { this.#setBenchConfig("mode", "tau2"); this.#benchRuntime = null; }
       await this.#benchState().reset(agentId);
       // A task starts on an empty transcript, because in production it would.
       //
@@ -1752,6 +1897,30 @@ export default {
         }
         case "/bench/poll":
           return Response.json(await stub.benchPoll(String(url.searchParams.get("taskId"))));
+        // SWE-bench inside the object. Start and shell spend money (a model
+        // account, a metered machine), so they sit behind the same guard as
+        // the τ² endpoints; stats only reads.
+        case "/bench/swe/start": {
+          const g = guardSpending(request, env);
+          if (g) return g;
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSweStart(String(b.taskId), b));
+        }
+        case "/bench/swe/shell": {
+          const g = guardSpending(request, env);
+          if (g) return g;
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSweShell(String(b.taskId), String(b.command)));
+        }
+        case "/bench/swe/release": {
+          const g = guardSpending(request, env);
+          if (g) return g;
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSweRelease(String(b.taskId)));
+        }
+        case "/bench/swe/stats":
+          return Response.json(await stub.benchSweStats(
+            String(url.searchParams.get("taskId")), Number(url.searchParams.get("wallMs") ?? 0)));
         case "/bench/activity":
           return Response.json(await stub.activity(Number(url.searchParams.get("since") ?? 0)));
         case "/bench/activity/reset": return Response.json(await stub.resetActivity());
