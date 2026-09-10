@@ -15,7 +15,7 @@
     "pi-agent": "node test/pi-agent.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.85.1",
+    "@earendil-works/pi-agent-core": "0.85.1",
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {

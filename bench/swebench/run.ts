@@ -271,15 +271,32 @@ async function runOne(inst: Instance) {
     a.calls += 1;
     a.prompt += m.usage?.input ?? 0;
     a.out += m.usage?.output ?? 0;
+    // What the provider served from cache rather than re-read. It is the
+    // number that decides what a long run actually costs, and reporting
+    // prompt tokens without it overstates the bill several times over.
+    a.cached += m.usage?.cacheRead ?? 0;
     return a;
-  }, { calls: 0, prompt: 0, out: 0 });
+  }, { calls: 0, prompt: 0, out: 0, cached: 0 });
+
+  /**
+   * Which tools were used, and how often.
+   *
+   * `run_js` earns its place only by replacing several calls with one, so a
+   * total that lumps it in with everything else cannot say whether it did.
+   * Reported separately for that reason, not for completeness.
+   */
+  const byTool: Record<string, number> = {};
+  for (const e of entries as any[]) {
+    const name = e.message?.role === "toolResult" ? e.message.toolName : null;
+    if (name) byTool[name] = (byTool[name] ?? 0) + 1;
+  }
 
   return {
     id: inst.instance_id, resolved: fail.ok && pass.ok,
     failToPass: fail.ok, passToPass: pass.ok,
     diff: String(diffRes.result?.output ?? "").trim().split("\n").pop() ?? "",
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, modelTurns, toolTurns,
-    modelCalls: w.calls, ...usage,
+    modelCalls: w.calls, byTool, ...usage,
     failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
   };
 }
@@ -297,11 +314,22 @@ for (const inst of instances) {
   }
   out.push(r);
   const mark = r.resolved ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-  console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.toolTurns ?? 0} tool calls  ${r.prompt} tok` +
+  const tools = Object.entries(r.byTool ?? {})
+    .sort((a: any, b: any) => b[1] - a[1]).map(([n, c]) => `${n}×${c}`).join(" ");
+  const cachePct = r.prompt ? Math.round((r.cached / r.prompt) * 100) : 0;
+  console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.prompt} tok ` +
+    `(${cachePct}% cached)` + (tools ? `  [${tools}]` : "") +
     (r.diff ? `  diff: ${r.diff}` : "") + (r.error ? `  ERROR ${r.error}` : ""));
   if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
 }
 const solved = out.filter((r) => r.resolved).length;
+const totals = out.reduce((a: any, r: any) => {
+  for (const [n, c] of Object.entries(r.byTool ?? {})) a.tools[n] = (a.tools[n] ?? 0) + (c as number);
+  return { ...a, prompt: a.prompt + (r.prompt ?? 0), cached: a.cached + (r.cached ?? 0) };
+}, { prompt: 0, cached: 0, tools: {} as Record<string, number> });
 console.log(`  ${"─".repeat(80)}\n  resolved ${solved}/${out.length}   ` +
   `${out.reduce((a, r) => a + r.seconds, 0)}s total   ` +
-  `${out.reduce((a, r) => a + (r.prompt ?? 0), 0)} prompt tokens\n`);
+  `${totals.prompt} prompt tokens ` +
+  `(${totals.prompt ? Math.round((totals.cached / totals.prompt) * 100) : 0}% served from cache)\n` +
+  `  tools: ${Object.entries(totals.tools).sort((a: any, b: any) => b[1] - a[1])
+    .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}\n`);
