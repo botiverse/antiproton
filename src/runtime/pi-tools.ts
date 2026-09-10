@@ -177,3 +177,25 @@ export function runJsTool(
     },
   } as AgentHarnessTool<undefined>;
 }
+
+/**
+ * Tools the model is never offered, by mount-qualified address.
+ *
+ * This is for the case where something the runner owns must not be the
+ * agent's to call. The one instance so far: a benchmark whose grader runs
+ * *after* the agent in the same container. `node.release` says it destroys
+ * the box and stops the meter, so an agent tidying up calls it — rightly, in
+ * production — and the grader then scores a fresh box from the base image:
+ * no diff, every test still failing, a zero that looks exactly like the model
+ * being wrong. Withholding the tool is the fix; the runner releases instead.
+ *
+ * Applied before the names are qualified, so the address is the mount's own
+ * (`node.release`), not whatever the provider-safe name became.
+ */
+export function withholdTools<T extends { address: string }>(
+  tools: T[],
+  addresses: Iterable<string>,
+): T[] {
+  const held = new Set(addresses);
+  return tools.filter((t) => !held.has(t.address));
+}

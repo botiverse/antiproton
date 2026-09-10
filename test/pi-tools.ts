@@ -13,7 +13,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { bridgeTools, replayPolicy, qualifyMountedTools, type MountedTool } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, replayPolicy, qualifyMountedTools, withholdTools, type MountedTool } from "../src/runtime/pi-tools.ts";
 import { offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -169,6 +169,22 @@ await check("gateway 拒绝时,模型收到的是拒绝而不是结果", async (
     throw new Error("a refusal was recorded as a result");
   }
   await harness.close(CTX);
+});
+
+await check("扣住的工具不会被提供,其余原样", async () => {
+  const cat = [
+    { name: "shell", address: "node.shell" },
+    { name: "release", address: "node.release" },
+    { name: "get", address: "web.get" },
+  ];
+  const left = withholdTools(cat, ["node.release"]);
+  if (left.length !== 2) throw new Error(`expected 2 tools left, got ${left.length}`);
+  if (left.some((t) => t.address === "node.release")) throw new Error("the withheld tool was still offered");
+  if (!left.some((t) => t.address === "node.shell") || !left.some((t) => t.address === "web.get")) {
+    throw new Error("a tool that was not withheld went missing");
+  }
+  // Nothing withheld means nothing changes — the common case must be a no-op.
+  if (withholdTools(cat, []).length !== 3) throw new Error("withholding nothing removed something");
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);

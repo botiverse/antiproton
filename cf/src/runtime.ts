@@ -15,6 +15,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import {
   bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
+  withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
@@ -173,6 +174,24 @@ export interface RuntimeDeps {
    * a question SWE-bench cannot answer, because there it obviously does.
    */
   sandbox?: boolean;
+  /**
+   * Mount-qualified addresses the model is never offered.
+   *
+   * For a benchmark whose grader runs after the agent in the same container:
+   * `node.release` says it destroys the box and stops the meter, so an agent
+   * tidying up calls it — rightly, in production — and the grader then scores
+   * a fresh box from the base image. The runner owns that lifetime instead.
+   */
+  withholdTools?: string[];
+  /**
+   * Whether a settled run hands its containers back by itself.
+   *
+   * On by default: a finished task should not hold a metered machine. Off only
+   * when something still has to happen in that machine after the agent is
+   * done — grading — and whoever switched it off takes the release, and the
+   * bill for forgetting it, on themselves.
+   */
+  autoRelease?: boolean;
 }
 
 export class AgentRuntime {
@@ -326,7 +345,7 @@ export class AgentRuntime {
       mounts: records.map((m) => ({
         alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
       })),
-      tools: qualifyMountedTools(records.flatMap((m) =>
+      tools: qualifyMountedTools(withholdTools(records.flatMap((m) =>
         (byId.get(m.plugin)?.tools ?? []).map((t) => ({
           name: t.name, description: t.summary, parameters: t.parameters,
           address: `${m.alias}.${t.name}`,
@@ -335,7 +354,7 @@ export class AgentRuntime {
           sideEffects: t.sideEffects, idempotency: t.idempotency,
           exclusive: byId.get(m.plugin)?.exclusive,
         })),
-      )),
+      ), this.#deps.withholdTools ?? [])),
     };
   }
 
@@ -438,7 +457,7 @@ export class AgentRuntime {
     const out = await agent.step();
     // A finished run should not still be holding a metered container.
     let releaseFailed: Array<{ alias: string; error: string }> = [];
-    if (out.open === 0 && out.settled.length) {
+    if (this.#deps.autoRelease !== false && out.open === 0 && out.settled.length) {
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
       releaseFailed = r.failed;
     }

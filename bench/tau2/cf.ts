@@ -78,6 +78,27 @@ const canon = (v: unknown): string => {
 };
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
+/**
+ * How two write actions compare: by name and by arguments, where an array of
+ * primitives is a set.
+ *
+ * `canon` keeps array order because the database hash must — a list in the
+ * domain is a list. A request's `item_ids` is not: `return_delivered_order_items`
+ * over the same three items in a different order is the same action, and the
+ * database agreed (db=ok) on every trial the positional comparison failed. The
+ * grader was asserting something the task does not require, three times in one
+ * matrix. Arrays of objects keep their order; only primitive arrays are sorted.
+ */
+const canonArgs = (v: unknown): string => {
+  if (Array.isArray(v) && v.every((x) => x === null || typeof x !== "object")) {
+    return `[${[...v].map((x) => JSON.stringify(x)).sort().join(",")}]`;
+  }
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonArgs).join(",")}]`;
+  return `{${Object.keys(v as object).sort()
+    .map((k) => `${JSON.stringify(k)}:${canonArgs((v as any)[k])}`).join(",")}}`;
+};
+
 /** The database the annotated solution leaves behind, hashed the same way the
  *  object hashes its own — the comparison is a hash because the database is
  *  2.8 MB and no part of it needs to travel. */
@@ -224,16 +245,31 @@ async function runTask(task: any) {
   const writes = (res.writes ?? []).filter((w: any) => WRITE_TOOLS.has(w.name));
   const dbMatch = res.dbHash === hash;
   const actionMatch = expected.every((e) =>
-    writes.some((w: any) => w.name === e.name && canon(w.args) === canon(e.args)));
+    writes.some((w: any) => w.name === e.name && canonArgs(w.args) === canonArgs(e.args)));
 
   return {
     id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
     turns: turns - 1, simCalls,
-    usage: res.usage ?? {}, kinds: res.kinds ?? {},
+    usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {},
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),
     performedWrites: writes.map((w: any) => w.name),
+    expectedArgs: expected, performedArgs: writes.map((w: any) => ({ name: w.name, args: w.args })),
   };
+}
+
+/** Which expected write had no performed write with the same name *and*
+ *  arguments — the actual criterion — with both sides shown. */
+function argDiff(expected: Array<{ name: string; args: any }>, performed: Array<{ name: string; args: any }>): string[] {
+  const out: string[] = [];
+  for (const e of expected) {
+    const same = performed.filter((p) => p.name === e.name);
+    if (same.some((p) => canonArgs(p.args) === canonArgs(e.args))) continue;
+    out.push(`${e.name} expected ${canonArgs(e.args).slice(0, 160)}`);
+    for (const p of same) out.push(`${" ".repeat(e.name.length)} performed ${canonArgs(p.args).slice(0, 160)}`);
+    if (!same.length) out.push(`${" ".repeat(e.name.length)} performed (nothing by that name)`);
+  }
+  return out;
 }
 
 function passAtK(rows: any[], k: number) {
@@ -270,7 +306,7 @@ for (let trial = 1; trial <= TRIALS; trial++) {
     catch (e) {
       r = { id: task.id, reward: 0, dbMatch: false, actionMatch: false,
             ended: `error: ${(e as Error).message.slice(0, 80)}`, turns: 0, simCalls: 0,
-            usage: {}, kinds: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
+            usage: {}, kinds: {}, byTool: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
     }
     results.push({ ...r, trial });
     const mark = r.reward ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
@@ -279,6 +315,10 @@ for (let trial = 1; trial <= TRIALS; trial++) {
       `${r.turns} turns / ${r.usage?.calls ?? "?"} calls / ${r.usage?.prompt ?? "?"} tok / ${r.seconds}s`);
     if (!r.reward && (r.expectedWrites.length || r.performedWrites.length)) {
       console.log(`      expected: [${r.expectedWrites.join(", ")}]  performed: [${r.performedWrites.join(", ")}]`);
+      // The match is on the arguments, not the names, so a line that prints
+      // only names can show `expected [X] performed [X]` next to act=NO and
+      // look like the grader is broken. Show what actually differed.
+      for (const line of argDiff(r.expectedArgs ?? [], r.performedArgs ?? [])) console.log(`        ${line}`);
     }
   }
 }
@@ -293,6 +333,15 @@ if (TRIALS > 1) {
 }
 console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.length).toFixed(1)}%   ` +
   `${results.reduce((a, r) => a + r.seconds, 0)}s wall`);
+
+// The same tally the in-process runner printed, so "did anything reach for
+// run_js" has an on-object answer rather than an in-process one.
+const toolTotals: Record<string, number> = {};
+for (const r of results) for (const [n, c] of Object.entries(r.byTool ?? {})) {
+  toolTotals[n] = (toolTotals[n] ?? 0) + (c as number);
+}
+console.log(`  tools: ${Object.entries(toolTotals).sort((a: any, b: any) => b[1] - a[1])
+  .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}`);
 
 const endings: Record<string, number> = {};
 for (const r of results.filter((x) => !x.reward)) endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;
