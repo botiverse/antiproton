@@ -229,7 +229,7 @@ async function runTask(task: any) {
   return {
     id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
     turns: turns - 1, simCalls,
-    usage: res.usage ?? {}, kinds: res.kinds ?? {},
+    usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {},
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),
     performedWrites: writes.map((w: any) => w.name),
@@ -285,7 +285,7 @@ for (let trial = 1; trial <= TRIALS; trial++) {
     catch (e) {
       r = { id: task.id, reward: 0, dbMatch: false, actionMatch: false,
             ended: `error: ${(e as Error).message.slice(0, 80)}`, turns: 0, simCalls: 0,
-            usage: {}, kinds: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
+            usage: {}, kinds: {}, byTool: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
     }
     results.push({ ...r, trial });
     const mark = r.reward ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
@@ -312,6 +312,15 @@ if (TRIALS > 1) {
 }
 console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.length).toFixed(1)}%   ` +
   `${results.reduce((a, r) => a + r.seconds, 0)}s wall`);
+
+// The same tally the in-process runner printed, so "did anything reach for
+// run_js" has an on-object answer rather than an in-process one.
+const toolTotals: Record<string, number> = {};
+for (const r of results) for (const [n, c] of Object.entries(r.byTool ?? {})) {
+  toolTotals[n] = (toolTotals[n] ?? 0) + (c as number);
+}
+console.log(`  tools: ${Object.entries(toolTotals).sort((a: any, b: any) => b[1] - a[1])
+  .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}`);
 
 const endings: Record<string, number> = {};
 for (const r of results.filter((x) => !x.reward)) endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;

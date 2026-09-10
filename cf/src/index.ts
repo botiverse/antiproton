@@ -1049,8 +1049,16 @@ export class AgentDO extends DurableObject<Env> {
         return a;
       }, { prompt: 0, completion: 0, calls: 0 });
     const kinds = events.reduce((m: any, e: any) => ((m[e.kind] = (m[e.kind] ?? 0) + 1), m), {});
+    // Which tools, how often. The in-process runner reported this and the
+    // object-side one did not, which left the one question the sandbox has
+    // to answer — does anything reach for run_js — with no on-object evidence.
+    const byTool: Record<string, number> = {};
+    for (const e of await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[]) {
+      const name = e.message?.role === "toolResult" ? e.message.toolName : null;
+      if (name) byTool[name] = (byTool[name] ?? 0) + 1;
+    }
     const r = await this.#benchState().result(`b_${taskId}`);
-    return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds };
+    return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds, byTool };
   }
 
   async resetActivity() {
