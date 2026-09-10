@@ -37,7 +37,7 @@
     // The window is looked up from this name rather than configured beside it:
     // the pair was once set to 131072 for a model holding a million, and
     // compaction fired at a twelfth of the context it had.
-    "HARNESS_MODEL": "deepseek-v4-pro",
+    "HARNESS_MODEL": "deepseek-flash",
     "ARTIFACT_BUCKET": "antiproton-artifacts",
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.

@@ -23,6 +23,11 @@ export const ASSUMED_CONTEXT_WINDOW = 131_072;
  * every call 404s. One was left here until the day it expired.
  */
 export const CONTEXT_WINDOWS: Record<string, number> = {
+  // Measured rather than read off a page: a 900,034-token prompt was accepted
+  // without a length refusal. The provider publishes no window in its model
+  // list, and this is the one number here that is wrong by an order of
+  // magnitude if guessed.
+  "deepseek-flash": 1_000_000,
   "deepseek-v4-pro": 1_000_000,
 };
 
