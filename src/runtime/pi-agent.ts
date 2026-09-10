@@ -31,7 +31,24 @@ import { bridgeTools, type MountedTool, type ToolHost } from "./pi-tools.ts";
 
 const JOBS = `CREATE TABLE IF NOT EXISTS pi_model_jobs (
   id TEXT PRIMARY KEY, request TEXT NOT NULL, answer TEXT,
-  created_at INTEGER NOT NULL, answered_at INTEGER)`;
+  created_at INTEGER NOT NULL, answered_at INTEGER, dispatched_at INTEGER)`;
+
+/**
+ * How long a dispatched call may be silent before it is assumed lost.
+ *
+ * It is two things at once, and they have to be the same number. It is how
+ * long the sweep waits before sending a job again, and it is how far out the
+ * alarm sets itself while a call is in flight — because the only reason to
+ * wake at all is that the answer never came.
+ *
+ * Chosen from both sides. It must be longer than any single completion, or a
+ * slow call is reclaimed while it is still running and answered twice at full
+ * price; and it must be short enough that a lost message still leaves time to
+ * recover inside a caller's patience. The common loss — a row written by an
+ * object that was evicted before it could send — does not wait at all: that job
+ * has no dispatch recorded, so the next pass sends it.
+ */
+const REDELIVERY_MS = 120_000;
 
 /**
  * Every table an agent keeps, created together.
@@ -46,6 +63,9 @@ const JOBS = `CREATE TABLE IF NOT EXISTS pi_model_jobs (
 export function ensureAgentTables(sql: SqlHost["sql"]) {
   ensurePiTables(sql);
   sql.exec(JOBS);
+  // Objects created before dispatch was written down already have the table.
+  try { sql.exec("ALTER TABLE pi_model_jobs ADD COLUMN dispatched_at INTEGER"); }
+  catch { /* already there */ }
 }
 
 export const LANE = "main";
@@ -125,8 +145,9 @@ export class PiAgent {
     };
     models.setProvider(offloadedProvider({
       port,
-      // What the caller should wait before asking again. The alarm uses it as
-      // its own delay, so it is the agent's polling cadence.
+      // What pi tells the caller to wait before asking again. The alarm does
+      // not use it — nothing here polls for an answer that is delivered — but
+      // it is part of the deferred handle pi hands back, so it is set honestly.
       pollAfterMs: opts.pollAfterMs ?? 1_000,
       id: opts.model.provider,
       models: [{
@@ -169,15 +190,36 @@ export class PiAgent {
     return id;
   }
 
-  /** Separated from #startJob because dispatch is I/O and the port is not. */
+  /**
+   * Send the jobs nobody is carrying. Separated from #startJob because dispatch
+   * is I/O and the port is not.
+   *
+   * "Nobody is carrying" is the whole point, and it used to mean "unanswered",
+   * which is not the same thing. A call in flight is unanswered for as long as
+   * the model takes, so every pass sent it again: fifty-one dispatches for
+   * eleven calls in one τ² run. A duplicate is not free — `takeJob` refuses a
+   * job only once it has an answer, so a second worker picks up a call still
+   * running and asks the provider a second time, and the tokens that answer
+   * loses are still billed.
+   *
+   * So a dispatch is written down, and the sweep only reclaims a job that has
+   * been silent longer than a call could plausibly take. That still recovers
+   * the case it exists for — a row written by an object that was evicted before
+   * it could send, or a queue message that was dropped.
+   */
   async dispatchPending(limit = 20): Promise<number> {
-    const rows = this.#sql
-      .exec("SELECT id FROM pi_model_jobs WHERE answer IS NULL ORDER BY created_at LIMIT ?", limit)
-      .toArray() as Array<{ id: string }>;
+    const now = (this.#opts.now ?? Date.now)();
+    const rows = this.#sql.exec(
+      "SELECT id FROM pi_model_jobs WHERE answer IS NULL" +
+      " AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
+      now - REDELIVERY_MS, limit).toArray() as Array<{ id: string }>;
     let sent = 0;
     for (const r of rows) {
-      try { await this.#opts.dispatch(String(r.id)); sent += 1; }
-      catch { /* the row stays; the next pass tries again */ }
+      try {
+        await this.#opts.dispatch(String(r.id));
+        this.#sql.exec("UPDATE pi_model_jobs SET dispatched_at = ? WHERE id = ?", now, r.id);
+        sent += 1;
+      } catch { /* not marked, so the next pass tries again immediately */ }
     }
     return sent;
   }
@@ -285,10 +327,16 @@ export class PiAgent {
         settled.push({ operationId, status: out.outcome?.status ?? "unknown" });
         continue;
       }
-      // waiting: retry has a time, deferred has a poll interval.
+      // waiting: retry has a time, deferred has a poll interval — and the poll
+      // interval is the wrong number here. It is meant for a provider batch API,
+      // where asking is the only way to find out. Our answer is delivered: the
+      // worker writes it and wakes the object in the same breath. Waking every
+      // second to ask a question we will be told the answer to was 55 alarm
+      // passes for 11 model calls, all of them billed. What is left is a safety
+      // net for an answer that never arrives at all.
       const at = out.reason === "retry"
         ? Math.max(0, Number(out.notBefore ?? now) - now)
-        : Number(out.deferred?.pollAfterMs ?? 1_000);
+        : REDELIVERY_MS;
       wake = wake === null ? at : Math.min(wake, at);
     }
 
@@ -300,7 +348,7 @@ export class PiAgent {
     const after = await this.#lane.inspectExecution(CTX);
     return {
       open: after.current ? 1 : 0,
-      wakeInMs: after.current ? (wake ?? 1_000) : null,
+      wakeInMs: after.current ? (wake ?? REDELIVERY_MS) : null,
       settled,
     };
   }

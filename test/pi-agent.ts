@@ -150,6 +150,58 @@ await check("模型还没答完时,重复的 step 不会把 transcript 撑大", 
   await f.agent.close();
 });
 
+await check("模型还在跑的时候,不会被重复派单", async () => {
+  // A duplicate dispatch is not a harmless retry. `takeJob` refuses a job only
+  // once it has an answer, so a second worker picks up a call that is still
+  // running and asks the provider again — and the losing answer's tokens are
+  // billed all the same. One τ² run sent eleven calls fifty-one times.
+  let clock = 1_700_000_000_000;
+  const host = sqliteHost();
+  const dispatched: string[] = [];
+  const agent = await PiAgent.open({
+    host, sessionId: "s", systemPrompt: "be brief", model: MODEL, tools: TOOLS,
+    toolHost: { async invoke() { return { status: "succeeded", result: {} }; } },
+    async dispatch(id) { dispatched.push(id); },
+    now: () => clock,
+  });
+  await agent.say("hello");
+  await agent.step();
+  if (dispatched.length !== 1) throw new Error(`first pass sent ${dispatched.length}`);
+
+  for (let i = 0; i < 20; i++) { clock += 1_000; await agent.step(); }
+  if (dispatched.length !== 1) {
+    throw new Error(`20 passes over 20s re-sent a call in flight ${dispatched.length - 1} times`);
+  }
+
+  // The sweep still exists for the case it was written for: an answer that
+  // never comes at all, because the object died between the write and the send
+  // or the queue lost the message.
+  clock += 121_000;
+  await agent.step();
+  if (dispatched.length !== 2) throw new Error("a silent call was never reclaimed");
+
+  const jobs = host.sql.exec("SELECT id FROM pi_model_jobs WHERE answer IS NULL").toArray() as any[];
+  if (jobs.length !== 1) throw new Error(`re-sending made ${jobs.length} jobs out of one`);
+  worker(agent).answer(jobs[0]!.id, { text: "done" });
+  if ((await agent.step()).open !== 0) throw new Error("did not settle after the answer");
+  await agent.close();
+});
+
+await check("等一个会被送来的答案时,闹钟不再每秒醒一次", async () => {
+  // The alarm's delay is this number. Waking every second to ask whether the
+  // model has answered was 55 alarm passes for 11 calls, all of them billed —
+  // and every one of them asked a question the worker was about to answer
+  // unprompted.
+  const f = await fixture();
+  await f.agent.say("hello");
+  const out = await f.agent.step();
+  if (out.open !== 1) throw new Error("nothing was left in flight");
+  if ((out.wakeInMs ?? 0) < 30_000) {
+    throw new Error(`the object rearms after ${out.wakeInMs}ms while the queue holds the call`);
+  }
+  await f.agent.close();
+});
+
 await check("对象被驱逐:重新 open 后接着跑完", async () => {
   const f = await fixture();
   await f.agent.say("hello");
