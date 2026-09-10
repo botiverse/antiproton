@@ -233,7 +233,22 @@ async function runTask(task: any) {
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),
     performedWrites: writes.map((w: any) => w.name),
+    expectedArgs: expected, performedArgs: writes.map((w: any) => ({ name: w.name, args: w.args })),
   };
+}
+
+/** Which expected write had no performed write with the same name *and*
+ *  arguments — the actual criterion — with both sides shown. */
+function argDiff(expected: Array<{ name: string; args: any }>, performed: Array<{ name: string; args: any }>): string[] {
+  const out: string[] = [];
+  for (const e of expected) {
+    const same = performed.filter((p) => p.name === e.name);
+    if (same.some((p) => canon(p.args) === canon(e.args))) continue;
+    out.push(`${e.name} expected ${canon(e.args).slice(0, 160)}`);
+    for (const p of same) out.push(`${" ".repeat(e.name.length)} performed ${canon(p.args).slice(0, 160)}`);
+    if (!same.length) out.push(`${" ".repeat(e.name.length)} performed (nothing by that name)`);
+  }
+  return out;
 }
 
 function passAtK(rows: any[], k: number) {
@@ -279,6 +294,10 @@ for (let trial = 1; trial <= TRIALS; trial++) {
       `${r.turns} turns / ${r.usage?.calls ?? "?"} calls / ${r.usage?.prompt ?? "?"} tok / ${r.seconds}s`);
     if (!r.reward && (r.expectedWrites.length || r.performedWrites.length)) {
       console.log(`      expected: [${r.expectedWrites.join(", ")}]  performed: [${r.performedWrites.join(", ")}]`);
+      // The match is on the arguments, not the names, so a line that prints
+      // only names can show `expected [X] performed [X]` next to act=NO and
+      // look like the grader is broken. Show what actually differed.
+      for (const line of argDiff(r.expectedArgs ?? [], r.performedArgs ?? [])) console.log(`        ${line}`);
     }
   }
 }
