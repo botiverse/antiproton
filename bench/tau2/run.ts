@@ -94,6 +94,7 @@ async function runTask(task: any, verbose: boolean) {
       name: t.name, description: t.summary, parameters: t.parameters,
       address: `${m.alias}.${t.name}`,
       sideEffects: t.sideEffects, idempotency: t.idempotency,
+      exclusive: byId.get(m.plugin)?.exclusive,
     })));
 
   const holder: { agent?: PiAgent } = {};

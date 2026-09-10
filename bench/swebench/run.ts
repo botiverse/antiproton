@@ -196,6 +196,7 @@ async function runOne(inst: Instance) {
       name: t.name, description: t.summary, parameters: t.parameters,
       address: `${m.alias}.${t.name}`,
       sideEffects: t.sideEffects, idempotency: t.idempotency,
+      exclusive: byId.get(m.plugin)?.exclusive,
     }))).filter((t) => !OWNED_BY_THE_RUNNER.has(t.address));
 
   const holder: { agent?: PiAgent } = {};

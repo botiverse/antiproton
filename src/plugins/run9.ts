@@ -188,6 +188,9 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
 export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
   return {
   id: "run9",
+  // One container per mount, created on demand — two calls at once would
+  // create two, and only one of them would ever be released.
+  exclusive: true,
   credential: {
     required: true,
     summary: "run9 access and secret keys, as JSON.",

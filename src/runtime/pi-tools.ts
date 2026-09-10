@@ -29,6 +29,9 @@ export interface MountedTool {
   address: string;
   sideEffects?: "read" | "write";
   idempotency?: "native" | "key" | "none";
+  /** Set when the plugin's mount owns a shared resource, so its calls must not
+   *  overlap. pi executes a turn's tool calls in parallel by default. */
+  exclusive?: boolean;
 }
 
 export interface ToolResult {
@@ -85,6 +88,9 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
     description: t.description,
     parameters: t.parameters as any,
     replay: replayPolicy(t),
+    // pi runs a turn's tool calls in parallel unless a tool says otherwise, and
+    // a plugin whose mount owns one container cannot survive that.
+    ...(t.exclusive ? { executionMode: "sequential" as const } : {}),
     async execute(_toolCallId: string, params: Json) {
       const res = await host.invoke({ tool: t.address, args: params });
       if (res.status !== "succeeded") {

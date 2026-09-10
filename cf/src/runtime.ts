@@ -318,6 +318,10 @@ export class AgentRuntime {
         (byId.get(m.plugin)?.tools ?? []).map((t) => ({
           name: t.name, description: t.summary, parameters: t.parameters,
           address: `${m.alias}.${t.name}`,
+          // Carried through so replay policy and exclusivity are decided by the
+          // plugin that knows, not guessed at the point of use.
+          sideEffects: t.sideEffects, idempotency: t.idempotency,
+          exclusive: byId.get(m.plugin)?.exclusive,
         })),
       )),
     };

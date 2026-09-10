@@ -118,6 +118,24 @@ async function runOnce(f: any, tools: any[]) {
   return { harness, lane, out: out.value ?? out };
 }
 
+await check("共享资源的插件,其工具不允许并行", async () => {
+  // pi runs a turn's tool calls in parallel unless a tool says otherwise. run9
+  // keeps one container per mount and creates it if absent, so two calls
+  // arriving together both find nothing and both create one — and only the
+  // last write to the connection state survives. Fifteen containers
+  // accumulated that way before the meter made it visible.
+  const [shared, plain] = bridgeTools([
+    { name: "shell", description: "", parameters: {}, address: "node.shell", exclusive: true },
+    { name: "get", description: "", parameters: {}, address: "web.get" },
+  ], { async invoke() { return { status: "succeeded" }; } }) as any[];
+  if (shared.executionMode !== "sequential") {
+    throw new Error(`a shared-resource tool was left parallel: ${shared.executionMode}`);
+  }
+  if ("executionMode" in plain) {
+    throw new Error("an ordinary tool was needlessly serialised");
+  }
+});
+
 await check("工具调用落到 gateway,结果进 transcript", async () => {
   const calls: any[] = [];
   const f = fixture(async () => ({}), msg(

@@ -85,6 +85,19 @@ export interface Plugin {
   id: string;
   version: string;
   tools: ToolSchema[];
+  /**
+   * Whether two calls to this plugin may overlap for one mount.
+   *
+   * Most plugins are fine concurrently — two HTTP fetches do not interfere.
+   * A plugin whose mount owns a shared resource is not: run9 keeps one
+   * container per mount and creates it if absent, so two calls arriving
+   * together both find nothing and both create one. Only the last write to the
+   * connection state survives; the rest become containers nobody will ever
+   * release, billed by the second for as long as they exist.
+   *
+   * Fifteen of them accumulated before the meter made it visible.
+   */
+  exclusive?: boolean;
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
   /** What credential it needs, if any. Absent means it never uses one. */
