@@ -328,22 +328,31 @@ instances each time:
 |---|---|---|---|---|---|
 | the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k | Node process, in-memory SQLite |
 | pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k | Node process, in-memory SQLite |
-| pi's loop | **deepseek-flash** *(deployed model)* | **3/3** | 690 s | 550 k (94% cached) | Node process, in-memory SQLite |
+| pi's loop | deepseek-flash | 3/3 | 690 s | 550 k (94% cached) | Node process, in-memory SQLite |
+| pi's loop | **deepseek-flash** *(deployed model)* | **3/3** | 692 s | 446 k (93% cached) | **Durable Object** `bench-swe1`, 2026-09-10, `swe-on-object` |
 
-All three rows are **in-process**: SWE-bench grades through an endpoint the
-object does not yet expose, so none of them meet the measurement standard above
-and none is a deployment figure. Moving them onto the object is the next
-change; until then they detect direction, not cost.
+The first two rows compare loops; the last two change the model as well, and
+are here because it is the model the deployment runs. Only the last row meets
+the standard: it was driven through the deployed Worker (`bench/swebench/cf.ts`),
+the agent ran inside the object with the instance's image mounted as its
+machine, the model calls went through the production queue, and the grader ran
+in the same container before the runner released it. Same score and wall clock
+as the in-process row, half the tokens, and one number the Node process could
+not produce at all: **the object was billed for 516 s of the 692 s wall clock
+(75 %)**, 28 s of it the runner grading. τ² bills the object for 3 % of wall
+clock; SWE-bench bills it for 75 %. The difference is where the waiting
+happens: a model call leaves the object through the queue, but a tool call runs
+inside it, and this task is 49 shell commands in a container, the first of them
+a 75-second image pull. That is a property of what ships, measured rather than
+argued, and not something this change fixes.
 
-Only the first two rows compare loops; the third changes the model as well, and
-is here because it is the model the deployment runs.
-
-Prompt tokens alone overstate the bill by more than ten times: of the 550 k in
-the last row, about 33 k were actually re-read. An append-only transcript earns
+Prompt tokens alone overstate the bill by more than ten times: of the 446 k in
+the last row, about 30 k were actually re-read. An append-only transcript earns
 that — each turn adds to the tail and leaves the prefix untouched, which is the
 shape a provider cache rewards.
 
-Across all three instances and 53 tool calls, `run_js` was used **zero** times.
+Across all three instances, in the in-process run (53 tool calls) and the
+on-object one (49), `run_js` was used **zero** times.
 This task is shell work inside a container, and the sandbox earns its place by
 replacing several calls with one; the benchmark is not the shape that tests it.
 
