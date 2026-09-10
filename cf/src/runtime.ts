@@ -252,6 +252,12 @@ export class AgentRuntime {
     { alias: "gh_public", plugin: "github", account: "unauthenticated" },
   ];
 
+  /** What is installed, for a console that wants to show settings rather than
+   *  guess them from whichever mounts happen to exist. */
+  plugins(): Plugin[] {
+    return this.#plugins;
+  }
+
   /** The gateway, so an approval decided outside a task can act on it. */
   gateway() {
     return this.#gateway;
@@ -344,6 +350,10 @@ export class AgentRuntime {
       systemPrompt: systemPrompt({
         workingSet: await workingSet(this.store, tenantId, agentId),
         policy: this.#deps.policy,
+        // The object mounts the sandbox itself, below, and parks large tool
+        // results — so both paragraphs describe something that is really there.
+        sandbox: true,
+        artifacts: true,
       }),
       model: {
         provider: binding.provider,

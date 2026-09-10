@@ -23,11 +23,12 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
 import { ensureAgentTables } from "../../src/runtime/pi-agent.ts";
+import { validateMount } from "../../src/runtime/mount-config.ts";
 import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens,
+  runtimePanel, timeline, tokens, plugins,
 } from "./ui.ts";
 
 export interface Env {
@@ -967,6 +968,70 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
+  /**
+   * What is installed, what this agent has mounted, and which of it is real.
+   *
+   * Two different questions that the console used to answer by mixing: a
+   * plugin is code that is present, a mount is an authority this agent has
+   * been given. The same plugin mounted twice against two accounts is two
+   * mounts and one plugin, and a page that shows only one of the two cannot
+   * explain why a tool call was refused.
+   */
+  async uiPlugins(tenantId: string, agentId: string) {
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    const installed = rt.plugins();
+    const byId = new Map(installed.map((p) => [p.id, p]));
+    const mounts = await rt.store.listMounts(tenantId, agentId);
+
+    // Which tools this agent has actually reached for. A catalogue says what is
+    // possible; this says what happened.
+    const used: Record<string, number> = {};
+    try {
+      const agent = await rt.agent(tenantId, agentId);
+      const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+      for (const e of entries as any[]) {
+        const n = e.message?.role === "toolResult" ? e.message.toolName : null;
+        if (n) used[n] = (used[n] ?? 0) + 1;
+      }
+    } catch { /* an agent with no transcript yet has used nothing */ }
+
+    return {
+      installed: installed.map((p) => ({
+        id: p.id,
+        version: p.version,
+        credential: p.credential ?? null,
+        config: p.config ?? [],
+        tools: p.tools.map((t) => ({
+          name: t.name, summary: t.summary,
+          sideEffects: t.sideEffects, idempotency: t.idempotency,
+        })),
+      })),
+      mounts: await Promise.all(mounts.map(async (m) => {
+        const plugin = byId.get(m.plugin);
+        const conn = await rt.store.getConnection(tenantId, agentId, m.alias).catch(() => null);
+        return {
+          alias: m.alias,
+          plugin: m.plugin,
+          version: m.toolVersion,
+          account: (m.publicConfig as any)?.account ?? null,
+          // Whether an account is attached, never which one and never its value.
+          connected: !!m.secretRef,
+          needsAccount: plugin?.credential?.required ?? false,
+          optionalAccount: plugin?.credential ? !plugin.credential.required : false,
+          policy: m.policy ?? null,
+          config: m.publicConfig ?? {},
+          session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
+          problems: plugin
+            ? validateMount(plugin, m.publicConfig as any, m.secretRef).map((x) => x.message)
+            : [`no plugin named ${m.plugin} is installed`],
+          tools: (plugin?.tools ?? []).map((t) => `${m.alias}.${t.name}`),
+        };
+      })),
+      used,
+    };
+  }
+
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiCompact", async () => {
@@ -1717,6 +1782,12 @@ export default {
             // panels on the right.
             ? trajectory(conversation(t.events), t.byOp, t.busy)
             : eventList(t.events));
+        }
+        case "/ui/plugins": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          return html(plugins(await stub.uiPlugins("demo", agentId)));
         }
         case "/ui/storage":
         case "/ui/memory":

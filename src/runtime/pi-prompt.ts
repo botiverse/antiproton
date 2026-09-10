@@ -6,14 +6,31 @@
  * from 84.9% to 0.0%, which is 6.6× the uncached tokens on the next call — so
  * it wants to be somewhere a person can see it is being changed.
  *
- * The working set is appended rather than woven in, for the same reason: what
- * the agent wrote down changes between tasks, and everything above it does not.
+ * It is also assembled rather than fixed, and that is not tidiness. The base
+ * used to be a page about the JavaScript sandbox that ended with *"when you
+ * have the answer, reply in plain text with no tool call"*. On a coding task
+ * that is fine. On a task whose correct ending **is** a tool call it is an
+ * instruction to stop early, sitting in the last line before the domain policy
+ * — and a τ²-bench trajectory showed exactly that: the agent verified the
+ * customer, found the order, priced the exchange, wrote a faultless summary,
+ * was told to go ahead, wrote the summary again, and never called
+ * `exchange_delivered_order_items`.
+ *
+ * So the sandbox paragraph appears only where a sandbox exists, and nothing in
+ * here equates finishing with not acting.
  */
-export const BASE_SYSTEM = `You are a long-running agent working on the user's behalf.
+
+const CORE = `You are a long-running agent working on the user's behalf.
 
 You have tools. Call them directly when you need one thing.
 
-You also have a special tool, run_js, which executes JavaScript in a sandbox where
+Finish the work before you describe it. If an action is needed and you have
+what you need to take it, take it — a summary of what you are about to do is
+not the same as doing it, and a person who has told you to go ahead has already
+answered the question you were going to ask. Reply in plain text when the work
+is done, or when you genuinely need something only the user can give you.`;
+
+const SANDBOX = `You also have a special tool, run_js, which executes JavaScript in a sandbox where
 the same tools are reachable as:
 
     const res = await tool\`TOOL_NAME \${ { ...arguments... } }\`;
@@ -29,16 +46,29 @@ in run_js.
 
 Inside run_js: every call returns { status, ... }. "succeeded" carries .result,
 "rejected" carries .error.code. There is no fetch, require, fs or process — the
-tool tag is the only way out. Nothing persists between runs.
+tool tag is the only way out. Nothing persists between runs.`;
 
-Large results may come back summarised with an artifact reference instead of the
+const ARTIFACTS = `Large results may come back summarised with an artifact reference instead of the
 full payload; read them back with the artifacts tool, projecting only the fields
-you need.
+you need.`;
 
-When you have the answer, reply in plain text with no tool call.`;
+/** Kept for tests and for anything that wants the unadorned text. */
+export const BASE_SYSTEM = CORE;
 
-export function systemPrompt(parts: { workingSet?: string; policy?: string } = {}): string {
-  const out = [BASE_SYSTEM];
+export interface PromptParts {
+  workingSet?: string;
+  policy?: string;
+  /** Whether `run_js` is actually offered. A page about a sandbox the agent
+   *  does not have is noise competing with the instructions that matter. */
+  sandbox?: boolean;
+  /** Whether large results can be parked and read back. */
+  artifacts?: boolean;
+}
+
+export function systemPrompt(parts: PromptParts = {}): string {
+  const out = [CORE];
+  if (parts.sandbox) out.push(SANDBOX);
+  if (parts.artifacts ?? parts.sandbox) out.push(ARTIFACTS);
   if (parts.policy?.trim()) out.push(parts.policy.trim());
   if (parts.workingSet?.trim()) out.push(parts.workingSet.trim());
   return out.join("\n\n");

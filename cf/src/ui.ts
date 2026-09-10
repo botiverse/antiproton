@@ -16,6 +16,15 @@ const esc = (s: unknown) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 
 const CSS = `
+
+.mount{border:1px solid var(--line);border-radius:4px;padding:10px 12px;margin:8px 0;background:var(--panel)}
+.mount-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.problems{border-left:2px solid var(--bad);padding:4px 0 4px 8px;margin:6px 0;font-size:12px;color:var(--bad)}
+.plug{border:1px solid var(--line);border-radius:4px;padding:8px 12px;margin:6px 0;background:var(--panel)}
+.plug summary{cursor:pointer;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.plug h4{margin:10px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+code.hot{color:var(--ok);border-color:var(--ok)}
+
 .step{border-left:2px solid var(--line);padding:8px 0 8px 12px;margin:0 0 10px}
 .step.user{border-color:var(--accent)}
 .step.agent{border-color:#9d7cd8}
@@ -210,6 +219,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   <section>
     <div class="tabs">
       ${tab("trajectory", "trajectory", "/ui/transcript")}
+      ${tab("plugins", "plugins", "/ui/plugins")}
       ${tab("events", "events", "/ui/events")}
       ${tab("storage", "storage", "/ui/storage")}
       ${tab("memory", "memory", "/ui/memory")}
@@ -773,4 +783,96 @@ ${allSaved.length
        survived because the agent called <span class="chip">node.save</span>; they are readable
        with <span class="chip">artifacts.read</span>.</div>`
     : `<div class="empty">nothing was saved out — everything those containers produced is gone</div>`}`;
+}
+
+
+/**
+ * What is installed, and what this agent may actually do.
+ *
+ * Two questions the console used to blur together. A *plugin* is code that is
+ * present on the deployment; a *mount* is an authority this agent has been
+ * given. The same plugin mounted twice against two accounts is one plugin and
+ * two mounts, with two credentials and two session states, and a page that
+ * shows only the catalogue cannot explain why one call worked and another was
+ * refused.
+ *
+ * Mounts come first because they are the answer to "why did that happen".
+ * Nothing here shows a credential; only whether one is attached.
+ */
+export function plugins(d: any): string {
+  const used: Record<string, number> = d.used ?? {};
+  const installed: any[] = d.installed ?? [];
+  const mounts: any[] = d.mounts ?? [];
+
+  const account = (m: any) => {
+    if (m.problems?.length) return `<span class="tag bad">misconfigured</span>`;
+    if (m.connected) return `<span class="tag ok">account attached</span>`;
+    if (m.needsAccount) return `<span class="tag bad">needs an account</span>`;
+    if (m.optionalAccount) return `<span class="tag">public only</span>`;
+    return `<span class="tag">no account needed</span>`;
+  };
+
+  const settings = (m: any) => {
+    const rows = Object.entries(m.config ?? {}).filter(([k]) => k !== "account");
+    if (!rows.length) return `<div class="hint">default settings</div>`;
+    return `<div class="kv">${rows.map(([k, v]) =>
+      `<div>${esc(k)}</div><div><code>${esc(
+        typeof v === "string" ? v : JSON.stringify(v))}</code></div>`).join("")}</div>`;
+  };
+
+  const mountBlock = (m: any) => `
+    <div class="mount">
+      <div class="mount-head">
+        <b>${esc(m.alias)}</b>
+        <span class="sub">${esc(m.plugin)} ${esc(m.version ?? "")}</span>
+        ${account(m)}
+        ${m.policy ? `<span class="tag">policy</span>` : ""}
+      </div>
+      ${(m.problems ?? []).length
+        ? `<div class="problems">${(m.problems as string[]).map((p) =>
+            `<div>${esc(p)}</div>`).join("")}</div>`
+        : ""}
+      ${settings(m)}
+      <div class="hint" style="padding-top:6px">${
+        m.tools.length
+          ? m.tools.map((t: string) => {
+              const bare = t.split(".").slice(1).join(".");
+              const n = used[bare] ?? 0;
+              return `<code class="${n ? "hot" : ""}">${esc(t)}${n ? ` ×${n}` : ""}</code>`;
+            }).join(" ")
+          : "no tools"
+      }</div>
+    </div>`;
+
+  const toolRow = (p: any) => (t: any) => [
+    t.name, t.sideEffects, t.idempotency, t.summary,
+  ];
+
+  const pluginBlock = (p: any) => `
+    <details class="plug">
+      <summary><b>${esc(p.id)}</b> <span class="sub">${esc(p.version)} · ${p.tools.length} tools</span>
+        ${p.credential
+          ? `<span class="tag ${p.credential.required ? "bad" : ""}">${
+              p.credential.required ? "account required" : "account optional"}</span>`
+          : ""}</summary>
+      ${p.credential ? `<div class="hint">${esc(p.credential.summary)}${
+        p.credential.grants ? ` — an account adds ${esc(p.credential.grants)}` : ""}</div>` : ""}
+      ${p.config.length ? `<h4>settings</h4>${table(
+        ["name", "type", "default", "what it does"],
+        p.config.map((c: any) => [c.name, c.type,
+          c.default === undefined ? "—" : String(c.default), c.summary]))}` : ""}
+      <h4>tools</h4>
+      ${table(["tool", "effect", "replay", "what it does"], p.tools.map(toolRow(p)))}
+    </details>`;
+
+  return `
+<h3>this agent's mounts</h3>
+<div class="hint">A mount is an authority, not a plugin. The same plugin mounted twice
+  against two accounts is two mounts, with two credentials and two session states.
+  No credential is shown here — only whether one is attached.</div>
+${mounts.length ? mounts.map(mountBlock).join("") : `<div class="empty">nothing mounted</div>`}
+
+<h3 style="margin-top:18px">installed on this deployment</h3>
+<div class="hint">Present in the code. Mounting one is a separate, deliberate act.</div>
+${installed.map(pluginBlock).join("")}`;
 }

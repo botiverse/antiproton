@@ -167,6 +167,28 @@ async function runTask(task: any, verbose: boolean) {
   const meter = await readMeter(store, T, AGENT, ["retail", "tools"], Date.now() - t0, {
     promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
   });
+  // The whole transcript, when asked for. A pass rate says a task failed; only
+  // the trajectory says whether the agent was wrong or the loop stopped early,
+  // and those want completely different fixes.
+  if (process.env.TRAJECTORY) {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(String(process.env.TRAJECTORY), { recursive: true });
+    writeFileSync(
+      `${process.env.TRAJECTORY}/task-${task.id}-${Date.now()}.json`,
+      JSON.stringify({
+        id: task.id, ended, turns: turns - 1,
+        expected: expected.map((e) => ({ name: e.name, args: e.args })),
+        performed: writes,
+        entries: entries.map((e: any) => ({
+          seq: e.seq, type: e.type,
+          role: e.message?.role, stopReason: e.message?.stopReason,
+          toolName: e.message?.toolName,
+          content: e.message?.content ?? e.message ?? null,
+        })),
+      }, null, 2),
+    );
+  }
+
   const release = await gw.releaseTask(ctx);
   for (const f of release.failed) console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
   await agent.close();

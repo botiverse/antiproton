@@ -188,6 +188,26 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
 export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
   return {
   id: "run9",
+  credential: {
+    required: true,
+    summary: "run9 access and secret keys, as JSON.",
+    shape: { keys: ["ak", "sk"] },
+    grants: "starting and destroying containers, which are billed by the second.",
+    docs: "https://run.sys9.ai",
+  },
+  config: [
+    { name: "image", type: "string", summary: "Container image to start from.",
+      default: "public.ecr.aws/docker/library/node:22-alpine" },
+    { name: "workdir", type: "string", summary: "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.", default: "/work" },
+    { name: "shape", type: "string", summary: "Machine size, e.g. 2c4g. Larger costs more per second." },
+    { name: "shell", type: "string", summary: "Shell the shell tool runs commands in.", default: "/bin/sh" },
+    { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
+    { name: "timeoutMs", type: "number", summary: "How long one call may take.", default: 120000 },
+    { name: "maxOutputBytes", type: "number", summary: "Output past this is parked as an artifact instead of returned.", default: 24000 },
+    { name: "secrets", type: "string[]", summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
+    { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
+    { name: "endpoint", type: "string", summary: "API endpoint.", default: "https://api.run.sys9.ai" },
+  ],
   version: "1.0.0",
   tools: [
     {

@@ -203,7 +203,7 @@ async function runOne(inst: Instance) {
   const agent = await PiAgent.open({
     host: sqliteHost(),
     sessionId: `${T}/${AGENT}`,
-    systemPrompt: systemPrompt({ policy: POLICY }),
+    systemPrompt: systemPrompt({ policy: POLICY, sandbox: true }),
     model: { provider: "openai-compatible", id: MODEL_ID, contextWindow: contextWindowFor(MODEL_ID) },
     tools,
     toolHost: host,

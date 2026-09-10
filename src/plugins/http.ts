@@ -142,6 +142,12 @@ const decodeEntities = (s: string) =>
 
 export const httpPlugin: Plugin = {
   id: "http",
+  config: [
+    { name: "allowedHosts", type: "string[]", summary: "When set, only these hosts may be reached. Unset means any public host." },
+    { name: "maxBytes", type: "number", summary: "Responses larger than this are parked as an artifact instead of returned." },
+    { name: "timeoutMs", type: "number", summary: "How long one request may take." },
+    { name: "searchEndpoint", type: "string", summary: "Where the search tool sends its query." },
+  ],
   version: "1.0.0",
   tools: [
     {
