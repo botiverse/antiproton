@@ -37,6 +37,7 @@ import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { run9Plugin } from "../../src/plugins/run9.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
+import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
@@ -261,6 +262,11 @@ async function runOne(inst: Instance) {
   // starts one per instance. Silence here is how thirteen of them were once
   // found alive.
   const release = await gw.releaseTask(ctx);
+  // Read after release: a session is written into the mount's connection state
+  // when the box is handed back, precisely so the meter outlives the box.
+  const meter = await readMeter(store, T, AGENT, ["node"], Date.now() - t0, {
+    promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
+  });
   for (const f of release.failed) {
     console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
   }
@@ -302,7 +308,7 @@ async function runOne(inst: Instance) {
     failToPass: fail.ok, passToPass: pass.ok,
     diff: String(diffRes.result?.output ?? "").trim().split("\n").pop() ?? "",
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, modelTurns, toolTurns,
-    modelCalls: w.calls, byTool, ...usage,
+    modelCalls: w.calls, byTool, meter, ...usage,
     failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
   };
 }
@@ -323,9 +329,11 @@ for (const inst of instances) {
   const tools = Object.entries(r.byTool ?? {})
     .sort((a: any, b: any) => b[1] - a[1]).map(([n, c]) => `${n}×${c}`).join(" ");
   const cachePct = r.prompt ? Math.round((r.cached / r.prompt) * 100) : 0;
+  const RATES = ratesFromEnv();
   console.log(`  ${mark} ${r.seconds}s  ${r.calls} model calls  ${r.prompt} tok ` +
     `(${cachePct}% cached)` + (tools ? `  [${tools}]` : "") +
     (r.diff ? `  diff: ${r.diff}` : "") + (r.error ? `  ERROR ${r.error}` : ""));
+  if (r.meter) console.log(`      ${meterLine(r.meter, RATES)}`);
   if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
 }
 const solved = out.filter((r) => r.resolved).length;

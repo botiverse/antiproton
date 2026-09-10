@@ -26,6 +26,7 @@ import type { MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { retailPlugin, applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { nodeWorker, runToRest } from "../node-worker.ts";
+import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import type { ToolResult } from "../../src/core/tools.ts";
 
@@ -152,14 +153,20 @@ async function runTask(task: any, verbose: boolean) {
     a.calls += 1;
     a.prompt += m.usage?.input ?? 0;
     a.cached += m.usage?.cacheRead ?? 0;
+    a.out += m.usage?.output ?? 0;
     return a;
-  }, { calls: 0, prompt: 0, cached: 0 });
+  }, { calls: 0, prompt: 0, cached: 0, out: 0 });
   const byTool: Record<string, number> = {};
   for (const e of entries as any[]) {
     const n = e.message?.role === "toolResult" ? e.message.toolName : null;
     if (n) byTool[n] = (byTool[n] ?? 0) + 1;
   }
 
+  // No container in this domain — which is the point of measuring it here too:
+  // τ² costs tokens only, and a benchmark that reports one meter cannot say so.
+  const meter = await readMeter(store, T, AGENT, ["retail", "tools"], Date.now() - t0, {
+    promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
+  });
   const release = await gw.releaseTask(ctx);
   for (const f of release.failed) console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
   await agent.close();
@@ -167,7 +174,7 @@ async function runTask(task: any, verbose: boolean) {
 
   return {
     id: task.id, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
-    turns: turns - 1, simCalls, passes, byTool, ...usage,
+    turns: turns - 1, simCalls, passes, byTool, meter, ...usage,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name), performedWrites: writes.map((x) => x.name),
   };
@@ -202,6 +209,7 @@ for (let trial = 1; trial <= TRIALS; trial++) {
       `act=${r.actionMatch ? "ok " : "NO "} ${String(r.ended).padEnd(13)} ` +
       `${r.turns} turns / ${r.calls} calls / ${r.prompt} tok (${cache}) / ${r.seconds}s`);
     if (tools) console.log(`      [${tools}]`);
+    if (r.meter) console.log(`      ${meterLine(r.meter, ratesFromEnv())}`);
     if (!r.reward && (r.expectedWrites.length || r.performedWrites.length)) {
       console.log(`      expected: [${r.expectedWrites.join(", ")}]  performed: [${r.performedWrites.join(", ")}]`);
     }
