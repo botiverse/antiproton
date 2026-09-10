@@ -42,6 +42,34 @@ await check("重放策略来自我们已经记录、却一直没用的字段", a
   if (got !== want) throw new Error(`got ${got}`);
 });
 
+await check("供应商不接受的字符会被清洗,地址不受影响", async () => {
+  const got = bridgeTools([
+    { name: "repos.get", description: "", parameters: {}, address: "gh.repos.get" },
+    { name: "issues.list", description: "", parameters: {}, address: "gh.issues.list" },
+  ], { async invoke() { return { status: "succeeded" }; } });
+  const names = got.map((t: any) => t.name);
+  for (const n of names) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(n)) throw new Error(`a provider would refuse ${n}`);
+  }
+  if (names.join(",") !== "repos_get,issues_list") throw new Error(names.join(","));
+});
+
+await check("清洗造成的重名也会被限定", async () => {
+  const got = qualifyMountedTools([
+    { name: "a.b", description: "", parameters: {}, address: "x.a.b" },
+    { name: "a-b", description: "", parameters: {}, address: "y.a-b" },
+  ]);
+  // Both sanitise to a_b / a-b — different, so neither needs a prefix.
+  const clash = qualifyMountedTools([
+    { name: "a.b", description: "", parameters: {}, address: "x.a.b" },
+    { name: "a_b", description: "", parameters: {}, address: "y.a_b" },
+  ]);
+  if (got.map((t) => t.name).join(",") !== "a_b,a-b") throw new Error(got.map((t) => t.name).join(","));
+  if (clash.map((t) => t.name).join(",") !== "x__a_b,y__a_b") {
+    throw new Error(`a clash created by sanitising was not qualified: ${clash.map((t) => t.name).join(",")}`);
+  }
+});
+
 await check("重名才限定,不重名保持裸名", async () => {
   const clash = qualifyMountedTools([
     { name: "show", description: "", parameters: {}, address: "a.show" },

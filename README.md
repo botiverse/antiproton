@@ -102,10 +102,10 @@ flowchart TB
 
     subgraph object["Durable Object — one per (tenant, agent)"]
         direction TB
-        kernel["<b>Kernel</b><br/>lease · fencing · generation<br/>checkpoint version · quota gate"]
-        harness["<b>Harness</b> <i>(replaceable adapter)</i><br/>state + events → commands"]
-        cmd["<b>Command executor</b>"]
-        store[("<b>Store</b><br/>tasks · events · waits<br/>outbox · operations · quotas")]
+        lane["<b>Lane</b> <i>(pi's harness)</i><br/>accept = a durable write<br/>drive = one I/O pass"]
+        harness["<b>Tools</b><br/>mounts + the sandbox,<br/>as functions the lane calls"]
+        cmd["<b>Model jobs</b><br/><i>written before dispatched</i>"]
+        store[("<b>Session</b><br/>entries · values · usage<br/>operations · quotas")]
         memory[("<b>Agent state</b><br/>memory · todo · journal<br/><i>outlives the task</i>")]
     end
 
@@ -173,18 +173,27 @@ how two accounts of the same SaaS get different authority.
 
 ### The step
 
-Every advance passes four gates before anything is written:
+Admission and work are separate calls, and that separation is the design:
 
 ```
-lease (fencing token)  →  generation  →  checkpoint version  →  tenant quota
-     fenced              stale_generation   version_conflict     quota_exceeded
+accept()   a pure write — the message is durable before anything is answered
+drive()    one I/O pass — returns `waiting` rather than blocking
+resume     the next alarm picks up whatever was left open
 ```
 
-Commands go to a transactional outbox with **derived, not random** ids
-(`sha256(taskId|generation|version|index|kind|payload)`), so replaying an
-advance after a crash produces the same ids and the insert collapses. Operation
-ids are derived the same way, so a replayed *write* is answered `unknown` — it
-may already have landed — instead of being performed twice.
+`accept` returns at once, so a person's message survives a crash that happens
+before the model is even asked. `drive` never waits for a model: the provider
+here answers `deferred` with a handle, the operation suspends durably, and the
+object stops being active while the queue does the waiting. Nothing needs a
+lease or a fencing token, because a Durable Object is single-threaded and pi's
+mutation line serialises the writes — there was never a second writer for them
+to protect against.
+
+Effects the object cannot re-run safely are marked. A tool declares
+`sideEffects` and `idempotency`, which becomes pi's `replay: "never" | "safe"`:
+a read repeats freely, a write repeats only if the plugin can make it
+idempotent, and everything else is answered `unknown` rather than performed
+twice.
 
 ### Tools are called the provider's way
 
@@ -273,10 +282,10 @@ unprompted, and formatted the reply the way it had been asked to.
 
 One contract, two implementations, no third:
 
-| Backend | Where | Kernel contract |
+| Backend | Where | pi storage conformance |
 |---|---|---|
-| `SqliteStore` | in-process (Node) | 31/31 |
-| `DurableObjectStore` | Cloudflare | 31/31 |
+| `PiSqliteStorage` on node:sqlite | in-process (Node) | 21/21 |
+| `PiSqliteStorage` on DO SQLite | Cloudflare | 21/21 |
 
 A db9/Postgres backend also passed, and was removed: 61,219 ms against sqlite's
 162 ms, no `SERIALIZABLE`, and `40001` on plain concurrent inserts. A backend
@@ -285,27 +294,26 @@ on every seam change while nobody exercises it.
 
 ## What is verified
 
-Contracts, not assertions in prose. `test/spec/` runs unchanged against every
-backend and every sandbox.
+Contracts, not assertions in prose. The storage contract runs unchanged against
+both backends, and it is not ours — it ships with pi, which is the point of
+implementing pi's interface rather than copying its design.
 
 | Suite | Cases | Covers |
 |---|---|---|
-| `spec/kernel-spec` | 31 | crash before/after commit, fencing, stale generation, lost wakeup, duplicate delivery, cross-tenant, connection state, quotas (incl. no double-spend under concurrency), replay, snapshots and pruning, policy per mount, approval held then performed exactly once, and an oversized checkpoint shrunk before it is refused |
-| `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
-| `strand` | 11 | a waiting task is never unreachable: giving up is visible, a message rescues a stranded task but never bypasses an approval, the turn budget refills, foreign call syntax is translated, a command that answers nothing is still retired |
-| `compaction` | 10 | the handover is asked for and folded back, the second pass updates rather than restarts, tool output is truncated, the record survives in the log, thresholds scale with the model's window |
-| `api` · `harness` · `steering` | 32 | HTTP surface, harness decisions, steering and follow-up |
-| `narrowing` · `cache-invariants` | 18 | tool disclosure, prompt-prefix stability, a rebuilt harness refuses without its catalogue |
-| `executor` · `http-plugin` | 17 | sandbox contract in-process, fetch and HTML extraction |
-| `tools` | 11 | mount addressing, ambiguity, version pinning, `unknown` semantics, replay, the executed source on the record |
+| `spec/executor-spec` | 9 | isolation, budgets, cancellation, output caps, escape reachability |
+| `pi-agent` | 4 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, and a run interrupted by eviction is reported open and finished |
+| `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
+| `pi-tools` | 6 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept |
+| `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
+| `pi-bridge` | 4 | pi's request shape against our provider client, both ways |
+| `executor` · `http-plugin` | 19 | sandbox contract in-process, fetch and HTML extraction |
 | `state` | 7 | memory that survives a task, byte budgets, per-agent isolation |
 | `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 | `appworld` | 9 | credential custody at 457 APIs (needs a licensed install) |
 
 Live on the deployment, against the Durable Object rather than sqlite:
-[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel) 31/31 and
 [`/conformance/executor`](https://antiproton.botiverse.workers.dev/conformance/executor) 9/9,
 plus `/isolation`, `/eviction`, `/model-binding`.
 
@@ -356,23 +364,23 @@ Everything that starts a real agent fails closed: the demo needs an Access
 identity, and the workers.dev address — which bypasses Access entirely —
 requires an automation secret instead. The read-only diagnostics stay open
 because they call no provider and cost nothing:
-[`/conformance/kernel`](https://antiproton.botiverse.workers.dev/conformance/kernel),
 [`/isolation`](https://antiproton.botiverse.workers.dev/isolation),
 [`/eviction`](https://antiproton.botiverse.workers.dev/eviction).
 
 ## Running
 
 ```bash
-npm run conformance                                   # kernel contract, sqlite — 30 cases
-node --experimental-strip-types test/tools.ts         # gateway and mount addressing
-node --experimental-strip-types test/strand.ts        # a waiting task is never unreachable
-node --experimental-strip-types test/state.ts         # memory that survives a task
-node --experimental-strip-types test/executor.ts      # sandbox contract, in-process
-cd cf && npx wrangler deploy                          # Cloudflare
+npm run pi-storage          # pi's storage conformance, node:sqlite — 21 cases
+npm run pi-storage:do       # the same 21, on real Durable Object storage
+npm run pi-agent            # the object-side loop, end to end against a fake worker
+npm run pi-offload          # the object never waits for the model
+node test/executor.ts       # sandbox contract, in-process
+node test/state.ts          # memory that survives a task
+cd cf && npx wrangler deploy
 ```
 
-The same kernel and executor contracts run against the Durable Object rather
-than sqlite by fetching `/conformance/kernel` and `/conformance/executor` on the
+The executor contract runs against the Durable Object rather than in-process by
+fetching `/conformance/executor` on the
 deployment; nothing about them is Node-specific.
 
 AppWorld needs a licensed local install; see [`bench/appworld/README.md`](bench/appworld/README.md).

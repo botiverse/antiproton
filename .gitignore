@@ -15,3 +15,6 @@ bench/tau2/data/db.json
 
 # wrangler dev writes local miniflare state here
 .wrangler/
+
+# wrangler dev secrets — never committed
+.dev.vars
