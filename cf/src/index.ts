@@ -583,6 +583,11 @@ export class AgentDO extends DurableObject<Env> {
         return { ...(await rt2.store.stateUsage(tenantId, agentId)), docs };
       })(),
       alarmFailures: this.#alarmFailures(),
+      // What is still being billed because it could not be handed back.
+      releaseErrors: (this.sql.exec(
+        "CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)"),
+        [...this.sql.exec("SELECT at, alias, message FROM release_errors ORDER BY at DESC LIMIT 5")]
+          .map((r: any) => ({ at: r.at, alias: r.alias, message: r.message }))),
       // The table exists only once an alarm has failed; diagnose must not be
       // the thing that throws while explaining why something else did.
       alarmErrors: (this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)"),
@@ -1195,6 +1200,13 @@ export class AgentDO extends DurableObject<Env> {
         const who = await this.owner();
         if (!who) { await this.ctx.storage.deleteAlarm(); return; }
         const out = await rt.step(who.tenantId, who.agentId);
+        // A container that could not be handed back is billed for merely
+        // existing, so it is written down where diagnose can find it rather
+        // than left to be noticed on an invoice.
+        for (const f of out.releaseFailed ?? []) {
+          this.sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
+          this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", Date.now(), f.alias, f.error);
+        }
         await this.broadcast();
         if (out.wakeInMs !== null) {
           // The pass said when to come back — a retry has a time, a model call

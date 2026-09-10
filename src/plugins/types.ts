@@ -46,9 +46,13 @@ export interface Plugin {
    *
    * Some mounts reserve something real and metered — a container, a session, a
    * lease — and without a point to hand it back, it is held until something
-   * else notices. Called on a terminal task; must be safe to call twice and
-   * must not throw, because a failure to tidy up is not a reason to fail a task
-   * that has already finished.
+   * else notices. Called on a terminal task; must be safe to call twice.
+   *
+   * It may throw, and should, when it could not let go of something that is
+   * still being billed. What must not happen is a finished task failing over
+   * tidying up, and that is the gateway's job rather than this one's: it
+   * records the failure and carries on. Returning `false` means there was
+   * nothing to release, which is not a failure.
    */
   release?(ctx: PluginContext): Promise<boolean | void>;
 }

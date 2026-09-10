@@ -307,7 +307,12 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
    *  running on the tenant's quota because nobody thought to stop it. */
   async release(ctx: PluginContext): Promise<boolean> {
     const r = await stopBox(ctx);
-    return r !== null && r.freed;
+    if (r === null) return false;
+    // A container is the one thing here billed for merely existing, so a
+    // release that did not release has to say so. stopBox has reported this
+    // since the day thirteen boxes were found alive; nothing was listening.
+    if (!r.freed) throw new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
+    return true;
   },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {

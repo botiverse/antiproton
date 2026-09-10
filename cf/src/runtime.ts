@@ -406,10 +406,12 @@ export class AgentRuntime {
     const agent = await this.agent(tenantId, agentId);
     const out = await agent.step();
     // A finished run should not still be holding a metered container.
+    let releaseFailed: Array<{ alias: string; error: string }> = [];
     if (out.open === 0 && out.settled.length) {
-      await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
+      releaseFailed = r.failed;
     }
-    return out;
+    return { ...out, releaseFailed };
   }
 
   /** What the worker asks for, and what it hands back. */

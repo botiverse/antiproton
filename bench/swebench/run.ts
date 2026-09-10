@@ -257,7 +257,13 @@ async function runOne(inst: Instance) {
     { command: "cd /testbed && git diff --stat | tail -3" });
   const fail = await grade(f2p.slice(0, 12));
   const pass = await grade(p2p.slice(0, 12));
-  await gw.releaseTask(ctx);
+  // A box that outlives its run is billed for existing, and this benchmark
+  // starts one per instance. Silence here is how thirteen of them were once
+  // found alive.
+  const release = await gw.releaseTask(ctx);
+  for (const f of release.failed) {
+    console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
+  }
   await agent.close();
   await store.close();
 
