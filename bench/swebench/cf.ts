@@ -222,6 +222,13 @@ async function runOne(inst: Instance) {
   // Read after release: the container's session is written into the mount's
   // connection state when the box is handed back, so the meter outlives it.
   const stats: any = await api(`/bench/swe/stats?taskId=${taskId}&wallMs=${Date.now() - t0}`);
+  // What the object was billed for this instance alone, the runner's grading
+  // shown apart: the activity log is per object and keeps every kind, so the
+  // window since this instance started is this instance.
+  const act: any = await api(`/bench/activity?since=${t0}`).catch(() => null);
+  const gradingMs = (act?.byKind ?? []).filter((k: any) => k.kind === "benchSweShell")
+    .reduce((a: number, k: any) => a + Number(k.ms), 0);
+  const objectMs = Number(act?.activeMs ?? 0);
   return {
     id: inst.instance_id, taskId,
     resolved: grade.failToPass && grade.passToPass,
@@ -231,6 +238,7 @@ async function runOne(inst: Instance) {
     modelTurns: stats.modelTurns, toolTurns: stats.toolTurns, byTool: stats.byTool ?? {},
     calls: stats.usage?.calls ?? 0, prompt: stats.usage?.prompt ?? 0, out: stats.usage?.out ?? 0,
     cached: stats.usage?.cached ?? 0, meter: stats.meter as Meter | undefined,
+    objectMs, gradingMs,
   };
 }
 
@@ -260,6 +268,11 @@ for (const inst of instances) {
     (r.ended && r.ended !== "answered" ? `  ended: ${r.ended}` : "") +
     (r.error ? `  ERROR ${r.error}` : ""));
   if (r.meter) console.log(`      ${meterLine(r.meter, RATES)}`);
+  if (r.objectMs) {
+    console.log(`      object billed ${(r.objectMs / 1000).toFixed(1)}s = ` +
+      `${r.seconds ? Math.round((r.objectMs / 1000 / r.seconds) * 100) : 0}% of wall` +
+      (r.gradingMs ? ` (${(r.gradingMs / 1000).toFixed(1)}s of it grading)` : ""));
+  }
   if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
 }
 
