@@ -15,7 +15,7 @@
  */
 import { createStorageConformance } from "@earendil-works/pi-agent-core/harness/session/testing";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { sqliteHost } from "./sqlite-host.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const cases = createStorageConformance(async () => {
   const host = sqliteHost();

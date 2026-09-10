@@ -12,7 +12,7 @@ import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { fromResponse } from "../src/model/pi-bridge.ts";
 import type { MountedTool } from "../src/runtime/pi-tools.ts";
-import { sqliteHost } from "./sqlite-host.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {

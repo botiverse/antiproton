@@ -17,7 +17,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { sqliteHost } from "./sqlite-host.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {

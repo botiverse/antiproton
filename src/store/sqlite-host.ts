@@ -1,11 +1,11 @@
 /**
  * The two methods a Durable Object gives PiSqliteStorage, over node:sqlite.
  *
- * Shared by the storage conformance and the loop spike so both exercise the
- * class production runs rather than a port of it.
+ * Shared by the tests and the benchmarks, so both exercise the class production
+ * runs rather than a port of it.
  */
 import { DatabaseSync } from "node:sqlite";
-import type { SqlHost } from "../src/store/pi-storage.ts";
+import type { SqlHost } from "./pi-storage.ts";
 
 export function sqliteHost(): SqlHost & { dispose(): void } {
   const db = new DatabaseSync(":memory:");
