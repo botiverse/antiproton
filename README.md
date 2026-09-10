@@ -320,10 +320,23 @@ instances each time:
 |---|---|---|---|---|
 | the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k |
 | pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k |
-| pi's loop | **deepseek-flash** *(deployed)* | **3/3** | 1,071 s | 813 k |
+| pi's loop | **deepseek-flash** *(deployed)* | **3/3** | 690 s | 550 k (94% cached) |
 
 Only the first two rows compare loops; the third changes the model as well, and
 is here because it is what the deployment actually runs.
+
+Prompt tokens alone overstate the bill by more than ten times: of the 550 k in
+the last row, about 33 k were actually re-read. An append-only transcript earns
+that — each turn adds to the tail and leaves the prefix untouched, which is the
+shape a provider cache rewards.
+
+Across all three instances and 53 tool calls, `run_js` was used **zero** times.
+This task is shell work inside a container, and the sandbox earns its place by
+replacing several calls with one; the benchmark is not the shape that tests it.
+
+Two runs of the same commit on the same model scored 3/3 both times and differed
+by a third in cost — 1,071 s / 813 k against 690 s / 550 k. That is the size of
+the noise, and it is worth knowing before reading any single figure as a trend.
 
 The score is not the interesting number. Both instances the old loop failed
 ended after **one model call** — it was not the model failing the task, it was
