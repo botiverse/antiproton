@@ -1,3 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Every benchmark antiproton has run, what each measures, and the gaps.">
 <title>Antiproton Benchmarks</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -157,6 +163,9 @@ footer a{color:var(--accent)}
   @keyframes rise{from{opacity:.5;transform:translateY(4px)}to{opacity:1;transform:none}}
 }
 </style>
+</head>
+<body>
+
 
 <div class="wrap">
 
@@ -179,68 +188,77 @@ footer a{color:var(--accent)}
 
 <section>
   <h2>SWE-bench Verified</h2>
-  <p class="sec-note">does the loop work a real problem end to end &middot; 3 astropy instances, official scoring</p>
-  <div class="col">
-    <p>The only benchmark here that needs a real machine: a repository, its dependencies and its test suite. The agent gets one through the run9 mount, which is deliberately the only way it can &mdash; the sandbox it normally works in has no filesystem and no network. Scoring is SWE-bench&rsquo;s own: apply the official test patch, require the failing tests to pass and the passing ones to still pass. The agent&rsquo;s claim to have fixed something is not evidence.</p>
-  </div>
+  <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring</p>
 
   <div class="scroll">
   <table>
     <thead><tr>
-      <th>run</th><th>loop</th><th>model</th><th class="n">resolved</th>
-      <th class="n">wall</th><th class="n">prompt tok</th><th>note</th>
+      <th>instance</th><th class="n"></th><th class="n">wall</th><th class="n">calls</th>
+      <th class="n">prompt tok</th><th class="n">cached</th><th class="n">container</th><th>patch</th>
     </tr></thead>
     <tbody>
-      <tr><td class="n">1</td><td>codegen</td><td class="k">v4-pro</td><td class="n">1&thinsp;/&thinsp;3</td>
-        <td class="n">699&thinsp;s</td><td class="n">307&thinsp;k</td>
-        <td>Both failures ended after <b>one model call</b>.</td></tr>
-      <tr><td class="n">2</td><td>pi</td><td class="k">v4-pro</td><td class="n">1&thinsp;/&thinsp;1</td>
-        <td class="n">262&thinsp;s</td><td class="n">167&thinsp;k</td>
-        <td>Single instance &mdash; the one run&nbsp;1 failed in one call.</td></tr>
-      <tr><td class="n">3</td><td>pi</td><td class="k">v4-pro</td><td class="n">2&thinsp;/&thinsp;3</td>
-        <td class="n">1,044&thinsp;s</td><td class="n">1,647&thinsp;k</td>
-        <td>The clean loop comparison: one variable against run&nbsp;1.</td></tr>
-      <tr><td class="n">4</td><td>pi</td><td class="k">flash</td><td class="n">3&thinsp;/&thinsp;3</td>
-        <td class="n">1,071&thinsp;s</td><td class="n">813&thinsp;k</td>
-        <td>First run on the deployed model.</td></tr>
-      <tr class="total"><td class="n">5</td><td>pi</td><td class="k">flash <span class="pill ok">deployed</span></td>
-        <td class="n">3&thinsp;/&thinsp;3</td><td class="n">690&thinsp;s</td><td class="n">550&thinsp;k</td>
-        <td>Same commit as run&nbsp;4. Instrumented.</td></tr>
+      <tr><td class="k">12907</td><td class="n">✓</td><td class="n">240&thinsp;s</td><td class="n">17</td><td class="n">171,071</td><td class="n">94&thinsp;%</td><td class="n">99&thinsp;%</td><td class="k">1 file, 1 ins(+), 1 del(-)</td></tr>
+      <tr><td class="k">13033</td><td class="n">✓</td><td class="n">197&thinsp;s</td><td class="n">10</td><td class="n">94,023</td><td class="n">92&thinsp;%</td><td class="n">98&thinsp;%</td><td class="k">1 file, 11 inss(+), 3 dels(-)</td></tr>
+      <tr><td class="k">13236</td><td class="n">✓</td><td class="n">445&thinsp;s</td><td class="n">49</td><td class="n">906,452</td><td class="n">98&thinsp;%</td><td class="n">100&thinsp;%</td><td class="k">2 files, 4 inss(+), 8 dels(-)</td></tr>
+      <tr><td class="k">13398</td><td class="n">✗</td><td class="n">357&thinsp;s</td><td class="n">39</td><td class="n">1,387,655</td><td class="n">97&thinsp;%</td><td class="n">80&thinsp;%</td><td class="k">7 files, 129 inss(+), 32 dels(-)</td></tr>
+      <tr><td class="k">13453</td><td class="n">✓</td><td class="n">732&thinsp;s</td><td class="n">40</td><td class="n">873,333</td><td class="n">97&thinsp;%</td><td class="n">89&thinsp;%</td><td class="k">1 file, 2 inss(+)</td></tr>
+      <tr><td class="k">13579</td><td class="n">✓</td><td class="n">314&thinsp;s</td><td class="n">24</td><td class="n">367,644</td><td class="n">97&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 5 inss(+), 1 del(-)</td></tr>
+      <tr><td class="k">13977</td><td class="n">✓</td><td class="n">298&thinsp;s</td><td class="n">34</td><td class="n">892,987</td><td class="n">97&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 56 inss(+), 39 dels(-)</td></tr>
+      <tr><td class="k">14096</td><td class="n">✓</td><td class="n">193&thinsp;s</td><td class="n">15</td><td class="n">106,644</td><td class="n">95&thinsp;%</td><td class="n">62&thinsp;%</td><td class="k">1 file, 2 inss(+), 4 dels(-)</td></tr>
+      <tr><td class="k">14182</td><td class="n">✗</td><td class="n">374&thinsp;s</td><td class="n">37</td><td class="n">749,501</td><td class="n">97&thinsp;%</td><td class="n">78&thinsp;%</td><td class="k">1 file, 4 inss(+), 3 dels(-)</td></tr>
+      <tr><td class="k">14309</td><td class="n">✓</td><td class="n">140&thinsp;s</td><td class="n">10</td><td class="n">89,897</td><td class="n">85&thinsp;%</td><td class="n">47&thinsp;%</td><td class="k">2 files, 4 inss(+)</td></tr>
+      <tr class="total"><td>8&thinsp;/&thinsp;10</td><td class="n"></td><td class="n">3,290&thinsp;s</td>
+        <td class="n">275</td><td class="n">5,639,207</td><td class="n">97&thinsp;%</td>
+        <td class="n">&mdash;</td><td class="k">shell&times;298 run&times;5</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p>Only runs&nbsp;1 and&nbsp;3 compare loops &mdash; same model, one variable, 1&thinsp;/&thinsp;3 to 2&thinsp;/&thinsp;3. The score is not the interesting part of that. Both instances the old loop failed ended after a <b>single model call</b>: the model never got to attempt the task, the loop simply stopped. That was the failure mode six rounds of patches in the old harness had been papering over, and it is why the token cost rose &mdash; the new loop is doing work the old one was not.</p>
+    <p><b>97&thinsp;% of prompt tokens came from cache</b>, so the gross figure overstates the bill by more than ten times &mdash; of 5.6&nbsp;M, roughly 190&nbsp;k were actually re-read. But a cache rate is not a cost measure on its own: the instance at 97&thinsp;% re-read 42&nbsp;k tokens, six times what the instance at 92&thinsp;% did.</p>
+    <p><b>The container is alive for 47&ndash;100&thinsp;% of wall clock</b>, and nearly all of that is spent waiting on the model rather than running anything. The task does not require that &mdash; a machine billed by the second is simply held open across every model call. Whether stopping it between calls pays depends on run9's compute-versus-storage rates, which we do not have. The meter is here so that question can be answered rather than guessed.</p>
+    <p>Both failures over-reached: one rewrote seven files and 129 lines, the other made a four-line change that raised a <code>ValueError</code>. Every success but one landed a patch of five lines or fewer.</p>
+  </div>
+</section>
+
+<section>
+  <h2>&tau;&sup2;-bench retail</h2>
+  <p class="sec-note">does it follow a written policy while a person changes their mind &middot; 8 tasks &times; 3 trials, no shell anywhere</p>
+
+  <div class="col">
+    <p>The domain is a mounted plugin, the customer is a second model, and the score is the database &mdash; whether the agent left the world in the state the annotated solution leaves it in. The agent's own account of what it did is not evidence.</p>
   </div>
 
-  <h3 style="font-size:1.05rem;font-weight:600;margin:2.25rem 0 .2rem">Run 5, per instance</h3>
-  <p class="sec-note">the only run with tool and cache instrumentation</p>
+  <div class="delta">
+    <div class="plus"><span class="num">87.5&thinsp;%</span><span class="cap">pass^1 &middot; 21/24</span></div>
+    <div class="plus"><span class="num">87.5&thinsp;%</span><span class="cap">pass^2 &middot; 7/8</span></div>
+    <div class="minus"><span class="num">62.5&thinsp;%</span><span class="cap">pass^3 &middot; 5/8</span></div>
+    <div class="plus"><span class="num">87&thinsp;%</span><span class="cap">served from cache</span></div>
+  </div>
+
+  <div class="col">
+    <p><b>pass^k is the number that matters.</b> pass^1 asks how often this works; pass^3 asks whether the same task survives three attempts, which is the question a deployment actually has. Reporting only the first is how a benchmark flatters a loop.</p>
+  </div>
+
   <div class="scroll">
   <table>
-    <thead><tr>
-      <th>instance</th><th class="n">wall</th><th class="n">model calls</th>
-      <th class="n">prompt tok</th><th class="n">cached</th><th>tools</th><th>patch</th>
-    </tr></thead>
+    <thead><tr><th>task</th><th>t1</th><th>t2</th><th>t3</th><th>what the zero was</th></tr></thead>
     <tbody>
-      <tr><td class="k">astropy-12907</td><td class="n">205&thinsp;s</td><td class="n">10</td>
-        <td class="n">62,422</td><td class="n">91&thinsp;%</td><td class="k">shell&times;9</td>
-        <td class="k">1 file, +1 &minus;1</td></tr>
-      <tr><td class="k">astropy-13033</td><td class="n">222&thinsp;s</td><td class="n">14</td>
-        <td class="n">134,336</td><td class="n">93&thinsp;%</td><td class="k">shell&times;16</td>
-        <td class="k">1 file, +11 &minus;3</td></tr>
-      <tr><td class="k">astropy-13236</td><td class="n">263&thinsp;s</td><td class="n">22</td>
-        <td class="n">353,057</td><td class="n">95&thinsp;%</td><td class="k">shell&times;28</td>
-        <td class="k">2 files, +4 &minus;8</td></tr>
-      <tr class="total"><td>3&thinsp;/&thinsp;3</td><td class="n">690&thinsp;s</td><td class="n">46</td>
-        <td class="n">549,815</td><td class="n">94&thinsp;%</td><td class="k">shell&times;53</td><td></td></tr>
+      <tr><td class="k">0</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">1</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">2</td><td>✓</td><td>✓</td><td>✗</td><td>The <b>benchmark's own user simulator</b> quit six seconds in. That task's instructions are a single full stop.</td></tr>
+      <tr><td class="k">3</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">4</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">5</td><td>✓</td><td>✓</td><td>✗</td><td><b>The agent was wrong.</b> Asked to return an item, it exchanged it.</td></tr>
+      <tr><td class="k">6</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+      <tr><td class="k">7</td><td>✓</td><td>✓</td><td>✗</td><td><b>The agent stopped short.</b> It investigated, priced the exchange, wrote the summary &mdash; and never submitted it.</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p><b>94&thinsp;% of prompt tokens came from the provider&rsquo;s cache.</b> Reporting the gross figure overstates the bill by more than ten times &mdash; of 549,815 tokens, roughly 33,000 were actually re-read. An append-only transcript is what earns it: a turn adds to the tail and leaves the prefix untouched, which is the shape a cache rewards. Every token figure recorded before run&nbsp;5 is a gross number.</p>
-    <p><b><code>run_js</code> was used zero times</b>, across three instances and 53 tool calls. The sandbox is offered on every turn and the agent never reached for it. The honest reading is not that it is useless: this task is shell work inside a container, and <code>run_js</code> earns its place by replacing several calls with one. It says this benchmark does not test it, and nothing here says whether it pays elsewhere.</p>
+    <p>One of the three zeros is not the loop's. Counting it as one would be measuring the benchmark's user simulator and calling it a harness score, which is why the ending of every failed conversation is recorded beside the result.</p>
+    <p><code>run_js</code> was used twice here and <b>not once</b> across SWE-bench's 298 tool calls. That is the difference between a task that is shell work inside a container and one that needs several query results combined &mdash; it says the sandbox has a shape of problem, not that it has none.</p>
   </div>
 </section>
 
@@ -323,3 +341,6 @@ footer a{color:var(--accent)}
 </footer>
 
 </div>
+
+</body>
+</html>
