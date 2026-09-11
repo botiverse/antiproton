@@ -510,12 +510,18 @@ export class AgentRuntime {
   ) {
     await this.ready();
     if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false };
-    try {
+    // The record and the mounts are separate questions. An agent the console
+    // created has a record (name, description) and no mounts yet; the old
+    // guard read "record exists" as "already provisioned" and gave such an
+    // agent its first run with no tools and no memory. Each seed mount is
+    // added only if absent, so this is safe to call on every first run.
+    let created = false;
+    if (!(await this.store.loadAgent(tenantId, agentId))) {
       await this.store.createAgent(tenantId, agentId, {});
-    } catch {
-      return { agentId, created: false };
+      created = true;
     }
     for (const m of mounts) {
+      if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: `inst-${m.alias}`, connectionId: null,
@@ -523,7 +529,7 @@ export class AgentRuntime {
         publicConfig: m.config ?? { account: m.account }, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
       });
     }
-    return { agentId, created: true };
+    return { agentId, created };
   }
 
   /**
