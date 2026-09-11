@@ -34,6 +34,7 @@ import {
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, RAFT_ISSUER, QA_VIEWER,
   type Viewer, type LoginState, type RaftConfig, type RefusalReason,
 } from "./auth.ts";
+import { loginPage, refusedPage } from "./login.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -1927,7 +1928,7 @@ function refuse(request: Request, reason: RefusalReason | "state" | "exchange" |
   return Response.json({ error: reason.toUpperCase().replace(/-/g, "_"), hint }, { status });
 }
 
-// Placeholders until the console's own pages land (cf/src/login.ts, Nova).
+// The key form has no page of its own: it is shown to nobody by design.
 const bare = (title: string, body: string, status = 200) => new Response(
   `<!doctype html><meta charset="utf-8"><title>antiproton</title>` +
   `<body style="font:14px ui-monospace,monospace;background:#0f1115;color:#d8dee9;padding:40px;max-width:44em">` +
@@ -1952,13 +1953,11 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
   switch (url.pathname) {
     case "/login": {
       if (await viewer(request, env)) return Response.redirect(new URL("/ui", url).toString(), 302);
-      return bare("sign in",
-        `<p><a href="/login/raft" style="color:#8fbcbb">Login with Raft</a></p>` +
-        (raftConfig(env) ? "" : `<p style="color:#bf616a">Login with Raft is not configured on this deployment.</p>`));
+      return html(loginPage());
     }
     case "/login/refused": {
       const reason = url.searchParams.get("reason") ?? "";
-      return bare("not signed in", `<p>${REFUSALS[reason] ?? "Sign-in was refused."}</p><p><a href="/login" style="color:#8fbcbb">back</a></p>`, 403);
+      return new Response(refusedPage(reason), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
     }
     case "/login/raft": {
       const cfg = raftConfig(env);
@@ -2489,7 +2488,7 @@ export default {
           const agentId = uiSelected?.agentId ?? uiAgent(who);
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
           await stub.uiEnsure("demo", agentId, taskId);
-          return new Response(page(taskId, who, agentId), {
+          return new Response(page(taskId, who, agentId, gate.viewer), {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         }
