@@ -110,6 +110,19 @@ not a transcript entry. A plugin that can check a credential reports the account
 it authenticated as, which is also the only credential-derived string the page
 shows.
 
+Dereferencing server-side decides who may *use* a credential. It does not by
+itself decide where one may be *sent*, and for most plugins the host is fixed by
+the plugin rather than chosen by the agent — so the question does not arise. The
+`http` mount is the exception: the agent supplies the URL, so a credential on it
+would go wherever the agent points it, and a setting (`allowedHosts`) is the only
+thing bounding that. A mount therefore **may not hold a key unless it names the
+hosts it may reach**; one that holds a key with the list unset, `null`, or empty
+is refused when it is mounted, rather than warned about. The requirement is
+declared by the field, so it is checked against *this mount's* `secret_ref`
+rather than against what the plugin is able to carry — a mount can hold a key
+before its plugin ever declares one, and the hazard does not wait for the
+declaration.
+
 [appworld]: https://github.com/StonyBrookNLP/appworld
 
 ## Architecture
