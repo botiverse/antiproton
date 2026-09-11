@@ -34,7 +34,7 @@ import {
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, RAFT_ISSUER, QA_VIEWER,
   type Viewer, type LoginState, type RaftConfig, type RefusalReason,
 } from "./auth.ts";
-import { loginPage, refusedPage } from "./login.ts";
+import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -1928,13 +1928,6 @@ function refuse(request: Request, reason: RefusalReason | "state" | "exchange" |
   return Response.json({ error: reason.toUpperCase().replace(/-/g, "_"), hint }, { status });
 }
 
-// The key form has no page of its own: it is shown to nobody by design.
-const bare = (title: string, body: string, status = 200) => new Response(
-  `<!doctype html><meta charset="utf-8"><title>antiproton</title>` +
-  `<body style="font:14px ui-monospace,monospace;background:#0f1115;color:#d8dee9;padding:40px;max-width:44em">` +
-  `<h1 style="font-size:16px">${title}</h1>${body}`,
-  { status, headers: { "content-type": "text/html; charset=utf-8" } },
-);
 const REFUSALS: Record<string, string> = {
   "not-human": "Only human accounts can use the console. Agents reach it through their runtime, not a browser.",
   "no-email": "Your Raft account has no verified email, and the console keys your agents off one.",
@@ -2014,8 +2007,8 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // The QA identity: a browser session minted from a long key that is
       // shown to nobody. Its own identity, so audit tells it apart from
       // automation, and it never reaches /admin, which stays header-only.
-      if (method !== "POST") return bare("sign in with a key",
-        `<form method="post"><input type="password" name="key" autocomplete="off" style="width:30em"> <button>sign in</button></form>`);
+      // No link leads here; the page itself wears the door's clothes (login.ts).
+      if (method !== "POST") return html(keyPage());
       if (!env.SESSION_SECRET || !env.QA_ACCESS_KEY) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       // Two secrets that happen to be equal would let this key reach the
       // admin routes through the other door; refuse rather than assume.
@@ -2025,6 +2018,10 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       const form = await formOf(request);
       const key = String(form?.get("key") ?? "");
       if (!key || !constantTimeEqual(key, env.QA_ACCESS_KEY)) {
+        // A browser gets the form back with the reason; a script gets JSON.
+        if ((request.headers.get("accept") ?? "").includes("text/html")) {
+          return new Response(keyPage("the key does not match"), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
+        }
         return Response.json({ error: "BAD_KEY", hint: "the key does not match" }, { status: 401 });
       }
       return new Response(null, {
