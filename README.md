@@ -94,7 +94,10 @@ call succeeds without the agent ever logging in, and the token never appears in
 a tool result.
 
 An operator attaches a credential for a mount from the console. It is stored in
-the agent's own object, sealed with AES-GCM under a Worker-held key: the row
+the agent's own object — **per agent, so a token attached under one agent is not
+there under the next**, which is the same boundary the mount scope comes from
+rather than a limitation of the page — sealed with AES-GCM under a Worker-held
+key: the row
 holds ciphertext and an IV, and no fragment of the value. The reference
 takes the form `agent:<name>` beside `env:NAME`, and resolves only against the
 (tenant, agent) that owns the mount naming it — the resolver takes its scope from
@@ -502,15 +505,17 @@ them:
   instead of offering a box that produces a mount which dies when the token
   expires. No plugin declares one yet, so the declaration is a capability the
   contract has rather than behaviour to observe.
-- **Threads below the level the console uses.** Conversations ship: a person can
-  open several against one agent, each is a session inside the object with its
-  own pi tables, and mounts, credentials and memory stay shared per agent, which
-  is what you would want. What remains unused is the older threading layer:
-  `events.thread_id` is a column nothing reads, and the SQLite store's
-  `threads`/`task_threads` tables and the `POST /agents/:id/threads` routes that
-  use them are not on the deployed path at all — `src/api/server.ts` takes a
-  `SqliteStore` and nothing calls it. So there are two vocabularies for the same
-  idea and only one of them is live; the console says conversation.
+- **Agents are named and described; nothing yet edits them.** A person owns
+  several agents, each its own object with its own mounts, credentials and
+  containers, and a name and description given at creation. The description is
+  handed to the model verbatim as the first section after the core prompt, so it
+  is standing instructions rather than a label. What is not built is changing
+  either afterwards: there is no edit or rename, and no way to delete one, so a
+  description written at creation is the description the agent keeps. The older
+  threading layer is also still unused — `events.thread_id` is a column nothing
+  reads, and the `threads`/`task_threads` tables with the `POST
+  /agents/:id/threads` routes sit on `SqliteStore` in a file nothing calls, so
+  there are two vocabularies for one idea and only the console's is live.
 - **External events.** Nothing can wake an agent from the outside yet — no
   webhooks. An agent now remembers across tasks, but it still cannot be woken
   by the world; that is the remaining half of "long-running".
