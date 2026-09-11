@@ -1,0 +1,1627 @@
+{
+ "bench": "tau2-retail",
+ "base": "https://antiproton.botiverse.workers.dev",
+ "object": "bench-fid1",
+ "model": "deepseek-flash",
+ "wait": "push",
+ "tasks": [
+  "0",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7"
+ ],
+ "trials": 3,
+ "startedAt": "2026-09-11T00:30:53.551Z",
+ "results": [
+  {
+   "id": "0",
+   "taskId": "t_0_mtw800vj",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 55372,
+    "completion": 3835,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 6
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_order_details": 1,
+    "get_product_details": 2,
+    "get_user_details": 1,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 71,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "1151293680",
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7706410293",
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "1151293680",
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7706410293",
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 1
+  },
+  {
+   "id": "1",
+   "taskId": "t_1_mtw81jrx",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 55688,
+    "completion": 3713,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 6
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_order_details": 1,
+    "get_product_details": 2,
+    "get_user_details": 1,
+    "get_item_details": 1
+   },
+   "seconds": 62,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 1
+  },
+  {
+   "id": "2",
+   "taskId": "t_2_mtw82vkz",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 3,
+   "simCalls": 4,
+   "usage": {
+    "prompt": 47216,
+    "completion": 2176,
+    "calls": 8
+   },
+   "kinds": {
+    "message": 3,
+    "model.response": 8,
+    "tool.result": 10
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "list_all_product_types": 1,
+    "get_user_details": 1,
+    "get_product_details": 1,
+    "get_order_details": 5,
+    "return_delivered_order_items": 1
+   },
+   "seconds": 40,
+   "expectedWrites": [
+    "return_delivered_order_items"
+   ],
+   "performedWrites": [
+    "return_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4602305039",
+       "4202497723",
+       "9408160950"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4202497723",
+       "4602305039",
+       "9408160950"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 1
+  },
+  {
+   "id": "3",
+   "taskId": "t_3_mtw83qe4",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 3,
+   "simCalls": 4,
+   "usage": {
+    "prompt": 46987,
+    "completion": 2577,
+    "calls": 8
+   },
+   "kinds": {
+    "message": 3,
+    "model.response": 8,
+    "tool.result": 10
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_order_details": 5,
+    "modify_pending_order_items": 1
+   },
+   "seconds": 43,
+   "expectedWrites": [
+    "modify_pending_order_items"
+   ],
+   "performedWrites": [
+    "modify_pending_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 1
+  },
+  {
+   "id": "4",
+   "taskId": "t_4_mtw84nxs",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 64161,
+    "completion": 3742,
+    "calls": 10
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 10,
+    "tool.result": 11
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_order_details": 5,
+    "modify_pending_order_items": 2
+   },
+   "seconds": 49,
+   "expectedWrites": [
+    "modify_pending_order_items",
+    "modify_pending_order_items"
+   ],
+   "performedWrites": [
+    "modify_pending_order_items",
+    "modify_pending_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W6247578",
+      "item_ids": [
+       "3799046073"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    },
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W6247578",
+      "item_ids": [
+       "3799046073"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    },
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "order_id": "#W4776164",
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 1
+  },
+  {
+   "id": "5",
+   "taskId": "t_5_mtw85pid",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 6,
+   "simCalls": 7,
+   "usage": {
+    "prompt": 70671,
+    "completion": 2701,
+    "calls": 11
+   },
+   "kinds": {
+    "message": 6,
+    "model.response": 11,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "return_delivered_order_items": 1
+   },
+   "seconds": 51,
+   "expectedWrites": [
+    "return_delivered_order_items"
+   ],
+   "performedWrites": [
+    "return_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8538875209"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8538875209"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 1
+  },
+  {
+   "id": "6",
+   "taskId": "t_6_mtw86sqq",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 46014,
+    "completion": 2617,
+    "calls": 8
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 8,
+    "tool.result": 7
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2
+   },
+   "seconds": 34,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "7453605304"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 1
+  },
+  {
+   "id": "7",
+   "taskId": "t_7_mtw87j35",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 6,
+   "simCalls": 7,
+   "usage": {
+    "prompt": 75212,
+    "completion": 2975,
+    "calls": 12
+   },
+   "kinds": {
+    "message": 6,
+    "model.response": 12,
+    "tool.result": 9
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "calculate": 1,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 66,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "1569765161"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "1569765161"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 1
+  },
+  {
+   "id": "0",
+   "taskId": "t_0_mtw88xqb",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "transfer",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 50542,
+    "completion": 6960,
+    "calls": 8
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 8,
+    "tool.result": 6
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 1,
+    "get_product_details": 2,
+    "transfer_to_human_agents": 1
+   },
+   "seconds": 82,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "1151293680",
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7706410293",
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 2
+  },
+  {
+   "id": "1",
+   "taskId": "t_1_mtw8ap72",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "transfer",
+   "turns": 2,
+   "simCalls": 3,
+   "usage": {
+    "prompt": 34926,
+    "completion": 2142,
+    "calls": 6
+   },
+   "kinds": {
+    "message": 2,
+    "model.response": 6,
+    "tool.result": 6
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_order_details": 1,
+    "get_user_details": 1,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 33,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 2
+  },
+  {
+   "id": "2",
+   "taskId": "t_2_mtw8bf04",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 3,
+   "simCalls": 4,
+   "usage": {
+    "prompt": 40734,
+    "completion": 1697,
+    "calls": 7
+   },
+   "kinds": {
+    "message": 3,
+    "model.response": 7,
+    "tool.result": 10
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_order_details": 5,
+    "return_delivered_order_items": 1
+   },
+   "seconds": 31,
+   "expectedWrites": [
+    "return_delivered_order_items"
+   ],
+   "performedWrites": [
+    "return_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4602305039",
+       "4202497723",
+       "9408160950"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4202497723",
+       "4602305039",
+       "9408160950"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 2
+  },
+  {
+   "id": "3",
+   "taskId": "t_3_mtw8c328",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 59621,
+    "completion": 2594,
+    "calls": 10
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 10,
+    "tool.result": 10
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_user_details": 1,
+    "get_order_details": 5,
+    "modify_pending_order_items": 1
+   },
+   "seconds": 44,
+   "expectedWrites": [
+    "modify_pending_order_items"
+   ],
+   "performedWrites": [
+    "modify_pending_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 2
+  },
+  {
+   "id": "4",
+   "taskId": "t_4_mtw8d11u",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 50461,
+    "completion": 3277,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 9
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_user_details": 1,
+    "get_order_details": 5
+   },
+   "seconds": 43,
+   "expectedWrites": [
+    "modify_pending_order_items",
+    "modify_pending_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W6247578",
+      "item_ids": [
+       "3799046073"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    },
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 2
+  },
+  {
+   "id": "5",
+   "taskId": "t_5_mtw8dyda",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 55697,
+    "completion": 2779,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 39,
+   "expectedWrites": [
+    "return_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8538875209"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "7453605304"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 2
+  },
+  {
+   "id": "6",
+   "taskId": "t_6_mtw8es9u",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 54034,
+    "completion": 2525,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 38,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "7453605304"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "7453605304"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 2
+  },
+  {
+   "id": "7",
+   "taskId": "t_7_mtw8flmq",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 54774,
+    "completion": 2618,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 41,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "1569765161"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "1569765161"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 2
+  },
+  {
+   "id": "0",
+   "taskId": "t_0_mtw8ghgc",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "stop",
+   "turns": 1,
+   "simCalls": 2,
+   "usage": {
+    "prompt": 20467,
+    "completion": 1559,
+    "calls": 4
+   },
+   "kinds": {
+    "message": 1,
+    "model.response": 4,
+    "tool.result": 5
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_order_details": 1,
+    "get_user_details": 1,
+    "get_product_details": 2
+   },
+   "seconds": 18,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "1151293680",
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7706410293",
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 3
+  },
+  {
+   "id": "1",
+   "taskId": "t_1_mtw8gv8d",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 3,
+   "simCalls": 4,
+   "usage": {
+    "prompt": 39290,
+    "completion": 1994,
+    "calls": 7
+   },
+   "kinds": {
+    "message": 3,
+    "model.response": 7,
+    "tool.result": 6
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_order_details": 1,
+    "get_user_details": 1,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 28,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 3
+  },
+  {
+   "id": "2",
+   "taskId": "t_2_mtw8hgzh",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 3,
+   "simCalls": 4,
+   "usage": {
+    "prompt": 47212,
+    "completion": 2097,
+    "calls": 8
+   },
+   "kinds": {
+    "message": 3,
+    "model.response": 8,
+    "tool.result": 10
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "list_all_product_types": 1,
+    "get_user_details": 1,
+    "get_product_details": 1,
+    "get_order_details": 5,
+    "return_delivered_order_items": 1
+   },
+   "seconds": 32,
+   "expectedWrites": [
+    "return_delivered_order_items"
+   ],
+   "performedWrites": [
+    "return_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4602305039",
+       "4202497723",
+       "9408160950"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "4202497723",
+       "4602305039",
+       "9408160950"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 3
+  },
+  {
+   "id": "3",
+   "taskId": "t_3_mtw8i5im",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 57811,
+    "completion": 2041,
+    "calls": 10
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 10,
+    "tool.result": 10
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_user_details": 1,
+    "get_order_details": 5,
+    "modify_pending_order_items": 1
+   },
+   "seconds": 36,
+   "expectedWrites": [
+    "modify_pending_order_items"
+   ],
+   "performedWrites": [
+    "modify_pending_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 3
+  },
+  {
+   "id": "4",
+   "taskId": "t_4_mtw8ix94",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 3,
+   "simCalls": 4,
+   "usage": {
+    "prompt": 41670,
+    "completion": 4313,
+    "calls": 7
+   },
+   "kinds": {
+    "message": 3,
+    "model.response": 7,
+    "tool.result": 11
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "list_all_product_types": 1,
+    "get_product_details": 1,
+    "get_order_details": 5,
+    "modify_pending_order_items": 2
+   },
+   "seconds": 43,
+   "expectedWrites": [
+    "modify_pending_order_items",
+    "modify_pending_order_items"
+   ],
+   "performedWrites": [
+    "modify_pending_order_items",
+    "modify_pending_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W6247578",
+      "item_ids": [
+       "3799046073"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    },
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W6247578",
+      "item_ids": [
+       "3799046073"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    },
+    {
+     "name": "modify_pending_order_items",
+     "args": {
+      "order_id": "#W4776164",
+      "item_ids": [
+       "8349118980"
+      ],
+      "new_item_ids": [
+       "9647292434"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "trial": 3
+  },
+  {
+   "id": "5",
+   "taskId": "t_5_mtw8juj6",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 54761,
+    "completion": 2799,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "calculate": 1
+   },
+   "seconds": 59,
+   "expectedWrites": [
+    "return_delivered_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "return_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8538875209"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 3
+  },
+  {
+   "id": "6",
+   "taskId": "t_6_mtw8l4ad",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 55119,
+    "completion": 2606,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 41,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "7453605304"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "7453605304"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 3
+  },
+  {
+   "id": "7",
+   "taskId": "t_7_mtw8lzqs",
+   "reward": 1,
+   "dbMatch": true,
+   "actionMatch": true,
+   "ended": "stop",
+   "turns": 4,
+   "simCalls": 5,
+   "usage": {
+    "prompt": 54649,
+    "completion": 3002,
+    "calls": 9
+   },
+   "kinds": {
+    "message": 4,
+    "model.response": 9,
+    "tool.result": 8
+   },
+   "byTool": {
+    "find_user_id_by_name_zip": 1,
+    "get_user_details": 1,
+    "get_order_details": 3,
+    "get_product_details": 2,
+    "exchange_delivered_order_items": 1
+   },
+   "seconds": 43,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "1569765161"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "performedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W6390527",
+      "item_ids": [
+       "8384507844"
+      ],
+      "new_item_ids": [
+       "1569765161"
+      ],
+      "payment_method_id": "paypal_7644869"
+     }
+    }
+   ],
+   "trial": 3
+  }
+ ],
+ "passAtK": {
+  "1": {
+   "passed": 6,
+   "of": 8
+  },
+  "2": {
+   "passed": 3,
+   "of": 8
+  },
+  "3": {
+   "passed": 3,
+   "of": 8
+  }
+ },
+ "tools": {
+  "find_user_id_by_name_zip": 24,
+  "get_order_details": 78,
+  "get_product_details": 39,
+  "get_user_details": 24,
+  "exchange_delivered_order_items": 9,
+  "get_item_details": 1,
+  "list_all_product_types": 9,
+  "return_delivered_order_items": 4,
+  "modify_pending_order_items": 7,
+  "calculate": 2,
+  "transfer_to_human_agents": 1
+ },
+ "endings": {
+  "stop": 6,
+  "transfer": 1
+ },
+ "activity": {
+  "activeMs": 23525,
+  "summedMs": 23525,
+  "pollMs": 0,
+  "invocations": 612,
+  "spanMs": 1065168,
+  "byKind": [
+   {
+    "kind": "benchStart",
+    "n": 24,
+    "ms": 246
+   },
+   {
+    "kind": "benchSay",
+    "n": 89,
+    "ms": 0
+   },
+   {
+    "kind": "alarm",
+    "n": 294,
+    "ms": 23279
+   },
+   {
+    "kind": "offload_dispatch",
+    "n": 205,
+    "ms": 0
+   },
+   {
+    "kind": "offload_provider",
+    "n": 205,
+    "ms": 526580
+   },
+   {
+    "kind": "offload_rtt",
+    "n": 205,
+    "ms": 526580
+   },
+   {
+    "kind": "deliver",
+    "n": 205,
+    "ms": 0
+   }
+  ]
+ }
+}
