@@ -147,7 +147,11 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
     // a plugin whose mount owns one container cannot survive that.
     ...(t.exclusive ? { executionMode: "sequential" as const } : {}),
     async execute(_toolCallId: string, params: Json) {
-      const lifted = liftConfirm(params);
+      // A tool that declares `confirm` itself owns the word; only tools that
+      // do not are eligible for the agent's hold. Today none declares it, so
+      // this changes nothing — it keeps an appworld catalogue that grows a
+      // `confirm` parameter tomorrow from losing it silently.
+      const lifted = declaresConfirm(t.parameters) ? { args: params, confirm: false } : liftConfirm(params);
       const res = await host.invoke({ tool: t.address, args: lifted.args, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
       if (res.status !== "succeeded") {
         // pi asks tools to throw rather than encode failure in content, so the
@@ -197,6 +201,11 @@ export interface Sandbox {
  * named `confirm` is ever mistaken for it once it is past this point. Only a
  * literal `true` counts; anything else is an ordinary argument.
  */
+export function declaresConfirm(parameters: unknown): boolean {
+  const props = (parameters as { properties?: Record<string, unknown> } | null)?.properties;
+  return !!props && Object.prototype.hasOwnProperty.call(props, "confirm");
+}
+
 export function liftConfirm(args: Json): { args: Json; confirm: boolean } {
   if (args && typeof args === "object" && !Array.isArray(args) && (args as Record<string, unknown>).confirm === true) {
     const { confirm: _c, ...rest } = args as Record<string, Json>;
@@ -229,6 +238,7 @@ export function runJsTool(
   // genuinely wrong name is refused by the gateway with its own message rather
   // than by a lookup here.
   const byName = new Map((opts.tools ?? []).map((t) => [t.name, t.address]));
+  const byAddress = new Map((opts.tools ?? []).map((t) => [t.address, t]));
   const address = (name: unknown) =>
     typeof name === "string" ? (byName.get(name) ?? name) : name;
   return {
@@ -253,7 +263,9 @@ export function runJsTool(
         // A stable key per call inside one execution, so a repeat reaches the
         // same operation rather than minting a new one.
         invoke: (call: any) => {
-          const lifted = liftConfirm(call.args);
+          const addr = address(call.tool);
+          const target = typeof addr === "string" ? byAddress.get(addr) : undefined;
+          const lifted = target && declaresConfirm(target.parameters) ? { args: call.args, confirm: false } : liftConfirm(call.args);
           return host.invoke({
             ...call,
             tool: address(call.tool),
