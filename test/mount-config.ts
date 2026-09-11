@@ -248,6 +248,30 @@ check("the boundary keeps everything, one past it does not", () => {
   if (!execOutput("x".repeat(41), 40).truncated) throw new Error("one past the limit was not cut");
 });
 
+check("a setting that has a default declares it, so a console never shows a blank for a real number", () => {
+  // The defect this catches is quiet: a person reads an empty field, assumes
+  // there is no limit, and learns the real one from a truncated result.
+  const declared = everyPlugin.flatMap((p) => (p.config ?? []).map((f) => [p.id, f] as const));
+  const numeric = declared.filter(([, f]) => f.type === "number");
+  const blank = numeric.filter(([, f]) => f.default === undefined);
+  if (blank.length) {
+    throw new Error(`numeric settings with a code default and no declared one: ${blank.map(([id, f]) => `${id}.${f.name}`).join(", ")}`);
+  }
+});
+
+check("no setting promises to park something the plugin cannot park", () => {
+  // Twice now a summary has said "parked as an artifact" over code that slices
+  // and discards. A summary is handed to the agent by tools.mounts, so it is a
+  // promise in the prompt rather than a comment.
+  for (const plugin of everyPlugin) {
+    for (const f of plugin.config ?? []) {
+      if (/parked as an artifact/i.test(f.summary)) {
+        throw new Error(`${plugin.id}.${f.name} promises parking; check the code actually parks before allowing this wording`);
+      }
+    }
+  }
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

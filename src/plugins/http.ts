@@ -140,12 +140,22 @@ const decodeEntities = (s: string) =>
   s.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 
+/** Declared on the setting and applied in the code, from one place, because a
+ *  console showing a blank default for a setting that has one is how a person
+ *  learns the wrong number. */
+const DEFAULT_MAX_BYTES = 64 * 1024;
+const DEFAULT_TIMEOUT_MS = 15_000;
+
 export const httpPlugin: Plugin = {
   id: "http",
   config: [
     { name: "allowedHosts", type: "string[]", summary: "When set, only these hosts may be reached. Unset means any public host." },
-    { name: "maxBytes", type: "number", summary: "Responses larger than this are parked as an artifact instead of returned." },
-    { name: "timeoutMs", type: "number", summary: "How long one request may take." },
+    // Nothing parks anything: this plugin has no object storage to park into,
+    // and never had. What the setting decides is how much of the body comes
+    // back; the result reports the full size beside it so the loss is visible.
+    { name: "maxBytes", type: "number", default: DEFAULT_MAX_BYTES,
+      summary: "How much of a response body is returned. The rest is cut and discarded, not kept anywhere; `bytes` reports the full size, so a truncated result says how much went." },
+    { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "How long one request may take." },
     { name: "searchEndpoint", type: "string", summary: "Where the search tool sends its query." },
   ],
   version: "1.0.0",
@@ -225,7 +235,7 @@ export const httpPlugin: Plugin = {
     if (!["get", "send", "search"].includes(tool)) throw new Error(`unknown tool: ${tool}`);
     const cfg = (ctx.publicConfig ?? {}) as HttpConfig;
     const allowed = cfg.allowedHosts;
-    const maxBytes = cfg.maxBytes ?? 64 * 1024;
+    const maxBytes = cfg.maxBytes ?? DEFAULT_MAX_BYTES;
     const a = (args ?? {}) as {
       url?: string; accept?: string; raw?: boolean;
       headers?: Record<string, unknown>; method?: string; body?: unknown;
@@ -269,7 +279,7 @@ export const httpPlugin: Plugin = {
               "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
             accept: "text/html",
           },
-          signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
+          signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
         });
         if (!res.ok) { refused = `HTTP ${res.status}`; continue; }
         const body = await res.text();
@@ -358,7 +368,7 @@ export const httpPlugin: Plugin = {
                 : jsonBody ? JSON.stringify(a.body) : String(a.body),
             }
           : {}),
-        signal: AbortSignal.timeout(cfg.timeoutMs ?? 15_000),
+        signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       });
 
       const location = res.headers.get("location");
