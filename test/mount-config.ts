@@ -306,6 +306,19 @@ check("a tool whose own summary says it destroys something is not declared a rea
   }
 });
 
+check("the mount's requirement and a field's requirement stay separate", () => {
+  // github is the case that separates them: it reads public repositories with
+  // no account, so the mount is optional while the token, if given, is a token.
+  // A form that took the field's answer for the mount's would mark the box
+  // mandatory on a mount the console labels "account optional".
+  const form = credentialForm(githubPlugin.credential);
+  if (form.kind !== "fields") throw new Error(`expected fields, got ${form.kind}`);
+  if (form.accountRequired !== false) throw new Error("github's mount works with no account at all");
+  if (form.fields[0]!.required !== true) throw new Error("a token, if supplied, is required to be one");
+  // And the name a caller reaches for cannot be the ambiguous one.
+  if ("required" in form) throw new Error("the mount-level flag is named `required`, which reads as the field's");
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

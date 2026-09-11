@@ -165,14 +165,24 @@ export interface CredentialSpec {
  * A bare token comes back as a single field rather than as its own case: it is
  * one box with a label, which is what `keys` already describes, and a page that
  * special-cases it grows two code paths for one question.
+ *
+ * `accountRequired` is deliberately not called `required`, because a caller sees
+ * it beside `CredentialField.required` and the two answer different questions:
+ * whether this mount needs an account at all, and whether one box of a
+ * credential the person has chosen to give may be left empty. `github` is the
+ * case that separates them — it reads public repositories with no account, so
+ * the mount is optional while the token, if given, is a token. A form that took
+ * the field's answer for the mount's would mark the box mandatory on a mount
+ * documented as optional. "Account" is the word the console already uses for
+ * the mount-level question, in the "account required" / "account optional" tag.
  */
 export type CredentialForm =
   /** The plugin never uses a credential. Ask for nothing. */
   | { kind: "none" }
   /** Ask for these, in this order. */
-  | { kind: "fields"; fields: CredentialField[]; required: boolean }
+  | { kind: "fields"; fields: CredentialField[]; accountRequired: boolean }
   /** Nothing to type: send the person to the provider. */
-  | { kind: "signIn"; signIn: SignIn; required: boolean };
+  | { kind: "signIn"; signIn: SignIn; accountRequired: boolean };
 
 export function credentialForm(credential: CredentialSpec | undefined | null): CredentialForm {
   if (!credential) return { kind: "none" };
@@ -180,15 +190,15 @@ export function credentialForm(credential: CredentialSpec | undefined | null): C
   if (shape === "token") {
     return {
       kind: "fields",
-      required,
+      accountRequired: required,
       // The declaration's own words: a plugin saying "a GitHub personal access
       // token" has already written the label, and repeating it generically as
       // "Token" throws away the only sentence written for this plugin.
       fields: [{ name: "token", summary, secret: true, required: true }],
     };
   }
-  if ("keys" in shape) return { kind: "fields", fields: shape.keys, required };
-  return { kind: "signIn", signIn: shape.signIn, required };
+  if ("keys" in shape) return { kind: "fields", fields: shape.keys, accountRequired: required };
+  return { kind: "signIn", signIn: shape.signIn, accountRequired: required };
 }
 
 export interface Plugin {
