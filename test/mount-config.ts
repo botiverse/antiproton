@@ -602,8 +602,9 @@ await check("带凭据的 http 挂载必须点名它的 host", () => {
     validateMount(httpPlugin, config, ref).some((p) => /carries a credential, so "allowedHosts"/.test(p.message));
 
   if (!refused({ account: "x" }, "secret:web")) throw new Error("an unset allowlist was accepted on a mount holding a key");
-  // An empty list is not a boundary anyone chose, and the mount could reach
-  // nothing anyway, so it counts as unset rather than as the safest setting.
+  // Three ways to have no list, and all three have to count. The empty array is
+  // the one most easily missed, because in type terms it is a value.
+  if (!refused({ account: "x", allowedHosts: null }, "secret:web")) throw new Error("an explicit null allowlist was accepted on a mount holding a key");
   if (!refused({ account: "x", allowedHosts: [] }, "secret:web")) throw new Error("an empty allowlist was accepted on a mount holding a key");
   if (refused({ account: "x", allowedHosts: ["api.example.com"] }, "secret:web")) throw new Error("a named host was refused");
   // And nothing changes for the anonymous mount every agent already has.
