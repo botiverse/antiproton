@@ -1394,10 +1394,16 @@ export class AgentDO extends DurableObject<Env> {
       total, shown: events.length, events, byOp, busy };
   }
 
+  /** The approvals panel. With a task, that task's approvals; without one,
+   *  every approval the tenant has, which is what a cross-task view wants.
+   *  The parameter was accepted and dropped before, so the per-task panel
+   *  silently showed the tenant-wide set. */
   async uiApprovals(tenantId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
-    return rt.store.listApprovals(tenantId);
+    const all = await rt.store.listApprovals(tenantId);
+    const t = String(taskId ?? "").trim();
+    return t && t !== "null" && t !== "undefined" ? all.filter((a) => a.taskId === t) : all;
   }
 
   async uiDecide(tenantId: string, operationId: string, decision: "approved" | "denied", approver: string) {
