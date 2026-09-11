@@ -15,20 +15,23 @@ by @tygg on 2026-09-11 from the outlined cut of direction A.
 
 | File | Use |
 |---|---|
-| `antiproton-mark.svg` | The mark, outlined, self-coloured. The primary form at 32 px and above on light surfaces. |
-| `antiproton-mark-flat.svg` | One-colour mark in `currentColor`. For small sizes, dark surfaces, and anywhere the outline cannot hold. |
+| `antiproton-mark.svg` | The mark, outlined, self-coloured. The primary form at 32 px and above, on light and dark surfaces alike. |
+| `antiproton-mark-flat.svg` | One-colour mark in `currentColor`. For small sizes and for places that take one colour only (favicons, tiles, monochrome print). |
 | `antiproton-wordmark.svg` | "antiproton" outlined, with the bar over the p. Type is outlined to paths; no font needed. |
 | `antiproton-wordmark-flat.svg` | One-colour wordmark, `currentColor`. |
 | `antiproton-lockup.svg` | Mark and wordmark together, outlined. |
-| `antiproton-lockup-flat.svg` | Same lockup, one colour, `currentColor`. Use on dark surfaces. |
+| `antiproton-lockup-flat.svg` | Same lockup, one colour, `currentColor`. For one-colour contexts. |
 | `favicon.svg`, `favicon-{16,32,48,180,512}.png` | Source Yellow tile with an ink flat mark and an ink border, square corners. 180 is the Apple touch icon, 512 the web-manifest size. |
 | `antiproton-tile-dark.svg` | The tile for dark surfaces: Elegant-dark canvas, light mark, yellow bar. |
 | `antiproton-lockup.png`, `antiproton-lockup-dark.png` | Raster lockups for places that cannot take SVG. |
 
 ## Rules
 
-- The outlined cut belongs on light surfaces. On dark surfaces use the flat
-  files; Brutal has no dark mode, and an ink outline on ink is nothing.
+- The outlined cut is the logo on every surface, light or dark (tygg,
+  2026-09-11). It is self-coloured: on a light surface the ink line draws the
+  shape; on a dark one the ink line and the shadow merge into the canvas and
+  the cream letterforms and the yellow bar carry it. Both are intended; do not
+  swap to the flat cut for dark mode.
 - Below about 32 px use the flat mark. The outline is five units on a hundred;
   at favicon size it is under a pixel.
 - The bar is Source Yellow only in the outlined cut and on tiles. In the flat
