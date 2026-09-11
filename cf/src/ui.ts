@@ -12,6 +12,7 @@ import type { ApprovalRecord } from "../../src/core/types.ts";
 import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
 import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
+import { ICONS } from "./icons.ts";
 import { md } from "./md.ts";
 
 const esc = (s: unknown) =>
@@ -84,7 +85,8 @@ background:var(--panel);border-right:1px solid var(--line)}
 .rail-brand .bar{fill:var(--accent);stroke:var(--accent)}
 .rail-item{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;width:52px;padding:7px 0 6px;
 color:var(--dim);text-decoration:none;font-size:9.5px;letter-spacing:.04em;border-radius:8px;border:1px solid transparent}
-.rail-item .ico{width:22px;height:22px;border-radius:6px;border:1.5px solid currentColor;opacity:.7}
+.rail-item .ico{width:22px;height:22px;display:flex;align-items:center;justify-content:center;opacity:.85}
+.rail-item .ico svg{width:21px;height:21px}
 .rail-item:hover{color:var(--ink)}
 .rail-item.on{color:var(--accent);border-color:var(--accent);background:var(--sunk)}
 .rail-item.on .ico{opacity:1}
@@ -92,7 +94,9 @@ color:var(--dim);text-decoration:none;font-size:9.5px;letter-spacing:.04em;borde
 background:var(--primary-400);color:var(--primary-950);font-size:9px;font-weight:600;line-height:15px;text-align:center}
 .rail-foot{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:8px}
 .mode{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:7px;padding:2px}
-.mode button{background:none;border:0;color:var(--dim);font:inherit;font-size:9px;padding:3px 5px;border-radius:5px;cursor:pointer}
+.mode button{background:none;border:0;color:var(--dim);font:inherit;padding:5px;border-radius:5px;cursor:pointer;display:flex;box-shadow:none}
+.mode button svg{width:14px;height:14px}
+.mode button:hover{background:var(--fill-muted)}
 .mode button.on{background:var(--sunk);color:var(--ink)}
 .viewer{width:26px;height:26px;border-radius:50%;background:var(--sunk);border:1px solid var(--line);color:var(--dim);
 font-size:11px;display:flex;align-items:center;justify-content:center;text-transform:uppercase}
@@ -265,7 +269,8 @@ border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
-.pane-btn{display:none;background:transparent;border:1px solid var(--line);color:var(--dim);box-shadow:none;padding:6px 10px;font-size:11.5px}
+.pane-btn{display:none;background:transparent;border:1px solid var(--line);color:var(--dim);box-shadow:none;padding:6px 10px;font-size:11.5px;gap:5px}
+.pane-btn svg,.pane-close svg{width:14px;height:14px}
 .pane-btn.on{color:var(--accent);border-color:var(--accent)}
 .sidebar .pane-close,.inspector .pane-close{display:none}
 /* --- phone: one pane at a time, the rail as a bottom nav ------------------
@@ -325,7 +330,7 @@ export function page(taskId: string, who: string, agentId: string): string {
       ${lazy(`insp-${name}`, path, "3s", inOpen)}
     </details>`;
   const rail = (view: string, label: string) =>
-    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico"></span><span>${label}</span></a>`;
+    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
   return `<!doctype html><html lang="en" data-theme="elegant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>antiproton</title>
@@ -336,22 +341,22 @@ export function page(taskId: string, who: string, agentId: string): string {
 <style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_SVG}</a>
-  ${rail("inbox", "inbox").replace('<span class="ico"></span>', '<span class="ico"></span><b class="count" id="inbox-count" hidden></b>')}
+  ${rail("inbox", "inbox").replace('</span><span>inbox', '</span><b class="count" id="inbox-count" hidden></b><span>inbox')}
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
   ${rail("runtime", "runtime")}
-  <a class="rail-item" href="https://report.botiverse.dev/" target="_blank" rel="noopener"><span class="ico"></span><span>report</span></a>
+  <a class="rail-item" href="https://report.botiverse.dev/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
-      <button type="button" data-mode="light" onclick="ap.mode('light')">light</button>
-      <button type="button" data-mode="dark" onclick="ap.mode('dark')">dark</button>
-      <button type="button" data-mode="system" onclick="ap.mode('system')">auto</button>
+      <button type="button" data-mode="light" onclick="ap.mode('light')" aria-label="light" title="light">${ICONS.light}</button>
+      <button type="button" data-mode="dark" onclick="ap.mode('dark')" aria-label="dark" title="dark">${ICONS.dark}</button>
+      <button type="button" data-mode="system" onclick="ap.mode('system')" aria-label="follow the system" title="follow the system">${ICONS.system}</button>
     </div>
     <span class="viewer" title="${esc(who)}">${esc(initial)}</span>
   </div>
 </nav>
 <aside class="sidebar" id="sidebar">
-  <button type="button" class="ghost pane-close" onclick="ap.pane('main')">← back</button>
+  <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
   <div class="side-view" data-for="agents">
     <h3>${esc(agentId)}</h3>
     <div class="sub">tasks, latest activity first</div>
@@ -373,8 +378,8 @@ export function page(taskId: string, who: string, agentId: string): string {
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><h2>${t}</h2><span class="sub">${esc(agentId)}</span><span class="spacer"></span>
-      <button type="button" class="pane-btn" onclick="ap.pane('side')">tasks</button>
-      <button type="button" class="pane-btn" onclick="ap.pane('insp')">inspector</button>
+      <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}tasks</button>
+      <button type="button" class="pane-btn" onclick="ap.pane('insp')">${ICONS.inspector}inspector</button>
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
         <input type="hidden" name="taskId" value="${t}">
         <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
@@ -417,7 +422,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   </section>
 </main>
 <aside class="inspector" id="inspector">
-  <button type="button" class="ghost pane-close" onclick="ap.pane('main')">← back</button>
+  <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
   <h3>inspector</h3>
   <div class="sub">what happened, and what the object holds. Each section re-reads the store while it is open.</div>
   ${insp("trajectory", `/ui/transcript?taskId=${t}`)}
