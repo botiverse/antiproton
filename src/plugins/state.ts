@@ -70,13 +70,17 @@ export const WORKING_SET = [
 
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
+/** Named once because `workingSet` looks a mount up by it. A second copy of the
+ *  string is how the injected text came to name a tool nothing had to provide. */
+const PLUGIN_ID = "state";
+
 export function statePlugin(
   store: StorageAdapter,
   artifacts: R2Artifacts | null,
   bucket: string,
 ): Plugin {
   return {
-    id: "state",
+    id: PLUGIN_ID,
     config: [
       // Two thresholds, and only one of them is this setting. A value over
       // INLINE_MAX spills to object storage and comes back as a reference; a
@@ -271,11 +275,33 @@ export async function workingSet(
     parts.push(`## ${doc.key} (${doc.what})\n${kept}`);
   }
   if (!parts.length) return "";
+  // Which name the model can call these by is the operator's choice, not ours:
+  // the harness dispatches on `<alias>.remember`, and an agent may hold this
+  // plugin under any alias or under none. Naming a tool that is not mounted is
+  // not a harmless hint — it is a wrong instruction competing with the right
+  // ones, which is why the prompt only mentions artifacts when an artifacts
+  // tool is really there (cf/src/runtime.ts). Read after the early return, so
+  // an agent with nothing written pays nothing for the lookup. Asked by plugin
+  // id, the way the gateway resolves one; the first mount if an operator has
+  // made two, since either name reaches the same store.
+  const alias = (await store.findMountsByPlugin(tenantId, agentId, PLUGIN_ID))[0]?.alias;
+  // Still injected when there is no mount: memory you can read but not edit is
+  // worth reading. What is dropped is only the sentence that would tell the
+  // agent to call something it has not got.
+  // Named as "the X tool on the Y mount" rather than as `Y.X`, because the
+  // dotted form is the harness's dispatch address and not a name the model can
+  // call: the tool it is offered is `remember`, qualified to `state__remember`
+  // only if another mount also has one. Which of those it is depends on the
+  // whole mounted set, so a plugin cannot know it — the mount and the tool it
+  // belongs to are the two facts that stay true under either.
+  const correcting = alias
+    ? `They are kept by the \`${alias}\` mount: correct one with its \`remember\` tool when it ` +
+      "turns out to be wrong, and drop one with `forget` when it stops being true."
+    : "You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.";
   return (
     "\n\n# What you already know\n" +
     "Written by you on earlier tasks, and shown here so you do not have to go and look. " +
-    "Correct it with state.remember when it turns out to be wrong, and delete it with " +
-    "state.forget when it stops being true.\n\n" +
+    correcting + "\n\n" +
     parts.join("\n\n")
   );
 }
