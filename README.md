@@ -500,12 +500,12 @@ them:
   visit, so drift self-heals. Disabling and revoking one is still missing, as
   is any notion of installing a plugin at runtime. Revoking has a dependency
   worth knowing before it lands: a prompt paragraph that tells the model to
-  call a tool has to name it as the mount does, and the memory paragraph
-  resolves that name from the mount rather than assuming one — it reads the
-  alias and drops the sentence entirely when nothing mounts the plugin. Any
-  future revocation has to keep that property, since a paragraph naming a tool
-  that no longer exists is a wrong instruction competing with the right ones
-  rather than a harmless hint.
+  call a tool has to name it the way the mount does. The memory paragraph is
+  the one that shows the trap — it says `state.remember` as a literal, so it is
+  correct only because the seed list happens to name that mount `state`, and a
+  rename or a removal would turn it into an instruction the harness cannot
+  dispatch. Nothing can do either today, which is why this is a reason to bind
+  the two rather than a live fault.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,
   a username and password, an access key and a secret key — and all three shapes
   exist in the tree today. OAuth is a flow rather than a paste: it needs a
