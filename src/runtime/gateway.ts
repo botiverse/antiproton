@@ -8,7 +8,9 @@ import type { Plugin } from "../plugins/types.ts";
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
 export interface SecretResolver {
-  resolve(ref: string): Promise<string | null>;
+  /** `scope` is the mount's owner. A reference is resolved for the agent whose
+   *  mount names it, never for whoever wrote the string. */
+  resolve(ref: string, scope?: { tenantId: string; agentId: string }): Promise<string | null>;
 }
 
 export const envSecrets: SecretResolver = {
@@ -150,7 +152,9 @@ export class ToolGateway {
       try {
         const did = await plugin.release({
           caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
-          credential: mount.secretRef ? await this.#secrets.resolve(mount.secretRef) : null,
+          credential: mount.secretRef
+            ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+            : null,
           publicConfig: mount.publicConfig,
           connection: {
             get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
@@ -257,7 +261,9 @@ export class ToolGateway {
       } as ToolResult;
     }
 
-    const credential = r.mount.secretRef ? await this.#secrets.resolve(r.mount.secretRef) : null;
+    const credential = r.mount.secretRef
+      ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
+      : null;
     try {
       const store = this.#store;
       const secrets = this.#secrets;
@@ -279,7 +285,9 @@ export class ToolGateway {
           const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
           if (!other) return null;
           return {
-            credential: other.secretRef ? await secrets.resolve(other.secretRef) : null,
+            credential: other.secretRef
+              ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
+              : null,
             connection: connectionFor(other.alias),
           };
         },
@@ -292,6 +300,36 @@ export class ToolGateway {
       const status = e.retryable ? "unknown" : "failed";
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
       return { status, operationId, error: { code: "tool_error", message: e.message } };
+    }
+  }
+
+  /**
+   * Operator-only: does this mount's credential work? Runs the plugin's own
+   * `checkCredential` with the same context a call would get, minus a task.
+   * Never a tool, so the model cannot ask; the value still never leaves the
+   * plugin's call context.
+   */
+  async checkMount(tenantId: string, agentId: string, alias: string):
+    Promise<{ ok: true; account?: string } | { ok: false; reason: string } | null> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return null;
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin?.checkCredential) return null;
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
+    const store = this.#store;
+    const connectionFor = (a: string) => ({
+      get: () => store.getConnection(tenantId, agentId, a),
+      set: (state: Json, expiresAt?: number | null) => store.putConnection(tenantId, agentId, a, state, expiresAt ?? null),
+    });
+    try {
+      return await plugin.checkCredential({
+        caller: { tenantId, agentId, taskId: "credential-check" },
+        credential, publicConfig: mount.publicConfig, connection: connectionFor(alias),
+        async sibling() { return null; },
+      });
+    } catch (e) {
+      return { ok: false, reason: String((e as Error).message ?? e).slice(0, 200) };
     }
   }
 }

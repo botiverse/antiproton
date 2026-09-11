@@ -32,6 +32,8 @@ const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
+import { agentSecrets, agentRef, importKek, isAgentRef, last4, seal } from "../../src/runtime/secrets.ts";
+import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -141,6 +143,10 @@ export interface RuntimeDeps {
    *  `node` mount resolves to no credential and its tools refuse to run, which
    *  is the right failure: a deployment without keys should not start boxes. */
   operatorRun9?: { ak: string; sk: string };
+  /** The key under which per-agent secrets are sealed at rest: 32 bytes,
+   *  base64, a Worker secret. Absent means `agent:` references cannot be
+   *  stored or resolved, and the credential form says so. */
+  secretKek?: string;
   /**
    * Durable Objects bill wall clock, Workers bill CPU — and a model call is
    * ~94% waiting. Handing `model.request` to a Worker lets the object go idle
@@ -199,6 +205,8 @@ export class AgentRuntime {
   #deps: RuntimeDeps;
   #plugins: Plugin[];
   #gateway: ToolGateway;
+  #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
+  #kek: Promise<CryptoKey | null> = Promise.resolve(null);
   #agent: PiAgent | null = null;
   #agentKey = "";
   #executor: DynamicWorkerExecutor;
@@ -222,12 +230,22 @@ export class AgentRuntime {
       builtinToolsPlugin(this.store, () => plugins),
     );
     this.#plugins = plugins;
-    this.#gateway = new ToolGateway(this.store, plugins, {
-      resolve: async (ref) =>
+    // Three reference forms, one resolver: the operator's sandbox account,
+    // the agent's own sealed store, and the Worker environment. The gateway
+    // passes the mount's owner as scope, so an `agent:` reference only ever
+    // reaches the store of the agent whose mount names it.
+    const kekPromise = deps.secretKek ? importKek(deps.secretKek) : Promise.resolve(null);
+    const operator = {
+      resolve: async (ref: string) =>
         ref === OPERATOR_RUN9_REF
           ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
           : envSecrets.resolve(ref),
-    });
+    };
+    this.#kek = kekPromise;
+    this.#secrets = {
+      resolve: async (ref, scope) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope),
+    };
+    this.#gateway = new ToolGateway(this.store, plugins, this.#secrets);
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -240,6 +258,82 @@ export class AgentRuntime {
           ? (deps.operatorModel?.apiKey ?? null)
           : envSecrets.resolve(ref),
     });
+  }
+
+  // ---- per-agent credentials, from the console. Value in, metadata out.
+
+  /**
+   * Store a credential for one of this agent's mounts and point the mount at
+   * it. `fields` is what the form posted, keyed by the plugin's declared field
+   * names; a bare token comes as `{ token }`. The value is sealed before it
+   * touches storage, and if the plugin can check it and says no, nothing is
+   * stored and the reason comes back instead.
+   */
+  async attachCredential(tenantId: string, agentId: string, alias: string, fields: Record<string, string>):
+    Promise<{ ok: true; verified: boolean; account: string | null } | { ok: false; error: string }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
+    const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { ok: false, error: `no mount named ${alias}` };
+    const plugin = this.#plugins.find((p) => p.id === mount.plugin);
+    if (!plugin?.credential) return { ok: false, error: `${mount.plugin} takes no credential` };
+    const form = credentialForm(plugin.credential);
+    if (form.kind !== "fields") return { ok: false, error: "this credential is a sign-in, not something to paste" };
+    const missing = form.fields.filter((f) => f.required && !String(fields[f.name] ?? "").trim());
+    if (missing.length) return { ok: false, error: `missing: ${missing.map((f) => f.name).join(", ")}` };
+    // The value a plugin reads: a bare token, or one JSON object of the fields.
+    const value = plugin.credential.shape === "token"
+      ? String(fields.token ?? "").trim()
+      : JSON.stringify(Object.fromEntries(form.fields.map((f) => [f.name, String(fields[f.name] ?? "").trim()])));
+    const shown = plugin.credential.shape === "token"
+      ? value
+      : String(fields[form.fields.filter((f) => f.secret).map((f) => f.name).pop() ?? form.fields[form.fields.length - 1]!.name] ?? "");
+    const sealed = await seal(kek, value);
+    const name = alias;
+    // Check before keeping, with the candidate in place: the check reads the
+    // credential through the same resolver a call would, so the mount points
+    // at the sealed candidate first and is pointed back if the plugin says no.
+    const previous = mount.secretRef;
+    await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv, last4: last4(shown) });
+    await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
+    const check = await this.#gateway.checkMount(tenantId, agentId, alias);
+    if (check && !check.ok) {
+      await this.store.removeSecret(tenantId, agentId, name);
+      await this.store.setMountSecretRef(tenantId, agentId, alias, previous && !isAgentRef(previous) ? previous : null);
+      return { ok: false, error: check.reason };
+    }
+    if (check?.ok) {
+      await this.store.putSecret(tenantId, agentId, name, {
+        ciphertext: sealed.ciphertext, iv: sealed.iv, last4: last4(shown), account: check.account ?? null, verified: true,
+      });
+    }
+    return { ok: true, verified: !!check?.ok, account: check?.ok ? (check.account ?? null) : null };
+  }
+
+  async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
+    await this.ready();
+    const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount || !isAgentRef(mount.secretRef)) return false;
+    await this.store.removeSecret(tenantId, agentId, alias);
+    await this.store.setMountSecretRef(tenantId, agentId, alias, null);
+    return true;
+  }
+
+  /** What a page may show for a mount's credential. Never the value. */
+  async credentialMeta(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null }) {
+    const attached = !!mount.secretRef;
+    const meta = isAgentRef(mount.secretRef) ? await this.store.secretMeta(tenantId, agentId, mount.alias) : null;
+    return {
+      attached,
+      verified: meta?.verified ?? false,
+      account: meta?.account ?? null,
+      last4: meta?.last4 ?? null,
+      setAt: meta?.updatedAt ?? null,
+      lastUsedAt: meta?.lastUsedAt ?? null,
+      storable: !!this.#deps.secretKek,
+      error: null as string | null,
+    };
   }
 
   async ready() {

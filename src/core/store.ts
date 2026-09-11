@@ -280,6 +280,21 @@ export interface StorageAdapter {
     tenantId: string, agentId: string, alias: string, publicConfig: Json,
   ): Promise<boolean>;
   getMountByAlias(tenantId: string, agentId: string, alias: string): Promise<MountRecord | null>;
+  /** Point a mount at a different reference, or at none. The value is never here. */
+  setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null): Promise<boolean>;
+
+  // ---- per-agent secrets, sealed. The store holds ciphertext and metadata; it
+  // never sees a value, and `last4` is written once so no read derives it.
+  putSecret(tenantId: string, agentId: string, name: string, sealed: {
+    ciphertext: string; iv: string; last4: string; account?: string | null; verified?: boolean;
+  }): Promise<void>;
+  getSecret(tenantId: string, agentId: string, name: string): Promise<{ ciphertext: string; iv: string } | null>;
+  secretMeta(tenantId: string, agentId: string, name: string): Promise<{
+    last4: string; account: string | null; verified: boolean;
+    createdAt: number; updatedAt: number; lastUsedAt: number | null;
+  } | null>;
+  touchSecret(tenantId: string, agentId: string, name: string, at: number): Promise<void>;
+  removeSecret(tenantId: string, agentId: string, name: string): Promise<boolean>;
   findMountsByPlugin(tenantId: string, agentId: string, plugin: string): Promise<MountRecord[]>;
   listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;
 }
