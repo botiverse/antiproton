@@ -1122,7 +1122,7 @@ export class AgentDO extends DurableObject<Env> {
       return MAIN_SESSION;
     }
     const task = await rt.store.loadTask(tenantId, t);
-    if (!task || task.agentId !== agentId) throw new Error(`no such conversation: ${t}`);
+    if (!task || task.agentId !== agentId) throw new Error(`no such conversation: ${t} (not this viewer's, or never created)`);
     return t;
   }
 
