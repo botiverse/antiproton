@@ -1944,9 +1944,14 @@ function avatarFor(agentId: string): string {
 export interface UiTranscript {
   total: number;
   shown: number;
-  // The two opaque fields are `any` on purpose: `unknown` is what the RPC
-  // rule cannot place, and a recursive JSON type is too deep for it. Both
-  // were already read through `as any` by every consumer.
+  // The two opaque fields are `any` on purpose. `unknown` is what the RPC
+  // rule cannot place. A recursive JSON type is not blocked by the compiler:
+  // Piper measured it on 8d83185 and it raises 20 signatures, one "too deep"
+  // here and nineteen ordinary assignability errors in plugin and API return
+  // types that are structurally JSON but declared loosely (`unknown[]`,
+  // `Fleet`, http responses). So `any` is the honest type until those
+  // declarations are tightened, which is plugin work, not a limit. Both
+  // fields were already read through `as any` by every consumer.
   events: Array<{ sequence: number; kind: string; payload: any; createdAt: number }>;
   byOp: Record<string, { state: string; approver: string | null; tool: string; request: any }>;
   busy: "thinking" | "waiting-for-approval" | null;
