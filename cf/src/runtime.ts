@@ -43,6 +43,13 @@ export function personaOf(config: unknown): { name?: string; description?: strin
   return name || description ? { name, description } : null;
 }
 import type { MountPolicy } from "../../src/core/store.ts";
+
+/** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
+export interface SeedMount {
+  alias: string; plugin: string;
+  account?: string; config?: Json;
+  secretRef?: string | null; policy?: MountPolicy | null;
+}
 import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
@@ -436,14 +443,53 @@ export class AgentRuntime {
     };
   }
 
-  static readonly DEFAULT_MOUNTS: Array<{ alias: string; plugin: string; account: string; policy?: MountPolicy | null }> = [
-    { alias: "tools", plugin: "tools", account: "builtin" },
-    { alias: "artifacts", plugin: "artifacts", account: "builtin" },
-    // One GitHub alias, the same one the console seeds, and gated the same
-    // way: a second alias for the same plugin with no policy is a door beside
-    // the gate, since a missing policy allows. No token, so it reads public
-    // repositories until a person attaches one on the credential page.
-    { alias: "gh", plugin: "github", account: "GitHub", policy: { write: "approval" } },
+  /**
+   * What every agent is mounted with, whichever path makes it first: the
+   * console on first open, or the API on first run. There was a shorter list
+   * for the API path once, and an agent run before it was opened had no
+   * memory; one list, read by both, is the only way that stays fixed.
+   */
+  static readonly DEFAULT_MOUNTS: SeedMount[] = [
+    { alias: "tools", plugin: "tools", config: { account: "builtin" },
+      secretRef: null, policy: null },
+    // Without this a parked result is a reference the agent cannot open.
+    { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
+      secretRef: null, policy: null },
+    // Writes that need a person: the policy is what the page exists to show.
+    { alias: "ops", plugin: "demo", config: { account: "demo-fleet" },
+      secretRef: null, policy: { write: "approval" as const } },
+    // Open on purpose: the agent holds no credential and writes need a
+    // human. maxBytes stays under the offload threshold so an ordinary page
+    // reaches the model directly rather than via a round trip to storage.
+    // Open, including writes, because the gate was on the wrong axis. It
+    // was meant to stop data leaving, but an agent can put anything it
+    // wants into a query string on a GET — so gating POST made the same
+    // exfiltration one step less convenient and nothing more, at the cost
+    // of stopping every ordinary API call for a signature. What actually
+    // bounds where data can go is `allowedHosts`, which covers both.
+    //
+    // The gate still exists and still works; a mount that reaches
+    // something that matters should use it, and use an allowlist too.
+    { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
+      secretRef: null, policy: null },
+    // GitHub, the first real user of the credential page. Seeded with no
+    // token, so it reads public repositories; the person attaches their
+    // own token there and the mount acts as that account. Writes (issues,
+    // comments, anything through `api`) wait for a person, like `ops`.
+    { alias: "gh", plugin: "github", config: { account: "GitHub" },
+      secretRef: null, policy: { write: "approval" as const } },
+    // A real container, for tasks that need one. Its tools describe
+    // themselves as a last resort so the agent reaches for free in-process
+    // JS first, and the framework releases the box once the agent has no
+    // conversation with work open (the scope is the agent, not a task).
+    { alias: "node", plugin: "run9", config: { account: "container" },
+      secretRef: OPERATOR_RUN9_REF, policy: null },
+    // The agent's own store. Deliberately not behind approval: an agent
+    // that must ask a person before writing a note will not keep notes, and
+    // the blast radius is its own memory, scoped to this (tenant, agent).
+    { alias: "state", plugin: "state", config: { account: "agent memory" },
+      secretRef: null, policy: null },
+
   ];
 
   /** What is installed, for a console that wants to show settings rather than
@@ -460,7 +506,7 @@ export class AgentRuntime {
   async provision(
     tenantId: string,
     agentId: string,
-    mounts: Array<{ alias: string; plugin: string; account: string; policy?: MountPolicy | null }> = AgentRuntime.DEFAULT_MOUNTS,
+    mounts: SeedMount[] = AgentRuntime.DEFAULT_MOUNTS,
   ) {
     await this.ready();
     if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false };
@@ -474,7 +520,7 @@ export class AgentRuntime {
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: `inst-${m.alias}`, connectionId: null,
         toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
-        publicConfig: { account: m.account }, secretRef: null, policy: m.policy ?? null,
+        publicConfig: m.config ?? { account: m.account }, secretRef: m.secretRef ?? null, policy: m.policy ?? null,
       });
     }
     return { agentId, created: true };

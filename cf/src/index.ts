@@ -1209,63 +1209,24 @@ export class AgentDO extends DurableObject<Env> {
       // threshold, so every page the agent fetched came back as a reference to
       // storage instead of as text. Both were invisible until something else
       // broke. Config and policy are now compared, not merely defaulted.
-      const desired = [
-        { alias: "tools", plugin: "tools", config: { account: "builtin" },
-          secretRef: null, policy: null },
-        // Without this a parked result is a reference the agent cannot open.
-        { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
-          secretRef: null, policy: null },
-        // Writes that need a person: the policy is what the page exists to show.
-        { alias: "ops", plugin: "demo", config: { account: "demo-fleet" },
-          secretRef: null, policy: { write: "approval" as const } },
-        // Open on purpose: the agent holds no credential and writes need a
-        // human. maxBytes stays under the offload threshold so an ordinary page
-        // reaches the model directly rather than via a round trip to storage.
-        // Open, including writes, because the gate was on the wrong axis. It
-        // was meant to stop data leaving, but an agent can put anything it
-        // wants into a query string on a GET — so gating POST made the same
-        // exfiltration one step less convenient and nothing more, at the cost
-        // of stopping every ordinary API call for a signature. What actually
-        // bounds where data can go is `allowedHosts`, which covers both.
-        //
-        // The gate still exists and still works; a mount that reaches
-        // something that matters should use it, and use an allowlist too.
-        { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
-          secretRef: null, policy: null },
-        // GitHub, the first real user of the credential page. Seeded with no
-        // token, so it reads public repositories; the person attaches their
-        // own token there and the mount acts as that account. Writes (issues,
-        // comments, anything through `api`) wait for a person, like `ops`.
-        { alias: "gh", plugin: "github", config: { account: "GitHub" },
-          secretRef: null, policy: { write: "approval" as const } },
-        // A real container, for tasks that need one. Its tools describe
-        // themselves as a last resort so the agent reaches for free in-process
-        // JS first, and the framework releases the box once the agent has no
-        // conversation with work open (the scope is the agent, not a task).
-        { alias: "node", plugin: "run9", config: { account: "container" },
-          secretRef: OPERATOR_RUN9_REF, policy: null },
-        // The agent's own store. Deliberately not behind approval: an agent
-        // that must ask a person before writing a note will not keep notes, and
-        // the blast radius is its own memory, scoped to this (tenant, agent).
-        { alias: "state", plugin: "state", config: { account: "agent memory" },
-          secretRef: null, policy: null },
-      ];
+      const desired = AgentRuntime.DEFAULT_MOUNTS;
       for (const d of desired) {
         // The pin is the registry's version, never a literal: the gateway
         // refuses a call whose pin disagrees with the registry, so a literal
         // is a mount that stops working the day its plugin moves.
         const toolVersion = rt.pluginVersion(d.plugin) ?? "1.0.0";
+        const config = d.config ?? { account: d.account };
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
         if (!have) {
           await rt.store.addMount({
             tenantId, agentId, alias: d.alias, plugin: d.plugin,
             installationId: `inst-${d.alias}`, connectionId: null, toolVersion,
-            publicConfig: d.config, secretRef: d.secretRef, policy: d.policy,
+            publicConfig: config, secretRef: d.secretRef ?? null, policy: d.policy ?? null,
           });
           continue;
         }
-        if (JSON.stringify(have.publicConfig) !== JSON.stringify(d.config)) {
-          await rt.store.updateMountConfig(tenantId, agentId, d.alias, d.config);
+        if (JSON.stringify(have.publicConfig) !== JSON.stringify(config)) {
+          await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
         }
         if (JSON.stringify(have.policy ?? null) !== JSON.stringify(d.policy ?? null)) {
           await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy);
