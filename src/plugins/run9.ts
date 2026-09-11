@@ -410,6 +410,52 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     return true;
   },
 
+  /**
+   * Does this key work, asked when a person pastes it rather than when an
+   * agent needs it.
+   *
+   * Listing the project's boxes is the cheapest authenticated call run9 has,
+   * and it checks the two things that are actually wrong when a run9 mount is
+   * wrong: the keys, and whether the configured project exists. A 401 and a
+   * missing project are different mistakes with the same symptom otherwise —
+   * the agent's first command failing — and a person who has just pasted a key
+   * cannot tell them apart from that.
+   *
+   * It names the project as the account, because that is the thing these keys
+   * grant and the thing a person can recognise on the page.
+   */
+  async checkCredential(ctx) {
+    if (!ctx.credential) return { ok: false as const, reason: "no keys: this mount cannot start a container" };
+    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+    let cred: Run9Credential;
+    try {
+      cred = JSON.parse(ctx.credential) as Run9Credential;
+    } catch {
+      return { ok: false as const, reason: "the stored value is not JSON; run9 needs an object with ak and sk" };
+    }
+    if (!cred.ak || !cred.sk) {
+      return { ok: false as const, reason: "run9 needs both ak and sk; one of them is missing" };
+    }
+    try {
+      const res = await fetch(`${cfg.endpoint}/projects/${cfg.project}/workspace/boxes`, {
+        headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
+        signal: AbortSignal.timeout(cfg.timeoutMs),
+      });
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false as const, reason: "run9 rejected these keys" };
+      }
+      if (res.status === 404) {
+        return { ok: false as const, reason: `the keys work, but project "${cfg.project}" does not exist` };
+      }
+      if (!res.ok) {
+        return { ok: false as const, reason: `run9 answered ${res.status}: ${(await res.text()).slice(0, 120)}` };
+      }
+      return { ok: true as const, account: cfg.project };
+    } catch (e) {
+      return { ok: false as const, reason: String((e as Error)?.message ?? e) };
+    }
+  },
+
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
     // Checked before anything else: neither releasing nor choosing an
     // environment should be the thing that starts a container.

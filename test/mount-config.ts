@@ -19,14 +19,14 @@ import { credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
-function check(name: string, fn: () => void) {
-  try { fn(); results.push({ name, ok: true }); }
+async function check(name: string, fn: () => void | Promise<void>) {
+  try { await fn(); results.push({ name, ok: true }); }
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
 const run9 = run9Plugin(null as any, "local");
 
-check("拼错的键会被拒绝,并给出最接近的那个", () => {
+await check("拼错的键会被拒绝,并给出最接近的那个", () => {
   const p = validateMount(run9, { timeout_ms: 5000 } as any, "env:RUN9");
   if (p.length !== 1) throw new Error(`expected one problem, got ${JSON.stringify(p)}`);
   if (!p[0]!.message.includes('did you mean "timeoutMs"')) {
@@ -34,24 +34,24 @@ check("拼错的键会被拒绝,并给出最接近的那个", () => {
   }
 });
 
-check("类型不对会被说出来,而不是被强转", () => {
+await check("类型不对会被说出来,而不是被强转", () => {
   const p = validateMount(run9, { timeoutMs: "5000" } as any, "env:RUN9");
   if (!p.some((x) => x.message.includes("should be number, got string"))) {
     throw new Error(JSON.stringify(p));
   }
 });
 
-check("需要账号却没有 secret_ref,挂载时就报", () => {
+await check("需要账号却没有 secret_ref,挂载时就报", () => {
   const p = validateMount(run9, { image: "x" } as any, null);
   if (!p.some((x) => x.message.includes("needs an account"))) throw new Error(JSON.stringify(p));
 });
 
-check("凭据可选的插件,没有账号也能挂", () => {
+await check("凭据可选的插件,没有账号也能挂", () => {
   const p = validateMount(githubPlugin, {} as any, null);
   if (p.length) throw new Error(`a public-only mount was refused: ${JSON.stringify(p)}`);
 });
 
-check("合法配置不报任何问题", () => {
+await check("合法配置不报任何问题", () => {
   const p = validateMount(run9, {
     account: "operator", image: "node:22-alpine", workdir: "/work",
     timeoutMs: 300000, secrets: ["STRIPE_KEY"],
@@ -59,19 +59,19 @@ check("合法配置不报任何问题", () => {
   if (p.length) throw new Error(JSON.stringify(p));
 });
 
-check("account 是控制台的标签,不算插件设置", () => {
+await check("account 是控制台的标签,不算插件设置", () => {
   const p = validateMount(githubPlugin, { account: "unauthenticated" } as any, null);
   if (p.length) throw new Error(JSON.stringify(p));
 });
 
-check("还没声明设置的插件不会因为已有的键被拒", () => {
+await check("还没声明设置的插件不会因为已有的键被拒", () => {
   // Refusing every key on a plugin that declares none would break every mount
   // already carrying one, which is not a migration anyone asked for.
   const p = validateMount({ id: "demo", config: [], credential: undefined }, { anything: 1 } as any, null);
   if (p.length) throw new Error(JSON.stringify(p));
 });
 
-check("assert 版本会抛,并且把问题都带上", () => {
+await check("assert 版本会抛,并且把问题都带上", () => {
   let msg = "";
   try { assertMountConfig(run9, { timeout_ms: 1, shel: "x" } as any, null); }
   catch (e) { msg = String((e as Error).message); }
@@ -81,21 +81,21 @@ check("assert 版本会抛,并且把问题都带上", () => {
   }
 });
 
-check("network none wraps the shell in an empty network namespace", () => {
+await check("network none wraps the shell in an empty network namespace", () => {
   const argv = execArgv({ shell: "/bin/bash", shellPrefix: "act && ", network: "none" }, "curl x");
   if (JSON.stringify(argv) !== JSON.stringify(["unshare", "-n", "--", "/bin/bash", "-lc", "act && curl x"])) {
     throw new Error(`got ${JSON.stringify(argv)}`);
   }
 });
 
-check("network open, or unset, runs the shell as before", () => {
+await check("network open, or unset, runs the shell as before", () => {
   for (const network of ["open", undefined] as const) {
     const argv = execArgv({ shell: "/bin/sh", network }, "ls");
     if (JSON.stringify(argv) !== JSON.stringify(["/bin/sh", "-lc", "ls"])) throw new Error(`got ${JSON.stringify(argv)}`);
   }
 });
 
-check("network is a mount setting", () => {
+await check("network is a mount setting", () => {
   const p = validateMount(run9, { network: "none" } as any, "env:RUN9");
   if (p.length) throw new Error(`unexpected problems: ${p.map((x) => x.message).join("; ")}`);
 });
@@ -114,14 +114,14 @@ const catalogue: Catalogue = {
 };
 const [spotify] = appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" });
 
-check("appworld says it needs an account instead of failing on the first call", () => {
+await check("appworld says it needs an account instead of failing on the first call", () => {
   const p = validateMount(spotify!, {} as any, null);
   if (!p.some((x) => x.message.includes("needs an account"))) {
     throw new Error(`a mount with no credential was accepted: ${JSON.stringify(p)}`);
   }
 });
 
-check("a credential field carries a label and says which part is secret", () => {
+await check("a credential field carries a label and says which part is secret", () => {
   const form = credentialForm(spotify!.credential);
   if (form.kind !== "fields" || !form.fields.every((k) => k.name && k.summary)) {
     throw new Error(`a page has nothing to label these with: ${JSON.stringify(form)}`);
@@ -153,7 +153,7 @@ const everyPlugin: Plugin[] = [
   ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
 ];
 
-check("no plugin takes a credential as a setting", () => {
+await check("no plugin takes a credential as a setting", () => {
   for (const plugin of everyPlugin) {
     const form = credentialForm(plugin.credential);
     const credentialKeys = new Set(form.kind === "fields" ? form.fields.map((k) => k.name) : []);
@@ -171,14 +171,14 @@ check("no plugin takes a credential as a setting", () => {
   }
 });
 
-check("the marker is what makes run9's secrets setting legitimate, not its name", () => {
+await check("the marker is what makes run9's secrets setting legitimate, not its name", () => {
   const field = run9.config!.find((f) => f.name === "secrets")!;
   if (field.references !== "credential") throw new Error("run9's secrets setting lost its marker");
   const { references, ...unmarked } = field;
   if (!CREDENTIAL_SHAPED.test(unmarked.name)) throw new Error("the pattern stopped matching the case it exists for");
 });
 
-check("a sign-in is a credential the page must not ask anyone to paste", () => {
+await check("a sign-in is a credential the page must not ask anyone to paste", () => {
   // Declared and not implemented: no plugin uses this yet. What is checked is
   // that the rest of the machinery does not assume a credential has fields —
   // a mount still needs an account, and the settings rule still runs.
@@ -200,7 +200,7 @@ check("a sign-in is a credential the page must not ask anyone to paste", () => {
   }
 });
 
-check("every credential shape answers the same question, including the one with no fields", () => {
+await check("every credential shape answers the same question, including the one with no fields", () => {
   // A page asks once and switches on the answer. The failure this prevents is
   // a reader that narrows to `keys` and meets a sign-in in the one path a
   // person uses to connect an account.
@@ -226,13 +226,13 @@ check("every credential shape answers the same question, including the one with 
   }
 });
 
-check("output under the limit is returned whole and says nothing about truncation", () => {
+await check("output under the limit is returned whole and says nothing about truncation", () => {
   const r = execOutput("hello", 24_000);
   if (r.output !== "hello" || r.truncated) throw new Error(JSON.stringify(r));
   if ("dropped" in r || "note" in r) throw new Error("a result that lost nothing should not discuss loss");
 });
 
-check("output over the limit says how much went, and that it is gone rather than parked", () => {
+await check("output over the limit says how much went, and that it is gone rather than parked", () => {
   // The threshold no benchmark has ever crossed, which is why it is tested here
   // rather than left for the first person whose build prints a lot.
   const r = execOutput("x".repeat(100), 40);
@@ -244,12 +244,12 @@ check("output over the limit says how much went, and that it is gone rather than
   if (r.output.length + r.dropped! !== 100) throw new Error("the arithmetic does not account for the whole output");
 });
 
-check("the boundary keeps everything, one past it does not", () => {
+await check("the boundary keeps everything, one past it does not", () => {
   if (execOutput("x".repeat(40), 40).truncated) throw new Error("exactly at the limit was cut");
   if (!execOutput("x".repeat(41), 40).truncated) throw new Error("one past the limit was not cut");
 });
 
-check("a setting that has a default declares it, so a console never shows a blank for a real number", () => {
+await check("a setting that has a default declares it, so a console never shows a blank for a real number", () => {
   // The defect this catches is quiet: a person reads an empty field, assumes
   // there is no limit, and learns the real one from a truncated result.
   const declared = everyPlugin.flatMap((p) => (p.config ?? []).map((f) => [p.id, f] as const));
@@ -260,7 +260,7 @@ check("a setting that has a default declares it, so a console never shows a blan
   }
 });
 
-check("no setting promises to park something the plugin cannot park", () => {
+await check("no setting promises to park something the plugin cannot park", () => {
   // Twice now a summary has said "parked as an artifact" over code that slices
   // and discards. A summary is handed to the agent by tools.mounts, so it is a
   // promise in the prompt rather than a comment.
@@ -279,7 +279,7 @@ check("no setting promises to park something the plugin cannot park", () => {
  * approval-gated mount lets through. `release` said read, and it destroys the
  * container and everything in it.
  */
-check("an approval-gated mount holds every run9 tool, because every one of them changes something", () => {
+await check("an approval-gated mount holds every run9 tool, because every one of them changes something", () => {
   // All six touch the container: run and shell execute in it, save writes to
   // object storage, keep and start_from fork and switch its filesystem, and
   // release destroys it. None is a read, so none may fall to `policy.read`.
@@ -292,7 +292,7 @@ check("an approval-gated mount holds every run9 tool, because every one of them 
   }
 });
 
-check("a tool whose own summary says it destroys something is not declared a read", () => {
+await check("a tool whose own summary says it destroys something is not declared a read", () => {
   // One direction only. The reverse — "no destructive verb, so it must be a
   // read" — flags twelve tools that correctly declare writes, so it would be
   // noise. This direction has exactly one historical hit and it was real.
@@ -306,7 +306,7 @@ check("a tool whose own summary says it destroys something is not declared a rea
   }
 });
 
-check("the mount's requirement and a field's requirement stay separate", () => {
+await check("the mount's requirement and a field's requirement stay separate", () => {
   // github is the case that separates them: it reads public repositories with
   // no account, so the mount is optional while the token, if given, is a token.
   // A form that took the field's answer for the mount's would mark the box
@@ -319,7 +319,7 @@ check("the mount's requirement and a field's requirement stay separate", () => {
   if ("required" in form) throw new Error("the mount-level flag is named `required`, which reads as the field's");
 });
 
-check("only an explicit secret:false reveals a field, so an unset flag never shows a password", () => {
+await check("only an explicit secret:false reveals a field, so an unset flag never shows a password", () => {
   // `undefined` is falsy, so a page writing `if (field.secret) mask()` against
   // an unset value shows the input in clear — and the two that ship unset are
   // run9's secret key and AppWorld's password. The declarations were right;
@@ -340,7 +340,7 @@ check("only an explicit secret:false reveals a field, so an unset flag never sho
   }
 });
 
-check("the resolver reads the declaration rather than overriding it", () => {
+await check("the resolver reads the declaration rather than overriding it", () => {
   const form = credentialForm({
     required: true, summary: "x",
     shape: { keys: [
@@ -368,7 +368,7 @@ check("the resolver reads the declaration rather than overriding it", () => {
  * Neither declaration was pinned by anything until now: deleting `exclusive`
  * from run9 broke no test, and the symptom is a bill rather than a failure.
  */
-check("a plugin with something to release is exclusive, because holding is what exclusive is for", () => {
+await check("a plugin with something to release is exclusive, because holding is what exclusive is for", () => {
   const holders = everyPlugin.filter((p) => typeof p.release === "function");
   const unguarded = holders.filter((p) => !p.exclusive).map((p) => p.id);
   if (unguarded.length) {
@@ -380,11 +380,54 @@ check("a plugin with something to release is exclusive, because holding is what 
   }
 });
 
-check("a plugin that holds nothing is not needlessly serialised", () => {
+await check("a plugin that holds nothing is not needlessly serialised", () => {
   // The reverse is not the same rule: two http fetches do not interfere, and
   // making everything exclusive would serialise calls that have no reason to be.
   const idle = everyPlugin.filter((p) => p.exclusive && typeof p.release !== "function").map((p) => p.id);
   if (idle.length) throw new Error(`${idle.join(", ")} serialise calls but hold nothing to release`);
+});
+
+/**
+ * The offline half of a verification check.
+ *
+ * The call itself needs a live run9 or AppWorld, but everything before the call
+ * does not — and that half is where a person's mistakes actually land: nothing
+ * pasted, the wrong shape pasted, one of a pair missing. Those must answer in
+ * words someone can act on rather than throwing, because the page shows the
+ * reason beside the box they just typed in.
+ */
+await check("a verification refuses a malformed credential in words, without calling anything", async () => {
+  const ctx = (credential: string | null): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" },
+    credential, publicConfig: {},
+    connection: { get: async () => null, set: async () => {} },
+    sibling: async () => null,
+  });
+  for (const [plugin, partial] of [[run9, JSON.stringify({ ak: "x" })], [spotify!, JSON.stringify({ username: "u" })]] as const) {
+    if (typeof plugin.checkCredential !== "function") throw new Error(`${plugin.id} has no check`);
+    for (const [label, value] of [["absent", null], ["not json", "oops"], ["half a pair", partial]] as const) {
+      const r = await plugin.checkCredential(ctx(value));
+      if (r.ok) throw new Error(`${plugin.id} accepted a ${label} credential`);
+      if (!r.reason || r.reason.length < 10) throw new Error(`${plugin.id} gave no usable reason for ${label}`);
+    }
+  }
+});
+
+await check("the plugins that take a credential are the plugins that can verify one", () => {
+  // An account is what makes a verified state useful — "acting as X" is
+  // checkable against what the person typed, where a bare "verified" is not.
+  // The contract allows a check to succeed without naming anything; none of
+  // ours does, so the page can rely on an account being there.
+  for (const plugin of everyPlugin) {
+    const takesOne = credentialForm(plugin.credential).kind !== "none";
+    const canCheck = typeof plugin.checkCredential === "function";
+    if (takesOne && !canCheck) {
+      throw new Error(`${plugin.id} takes a credential and cannot tell anyone whether it works`);
+    }
+    if (!takesOne && canCheck) {
+      throw new Error(`${plugin.id} has a check but no credential to check`);
+    }
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
