@@ -2400,8 +2400,9 @@ export default {
         case "/ui/approvals": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          return html(approvals(await stub.uiApprovals("demo", uiSelected?.agentId ?? uiAgent(gate.who), taskId)));
+          return html(approvals(await stub.uiApprovals("demo", agentId, taskId)));
         }
         case "/ui/message": {
           const form = await formOf(request);
