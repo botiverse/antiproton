@@ -340,6 +340,8 @@ check("the shell carries the current agent and sends it with every panel request
   must(/fetch\('\/ui\/agent', \{ method: 'POST'/.test(html), "create posts to /ui/agent");
   must(/Nothing is copied from another agent/.test(html), "the form says credentials and memory are per agent");
   must(html.includes(AVATAR_JS), "the shell ships the avatar function");
+});
+
 // task #7: a decided call leaves the approvals panel; only pending ones show.
 check("the approvals panel shows pending calls only; decided ones are gone", () => {
   const rows: any[] = [
