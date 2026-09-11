@@ -79,11 +79,27 @@ const MAX_NAME = 64;
  * the plugin's own names. Two names can still meet at the cap, so the last step
  * is a deterministic tie-break rather than a silent collapse — two tools sharing
  * one name is the one outcome the model cannot work around.
+ *
+ * **Applying this twice must equal applying it once.** Two call sites qualify
+ * the same catalogue — the runtime builds it, and `bridgeTools` qualifies
+ * whatever it is handed so a caller cannot pass a provider a name with a dot in
+ * it. Under the old collision-only rule the second pass was a no-op on an
+ * already-unique name; under this one it re-prefixed, and a τ² run went out
+ * with `retail__retail__get_order_details` in front of the model. So a name
+ * that already belongs to its own mount is left exactly as it is — and it still
+ * takes its place in `used`, so it cannot be handed out twice.
  */
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   const used = new Set<string>();
   return tools.map((t) => {
     const alias = modelName(t.address.split(".")[0]!);
+    // Recognised by the prefix rather than by re-deriving the whole string,
+    // because a name that went through the tie-break no longer equals what a
+    // second derivation would produce.
+    if (t.name.startsWith(`${alias}__`)) {
+      used.add(t.name);
+      return t;
+    }
     const bare = modelName(t.name);
     const room = Math.max(1, MAX_NAME - alias.length - 2);
     let name = `${alias}__${bare.slice(0, room)}`;

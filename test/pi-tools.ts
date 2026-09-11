@@ -93,6 +93,36 @@ await check("每个工具都带挂载名,哪怕它本来不重名", async () => 
   }
 });
 
+await check("限定两次等于限定一次", async () => {
+  // Two call sites qualify the same catalogue: the runtime builds it, and
+  // `bridgeTools` qualifies whatever it is handed so nobody can pass a provider
+  // a name with a dot in it. Under the old collision-only rule the second pass
+  // was a no-op; under always-qualify it re-prefixed, and a τ² run went out
+  // with `retail__retail__get_order_details` in front of the model — the
+  // measurement priced a name nobody intended.
+  const t = (name: string, address: string) => ({ name, address, description: "", parameters: {} });
+  const catalogue = [
+    t("get_order_details", "retail.get_order_details"),
+    t("a.b", "x.a.b"),   // sanitises into
+    t("a_b", "x.a_b"),   // the one before it, so this pair exercises the tie-break
+  ];
+  const once = qualifyMountedTools(catalogue).map((x) => x.name);
+  const twice = qualifyMountedTools(qualifyMountedTools(catalogue)).map((x) => x.name);
+  if (once.join(",") !== twice.join(",")) {
+    throw new Error(`qualifying twice changed the names: ${once.join(",")} vs ${twice.join(",")}`);
+  }
+  // Stated separately from the round trip, because that is the name the run
+  // actually shipped and it should fail by sight.
+  if (twice.some((n) => /^(\w+)__\1__/.test(n))) throw new Error(`double prefix: ${twice.join(",")}`);
+  // And the bridge is one of those two call sites, so it must be safe on an
+  // already-qualified list as well.
+  const bridged = bridgeTools(qualifyMountedTools(catalogue) as MountedTool[],
+    { async invoke() { return { status: "succeeded" }; } }).map((x: any) => x.name);
+  if (bridged.join(",") !== once.join(",")) {
+    throw new Error(`the bridge re-qualified names it was handed: ${bridged.join(",")}`);
+  }
+});
+
 function fixture(invoke: (call: any) => Promise<any>, reply: AssistantMessage) {
   const host = sqliteHost();
   const storage = new PiSqliteStorage(host);
