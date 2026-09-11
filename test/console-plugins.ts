@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, mountList, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -228,23 +228,7 @@ check("an empty inbox says nothing needs you and what is running", () => {
   must(/Nothing is waiting on you\. 1 of 3 tasks running\./.test(html), "the empty state names the running count");
 });
 
-check("the task list shows status, activity, held count and busy, and never a turn count of zero", () => {
-  const html = taskList({ agentId: "u-x", tasks: [
-    { taskId: "t_a", status: "open", lastActivityAt: "2026-09-11T05:00:00Z", pending: 2, turns: null, busy: true },
-    { taskId: "t_b", status: "completed", lastActivityAt: "2026-09-10T05:00:00Z", pending: 0, turns: null, busy: false },
-  ] });
-  must(/data-task="t_a"/.test(html) && /data-task="t_b"/.test(html), "both tasks render");
-  must(/2 held/.test(html), "held count shows");
-  must(/working/.test(html), "busy shows");
-  must(!/turns/.test(html), "a null turn count is not rendered at all");
-  must(/2026-09-11 05:00Z/.test(html), "last activity renders");
-  must(!/undefined|null/.test(html), "nothing renders as undefined or null");
-});
 
-check("a hostile task id cannot break out of the task list", () => {
-  const html = taskList({ agentId: "u-x", tasks: [{ taskId: `t" onmouseover="1`, status: "open", lastActivityAt: null, pending: 0, turns: null, busy: false }] });
-  must(!/data-task="t" onmouseover/.test(html), "the id must be escaped in attributes");
-});
 
 check("the mount list names each mount, its plugin and its credential state, and the catalogue lists what is installed", () => {
   const d = { installed, mounts: [
@@ -273,17 +257,6 @@ check("an unknown mount alias is said back, escaped", () => {
   must(!/id="[^"]*<[^"]*"/.test(html), "no id may carry markup");
 });
 
-check("a conversation row shows its title, or a dash, and never the id dressed as a title", () => {
-  const html = taskList({ agentId: "u-x", tasks: [
-    { taskId: "t_u-x_abc", title: "Open an issue on the repo about the flaky test.\nsecond line", status: "open", lastActivityAt: "2026-09-11T05:00:00Z", pending: 0, turns: null, busy: false },
-    { taskId: "t_u-x", title: null, status: "open", lastActivityAt: "2026-09-11T04:00:00Z", pending: 0, turns: null, busy: false },
-    { taskId: "t_u-x_xss", title: `<img src=x onerror=1>`, status: "open", lastActivityAt: null, pending: 0, turns: null, busy: false },
-  ] });
-  must(/<span class="title">Open an issue on the repo about the flaky test\.\nsecond line<\/span>/.test(html) || /<span class="title">Open an issue on the repo about the flaky test\./.test(html), "the title is shown");
-  must(/data-title="—"/.test(html) && /<span class="title">—<\/span>/.test(html), "a missing title is a dash");
-  must(/<span class="tid">t_u-x<\/span>/.test(html), "the id stays in the meta line");
-  must(!html.includes("<img src=x"), "titles are escaped");
-});
 
 // The credential form lives inside a panel that polls, and a poll that swaps
 // the panel empties the form under the person's cursor (#86). The guard is one
@@ -335,7 +308,7 @@ check("the shell carries the current agent and sends it with every panel request
   must(/<body[^>]*data-agent="u-x_k3"/.test(html), "the body names the agent");
   must(/id="agents" data-lazy hx-get="\/ui\/agents"/.test(html), "the sidebar loads the agent list");
   must(/e\.detail\.parameters\.agentId = document\.body\.dataset\.agent/.test(html), "the configRequest hook adds agentId");
-  must(/href="\/ui\?view=inbox&agentId=u-x_k3&taskId=t_u-x"/.test(html), "rail links keep the agent");
+  must(/href="\/ui\?view=inbox&agentId=u-x_k3"/.test(html), "rail links carry the agent and nothing else");
   must(/<form class="new-agent-form" id="new-agent" hidden/.test(html) && /name="name" maxlength="60" required/.test(html) && /name="description" maxlength="2000"/.test(html), "the create form has name and description within the limits");
   must(/fetch\('\/ui\/agent', \{ method: 'POST'/.test(html), "create posts to /ui/agent");
   must(/Nothing is copied from another agent/.test(html), "the form says credentials and memory are per agent");
@@ -370,6 +343,7 @@ check("no unscoped .agent rule reaches the transcript's steps", () => {
 check("the sidebar has no conversations section and no new-conversation button", () => {
   const html = page("t_u-x", "someone", "u-x");
   must(!/new conversation|id="tasks"|\/ui\/tasks|conversations<\/h3>|newConversation|markTask/.test(html), "no conversation list, button, route call or script");
+  must(!/taskId|data-task/.test(html), "the page carries no task id: the routes default to the agent's one conversation");
   must(/<h2 id="agent-name">u-x<\/h2>\s*<span class="spacer">/.test(html), "the header is the agent, with no conversation title beside it");
 });
 
