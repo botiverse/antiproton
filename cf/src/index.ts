@@ -29,7 +29,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList,
+  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue,
 } from "./ui.ts";
 
 export interface Env {
@@ -2204,7 +2204,15 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
-          return html(plugins(await stub.uiPlugins("demo", agentId)));
+          // One read, dispatched to the part the shell asked for: the mount
+          // list, one mount's block, the catalogue, or the whole page.
+          const d = await stub.uiPlugins("demo", agentId);
+          switch (url.searchParams.get("part")) {
+            case "mounts": return html(mountList(d));
+            case "mount": return html(mountFragment(d, String(url.searchParams.get("alias") ?? "").trim()));
+            case "catalogue": return html(catalogue(d));
+            default: return html(plugins(d));
+          }
         }
         case "/ui/credential": {
           // A value comes in; a re-rendered mount block goes out, and nothing
