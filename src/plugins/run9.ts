@@ -447,14 +447,22 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     },
   ],
 
-  /** Called when the agent has nothing open, so an idle box is not left running
-   *  on the tenant's quota because nobody thought to stop it.
+  /** Hands this mount's box back, so an idle one is not left running on the
+   *  tenant's quota because nobody thought to stop it. Safe to call when there
+   *  is no box: it reports that nothing was released rather than failing.
+   *
+   *  **When** it is called is the framework's decision and deliberately not
+   *  described here. It was, twice: the comment said "when the task ends" while
+   *  the body twenty lines down was already mount-scoped, and then it said "when
+   *  the agent has nothing open", which was true only while the gateway released
+   *  at exactly that step. Both sentences were correct when written, went stale
+   *  in a file nobody had reason to reread, and cost nothing until someone
+   *  relied on them. The trigger lives at the call site — today
+   *  `cf/src/runtime.ts` — so that is where it is stated and where it changes.
    *
    *  Not per task, despite what the gateway's `releaseTask` is called: the body
    *  below reads the mount's connection state and never looks at the caller's
-   *  task. The comment used to say "when the task ends" while the code twenty
-   *  lines down was already mount-scoped — the two were written in one file
-   *  without meeting, which is why the wrong sentence cost nothing and stayed. */
+   *  task. */
   async release(ctx: PluginContext): Promise<boolean> {
     const r = await stopBox(ctx);
     if (r === null) return false;
