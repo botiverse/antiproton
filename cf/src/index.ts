@@ -1127,6 +1127,61 @@ export class AgentDO extends DurableObject<Env> {
     return t;
   }
 
+  /**
+   * The person's agents, kept in their first agent's object: that object is
+   * the one their identity names, so it is the one place a list of what they
+   * own can live without a directory service. Each agent listed here is its
+   * own object with its own mounts, credentials, memory and transcript; this
+   * table only says whose it is, and what to call it.
+   */
+  #directory() {
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS owned_agents(
+      agent_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
+      avatar TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+  }
+
+  /** Records an agent the route has already had adopted by its own object. */
+  async uiRecordAgent(tenantId: string, ownerAgentId: string, rec: { agentId: string; name: string; description: string; avatar: string; createdAt: number }) {
+    this.#claim(tenantId, ownerAgentId);
+    this.#directory();
+    this.sql.exec("INSERT OR IGNORE INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?)",
+      rec.agentId, rec.name, rec.description, rec.avatar, rec.createdAt);
+    return rec;
+  }
+
+  async uiListAgents(tenantId: string, ownerAgentId: string) {
+    this.#claim(tenantId, ownerAgentId);
+    this.#directory();
+    const rows = this.sql.exec("SELECT * FROM owned_agents ORDER BY created_at DESC").toArray() as any[];
+    const owned = rows.map((r) => ({
+      agentId: String(r.agent_id), name: String(r.name), description: String(r.description),
+      avatar: String(r.avatar), createdAt: Number(r.created_at),
+    }));
+    // The first agent is the person's own object, named before names existed.
+    return [...owned, { agentId: ownerAgentId, name: "default", description: "", avatar: avatarFor(ownerAgentId), createdAt: 0 }];
+  }
+
+  async uiOwnsAgent(tenantId: string, ownerAgentId: string, agentId: string): Promise<boolean> {
+    if (agentId === ownerAgentId) return true;
+    this.#claim(tenantId, ownerAgentId);
+    this.#directory();
+    return this.sql.exec("SELECT 1 FROM owned_agents WHERE agent_id=?", agentId).toArray().length > 0;
+  }
+
+  /**
+   * Runs in the new agent's own object: the record that the harness reads
+   * its persona from lives here, beside everything else that is this agent's.
+   */
+  async uiAdoptAgent(tenantId: string, agentId: string, spec: { name: string; description: string; avatar: string }) {
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    if (!(await rt.store.loadAgent(tenantId, agentId))) {
+      await rt.store.createAgent(tenantId, agentId, { name: spec.name, description: spec.description, avatar: spec.avatar });
+    }
+    return { ok: true };
+  }
+
   /** The only way a conversation id comes to exist. */
   async uiNewConversation(tenantId: string, agentId: string) {
     this.#claim(tenantId, agentId);
@@ -1943,7 +1998,35 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/conversation"]);
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/conversation", "/ui/agent"]);
+
+/**
+ * What a person may name an agent. Checked in the route before any object is
+ * touched, so a refusal costs nothing and leaves nothing behind.
+ */
+function agentSpec(form: FormData, ownerAgentId: string): { agentId: string; name: string; description: string; avatar: string; createdAt: number } | string {
+  const name = String(form.get("name") ?? "").trim();
+  const description = String(form.get("description") ?? "").trim();
+  if (!name) return "an agent needs a name";
+  if (name.length > 60) return "a name is at most 60 characters";
+  if (description.length > 2000) return "a description is at most 2000 characters";
+  const given = String(form.get("avatar") ?? "");
+  const avatar = /^[0-9a-f]{8}$/i.test(given) ? given.toLowerCase() : mintAvatar();
+  return { agentId: `${ownerAgentId}_${Date.now().toString(36)}`, name, description, avatar, createdAt: Date.now() };
+}
+
+/** Eight hex characters, enough for a page to draw a stable face from. */
+function mintAvatar(): string {
+  const b = new Uint8Array(4); crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** The first agent had no seed minted for it; derive one from its id so it draws the same every time. */
+function avatarFor(agentId: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < agentId.length; i++) { h ^= agentId.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, "0");
+}
 
 function uiAgent(who: string): string {
   return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
@@ -2058,6 +2141,7 @@ export default {
     // Agent traffic is addressed by identity; probes and the benchmark keep
     // their own fixed objects.
     let name: string;
+    let uiSelected: { who: string; home: string; agentId: string } | null = null;
     if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
     else if (url.pathname.startsWith("/bench")) name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
     else if (url.pathname.startsWith("/ui")) {
@@ -2076,8 +2160,23 @@ export default {
       if (who.startsWith("anonymous") && UI_WRITE_ROUTES.has(url.pathname)) {
         return new Response("read-only: the console is open to anonymous viewers, but not for writes", { status: 403 });
       }
+      // Which of the person's agents. The identity names their first one;
+      // any other must be in that first object's directory, or it is 404,
+      // reads and writes alike, so "not yours" and "does not exist" look the
+      // same from outside.
+      const home = uiAgent(who);
+      const peek = request.method === "POST" ? await formOf(request.clone()) : null;
+      const asked = String(url.searchParams.get("agentId") ?? peek?.get("agentId") ?? "").trim();
+      const agentId = asked || home;
+      if (agentId !== home) {
+        const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
+        if (!(await homeStub.uiOwnsAgent("demo", home, agentId))) {
+          return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
+        }
+      }
+      uiSelected = { who, home, agentId };
       try {
-        name = agentObjectName("demo", uiAgent(who));
+        name = agentObjectName("demo", agentId);
       } catch (e: any) {
         return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
       }
@@ -2254,7 +2353,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiAgent(who);
+          const agentId = uiSelected?.agentId ?? uiAgent(who);
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
           await stub.uiEnsure("demo", agentId, taskId);
           return new Response(page(taskId, who, agentId), {
@@ -2265,7 +2364,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiAgent(who);
+          const agentId = uiSelected?.agentId ?? uiAgent(who);
           const taskId = String(url.searchParams.get("taskId"));
           const unchanged = await notModified(request, stub, agentId, taskId);
           if (unchanged) return unchanged;
@@ -2288,7 +2387,7 @@ export default {
         case "/ui/events": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = String(url.searchParams.get("taskId"));
           const unchanged = await notModified(request, stub, agentId, taskId);
           if (unchanged) return unchanged;
@@ -2303,7 +2402,7 @@ export default {
         case "/ui/plugins": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           // One read, dispatched to the part the shell asked for: the mount
           // list, one mount's block, the catalogue, or the whole page.
           const d = await stub.uiPlugins("demo", agentId);
@@ -2319,7 +2418,7 @@ export default {
           // else does: not the value, not on success, not on failure.
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
@@ -2333,7 +2432,7 @@ export default {
         case "/ui/credential/remove": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
@@ -2346,7 +2445,7 @@ export default {
         case "/ui/runtime": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = String(url.searchParams.get("taskId"));
           const unchanged = await notModified(request, stub, agentId, taskId);
           if (unchanged) return unchanged;
@@ -2359,6 +2458,37 @@ export default {
         // Data routes for the console shell, rendered by the shell's own
         // renderers with `d`, the way /ui/plugins does. `viewer` is the
         // identity the gate resolved.
+        case "/ui/agent": {
+          // The only way an agent id comes to exist for a person. Order
+          // matters: the new object adopts the record first, since that is
+          // where its harness reads the persona from; the directory in the
+          // person's first object records it last, so a failure between the
+          // two leaves an unlisted object rather than a listed one with no
+          // persona. Both calls are idempotent.
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          if (request.method !== "POST") return new Response("POST", { status: 405 });
+          if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
+          const home = uiAgent(gate.who);
+          const made = agentSpec(form, home);
+          if (typeof made === "string") return new Response(made, { status: 400 });
+          const own = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", made.agentId)));
+          await own.uiAdoptAgent("demo", made.agentId, made);
+          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
+          await homeStub.uiRecordAgent("demo", home, made);
+          return Response.json(made);
+        }
+        case "/ui/agents": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const home = uiAgent(gate.who);
+          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
+          const agents = (await homeStub.uiListAgents("demo", home))
+            .map((a) => ({ ...a, current: a.agentId === (uiSelected?.agentId ?? home) }));
+          return Response.json({ agents });
+        }
         case "/ui/conversation": {
           // The only way a conversation id comes to exist; every route that
           // takes one refuses an id this did not mint for the viewer's agent.
@@ -2366,24 +2496,24 @@ export default {
           if (gate instanceof Response) return gate;
           if (request.method !== "POST") return new Response("POST", { status: 405 });
           if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
-          return Response.json(await stub.uiNewConversation("demo", uiAgent(gate.who)));
+          return Response.json(await stub.uiNewConversation("demo", uiSelected?.agentId ?? uiAgent(gate.who)));
         }
         case "/ui/inbox": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const d = await stub.uiInbox("demo", uiAgent(gate.who));
+          const d = await stub.uiInbox("demo", uiSelected?.agentId ?? uiAgent(gate.who));
           return html(inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/tasks": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          return html(taskList(await stub.uiTasks("demo", uiAgent(gate.who))));
+          return html(taskList(await stub.uiTasks("demo", uiSelected?.agentId ?? uiAgent(gate.who))));
         }
         case "/ui/approvals": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const taskId = String(url.searchParams.get("taskId"));
-          return html(approvals(await stub.uiApprovals("demo", uiAgent(gate.who), taskId)));
+          return html(approvals(await stub.uiApprovals("demo", uiSelected?.agentId ?? uiAgent(gate.who), taskId)));
         }
         case "/ui/message": {
           const form = await formOf(request);
@@ -2391,7 +2521,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiAgent(who);
+          const agentId = uiSelected?.agentId ?? uiAgent(who);
           const taskId = String(form.get("taskId"));
           const text = String(form.get("text") ?? "").trim();
           const mode = String(form.get("mode")) === "followUp" ? "followUp" as const : "steer" as const;
@@ -2402,7 +2532,7 @@ export default {
         case "/ui/compact": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const taskId = String(form.get("taskId"));
@@ -2416,7 +2546,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiAgent(who);
+          const agentId = uiSelected?.agentId ?? uiAgent(who);
           const decision = String(form.get("decision")) === "approved" ? "approved" : "denied";
           // The panel that posted names its conversation; an older page that
           // does not is the first one. Either way it is the viewer's own or 404.

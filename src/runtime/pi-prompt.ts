@@ -66,6 +66,9 @@ you need.`;
 export const BASE_SYSTEM = CORE;
 
 export interface PromptParts {
+  /** Who this agent is, as the person who created it said: a name, and a
+   *  description handed over verbatim as its standing instructions. */
+  persona?: { name?: string; description?: string } | null;
   workingSet?: string;
   policy?: string;
   /** Whether `run_js` is actually offered. A page about a sandbox the agent
@@ -77,9 +80,27 @@ export interface PromptParts {
 
 export function systemPrompt(parts: PromptParts = {}): string {
   const out = [CORE];
+  const persona = personaSection(parts.persona);
+  if (persona) out.push(persona);
   if (parts.sandbox) out.push(SANDBOX);
   if (parts.artifacts ?? parts.sandbox) out.push(ARTIFACTS);
   if (parts.policy?.trim()) out.push(parts.policy.trim());
   if (parts.workingSet?.trim()) out.push(parts.workingSet.trim());
   return out.join("\n\n");
+}
+
+/**
+ * The persona sits first after the core, before anything about tools: it is
+ * the one part of the prompt a person wrote, and it is what the agent is.
+ * The description is verbatim; paraphrasing what someone typed as their
+ * agent's instructions would be a second author nobody asked for.
+ */
+export function personaSection(p: PromptParts["persona"]): string {
+  const name = String(p?.name ?? "").trim();
+  const description = String(p?.description ?? "").trim();
+  if (!name && !description) return "";
+  const lines: string[] = [];
+  if (name) lines.push(`You are ${name}.`);
+  if (description) lines.push(description);
+  return lines.join("\n\n");
 }

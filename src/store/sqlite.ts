@@ -223,6 +223,13 @@ export class SqliteStore implements StorageAdapter {
       .run(tenantId, agentId, j(config), now());
   }
 
+  async loadAgent(tenantId: string, agentId: string) {
+    const r = this.#db
+      .prepare("SELECT agent_id, config, created_at FROM agents WHERE tenant_id=? AND agent_id=?")
+      .get(tenantId, agentId) as any;
+    return r ? { agentId: String(r.agent_id), config: JSON.parse(String(r.config ?? "{}")) as Json, createdAt: Number(r.created_at) } : null;
+  }
+
   async createTask(
     tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion = 0,
   ) {

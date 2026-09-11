@@ -35,6 +35,8 @@ export interface StorageAdapter {
   close(): Promise<void>;
 
   createAgent(tenantId: string, agentId: string, config?: Json): Promise<void>;
+  /** The agent's record as created: its config is where a name and a description live. */
+  loadAgent(tenantId: string, agentId: string): Promise<{ agentId: string; config: Json; createdAt: number } | null>;
   /**
    * Snapshots and the raw task log.
    *
