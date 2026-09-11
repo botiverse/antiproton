@@ -17,7 +17,6 @@ cf/src/index.ts: error TS2339: Property 'byOp' does not exist on type 'never'.
 cf/src/index.ts: error TS2339: Property 'events' does not exist on type 'never'.
 cf/src/index.ts: error TS2339: Property 'shown' does not exist on type 'never'.
 cf/src/index.ts: error TS2339: Property 'total' does not exist on type 'never'.
-cf/src/index.ts: error TS2345: Argument of type 'MountPolicy | null | undefined' is not assignable to parameter of type 'MountPolicy | null'.
 cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
 cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
 src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.
