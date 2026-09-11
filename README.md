@@ -512,12 +512,15 @@ them:
   is standing instructions rather than a label. What is not built is changing
   either afterwards: there is no edit or rename, and no way to delete one, so a
   description written at creation is the description the agent keeps. Nor does an
-  agent have its mounts at the moment it is created — creation writes its record,
-  and the mounts arrive when it is first opened or first asked to run anything,
-  so a fresh id read before either looks unmounted. That is a window between two
-  steps rather than a fault: the record and the mounts are made by different
-  paths, and folding them together would make creation do seven things it does
-  not need to. Worth knowing before re-running a check that reads a mount list. The older
+  agent have its mounts at the moment it is created — creation writes its record
+  and nothing else. They arrive on the first open or the first run, and both read
+  one seed list, so it does not matter which comes first: the same seven mounts,
+  `state` among them. Only the window between creation and that first touch is
+  empty. The two paths seed the same set but are not interchangeable afterwards:
+  a visit reconciles a mount's config and policy, a run only adds what is missing,
+  so a changed config reaches an agent the next time somebody opens it. Two lists
+  used to seed this and they had drifted — a run gave three, the console seven —
+  which is why the sentence is here rather than left to the code. The older
   threading layer is also still unused — `events.thread_id` is a column nothing
   reads, and the `threads`/`task_threads` tables with the `POST
   /agents/:id/threads` routes sit on `SqliteStore` in a file nothing calls, so
