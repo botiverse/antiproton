@@ -1210,7 +1210,7 @@ export class AgentDO extends DurableObject<Env> {
           await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
         }
         if (JSON.stringify(have.policy ?? null) !== JSON.stringify(d.policy ?? null)) {
-          await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy);
+          await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy ?? null);
         }
       }
       // Reconciled, not merely defaulted. The binding is written when an agent
