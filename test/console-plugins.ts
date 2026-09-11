@@ -126,6 +126,15 @@ check("a reference the operator configured is attached by the operator, with no 
   must(!/undefined|null/.test(html), "nothing may render as undefined");
 });
 
+check("a paste rejected over an operator reference still says why", () => {
+  const hostile = `<b>run9 rejected these keys</b>`;
+  const html = render(mount("node", "run9", { connected: true, credential: { attached: true, operator: true, verified: false, account: null, error: hostile } }));
+  must(/attached by the operator/.test(html), "the operator reference stays attached");
+  must(html.includes("&lt;b&gt;run9 rejected these keys&lt;/b&gt;"), "the reason must show, escaped");
+  must(!html.includes(hostile), "the reason must not render as markup");
+  must(!/<input|<form/.test(html), "still no controls on an operator reference");
+});
+
 check("attached and unverified: says so, shows no fragment of the key, and never the word undefined", () => {
   const html = render(mount("r9", "run9", { connected: true, credential: { attached: true, account: null, last4: "wxyz", setAt: null, lastUsedAt: null, error: null } }));
   must(/attached · unverified/.test(html), "must say unverified");

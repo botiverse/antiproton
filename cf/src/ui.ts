@@ -896,10 +896,13 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
 
   // A reference the operator configured at deploy time is attached, but it is
   // not in this agent's store: nothing here set it, and nothing here can
-  // replace or remove it. Say who attached it and offer no controls.
+  // replace or remove it. Say who attached it and offer no controls. A paste
+  // rejected on top of it still reports its reason, or the person who pasted
+  // wrong keys over the operator's is shown no change at all.
   if (c.operator === true) {
     return `<div class="cred">
       <div class="state"><b>attached by the operator</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}<span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
+      ${error ? `<div class="err">${esc(error)}</div>` : ""}
     </div>`;
   }
 
