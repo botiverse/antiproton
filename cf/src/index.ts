@@ -1774,7 +1774,9 @@ async function formOf(request: Request): Promise<FormData | null> {
   try { return await request.formData(); } catch { return null; }
 }
 
-/** Console routes that write: a message, a decision, a credential. */
+/** Console routes that write. Add a route here when it writes, whether it
+ *  arms the object (message, decide, compact) or changes what the agent is
+ *  authorised as (credential, credential/remove). */
 const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove"]);
 
 function uiAgent(who: string): string {
@@ -1900,9 +1902,11 @@ export default {
       if (gate instanceof Response) return gate;
       const who = gate.who;
       // The anonymous switch opens the page to look at, not to act on. Every
-      // write route enqueues something and arms the object's alarm, so an
-      // anonymous viewer is refused there rather than admitted to a turn that
-      // runs and fails; the flag can then never be more than read-only.
+      // route in the set writes. Three of them, message, decide and compact,
+      // also arm the object's alarm and would run a turn that fails without a
+      // key; the two credential routes arm nothing and succeed regardless,
+      // because they only touch the store, and they change what the agent is
+      // authorised as. The second pair is the one the refusal exists for.
       if (who.startsWith("anonymous") && UI_WRITE_ROUTES.has(url.pathname)) {
         return new Response("read-only: the console is open to anonymous viewers, but not for writes", { status: 403 });
       }
