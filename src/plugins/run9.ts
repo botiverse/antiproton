@@ -199,6 +199,38 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
 /** The argv one command becomes. With `network: "none"` the shell itself is
  *  started inside an empty network namespace, so nothing the command spawns
  *  can inherit a route out. */
+/**
+ * What of a command's output the agent gets, and what it is told about the rest.
+ *
+ * The setting said the overflow was "parked as an artifact". Nothing parked it:
+ * the output was sliced and the remainder dropped, and the agent was left a
+ * bare `truncated: true` it could do nothing with — it cannot ask for the rest,
+ * and nothing told it the rest was gone rather than waiting somewhere.
+ *
+ * So the result now says how much went and what to do instead. The box has a
+ * real filesystem and a save tool, so a command whose output matters can
+ * redirect it to a file and keep that; the one thing the agent must not do is
+ * assume the tail is retrievable.
+ *
+ * Exported because no benchmark has ever crossed this threshold — the path
+ * exists and has never run — and a unit test is the only thing that will
+ * exercise it before a person does.
+ */
+export function execOutput(out: string, maxOutputBytes: number): {
+  output: string;
+  truncated: boolean;
+  dropped?: number;
+  note?: string;
+} {
+  if (out.length <= maxOutputBytes) return { output: out, truncated: false };
+  return {
+    output: out.slice(0, maxOutputBytes),
+    truncated: true,
+    dropped: out.length - maxOutputBytes,
+    note: "the rest was discarded, not stored: re-run sending output to a file and node.save it",
+  };
+}
+
 export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "open" | "none" }, command: string): string[] {
   const line = cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command;
   const argv = [cfg.shell, "-lc", line];
@@ -235,7 +267,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
     { name: "network", type: "string", summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS.", default: "open" },
     { name: "timeoutMs", type: "number", summary: "How long one call may take.", default: 120000 },
-    { name: "maxOutputBytes", type: "number", summary: "Output past this is parked as an artifact instead of returned.", default: 24000 },
+    { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
     { name: "secrets", type: "string[]", references: "credential",
       summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
@@ -615,8 +647,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
           // nothing between executions" concluded this box was volatile too — which
           // would have it reinstalling packages on every call.
           reminder: "this container persists between calls; run9.release destroys it",
-          output: out.slice(0, cfg.maxOutputBytes),
-          truncated: out.length > cfg.maxOutputBytes,
+          ...execOutput(out, cfg.maxOutputBytes),
           box: state.boxId,
           // So the agent learns the environment from a result it already has,
           // instead of spending turns probing for an interpreter.

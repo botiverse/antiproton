@@ -7,7 +7,7 @@
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin, execArgv } from "../src/plugins/run9.ts";
+import { run9Plugin, execArgv, execOutput } from "../src/plugins/run9.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -223,6 +223,29 @@ check("every credential shape answers the same question, including the one with 
   if (signIn.kind !== "signIn" || signIn.signIn.provider !== "Somewhere") {
     throw new Error(`a sign-in should not come back as fields: ${JSON.stringify(signIn)}`);
   }
+});
+
+check("output under the limit is returned whole and says nothing about truncation", () => {
+  const r = execOutput("hello", 24_000);
+  if (r.output !== "hello" || r.truncated) throw new Error(JSON.stringify(r));
+  if ("dropped" in r || "note" in r) throw new Error("a result that lost nothing should not discuss loss");
+});
+
+check("output over the limit says how much went, and that it is gone rather than parked", () => {
+  // The threshold no benchmark has ever crossed, which is why it is tested here
+  // rather than left for the first person whose build prints a lot.
+  const r = execOutput("x".repeat(100), 40);
+  if (r.output.length !== 40) throw new Error(`kept ${r.output.length}`);
+  if (!r.truncated || r.dropped !== 60) throw new Error(JSON.stringify(r));
+  if (!/discarded/.test(r.note ?? "")) {
+    throw new Error(`the agent is not told the tail is gone: ${JSON.stringify(r.note)}`);
+  }
+  if (r.output.length + r.dropped! !== 100) throw new Error("the arithmetic does not account for the whole output");
+});
+
+check("the boundary keeps everything, one past it does not", () => {
+  if (execOutput("x".repeat(40), 40).truncated) throw new Error("exactly at the limit was cut");
+  if (!execOutput("x".repeat(41), 40).truncated) throw new Error("one past the limit was not cut");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
