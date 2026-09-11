@@ -205,6 +205,16 @@ export class AgentRuntime {
   readonly store: DurableObjectStore;
   #deps: RuntimeDeps;
   #plugins: Plugin[];
+  /**
+   * What the registry says a plugin's version is. A mount pins a version and
+   * the gateway refuses a call when the pin and the registry disagree, so a
+   * seed that writes a literal is a seed that breaks the day the plugin moves:
+   * github went to 2.0.0 and every mount written as "1.0.0" was refused.
+   */
+  pluginVersion(id: string): string | undefined {
+    return this.#plugins.find((p) => p.id === id)?.version;
+  }
+
   #gateway: ToolGateway;
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
@@ -418,7 +428,8 @@ export class AgentRuntime {
     for (const m of mounts) {
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
-        installationId: `inst-${m.alias}`, connectionId: null, toolVersion: "1.0.0",
+        installationId: `inst-${m.alias}`, connectionId: null,
+        toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
         publicConfig: { account: m.account }, secretRef: null,
       });
     }

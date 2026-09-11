@@ -1175,6 +1175,12 @@ export class AgentDO extends DurableObject<Env> {
         // something that matters should use it, and use an allowlist too.
         { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
           secretRef: null, policy: null },
+        // GitHub, the first real user of the credential page. Seeded with no
+        // token, so it reads public repositories; the person attaches their
+        // own token there and the mount acts as that account. Writes (issues,
+        // comments, anything through `api`) wait for a person, like `ops`.
+        { alias: "gh", plugin: "github", config: { account: "GitHub" },
+          secretRef: null, policy: { write: "approval" as const } },
         // A real container, for tasks that need one. Its tools describe
         // themselves as a last resort so the agent reaches for free in-process
         // JS first, and the framework releases the box once the agent has no
@@ -1188,14 +1194,21 @@ export class AgentDO extends DurableObject<Env> {
           secretRef: null, policy: null },
       ];
       for (const d of desired) {
+        // The pin is the registry's version, never a literal: the gateway
+        // refuses a call whose pin disagrees with the registry, so a literal
+        // is a mount that stops working the day its plugin moves.
+        const toolVersion = rt.pluginVersion(d.plugin) ?? "1.0.0";
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
         if (!have) {
           await rt.store.addMount({
             tenantId, agentId, alias: d.alias, plugin: d.plugin,
-            installationId: `inst-${d.alias}`, connectionId: null, toolVersion: "1.0.0",
+            installationId: `inst-${d.alias}`, connectionId: null, toolVersion,
             publicConfig: d.config, secretRef: d.secretRef, policy: d.policy,
           });
           continue;
+        }
+        if (have.toolVersion !== toolVersion) {
+          await rt.store.updateMountToolVersion(tenantId, agentId, d.alias, toolVersion);
         }
         if (JSON.stringify(have.publicConfig) !== JSON.stringify(d.config)) {
           await rt.store.updateMountConfig(tenantId, agentId, d.alias, d.config);

@@ -276,6 +276,8 @@ export interface StorageAdapter {
    * storage and came back as a reference it could not use. Creation-only
    * reconciliation cements whatever the first deploy happened to write.
    */
+  /** The version a mount pins; the console reconciles it to the registry's. */
+  updateMountToolVersion(tenantId: string, agentId: string, alias: string, toolVersion: string): Promise<boolean>;
   updateMountConfig(
     tenantId: string, agentId: string, alias: string, publicConfig: Json,
   ): Promise<boolean>;
