@@ -667,6 +667,13 @@ export class DurableObjectStore implements StorageAdapter {
       tenantId, agentId, alias);
   }
 
+  async updateMountToolVersion(tenantId: string, agentId: string, alias: string, toolVersion: string) {
+    this.#sql.exec("UPDATE mounts SET tool_version=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+      toolVersion, tenantId, agentId, alias);
+    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+      tenantId, agentId, alias);
+  }
+
   async updateMountConfig(tenantId: string, agentId: string, alias: string, publicConfig: Json) {
     this.#sql.exec("UPDATE mounts SET public_config=? WHERE tenant_id=? AND agent_id=? AND alias=?",
       j(publicConfig), tenantId, agentId, alias);
