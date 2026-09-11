@@ -1419,10 +1419,13 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * The agent's tasks, latest activity first, each with its held-call count
    * and whether the agent is mid-turn on it. `lastActivityAt` is the task's
-   * last checkpoint; `turns` is null because transcript entries do not carry
-   * a task id, so a per-task turn count is not derivable without a change to
-   * what the loop records. `busy` is the agent's lane state, attributed to
-   * the most recently active open task, since one lane serves every task.
+   * last checkpoint. `turns` is null: the per-task record is `events.task_id`,
+   * while the transcript is built from `pi_entries`, which has no task id, so
+   * a count would have to come from `events` — and what `events` holds today
+   * is prompts and compactions per task, not model turns, so it would count
+   * the person's messages rather than the agent's turns. `busy` is the agent's
+   * lane state, attributed to the most recently active open task, since one
+   * lane serves every task.
    */
   async uiTasks(tenantId: string, agentId: string) {
     const rt = this.runtime();
