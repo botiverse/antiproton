@@ -10,6 +10,7 @@
  */
 import type { ApprovalRecord } from "../../src/core/types.ts";
 import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
+import { FAVICON_DATA_URI, LOCKUP_SVG } from "./brand.ts";
 import { md } from "./md.ts";
 
 const esc = (s: unknown) =>
@@ -59,6 +60,9 @@ font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
 header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
 gap:14px;align-items:baseline;flex-wrap:wrap}
 h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.01em}
+h1.brand{display:flex;align-items:center;color:var(--ink)}
+h1.brand svg{height:20px;width:auto;display:block}
+h1.brand .bar{fill:var(--warn);stroke:var(--warn)}
 header .sub{color:var(--dim);font-size:12px}
 main{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(320px,1fr);
 gap:16px;padding:16px 20px;align-items:start}
@@ -195,10 +199,11 @@ export function page(taskId: string, who: string, agentId: string): string {
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>antiproton</title>
+<link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
 <style>${CSS}</style></head><body>
 <header>
-  <h1>antiproton</h1>
+  <h1 class="brand">${LOCKUP_SVG}</h1>
   <span class="sub">${esc(agentId)} · ${t}</span>
   <span class="sub" style="margin-left:auto">${esc(who)}</span>
 </header>
