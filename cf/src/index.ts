@@ -23,7 +23,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
-import { ensureAgentTables } from "../../src/runtime/pi-agent.ts";
+import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
@@ -1436,7 +1436,15 @@ export class AgentDO extends DurableObject<Env> {
     const session = await this.#conversation(tenantId, agentId, taskId);
     const rt = this.runtime();
     const agent = await rt.agent(tenantId, agentId, session);
-    const all = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
+    const entries = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
+    // A run that failed before its first model call leaves no entry, only
+    // pi's outcome record; without this the page shows the message and then
+    // nothing, which is what an hour of today looked like.
+    const failed = failedRuns(this.sql, session).map((f) => ({
+      sequence: f.seq, kind: "model.failed",
+      payload: { error: `${f.code}: ${f.message}`, operationId: f.operationId, at: f.at } as Record<string, unknown>,
+    }));
+    const all = [...entries, ...failed].sort((a, b) => a.sequence - b.sequence);
     const total = all.length;
     const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
       sequence: e.sequence, kind: e.kind, payload: e.payload,
@@ -2442,7 +2450,16 @@ export default {
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
           const text = String(form.get("text") ?? "").trim();
           const mode = String(form.get("mode")) === "followUp" ? "followUp" as const : "steer" as const;
-          if (text) await stub.uiSay("demo", agentId, taskId, text, mode);
+          if (text) {
+            // A refusal returned as a value is still a refusal: the page shows
+            // it only if the status says so (Vera, after the day the lane
+            // refused every message and the route answered 200 each time).
+            const r: any = await stub.uiSay("demo", agentId, taskId, text, mode);
+            if (r?.result?.ok === false) {
+              const err = r.result.error;
+              return new Response(`refused: ${err?.code ?? ""} ${err?.message ?? JSON.stringify(err)}`.trim(), { status: 409 });
+            }
+          }
           const t = await stub.uiTranscript("demo", agentId, taskId);
           return html(trajectory(t.events, t.byOp, t.busy));
         }
