@@ -1,0 +1,51 @@
+
+  SWE-bench Verified — 10 instance(s), inside the deployed object
+  on https://antiproton.botiverse.workers.dev object bench-swe2
+  ────────────────────────────────────────────────────────────────────────────────
+  astropy__astropy-12907  (astropy/astropy)
+  [32m✓[0m 78s  8 model calls  56424 tok (91% cached)  [shell×7]  diff:  1 file changed, 1 insertion(+), 1 deletion(-)
+      56424 tok (5096 re-read)  ·  container 72s = 92% of wall
+      object billed 36.2s = 46% of wall (9.5s of it grading)
+  astropy__astropy-13033  (astropy/astropy)
+  [32m✓[0m 84s  13 model calls  96580 tok (93% cached)  [shell×12 run×1]  diff:  1 file changed, 11 insertions(+), 3 deletions(-)
+      96580 tok (7108 re-read)  ·  container 80s = 96% of wall
+      object billed 48.1s = 57% of wall (10.9s of it grading)
+  astropy__astropy-13236  (astropy/astropy)
+  [32m✓[0m 150s  24 model calls  236787 tok (95% cached)  [shell×23]  diff:  2 files changed, 4 insertions(+), 8 deletions(-)
+      236787 tok (11891 re-read)  ·  container 148s = 99% of wall
+      object billed 89.6s = 60% of wall (9.5s of it grading)
+  astropy__astropy-13398  (astropy/astropy)
+  [31m✗[0m 785s  60 model calls  2567617 tok (98% cached)  [shell×67]  diff:  3 files changed, 57 insertions(+), 13 deletions(-)
+      2567617 tok (52929 re-read)  ·  container 782s = 100% of wall
+      object billed 585.0s = 75% of wall (10.9s of it grading)
+      [31mastropy/utils/iers/iers.py:271: TypeError | =========================== short test summary info ============================ | FAILED astropy/coordinates/tests/test_intermediate_transformations.py::test_itrs_topo_to_alta[0m
+  astropy__astropy-13453  (astropy/astropy)
+  [32m✓[0m 332s  35 model calls  689372 tok (95% cached)  [shell×34]  diff:  1 file changed, 2 insertions(+)
+      689372 tok (31836 re-read)  ·  container 329s = 99% of wall
+      object billed 244.1s = 74% of wall (8.3s of it grading)
+  astropy__astropy-13579  (astropy/astropy)
+  [32m✓[0m 330s  23 model calls  401761 tok (95% cached)  [shell×24]  diff:  1 file changed, 5 insertions(+), 1 deletion(-)
+      401761 tok (18785 re-read)  ·  container 327s = 99% of wall
+      object billed 251.6s = 76% of wall (9.6s of it grading)
+  astropy__astropy-13977  (astropy/astropy)
+  [32m✓[0m 355s  23 model calls  497231 tok (95% cached)  [shell×29]  diff:  1 file changed, 56 insertions(+), 39 deletions(-)
+      497231 tok (26575 re-read)  ·  container 353s = 99% of wall
+      object billed 290.6s = 82% of wall (9.6s of it grading)
+  astropy__astropy-14096  (astropy/astropy)
+  [32m✓[0m 213s  12 model calls  89958 tok (91% cached)  [shell×11]  diff:  1 file changed, 2 insertions(+), 4 deletions(-)
+      89958 tok (7782 re-read)  ·  container 211s = 99% of wall
+      object billed 179.2s = 84% of wall (75.0s of it grading)
+  astropy__astropy-14182  (astropy/astropy)
+  [32m✓[0m 248s  16 model calls  204370 tok (90% cached)  [shell×18]  diff:  1 file changed, 8 insertions(+), 4 deletions(-)
+      204370 tok (20946 re-read)  ·  container 242s = 98% of wall
+      object billed 183.3s = 74% of wall (10.8s of it grading)
+  astropy__astropy-14309  (astropy/astropy)
+  [32m✓[0m 294s  24 model calls  390381 tok (95% cached)  [shell×22 run×1]  diff:  3 files changed, 7 insertions(+), 3 deletions(-)
+      390381 tok (21101 re-read)  ·  container 286s = 97% of wall
+      object billed 197.3s = 67% of wall (10.8s of it grading)
+  ────────────────────────────────────────────────────────────────────────────────
+  resolved 9/10   2869s total   5230481 prompt tokens (96% served from cache)
+  tools: shell×247  run×2
+  object billed 2104.9s of 2869s wall (73%), of which 164.7s is this runner grading
+
+exit 0
