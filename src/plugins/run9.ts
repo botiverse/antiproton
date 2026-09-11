@@ -193,14 +193,7 @@ async function stopBox(
   // delete only means the next call tries to reuse something that may not be
   // there — but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
-  const session: Session = {
-    boxId: state.boxId, startedAt: state.createdAt, endedAt: Date.now(),
-    // Carried into the record rather than zeroed with the rest of the live
-    // state below: it is maintained on every call already, and it is the only
-    // term that separates "held while working" from "held while idle".
-    lastUsedAt: state.lastUsedAt || state.createdAt,
-    execs: state.execs ?? 0, saved: state.saved ?? [],
-  };
+  const session = sessionOf(state, Date.now());
   await ctx.connection.set({
     boxId: "", createdAt: 0, lastUsedAt: 0,
     sessions: [session, ...(state.sessions ?? [])].slice(0, SESSIONS_KEPT),
@@ -226,6 +219,33 @@ async function stopBox(
  * and mounts rely on it; a *present* value that is not `"open"` isolates, which
  * is the direction a mistake should fail in.
  */
+/**
+ * What a finished container leaves behind, as one readable thing.
+ *
+ * Extracted so the record's contents can be asserted without a live box —
+ * `stopBox` needs a credential and a network, so nothing in the suite reaches
+ * the object literal this used to be. The field that makes that worth doing is
+ * `lastUsedAt`: it is carried *from* the live state while the line just below
+ * its old home resets every other field of that state to zero. That line is
+ * correct and looks correct, which is the danger — extending it by one token
+ * would be consistent with its neighbours and would quietly empty this record.
+ */
+export function sessionOf(
+  state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
+  endedAt: number,
+): Session {
+  return {
+    boxId: state.boxId,
+    startedAt: state.createdAt,
+    endedAt,
+    // Held-while-working versus held-while-idle is the only term that separates
+    // the two release policies, and it is computable only from here.
+    lastUsedAt: state.lastUsedAt || state.createdAt,
+    execs: state.execs ?? 0,
+    saved: state.saved ?? [],
+  };
+}
+
 /**
  * What of a command's output the agent gets, and what it is told about the rest.
  *
