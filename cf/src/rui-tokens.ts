@@ -9,8 +9,12 @@
  * values those scopes reference and the Elegant font names. The page puts
  * data-theme="elegant" on <html> and a .light or .dark class from the
  * viewer's stored choice; with neither, the system decides. Re-copy from the
- * package on upgrade rather than editing here; the report page vendors the
- * same blocks in report/public/rui-foundation.css.
+ * package on upgrade rather than editing here.
+ *
+ * The report page carries its own copy of the same blocks in
+ * report/public/rui-foundation.css. As of #57 the two carried the same values
+ * for every name they share; nothing keeps them in step, and the report's
+ * copy is Dora's, so a change here is a change to tell her about.
  */
 export const RUI_TOKENS = `[data-theme="elegant"]{
   --color-brutal-yellow-400: oklch(0.883 0.162 91.89);

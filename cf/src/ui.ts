@@ -105,6 +105,12 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .task.on{border-color:var(--accent);background:var(--sunk)}
 .task .id{font-size:12px}
 .task .meta{color:var(--dim);font-size:10.5px;margin-top:3px}
+.mount-link{display:block;padding:9px 12px;border:1px solid var(--line);border-radius:7px;margin:0 0 8px;color:var(--ink);text-decoration:none}
+.mount-link.on{border-color:var(--accent);background:var(--sunk)}
+.mount-link .id{font-size:12px}.mount-link .id .sub{color:var(--dim);font-size:11px}
+.mount-link .meta{margin-top:4px}
+.side-link{display:block;color:var(--dim);font-size:11px;margin-top:12px;text-decoration:none}
+.side-link:hover{color:var(--ink)}
 main.main{grid-area:main;overflow:auto;padding:14px 16px;min-width:0}
 section.view{display:none;flex-direction:column;gap:12px;min-height:100%;background:none;border:0;border-radius:0;overflow:visible}
 .view>.body{background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:none}
@@ -309,7 +315,10 @@ export function page(taskId: string, who: string, agentId: string): string {
   </div>
   <div class="side-view" data-for="plugins">
     <h3>mounts</h3>
-    <div class="sub">this agent's authorities; the list moves here next</div>
+    <div class="sub">this agent's authorities</div>
+    <div id="mounts" data-lazy hx-get="/ui/plugins?part=mounts" hx-swap="innerHTML"
+         hx-trigger="ap:show, every 5s[document.body.dataset.view==='plugins']" hx-on::after-swap="ap.markMount()"></div>
+    <a class="side-link" href="/ui?view=plugins&alias=" onclick="ap.mount('');return false">installed on this deployment →</a>
   </div>
 </aside>
 <main class="main" id="main">
@@ -346,13 +355,17 @@ export function page(taskId: string, who: string, agentId: string): string {
       <b>after</b> holds the message until it has finished. A held call shows above the composer until you sign it.</div>
   </section>
   <section class="view" data-view="plugins">
-    <div class="view-head"><h2>Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
-    ${lazy("plugins", "/ui/plugins", "3s", inView)}
+    <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
+    <div class="body" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
+         hx-trigger="ap:show, every 3s[${inView}]">loading…</div>
   </section>
   <section class="view" data-view="runtime">
     <div class="view-head"><h2>Runtime</h2><span class="sub">what the object is billed for, and what it is holding</span></div>
+    <h3>the object</h3>
     ${lazy("runtime", "/ui/runtime", "3s", inView)}
+    <h3>containers</h3>
     ${lazy("sandbox", "/ui/sandbox", "3s", inView)}
+    <h3>storage</h3>
     ${lazy("storage", "/ui/storage", "3s", inView)}
   </section>
 </main>
@@ -396,6 +409,20 @@ export function page(taskId: string, who: string, agentId: string): string {
       const u = new URL(location.href); u.searchParams.set('taskId', id); u.searchParams.set('view', 'agents');
       location.href = u.toString();
     },
+    mount(alias) {
+      const u = new URL(location.href); u.searchParams.set('view', 'plugins');
+      if (alias) u.searchParams.set('alias', alias); else u.searchParams.delete('alias');
+      history.replaceState(null, '', u);
+      const panel = document.getElementById('plugins');
+      panel.setAttribute('hx-get', alias ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(alias) : '/ui/plugins?part=catalogue');
+      htmx.process(panel); htmx.trigger(panel, 'ap:show');
+      document.getElementById('plugins-title').textContent = alias || 'Installed';
+      ap.markMount();
+    },
+    markMount() {
+      const a = new URL(location.href).searchParams.get('alias') || '';
+      document.querySelectorAll('#mounts .mount-link').forEach(el => el.classList.toggle('on', el.dataset.alias === a));
+    },
     markTask() {
       const t = document.body.dataset.task;
       document.querySelectorAll('#tasks .task').forEach(a => a.classList.toggle('on', a.dataset.task === t));
@@ -410,7 +437,12 @@ export function page(taskId: string, who: string, agentId: string): string {
   (function () {
     let m = 'dark'; try { m = localStorage.getItem('ap-mode') || 'dark'; } catch (e) {}
     document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
-    const v = new URL(location.href).searchParams.get('view');
+    const url = new URL(location.href), v = url.searchParams.get('view');
+    if (url.searchParams.has('alias')) {
+      const panel = document.getElementById('plugins'), a = url.searchParams.get('alias');
+      panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue');
+      document.getElementById('plugins-title').textContent = a || 'Installed';
+    }
     ap.show(['inbox', 'agents', 'plugins', 'runtime'].includes(v) ? v : 'inbox');
   })();
   // Poll without re-rendering. Each panel remembers the version it last drew;
@@ -990,7 +1022,7 @@ export function inbox(d: any): string {
     return m < 1 ? "just now" : m < 60 ? `${m} min` : m < 1440 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} d`;
   };
   const card = (a: any) => {
-    const req = a.args?.args ?? a.args ?? {};
+    const req = a.args ?? {};
     return `<div class="card inbox-card">
   <div class="inbox-head"><span class="tool">${esc(a.tool)}</span>
     <span class="meta">${esc(a.taskId)}${a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
@@ -1189,14 +1221,31 @@ function mountBlock(d: any, m: any): string {
     </div>`;
 }
 
-export function plugins(d: any): string {
-  const installed: any[] = d.installed ?? [];
+/** The sidebar's list of mounts: alias, plugin, and whether an account is attached. */
+export function mountList(d: any): string {
   const mounts: any[] = d.mounts ?? [];
+  if (!mounts.length) return `<div class="empty">nothing mounted</div>`;
+  const state = (m: any) => {
+    if (m.problems?.length) return `<span class="tag bad">misconfigured</span>`;
+    const c = m.credential ?? {};
+    const attached = typeof c.attached === "boolean" ? c.attached : m.connected;
+    if (attached && c.operator === true) return `<span class="tag ok">operator</span>`;
+    if (attached && c.verified === true) return `<span class="tag ok">verified</span>`;
+    if (attached) return `<span class="tag warn">unverified</span>`;
+    if (m.needsAccount) return `<span class="tag bad">needs an account</span>`;
+    if (m.optionalAccount) return `<span class="tag">public only</span>`;
+    return `<span class="tag">no account</span>`;
+  };
+  return mounts.map((m) => `<a class="mount-link" data-alias="${esc(m.alias)}" href="/ui?view=plugins&alias=${encodeURIComponent(m.alias)}" onclick="ap.mount('${esc(m.alias)}');return false">
+  <div class="id"><b>${esc(m.alias)}</b> <span class="sub">${esc(m.plugin)}</span></div>
+  <div class="meta">${state(m)}</div>
+</a>`).join("");
+}
 
-  const toolRow = (p: any) => (t: any) => [
-    t.name, t.sideEffects, t.idempotency, t.summary,
-  ];
-
+/** What is installed on this deployment: the catalogue, mounting being a separate act. */
+export function catalogue(d: any): string {
+  const installed: any[] = d.installed ?? [];
+  const toolRow = (t: any) => [t.name, t.sideEffects, t.idempotency, t.summary];
   const pluginBlock = (p: any) => `
     <details class="plug">
       <summary><b>${esc(p.id)}</b> <span class="sub">${esc(p.version)} · ${p.tools.length} tools</span>
@@ -1211,9 +1260,14 @@ export function plugins(d: any): string {
         p.config.map((c: any) => [c.name, c.type,
           c.default === undefined ? "—" : String(c.default), c.summary]))}` : ""}
       <h4>tools</h4>
-      ${table(["tool", "effect", "replay", "what it does"], p.tools.map(toolRow(p)))}
+      ${table(["tool", "effect", "replay", "what it does"], p.tools.map(toolRow))}
     </details>`;
+  return `<div class="hint">Present in the code. Mounting one is a separate, deliberate act.</div>
+${installed.length ? installed.map(pluginBlock).join("") : `<div class="empty">nothing installed</div>`}`;
+}
 
+export function plugins(d: any): string {
+  const mounts: any[] = d.mounts ?? [];
   return `
 <h3>this agent's mounts</h3>
 <div class="hint">A mount is an authority, not a plugin. The same plugin mounted twice
@@ -1222,6 +1276,5 @@ export function plugins(d: any): string {
 ${mounts.length ? mounts.map((m) => mountBlock(d, m)).join("") : `<div class="empty">nothing mounted</div>`}
 
 <h3 style="margin-top:18px">installed on this deployment</h3>
-<div class="hint">Present in the code. Mounting one is a separate, deliberate act.</div>
-${installed.map(pluginBlock).join("")}`;
+${catalogue(d)}`;
 }
