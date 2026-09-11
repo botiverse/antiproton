@@ -94,6 +94,20 @@ export function validateMount(
     if (f.required && given[f.name] === undefined) {
       problems.push({ key: f.name, message: `${plugin.id} needs "${f.name}": ${f.summary}` });
     }
+    // A setting that is advice without a key and a boundary with one. Checked
+    // against the mount's `secret_ref` rather than against the plugin's
+    // declaration, because what matters is whether *this* mount holds a
+    // credential, not whether the plugin can take one.
+    if (f.requiredWithCredential && secretRef) {
+      const v = given[f.name];
+      const missing = v === undefined || v === null || (Array.isArray(v) && v.length === 0);
+      if (missing) {
+        problems.push({
+          key: f.name,
+          message: `${plugin.id} carries a credential, so "${f.name}" must be set: ${f.summary}`,
+        });
+      }
+    }
   }
 
   const cred = plugin.credential;
