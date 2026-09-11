@@ -76,9 +76,20 @@ export function statePlugin(
   return {
     id: "state",
     config: [
-      { name: "maxValueBytes", type: "number", summary: "Largest single value. Anything bigger must go to object storage." },
-      { name: "maxDocumentBytes", type: "number", summary: "Largest working-set document before its head is trimmed." },
-      { name: "maxTotalBytes", type: "number", summary: "How much this agent may keep in total." },
+      // Two thresholds, and only one of them is this setting. A value over
+      // INLINE_MAX spills to object storage and comes back as a reference; a
+      // value over this is refused outright. "Anything bigger must go to object
+      // storage" described the first while naming the second.
+      //
+      // The declared defaults come from DEFAULTS rather than being written
+      // again here: a console showing a blank default for a setting that has
+      // one is how a person learns the wrong number.
+      { name: "maxValueBytes", type: "number", default: DEFAULTS.maxValueBytes,
+        summary: `Largest single value; anything bigger is refused. Values over ${INLINE_MAX / 1024} KiB are kept in object storage and handed back as a reference, which is not configurable.` },
+      { name: "maxDocumentBytes", type: "number", default: DEFAULTS.maxDocumentBytes,
+        summary: "Largest working-set document before its head is trimmed." },
+      { name: "maxTotalBytes", type: "number", default: DEFAULTS.maxTotalBytes,
+        summary: "How much this agent may keep in total. A write that would pass it is refused." },
     ],
     version: "1.0.0",
     tools: [
