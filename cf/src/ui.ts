@@ -11,6 +11,7 @@
 import type { ApprovalRecord } from "../../src/core/types.ts";
 import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
 import { FAVICON_DATA_URI, LOCKUP_SVG } from "./brand.ts";
+import { RUI_DARK_TOKENS } from "./rui-tokens.ts";
 import { md } from "./md.ts";
 
 const esc = (s: unknown) =>
@@ -29,20 +30,20 @@ code.hot{color:var(--ok);border-color:var(--ok)}
 
 .step{border-left:2px solid var(--line);padding:8px 0 8px 12px;margin:0 0 10px}
 .step.user{border-color:var(--accent)}
-.step.agent{border-color:#9d7cd8}
+.step.agent{border-color:var(--model)}
 .step.run{border-color:var(--dim)}
 .step.held{border-color:var(--warn)}
 .step.decided{border-color:var(--ok)}
 .step.fail{border-color:var(--bad)}
 .lbl{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.07em;
 display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.t{color:#5c6472;text-transform:none;letter-spacing:0}
+.t{color:var(--faint);text-transform:none;letter-spacing:0}
 .badge{border:1px solid var(--line);border-radius:99px;padding:0 7px;font-size:10px;
 text-transform:none;letter-spacing:0;color:var(--dim)}
 .badge.ok{color:var(--ok);border-color:var(--ok)}
 .badge.bad{color:var(--bad);border-color:var(--bad)}
 .badge.warn{color:var(--warn);border-color:var(--warn)}
-.code{background:#0a0c10;border-left:2px solid #9d7cd8;color:#c0caf5}
+.code{background:var(--sunk);border-left:2px solid var(--model);color:var(--strong)}
 .chip{border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11px;
 color:var(--ink);text-transform:none;letter-spacing:0}
 .calls{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
@@ -52,17 +53,26 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;margin-top:5px}
 @keyframes d{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
 details[open] summary{color:var(--ink)}
 
-:root{--bg:#0f1115;--panel:#161a21;--line:#252b36;--ink:#d8dee9;--dim:#8b95a6;
---accent:#7aa2f7;--warn:#e0af68;--ok:#9ece6a;--bad:#f7768e;color-scheme:dark}
+/* The console's own names, aliased onto rUI's Elegant dark tokens (the scope
+   itself is RUI_DARK_TOKENS, prepended below). Two roles split what was one
+   blue: --accent is the expressive one (the active tab, the user's turn, the
+   live label) and is rUI's primary, Source Yellow; --action is what buttons
+   are, rUI's accent. --js keeps the JS sandbox's own colour, rUI's info. */
+:root{--bg:var(--layer-canvas);--panel:var(--layer-panel);--sunk:var(--layer-canvas-muted);
+--line:var(--line-muted);--hairline:var(--line-hairline);--ink:var(--foreground);
+--strong:var(--foreground-strong);--dim:var(--foreground-hint);--faint:var(--foreground-placeholder);
+--accent:var(--primary-strong);--action:var(--accent-strong);--action-ink:var(--foreground-inverse);
+--model:var(--accent-strong);--js:var(--info-strong);--js-soft:var(--info-muted);
+--warn:var(--warning-strong);--ok:var(--success-strong);--bad:var(--danger-strong);color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
-font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+font:14px/1.55 var(--mono-font)}
 header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
 gap:14px;align-items:baseline;flex-wrap:wrap}
 h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.01em}
 h1.brand{display:flex;align-items:center;color:var(--ink)}
 h1.brand svg{height:20px;width:auto;display:block}
-h1.brand .bar{fill:var(--warn);stroke:var(--warn)}
+h1.brand .bar{fill:var(--primary-strong);stroke:var(--primary-strong)}
 header .sub{color:var(--dim);font-size:12px}
 main{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(320px,1fr);
 gap:16px;padding:16px 20px;align-items:start}
@@ -76,9 +86,9 @@ color:var(--dim);text-transform:uppercase;letter-spacing:.09em;font-weight:600}
 .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 .msg{white-space:pre-wrap;word-break:break-word;margin-top:3px}
 form{display:flex;gap:8px;padding:13px;border-top:1px solid var(--line)}
-input[type=text],input[type=password]{flex:1;background:#0c0e12;border:1px solid var(--line);
+input[type=text],input[type=password]{flex:1;background:var(--sunk);border:1px solid var(--line);
 color:var(--ink);padding:9px 11px;border-radius:6px;font:inherit}
-button{background:var(--accent);border:0;color:#0c0e12;padding:9px 15px;
+button{background:var(--action);border:0;color:var(--action-ink);padding:9px 15px;
 border-radius:6px;font:inherit;font-weight:600;cursor:pointer}
 button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
 button.bad{background:var(--bad)}
@@ -91,7 +101,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .cred .when{color:var(--dim)}
 .cred form{display:flex;flex-direction:column;gap:7px;padding:6px 0 0;border:0}
 .cred label{display:flex;flex-direction:column;gap:3px;color:var(--dim)}
-.cred label i{color:#5c6472;font-style:normal}
+.cred label i{color:var(--faint);font-style:normal}
 .cred .row{display:flex;gap:8px;align-items:center}
 .cred .err{color:var(--bad)}
 .cred details{margin-top:4px}
@@ -99,7 +109,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .cred form.inline{flex-direction:row;padding:0}
 .card{border:1px solid var(--warn);border-radius:7px;padding:11px;margin-bottom:11px}
 .card .tool{color:var(--warn);font-weight:600}
-pre{background:#0c0e12;border:1px solid var(--line);border-radius:6px;
+pre{background:var(--sunk);border:1px solid var(--line);border-radius:6px;
 padding:9px;overflow:auto;margin:8px 0;font-size:12px}
 .row{display:flex;gap:8px;margin-top:9px}
 .empty{color:var(--dim);padding:6px 0}
@@ -121,8 +131,8 @@ border:1px solid var(--line);color:var(--dim)}
 .md .h3,.md .h4{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
 .md ul,.md ol{margin:0 0 7px;padding-left:20px}
 .md li{margin:1px 0}
-.md code{background:#0a0c10;border:1px solid var(--line);border-radius:4px;
-padding:0 4px;font-size:12px;color:#9ece6a}
+.md code{background:var(--sunk);border:1px solid var(--line);border-radius:4px;
+padding:0 4px;font-size:12px;color:var(--ok)}
 .md pre{white-space:pre-wrap;word-break:break-word}
 .md pre code{background:0;border:0;padding:0;color:inherit}
 .md table{margin:6px 0 9px}
@@ -130,24 +140,24 @@ padding:0 4px;font-size:12px;color:#9ece6a}
 .md blockquote{margin:6px 0;padding-left:10px;border-left:2px solid var(--line);color:var(--dim)}
 .md hr{border:0;border-top:1px solid var(--line);margin:10px 0}
 .md a{color:var(--accent)}
-.md strong{color:#fff;font-weight:600}
+.md strong{color:var(--strong);font-weight:600}
 /* The model's own reasoning: present, and folded away, because it is context
    for a person debugging rather than part of what the agent said. */
 .think{margin:0 0 7px}
-.think summary{color:#6b7690;font-size:11px;text-transform:uppercase;letter-spacing:.07em}
+.think summary{color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:.07em}
 .think[open] summary{color:var(--dim);margin-bottom:5px}
-.think>.md{border-left:2px solid #2a3142;padding-left:10px;color:#8b95a6;font-size:13px}
+.think>.md{border-left:2px solid var(--line);padding-left:10px;color:var(--dim);font-size:13px}
 
 /* --- debugging console ------------------------------------------------- */
 .tabs{display:flex;gap:2px;padding:0 8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-.tabs a{padding:8px 11px;color:var(--dim);text-decoration:none;font-size:12px;
+.tabs a{padding:8px 8px;color:var(--dim);text-decoration:none;font-size:11.5px;
 border-bottom:2px solid transparent;cursor:pointer}
 .tabs a:hover{color:var(--ink)}
 .tabs a.on{color:var(--accent);border-bottom-color:var(--accent)}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{text-align:left;color:var(--dim);font-weight:600;padding:4px 8px 4px 0;
 border-bottom:1px solid var(--line);text-transform:uppercase;font-size:10px;letter-spacing:.06em}
-td{padding:4px 8px 4px 0;border-bottom:1px solid #1c212a;vertical-align:top;
+td{padding:4px 8px 4px 0;border-bottom:1px solid var(--hairline);vertical-align:top;
 word-break:break-word}
 tr:last-child td{border-bottom:0}
 .num{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
@@ -155,26 +165,26 @@ h3{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em
 margin:16px 0 6px;font-weight:600}
 h3:first-child{margin-top:0}
 /* timeline: one tick per event, placed by time, so a gap looks like a gap */
-.tl{position:relative;height:34px;background:#0c0e12;border:1px solid var(--line);
+.tl{position:relative;height:34px;background:var(--sunk);border:1px solid var(--line);
 border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .tl i{position:absolute;top:4px;width:2px;height:26px;background:var(--dim);border-radius:1px}
-.tl i.model{background:#9d7cd8}.tl i.js{background:var(--accent)}
-.tl i.msg{background:var(--ok)}.tl i.op{background:#3d4657}
+.tl i.model{background:var(--model)}.tl i.js{background:var(--js)}
+.tl i.msg{background:var(--ok)}.tl i.op{background:var(--fill-strong)}
 .tl i.bad{background:var(--bad);width:3px}
-.axis{display:flex;justify-content:space-between;color:#5c6472;font-size:10px}
+.axis{display:flex;justify-content:space-between;color:var(--faint);font-size:10px}
 /* stacked bars for prompt cache and completion, per model call */
 .bars{display:flex;flex-direction:column;gap:3px;margin-top:4px}
 .bar{display:flex;align-items:center;gap:6px;font-size:11px}
-.bar .n{color:#5c6472;width:22px;text-align:right;flex:none}
-.bar .t2{flex:1;display:flex;height:12px;border-radius:3px;overflow:hidden;background:#0c0e12}
-.bar .cached{background:#2d4f6b}.bar .fresh{background:var(--accent)}
-.bar .out{background:#9d7cd8}
+.bar .n{color:var(--faint);width:22px;text-align:right;flex:none}
+.bar .t2{flex:1;display:flex;height:12px;border-radius:3px;overflow:hidden;background:var(--sunk)}
+.bar .cached{background:var(--js-soft)}.bar .fresh{background:var(--js)}
+.bar .out{background:var(--model)}
 .bar .v{color:var(--dim);flex:none;font-variant-numeric:tabular-nums}
 .legend{display:flex;gap:12px;color:var(--dim);font-size:11px;margin-top:6px;flex-wrap:wrap}
 .legend b{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12px}
 .kv div:nth-child(odd){color:var(--dim)}
-.doc{background:#0c0e12;border:1px solid var(--line);border-radius:6px;padding:8px;
+.doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:1100px){.split{grid-template-columns:1fr}}
@@ -201,7 +211,8 @@ export function page(taskId: string, who: string, agentId: string): string {
 <title>antiproton</title>
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
-<style>${CSS}</style></head><body>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
+<style>${RUI_DARK_TOKENS}${CSS}</style></head><body>
 <header>
   <h1 class="brand">${LOCKUP_SVG}</h1>
   <span class="sub">${esc(agentId)} · ${t}</span>
@@ -510,11 +521,11 @@ export function timeline(
   return `<div class="tl">${ticks}</div>
     <div class="axis"><span>0</span><span>${esc(secs(span))}</span></div>
     <div class="legend">
-      <span><b style="background:#9ece6a"></b>message</span>
-      <span><b style="background:#9d7cd8"></b>model</span>
-      <span><b style="background:#7aa2f7"></b>execution</span>
-      <span><b style="background:#3d4657"></b>operation</span>
-      <span><b style="background:#f7768e"></b>failure</span>
+      <span><b style="background:var(--ok)"></b>message</span>
+      <span><b style="background:var(--model)"></b>model</span>
+      <span><b style="background:var(--js)"></b>execution</span>
+      <span><b style="background:var(--fill-strong)"></b>operation</span>
+      <span><b style="background:var(--bad)"></b>failure</span>
     </div>`;
 }
 
@@ -547,9 +558,9 @@ export function tokens(
   }).join("");
   return `<div class="bars">${rows}</div>
     <div class="legend">
-      <span><b style="background:#2d4f6b"></b>cached prompt</span>
-      <span><b style="background:#7aa2f7"></b>fresh prompt</span>
-      <span><b style="background:#9d7cd8"></b>completion</span>
+      <span><b style="background:var(--js-soft)"></b>cached prompt</span>
+      <span><b style="background:var(--js)"></b>fresh prompt</span>
+      <span><b style="background:var(--model)"></b>completion</span>
       <span style="margin-left:auto">${totals.p.toLocaleString()} in · ${totals.c.toLocaleString()} out ·
         ${totals.p ? Math.round(totals.cached / totals.p * 100) : 0}% cached overall</span>
     </div>`;
@@ -713,7 +724,7 @@ export function runtimePanel(d: any): string {
 <div class="bars">
   ${bar("billed inside the object", active, "var(--warn)")}
   ${bar("waited outside it", outside, "var(--ok)")}
-  ${prov ? bar("of which the provider", Number(prov.ms), "#3d4657") : ""}
+  ${prov ? bar("of which the provider", Number(prov.ms), "var(--fill-strong)") : ""}
 </div>
 <div class="hint" style="padding:6px 0">Durable Objects bill wall clock; Workers bill CPU.
   The green bar is the wait that was moved off the meter — if it collapses, the offload
