@@ -10,8 +10,8 @@
  */
 import type { ApprovalRecord } from "../../src/core/types.ts";
 import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
-import { FAVICON_DATA_URI, LOCKUP_SVG } from "./brand.ts";
-import { RUI_DARK_TOKENS } from "./rui-tokens.ts";
+import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_SVG } from "./brand.ts";
+import { RUI_TOKENS } from "./rui-tokens.ts";
 import { md } from "./md.ts";
 
 const esc = (s: unknown) =>
@@ -54,7 +54,7 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;margin-top:5px}
 details[open] summary{color:var(--ink)}
 
 /* The console's own names, aliased onto rUI's Elegant dark tokens (the scope
-   itself is RUI_DARK_TOKENS, prepended below). Two roles split what was one
+   itself is RUI_TOKENS, prepended below). Two roles split what was one
    blue: --accent is the expressive one (the active tab, the user's turn, the
    live label) and is rUI's primary, Source Yellow; --action is what buttons
    are, rUI's accent. --js keeps the JS sandbox's own colour, rUI's info. */
@@ -67,16 +67,68 @@ details[open] summary{color:var(--ink)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
 font:14px/1.55 var(--mono-font)}
-header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
-gap:14px;align-items:baseline;flex-wrap:wrap}
-h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.01em}
-h1.brand{display:flex;align-items:center;color:var(--ink)}
-h1.brand svg{height:20px;width:auto;display:block}
-h1.brand .bar{fill:var(--primary-strong);stroke:var(--primary-strong)}
+/* --- the shell: rail · sidebar · main · inspector ------------------------
+   rUI's AppShell, as CSS. Slots own placement only; the panels inside own
+   their surfaces. Which columns exist depends on the section: the inbox is
+   one wide column, a conversation has all four. */
+body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 380px;grid-template-areas:"rail side main insp";
+height:100vh;overflow:hidden}
+body.shell[data-view=inbox],body.shell[data-view=runtime]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
+@media(max-width:1100px){body.shell[data-view=agents]{grid-template-columns:56px 0 minmax(0,1fr) 0}}
+@media(max-width:760px){body.shell{grid-template-columns:56px 0 minmax(0,1fr) 0}}
+.rail{grid-area:rail;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 0;
+background:var(--panel);border-right:1px solid var(--line)}
+.rail-brand{display:block;width:26px;height:27px;color:var(--ink);margin:0 0 14px}
+.rail-brand svg{width:100%;height:100%;display:block}
+.rail-brand .bar{fill:var(--accent);stroke:var(--accent)}
+.rail-item{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;width:52px;padding:7px 0 6px;
+color:var(--dim);text-decoration:none;font-size:9.5px;letter-spacing:.04em;border-radius:8px;border:1px solid transparent}
+.rail-item .ico{width:22px;height:22px;border-radius:6px;border:1.5px solid currentColor;opacity:.7}
+.rail-item:hover{color:var(--ink)}
+.rail-item.on{color:var(--accent);border-color:var(--accent);background:var(--sunk)}
+.rail-item.on .ico{opacity:1}
+.rail-item .count{position:absolute;top:2px;right:6px;min-width:15px;height:15px;padding:0 4px;border-radius:8px;
+background:var(--accent);color:var(--action-ink);font-size:9px;font-weight:600;line-height:15px;text-align:center}
+.rail-foot{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:8px}
+.mode{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:7px;padding:2px}
+.mode button{background:none;border:0;color:var(--dim);font:inherit;font-size:9px;padding:3px 5px;border-radius:5px;cursor:pointer}
+.mode button.on{background:var(--sunk);color:var(--ink)}
+.viewer{width:26px;height:26px;border-radius:50%;background:var(--sunk);border:1px solid var(--line);color:var(--dim);
+font-size:11px;display:flex;align-items:center;justify-content:center;text-transform:uppercase}
+.sidebar{grid-area:side;overflow:auto;background:var(--panel);border-right:1px solid var(--line);min-width:0}
+.sidebar .side-view{display:none;padding:14px 12px}
+.sidebar .side-view.on{display:block}
+.sidebar h3{margin:0 0 2px;font-size:12px;color:var(--ink);text-transform:none;letter-spacing:0}
+.sidebar .sub{color:var(--dim);font-size:11px;margin-bottom:12px}
+.task{display:block;padding:10px 12px;border:1px solid var(--line);border-radius:7px;margin:0 0 8px;color:var(--ink);text-decoration:none}
+.task.on{border-color:var(--accent);background:var(--sunk)}
+.task .id{font-size:12px}
+.task .meta{color:var(--dim);font-size:10.5px;margin-top:3px}
+main.main{grid-area:main;overflow:auto;padding:14px 16px;min-width:0}
+section.view{display:none;flex-direction:column;gap:12px;min-height:100%;background:none;border:0;border-radius:0;overflow:visible}
+.view>.body{background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:none}
+.view.on{display:flex}
+.view-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.view-head h2{border:0;padding:0;font-size:15px;color:var(--ink);text-transform:none;letter-spacing:0;font-weight:600}
+.view-head .sub{color:var(--dim);font-size:11px}
+.view-head .spacer{flex:1}
+.conv{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;
+flex:1;min-height:0}
+.conv .body{flex:1;max-height:none}
+.held{border-top:1px solid var(--line);padding:0 13px}
+.held:empty{display:none}
+.held .card{margin:10px 0}
+.inspector{grid-area:insp;overflow:auto;background:var(--panel);border-left:1px solid var(--line);padding:12px;min-width:0}
+.inspector h3{font-size:12px;color:var(--ink);text-transform:none;letter-spacing:0;margin:2px 0 10px}
+.inspector .sub{color:var(--dim);font-size:10.5px;margin:-6px 0 10px}
+details.insp{border:1px solid var(--line);border-radius:6px;margin:0 0 8px;background:var(--bg)}
+details.insp summary{cursor:pointer;padding:8px 10px;font-size:11.5px;color:var(--dim);list-style:none;display:flex;gap:8px}
+details.insp summary::before{content:"+";width:10px;color:var(--faint)}
+details.insp[open] summary{color:var(--ink);border-bottom:1px solid var(--line)}
+details.insp[open] summary::before{content:"\\2013"}
+details.insp .body{max-height:52vh;padding:10px}
 header .sub{color:var(--dim);font-size:12px}
-main{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(320px,1fr);
-gap:16px;padding:16px 20px;align-items:start}
-@media(max-width:900px){main{grid-template-columns:1fr}}
 section{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 h2{font-size:12px;margin:0;padding:9px 13px;border-bottom:1px solid var(--line);
 color:var(--dim);text-transform:uppercase;letter-spacing:.09em;font-weight:600}
@@ -149,11 +201,6 @@ padding:0 4px;font-size:12px;color:var(--ok)}
 .think>.md{border-left:2px solid var(--line);padding-left:10px;color:var(--dim);font-size:13px}
 
 /* --- debugging console ------------------------------------------------- */
-.tabs{display:flex;gap:2px;padding:0 8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-.tabs a{padding:8px 8px;color:var(--dim);text-decoration:none;font-size:11.5px;
-border-bottom:2px solid transparent;cursor:pointer}
-.tabs a:hover{color:var(--ink)}
-.tabs a.on{color:var(--accent);border-bottom-color:var(--accent)}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{text-align:left;color:var(--dim);font-weight:600;padding:4px 8px 4px 0;
 border-bottom:1px solid var(--line);text-transform:uppercase;font-size:10px;letter-spacing:.06em}
@@ -186,93 +233,159 @@ border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
-.split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:1100px){.split{grid-template-columns:1fr}}
 `;
 
 /**
- * A debugging console, not a demo page.
+ * The console, as a product rather than a debugging page.
  *
- * The chat is one panel among several because talking to the agent is the least
- * interesting thing you can do to it while working on the runtime. What is hard
- * to see from outside — what the object is holding, which commands are still
- * out, what the agent believes, where the time went — gets the other half of
- * the screen, and every panel is a plain GET that renders the store directly.
+ * Four sections on a rail. The inbox is home: every call the gateway is
+ * holding for this viewer, the request verbatim, and the two buttons that
+ * settle it — that flow is what antiproton is, so it is the first thing seen.
+ * A conversation shows the transcript with any held call above the composer;
+ * beside it the inspector opens what is hard to see from outside — the
+ * trajectory, the raw events, what the object is holding, where the time
+ * went — one section at a time. Plugins and runtime are their own sections.
+ * Every panel is still a plain GET that renders the store directly; the
+ * shell keeps only which section is showing and which mode the viewer chose.
  */
 export function page(taskId: string, who: string, agentId: string): string {
   const t = esc(taskId);
-  const tab = (id: string, label: string, path: string) =>
-    `<a id="tab-${id}" class="${id === "trajectory" ? "on" : ""}"
-        hx-get="${path}?taskId=${t}" hx-target="#panel" hx-swap="innerHTML"
-        hx-on::after-request="document.querySelectorAll('.tabs a').forEach(e=>e.classList.remove('on'));this.classList.add('on');window.__panel='${path}'"
-      >${label}</a>`;
-  return `<!doctype html><html><head><meta charset="utf-8">
+  const initial = (who || "?").trim().slice(0, 1);
+  // A lazily loaded, polled fragment: loads when its view or section is shown,
+  // then re-reads the store every few seconds while it stays shown. The
+  // condition is evaluated by htmx against the element, so a hidden view
+  // costs nothing.
+  const lazy = (id: string, path: string, every: string, cond: string) =>
+    `<div class="body" id="${id}" data-lazy hx-get="${path}" hx-swap="innerHTML"
+          hx-trigger="ap:show, every ${every}[${cond}]">loading…</div>`;
+  const inView = "this.closest('.view').classList.contains('on')";
+  const inOpen = "this.closest('details').open";
+  const insp = (name: string, path: string) => `
+    <details class="insp" hx-on:toggle="if(this.open)htmx.trigger(this.querySelector('.body'),'ap:show')">
+      <summary>${name}</summary>
+      ${lazy(`insp-${name}`, path, "3s", inOpen)}
+    </details>`;
+  const rail = (view: string, label: string) =>
+    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico"></span><span>${label}</span></a>`;
+  return `<!doctype html><html lang="en" data-theme="elegant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>antiproton</title>
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
+<script>(function(){try{var m=localStorage.getItem('ap-mode')||'dark';if(m==='light'||m==='dark')document.documentElement.classList.add(m)}catch(e){}})()</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
-<style>${RUI_DARK_TOKENS}${CSS}</style></head><body>
-<header>
-  <h1 class="brand">${LOCKUP_SVG}</h1>
-  <span class="sub">${esc(agentId)} · ${t}</span>
-  <span class="sub" style="margin-left:auto">${esc(who)}</span>
-</header>
-<main>
-  <section>
-    <h2>interaction</h2>
-    <div class="body" id="transcript" style="max-height:52vh"
-         hx-get="/ui/chat?taskId=${t}"
-         hx-trigger="load, every 2s" hx-swap="innerHTML"
-         hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
-         onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
-         >loading…</div>
-    <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML"
-          hx-on::after-request="this.reset()">
-      <input type="hidden" name="taskId" value="${t}">
-      <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
-      <button type="submit" name="mode" value="steer">send</button>
-      <button type="submit" name="mode" value="followUp" class="ghost"
-              title="Held back until the agent has finished everything it is doing">after</button>
-    </form>
-    <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding-top:0">
-      <input type="hidden" name="taskId" value="${t}">
-      <button type="submit" class="ghost"
-              title="Summarise the older part of this conversation now, keeping the recent part">compact now</button>
-    </form>
-    <div class="hint">Sending while it works steers it: the message reaches the model
-      before its next call, and nothing in flight is stopped. <b>after</b> holds the message
-      until it has finished.</div>
-    <h2 style="border-top:1px solid var(--line)">awaiting approval</h2>
-    <div class="body" id="approvals" style="max-height:22vh"
-         hx-get="/ui/approvals?taskId=${t}"
-         hx-trigger="load, every 2s" hx-swap="innerHTML">loading…</div>
-  </section>
-  <section>
-    <div class="tabs">
-      ${tab("trajectory", "trajectory", "/ui/transcript")}
-      ${tab("plugins", "plugins", "/ui/plugins")}
-      ${tab("events", "events", "/ui/events")}
-      ${tab("storage", "storage", "/ui/storage")}
-      ${tab("memory", "memory", "/ui/memory")}
-      ${tab("sandbox", "sandbox", "/ui/sandbox")}
-      ${tab("runtime", "runtime", "/ui/runtime")}
+<style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}">
+<nav class="rail" aria-label="sections">
+  <a class="rail-brand" href="/ui" title="antiproton">${MARK_SVG}</a>
+  ${rail("inbox", "inbox").replace('<span class="ico"></span>', '<span class="ico"></span><b class="count" id="inbox-count" hidden></b>')}
+  ${rail("agents", "agents")}
+  ${rail("plugins", "plugins")}
+  ${rail("runtime", "runtime")}
+  <a class="rail-item" href="https://report.botiverse.dev/" target="_blank" rel="noopener"><span class="ico"></span><span>report</span></a>
+  <div class="rail-foot">
+    <div class="mode" role="group" aria-label="theme">
+      <button type="button" data-mode="light" onclick="ap.mode('light')">light</button>
+      <button type="button" data-mode="dark" onclick="ap.mode('dark')">dark</button>
+      <button type="button" data-mode="system" onclick="ap.mode('system')">auto</button>
     </div>
-    <div class="body" id="panel" style="max-height:78vh"
-         hx-get="/ui/transcript?taskId=${t}"
-         hx-trigger="load, every 3s[window.__panel===undefined||window.__panel==='/ui/transcript']"
-         hx-swap="innerHTML">loading…</div>
-    <div class="hint">Panels re-read the object on every request; nothing is cached
-      client-side, so what you see is what the store holds.</div>
+    <span class="viewer" title="${esc(who)}">${esc(initial)}</span>
+  </div>
+</nav>
+<aside class="sidebar" id="sidebar">
+  <div class="side-view" data-for="agents">
+    <h3>${esc(agentId)}</h3>
+    <div class="sub">1 agent · 1 task</div>
+    <a class="task on" href="/ui?view=agents&taskId=${t}"><div class="id">${t}</div><div class="meta">this conversation</div></a>
+  </div>
+  <div class="side-view" data-for="plugins">
+    <h3>mounts</h3>
+    <div class="sub">this agent's authorities; the list moves here next</div>
+  </div>
+</aside>
+<main class="main" id="main">
+  <section class="view" data-view="inbox">
+    <div class="view-head"><h2>Inbox</h2><span class="sub">calls held by the gateway, waiting for your signature</span></div>
+    ${lazy("inbox", "/ui/approvals", "3s", inView)}
+  </section>
+  <section class="view" data-view="agents">
+    <div class="view-head"><h2>${t}</h2><span class="sub">${esc(agentId)}</span><span class="spacer"></span>
+      <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
+        <input type="hidden" name="taskId" value="${t}">
+        <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
+      </form></div>
+    <div class="conv">
+      <div class="body" id="transcript" data-lazy
+           hx-get="/ui/chat?taskId=${t}" hx-swap="innerHTML"
+           hx-trigger="ap:show, every 2s[${inView}]"
+           hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
+           onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
+           >loading…</div>
+      <div class="held" id="approvals" data-lazy hx-get="/ui/approvals?taskId=${t}" hx-swap="innerHTML"
+           hx-trigger="ap:show, every 2s[${inView}]"></div>
+      <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-on::after-request="this.reset()">
+        <input type="hidden" name="taskId" value="${t}">
+        <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
+        <button type="submit" name="mode" value="steer">send</button>
+        <button type="submit" name="mode" value="followUp" class="ghost"
+                title="Held back until the agent has finished everything it is doing">after</button>
+      </form>
+    </div>
+    <div class="hint" style="padding:0">Sending while it works steers it: the message reaches the model before its next call.
+      <b>after</b> holds the message until it has finished. A held call shows above the composer until you sign it.</div>
+  </section>
+  <section class="view" data-view="plugins">
+    <div class="view-head"><h2>Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
+    ${lazy("plugins", "/ui/plugins", "3s", inView)}
+  </section>
+  <section class="view" data-view="runtime">
+    <div class="view-head"><h2>Runtime</h2><span class="sub">what the object is billed for, and what it is holding</span></div>
+    ${lazy("runtime", "/ui/runtime", "3s", inView)}
+    ${lazy("sandbox", "/ui/sandbox", "3s", inView)}
+    ${lazy("storage", "/ui/storage", "3s", inView)}
   </section>
 </main>
+<aside class="inspector" id="inspector">
+  <h3>inspector</h3>
+  <div class="sub">what happened, and what the object holds. Each section re-reads the store while it is open.</div>
+  ${insp("trajectory", `/ui/transcript?taskId=${t}`)}
+  ${insp("events", `/ui/events?taskId=${t}`)}
+  ${insp("storage", `/ui/storage?taskId=${t}`)}
+  ${insp("memory", `/ui/memory?taskId=${t}`)}
+  ${insp("sandbox", `/ui/sandbox?taskId=${t}`)}
+  ${insp("runtime", `/ui/runtime?taskId=${t}`)}
+</aside>
+<div hidden id="inbox-poll" hx-get="/ui/approvals" hx-swap="innerHTML" hx-trigger="load, every 5s"
+     hx-on::after-swap="ap.count(this)"></div>
 <script>
-  // Keep whichever panel is open refreshing, rather than snapping back.
-  setInterval(() => {
-    const p = window.__panel; if (!p) return;
-    htmx.ajax('GET', p + '?taskId=${t}', { target: '#panel', swap: 'innerHTML' });
-  }, 3000);
-
+  // The shell's own state: which section is showing and which mode the
+  // viewer chose. Both are on the URL or in localStorage, never in the
+  // server; every panel is still a plain GET that reads the store.
+  window.ap = {
+    show(view) {
+      document.body.dataset.view = view;
+      document.querySelectorAll('.rail-item[data-view]').forEach(a => a.classList.toggle('on', a.dataset.view === view));
+      document.querySelectorAll('.view').forEach(v => v.classList.toggle('on', v.dataset.view === view));
+      document.querySelectorAll('.side-view').forEach(v => v.classList.toggle('on', v.dataset.for === view));
+      const u = new URL(location.href); u.searchParams.set('view', view); history.replaceState(null, '', u);
+      const on = document.querySelector('.view.on'); if (on) on.querySelectorAll('[data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
+    },
+    count(el) {
+      const n = el.querySelectorAll('.card').length, b = document.getElementById('inbox-count');
+      b.textContent = String(n); b.hidden = n === 0;
+    },
+    mode(m) {
+      const h = document.documentElement; h.classList.remove('light', 'dark');
+      if (m === 'light' || m === 'dark') h.classList.add(m);
+      try { localStorage.setItem('ap-mode', m); } catch (e) {}
+      document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+    },
+  };
+  (function () {
+    let m = 'dark'; try { m = localStorage.getItem('ap-mode') || 'dark'; } catch (e) {}
+    document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+    const v = new URL(location.href).searchParams.get('view');
+    ap.show(['inbox', 'agents', 'plugins', 'runtime'].includes(v) ? v : 'inbox');
+  })();
   // Poll without re-rendering. Each panel remembers the version it last drew;
   // the server answers 304 when nothing has moved, and htmx leaves the DOM
   // alone. Without this a long conversation re-parses megabytes every few
