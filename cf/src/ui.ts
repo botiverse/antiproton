@@ -830,8 +830,12 @@ export function trajectory(
       // A held call surfaces here as a pending result; show it as the gate it is.
       const heldText = typeof body === "string" ? body : JSON.stringify(body ?? "");
       const held = heldText.includes("awaiting_approval");
+      // Two reasons a call waits: a policy stopped it, or the agent asked
+      // for a word first (confirm: true, recorded as heldBy "agent"). Say which.
+      const heldRec = approvalsByOp[String(p.operationId ?? "")];
+      const heldWhy = heldRec?.request?.heldBy === "agent" ? "the agent asked you to confirm" : "held for approval";
       out.push(`<div class="step ${held ? "held" : bad ? "fail" : "run"}">
-        <div class="lbl">${esc(label)} ${rel}${held ? ` <span class="badge warn">held for approval</span>` : ""}</div>
+        <div class="lbl">${esc(label)} ${rel}${held ? ` <span class="badge warn">${heldWhy}</span>` : ""}</div>
         ${p.source
           ? `<details><summary>what ran</summary><pre class="code">${esc(String(p.source))}</pre></details>`
           : ""}
@@ -877,7 +881,7 @@ export function approvals(rows: ApprovalRecord[]): string {
     ? pending.map((a) => {
         const req = a.request as any;
         return `<div class="card">
-  <div><span class="tool">${esc(a.mountAlias)}.${esc(a.tool)}</span></div>
+  <div><span class="tool">${esc(a.mountAlias)}.${esc(a.tool)}</span>${req?.heldBy === "agent" ? ` <span class="badge warn">the agent asked you to confirm</span>` : ""}</div>
   <pre>${esc(JSON.stringify(req?.args ?? {}, null, 2))}</pre>
   <div class="row">
     <button hx-post="/ui/decide" hx-target="#approvals" hx-swap="innerHTML"
@@ -1263,7 +1267,7 @@ export function inbox(d: any): string {
     const req = a.args ?? {};
     return `<div class="card inbox-card">
   <div class="inbox-head"><span class="tool">${esc(a.tool)}</span>
-    <span class="meta">${esc(a.agentId ?? "")}${a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
+    <span class="meta">${esc(a.agentId ?? "")}${a.heldBy === "the agent" ? " · the agent asked you to confirm" : a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
   <div class="k">the request, verbatim</div>
   <pre>${esc(JSON.stringify(req, null, 2))}</pre>
   <div class="row">
