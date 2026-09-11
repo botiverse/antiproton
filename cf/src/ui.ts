@@ -783,10 +783,15 @@ export function trajectory(
   return out.join("");
 }
 
+/**
+ * The calls held in this conversation, waiting for a signature. Only those:
+ * a decided call leaves the panel with the decision (task #7), since the
+ * panel is for what needs the person now. The history of decisions is in
+ * the trajectory and the events tab, where a record belongs.
+ */
 export function approvals(rows: ApprovalRecord[]): string {
   const pending = rows.filter((r) => r.state === "pending");
-  const decided = rows.filter((r) => r.state !== "pending").slice(-4);
-  const head = pending.length
+  return pending.length
     ? pending.map((a) => {
         const req = a.request as any;
         return `<div class="card">
@@ -801,13 +806,6 @@ export function approvals(rows: ApprovalRecord[]): string {
 </div>`;
       }).join("")
     : `<div class="empty">nothing waiting. Ask the agent to change something.</div>`;
-  const tail = decided.length
-    ? `<div class="k" style="margin-top:12px">decided</div>` +
-      decided.map((a) => `<div class="ev"><div class="msg">
-        <span class="tag ${a.state === "approved" ? "ok" : "bad"}">${esc(a.state)}</span>
-        ${esc(a.mountAlias)}.${esc(a.tool)} — ${esc(a.approver ?? "")}</div></div>`).join("")
-    : "";
-  return head + tail;
 }
 
 // ---------------------------------------------------------------- console

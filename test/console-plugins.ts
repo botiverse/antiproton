@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -299,6 +299,19 @@ check("the plugins panel's poll waits while a person is typing in it", () => {
   // clicks away to check the token, and comes back must still find it.
   must(/el\.value/.test(fn), "ap.editing also looks at a non-empty value, not only focus");
   must(/type !== 'hidden'/.test(fn), "the hidden alias field does not count as typing");
+});
+
+// task #7: a decided call leaves the approvals panel; only pending ones show.
+check("the approvals panel shows pending calls only; decided ones are gone", () => {
+  const rows: any[] = [
+    { operationId: "op-1", mountAlias: "gh", tool: "issues.create", state: "pending", request: { args: { title: "x" } } },
+    { operationId: "op-0", mountAlias: "gh", tool: "issues.list", state: "approved", approver: "someone", request: { args: {} } },
+    { operationId: "op-9", mountAlias: "node", tool: "exec", state: "denied", approver: "someone", request: { args: {} } },
+  ];
+  const html = approvals(rows);
+  must(count(html, /class="card"/g) === 1 && html.includes("op-1"), "the pending call is the only card");
+  must(!/>decided<|class="tag ok"|class="tag bad"|op-0|op-9/.test(html), "no decided call, no decided heading");
+  must(/nothing waiting/.test(approvals(rows.slice(1))), "with nothing pending the panel says so, and lists nothing");
 });
 
 const failed = results.filter((r) => !r.ok);
