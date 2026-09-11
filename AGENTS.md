@@ -32,7 +32,11 @@ which has already happened once. Three files in `test/` are not part of that set
 and are meant to be skipped unless you have the services: `appworld` needs both
 AppWorld servers running locally
 (`appworld serve apis --port 8800`, `environment --port 8799`), and `live-e2e`
-and `live-github` reach out to live endpoints.
+and `live-github` reach out to live endpoints. **A skipped suite still rots.** One
+of these called a tool name the plugin no longer answered, and nothing said so,
+because a file that exists and is named for the right thing reads as coverage
+whether or not it runs. Run them when you have the services, and treat "it is in
+`test/`" as a fact about the directory rather than about the code.
 
 Two ways this goes wrong, both of which produce an error that points at the code
 rather than at the setup:
