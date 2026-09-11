@@ -1,36 +1,73 @@
 /**
- * rUI's Elegant tokens, inlined for the console.
+ * rUI's tokens, inlined for the console: all three themes.
  *
  * The console is one Worker serving HTML from strings, so it cannot link a
- * stylesheet file; the token scopes are a string here instead. They are the
- * Elegant family's scopes of raft-ui 0.5.11's dist/styles.css, copied
- * verbatim (light, the explicit .light and .dark classes, and the
- * prefers-color-scheme fallback), plus the ramp values and the solid state
- * colours those scopes reference, which the package defines in the Brutal
- * scope and the theme block, and the Elegant font names. The page puts
- * data-theme="elegant" on <html> and a .light or .dark class from the
- * viewer's stored choice; with neither, the system decides. Re-copy from the
- * package on upgrade rather than editing here.
+ * stylesheet file; the token scopes are a string here instead. They are
+ * copied verbatim from raft-ui 0.5.11's dist/styles.css: the Brutal scope,
+ * and the Elegant family's scopes (light, the explicit .light and .dark
+ * classes, and the prefers-color-scheme fallback). Ahead of them sits a
+ * :root block carrying the ramp values the scopes reference from the
+ * package's theme block, the solid state colours, and the shades the
+ * console's own recipes use, so every var() resolves in plain CSS; then the
+ * two families' font names. The page sets data-theme on <html> to "brutal"
+ * or "elegant" and, for elegant, a .light or .dark class, from the viewer's
+ * stored choice among rUI's three themes. Re-copy from the package on
+ * upgrade rather than editing here.
  *
- * The report page carries its own copy of the same blocks in
+ * The report page carries its own copy of the Elegant blocks in
  * report/public/rui-foundation.css. As of #57 the two carried the same values
  * for every name they share; nothing keeps them in step, and the report's
  * copy is Dora's, so a change here is a change to tell her about.
  */
-export const RUI_TOKENS = `[data-theme="elegant"]{
+export const RUI_TOKENS = `:root{
+  --color-black: oklch(0 0 0);
+  --color-brutal-cyan-100: oklch(0.945 0.033 226.27);
+  --color-brutal-cyan-200: oklch(0.892 0.07 224.23);
+  --color-brutal-cyan-400: oklch(0.783 0.135 219.2);
+  --color-brutal-cyan-800: oklch(0.348 0.06 219.02);
+  --color-brutal-pink-100: oklch(0.936 0.034 2.02);
+  --color-brutal-pink-200: oklch(0.871 0.073 0.34);
+  --color-brutal-pink-300: oklch(0.808 0.116 0.76);
+  --color-brutal-pink-400: oklch(0.749 0.162 0.71);
+  --color-brutal-pink-50: oklch(0.968 0.017 359.4);
+  --color-brutal-pink-500: oklch(0.662 0.244 0.59);
+  --color-brutal-pink-600: oklch(0.565 0.226 0.56);
+  --color-brutal-pink-700: oklch(0.456 0.182 0.91);
+  --color-brutal-pink-800: oklch(0.354 0.142 0.38);
+  --color-brutal-pink-900: oklch(0.246 0.098 0.96);
+  --color-brutal-pink-950: oklch(0.198 0.08 359.99);
+  --color-brutal-red-100: oklch(0.926 0.034 20.05);
+  --color-brutal-red-200: oklch(0.854 0.072 22.92);
+  --color-brutal-red-800: oklch(0.331 0.11 33.1);
+  --color-brutal-stone-100: oklch(0.947 0.003 67.83);
+  --color-brutal-stone-200: oklch(0.896 0.008 73.73);
+  --color-brutal-stone-300: oklch(0.845 0.014 71.31);
+  --color-brutal-stone-400: oklch(0.789 0.014 71.29);
+  --color-brutal-stone-50: oklch(0.974 0.002 67.9);
+  --color-brutal-stone-500: oklch(0.682 0.012 76.55);
+  --color-brutal-stone-600: oklch(0.569 0.01 67.63);
+  --color-brutal-stone-700: oklch(0.466 0.008 67.63);
+  --color-brutal-stone-800: oklch(0.354 0.007 67.62);
+  --color-brutal-stone-900: oklch(0.249 0.005 67.61);
+  --color-brutal-stone-950: oklch(0.187 0.003 67.68);
+  --color-brutal-yellow-100: oklch(0.975 0.027 85.64);
+  --color-brutal-yellow-200: oklch(0.94 0.066 86.23);
+  --color-brutal-yellow-300: oklch(0.913 0.103 88.02);
   --color-brutal-yellow-400: oklch(0.883 0.162 91.89);
+  --color-brutal-yellow-50: oklch(0.984 0.017 84.56);
+  --color-brutal-yellow-500: oklch(0.759 0.155 92.93);
+  --color-brutal-yellow-600: oklch(0.637 0.13 92.64);
+  --color-brutal-yellow-700: oklch(0.508 0.104 92.9);
+  --color-brutal-yellow-800: oklch(0.388 0.08 93.41);
+  --color-brutal-yellow-900: oklch(0.26 0.053 92.86);
+  --color-brutal-yellow-950: oklch(0.199 0.041 93.21);
   --primary-400: var(--color-brutal-yellow-400);
   --primary: var(--primary-400);
-  --color-brutal-pink-400: oklch(0.749 0.162 0.71);
+  --primary-950: var(--color-brutal-yellow-950);
   --accent-400: var(--color-brutal-pink-400);
   --accent: var(--accent-400);
-  --color-brutal-yellow-950: oklch(0.199 0.041 93.21);
-  --primary-950: var(--color-brutal-yellow-950);
-  --color-brutal-pink-500: oklch(0.662 0.244 0.59);
-  --color-brutal-pink-950: oklch(0.198 0.08 359.99);
   --accent-500: var(--color-brutal-pink-500);
   --accent-950: var(--color-brutal-pink-950);
-  --color-brutal-cyan-400: oklch(0.783 0.135 219.2);
   --info: var(--color-brutal-cyan-400);
   --success: oklch(0.714 0.176 153.079);
   --success-foreground: oklch(1 0 0);
@@ -38,9 +75,166 @@ export const RUI_TOKENS = `[data-theme="elegant"]{
   --warning-foreground: oklch(1 0 0);
   --danger: oklch(0.616 0.249 26.758);
   --danger-foreground: oklch(1 0 0);
+}
+[data-theme="brutal"]{
+  --heading-font: "Hanken Grotesk", system-ui, sans-serif;
+  --sans-font: "Hanken Grotesk", system-ui, sans-serif;
+  --mono-font: "Geist Mono", ui-monospace, monospace;
+}
+[data-theme="elegant"]{
   --heading-font: "Inter", system-ui, sans-serif;
   --sans-font: "Geist", system-ui, sans-serif;
   --mono-font: "Geist Mono", ui-monospace, monospace;
+}
+[data-theme="brutal"] {
+  --foreground: oklch(0.18 0.006 25);
+  --foreground-strong: oklch(0.18 0.006 25);
+  --foreground-muted: oklch(0.18 0.006 25 / 0.6);
+  --foreground-hint: oklch(0.48 0 0);
+  --foreground-icon: oklch(0.18 0.006 25 / 0.68);
+  --foreground-placeholder: oklch(0.18 0.006 25 / 0.5);
+  --foreground-disabled: oklch(0.18 0.006 25 / 0.3);
+  --foreground-inverse: oklch(1 0 0);
+  --foreground-active: oklch(0.38 0.006 106.42);
+  --foreground-hover: oklch(0.42 0.006 106.42);
+
+  --layer-canvas: oklch(1 0 0);
+  --layer-canvas-muted: oklch(1 0 0);
+  --layer-panel: oklch(1 0 0);
+  --layer-popover: oklch(1 0 0);
+  --layer-backdrop: oklch(0 0 0 / 0.65);
+  /* inset = recessed zone inside a surface (code blocks, dialog header/footer
+     bands, attachment wells); card = bordered embed sitting on a surface
+     (message embeds, reply/quote previews). */
+  --layer-inset: oklch(0.99 0.002 84.559);
+  --layer-card: oklch(0.985 0.003 84.559);
+  --layer-hud: oklch(0.263 0.009 294.9);
+  --layer-hud-foreground: oklch(0.965 0.002 286);
+
+  /* The fills are the old brutal alpha washes flattened over white
+     (gamma-space, pixel-identical on white). */
+  --fill-muted: oklch(0.9645 0.0002 25);
+  --fill-strong: oklch(0.9389 0 0);
+
+  --line-strong: oklch(0.18 0.006 25);
+  --line: oklch(0.18 0.006 25);
+  --line-muted: oklch(0.18 0.006 25 / 0.3);
+  --line-hairline: oklch(0.18 0.006 25 / 0.15);
+
+  /* Field-scoped tokens shared by input, input-group, and textarea. */
+  --line-field: var(--ink-8);
+  --line-field-hover: var(--ink-10);
+
+  /* Ink overlay ramp — step suffix = alpha %. For fills, hairlines, hover/active washes. */
+  --ink: oklch(0 0 0);
+  --ink-2: oklch(0 0 0 / 0.02);
+  --ink-4: oklch(0 0 0 / 0.04);
+  --ink-6: oklch(0 0 0 / 0.06);
+  --ink-8: oklch(0 0 0 / 0.08);
+  --ink-10: oklch(0 0 0 / 0.1);
+  --ink-16: oklch(0 0 0 / 0.16);
+  --ink-20: oklch(0 0 0 / 0.2);
+  --ink-30: oklch(0 0 0 / 0.3);
+  --ink-40: oklch(0 0 0 / 0.4);
+
+  --primary-50: var(--color-brutal-yellow-50);
+  --primary-100: var(--color-brutal-yellow-100);
+  --primary-200: var(--color-brutal-yellow-200);
+  --primary-300: var(--color-brutal-yellow-300);
+  --primary-400: var(--color-brutal-yellow-400);
+  --primary-500: var(--color-brutal-yellow-500);
+  --primary-600: var(--color-brutal-yellow-600);
+  --primary-700: var(--color-brutal-yellow-700);
+  --primary-800: var(--color-brutal-yellow-800);
+  --primary-900: var(--color-brutal-yellow-900);
+  --primary-950: var(--color-brutal-yellow-950);
+
+  --accent-50: var(--color-brutal-pink-50);
+  --accent-100: var(--color-brutal-pink-100);
+  --accent-200: var(--color-brutal-pink-200);
+  --accent-300: var(--color-brutal-pink-300);
+  --accent-400: var(--color-brutal-pink-400);
+  --accent-500: var(--color-brutal-pink-500);
+  --accent-600: var(--color-brutal-pink-600);
+  --accent-700: var(--color-brutal-pink-700);
+  --accent-800: var(--color-brutal-pink-800);
+  --accent-900: var(--color-brutal-pink-900);
+  --accent-950: var(--color-brutal-pink-950);
+
+  --secondary-50: var(--color-brutal-stone-50);
+  --secondary-100: var(--color-brutal-stone-100);
+  --secondary-200: var(--color-brutal-stone-200);
+  --secondary-300: var(--color-brutal-stone-300);
+  --secondary-400: var(--color-brutal-stone-400);
+  --secondary-500: var(--color-brutal-stone-500);
+  --secondary-600: var(--color-brutal-stone-600);
+  --secondary-700: var(--color-brutal-stone-700);
+  --secondary-800: var(--color-brutal-stone-800);
+  --secondary-900: var(--color-brutal-stone-900);
+  --secondary-950: var(--color-brutal-stone-950);
+
+  /* State families — brutal-parity slot values. Solids and -foreground are
+     theme-invariant; each theme re-tunes the ladder steps. */
+  --info: var(--color-brutal-cyan-400);
+  --info-strong: var(--color-brutal-cyan-800);
+  --info-muted: var(--color-brutal-cyan-200);
+  --info-soft: var(--color-brutal-cyan-100);
+
+  --success: oklch(0.714 0.176 153.079);
+  --success-foreground: oklch(1 0 0);
+  --success-strong: oklch(0.366 0.09 153.079);
+  --success-muted: oklch(0.91 0.149 153.079);
+  --success-soft: oklch(0.949 0.079 153.079);
+
+  --warning: oklch(0.7 0.202 44.441);
+  --warning-foreground: oklch(1 0 0);
+  --warning-strong: oklch(0.366 0.106 44.441);
+  --warning-muted: oklch(0.91 0.05 44.441);
+  --warning-soft: oklch(0.949 0.027 44.441);
+
+  --danger: oklch(0.616 0.249 26.758);
+  --danger-foreground: oklch(1 0 0);
+  --danger-strong: var(--color-brutal-red-800);
+  --danger-muted: var(--color-brutal-red-200);
+  --danger-soft: var(--color-brutal-red-100);
+
+  --inactive: oklch(0.573 0 0);
+  --inactive-foreground: oklch(0.946 0 0);
+
+  /* Brand ladder steps + the shared primary ring edge. */
+  --primary-strong: oklch(0.44 0.09 91.39);
+  --primary-soft: oklch(0.955 0.067 93.62);
+  --primary-edge: oklch(0.83 0.14 91.89 / 0.7);
+  --primary-glow: oklch(0.85 0.162 91.89);
+  --accent-strong: oklch(0.543 0.215 359.77);
+  --accent-soft: oklch(0.914 0.048 358.59);
+
+  /* Interaction axis — resting color ⊕ ink, resolves per-theme at use point.
+     Families opt in as components need them; an opted-in family always gets the full hover/active pair. */
+  --primary-hover: color-mix(in srgb-linear, var(--primary-400) 92%, var(--ink));
+  --primary-active: color-mix(in srgb-linear, var(--primary-400) 84%, var(--ink));
+  --accent-hover: color-mix(in srgb-linear, var(--accent-400) 92%, var(--ink));
+  --accent-active: color-mix(in srgb-linear, var(--accent-400) 84%, var(--ink));
+  --info-hover: color-mix(in srgb-linear, var(--info) 84%, var(--ink));
+  --info-active: color-mix(in srgb-linear, var(--info) 76%, var(--ink));
+  --warning-hover: color-mix(in srgb-linear, var(--warning) 84%, var(--ink));
+  --warning-active: color-mix(in srgb-linear, var(--warning) 76%, var(--ink));
+  --danger-hover: color-mix(in srgb-linear, var(--danger) 84%, var(--ink));
+  --danger-active: color-mix(in srgb-linear, var(--danger) 76%, var(--ink));
+
+  --theme-shadow-xs: 1px 1px 0px var(--line-strong);
+  --theme-shadow-sm: 2px 2px 0px var(--line-strong);
+  --theme-shadow-md: 4px 4px 0px var(--line-strong);
+  --theme-shadow-lg: 4px 4px 0px var(--color-black);
+  --theme-shadow-xl: 6px 6px 0px var(--line-strong);
+  /* Field metrics — see the Field metric axis note in @theme inline. */
+  --field-font-size: 16px;
+  --field-font-weight: 400;
+  --field-line-height: 24px;
+  /* Card-title metrics — see the Card-title metric axis note in @theme inline. */
+  --card-title-font-size: 18px;
+  --card-title-font-weight: 700;
+  --card-title-line-height: 20px;
 }
 [data-theme="elegant"] {
   --foreground: oklch(0.21 0.006 106.42);

@@ -269,6 +269,33 @@ border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
+/* --- Brutal: square corners, two-pixel line-strong borders, hard offset
+   shadows, the family's own recipe. Elegant keeps the rounded, shadowed
+   treatment above. Applied by attribute so switching themes changes shape
+   as well as colour, which is what makes them two themes and not two
+   palettes. */
+[data-theme="brutal"] button,[data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password],
+[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,
+[data-theme="brutal"] .view>.body,[data-theme="brutal"] .task,[data-theme="brutal"] .mount-link,[data-theme="brutal"] details.insp,
+[data-theme="brutal"] .banner,[data-theme="brutal"] .rail-item,[data-theme="brutal"] .mode,[data-theme="brutal"] pre,
+[data-theme="brutal"] .badge,[data-theme="brutal"] .tag,[data-theme="brutal"] .inbox-card{border-radius:0}
+[data-theme="brutal"] button{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-sm)}
+[data-theme="brutal"] button:hover{box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] button.ghost{border-color:var(--line-strong);box-shadow:none}
+[data-theme="brutal"] button:disabled{box-shadow:none}
+[data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password]{border:2px solid var(--line-strong);background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
+[data-theme="brutal"] input[type=text]:focus,[data-theme="brutal"] input[type=password]:focus{box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body,[data-theme="brutal"] details.insp,[data-theme="brutal"] .banner{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .card{border-left-width:2px}
+[data-theme="brutal"] .task,[data-theme="brutal"] .mount-link{border:2px solid var(--line-strong)}
+[data-theme="brutal"] .task.on,[data-theme="brutal"] .mount-link.on{background:var(--primary-soft)}
+[data-theme="brutal"] .rail-item.on{border:2px solid var(--line-strong);background:var(--primary-400);color:var(--primary-950);box-shadow:var(--theme-shadow-sm)}
+[data-theme="brutal"] .rail,[data-theme="brutal"] .sidebar,[data-theme="brutal"] .inspector{border-color:var(--line-strong)}
+[data-theme="brutal"] .badge,[data-theme="brutal"] .tag{border:1px solid var(--line-strong)}
+[data-theme="brutal"] .mode{border:2px solid var(--line-strong)}
+[data-theme="brutal"] .mode button{border:0;box-shadow:none}
+[data-theme="brutal"] .mode button.on{background:var(--primary-400);color:var(--primary-950)}
+[data-theme="brutal"] h1.brand .bar,[data-theme="brutal"] .rail-brand .bar{fill:var(--primary-400);stroke:var(--primary-400)}
 .pane-btn{display:none;background:transparent;border:1px solid var(--line);color:var(--dim);box-shadow:none;padding:6px 10px;font-size:11.5px;gap:5px}
 .pane-btn svg,.pane-close svg{width:14px;height:14px}
 .pane-btn.on{color:var(--accent);border-color:var(--accent)}
@@ -331,11 +358,11 @@ export function page(taskId: string, who: string, agentId: string): string {
     </details>`;
   const rail = (view: string, label: string) =>
     `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
-  return `<!doctype html><html lang="en" data-theme="elegant"><head><meta charset="utf-8">
+  return `<!doctype html><html lang="en" data-theme="brutal"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>antiproton</title>
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
-<script>(function(){try{var m=localStorage.getItem('ap-mode')||'dark';if(m==='light'||m==='dark')document.documentElement.classList.add(m)}catch(e){}})()</script>
+<script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
 <style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}">
@@ -348,9 +375,9 @@ export function page(taskId: string, who: string, agentId: string): string {
   <a class="rail-item" href="https://report.botiverse.dev/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
-      <button type="button" data-mode="light" onclick="ap.mode('light')" aria-label="light" title="light">${ICONS.light}</button>
-      <button type="button" data-mode="dark" onclick="ap.mode('dark')" aria-label="dark" title="dark">${ICONS.dark}</button>
-      <button type="button" data-mode="system" onclick="ap.mode('system')" aria-label="follow the system" title="follow the system">${ICONS.system}</button>
+      <button type="button" data-theme-choice="brutal" onclick="ap.theme('brutal')" aria-label="Brutal" title="Brutal">${ICONS.brutal}</button>
+      <button type="button" data-theme-choice="elegant" onclick="ap.theme('elegant')" aria-label="Elegant" title="Elegant">${ICONS.light}</button>
+      <button type="button" data-theme-choice="elegant-dark" onclick="ap.theme('elegant-dark')" aria-label="Elegant dark" title="Elegant dark">${ICONS.dark}</button>
     </div>
     <span class="viewer" title="${esc(who)}">${esc(initial)}</span>
   </div>
@@ -485,19 +512,23 @@ export function page(taskId: string, who: string, agentId: string): string {
       const t = document.body.dataset.task;
       document.querySelectorAll('#tasks .task').forEach(a => a.classList.toggle('on', a.dataset.task === t));
     },
-    mode(m) {
+    // rUI's three themes: Brutal, Elegant, Elegant dark. The family goes on
+    // data-theme; Elegant's mode is a class; Brutal has no dark mode.
+    theme(t) {
       const h = document.documentElement; h.classList.remove('light', 'dark');
-      if (m === 'light' || m === 'dark') h.classList.add(m);
-      try { localStorage.setItem('ap-mode', m); } catch (e) {}
-      document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+      if (t === 'elegant') { h.setAttribute('data-theme', 'elegant'); h.classList.add('light'); }
+      else if (t === 'elegant-dark') { h.setAttribute('data-theme', 'elegant'); h.classList.add('dark'); }
+      else { t = 'brutal'; h.setAttribute('data-theme', 'brutal'); }
+      try { localStorage.setItem('ap-theme', t); } catch (e) {}
+      document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.themeChoice === t));
     },
   };
   // htmx wires the page on DOMContentLoaded, after this script has run, so
   // the first section-show must wait for it or its fetch fires into elements
   // nobody is listening on yet; the next poll would catch up, seconds later.
   document.addEventListener('DOMContentLoaded', function () {
-    let m = 'dark'; try { m = localStorage.getItem('ap-mode') || 'dark'; } catch (e) {}
-    document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+    let t = 'brutal'; try { t = localStorage.getItem('ap-theme') || 'brutal'; } catch (e) {}
+    document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.themeChoice === t));
     const url = new URL(location.href), v = url.searchParams.get('view');
     if (url.searchParams.has('alias')) {
       const panel = document.getElementById('plugins'), a = url.searchParams.get('alias');
