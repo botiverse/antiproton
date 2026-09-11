@@ -15,9 +15,11 @@
  * upgrade rather than editing here.
  *
  * The report page carries its own copy of the Elegant blocks in
- * report/public/rui-foundation.css. As of #57 the two carried the same values
- * for every name they share; nothing keeps them in step, and the report's
- * copy is Dora's, so a change here is a change to tell her about.
+ * report/public/rui-foundation.css: the console carries the Brutal scope as
+ * well, while the report borrows Brutal's ramp values but offers no Brutal
+ * theme. As of #57 the two carried the same values for every name they
+ * share; nothing keeps them in step, and the report's copy is Dora's, so a
+ * change here is a change to tell her about.
  */
 export const RUI_TOKENS = `:root{
   --color-black: oklch(0 0 0);
