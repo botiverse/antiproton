@@ -8,7 +8,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat"],
-  // workers.dev until the custom domain exists: attaching preview.botiverse.dev
+  // workers.dev until the custom domain exists: attaching antiproton-preview.botiverse.dev
   // needs zone permission this token does not hold, so the domain is added in
   // the dashboard by the account owner (Settings > Domains & Routes).
   "workers_dev": true,
