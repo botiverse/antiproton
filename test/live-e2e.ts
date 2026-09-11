@@ -24,7 +24,7 @@ await store.createAgent(T, "agent-1");
 await store.createTask(T, "agent-1", "task-1", {});
 await store.addMount({
   tenantId: T, agentId: "agent-1", alias: "gh_public", plugin: "github",
-  installationId: "inst-public", connectionId: null, toolVersion: "1.0.0",
+  installationId: "inst-public", connectionId: null, toolVersion: githubPlugin.version,
   publicConfig: { account: "unauthenticated" }, secretRef: null,
 });
 
@@ -68,7 +68,7 @@ const host = {
 // What a model would have written.
 const agentCode = `
 const repo = "nodejs/node";
-const issues = await tool\`gh_public.issues.list \${ { repo, perPage: 30 } }\`;
+const issues = await tool\`gh_public.issue_list \${ { repo, perPage: 30 } }\`;
 
 if (issues.status !== "succeeded") {
   output({ problem: issues.status, error: issues.error });
