@@ -29,7 +29,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins,
+  runtimePanel, timeline, tokens, plugins, mountFragment,
 } from "./ui.ts";
 
 export interface Env {
@@ -42,6 +42,8 @@ export interface Env {
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
    *  mount exists but cannot start a container. */
   RUN9?: string;
+  /** 32 bytes, base64: the key per-agent credentials are sealed under. */
+  SECRET_KEK?: string;
   HARNESS_MODE?: string;
   /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
   HARNESS_CONTEXT_WINDOW?: string;
@@ -326,6 +328,7 @@ export class AgentDO extends DurableObject<Env> {
         model: this.env.HARNESS_MODEL,
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
+      secretKek: this.env.SECRET_KEK,
       // Native tool calling by default. The alternative asks the model to
       // reply in a convention invented here, and a model under any pressure
       // falls back to the one it was trained on — four different markups
@@ -712,6 +715,7 @@ export class AgentDO extends DurableObject<Env> {
         model: this.env.HARNESS_MODEL,
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
+      secretKek: this.env.SECRET_KEK,
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
       // the runtime already has.
       extraPlugins: swe ? [] : [this.#benchState().plugin()],
@@ -1290,6 +1294,8 @@ export class AgentDO extends DurableObject<Env> {
           policy: m.policy ?? null,
           config: m.publicConfig ?? {},
           session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
+          // Attached, verified, account, last four, dates. Never a value.
+          credential: await rt.credentialMeta(tenantId, agentId, m),
           problems: plugin
             ? validateMount(plugin, m.publicConfig as any, m.secretRef).map((x) => x.message)
             : [`no plugin named ${m.plugin} is installed`],
@@ -1298,6 +1304,19 @@ export class AgentDO extends DurableObject<Env> {
       })),
       used,
     };
+  }
+
+  /** The console attaches a credential to one of this agent's mounts. The
+   *  value arrives here once, is sealed, and is never read back by anything
+   *  the console can call. */
+  async uiAttachCredential(tenantId: string, agentId: string, alias: string, fields: Record<string, string>) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiAttachCredential", () => this.runtime().attachCredential(tenantId, agentId, alias, fields));
+  }
+
+  async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
   }
 
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
@@ -2094,6 +2113,30 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
           return html(plugins(await stub.uiPlugins("demo", agentId)));
+        }
+        case "/ui/credential": {
+          // A value comes in; a re-rendered mount block goes out, and nothing
+          // else does: not the value, not on success, not on failure.
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          const form = await request.formData();
+          const alias = String(form.get("alias") ?? "").trim();
+          const fields: Record<string, string> = {};
+          for (const [k, v] of form.entries()) if (k !== "alias" && typeof v === "string") fields[k] = v;
+          const r = alias ? await stub.uiAttachCredential("demo", agentId, alias, fields) : { ok: false as const, error: "no mount named" };
+          const d: any = await stub.uiPlugins("demo", agentId);
+          if (!r.ok) for (const m of d.mounts ?? []) if (m.alias === alias && m.credential) m.credential.error = r.error;
+          return html(mountFragment(d, alias));
+        }
+        case "/ui/credential/remove": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiAgent(gate.who);
+          const form = await request.formData();
+          const alias = String(form.get("alias") ?? "").trim();
+          if (alias) await stub.uiRemoveCredential("demo", agentId, alias);
+          return html(mountFragment(await stub.uiPlugins("demo", agentId), alias));
         }
         case "/ui/storage":
         case "/ui/memory":

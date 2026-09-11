@@ -135,6 +135,12 @@ CREATE TABLE IF NOT EXISTS mounts (
   installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
   tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT, policy TEXT,
   PRIMARY KEY (tenant_id, agent_id, alias));
+CREATE TABLE IF NOT EXISTS secrets (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, name TEXT NOT NULL,
+  ciphertext TEXT NOT NULL, iv TEXT NOT NULL, last4 TEXT NOT NULL,
+  account TEXT, verified INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER,
+  PRIMARY KEY (tenant_id, agent_id, name));
 `;
 
 const now = () => Date.now();
@@ -169,6 +175,15 @@ export class SqliteStore implements StorageAdapter {
     this.#db
       .prepare("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)")
       .run();
+  }
+
+  /** Every row of every table, for tests that assert what is *not* stored.
+   *  In-process only; the Durable Object backend has no such door. */
+  dumpTables(): Record<string, unknown[]> {
+    const out: Record<string, unknown[]> = {};
+    const names = (this.#db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => String(r.name));
+    for (const t of names) out[t] = this.#db.prepare(`SELECT * FROM "${t}"`).all();
+    return out;
   }
 
   async close() {
@@ -989,6 +1004,55 @@ export class SqliteStore implements StorageAdapter {
         .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias")
         .all(tenantId, agentId) as any[]
     ).map((r) => this.#mountRow(r));
+  }
+
+  async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
+    const r = this.#db
+      .prepare("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?")
+      .run(secretRef, tenantId, agentId, alias);
+    return Number(r.changes) > 0;
+  }
+
+  // ---- secrets: ciphertext in, ciphertext out; metadata is all a page gets.
+  async putSecret(tenantId: string, agentId: string, name: string, s: {
+    ciphertext: string; iv: string; last4: string; account?: string | null; verified?: boolean;
+  }) {
+    const t = now();
+    this.#db.prepare(
+      `INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, last4, account, verified, created_at, updated_at, last_used_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,NULL)
+       ON CONFLICT(tenant_id, agent_id, name) DO UPDATE SET
+         ciphertext=excluded.ciphertext, iv=excluded.iv, last4=excluded.last4, account=excluded.account,
+         verified=excluded.verified, updated_at=excluded.updated_at, last_used_at=NULL`,
+    ).run(tenantId, agentId, name, s.ciphertext, s.iv, s.last4, s.account ?? null, s.verified ? 1 : 0, t, t);
+  }
+
+  async getSecret(tenantId: string, agentId: string, name: string) {
+    const r = this.#db.prepare("SELECT ciphertext, iv FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?")
+      .get(tenantId, agentId, name) as any;
+    return r ? { ciphertext: String(r.ciphertext), iv: String(r.iv) } : null;
+  }
+
+  async secretMeta(tenantId: string, agentId: string, name: string) {
+    const r = this.#db.prepare(
+      "SELECT last4, account, verified, created_at, updated_at, last_used_at FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?",
+    ).get(tenantId, agentId, name) as any;
+    return r ? {
+      last4: String(r.last4), account: r.account == null ? null : String(r.account), verified: Number(r.verified) === 1,
+      createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+      lastUsedAt: r.last_used_at == null ? null : Number(r.last_used_at),
+    } : null;
+  }
+
+  async touchSecret(tenantId: string, agentId: string, name: string, at: number) {
+    this.#db.prepare("UPDATE secrets SET last_used_at=? WHERE tenant_id=? AND agent_id=? AND name=?")
+      .run(at, tenantId, agentId, name);
+  }
+
+  async removeSecret(tenantId: string, agentId: string, name: string) {
+    const r = this.#db.prepare("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?")
+      .run(tenantId, agentId, name);
+    return Number(r.changes) > 0;
   }
 
   async createThread(tenantId: string, agentId: string, threadId: string, metadata: Json = {}) {

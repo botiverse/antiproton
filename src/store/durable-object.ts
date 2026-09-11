@@ -80,6 +80,12 @@ const SCHEMA = [
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL,
      connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL,
      secret_ref TEXT, policy TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
+    `CREATE TABLE IF NOT EXISTS secrets (
+     tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, name TEXT NOT NULL,
+     ciphertext TEXT NOT NULL, iv TEXT NOT NULL, last4 TEXT NOT NULL,
+     account TEXT, verified INTEGER NOT NULL DEFAULT 0,
+     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER,
+     PRIMARY KEY (tenant_id, agent_id, name))`,
 ];
 
 const j = (v: Json) => JSON.stringify(v ?? null);
@@ -678,6 +684,55 @@ export class DurableObjectStore implements StorageAdapter {
   async listMounts(tenantId: string, agentId: string) {
     return this.#all("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias",
       tenantId, agentId).map((r) => this.#mount(r));
+  }
+
+  async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
+    this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+      secretRef, tenantId, agentId, alias);
+    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+      tenantId, agentId, alias);
+  }
+
+  // ---- secrets: ciphertext in, ciphertext out; metadata is all a page gets.
+  async putSecret(tenantId: string, agentId: string, name: string, s: {
+    ciphertext: string; iv: string; last4: string; account?: string | null; verified?: boolean;
+  }) {
+    const t = this.#now();
+    this.#sql.exec(
+      `INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, last4, account, verified, created_at, updated_at, last_used_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,NULL)
+       ON CONFLICT(tenant_id, agent_id, name) DO UPDATE SET
+         ciphertext=excluded.ciphertext, iv=excluded.iv, last4=excluded.last4, account=excluded.account,
+         verified=excluded.verified, updated_at=excluded.updated_at, last_used_at=NULL`,
+      tenantId, agentId, name, s.ciphertext, s.iv, s.last4, s.account ?? null, s.verified ? 1 : 0, t, t);
+  }
+
+  async getSecret(tenantId: string, agentId: string, name: string) {
+    const r = this.#one("SELECT ciphertext, iv FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?",
+      tenantId, agentId, name) as any;
+    return r ? { ciphertext: String(r.ciphertext), iv: String(r.iv) } : null;
+  }
+
+  async secretMeta(tenantId: string, agentId: string, name: string) {
+    const r = this.#one(
+      "SELECT last4, account, verified, created_at, updated_at, last_used_at FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?",
+      tenantId, agentId, name) as any;
+    return r ? {
+      last4: String(r.last4), account: r.account == null ? null : String(r.account), verified: Number(r.verified) === 1,
+      createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+      lastUsedAt: r.last_used_at == null ? null : Number(r.last_used_at),
+    } : null;
+  }
+
+  async touchSecret(tenantId: string, agentId: string, name: string, at: number) {
+    this.#sql.exec("UPDATE secrets SET last_used_at=? WHERE tenant_id=? AND agent_id=? AND name=?",
+      at, tenantId, agentId, name);
+  }
+
+  async removeSecret(tenantId: string, agentId: string, name: string) {
+    const before = this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
+    this.#sql.exec("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
+    return !!before;
   }
 
   /** What the alarm needs: which tasks still have unconsumed events. */
