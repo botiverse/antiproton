@@ -101,6 +101,14 @@ interface Session {
   boxId: string;
   startedAt: number;
   endedAt: number;
+  /**
+   * When the box was last actually used, so idle time is computable after the
+   * fact: `endedAt - lastUsedAt`. `endedAt - startedAt` is how long it lived,
+   * which is the wrong segment for deciding a release policy — the two
+   * policies differ only in how long a box sits unused, and without this the
+   * record could not tell them apart.
+   */
+  lastUsedAt: number;
   execs: number;
   saved: string[];
 }
@@ -187,6 +195,10 @@ async function stopBox(
   // billed for merely existing, so how long it lived outlives the box.
   const session: Session = {
     boxId: state.boxId, startedAt: state.createdAt, endedAt: Date.now(),
+    // Carried into the record rather than zeroed with the rest of the live
+    // state below: it is maintained on every call already, and it is the only
+    // term that separates "held while working" from "held while idle".
+    lastUsedAt: state.lastUsedAt || state.createdAt,
     execs: state.execs ?? 0, saved: state.saved ?? [],
   };
   await ctx.connection.set({
