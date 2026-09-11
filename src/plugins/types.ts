@@ -152,6 +152,45 @@ export interface CredentialSpec {
   docs?: string;
 }
 
+/**
+ * What a page has to put in front of a person, for one plugin.
+ *
+ * There are three credential shapes and only two of them have fields, so every
+ * reader has to ask which it is holding. `shape.keys` on a sign-in is a
+ * `TypeError`, and the first place that would happen is the form someone uses
+ * to connect an account — the worst place to find out. So the shape is read
+ * once, here, and a caller switches on `kind` instead of narrowing a union it
+ * has to remember the members of.
+ *
+ * A bare token comes back as a single field rather than as its own case: it is
+ * one box with a label, which is what `keys` already describes, and a page that
+ * special-cases it grows two code paths for one question.
+ */
+export type CredentialForm =
+  /** The plugin never uses a credential. Ask for nothing. */
+  | { kind: "none" }
+  /** Ask for these, in this order. */
+  | { kind: "fields"; fields: CredentialField[]; required: boolean }
+  /** Nothing to type: send the person to the provider. */
+  | { kind: "signIn"; signIn: SignIn; required: boolean };
+
+export function credentialForm(credential: CredentialSpec | undefined | null): CredentialForm {
+  if (!credential) return { kind: "none" };
+  const { shape, required, summary } = credential;
+  if (shape === "token") {
+    return {
+      kind: "fields",
+      required,
+      // The declaration's own words: a plugin saying "a GitHub personal access
+      // token" has already written the label, and repeating it generically as
+      // "Token" throws away the only sentence written for this plugin.
+      fields: [{ name: "token", summary, secret: true, required: true }],
+    };
+  }
+  if ("keys" in shape) return { kind: "fields", fields: shape.keys, required };
+  return { kind: "signIn", signIn: shape.signIn, required };
+}
+
 export interface Plugin {
   id: string;
   version: string;

@@ -14,6 +14,7 @@ import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
+import { credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -120,11 +121,11 @@ check("appworld says it needs an account instead of failing on the first call", 
 });
 
 check("a credential field carries a label and says which part is secret", () => {
-  const shape = spotify!.credential!.shape;
-  if (shape === "token" || !("keys" in shape) || !shape.keys.every((k) => k.name && k.summary)) {
-    throw new Error(`a page has nothing to label these with: ${JSON.stringify(shape)}`);
+  const form = credentialForm(spotify!.credential);
+  if (form.kind !== "fields" || !form.fields.every((k) => k.name && k.summary)) {
+    throw new Error(`a page has nothing to label these with: ${JSON.stringify(form)}`);
   }
-  const username = shape.keys.find((k) => k.name === "username");
+  const username = form.fields.find((k) => k.name === "username");
   if (username?.secret !== false) throw new Error("a username is an identifier, not a secret");
 });
 
@@ -153,10 +154,8 @@ const everyPlugin: Plugin[] = [
 
 check("no plugin takes a credential as a setting", () => {
   for (const plugin of everyPlugin) {
-    const shape = plugin.credential?.shape;
-    const credentialKeys = new Set(
-      shape && shape !== "token" && "keys" in shape ? shape.keys.map((k) => k.name) : [],
-    );
+    const form = credentialForm(plugin.credential);
+    const credentialKeys = new Set(form.kind === "fields" ? form.fields.map((k) => k.name) : []);
     for (const f of plugin.config ?? []) {
       if (credentialKeys.has(f.name)) {
         throw new Error(`${plugin.id} declares "${f.name}" as both a setting and part of its credential`);
@@ -197,6 +196,32 @@ check("a sign-in is a credential the page must not ask anyone to paste", () => {
   }
   if (validateMount(signIn, { workspace: "w" } as any, "agent:somewhere").length) {
     throw new Error("a connected mount was refused");
+  }
+});
+
+check("every credential shape answers the same question, including the one with no fields", () => {
+  // A page asks once and switches on the answer. The failure this prevents is
+  // a reader that narrows to `keys` and meets a sign-in in the one path a
+  // person uses to connect an account.
+  const token = credentialForm(githubPlugin.credential);
+  if (token.kind !== "fields" || token.fields.length !== 1 || token.fields[0]!.name !== "token") {
+    throw new Error(`a bare token should be one labelled box: ${JSON.stringify(token)}`);
+  }
+  if (token.fields[0]!.summary !== githubPlugin.credential!.summary) {
+    throw new Error("the plugin's own words were thrown away for a generic label");
+  }
+  const pair = credentialForm(run9.credential);
+  if (pair.kind !== "fields" || pair.fields.map((f) => f.name).join() !== "ak,sk") {
+    throw new Error(`expected two fields: ${JSON.stringify(pair)}`);
+  }
+  const none = credentialForm(httpPlugin.credential);
+  if (none.kind !== "none") throw new Error("a plugin that needs no account should ask for nothing");
+  const signIn = credentialForm({
+    required: true, summary: "Connect the account.",
+    shape: { signIn: { provider: "Somewhere" } },
+  });
+  if (signIn.kind !== "signIn" || signIn.signIn.provider !== "Somewhere") {
+    throw new Error(`a sign-in should not come back as fields: ${JSON.stringify(signIn)}`);
   }
 });
 
