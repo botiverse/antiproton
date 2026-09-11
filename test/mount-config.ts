@@ -590,6 +590,32 @@ await check("没有 summary 把分派地址当成工具名交给模型", () => {
   }
 });
 
+await check("带凭据的 http 挂载必须点名它的 host", () => {
+  // For every other credential plugin the host is fixed by the plugin; here the
+  // *agent* chooses the URL, so an unset allowlist means a key that travels
+  // wherever it points. The comment at http.ts said this "should be refused at
+  // mount time" — a should in a comment is not a does in code, and this is the
+  // does. Checked against the mount's secret_ref, not the plugin's credential
+  // declaration: `secret_ref` is a mount field, so a mount can carry a key
+  // before the plugin ever declares one.
+  const refused = (config: any, ref: string | null) =>
+    validateMount(httpPlugin, config, ref).some((p) => /carries a credential, so "allowedHosts"/.test(p.message));
+
+  if (!refused({ account: "x" }, "secret:web")) throw new Error("an unset allowlist was accepted on a mount holding a key");
+  // An empty list is not a boundary anyone chose, and the mount could reach
+  // nothing anyway, so it counts as unset rather than as the safest setting.
+  if (!refused({ account: "x", allowedHosts: [] }, "secret:web")) throw new Error("an empty allowlist was accepted on a mount holding a key");
+  if (refused({ account: "x", allowedHosts: ["api.example.com"] }, "secret:web")) throw new Error("a named host was refused");
+  // And nothing changes for the anonymous mount every agent already has.
+  if (refused({ account: "open web", maxBytes: 24_000 }, null)) throw new Error("the anonymous web mount was refused");
+
+  // "Refused at mount time" means the throwing half, which provision calls.
+  let threw = "";
+  try { assertMountConfig(httpPlugin, { account: "x" } as any, "secret:web"); }
+  catch (e) { threw = String((e as Error).message); }
+  if (!/cannot mount http/.test(threw)) throw new Error(`it validates but does not refuse: ${threw || "no throw"}`);
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

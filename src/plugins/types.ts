@@ -62,6 +62,21 @@ export interface ConfigField {
   summary: string;
   default?: Json;
   required?: boolean;
+  /**
+   * Required only once the mount carries a credential.
+   *
+   * Some settings are advice on an anonymous mount and a boundary on one
+   * holding a key. `http`'s `allowedHosts` is the case this exists for: for
+   * every other credential plugin the host is fixed by the plugin, while there
+   * the *agent* chooses the URL, so an unset allowlist means a key that travels
+   * wherever the agent points it. Declaring it here makes the difference a rule
+   * the validator applies rather than a hazard the next person inherits.
+   *
+   * For a `string[]` an empty list counts as unset for this purpose: it is not
+   * a boundary anyone chose, and a mount that can reach nothing cannot be what
+   * was meant.
+   */
+  requiredWithCredential?: boolean;
   /** When the value is one of a fixed set. */
   choices?: string[];
   /**

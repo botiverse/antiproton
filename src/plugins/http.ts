@@ -157,12 +157,14 @@ export const httpPlugin: Plugin = {
     // and this setting is the only thing that bounds it.
     //
     // No http mount can carry a credential today — the plugin declares none.
-    // If that ever changes, the allowlist stops being advice: a
-    // credential-bearing mount should be refused at mount time when this is
-    // empty, rather than documented as a hazard someone configuring in a hurry
-    // will inherit. Written here because this is the line that would be
-    // inherited.
-    { name: "allowedHosts", type: "string[]", summary: "When set, only these hosts may be reached. Unset means any public host." },
+    // The refusal is declared anyway, because the hazard belongs to the
+    // *mount* rather than to the plugin: `secret_ref` is a mount field, so a
+    // mount of this plugin can carry a key before the plugin ever declares
+    // one. `requiredWithCredential` is what turns the paragraph above from
+    // advice a future author has to remember into a rule the validator
+    // applies.
+    { name: "allowedHosts", type: "string[]", requiredWithCredential: true,
+      summary: "When set, only these hosts may be reached. Unset means any public host — which is why a mount holding a credential must set it." },
     // Nothing parks anything: this plugin has no object storage to park into,
     // and never had. What the setting decides is how much of the body comes
     // back; the result reports the full size beside it so the loss is visible.
