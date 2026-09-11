@@ -30,7 +30,7 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  */
 const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
-import { assertMountConfig } from "../../src/runtime/mount-config.ts";
+import { assertMountConfig, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
@@ -345,6 +345,14 @@ export class AgentRuntime {
     if (form.kind !== "fields") return { ok: false, error: "this credential is a sign-in, not something to paste" };
     const missing = form.fields.filter((f) => f.required && !String(fields[f.name] ?? "").trim());
     if (missing.length) return { ok: false, error: `missing: ${missing.map((f) => f.name).join(", ")}` };
+    // The mount's settings are judged again with the reference this attach
+    // would set, because a rule can depend on a credential being present
+    // (http's allowlist is advice on an anonymous mount and a boundary on one
+    // holding a key). Mount-time validation saw a mount with no key; this is
+    // the moment it gains one, and "mount first, attach later" must not be a
+    // way around a refusal the seed path would have made.
+    const problems = validateMount(plugin, mount.publicConfig as any, agentRef(alias));
+    if (problems.length) return { ok: false, error: problems.map((x) => x.message).join("; ") };
     // The value a plugin reads: a bare token, or one JSON object of the fields.
     const value = plugin.credential.shape === "token"
       ? String(fields.token ?? "").trim()
