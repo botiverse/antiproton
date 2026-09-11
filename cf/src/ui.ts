@@ -9,6 +9,7 @@
  * having never seen a credential.
  */
 import type { ApprovalRecord } from "../../src/core/types.ts";
+import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
 import { md } from "./md.ts";
 
 const esc = (s: unknown) =>
@@ -71,12 +72,27 @@ color:var(--dim);text-transform:uppercase;letter-spacing:.09em;font-weight:600}
 .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 .msg{white-space:pre-wrap;word-break:break-word;margin-top:3px}
 form{display:flex;gap:8px;padding:13px;border-top:1px solid var(--line)}
-input[type=text]{flex:1;background:#0c0e12;border:1px solid var(--line);
+input[type=text],input[type=password]{flex:1;background:#0c0e12;border:1px solid var(--line);
 color:var(--ink);padding:9px 11px;border-radius:6px;font:inherit}
 button{background:var(--accent);border:0;color:#0c0e12;padding:9px 15px;
 border-radius:6px;font:inherit;font-weight:600;cursor:pointer}
 button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
 button.bad{background:var(--bad)}
+button:disabled{opacity:.45;cursor:not-allowed}
+/* a mount's credential: what is attached, never what it is */
+.cred{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px}
+.cred .state{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.cred .state b{color:var(--ok)}
+.cred .state b.unverified{color:var(--warn)}
+.cred .when{color:var(--dim)}
+.cred form{display:flex;flex-direction:column;gap:7px;padding:6px 0 0;border:0}
+.cred label{display:flex;flex-direction:column;gap:3px;color:var(--dim)}
+.cred label i{color:#5c6472;font-style:normal}
+.cred .row{display:flex;gap:8px;align-items:center}
+.cred .err{color:var(--bad)}
+.cred details{margin-top:4px}
+.cred details summary{margin-top:0}
+.cred form.inline{flex-direction:row;padding:0}
 .card{border:1px solid var(--warn);border-radius:7px;padding:11px;margin-bottom:11px}
 .card .tool{color:var(--warn);font-weight:600}
 pre{background:#0c0e12;border:1px solid var(--line);border-radius:6px;
@@ -799,20 +815,113 @@ ${allSaved.length
  * Mounts come first because they are the answer to "why did that happen".
  * Nothing here shows a credential; only whether one is attached.
  */
-export function plugins(d: any): string {
+/** The element a credential route swaps: one mount, re-rendered. */
+export const mountBlockId = (alias: string) => `mount-${String(alias).replace(/[^A-Za-z0-9_-]/g, "_")}`;
+
+/** A time from the store, or nothing. Never "Invalid Date", never "undefined". */
+const when = (v: unknown): string | null => {
+  if (v === null || v === undefined || v === "") return null;
+  const t = typeof v === "number" ? new Date(v) : new Date(String(v));
+  return Number.isNaN(t.getTime()) ? null : t.toISOString().slice(0, 16).replace("T", " ") + "Z";
+};
+
+/**
+ * The credential region of one mount.
+ *
+ * Reads the plugin's declaration through `credentialForm` and nothing else, so
+ * a sign-in shape (which has no fields) is a disabled button rather than a
+ * TypeError, and every field's `secret` and `required` arrive as booleans. The
+ * value itself is never here: inputs are never prefilled, the read block
+ * carries only whether one is attached, who it acts as, and when. Each of
+ * those renders only when the store actually produced it.
+ *
+ * Attached comes in two strengths — verified, when the plugin's check made a
+ * call and returned who the key acts as, and unverified, when it was stored
+ * and never tried — and the page keeps them apart.
+ */
+function credentialRegion(m: any, spec: CredentialSpec | null | undefined): string {
+  const form = credentialForm(spec);
+  if (form.kind === "none") return "";
+  const target = `hx-target="#${mountBlockId(m.alias)}" hx-swap="outerHTML"`;
+  const c = m.credential ?? {};
+  const attached = typeof c.attached === "boolean" ? c.attached : !!m.connected;
+  const error = typeof c.error === "string" && c.error ? c.error : null;
+  const optional = form.accountRequired === false;
+
+  if (form.kind === "signIn") {
+    return `<div class="cred">
+      <div class="row"><button type="button" disabled>Connect with ${esc(form.signIn.provider)}</button>
+        <span class="hint" style="padding:0">sign-in is not built yet${optional ? " · optional" : ""}</span></div>
+      ${form.signIn.grants ? `<div class="hint" style="padding:4px 0 0">connecting grants ${esc(form.signIn.grants)}</div>` : ""}
+    </div>`;
+  }
+
+  const inputs = form.fields.map((f) => `
+      <label><span>${esc(f.summary)}${f.required ? "" : " <i>(optional)</i>"}</span>
+        <input type="${f.secret ? "password" : "text"}" name="${esc(f.name)}"${f.required ? " required" : ""}
+               autocomplete="off" spellcheck="false"></label>`).join("");
+  const paste = (verb: string) => `
+    <form hx-post="/ui/credential" ${target}>
+      <input type="hidden" name="alias" value="${esc(m.alias)}">${inputs}
+      ${error ? `<div class="err">${esc(error)}</div>` : ""}
+      <div class="row"><button type="submit">${verb}</button></div>
+    </form>`;
+
+  if (!attached) {
+    return `<div class="cred">
+      ${optional ? `<div class="hint" style="padding:0">optional: without an account this mount works public-only</div>` : ""}
+      ${paste("attach")}
+    </div>`;
+  }
+
+  // Three states, not two. `verified` is a fact the store recorded: the plugin's
+  // `checkCredential` made a real call and it succeeded. Without it the value
+  // was stored and never tried — for a plugin without a check that is the only
+  // state there is, and a typo'd key looks exactly like a good one until the
+  // agent's first call fails. The page says which of the two it is rather than
+  // letting one word carry both, and the account name, when the check returned
+  // one, is shown rather than being what the state is inferred from.
+  const account = typeof c.account === "string" && c.account ? c.account : null;
+  const verified = c.verified === true;
+  const last4 = !account && typeof c.last4 === "string" && c.last4 ? c.last4 : null;
+  const setAt = when(c.setAt), usedAt = when(c.lastUsedAt);
+  const times = [setAt ? `set ${setAt}` : "", usedAt ? `last used ${usedAt}` : ""].filter(Boolean).join(" · ");
+  const state = verified
+    ? `<b>attached · verified</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}`
+    : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">stored, not yet tried${last4 ? `; ends in <code>${esc(last4)}</code>` : ""}</span>`;
+  return `<div class="cred">
+      <div class="state">${state}${times ? `<span class="when">${times}</span>` : ""}
+        <form class="inline" hx-post="/ui/credential/remove" ${target}
+              hx-confirm="Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.">
+          <input type="hidden" name="alias" value="${esc(m.alias)}">
+          <button type="submit" class="ghost">remove</button>
+        </form></div>
+      <details><summary>replace</summary>${paste("replace")}</details>
+    </div>`;
+}
+
+/** One mount, rendered on its own: what the credential routes return. */
+export function mountFragment(d: any, alias: string): string {
+  const m = (d.mounts ?? []).find((x: any) => x.alias === alias);
+  if (!m) return `<div class="mount" id="${mountBlockId(alias)}"><div class="empty">no mount named ${esc(alias)}</div></div>`;
+  return mountBlock(d, m);
+}
+
+function mountBlock(d: any, m: any): string {
   const used: Record<string, number> = d.used ?? {};
   const installed: any[] = d.installed ?? [];
-  const mounts: any[] = d.mounts ?? [];
+  const spec = installed.find((p) => p.id === m.plugin)?.credential ?? null;
 
-  const account = (m: any) => {
+  const account = () => {
     if (m.problems?.length) return `<span class="tag bad">misconfigured</span>`;
-    if (m.connected) return `<span class="tag ok">account attached</span>`;
+    const attached = typeof m.credential?.attached === "boolean" ? m.credential.attached : m.connected;
+    if (attached) return `<span class="tag ok">account attached</span>`;
     if (m.needsAccount) return `<span class="tag bad">needs an account</span>`;
     if (m.optionalAccount) return `<span class="tag">public only</span>`;
     return `<span class="tag">no account needed</span>`;
   };
 
-  const settings = (m: any) => {
+  const settings = () => {
     const rows = Object.entries(m.config ?? {}).filter(([k]) => k !== "account");
     if (!rows.length) return `<div class="hint">default settings</div>`;
     return `<div class="kv">${rows.map(([k, v]) =>
@@ -820,19 +929,20 @@ export function plugins(d: any): string {
         typeof v === "string" ? v : JSON.stringify(v))}</code></div>`).join("")}</div>`;
   };
 
-  const mountBlock = (m: any) => `
-    <div class="mount">
+  return `
+    <div class="mount" id="${mountBlockId(m.alias)}">
       <div class="mount-head">
         <b>${esc(m.alias)}</b>
         <span class="sub">${esc(m.plugin)} ${esc(m.version ?? "")}</span>
-        ${account(m)}
+        ${account()}
         ${m.policy ? `<span class="tag">policy</span>` : ""}
       </div>
       ${(m.problems ?? []).length
         ? `<div class="problems">${(m.problems as string[]).map((p) =>
             `<div>${esc(p)}</div>`).join("")}</div>`
         : ""}
-      ${settings(m)}
+      ${settings()}
+      ${credentialRegion(m, spec)}
       <div class="hint" style="padding-top:6px">${
         m.tools.length
           ? m.tools.map((t: string) => {
@@ -843,6 +953,11 @@ export function plugins(d: any): string {
           : "no tools"
       }</div>
     </div>`;
+}
+
+export function plugins(d: any): string {
+  const installed: any[] = d.installed ?? [];
+  const mounts: any[] = d.mounts ?? [];
 
   const toolRow = (p: any) => (t: any) => [
     t.name, t.sideEffects, t.idempotency, t.summary,
@@ -870,7 +985,7 @@ export function plugins(d: any): string {
 <div class="hint">A mount is an authority, not a plugin. The same plugin mounted twice
   against two accounts is two mounts, with two credentials and two session states.
   No credential is shown here — only whether one is attached.</div>
-${mounts.length ? mounts.map(mountBlock).join("") : `<div class="empty">nothing mounted</div>`}
+${mounts.length ? mounts.map((m) => mountBlock(d, m)).join("") : `<div class="empty">nothing mounted</div>`}
 
 <h3 style="margin-top:18px">installed on this deployment</h3>
 <div class="hint">Present in the code. Mounting one is a separate, deliberate act.</div>
