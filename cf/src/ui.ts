@@ -466,7 +466,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   <section class="view" data-view="plugins">
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
     <div class="body" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
-         hx-trigger="ap:show, every 3s[${inView}]">loading…</div>
+         hx-trigger="ap:show, every 3s[${inView} && !ap.editing('#plugins')]">loading…</div>
   </section>
   <section class="view" data-view="runtime">
     <div class="view-head"><h2>Runtime</h2><span class="sub">what the object is billed for, and what it is holding</span></div>
@@ -494,6 +494,15 @@ export function page(taskId: string, who: string, agentId: string): string {
   // viewer chose. Both are on the URL or in localStorage, never in the
   // server; every panel is still a plain GET that reads the store.
   window.ap = {
+    // A panel that polls replaces its own form under the person's cursor:
+    // the credential box was emptied every three seconds. While any field
+    // in the panel is focused or holds text, the poll waits.
+    editing(sel) {
+      const root = document.querySelector(sel);
+      if (!root) return false;
+      return [...root.querySelectorAll('input, textarea, select')].some(
+        (el) => el === document.activeElement || (el.type !== 'hidden' && el.value));
+    },
     show(view) {
       document.body.dataset.view = view; delete document.body.dataset.pane;
       document.querySelectorAll('.rail-item[data-view]').forEach(a => a.classList.toggle('on', a.dataset.view === view));
