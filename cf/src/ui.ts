@@ -985,7 +985,8 @@ export function memoryPanel(d: any): string {
       <div class="hint" style="padding:8px 0">It writes here with
       <span class="chip">state.remember</span>; <span class="chip">memory</span>,
       <span class="chip">todo</span> and <span class="chip">journal</span> are read back
-      into the system prompt when a task opens.</div>`;
+      into the system prompt when the agent's harness opens, once for every conversation,
+      since the working set belongs to the agent and not to any one conversation.</div>`;
   }
   const known = new Set(["memory", "todo", "journal"]);
   const one = (r: any) => {
