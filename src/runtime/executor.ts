@@ -107,7 +107,12 @@ export class QuickJsExecutor implements JsExecutor {
 
     const outputFn = ctx.newFunction("output", (valueHandle) => {
       const v = ctx.dump(valueHandle);
-      const size = Buffer.byteLength(JSON.stringify(v ?? null));
+      // String.length, UTF-16 code units, like every other `…Bytes` cap on a
+      // string in this tree; the one byte-accurate bound is on binary, in
+      // src/store/artifacts.ts. Counting real bytes here was the single
+      // disagreement, and a cap that disagrees with its siblings is a bug
+      // waiting for a non-ASCII payload.
+      const size = JSON.stringify(v ?? null).length;
       if (outputBytes + size > limits.maxOutputBytes) {
         outputs.push({ truncated: true, reason: "max_output_bytes" });
         return ctx.undefined;
