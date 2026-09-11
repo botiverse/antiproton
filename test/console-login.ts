@@ -10,7 +10,7 @@
  * and a way out; a viewer the routes only know as a string sees what they
  * saw before, because there is no session behind it to end.
  */
-import { loginPage, refusedPage, REFUSALS } from "../cf/src/login.ts";
+import { loginPage, refusedPage, keyPage, REFUSALS } from "../cf/src/login.ts";
 import { page, viewerBadge } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -47,7 +47,22 @@ check("every refusal says what happened, what to do, and leads back to /login", 
     must(!/class="reason"/.test(h), `${reason}: a known reason is not echoed as a tag`);
     must(/You are not signed in/.test(h), `${reason}: it says no session exists`);
   }
-  must("not-human" in REFUSALS && "no-email" in REFUSALS && "wrong-server" in REFUSALS && "state" in REFUSALS, "the four reasons the callback redirects with are covered");
+  // Every reason index.ts's refuse() can redirect with (admit()'s three, plus
+  // the three the routes name themselves) has words of its own.
+  for (const r of ["not-human", "no-email", "wrong-server", "state", "exchange", "unconfigured"]) must(r in REFUSALS, `reason "${r}" has a page`);
+});
+
+check("the key page is a form to /login/key and nothing else; the error is ours, escaped; no link leads to it", () => {
+  const h = keyPage();
+  must(/<form method="post" action="\/login\/key"/.test(h), "posts to /login/key");
+  must(/<input type="password" name="key"/.test(h), "one password field named key");
+  must(count(h, /<input/g) === 1, "and only that field");
+  must(!/role="alert"/.test(h), "no error on first render");
+  must(/href="\/login"/.test(h), "it points a person to the real door");
+  const bad = keyPage('the key does not match <b>x</b>');
+  must(/<p class="err" role="alert">the key does not match &lt;b&gt;x&lt;\/b&gt;<\/p>/.test(bad), "the error is shown, escaped");
+  must(!/value=/.test(bad), "the key typed is never echoed back");
+  must(!/login\/key/.test(loginPage()), "the sign-in page still does not lead here");
 });
 
 check("an unknown reason renders the generic page with the reason escaped, never as markup", () => {

@@ -11,8 +11,9 @@
  * The console signs in humans only (a Raft *agent* account is refused after
  * the exchange, see `REFUSALS`), and it keys everything a person owns on their
  * verified email, so the page says both up front rather than after the
- * round trip. The QA entrance (`POST /login/key`) is deliberately absent from
- * this page: it is a secret, not a choice.
+ * round trip. The QA entrance (`/login/key`) is deliberately absent from the
+ * sign-in page: it is a secret, not a choice. Its own form is rendered here
+ * too (`keyPage`), so the one person who does reach it sees the same product.
  */
 import { FAVICON_DATA_URI, LOCKUP_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
@@ -48,6 +49,15 @@ box-shadow:var(--theme-shadow-xs);transition:background .15s ease-out,box-shadow
 .door .fine{margin:0;color:var(--dim);font-size:11.5px;line-height:1.5}
 .door .fine a,.door p a{color:var(--ink);text-decoration:underline;text-underline-offset:2px}
 .door .fine a:hover,.door p a:hover{color:var(--strong)}
+.door .field{display:block;margin:18px 0 0}
+.door .field span{display:block;font-size:11.5px;color:var(--dim);margin-bottom:5px}
+.door .field input{width:100%;font:inherit;font-size:13.5px;padding:9px 10px;color:var(--strong);background:var(--layer-canvas-muted);
+border:1px solid var(--line);border-radius:6px;outline:0}
+.door .field input:focus{box-shadow:0 0 0 1px var(--primary-400);border-color:var(--primary-400)}
+.door .err{margin:10px 0 0;color:var(--danger-strong);font-size:12.5px}
+.door form .btn{margin:16px 0 14px}
+[data-theme="brutal"] .door .field input{border:2px solid var(--line-strong);border-radius:0;background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
+[data-theme="brutal"] .door .field input:focus{box-shadow:var(--theme-shadow-md)}
 .door .reason{display:inline-block;margin:0 0 14px;padding:2px 7px;border:1px solid var(--line);border-radius:4px;color:var(--dim);font-size:11.5px;word-break:break-all}
 :focus-visible{outline:2px solid var(--primary-400);outline-offset:2px}
 [data-theme="brutal"] .door{border:2px solid var(--line-strong);border-radius:0;box-shadow:var(--theme-shadow-md)}
@@ -117,6 +127,16 @@ export const REFUSALS: Record<string, { title: string; body: string; next: strin
     body: "This happens when the page sat open too long, or the browser dropped the cookie that remembers where you were going.",
     next: "Start the sign-in again from here.",
   },
+  exchange: {
+    title: "Raft did not accept the sign-in",
+    body: "The one-time code Raft sent back could not be traded for an identity. Codes expire within minutes and work once.",
+    next: "Start the sign-in again from here.",
+  },
+  unconfigured: {
+    title: "Sign-in is not set up on this deployment",
+    body: "The operator has not configured Login with Raft here, so nobody can sign in yet.",
+    next: "Tell the operator. There is nothing to do on your side.",
+  },
 };
 
 const GENERIC = {
@@ -136,4 +156,22 @@ export function refusedPage(reason: string): string {
   ${tag}<p class="why">${esc(r.next)}</p>
   <a class="btn" href="/login">${RAFT_MARK}Back to sign in</a>
   <p class="fine">Nothing was created. You are not signed in.</p>`);
+}
+
+/**
+ * GET /login/key, and the 401 re-render when the key did not match. The QA
+ * entrance: one password field, nothing else, and no link leads here. It
+ * wears the door's clothes so that whoever QA is that day sees one product,
+ * not a page from before. `error` is a sentence of ours, never the key.
+ */
+export function keyPage(error?: string): string {
+  return shell("sign in with a key",
+    `<h1>Sign in with a key</h1>
+  <p class="why">For testing this deployment with a browser. A person signs in with <a href="/login">Login with Raft</a> instead.</p>
+  <form method="post" action="/login/key" autocomplete="off">
+    <label class="field"><span>key</span><input type="password" name="key" autocomplete="off" spellcheck="false" autofocus required></label>
+    ${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
+    <button type="submit" class="btn">sign in</button>
+  </form>
+  <p class="fine">The key is never shown and never sent anywhere but here.</p>`);
 }
