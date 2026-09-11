@@ -497,15 +497,17 @@ them:
   does not, so a genuinely long-running agent's floor rises for ever and will
   eventually exhaust one object's 10 GB.
 - **Plugin lifecycle.** A mount's config and policy are reconciled on every
-  visit, so drift self-heals. Disabling and revoking one is still missing, as
-  is any notion of installing a plugin at runtime. Revoking has a dependency
-  worth knowing before it lands: a prompt paragraph that tells the model to
-  call a tool has to name it the way the mount does. The memory paragraph is
-  the one that shows the trap — it says `state.remember` as a literal, so it is
-  correct only because the seed list happens to name that mount `state`, and a
-  rename or a removal would turn it into an instruction the harness cannot
-  dispatch. Nothing can do either today, which is why this is a reason to bind
-  the two rather than a live fault.
+  visit, so drift self-heals, and a seed mount is validated on the first agent
+  it reaches. Disabling and revoking one is still missing, as is any notion of
+  installing a plugin at runtime. Revoking would have to respect one property
+  that the prompt now depends on: a paragraph telling the model to call a tool
+  names the mount and the tool — "kept by the `state` mount, correct one with
+  its `remember` tool" — rather than the address the harness dispatches to,
+  because that address is not what the model is offered. Both halves are
+  resolved at prompt time and the sentence is dropped when no mount is there,
+  so revoking a mount has to keep the resolution rather than the wording.
+  Nothing can revoke today, which is why this is a property to preserve rather
+  than a fault to fix.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,
   a username and password, an access key and a secret key — and all three shapes
   exist in the tree today. OAuth is a flow rather than a paste: it needs a
