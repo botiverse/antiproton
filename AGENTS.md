@@ -24,11 +24,13 @@ measures real bytes on binary via `byteLength`.
 
 ## Running the tests
 
-Fifteen suites run with no external services; run them with `node test/<name>.ts`.
-(Which suites and how many cases move as work lands — count them rather than
-trusting a number in a document, including this one.) There are three more files
-in `test/` that are not part of that set and are meant to be skipped unless you
-have the services: `appworld` needs both AppWorld servers running locally
+The suites in `test/` run with no external services; run them with
+`node test/<name>.ts`. How many there are and how many cases each holds moves as
+work lands, so **count rather than trust a number in a document, including this
+one** — a suite added in the afternoon makes any figure here stale by evening,
+which has already happened once. Three files in `test/` are not part of that set
+and are meant to be skipped unless you have the services: `appworld` needs both
+AppWorld servers running locally
 (`appworld serve apis --port 8800`, `environment --port 8799`), and `live-e2e`
 and `live-github` reach out to live endpoints.
 
