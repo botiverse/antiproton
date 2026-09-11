@@ -1,0 +1,52 @@
+
+  τ²-bench retail — 8 task(s) × 3 trial(s), model deepseek-flash, waiting by push
+  on https://antiproton.botiverse.workers.dev object bench-veratools1
+  ────────────────────────────────────────────────────────────────────────────────────
+  [32m✓[0m task 0    db=ok act=ok  stop          4 turns / 9 calls / 44748 tok / 76s
+  [32m✓[0m task 1    db=ok act=ok  stop          5 turns / 10 calls / 47743 tok / 46s
+  [31m✗[0m task 2    db=ok act=NO  stop          3 turns / 9 calls / 43212 tok / 36s
+      expected: [return_delivered_order_items]  performed: [return_delivered_order_items]
+        return_delivered_order_items expected {"item_ids":["4602305039","4202497723","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                     performed {"item_ids":["4202497723","4602305039","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+  [32m✓[0m task 3    db=ok act=ok  stop          4 turns / 10 calls / 50221 tok / 38s
+  [32m✓[0m task 4    db=ok act=ok  stop          4 turns / 10 calls / 51535 tok / 32s
+  [31m✗[0m task 5    db=NO act=NO  stop          4 turns / 9 calls / 46051 tok / 31s
+      expected: [return_delivered_order_items]  performed: [exchange_delivered_order_items]
+        return_delivered_order_items expected {"item_ids":["8538875209"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                     performed (nothing by that name)
+  [32m✓[0m task 6    db=ok act=ok  stop          4 turns / 9 calls / 45537 tok / 33s
+  [32m✓[0m task 7    db=ok act=ok  stop          4 turns / 9 calls / 44423 tok / 32s
+  [32m✓[0m task 0    db=ok act=ok  stop          4 turns / 9 calls / 42717 tok / 38s
+  [32m✓[0m task 1    db=ok act=ok  transfer      4 turns / 11 calls / 54796 tok / 54s
+  [31m✗[0m task 2    db=ok act=NO  stop          3 turns / 7 calls / 33405 tok / 24s
+      expected: [return_delivered_order_items]  performed: [return_delivered_order_items]
+        return_delivered_order_items expected {"item_ids":["4602305039","4202497723","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                     performed {"item_ids":["4202497723","4602305039","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+  [32m✓[0m task 3    db=ok act=ok  stop          4 turns / 14 calls / 70688 tok / 47s
+  [32m✓[0m task 4    db=ok act=ok  stop          3 turns / 8 calls / 40045 tok / 35s
+  [31m✗[0m task 5    db=NO act=NO  stop          5 turns / 9 calls / 44593 tok / 44s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["8538875209"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                     performed (nothing by that name)
+  [32m✓[0m task 6    db=ok act=ok  stop          4 turns / 10 calls / 50647 tok / 39s
+  [32m✓[0m task 7    db=ok act=ok  stop          4 turns / 10 calls / 51199 tok / 35s
+  [32m✓[0m task 0    db=ok act=ok  stop          3 turns / 9 calls / 40072 tok / 34s
+  [32m✓[0m task 1    db=ok act=ok  transfer      4 turns / 10 calls / 46579 tok / 39s
+  [31m✗[0m task 2    db=ok act=NO  stop          3 turns / 7 calls / 33196 tok / 23s
+      expected: [return_delivered_order_items]  performed: [return_delivered_order_items]
+        return_delivered_order_items expected {"item_ids":["4602305039","4202497723","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                     performed {"item_ids":["4202497723","4602305039","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+  [32m✓[0m task 3    db=ok act=ok  stop          3 turns / 8 calls / 38287 tok / 31s
+  [32m✓[0m task 4    db=ok act=ok  stop          4 turns / 11 calls / 55685 tok / 35s
+  [32m✓[0m task 5    db=ok act=ok  stop          8 turns / 14 calls / 73683 tok / 56s
+  [32m✓[0m task 6    db=ok act=ok  stop          5 turns / 10 calls / 48673 tok / 38s
+  [32m✓[0m task 7    db=ok act=ok  stop          4 turns / 10 calls / 51131 tok / 33s
+  ────────────────────────────────────────────────────────────────────────────────────
+  pass^1 = 6/8 = 75.0%
+  pass^2 = 6/8 = 75.0%
+  pass^3 = 6/8 = 75.0%
+  pass^1 = 19/24 = 79.2%   929s wall
+  tools: get_order_details×94  get_product_details×39  find_user_id_by_name_zip×24  get_user_details×24  exchange_delivered_order_items×13  list_all_product_types×9  modify_pending_order_items×9  return_delivered_order_items×4  calculate×4  transfer_to_human_agents×1
+  failures by ending: stop×5
+  object billed 36.3s of 929s wall (4%)
+
