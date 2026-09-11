@@ -25,7 +25,7 @@ import { LaneBusy } from "@earendil-works/pi-agent-core";
 import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
-import { PiSqliteStorage, ensurePiTables, type SqlHost } from "../store/pi-storage.ts";
+import { PiSqliteStorage, ensurePiTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort } from "../model/pi-offloaded.ts";
 import { bridgeTools, type MountedTool, type ToolHost } from "./pi-tools.ts";
 
@@ -60,12 +60,42 @@ const REDELIVERY_MS = 120_000;
  * simply spun: every panel answered 500. Fixing one table found the second, so
  * they are now one call with one home.
  */
-export function ensureAgentTables(sql: SqlHost["sql"]) {
-  ensurePiTables(sql);
+export function ensureAgentTables(sql: SqlHost["sql"], session: string = MAIN_SESSION) {
+  ensurePiTables(sql, session);
   sql.exec(JOBS);
   // Objects created before dispatch was written down already have the table.
   try { sql.exec("ALTER TABLE pi_model_jobs ADD COLUMN dispatched_at INTEGER"); }
   catch { /* already there */ }
+  // A job belongs to the session that started it, so the answer comes back to
+  // the transcript that asked. Rows from before sessions existed are the main
+  // session's, which is what the default says.
+  try { sql.exec(`ALTER TABLE pi_model_jobs ADD COLUMN session TEXT NOT NULL DEFAULT '${MAIN_SESSION}'`); }
+  catch { /* already there */ }
+  // Which sessions this object has, so a wake can step the ones with work
+  // without opening every transcript. `active` is the last step's verdict.
+  sql.exec(`CREATE TABLE IF NOT EXISTS pi_sessions (
+    session TEXT PRIMARY KEY, created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1)`);
+  sql.exec("INSERT OR IGNORE INTO pi_sessions(session, created_at) VALUES (?, ?)", session, Date.now());
+}
+
+/** Which session a job belongs to, or null if the job is unknown. */
+export function jobSession(sql: SqlHost["sql"], jobId: string): string | null {
+  const row = sql.exec("SELECT session FROM pi_model_jobs WHERE id = ?", jobId).toArray()[0] as any;
+  return row ? String(row.session) : null;
+}
+
+/** The sessions a wake should step: marked active by their last step, or
+ *  holding a model call that has not been answered. */
+export function sessionsWithWork(sql: SqlHost["sql"]): string[] {
+  const rows = sql.exec(
+    `SELECT session FROM pi_sessions WHERE active = 1
+     UNION SELECT session FROM pi_model_jobs WHERE answer IS NULL`).toArray() as any[];
+  return rows.map((r) => String(r.session));
+}
+
+export function markSession(sql: SqlHost["sql"], session: string, active: boolean) {
+  sql.exec("INSERT INTO pi_sessions(session, created_at, active) VALUES (?, ?, ?)" +
+    " ON CONFLICT(session) DO UPDATE SET active = excluded.active", session, Date.now(), active ? 1 : 0);
 }
 
 export const LANE = "main";
@@ -80,6 +110,9 @@ export interface ModelChoice {
 export interface PiAgentOptions {
   host: SqlHost;
   sessionId: string;
+  /** Which of the agent's transcripts this is. Absent means the first one,
+   *  which keeps the tables it has always had. */
+  session?: string;
   systemPrompt: string;
   model: ModelChoice;
   tools: MountedTool[];
@@ -127,8 +160,9 @@ export class PiAgent {
    * the whole recovery mechanism.
    */
   static async open(opts: PiAgentOptions): Promise<PiAgent> {
-    ensureAgentTables(opts.host.sql);
-    const storage = new PiSqliteStorage(opts.host, opts.now ? { now: opts.now } : {});
+    const conversation = opts.session ?? MAIN_SESSION;
+    ensureAgentTables(opts.host.sql, conversation);
+    const storage = new PiSqliteStorage(opts.host, { session: conversation, ...(opts.now ? { now: opts.now } : {}) });
     const session = new StorageBackedSession(
       { id: opts.sessionId, createdAt: (opts.now ?? Date.now)(), storageVersion: 1 },
       storage as any,
@@ -185,8 +219,8 @@ export class PiAgent {
     const id = `mj_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
     // Durable before it is dispatched: a dispatch that never happens can be
     // retried from the row, but a row that was never written cannot.
-    this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at) VALUES (?,?,?)",
-      id, JSON.stringify(request), (this.#opts.now ?? Date.now)());
+    this.#sql.exec("INSERT INTO pi_model_jobs(id, request, created_at, session) VALUES (?,?,?,?)",
+      id, JSON.stringify(request), (this.#opts.now ?? Date.now)(), this.#opts.session ?? MAIN_SESSION);
     return id;
   }
 
@@ -210,9 +244,9 @@ export class PiAgent {
   async dispatchPending(limit = 20): Promise<number> {
     const now = (this.#opts.now ?? Date.now)();
     const rows = this.#sql.exec(
-      "SELECT id FROM pi_model_jobs WHERE answer IS NULL" +
+      "SELECT id FROM pi_model_jobs WHERE answer IS NULL AND session = ?" +
       " AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
-      now - REDELIVERY_MS, limit).toArray() as Array<{ id: string }>;
+      this.#opts.session ?? MAIN_SESSION, now - REDELIVERY_MS, limit).toArray() as Array<{ id: string }>;
     let sent = 0;
     for (const r of rows) {
       try {
@@ -228,7 +262,8 @@ export class PiAgent {
    *  is cheaper than asserting it. */
   #unanswered(): number {
     const row = this.#sql
-      .exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL").toArray()[0] as any;
+      .exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?",
+        this.#opts.session ?? MAIN_SESSION).toArray()[0] as any;
     return Number(row?.n ?? 0);
   }
 

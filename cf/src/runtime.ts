@@ -12,7 +12,7 @@
  */
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
-import { PiAgent } from "../../src/runtime/pi-agent.ts";
+import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import {
   bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
@@ -33,6 +33,7 @@ import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
+import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
 import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
@@ -208,8 +209,11 @@ export class AgentRuntime {
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
   #unchecked = new Map<string, string>();
-  #agent: PiAgent | null = null;
-  #agentKey = "";
+  // One harness per (agent, session): a conversation is a session inside the
+  // agent's object, with its own transcript and the agent's shared mounts,
+  // credentials and memory. Keyed so a second conversation never reads the
+  // first one's transcript, and cached so a wake does not rebuild them all.
+  #agents = new Map<string, PiAgent>();
   #executor: DynamicWorkerExecutor;
   #models: ModelResolver;
   #artifacts: BoundArtifacts;
@@ -471,21 +475,27 @@ export class AgentRuntime {
    * it starts no timers and no provider work — it reads the transcript and
    * reports what was left open.
    */
-  async agent(tenantId: string, agentId: string): Promise<PiAgent> {
+  async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<PiAgent> {
     await this.ready();
     const key = `${tenantId}/${agentId}`;
-    if (this.#agent && this.#agentKey === key) return this.#agent;
+    const cacheKey = `${key}#${session}`;
+    const cached = this.#agents.get(cacheKey);
+    if (cached) return cached;
 
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
     const { tools } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
-    const host = this.#host({ tenantId, agentId, taskId: LEGACY_TASK });
+    // The call context's task is the conversation, so held calls and audit
+    // rows say which conversation asked. The first session's id is the same
+    // string the single-conversation object always used.
+    const host = this.#host({ tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session });
     const store = this.store;
 
     const agent = await PiAgent.open({
       host: this.#deps.ctx.storage,
-      sessionId: key,
+      sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
+      session,
       // Read here rather than inside the harness, so the harness keeps holding
       // no I/O of its own.
       systemPrompt: systemPrompt({
@@ -523,15 +533,14 @@ export class AgentRuntime {
         : []),
     ] as any, BACKGROUND_CONTEXT);
 
-    this.#agent = agent;
-    this.#agentKey = key;
+    this.#agents.set(cacheKey, agent);
     return agent;
   }
 
   /** Compact on demand, the way pi's /compact does: an operation like any
    *  other, so it is admitted, durable, and drives on the same pass. */
-  async requestCompaction(tenantId: string, agentId: string) {
-    return (await this.agent(tenantId, agentId)).compact();
+  async requestCompaction(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
+    return (await this.agent(tenantId, agentId, session)).compact();
   }
 
   /**
@@ -547,8 +556,12 @@ export class AgentRuntime {
   async postMessage(
     tenantId: string, agentId: string, text: string,
     mode: "prompt" | "steer" | "followUp" = "prompt",
+    session: string = MAIN_SESSION,
   ) {
-    const agent = await this.agent(tenantId, agentId);
+    const agent = await this.agent(tenantId, agentId, session);
+    // A conversation that has just been spoken to has work until a step says
+    // otherwise, so the next wake steps it.
+    markSession(this.#deps.ctx.storage.sql, session, true);
     const res: any = await agent.say(text, mode);
     // What actually happened rather than what was asked for: a run admitted
     // carries an operation id, a queued message carries an entry id.
@@ -556,25 +569,48 @@ export class AgentRuntime {
     return { mode: landed, queued: landed !== "prompt", result: res };
   }
 
-  /** One pass, which is all an alarm should ever do. */
+  /**
+   * One pass over every session with work, which is all an alarm should ever
+   * do. A session is stepped when its last step left something open or a
+   * model call of its is still out; the rest stay closed and cost nothing.
+   * The wake is the soonest any session asked for.
+   */
   async step(tenantId: string, agentId: string) {
-    const agent = await this.agent(tenantId, agentId);
-    const out = await agent.step();
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    ensureAgentTables(sql);
+    const sessions = sessionsWithWork(sql);
+    if (!sessions.length) sessions.push(MAIN_SESSION);
+    let open = 0, wakeInMs: number | null = null;
+    const settled: Array<{ operationId: string; status: string }> = [];
+    for (const session of sessions) {
+      const agent = await this.agent(tenantId, agentId, session);
+      const out = await agent.step();
+      open += out.open;
+      settled.push(...out.settled);
+      if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
+      markSession(sql, session, out.open > 0 || out.wakeInMs !== null);
+    }
     // A finished run should not still be holding a metered container.
     let releaseFailed: Array<{ alias: string; error: string }> = [];
-    if (this.#deps.autoRelease !== false && out.open === 0 && out.settled.length) {
+    if (this.#deps.autoRelease !== false && open === 0 && settled.length) {
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
       releaseFailed = r.failed;
     }
-    return { ...out, releaseFailed };
+    return { open, wakeInMs, settled, releaseFailed };
   }
 
-  /** What the worker asks for, and what it hands back. */
+  /** What the worker asks for, and what it hands back. The job row says which
+   *  session asked, so the answer lands in the transcript that is waiting. */
   async takeJob(tenantId: string, agentId: string, jobId: string) {
-    return (await this.agent(tenantId, agentId)).takeJob(jobId);
+    await this.ready();
+    const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
+    return (await this.agent(tenantId, agentId, session)).takeJob(jobId);
   }
 
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
-    return (await this.agent(tenantId, agentId)).deliver(jobId, answer as any);
+    await this.ready();
+    const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
+    return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
   }
 }
