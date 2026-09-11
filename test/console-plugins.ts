@@ -219,7 +219,7 @@ check("the inbox renders each held call with the request verbatim, escaped, and 
   must(/waiting 2 min/.test(html), "how long it has waited");
   must(/held by gh policy/.test(html), "who is holding it");
   must(/hx-post="\/ui\/decide"[^>]*hx-target="#inbox"/.test(html.replace(/\n/g, " ")), "decisions re-render the inbox");
-  must(/t_a/.test(html) && /open the conversation/.test(html), "each card links to its conversation");
+  must(/open the agent/.test(html) && /agentId=u-x/.test(html) && !/open the conversation/.test(html), "each card opens its agent (one agent, one conversation)");
 });
 
 check("an empty inbox says nothing needs you and what is running", () => {
@@ -364,6 +364,13 @@ check("no unscoped .agent rule reaches the transcript's steps", () => {
   const bare = css.match(/(^|[\n;}])\s*\.agent(?![\w-])[^{]*\{/g) ?? [];
   must(bare.length === 0, "a rule starting with .agent would also match .step.agent: " + bare.join(" | "));
   must(/#agents \.agent\{/.test(css), "the sidebar row rule is scoped under #agents");
+});
+
+// tygg: one agent, one conversation. The sidebar lists agents only.
+check("the sidebar has no conversations section and no new-conversation button", () => {
+  const html = page("t_u-x", "someone", "u-x");
+  must(!/new conversation|id="tasks"|\/ui\/tasks|conversations<\/h3>|newConversation|markTask/.test(html), "no conversation list, button, route call or script");
+  must(/<h2 id="agent-name">u-x<\/h2>\s*<span class="spacer">/.test(html), "the header is the agent, with no conversation title beside it");
 });
 
 const failed = results.filter((r) => !r.ok);

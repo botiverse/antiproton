@@ -113,11 +113,6 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .task .meta{color:var(--dim);font-size:10.5px;margin-top:3px}
 .task .title{font-size:12px;color:var(--ink)}
 .task .tid{font-family:var(--mono-font)}
-.new-conv{width:100%;justify-content:center;margin:0 0 10px;gap:6px}
-.new-conv svg{width:14px;height:14px}
-.new-conv-err{font-size:11px;color:var(--bad);margin:-4px 0 10px}
-.new-conv-err[hidden]{display:none}
-.sidebar h3.later{margin-top:16px}
 /* --- agents: an avatar drawn from the agent's seed, a name, one line of
    what it is for. The create form sits in the sidebar, no dialog. */
 .avatar{display:inline-block;width:22px;height:22px;flex:none;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--sunk);vertical-align:middle}
@@ -462,12 +457,6 @@ export function page(taskId: string, who: string, agentId: string): string {
     </form>
     <div id="agents" data-lazy hx-get="/ui/agents" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
          hx-on::after-swap="ap.markAgent()"></div>
-    <h3 class="later">conversations</h3>
-    <div class="sub">of this agent, latest activity first</div>
-    <button type="button" class="ghost new-conv" onclick="ap.newConversation(this)">${ICONS.plus}new conversation</button>
-    <div class="err new-conv-err" id="new-conv-err" hidden></div>
-    <div id="tasks" data-lazy hx-get="/ui/tasks" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
-         hx-on::after-swap="ap.markTask()"><a class="task on" data-task="${t}"><div class="id">${t}</div><div class="meta">this conversation</div></a></div>
   </div>
   <div class="side-view" data-for="plugins">
     <h3>mounts</h3>
@@ -484,8 +473,8 @@ export function page(taskId: string, who: string, agentId: string): string {
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><span class="avatar lg" id="agent-avatar" hidden></span><h2 id="agent-name">${esc(agentId)}</h2>
-      <span class="sub" id="conv-title">${t}</span><span class="sub faint" id="conv-id"></span><span class="spacer"></span>
-      <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}tasks</button>
+      <span class="spacer"></span>
+      <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}agents</button>
       <button type="button" class="pane-btn" onclick="ap.pane('insp')">${ICONS.inspector}inspector</button>
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
         <input type="hidden" name="taskId" value="${t}">
@@ -648,26 +637,6 @@ export function page(taskId: string, who: string, agentId: string): string {
       if (name === 'main') delete document.body.dataset.pane; else document.body.dataset.pane = name;
       if (name === 'insp') htmx.trigger(document.getElementById('insp'), 'ap:show');
       if (name === 'side') document.querySelectorAll('.side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
-    },
-    markTask() {
-      const t = document.body.dataset.task;
-      document.querySelectorAll('#tasks .task').forEach(a => a.classList.toggle('on', a.dataset.task === t));
-      const row = document.querySelector('#tasks .task.on');
-      if (row && row.dataset.title && row.dataset.title !== '—') {
-        document.getElementById('conv-title').textContent = row.dataset.title;
-        document.getElementById('conv-id').textContent = t;
-      }
-    },
-    // Ids are minted by the server; the page never invents one. A refusal
-    // (the preview's anonymous viewer, or a gate) is said beside the button.
-    async newConversation(btn) {
-      const err = document.getElementById('new-conv-err'); err.hidden = true; btn.disabled = true;
-      try {
-        const r = await fetch('/ui/conversation', { method: 'POST', headers: { 'accept': 'application/json' }, body: new URLSearchParams({ agentId: document.body.dataset.agent }) });
-        if (!r.ok) { err.textContent = 'could not start a conversation: ' + r.status + ' ' + (await r.text()).slice(0, 120); err.hidden = false; return; }
-        const d = await r.json(); if (d && d.taskId) ap.task(d.taskId); else { err.textContent = 'the server returned no conversation id'; err.hidden = false; }
-      } catch (e) { err.textContent = 'could not reach the server'; err.hidden = false; }
-      finally { btn.disabled = false; }
     },
     // rUI's three themes: Brutal, Elegant, Elegant dark. The family goes on
     // data-theme; Elegant's mode is a class; Brutal has no dark mode.
@@ -1284,7 +1253,9 @@ export function inbox(d: any): string {
       hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "approved" }))}'>approve</button>
     <button class="bad" hx-post="/ui/decide" hx-target="#inbox" hx-swap="innerHTML"
       hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "denied" }))}'>deny</button>
-    <a class="open" href="/ui?view=agents&taskId=${encodeURIComponent(a.taskId)}" onclick="ap.task('${esc(a.taskId)}');return false">open the conversation →</a>
+    ${a.agentId
+      ? `<a class="open" href="/ui?view=agents&agentId=${encodeURIComponent(a.agentId)}" onclick="ap.agent('${esc(a.agentId)}');return false">open the agent →</a>`
+      : `<a class="open" href="/ui?view=agents&taskId=${encodeURIComponent(a.taskId)}" onclick="ap.task('${esc(a.taskId)}');return false">open the conversation →</a>`}
   </div>
 </div>`;
   };
