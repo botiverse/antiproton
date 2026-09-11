@@ -386,6 +386,24 @@ check("the held-approvals panel is capped and card arguments wrap", () => {
   must(/\.card pre,\.inbox-card pre\{[^}]*white-space:pre-wrap/.test(css), "card argument blocks wrap");
 });
 
+// An agent-raised hold (confirm: true, recorded as heldBy "agent") reads as
+// the agent asking, not as a policy stopping it, on the inbox card and the
+// conversation's approvals card alike.
+check("an agent-raised hold says the agent asked, a policy hold says held by", () => {
+  const inb = inbox({ viewer: "someone", pending: [
+    { operationId: "op-a", taskId: "t", agentId: "u-x", tool: "gh.issue_create", args: { title: "x" }, requestedAt: new Date().toISOString(), heldBy: "the agent" },
+    { operationId: "op-p", taskId: "t", agentId: "u-x", tool: "node.exec", args: { cmd: "ls" }, requestedAt: new Date().toISOString(), heldBy: "node policy" },
+  ], tasks: { total: 1, running: 1 } });
+  must(/the agent asked you to confirm/.test(inb) && !/held by the agent/.test(inb), "the agent-raised card says the agent asked");
+  must(/held by node policy/.test(inb), "a policy hold still says held by the policy");
+  const rows: any[] = [
+    { operationId: "op-a", mountAlias: "gh", tool: "issue_create", state: "pending", request: { args: { title: "x" }, heldBy: "agent" } },
+    { operationId: "op-p", mountAlias: "node", tool: "exec", state: "pending", request: { args: { cmd: "ls" } } },
+  ];
+  const panel = approvals(rows);
+  must(count(panel, /the agent asked you to confirm/g) === 1, "only the agent-raised card carries the badge in the conversation panel");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
