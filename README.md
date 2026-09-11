@@ -494,18 +494,15 @@ them:
   instead of offering a box that produces a mount which dies when the token
   expires. No plugin declares one yet, so the declaration is a capability the
   contract has rather than behaviour to observe.
-- **Threads are a column, not a feature.** Events carry a `thread_id` and the
-  object accepts one on write, so the column is real on the deployed path. What
-  is missing underneath it is the rest: the SQLite store has `threads`,
-  `task_threads` (many-to-many) and the three methods that use them, and the
-  Durable Object — the thing the console actually runs on — has none of those,
-  only the column. The `POST /agents/:id/threads` routes exist in
-  `src/api/server.ts`, but that file takes a `SqliteStore` and nothing calls it,
-  so it is a local harness rather than a deployed surface. And nothing reads the
-  column: the console reads a task's transcript with no notion of which thread a
-  message belongs to, so a person sees one conversation per task however many
-  the column could distinguish. Creating conversations is therefore new work
-  rather than wiring, which is what the console refactor assumes.
+- **Threads below the level the console uses.** Conversations ship: a person can
+  open several against one agent, each is a session inside the object with its
+  own pi tables, and mounts, credentials and memory stay shared per agent, which
+  is what you would want. What remains unused is the older threading layer:
+  `events.thread_id` is a column nothing reads, and the SQLite store's
+  `threads`/`task_threads` tables and the `POST /agents/:id/threads` routes that
+  use them are not on the deployed path at all — `src/api/server.ts` takes a
+  `SqliteStore` and nothing calls it. So there are two vocabularies for the same
+  idea and only one of them is live; the console says conversation.
 - **External events.** Nothing can wake an agent from the outside yet — no
   webhooks. An agent now remembers across tasks, but it still cannot be woken
   by the world; that is the remaining half of "long-running".
