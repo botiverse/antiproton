@@ -328,7 +328,7 @@ check("the avatar is a pure function of its seed, on both sides of the wire", ()
   must(!/#[0-9a-f]{3,6}|rgb\(|hsl\(/i.test(avatarSvg("deadbeef")), "colours are the shell's variables, not literals");
   const inPage = new Function(AVATAR_JS + "; return apAvatar;")();
   must(seeds.every((x) => inPage(x) === avatarSvg(x)), "the shell's copy draws the same picture as the server's");
-  must(/^function apAvatar\(/.test(AVATAR_JS) && !/\bimport\b|\brequire\b|\besc\(/.test(AVATAR_JS), "the shipped source is self-contained under a fixed name");
+  must(/^function apAvatar\(/.test(AVATAR_JS) && !/\bimport\b|\brequire\b|\besc\(|__name|toString/.test(AVATAR_JS), "the shipped source is self-contained under a fixed name, with no bundler helper in it");
 });
 check("the shell carries the current agent and sends it with every panel request", () => {
   const html = page("t_u-x", "someone", "u-x_k3");

@@ -1327,25 +1327,34 @@ export function taskList(d: any): string {
  * them in Elegant and squares them in Brutal. Sizes are the container's.
  *
  * The same drawing runs in the page, for the preview on the create form,
- * so the function is written once and shipped both ways: `avatarSvg` calls
- * it here and `AVATAR_JS` is its source text for the shell. A test holds
- * the two to the same output, seed by seed.
+ * so it exists twice: `avatarSvg` here and `AVATAR_JS`, the same drawing as
+ * plain page source. A test holds the two to the same output, seed by seed.
  */
-function apAvatar(seed: unknown): string {
-  var hex = String(seed == null ? "" : seed).toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 8);
+export function avatarSvg(seed: unknown): string {
+  let hex = String(seed == null ? "" : seed).toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 8);
   while (hex.length < 8) hex += "0";
-  var n = parseInt(hex, 16) >>> 0, cells = "";
-  var box = function (c: number, r: number) { return '<rect x="' + c + '" y="' + r + '" width="1" height="1"/>'; };
+  let n = parseInt(hex, 16) >>> 0, cells = "";
+  const box = (c: number, r: number) => `<rect x="${c}" y="${r}" width="1" height="1"/>`;
   if ((n & 0x7fff) === 0) n |= 0x40;
-  for (var r = 0; r < 5; r++) for (var c = 0; c < 3; c++) if ((n >>> (r * 3 + c)) & 1) { cells += box(c, r); if (c < 2) cells += box(4 - c, r); }
-  var tone = ["--accent", "--action", "--ink", "--js", "--ok"][(n >>> 15) % 5];
-  return '<svg viewBox="0 0 5 5" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><rect width="5" height="5" fill="var(--sunk)"/><g fill="var(' + tone + ')">' + cells + "</g></svg>";
+  for (let r = 0; r < 5; r++) for (let c = 0; c < 3; c++) if ((n >>> (r * 3 + c)) & 1) { cells += box(c, r); if (c < 2) cells += box(4 - c, r); }
+  const tone = ["--accent", "--action", "--ink", "--js", "--ok"][(n >>> 15) % 5];
+  return `<svg viewBox="0 0 5 5" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><rect width="5" height="5" fill="var(--sunk)"/><g fill="var(${tone})">${cells}</g></svg>`;
 }
-export const avatarSvg = (seed: string): string => apAvatar(seed);
-// The function's own source, under a fixed name whatever a bundler renames
-// it to. It reads nothing outside itself, so the text is the whole of it.
-// Not `new Function`: a Worker refuses code built from strings at runtime.
-export const AVATAR_JS = "function apAvatar" + apAvatar.toString().slice(apAvatar.toString().indexOf("("));
+// The page's copy, as plain source. Written out rather than taken from
+// avatarSvg.toString(): a bundler rewrites a function's body (esbuild adds a
+// __name helper), so the text of a compiled function is not shippable.
+// Not new Function either: a Worker refuses code built from strings. The
+// test holds this text to avatarSvg, seed by seed.
+export const AVATAR_JS = `function apAvatar(seed) {
+    var hex = String(seed == null ? '' : seed).toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8);
+    while (hex.length < 8) hex += '0';
+    var n = parseInt(hex, 16) >>> 0, cells = '';
+    var box = function (c, r) { return '<rect x="' + c + '" y="' + r + '" width="1" height="1"/>'; };
+    if ((n & 0x7fff) === 0) n |= 0x40;
+    for (var r = 0; r < 5; r++) for (var c = 0; c < 3; c++) if ((n >>> (r * 3 + c)) & 1) { cells += box(c, r); if (c < 2) cells += box(4 - c, r); }
+    var tone = ['--accent', '--action', '--ink', '--js', '--ok'][(n >>> 15) % 5];
+    return '<svg viewBox="0 0 5 5" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><rect width="5" height="5" fill="var(--sunk)"/><g fill="var(' + tone + ')">' + cells + '</g></svg>';
+  }`;
 
 /**
  * The person's agents for the sidebar, newest first, as the route lists
