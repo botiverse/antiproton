@@ -113,11 +113,6 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .task .meta{color:var(--dim);font-size:10.5px;margin-top:3px}
 .task .title{font-size:12px;color:var(--ink)}
 .task .tid{font-family:var(--mono-font)}
-.new-conv{width:100%;justify-content:center;margin:0 0 10px;gap:6px}
-.new-conv svg{width:14px;height:14px}
-.new-conv-err{font-size:11px;color:var(--bad);margin:-4px 0 10px}
-.new-conv-err[hidden]{display:none}
-.sidebar h3.later{margin-top:16px}
 /* --- agents: an avatar drawn from the agent's seed, a name, one line of
    what it is for. The create form sits in the sidebar, no dialog. */
 .avatar{display:inline-block;width:22px;height:22px;flex:none;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--sunk);vertical-align:middle}
@@ -405,8 +400,11 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
  * Every panel is still a plain GET that renders the store directly; the
  * shell keeps only which section is showing and which mode the viewer chose.
  */
-export function page(taskId: string, who: string, agentId: string): string {
-  const t = esc(taskId);
+export function page(_taskId: string, who: string, agentId: string): string {
+  // The first argument is the conversation id the route used to pass. An
+  // agent has one conversation now, so the page carries no task id; the
+  // routes default to the agent's own. The parameter stays so the call site
+  // in index.ts does not change.
   const initial = (who || "?").trim().slice(0, 1);
   // A lazily loaded, polled fragment: loads when its view or section is shown,
   // then re-reads the store every few seconds while it stays shown. The
@@ -419,7 +417,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   const inspTab = (name: string) => `<button type="button" role="tab" data-insp="${name}" onclick="ap.insp('${name}')">${name}</button>`;
   const a = encodeURIComponent(agentId);
   const rail = (view: string, label: string) =>
-    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&agentId=${a}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
+    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&agentId=${a}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
   return `<!doctype html><html lang="en" data-theme="brutal"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>antiproton</title>
@@ -427,7 +425,7 @@ export function page(taskId: string, who: string, agentId: string): string {
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
-<style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}" data-agent="${esc(agentId)}">
+<style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-agent="${esc(agentId)}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("inbox", "inbox").replace('</span><span>inbox', '</span><b class="count" id="inbox-count" hidden></b><span>inbox')}
@@ -462,12 +460,6 @@ export function page(taskId: string, who: string, agentId: string): string {
     </form>
     <div id="agents" data-lazy hx-get="/ui/agents" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
          hx-on::after-swap="ap.markAgent()"></div>
-    <h3 class="later">conversations</h3>
-    <div class="sub">of this agent, latest activity first</div>
-    <button type="button" class="ghost new-conv" onclick="ap.newConversation(this)">${ICONS.plus}new conversation</button>
-    <div class="err new-conv-err" id="new-conv-err" hidden></div>
-    <div id="tasks" data-lazy hx-get="/ui/tasks" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
-         hx-on::after-swap="ap.markTask()"><a class="task on" data-task="${t}"><div class="id">${t}</div><div class="meta">this conversation</div></a></div>
   </div>
   <div class="side-view" data-for="plugins">
     <h3>mounts</h3>
@@ -484,26 +476,24 @@ export function page(taskId: string, who: string, agentId: string): string {
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><span class="avatar lg" id="agent-avatar" hidden></span><h2 id="agent-name">${esc(agentId)}</h2>
-      <span class="sub" id="conv-title">${t}</span><span class="sub faint" id="conv-id"></span><span class="spacer"></span>
-      <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}tasks</button>
+      <span class="spacer"></span>
+      <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}agents</button>
       <button type="button" class="pane-btn" onclick="ap.pane('insp')">${ICONS.inspector}inspector</button>
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
-        <input type="hidden" name="taskId" value="${t}">
         <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
       </form></div>
     <div class="banner" id="banner" hidden><span class="dot"></span><span class="text"></span>
       <a href="/ui?view=inbox" onclick="ap.show('inbox');return false">review</a></div>
     <div class="conv">
       <div class="body" id="transcript" data-lazy
-           hx-get="/ui/chat?taskId=${t}" hx-swap="innerHTML"
+           hx-get="/ui/chat" hx-swap="innerHTML"
            hx-trigger="ap:show, every 2s[${inView}]"
            hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
            onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
            >loading…</div>
-      <div class="held" id="approvals" data-lazy hx-get="/ui/approvals?taskId=${t}" hx-swap="innerHTML"
+      <div class="held" id="approvals" data-lazy hx-get="/ui/approvals" hx-swap="innerHTML"
            hx-trigger="ap:show, every 2s[${inView}]"></div>
       <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-on::after-request="this.reset()">
-        <input type="hidden" name="taskId" value="${t}">
         <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
         <button type="submit" name="mode" value="steer">send</button>
         <button type="submit" name="mode" value="followUp" class="ghost"
@@ -533,7 +523,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   <div class="tabs" role="tablist" aria-label="inspector">
     ${inspTab("trajectory")}${inspTab("events")}${inspTab("storage")}${inspTab("memory")}${inspTab("sandbox")}${inspTab("runtime")}
   </div>
-  <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/transcript?taskId=${t}" hx-swap="innerHTML"
+  <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/transcript" hx-swap="innerHTML"
        hx-trigger="ap:show, every 3s[document.body.dataset.view==='agents']">loading…</div>
   <div class="hint" style="padding:8px 0 0">Every tab re-reads the store while it is showing; nothing is cached client-side.</div>
 </aside>
@@ -573,15 +563,10 @@ export function page(taskId: string, who: string, agentId: string): string {
         ? '1 call is waiting for you: ' + (first ? first.textContent : '')
         : n + ' calls are waiting for you';
     },
-    task(id) {
-      const u = new URL(location.href); u.searchParams.set('taskId', id); u.searchParams.set('view', 'agents');
-      location.href = u.toString();
-    },
-    // Switching agents drops the conversation: the server opens the agent's
-    // default one. The agent id stays on the URL from here on, and every
-    // panel request carries it (see the configRequest hook below).
+    // Switching agents: the agent id goes on the URL and every panel
+    // request carries it from there (the configRequest hook below).
     agent(id) {
-      const u = new URL(location.href); u.searchParams.set('agentId', id); u.searchParams.delete('taskId'); u.searchParams.set('view', 'agents');
+      const u = new URL(location.href); u.searchParams.set('agentId', id); u.searchParams.set('view', 'agents');
       location.href = u.toString();
     },
     markAgent() {
@@ -640,7 +625,7 @@ export function page(taskId: string, who: string, agentId: string): string {
       if (!paths[name]) name = 'trajectory';
       document.querySelectorAll('.inspector [role=tab]').forEach(b => { const on = b.dataset.insp === name; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
       const panel = document.getElementById('insp');
-      panel.setAttribute('hx-get', paths[name] + '?taskId=' + encodeURIComponent(document.body.dataset.task));
+      panel.setAttribute('hx-get', paths[name]);
       htmx.process(panel); htmx.trigger(panel, 'ap:show');
       const u = new URL(location.href); u.searchParams.set('insp', name); history.replaceState(null, '', u);
     },
@@ -648,26 +633,6 @@ export function page(taskId: string, who: string, agentId: string): string {
       if (name === 'main') delete document.body.dataset.pane; else document.body.dataset.pane = name;
       if (name === 'insp') htmx.trigger(document.getElementById('insp'), 'ap:show');
       if (name === 'side') document.querySelectorAll('.side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
-    },
-    markTask() {
-      const t = document.body.dataset.task;
-      document.querySelectorAll('#tasks .task').forEach(a => a.classList.toggle('on', a.dataset.task === t));
-      const row = document.querySelector('#tasks .task.on');
-      if (row && row.dataset.title && row.dataset.title !== '—') {
-        document.getElementById('conv-title').textContent = row.dataset.title;
-        document.getElementById('conv-id').textContent = t;
-      }
-    },
-    // Ids are minted by the server; the page never invents one. A refusal
-    // (the preview's anonymous viewer, or a gate) is said beside the button.
-    async newConversation(btn) {
-      const err = document.getElementById('new-conv-err'); err.hidden = true; btn.disabled = true;
-      try {
-        const r = await fetch('/ui/conversation', { method: 'POST', headers: { 'accept': 'application/json' }, body: new URLSearchParams({ agentId: document.body.dataset.agent }) });
-        if (!r.ok) { err.textContent = 'could not start a conversation: ' + r.status + ' ' + (await r.text()).slice(0, 120); err.hidden = false; return; }
-        const d = await r.json(); if (d && d.taskId) ap.task(d.taskId); else { err.textContent = 'the server returned no conversation id'; err.hidden = false; }
-      } catch (e) { err.textContent = 'could not reach the server'; err.hidden = false; }
-      finally { btn.disabled = false; }
     },
     // rUI's three themes: Brutal, Elegant, Elegant dark. The family goes on
     // data-theme; Elegant's mode is a class; Brutal has no dark mode.
@@ -1276,7 +1241,7 @@ export function inbox(d: any): string {
     const req = a.args ?? {};
     return `<div class="card inbox-card">
   <div class="inbox-head"><span class="tool">${esc(a.tool)}</span>
-    <span class="meta">${esc(a.taskId)}${a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
+    <span class="meta">${esc(a.agentId ?? "")}${a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
   <div class="k">the request, verbatim</div>
   <pre>${esc(JSON.stringify(req, null, 2))}</pre>
   <div class="row">
@@ -1284,7 +1249,7 @@ export function inbox(d: any): string {
       hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "approved" }))}'>approve</button>
     <button class="bad" hx-post="/ui/decide" hx-target="#inbox" hx-swap="innerHTML"
       hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "denied" }))}'>deny</button>
-    <a class="open" href="/ui?view=agents&taskId=${encodeURIComponent(a.taskId)}" onclick="ap.task('${esc(a.taskId)}');return false">open the conversation →</a>
+    <a class="open" href="/ui?view=agents&agentId=${encodeURIComponent(a.agentId ?? "")}" onclick="ap.agent('${esc(a.agentId ?? "")}');return false">open the agent →</a>
   </div>
 </div>`;
   };
@@ -1294,28 +1259,6 @@ export function inbox(d: any): string {
   return `<div class="inbox-list" data-pending="${pending.length}">${body}</div>`;
 }
 
-/**
- * The agent's tasks, latest activity first, for the sidebar.
- *
- * `turns` is null from the route because transcript entries carry no task id,
- * so it is not shown rather than shown as zero: a zero would say "this task
- * ran nothing", which is a different and false claim. The current task is
- * marked client-side from the URL, so the route stays a plain store read.
- * The title is the first line of the first user message when the route has
- * one, since a person recognises a conversation by what they asked; when it
- * has none the row shows a dash and the id stays in the meta line, so an id
- * is never dressed up as a title.
- */
-export function taskList(d: any): string {
-  const tasks: any[] = d?.tasks ?? [];
-  const when = (iso: string) => { const t = Date.parse(iso); return Number.isNaN(t) ? "" : new Date(t).toISOString().slice(0, 16).replace("T", " ") + "Z"; };
-  if (!tasks.length) return `<div class="empty">no tasks yet</div>`;
-  const title = (t: any) => typeof t.title === "string" && t.title.trim() ? esc(t.title.trim().slice(0, 80)) : "—";
-  return tasks.map((t) => `<a class="task" data-task="${esc(t.taskId)}" data-title="${title(t)}" href="/ui?view=agents&taskId=${encodeURIComponent(t.taskId)}" onclick="ap.task('${esc(t.taskId)}');return false">
-  <div class="id"><span class="title">${title(t)}</span>${t.busy ? ` <span class="tag ok">working</span>` : ""}${t.pending ? ` <span class="tag warn">${t.pending} held</span>` : ""}</div>
-  <div class="meta"><span class="tid">${esc(t.taskId)}</span>${t.status ? ` · ${esc(t.status)}` : ""}${t.lastActivityAt ? ` · ${esc(when(t.lastActivityAt))}` : ""}${typeof t.turns === "number" ? ` · ${t.turns} turns` : ""}</div>
-</a>`).join("");
-}
 
 /**
  * An agent's avatar, drawn from its seed.
