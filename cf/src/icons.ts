@@ -6,6 +6,9 @@
  * and monitor for the theme control; chevron-left, list-todo and panel-right
  * for the phone's pane controls. Path data is from lucide-react 1.44.0
  * (ISC), copied here because the Worker serves strings and has no bundle.
+ * Copyright (c) 2026 Lucide Icons and Contributors; chevron-left, monitor and
+ * moon derive from Feather, Copyright (c) 2013-present Cole Bemis (MIT). The
+ * full notices are carried in NOTICE at the repository root.
  * Each icon sits beside a visible label or in a control with its own
  * aria-label, so the SVG itself is aria-hidden.
  */
