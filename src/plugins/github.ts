@@ -239,6 +239,25 @@ export const githubPlugin: Plugin = {
     }, ["path"], "write"),
   ],
 
+  /**
+   * The same question `auth_status` answers, asked by the person configuring
+   * the mount rather than by the agent using it. A token that is expired,
+   * revoked, or simply the wrong one of several is indistinguishable from a
+   * working one until something is called with it; here it costs one request
+   * while the person still remembers which key they pasted.
+   */
+  async checkCredential(ctx) {
+    if (!ctx.credential) {
+      return { ok: false, reason: "no token — this mount can only read public data" };
+    }
+    try {
+      const u = await call("GET", "/user", ctx);
+      return { ok: true, account: u.login };
+    } catch (e) {
+      return { ok: false, reason: String((e as Error)?.message ?? e) };
+    }
+  },
+
   async invoke(name, args, ctx): Promise<Json> {
     const a = (args ?? {}) as Record<string, any>;
     switch (name) {

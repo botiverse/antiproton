@@ -8,6 +8,13 @@
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { run9Plugin, execArgv } from "../src/plugins/run9.ts";
+import { httpPlugin } from "../src/plugins/http.ts";
+import { demoPlugin } from "../src/plugins/demo.ts";
+import { statePlugin } from "../src/plugins/state.ts";
+import { artifactsPlugin } from "../src/plugins/artifacts.ts";
+import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
+import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
+import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -89,6 +96,86 @@ check("network open, or unset, runs the shell as before", () => {
 check("network is a mount setting", () => {
   const p = validateMount(run9, { network: "none" } as any, "env:RUN9");
   if (p.length) throw new Error(`unexpected problems: ${p.map((x) => x.message).join("; ")}`);
+});
+
+// AppWorld's catalogue is gitignored, and a mount does not need it: one app
+// with one API is enough to build the plugin and ask it what it takes.
+const catalogue: Catalogue = {
+  spotify: {
+    description: "music",
+    apis: [{
+      app_name: "spotify", api_name: "search_songs", path: "/search_songs", method: "GET",
+      description: "find songs",
+      parameters: [{ name: "access_token", type: "string", required: true, description: "", default: null, constraints: [] }],
+    }],
+  },
+};
+const [spotify] = appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" });
+
+check("appworld says it needs an account instead of failing on the first call", () => {
+  const p = validateMount(spotify!, {} as any, null);
+  if (!p.some((x) => x.message.includes("needs an account"))) {
+    throw new Error(`a mount with no credential was accepted: ${JSON.stringify(p)}`);
+  }
+});
+
+check("a credential field carries a label and says which part is secret", () => {
+  const shape = spotify!.credential!.shape;
+  if (shape === "token" || !shape.keys.every((k) => k.name && k.summary)) {
+    throw new Error(`a page has nothing to label these with: ${JSON.stringify(shape)}`);
+  }
+  const username = shape.keys.find((k) => k.name === "username");
+  if (username?.secret !== false) throw new Error("a username is an identifier, not a secret");
+});
+
+/**
+ * The one path that puts a credential where the model can read it.
+ *
+ * `public_config` is rendered in the console *and* handed to the agent by the
+ * builtin `tools.mounts`, while `secret_ref` is exposed in neither. So a
+ * credential entered into a settings field rather than the credential field is
+ * in the prompt, and nothing downstream can tell it apart from an image name.
+ *
+ * The check is a declaration rather than a guess about vocabulary. A name is
+ * not a value — run9's `secrets` setting names the secrets to inject and
+ * carries none of them — so a field whose name is credential-shaped says which
+ * of the two it is, and one that says nothing is refused. A new field that
+ * forgets to say fails here rather than in the console.
+ */
+const CREDENTIAL_SHAPED = /token|secret|key|password|credential|auth|bearer/i;
+const everyPlugin: Plugin[] = [
+  githubPlugin, httpPlugin, demoPlugin, run9,
+  statePlugin(null as any, null, "local"),
+  artifactsPlugin(null as any, "local"),
+  builtinToolsPlugin(null as any, () => []),
+  ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
+];
+
+check("no plugin takes a credential as a setting", () => {
+  for (const plugin of everyPlugin) {
+    const shape = plugin.credential?.shape;
+    const credentialKeys = new Set(
+      shape && shape !== "token" ? shape.keys.map((k) => k.name) : [],
+    );
+    for (const f of plugin.config ?? []) {
+      if (credentialKeys.has(f.name)) {
+        throw new Error(`${plugin.id} declares "${f.name}" as both a setting and part of its credential`);
+      }
+      if (CREDENTIAL_SHAPED.test(f.name) && f.references !== "credential") {
+        throw new Error(
+          `${plugin.id}'s setting "${f.name}" reads as a credential and does not say it only names one; ` +
+          `settings are public, so if it holds a value it is in the prompt`,
+        );
+      }
+    }
+  }
+});
+
+check("the marker is what makes run9's secrets setting legitimate, not its name", () => {
+  const field = run9.config!.find((f) => f.name === "secrets")!;
+  if (field.references !== "credential") throw new Error("run9's secrets setting lost its marker");
+  const { references, ...unmarked } = field;
+  if (!CREDENTIAL_SHAPED.test(unmarked.name)) throw new Error("the pattern stopped matching the case it exists for");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
