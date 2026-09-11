@@ -1,6 +1,7 @@
 # The status report
 
-`public/index.html` is a single self-contained page. Publish it with:
+`public/index.html` is a static page that links a stylesheet beside it; the
+directory is published as-is. Publish it with:
 
     cd report && npx wrangler deploy
 
