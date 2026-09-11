@@ -1985,7 +1985,7 @@ function requireViewer(request: Request, env: Env): { who: string } | Response {
 /**
  * Guards the endpoints that spend the operator's model account.
  *
- * Access protects the custom hostname, but the workers.dev address bypasses it
+ * Access protects the custom hostnames (antiproton.botiverse.dev and antiproton.ai), but the workers.dev address bypasses them
  * entirely, and several routes there start a real agent. Either a Cloudflare
  * identity or the automation secret is required; anything else is refused. The
  * diagnostics (conformance, isolation, eviction) stay open because they call no

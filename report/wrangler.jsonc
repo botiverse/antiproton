@@ -13,6 +13,9 @@
   // from every network the readers are on — which is the same reason the console
   // sits on this zone rather than that one. Additive: a new subdomain, nothing
   // touched that already exists.
-  "routes": [{ "pattern": "report.botiverse.dev", "custom_domain": true }],
+  "routes": [
+    { "pattern": "report.botiverse.dev", "custom_domain": true },
+    { "pattern": "report.antiproton.ai", "custom_domain": true }
+  ],
   "assets": { "directory": "./public" }
 }

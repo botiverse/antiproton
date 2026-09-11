@@ -12,6 +12,7 @@
   // needs zone permission this token does not hold, so the domain is added in
   // the dashboard by the account owner (Settings > Domains & Routes).
   "workers_dev": true,
+  "routes": [{ "pattern": "preview.antiproton.ai", "custom_domain": true }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentDO"] }],
   "durable_objects": { "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }] },
   "worker_loaders": [{ "binding": "LOADER" }],
