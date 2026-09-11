@@ -4,7 +4,7 @@
  * session keeps the tables it always had.
  */
 import { piTables, MAIN_SESSION } from "../src/store/pi-storage.ts";
-import { PiAgent, jobSession, sessionsWithWork } from "../src/runtime/pi-agent.ts";
+import { PiAgent, jobSession, sessionsWithWork, failedRuns } from "../src/runtime/pi-agent.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 
@@ -127,6 +127,24 @@ await check("a session that remembers old tool names runs again after the names 
   const out = await B.step();
   if (dispatched.length !== 1) throw new Error(`no model call after reopen: dispatched ${dispatched.length}, settled ${JSON.stringify(out.settled)}`);
   await B.close(); host.dispose();
+});
+
+
+await check("a run that failed before its first model call is readable with pi's reason", async () => {
+  const host = sqliteHost();
+  const MODEL = { provider: "queue", id: "m", contextWindow: 128_000 };
+  const A = await PiAgent.open({ host, sessionId: "s", systemPrompt: "be brief", model: MODEL, tools: [],
+    toolHost: { async invoke() { return { status: "succeeded", result: { ok: true } }; } }, async dispatch() {} });
+  if (failedRuns(host.sql).length !== 0) throw new Error("a fresh session reports failed runs");
+  // What pi writes for a run refused at generation: an outcome record, no entry.
+  const t = piTables(MAIN_SESSION);
+  host.sql.exec(`INSERT INTO ${t.values}(namespace, key, seq, body) VALUES ('pi.result', 'op-1', 999, ?)`,
+    JSON.stringify({ operationId: "op-1", kind: "run", status: "failed", error: { code: "configured_tools_unavailable", message: "One or more configured tools are unavailable in this process" } }));
+  host.sql.exec(`INSERT INTO ${t.values}(namespace, key, seq, body) VALUES ('pi.result', 'op-2', 1000, ?)`,
+    JSON.stringify({ operationId: "op-2", kind: "run", status: "completed" }));
+  const f = failedRuns(host.sql);
+  if (f.length !== 1 || f[0]!.operationId !== "op-1" || f[0]!.code !== "configured_tools_unavailable") throw new Error(`wrong failed runs: ${JSON.stringify(f)}`);
+  await A.close(); host.dispose();
 });
 
 console.log(`\n  Sessions\n  ${"─".repeat(56)}`);

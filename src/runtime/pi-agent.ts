@@ -25,7 +25,7 @@ import { LaneBusy } from "@earendil-works/pi-agent-core";
 import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
-import { PiSqliteStorage, ensurePiTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
+import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort } from "../model/pi-offloaded.ts";
 import { bridgeTools, type MountedTool, type ToolHost } from "./pi-tools.ts";
 
@@ -86,6 +86,33 @@ export function jobSession(sql: SqlHost["sql"], jobId: string): string | null {
 
 /** The sessions a wake should step: marked active by their last step, or
  *  holding a model call that has not been answered. */
+/**
+ * Runs that ended failed, with pi's own reason. pi records the outcome of
+ * every operation in its values table and writes no transcript entry for a
+ * run that failed before its first model call, so such a run is invisible in
+ * the transcript unless it is read from here: the message is there, then
+ * nothing. Today's example was a configuration failure; the page shows
+ * these as "model failed" with the code and message.
+ */
+export function failedRuns(sql: SqlHost["sql"], session: string = MAIN_SESSION): Array<{ seq: number; operationId: string; code: string; message: string; at: number }> {
+  const t = piTables(session);
+  const out: Array<{ seq: number; operationId: string; code: string; message: string; at: number }> = [];
+  let rows: any[] = [];
+  try { rows = sql.exec(`SELECT seq, body FROM ${t.values} WHERE namespace = 'pi.result' ORDER BY seq ASC`).toArray() as any[]; }
+  catch { return out; }
+  for (const r of rows) {
+    let b: any; try { b = JSON.parse(String(r.body)); } catch { continue; }
+    if (b?.status !== "failed") continue;
+    let at = 0;
+    if (b.fromTipId) {
+      const e = sql.exec(`SELECT timestamp FROM ${t.entries} WHERE id = ?`, b.fromTipId).toArray()[0] as any;
+      at = Number(e?.timestamp ?? 0);
+    }
+    out.push({ seq: Number(r.seq), operationId: String(b.operationId ?? ""), code: String(b.error?.code ?? "failed"), message: String(b.error?.message ?? ""), at });
+  }
+  return out;
+}
+
 export function sessionsWithWork(sql: SqlHost["sql"]): string[] {
   const rows = sql.exec(
     `SELECT session FROM pi_sessions WHERE active = 1
