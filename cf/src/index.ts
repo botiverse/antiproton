@@ -1197,21 +1197,14 @@ export class AgentDO extends DurableObject<Env> {
       // storage instead of as text. Both were invisible until something else
       // broke. Config and policy are now compared, not merely defaulted.
       const desired = AgentRuntime.DEFAULT_MOUNTS;
+      // One add path for both routes in: provision adds what is missing and
+      // validates each seed as it goes. What the console adds on top is the
+      // reconcile below, for a mount that exists but no longer matches.
+      await rt.provision(tenantId, agentId, desired);
       for (const d of desired) {
-        // The pin is the registry's version, never a literal: the gateway
-        // refuses a call whose pin disagrees with the registry, so a literal
-        // is a mount that stops working the day its plugin moves.
-        const toolVersion = rt.pluginVersion(d.plugin) ?? "1.0.0";
         const config = d.config ?? { account: d.account };
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
-        if (!have) {
-          await rt.store.addMount({
-            tenantId, agentId, alias: d.alias, plugin: d.plugin,
-            installationId: `inst-${d.alias}`, connectionId: null, toolVersion,
-            publicConfig: config, secretRef: d.secretRef ?? null, policy: d.policy ?? null,
-          });
-          continue;
-        }
+        if (!have) continue;
         if (JSON.stringify(have.publicConfig) !== JSON.stringify(config)) {
           await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
         }

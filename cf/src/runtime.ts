@@ -30,6 +30,7 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  */
 const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
+import { assertMountConfig } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
@@ -522,6 +523,13 @@ export class AgentRuntime {
     }
     for (const m of mounts) {
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
+      // The seed is hand-written and reaches every agent, and the console's
+      // validator only shows problems to whoever opens the plugins page. The
+      // throwing one had no caller at all. A misspelt setting is refused here,
+      // at the first agent it would have reached, rather than becoming the
+      // plugin's silent default everywhere.
+      const plugin = this.#plugins.find((p) => p.id === m.plugin);
+      if (plugin) assertMountConfig(plugin, (m.config ?? { account: m.account }) as Record<string, Json>, m.secretRef ?? null);
       await this.store.addMount({
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: `inst-${m.alias}`, connectionId: null,
