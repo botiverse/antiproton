@@ -169,10 +169,13 @@ export const httpPlugin: Plugin = {
     //
     // Named in bytes and applied in UTF-16 code units: `text.slice(0, maxBytes)`
     // counts units, so 24,000 units of CJK is 72,000 bytes. Measured and left
-    // alone deliberately — the tool-result offload counts the same unit
-    // (`JSON.stringify(result).length` in cf/src/runtime.ts), so both sides are
-    // wrong in the same direction and agree, and a rename would refuse every
-    // mount already carrying the old key.
+    // alone deliberately — the tool-result offload counts the same unit, so
+    // both sides are wrong in the same direction and therefore agree, and a
+    // rename would refuse every mount already carrying the old key.
+    //
+    // Quoted rather than paraphrased, so the citation can be grepped:
+    //     cf/src/runtime.ts:366   const body = JSON.stringify(res.result);
+    //     cf/src/runtime.ts:367   if (body.length <= OFFLOAD_BYTES) return res;
     { name: "maxBytes", type: "number", default: DEFAULT_MAX_BYTES,
       summary: "How much of a response body is returned. The rest is cut and discarded, not kept anywhere; `bytes` reports the full size, so a truncated result says how much went." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "How long one request may take." },
