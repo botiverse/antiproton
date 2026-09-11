@@ -284,13 +284,13 @@ export interface StorageAdapter {
   setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null): Promise<boolean>;
 
   // ---- per-agent secrets, sealed. The store holds ciphertext and metadata; it
-  // never sees a value, and `last4` is written once so no read derives it.
+  // never sees a value and keeps nothing derived from one.
   putSecret(tenantId: string, agentId: string, name: string, sealed: {
-    ciphertext: string; iv: string; last4: string; account?: string | null; verified?: boolean;
+    ciphertext: string; iv: string; account?: string | null; verified?: boolean;
   }): Promise<void>;
   getSecret(tenantId: string, agentId: string, name: string): Promise<{ ciphertext: string; iv: string } | null>;
   secretMeta(tenantId: string, agentId: string, name: string): Promise<{
-    last4: string; account: string | null; verified: boolean;
+    account: string | null; verified: boolean;
     createdAt: number; updatedAt: number; lastUsedAt: number | null;
   } | null>;
   touchSecret(tenantId: string, agentId: string, name: string, at: number): Promise<void>;

@@ -82,7 +82,7 @@ const SCHEMA = [
      secret_ref TEXT, policy TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
     `CREATE TABLE IF NOT EXISTS secrets (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, name TEXT NOT NULL,
-     ciphertext TEXT NOT NULL, iv TEXT NOT NULL, last4 TEXT NOT NULL,
+     ciphertext TEXT NOT NULL, iv TEXT NOT NULL,
      account TEXT, verified INTEGER NOT NULL DEFAULT 0,
      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER,
      PRIMARY KEY (tenant_id, agent_id, name))`,
@@ -120,6 +120,10 @@ export class DurableObjectStore implements StorageAdapter {
     for (const alter of [
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
+      // A secrets table created before the suffix column was dropped keeps a
+      // NOT NULL column the insert no longer fills; drop it, and with it the
+      // one plaintext fragment of a value the row ever held.
+      "ALTER TABLE secrets DROP COLUMN last4",
     ]) {
       try { this.#sql.exec(alter); } catch { /* already present */ }
     }
@@ -695,16 +699,16 @@ export class DurableObjectStore implements StorageAdapter {
 
   // ---- secrets: ciphertext in, ciphertext out; metadata is all a page gets.
   async putSecret(tenantId: string, agentId: string, name: string, s: {
-    ciphertext: string; iv: string; last4: string; account?: string | null; verified?: boolean;
+    ciphertext: string; iv: string; account?: string | null; verified?: boolean;
   }) {
     const t = this.#now();
     this.#sql.exec(
-      `INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, last4, account, verified, created_at, updated_at, last_used_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,NULL)
+      `INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, account, verified, created_at, updated_at, last_used_at)
+       VALUES (?,?,?,?,?,?,?,?,?,NULL)
        ON CONFLICT(tenant_id, agent_id, name) DO UPDATE SET
-         ciphertext=excluded.ciphertext, iv=excluded.iv, last4=excluded.last4, account=excluded.account,
+         ciphertext=excluded.ciphertext, iv=excluded.iv, account=excluded.account,
          verified=excluded.verified, updated_at=excluded.updated_at, last_used_at=NULL`,
-      tenantId, agentId, name, s.ciphertext, s.iv, s.last4, s.account ?? null, s.verified ? 1 : 0, t, t);
+      tenantId, agentId, name, s.ciphertext, s.iv, s.account ?? null, s.verified ? 1 : 0, t, t);
   }
 
   async getSecret(tenantId: string, agentId: string, name: string) {
@@ -715,10 +719,10 @@ export class DurableObjectStore implements StorageAdapter {
 
   async secretMeta(tenantId: string, agentId: string, name: string) {
     const r = this.#one(
-      "SELECT last4, account, verified, created_at, updated_at, last_used_at FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?",
+      "SELECT account, verified, created_at, updated_at, last_used_at FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?",
       tenantId, agentId, name) as any;
     return r ? {
-      last4: String(r.last4), account: r.account == null ? null : String(r.account), verified: Number(r.verified) === 1,
+      account: r.account == null ? null : String(r.account), verified: Number(r.verified) === 1,
       createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
       lastUsedAt: r.last_used_at == null ? null : Number(r.last_used_at),
     } : null;

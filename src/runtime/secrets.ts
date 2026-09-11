@@ -9,15 +9,15 @@
  *
  * Three properties, each pinned by a test:
  *  - the plaintext exists only in gateway memory for the duration of a call;
- *    the table holds ciphertext, an IV, and the last four characters written
- *    once at store time so that no read path ever touches the value;
+ *    the table holds ciphertext and an IV, and nothing derived from the value:
+ *    no read path touches it, and no fragment of it exists anywhere else;
  *  - an `agent:` reference resolves only against the (tenant, agent) that owns
  *    the mount naming it — the resolver takes the scope from the mount, not
  *    from the reference, so there is no reference one agent could write that
  *    reaches another's store;
  *  - nothing returns the value: not the console, not a tool result, not a
- *    transcript entry. The only outputs are `last4`, timestamps, and whatever
- *    a plugin's own `checkCredential` reports.
+ *    transcript entry. The only outputs are timestamps and whatever a
+ *    plugin's own `checkCredential` reports about the account.
  */
 import type { StorageAdapter } from "../core/store.ts";
 import type { SecretResolver } from "./gateway.ts";
@@ -53,11 +53,6 @@ export async function open(kek: CryptoKey, sealed: Sealed): Promise<string> {
   const pt = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: unb64(sealed.iv) }, kek, unb64(sealed.ciphertext));
   return dec.decode(pt);
-}
-
-/** What a page may see. Never the value. */
-export function last4(value: string): string {
-  return value.length <= 4 ? "" : value.slice(-4);
 }
 
 /**
