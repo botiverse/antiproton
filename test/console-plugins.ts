@@ -367,6 +367,16 @@ check("the shell refuses to swap a 304 poll response", () => {
   must(/htmx:beforeSwap/.test(html) && /status === 304\) e\.detail\.shouldSwap = false/.test(html), "a beforeSwap listener sets shouldSwap=false on 304");
 });
 
+// task #8: a send the server refused must not vanish. The composer resets
+// only on success and otherwise keeps the text and says why.
+check("the composer keeps a refused message and says why", () => {
+  const html = page("t_u-x", "someone", "u-x");
+  must(!/hx-on::after-request="this\.reset\(\)"/.test(html), "the composer no longer resets unconditionally");
+  must(/hx-post="\/ui\/message"[^>]*hx-on::after-request="ap\.sent\(this, event\)"/.test(html), "the composer reports through ap.sent");
+  must(/id="send-err" hidden/.test(html), "there is a place under the composer for the reason");
+  must(/if \(ev\.detail\.successful\) \{ form\.reset\(\)/.test(html) && /err\.textContent = 'not sent: '/.test(html), "reset only on success; otherwise the reason is shown");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
