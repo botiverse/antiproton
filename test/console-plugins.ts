@@ -22,6 +22,13 @@ const count = (s: string, re: RegExp) => (s.match(re) ?? []).length;
 // Declarations in the shape the plugins actually use: github (a bare token, the
 // mount works without one), appworld (an identifier and a password), run9 (two
 // secret keys), and a synthetic sign-in, which no plugin declares yet.
+//
+// appworld's `password` and run9's `ak`/`sk` deliberately carry no `secret`
+// flag. That is how the real plugins declare them, and it is the case that
+// once rendered a password in clear: a page reading the flag truthily inverts
+// the documented default. `credentialForm` resolves it now (#31), and these
+// fixtures are the page-side regression test for that — do not "simplify"
+// them by adding `secret: true`.
 const installed = [
   { id: "github", version: "1", tools: [], config: [],
     credential: { required: false, summary: "A GitHub personal access token, or a GitHub App installation token", shape: "token", grants: "writing to repositories" } },
