@@ -140,6 +140,14 @@ check("before the store exists, the read block is absent and the page still rend
   must(!/undefined|null|Invalid Date|set |last used /.test(html), "no metadata may be invented");
 });
 
+check("a key kept during an outage: attached, unverified, and the line says why rather than 'not yet tried'", () => {
+  const html = render(mount("gh", "github", { connected: true, credential: { attached: true, verified: false, account: null, error: "kept, could not be checked: fetch failed" } }));
+  must(/attached · unverified/.test(html), "still unverified");
+  must(/kept, could not be checked: fetch failed/.test(html), "the reason must show");
+  must(!/not yet tried/.test(html), "a key that was tried and could not be judged is not 'not yet tried'");
+  must(/<details><summary>replace<\/summary>/.test(html), "replace stays available so a re-check is one paste away");
+});
+
 check("a rejected paste: the reason shows, the form stays open, nothing is attached", () => {
   const html = render(mount("gh", "github", { optionalAccount: true, credential: { attached: false, account: null, error: "GitHub answered 401 for that token" } }));
   must(/<div class="err">GitHub answered 401 for that token<\/div>/.test(html), "the reason must show");

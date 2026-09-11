@@ -840,7 +840,10 @@ const when = (v: unknown): string | null => {
  *
  * Attached comes in two strengths — verified, when the plugin's check made a
  * call and returned who the key acts as, and unverified, when it was stored
- * and never tried — and the page keeps them apart. A reference the operator
+ * and not judged — and the page keeps them apart. Unverified says why when
+ * the store knows: a key kept during an outage reads "kept, could not be
+ * checked", not "not yet tried", so the person knows the key is not the
+ * suspect. A reference the operator
  * configured at deploy time is a third case: attached, but not by this page
  * and not changeable from it.
  */
@@ -902,7 +905,7 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
 
   const state = verified
     ? `<b>attached · verified</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}`
-    : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">stored, not yet tried</span>`;
+    : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">${error ? esc(error) : "stored, not yet tried"}</span>`;
   return `<div class="cred">
       <div class="state">${state}${times ? `<span class="when">${times}</span>` : ""}
         <form class="inline" hx-post="/ui/credential/remove" ${target}
