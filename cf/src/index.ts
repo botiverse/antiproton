@@ -2266,7 +2266,7 @@ export default {
           if (gate instanceof Response) return gate;
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
-          const taskId = String(url.searchParams.get("taskId"));
+          const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const unchanged = await notModified(request, stub, agentId, taskId);
           if (unchanged) return unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
@@ -2289,7 +2289,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
-          const taskId = String(url.searchParams.get("taskId"));
+          const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const unchanged = await notModified(request, stub, agentId, taskId);
           if (unchanged) return unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
@@ -2347,7 +2347,7 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
-          const taskId = String(url.searchParams.get("taskId"));
+          const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const unchanged = await notModified(request, stub, agentId, taskId);
           if (unchanged) return unchanged;
           const d = await stub.uiStorage("demo", agentId, taskId);
@@ -2400,7 +2400,7 @@ export default {
         case "/ui/approvals": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const taskId = String(url.searchParams.get("taskId"));
+          const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           return html(approvals(await stub.uiApprovals("demo", uiSelected?.agentId ?? uiAgent(gate.who), taskId)));
         }
         case "/ui/message": {
@@ -2410,7 +2410,7 @@ export default {
           if (gate instanceof Response) return gate;
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
-          const taskId = String(form.get("taskId"));
+          const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
           const text = String(form.get("text") ?? "").trim();
           const mode = String(form.get("mode")) === "followUp" ? "followUp" as const : "steer" as const;
           if (text) await stub.uiSay("demo", agentId, taskId, text, mode);
@@ -2423,7 +2423,7 @@ export default {
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
-          const taskId = String(form.get("taskId"));
+          const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
           await stub.uiCompact("demo", agentId, taskId);
           const t = await stub.uiTranscript("demo", agentId, taskId);
           return html(trajectory(conversation(t.events), t.byOp, t.busy));
