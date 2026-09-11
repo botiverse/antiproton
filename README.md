@@ -345,7 +345,7 @@ to each instance is a public commit):
 | pi's loop | **deepseek-flash** *(deployed model)* | **7/10** | 6,059 s | 7.56 M (97% cached) | **Durable Object** `bench-swe3`, 2026-09-11, Worker `60580fd`, network none |
 
 Record: `report/runs/2026-09-11/swebench-swe3-mtwgij3r.json`. All ten
-transcripts were read: five commands tried to reach GitHub, none received
+transcripts were read: seven commands tried to reach GitHub, none received
 anything. The three misses ran out of the fifteen-minute budget; every solve
 landed in one file. The object was billed for 4,419 s of the 6,059 s wall clock
 (73 %), 527 s of it the runner grading.
