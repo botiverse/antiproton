@@ -66,10 +66,11 @@ await check("the bridge lifts confirm out of the model's arguments into the call
   const calls: any[] = [];
   const host = { async invoke(call: any) { calls.push(call); return { status: "succeeded", operationId: "op", result: {} }; } };
   const [zap] = bridgeTools([{ name: "zap", address: "p.zap", description: "", parameters: {}, sideEffects: "write", idempotency: "none" } as any], host as any);
-  await zap.execute("c1", { x: 1, confirm: true } as any);
+  const run = (zap as any).execute.bind(zap) as (id: string, p: unknown) => Promise<unknown>;
+  await run("c1", { x: 1, confirm: true });
   must(JSON.stringify(calls[0].args) === JSON.stringify({ x: 1 }), `the plugin would have seen ${JSON.stringify(calls[0].args)}`);
   must(calls[0].opts?.confirm === true, "the option did not travel");
-  await zap.execute("c2", { x: 2 } as any);
+  await run("c2", { x: 2 });
   must(calls[1].opts?.confirm !== true, "a call without confirm was marked");
 });
 
