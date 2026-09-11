@@ -113,6 +113,15 @@ section.view{display:none;flex-direction:column;gap:12px;min-height:100%;backgro
 .view-head h2{border:0;padding:0;font-size:15px;color:var(--ink);text-transform:none;letter-spacing:0;font-weight:600}
 .view-head .sub{color:var(--dim);font-size:11px}
 .view-head .spacer{flex:1}
+.banner{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--accent);border-radius:8px;
+background:var(--sunk);color:var(--accent);font-size:12px}
+.banner .dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.banner .text{flex:1}
+.banner a{color:var(--accent);font-weight:600}
+.inbox-card .inbox-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
+.inbox-card .meta{color:var(--dim);font-size:11px}
+.inbox-card .row{align-items:center}
+.inbox-card .open{margin-left:auto;color:var(--dim);font-size:12px}
 .conv{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;
 flex:1;min-height:0}
 .conv .body{flex:1;max-height:none}
@@ -294,8 +303,9 @@ export function page(taskId: string, who: string, agentId: string): string {
 <aside class="sidebar" id="sidebar">
   <div class="side-view" data-for="agents">
     <h3>${esc(agentId)}</h3>
-    <div class="sub">1 agent · 1 task</div>
-    <a class="task on" href="/ui?view=agents&taskId=${t}"><div class="id">${t}</div><div class="meta">this conversation</div></a>
+    <div class="sub">tasks, latest activity first</div>
+    <div id="tasks" data-lazy hx-get="/ui/tasks" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
+         hx-on::after-swap="ap.markTask()"><a class="task on" data-task="${t}"><div class="id">${t}</div><div class="meta">this conversation</div></a></div>
   </div>
   <div class="side-view" data-for="plugins">
     <h3>mounts</h3>
@@ -305,7 +315,7 @@ export function page(taskId: string, who: string, agentId: string): string {
 <main class="main" id="main">
   <section class="view" data-view="inbox">
     <div class="view-head"><h2>Inbox</h2><span class="sub">calls held by the gateway, waiting for your signature</span></div>
-    ${lazy("inbox", "/ui/approvals", "3s", inView)}
+    ${lazy("inbox", "/ui/inbox", "3s", inView)}
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><h2>${t}</h2><span class="sub">${esc(agentId)}</span><span class="spacer"></span>
@@ -313,6 +323,8 @@ export function page(taskId: string, who: string, agentId: string): string {
         <input type="hidden" name="taskId" value="${t}">
         <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
       </form></div>
+    <div class="banner" id="banner" hidden><span class="dot"></span><span class="text"></span>
+      <a href="/ui?view=inbox" onclick="ap.show('inbox');return false">review</a></div>
     <div class="conv">
       <div class="body" id="transcript" data-lazy
            hx-get="/ui/chat?taskId=${t}" hx-swap="innerHTML"
@@ -354,7 +366,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   ${insp("sandbox", `/ui/sandbox?taskId=${t}`)}
   ${insp("runtime", `/ui/runtime?taskId=${t}`)}
 </aside>
-<div hidden id="inbox-poll" hx-get="/ui/approvals" hx-swap="innerHTML" hx-trigger="load, every 5s"
+<div hidden id="inbox-poll" hx-get="/ui/inbox" hx-swap="innerHTML" hx-trigger="load, every 5s"
      hx-on::after-swap="ap.count(this)"></div>
 <script>
   // The shell's own state: which section is showing and which mode the
@@ -370,8 +382,23 @@ export function page(taskId: string, who: string, agentId: string): string {
       const on = document.querySelector('.view.on'); if (on) on.querySelectorAll('[data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
     },
     count(el) {
-      const n = el.querySelectorAll('.card').length, b = document.getElementById('inbox-count');
-      b.textContent = String(n); b.hidden = n === 0;
+      const list = el.querySelector('.inbox-list');
+      const n = list ? Number(list.dataset.pending || 0) : el.querySelectorAll('.card').length;
+      const b = document.getElementById('inbox-count'); b.textContent = String(n); b.hidden = n === 0;
+      const banner = document.getElementById('banner');
+      const first = el.querySelector('.inbox-card .tool');
+      banner.hidden = n === 0;
+      banner.querySelector('.text').textContent = n === 1
+        ? '1 call is waiting for you: ' + (first ? first.textContent : '')
+        : n + ' calls are waiting for you';
+    },
+    task(id) {
+      const u = new URL(location.href); u.searchParams.set('taskId', id); u.searchParams.set('view', 'agents');
+      location.href = u.toString();
+    },
+    markTask() {
+      const t = document.body.dataset.task;
+      document.querySelectorAll('#tasks .task').forEach(a => a.classList.toggle('on', a.dataset.task === t));
     },
     mode(m) {
       const h = document.documentElement; h.classList.remove('light', 'dark');
@@ -944,6 +971,64 @@ ${allSaved.length
  * Mounts come first because they are the answer to "why did that happen".
  * Nothing here shows a credential; only whether one is attached.
  */
+/**
+ * The inbox: every call the gateway is holding for this viewer, across tasks.
+ *
+ * This is the product's moment — the agent asked, the gateway held, a person
+ * reads the request verbatim and signs — so it is the home section. Oldest
+ * first, because the one that has waited longest is the one to look at. The
+ * root carries the pending count so the rail badge can read it without a
+ * second request. The empty state says what is running, so an empty inbox
+ * reads as "nothing needs you" rather than "nothing is happening".
+ */
+export function inbox(d: any): string {
+  const pending: any[] = d?.pending ?? [];
+  const tasks = d?.tasks ?? { total: 0, running: 0 };
+  const ago = (iso: string) => {
+    const t = Date.parse(iso); if (Number.isNaN(t)) return "";
+    const m = Math.max(0, Math.round((Date.now() - t) / 60000));
+    return m < 1 ? "just now" : m < 60 ? `${m} min` : m < 1440 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} d`;
+  };
+  const card = (a: any) => {
+    const req = a.args?.args ?? a.args ?? {};
+    return `<div class="card inbox-card">
+  <div class="inbox-head"><span class="tool">${esc(a.tool)}</span>
+    <span class="meta">${esc(a.taskId)}${a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
+  <div class="k">the request, verbatim</div>
+  <pre>${esc(JSON.stringify(req, null, 2))}</pre>
+  <div class="row">
+    <button hx-post="/ui/decide" hx-target="#inbox" hx-swap="innerHTML"
+      hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "approved" }))}'>approve</button>
+    <button class="bad" hx-post="/ui/decide" hx-target="#inbox" hx-swap="innerHTML"
+      hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "denied" }))}'>deny</button>
+    <a class="open" href="/ui?view=agents&taskId=${encodeURIComponent(a.taskId)}" onclick="ap.task('${esc(a.taskId)}');return false">open the conversation →</a>
+  </div>
+</div>`;
+  };
+  const body = pending.length
+    ? pending.map(card).join("")
+    : `<div class="empty">Nothing is waiting on you. ${tasks.running} of ${tasks.total} task${tasks.total === 1 ? "" : "s"} running.</div>`;
+  return `<div class="inbox-list" data-pending="${pending.length}">${body}</div>`;
+}
+
+/**
+ * The agent's tasks, latest activity first, for the sidebar.
+ *
+ * `turns` is null from the route because transcript entries carry no task id,
+ * so it is not shown rather than shown as zero: a zero would say "this task
+ * ran nothing", which is a different and false claim. The current task is
+ * marked client-side from the URL, so the route stays a plain store read.
+ */
+export function taskList(d: any): string {
+  const tasks: any[] = d?.tasks ?? [];
+  const when = (iso: string) => { const t = Date.parse(iso); return Number.isNaN(t) ? "" : new Date(t).toISOString().slice(0, 16).replace("T", " ") + "Z"; };
+  if (!tasks.length) return `<div class="empty">no tasks yet</div>`;
+  return tasks.map((t) => `<a class="task" data-task="${esc(t.taskId)}" href="/ui?view=agents&taskId=${encodeURIComponent(t.taskId)}" onclick="ap.task('${esc(t.taskId)}');return false">
+  <div class="id">${esc(t.taskId)}${t.busy ? ` <span class="tag ok">working</span>` : ""}${t.pending ? ` <span class="tag warn">${t.pending} held</span>` : ""}</div>
+  <div class="meta">${esc(t.status ?? "")}${t.lastActivityAt ? ` · ${esc(when(t.lastActivityAt))}` : ""}${typeof t.turns === "number" ? ` · ${t.turns} turns` : ""}</div>
+</a>`).join("");
+}
+
 /** The element a credential route swaps: one mount, re-rendered. */
 export const mountBlockId = (alias: string) => `mount-${String(alias).replace(/[^A-Za-z0-9_-]/g, "_")}`;
 
