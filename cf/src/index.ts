@@ -1157,8 +1157,10 @@ export class AgentDO extends DurableObject<Env> {
       agentId: String(r.agent_id), name: String(r.name), description: String(r.description),
       avatar: String(r.avatar), createdAt: Number(r.created_at),
     }));
-    // The first agent is the person's own object, named before names existed.
-    return [...owned, { agentId: ownerAgentId, name: "default", description: "", avatar: avatarFor(ownerAgentId), createdAt: 0 }];
+    // The first agent is the person's own object, named before names existed;
+    // it gets a name and a face the same way a new one would, drawn from its
+    // id so they never change, rather than a label that says "default".
+    return [...owned, { agentId: ownerAgentId, name: nameFor(ownerAgentId), description: "", avatar: avatarFor(ownerAgentId), createdAt: 0 }];
   }
 
   async uiOwnsAgent(tenantId: string, ownerAgentId: string, agentId: string): Promise<boolean> {
@@ -2019,6 +2021,18 @@ function agentSpec(form: FormData, ownerAgentId: string): { agentId: string; nam
 function mintAvatar(): string {
   const b = new Uint8Array(4); crypto.getRandomValues(b);
   return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * A name for an agent nobody named: two words, chosen by the id's hash, so
+ * the same object is called the same thing on every visit. The lists are
+ * small on purpose; a name is a handle, not a personality.
+ */
+const NAME_FIRST = ["Quiet", "Amber", "Brisk", "Cedar", "Dusky", "Early", "Frank", "Gentle", "Hollow", "Ivory", "Jolly", "Keen", "Lunar", "Mossy", "Noble", "Olive", "Plain", "Rustic", "Silver", "Tidy", "Umber", "Vivid", "Windy", "Young"];
+const NAME_SECOND = ["Heron", "Otter", "Falcon", "Badger", "Cricket", "Dolphin", "Elk", "Finch", "Gecko", "Hare", "Ibis", "Jay", "Koala", "Lark", "Marten", "Newt", "Osprey", "Puffin", "Quail", "Raven", "Seal", "Tern", "Vole", "Wren"];
+function nameFor(agentId: string): string {
+  const h = parseInt(avatarFor(agentId), 16);
+  return `${NAME_FIRST[h % NAME_FIRST.length]} ${NAME_SECOND[(h >>> 8) % NAME_SECOND.length]}`;
 }
 
 /** The first agent had no seed minted for it; derive one from its id so it draws the same every time. */
