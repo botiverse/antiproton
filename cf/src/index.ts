@@ -1768,6 +1768,9 @@ async function notModified(
 let lastEtag: string | null = null;
 
 /** One identity, one agent. Was repeated at every route that needed it. */
+/** Console routes that write: a message, a decision, a credential. */
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove"]);
+
 function uiAgent(who: string): string {
   return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
 }
@@ -1890,6 +1893,13 @@ export default {
       const gate = requireViewer(request, env);
       if (gate instanceof Response) return gate;
       const who = gate.who;
+      // The anonymous switch opens the page to look at, not to act on. Every
+      // write route enqueues something and arms the object's alarm, so an
+      // anonymous viewer is refused there rather than admitted to a turn that
+      // runs and fails; the flag can then never be more than read-only.
+      if (who.startsWith("anonymous") && UI_WRITE_ROUTES.has(url.pathname)) {
+        return new Response("read-only: the console is open to anonymous viewers, but not for writes", { status: 403 });
+      }
       try {
         name = agentObjectName("demo", uiAgent(who));
       } catch (e: any) {
