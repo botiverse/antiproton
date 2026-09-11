@@ -495,7 +495,14 @@ them:
   eventually exhaust one object's 10 GB.
 - **Plugin lifecycle.** A mount's config and policy are reconciled on every
   visit, so drift self-heals. Disabling and revoking one is still missing, as
-  is any notion of installing a plugin at runtime.
+  is any notion of installing a plugin at runtime. Revoking has a dependency
+  worth knowing before it lands: a prompt paragraph that tells the model to
+  call a tool has to name it as the mount does, and the memory paragraph
+  resolves that name from the mount rather than assuming one — it reads the
+  alias and drops the sentence entirely when nothing mounts the plugin. Any
+  future revocation has to keep that property, since a paragraph naming a tool
+  that no longer exists is a wrong instruction competing with the right ones
+  rather than a harmless hint.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,
   a username and password, an access key and a secret key — and all three shapes
   exist in the tree today. OAuth is a flow rather than a paste: it needs a
