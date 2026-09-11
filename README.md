@@ -51,9 +51,12 @@ Three things had to be true for the last row, and each was a bug first:
 The other half of cost is tokens, and the number that decides it is prompt-cache
 hit rate. Measured here: editing the system message drops it from **84.9% to
 0.0%** — 6.6x the uncached tokens — while editing the tool block costs 1.1x. So
-the agent's memory is injected once when a task opens rather than before every
-turn, which is where a local harness would put it. The console draws the cache
-hit per call, so losing it is visible rather than merely expensive.
+the agent's memory is injected once when the harness opens rather than before
+every turn, which is where a local harness would put it. Those are the same
+moment while an agent holds one conversation, and the injection is built from
+tenant and agent — so it is the harness that decides how often it is paid. The
+console draws the cache hit per call, so losing it is visible rather than merely
+expensive.
 
 The cache is not the whole story, though: on a long investigation it sits above
 99% and the bill still climbs, because each fetched page is re-sent on every
@@ -281,7 +284,8 @@ The load-bearing part is theirs too: the working set is **pushed into the
 prompt**, not left to be pulled, because an agent that has to remember to go and
 look will not look. What does not carry over is doing it before every turn. That
 is affordable in a local CLI and not here — see the cache numbers above — so it
-is injected once when the task opens, where the prefix stays stable and cached.
+is injected once when the harness opens, where the prefix stays stable and
+cached.
 
 Demonstrated across two tasks: told a deploy window, a formatting preference and
 an unhandled certificate expiry in one, then asked in a *new* task when to ship,
