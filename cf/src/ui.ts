@@ -10,7 +10,7 @@
  */
 import type { ApprovalRecord } from "../../src/core/types.ts";
 import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
-import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_SVG } from "./brand.ts";
+import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_OUTLINED_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
 import { ICONS } from "./icons.ts";
 import { md } from "./md.ts";
@@ -80,9 +80,11 @@ body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 
 .rail{grid-area:rail;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 0;
 background:var(--panel);border-right:1px solid var(--line)}
-.rail-brand{display:block;width:26px;height:27px;color:var(--ink);margin:0 0 14px}
-.rail-brand svg{width:100%;height:100%;display:block}
-.rail-brand .bar{fill:var(--accent);stroke:var(--accent)}
+/* The brand in the rail is the outlined cut in every theme: it carries its
+   own colours (ink line, cream body, yellow bar, hard shadow), so it reads the
+   same on light and dark. */
+.rail-brand{display:block;width:30px;margin:0 0 12px}
+.rail-brand svg{width:100%;height:auto;display:block}
 .rail-item{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;width:52px;padding:7px 0 6px;
 color:var(--dim);text-decoration:none;font-size:9.5px;letter-spacing:.04em;border-radius:8px;border:1px solid transparent}
 .rail-item .ico{width:22px;height:22px;display:flex;align-items:center;justify-content:center;opacity:.85}
@@ -319,7 +321,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] .mode{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .mode button{border:0;box-shadow:none}
 [data-theme="brutal"] .mode button.on{background:var(--primary-400);color:var(--primary-950)}
-[data-theme="brutal"] h1.brand .bar,[data-theme="brutal"] .rail-brand .bar{fill:var(--primary-400);stroke:var(--primary-400)}
+[data-theme="brutal"] h1.brand .bar{fill:var(--primary-400);stroke:var(--primary-400)}
 .pane-btn{display:none;background:transparent;border:1px solid var(--line);color:var(--dim);box-shadow:none;padding:6px 10px;font-size:11.5px;gap:5px}
 .pane-btn svg,.pane-close svg{width:14px;height:14px}
 .pane-btn.on{color:var(--accent);border-color:var(--accent)}
@@ -391,7 +393,7 @@ export function page(taskId: string, who: string, agentId: string): string {
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
 <style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}">
 <nav class="rail" aria-label="sections">
-  <a class="rail-brand" href="/ui" title="antiproton">${MARK_SVG}</a>
+  <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("inbox", "inbox").replace('</span><span>inbox', '</span><b class="count" id="inbox-count" hidden></b><span>inbox')}
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
