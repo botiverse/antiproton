@@ -522,6 +522,10 @@ export class AgentRuntime {
       created = true;
     }
     for (const m of mounts) {
+      // The skip comes first on purpose: the assert below runs only for a
+      // mount being added, so an open of an agent that already has its seven
+      // costs one read per seed and no validation. Moving the assert above
+      // this line would run it on every open of every agent.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
       // The seed is hand-written and reaches every agent, and the console's
       // validator only shows problems to whoever opens the plugins page. The
