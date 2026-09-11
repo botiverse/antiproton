@@ -117,6 +117,15 @@ check("an account without verified is not promoted to verified", () => {
   must(/as <code>someone<\/code>/.test(html), "the name still shows");
 });
 
+check("a reference the operator configured is attached by the operator, with no controls", () => {
+  const html = render(mount("node", "run9", { connected: true, credential: { attached: true, operator: true, verified: false, account: null } }));
+  must(/attached by the operator/.test(html), "must say who attached it");
+  must(/configured at deploy time/.test(html), "must say when");
+  must(!/unverified|not yet tried/.test(html), "an operator reference is not an untried paste");
+  must(!/<input|<form|<details/.test(html), "nothing on the page can replace or remove an operator reference");
+  must(!/undefined|null/.test(html), "nothing may render as undefined");
+});
+
 check("attached and unverified: says so, shows no fragment of the key, and never the word undefined", () => {
   const html = render(mount("r9", "run9", { connected: true, credential: { attached: true, account: null, last4: "wxyz", setAt: null, lastUsedAt: null, error: null } }));
   must(/attached · unverified/.test(html), "must say unverified");

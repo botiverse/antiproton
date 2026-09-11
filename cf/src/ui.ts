@@ -840,7 +840,9 @@ const when = (v: unknown): string | null => {
  *
  * Attached comes in two strengths — verified, when the plugin's check made a
  * call and returned who the key acts as, and unverified, when it was stored
- * and never tried — and the page keeps them apart.
+ * and never tried — and the page keeps them apart. A reference the operator
+ * configured at deploy time is a third case: attached, but not by this page
+ * and not changeable from it.
  */
 function credentialRegion(m: any, spec: CredentialSpec | null | undefined): string {
   const form = credentialForm(spec);
@@ -888,6 +890,16 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   const verified = c.verified === true;
   const setAt = when(c.setAt), usedAt = when(c.lastUsedAt);
   const times = [setAt ? `set ${setAt}` : "", usedAt ? `last used ${usedAt}` : ""].filter(Boolean).join(" · ");
+
+  // A reference the operator configured at deploy time is attached, but it is
+  // not in this agent's store: nothing here set it, and nothing here can
+  // replace or remove it. Say who attached it and offer no controls.
+  if (c.operator === true) {
+    return `<div class="cred">
+      <div class="state"><b>attached by the operator</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}<span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
+    </div>`;
+  }
+
   const state = verified
     ? `<b>attached · verified</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}`
     : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">stored, not yet tried</span>`;
