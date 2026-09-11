@@ -25,10 +25,8 @@ them in separate columns for exactly this reason.
 
 These are the terminal logs, not the per-task transcripts. The transcripts for
 each τ² run are archived in the object itself and read back through
-`/bench/trajectory`. On the deployed Worker both id forms are accepted; on
-`master` only the bare form works, until `tau2-fidelity` merges and normalises
-them. So pass the listing's `agent_id` **without** its `b_` prefix, which works
-on either.
+`/bench/trajectory`, which accepts the id either as the listing prints it
+(`b_t_…`) or bare; the runner normalises them.
 
 Run A, the 08:25Z matrix, is deliberately absent: it ran in process, before the
 on-object runner existed, so it is not part of any on-object comparison.
