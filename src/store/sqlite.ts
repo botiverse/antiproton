@@ -169,6 +169,10 @@ export class SqliteStore implements StorageAdapter {
     for (const alter of [
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
+      // A secrets table created before the suffix column was dropped keeps a
+      // NOT NULL column the insert no longer fills; drop it, and with it the
+      // one plaintext fragment of a value the row ever held.
+      "ALTER TABLE secrets DROP COLUMN last4",
     ]) {
       try { this.#db.exec(alter); } catch { /* already present */ }
     }
