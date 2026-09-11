@@ -48,18 +48,21 @@ Three things had to be true for the last row, and each was a bug first:
   nothing open, not stopped — `stop` returns 200, leaves the box and its storage
   in place, and keeps billing. Thirteen boxes were live before that was noticed.
   The release is scoped to the agent and covers every mount it holds, so it fires
-  when the *agent* has nothing open rather than when a particular task ends.
-  Those are the same moment while an agent has one conversation, and the scope is
-  what keeps a mount alive when it has several: one conversation going idle does
-  not hand back a container another is still working in.
+  when the *agent* has nothing open rather than when a particular task ends. The
+  condition is per pass, not per conversation: a wake that settles a turn and
+  opens no new one releases, so a container is handed back between turns of the
+  same conversation rather than only at its end. A mount whose plugin keeps
+  something across calls should therefore expect to be released and re-entered
+  rather than held — `run9` preserves the environments named in `envs` for that
+  reason, and anything a container accumulates that is not named there is gone.
 
 The other half of cost is tokens, and the number that decides it is prompt-cache
 hit rate. Measured here: editing the system message drops it from **84.9% to
 0.0%** — 6.6x the uncached tokens — while editing the tool block costs 1.1x. So
 the agent's memory is injected once when the harness opens rather than before
-every turn, which is where a local harness would put it. Those are the same
-moment while an agent holds one conversation, and the injection is built from
-tenant and agent — so it is the harness that decides how often it is paid. The console draws the cache
+every turn, which is where a local harness would put it. The injection is built
+from tenant and agent rather than from anything per conversation, so the harness
+opening decides how often it is paid. The console draws the cache
 hit per call, so losing it is visible rather than merely expensive.
 
 The cache is not the whole story, though: on a long investigation it sits above
