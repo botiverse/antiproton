@@ -5,6 +5,12 @@
   "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  // Two custom hostnames serve this Worker: the original, and antiproton.ai
+  // (tygg, 2026-09-11). Both are listed so a deploy adds without removing.
+  "routes": [
+    { "pattern": "antiproton.botiverse.dev", "custom_domain": true },
+    { "pattern": "antiproton.ai", "custom_domain": true }
+  ],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentDO"] }],
   "durable_objects": {
     "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }]
