@@ -106,7 +106,20 @@ background:var(--primary-400);color:var(--primary-950);font-size:9px;font-weight
 .mode button:hover{background:var(--fill-muted)}
 .mode button.on{background:var(--sunk);color:var(--ink)}
 .viewer{width:26px;height:26px;border-radius:50%;background:var(--sunk);border:1px solid var(--line);color:var(--dim);
-font-size:11px;display:flex;align-items:center;justify-content:center;text-transform:uppercase}
+font-size:11px;display:flex;align-items:center;justify-content:center;text-transform:uppercase;position:relative;overflow:hidden}
+.viewer img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+/* who is signed in, and the way out: a card off the rail's corner */
+.me{position:relative}
+.me>summary{list-style:none;cursor:pointer;display:block;border-radius:50%}
+.me>summary::-webkit-details-marker{display:none}
+.me[open]>summary .viewer,.me>summary:hover .viewer{border-color:var(--ink)}
+.me-card{position:absolute;left:36px;bottom:-2px;min-width:190px;max-width:280px;z-index:6;background:var(--panel);border:1px solid var(--line);
+border-radius:8px;padding:10px 12px;box-shadow:var(--theme-shadow-md);font-size:12px;text-align:left}
+.me-card b{display:block;color:var(--strong);font-weight:600;word-break:break-word}
+.me-card .sub{display:block;color:var(--dim);word-break:break-all}
+.me-card form{margin:8px 0 0;padding-top:8px;border-top:1px solid var(--hairline)}
+.me-card button{width:100%;justify-content:flex-start;padding:5px 6px;font-size:12px}
+.me-card button svg{width:13px;height:13px}
 .sidebar{grid-area:side;overflow:auto;background:var(--panel);border-right:1px solid var(--line);min-width:0}
 .sidebar .side-view{display:none;padding:14px 12px}
 .sidebar .side-view.on{display:block}
@@ -365,6 +378,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] .mode{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .mode button{border:0;box-shadow:none}
 [data-theme="brutal"] .mode button.on{background:var(--primary-400);color:var(--primary-950)}
+[data-theme="brutal"] .me-card{border:2px solid var(--line-strong);border-radius:0}
 [data-theme="brutal"] .avatar,[data-theme="brutal"] textarea,[data-theme="brutal"] .new-agent-form{border-radius:0;border:2px solid var(--line-strong)}
 [data-theme="brutal"] textarea{background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
 [data-theme="brutal"] textarea:focus{box-shadow:var(--theme-shadow-md)}
@@ -382,6 +396,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
   .rail{flex-direction:row;justify-content:space-around;align-items:center;gap:0;padding:0 4px;border-right:0;border-top:1px solid var(--line)}
   .rail-brand,.rail-foot .mode,.rail-item[href^="https"]{display:none}
   .rail-foot{margin:0}
+  .me-card{left:auto;right:0;bottom:40px}
   .rail-item{width:auto;min-width:60px;padding:6px 4px 5px;font-size:10px}
   .sidebar,.inspector{grid-area:main;display:none;border:0}
   body[data-pane=side] .sidebar,body[data-pane=insp] .inspector{display:block}
@@ -412,12 +427,37 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
  * Every panel is still a plain GET that renders the store directly; the
  * shell keeps only which section is showing and which mode the viewer chose.
  */
-export function page(_taskId: string, who: string, agentId: string): string {
+/**
+ * Who is looking, as the rail shows it. Every field is optional: the Access
+ * identity is an email alone, the QA identity is a name alone, and a Raft
+ * login carries all four with `picture` possibly null. `who` stays the
+ * identity string the routes key on; this is only what is drawn.
+ */
+export type Viewer = { email?: string | null; name?: string | null; username?: string | null; picture?: string | null };
+
+/** The rail's corner: an avatar, and behind it who that is and the way out. */
+export function viewerBadge(who: string, viewer?: Viewer): string {
+  const label = (viewer?.name || viewer?.email || who || "?").trim();
+  const initial = label.slice(0, 1) || "?";
+  const pic = viewer?.picture
+    ? `<img src="${esc(viewer.picture)}" alt="" referrerpolicy="no-referrer" onerror="this.remove()">`
+    : "";
+  const face = `<span class="viewer" title="${esc(label)}">${esc(initial)}${pic}</span>`;
+  // Without a viewer object there is no session to end (the identity came
+  // from the edge, or from a header), so the face is all there is.
+  if (!viewer) return face;
+  const sub = viewer.email && viewer.email !== viewer.name ? viewer.email : viewer.username ? `@${viewer.username}` : "";
+  return `<details class="me"><summary aria-label="signed in as ${esc(label)}">${face}</summary>
+      <div class="me-card"><b>${esc(label)}</b>${sub ? `<span class="sub">${esc(sub)}</span>` : ""}
+        <form method="post" action="/logout"><button type="submit" class="ghost">${ICONS.logout}sign out</button></form></div></details>`;
+}
+
+export function page(_taskId: string, who: string, agentId: string, viewer?: Viewer): string {
   // The first argument is the conversation id the route used to pass. An
   // agent has one conversation now, so the page carries no task id; the
   // routes default to the agent's own. The parameter stays so the call site
-  // in index.ts does not change.
-  const initial = (who || "?").trim().slice(0, 1);
+  // in index.ts does not change. `viewer` is what the rail draws for the
+  // person; when the route has only a string, the face is their initial.
   // A lazily loaded, polled fragment: loads when its view or section is shown,
   // then re-reads the store every few seconds while it stays shown. The
   // condition is evaluated by htmx against the element, so a hidden view
@@ -451,7 +491,7 @@ export function page(_taskId: string, who: string, agentId: string): string {
       <button type="button" data-theme-choice="elegant" onclick="ap.theme('elegant')" aria-label="Elegant" title="Elegant">${ICONS.light}</button>
       <button type="button" data-theme-choice="elegant-dark" onclick="ap.theme('elegant-dark')" aria-label="Elegant dark" title="Elegant dark">${ICONS.dark}</button>
     </div>
-    <span class="viewer" title="${esc(who)}">${esc(initial)}</span>
+    ${viewerBadge(who, viewer)}
   </div>
 </nav>
 <aside class="sidebar" id="sidebar">
