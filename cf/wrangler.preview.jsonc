@@ -1,0 +1,35 @@
+{
+  // The preview console: the same code as `antiproton`, on its own hostname,
+  // with its own objects, bucket and queues and no model, sandbox or sealing
+  // keys, so it can render every page and run nothing. Deployed from a branch
+  // before merge so a change can be looked at; deleted when it is not needed.
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-preview",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-05",
+  "compatibility_flags": ["nodejs_compat"],
+  // workers.dev until the custom domain exists: attaching antiproton-preview.botiverse.dev
+  // needs zone permission this token does not hold, so the domain is added in
+  // the dashboard by the account owner (Settings > Domains & Routes).
+  "workers_dev": true,
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentDO"] }],
+  "durable_objects": { "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }] },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "antiproton-preview-artifacts" }],
+  "queues": {
+    "producers": [{ "binding": "MODEL_QUEUE", "queue": "antiproton-preview-model" }],
+    "consumers": [
+      { "queue": "antiproton-preview-model", "max_batch_size": 1, "max_batch_timeout": 0, "max_retries": 3, "dead_letter_queue": "antiproton-preview-model-dlq" },
+      { "queue": "antiproton-preview-model-dlq", "max_batch_size": 10, "max_batch_timeout": 5 }
+    ]
+  },
+  "vars": {
+    "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+    "HARNESS_MODEL": "deepseek-flash",
+    "ARTIFACT_BUCKET": "antiproton-preview-artifacts",
+    // Open to look at until the Access application exists; the write routes
+    // refuse the anonymous viewer regardless, and there are no keys to spend.
+    "UI_ALLOW_ANONYMOUS": "1"
+  },
+  "observability": { "enabled": true }
+}

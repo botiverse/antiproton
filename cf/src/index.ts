@@ -29,7 +29,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment,
+  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList,
 } from "./ui.ts";
 
 export interface Env {
@@ -1407,7 +1407,10 @@ export class AgentDO extends DurableObject<Env> {
       .sort((x, y) => x.createdAt - y.createdAt)
       .map((a) => ({
         operationId: a.operationId, taskId: a.taskId, agentId: a.agentId,
-        tool: `${a.mountAlias}.${a.tool}`, args: a.request,
+        tool: `${a.mountAlias}.${a.tool}`,
+        // The gateway holds the request as { tool, args }; the tool is already
+        // named above, so the card gets the arguments themselves.
+        args: (a.request as any)?.args ?? a.request,
         requestedAt: new Date(a.createdAt).toISOString(),
         heldBy: `${a.mountAlias} policy`,
       }));
@@ -2245,19 +2248,19 @@ export default {
             : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
             : runtimePanel(d));
         }
-        // Data routes for the console shell. They answer JSON until the shell's
-        // renderers exist; the shell then calls its renderer with this `d`, the
-        // way /ui/plugins does. `viewer` is the identity the gate resolved.
+        // Data routes for the console shell, rendered by the shell's own
+        // renderers with `d`, the way /ui/plugins does. `viewer` is the
+        // identity the gate resolved.
         case "/ui/inbox": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const d = await stub.uiInbox("demo", uiAgent(gate.who));
-          return Response.json({ viewer: gate.who, ...d });
+          return html(inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/tasks": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          return Response.json(await stub.uiTasks("demo", uiAgent(gate.who)));
+          return html(taskList(await stub.uiTasks("demo", uiAgent(gate.who))));
         }
         case "/ui/approvals": {
           const taskId = String(url.searchParams.get("taskId"));
