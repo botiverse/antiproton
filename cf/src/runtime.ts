@@ -43,7 +43,7 @@ export function personaOf(config: unknown): { name?: string; description?: strin
   const description = typeof c.description === "string" ? c.description : undefined;
   return name || description ? { name, description } : null;
 }
-import type { MountPolicy } from "../../src/core/store.ts";
+import type { MountPolicy } from "../../src/core/types.ts";
 
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {

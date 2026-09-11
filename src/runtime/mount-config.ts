@@ -16,7 +16,8 @@
  * is a typo that survives, and there is no case where silently ignoring a
  * setting someone deliberately wrote is the helpful thing to do.
  */
-import type { ConfigField, Json, Plugin } from "../plugins/types.ts";
+import type { ConfigField, Plugin } from "../plugins/types.ts";
+import type { Json } from "../core/types.ts";
 
 export interface MountProblem {
   key?: string;
