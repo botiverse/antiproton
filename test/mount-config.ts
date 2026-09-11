@@ -121,7 +121,7 @@ check("appworld says it needs an account instead of failing on the first call", 
 
 check("a credential field carries a label and says which part is secret", () => {
   const shape = spotify!.credential!.shape;
-  if (shape === "token" || !shape.keys.every((k) => k.name && k.summary)) {
+  if (shape === "token" || !("keys" in shape) || !shape.keys.every((k) => k.name && k.summary)) {
     throw new Error(`a page has nothing to label these with: ${JSON.stringify(shape)}`);
   }
   const username = shape.keys.find((k) => k.name === "username");
@@ -155,7 +155,7 @@ check("no plugin takes a credential as a setting", () => {
   for (const plugin of everyPlugin) {
     const shape = plugin.credential?.shape;
     const credentialKeys = new Set(
-      shape && shape !== "token" ? shape.keys.map((k) => k.name) : [],
+      shape && shape !== "token" && "keys" in shape ? shape.keys.map((k) => k.name) : [],
     );
     for (const f of plugin.config ?? []) {
       if (credentialKeys.has(f.name)) {
@@ -176,6 +176,28 @@ check("the marker is what makes run9's secrets setting legitimate, not its name"
   if (field.references !== "credential") throw new Error("run9's secrets setting lost its marker");
   const { references, ...unmarked } = field;
   if (!CREDENTIAL_SHAPED.test(unmarked.name)) throw new Error("the pattern stopped matching the case it exists for");
+});
+
+check("a sign-in is a credential the page must not ask anyone to paste", () => {
+  // Declared and not implemented: no plugin uses this yet. What is checked is
+  // that the rest of the machinery does not assume a credential has fields —
+  // a mount still needs an account, and the settings rule still runs.
+  const signIn: Pick<Plugin, "id" | "config" | "credential"> = {
+    id: "somewhere",
+    config: [{ name: "workspace", type: "string", summary: "Which workspace to act in." }],
+    credential: {
+      required: true,
+      summary: "Connect the account at the provider; there is nothing to paste here.",
+      shape: { signIn: { provider: "Somewhere", grants: "reading and posting as that account" } },
+    },
+  };
+  const p = validateMount(signIn, { workspace: "w" } as any, null);
+  if (!p.some((x) => x.message.includes("needs an account"))) {
+    throw new Error(`a mount that was never connected was accepted: ${JSON.stringify(p)}`);
+  }
+  if (validateMount(signIn, { workspace: "w" } as any, "agent:somewhere").length) {
+    throw new Error("a connected mount was refused");
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
