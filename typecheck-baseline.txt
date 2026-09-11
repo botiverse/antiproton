@@ -12,11 +12,6 @@ bench/tau2/run.ts: error TS7006: Parameter 't' implicitly has an 'any' type.
 bench/tau2/run.ts: error TS7022: 'plugins' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer.
 bench/tau2/run.ts: error TS7024: Function implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.
 cf/src/index.ts: error TS2339: Property 'ToolBinding' does not exist on type 'Exports'.
-cf/src/index.ts: error TS2339: Property 'busy' does not exist on type 'never'.
-cf/src/index.ts: error TS2339: Property 'byOp' does not exist on type 'never'.
-cf/src/index.ts: error TS2339: Property 'events' does not exist on type 'never'.
-cf/src/index.ts: error TS2339: Property 'shown' does not exist on type 'never'.
-cf/src/index.ts: error TS2339: Property 'total' does not exist on type 'never'.
 cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
 cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
 src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.

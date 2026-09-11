@@ -1432,7 +1432,7 @@ export class AgentDO extends DurableObject<Env> {
     return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}`;
   }
 
-  async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0) {
+  async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0): Promise<UiTranscript> {
     const session = await this.#conversation(tenantId, agentId, taskId);
     const rt = this.runtime();
     const agent = await rt.agent(tenantId, agentId, session);
@@ -1449,10 +1449,10 @@ export class AgentDO extends DurableObject<Env> {
       : running ? "thinking" : null;
     // Approvals are keyed by operation so the trajectory can show a held call
     // where it happened, with who signed it, instead of in a separate panel.
-    const byOp: Record<string, any> = {};
+    const byOp: UiTranscript["byOp"] = {};
     for (const a of await rt.store.listApprovals(tenantId)) {
       byOp[a.operationId] = {
-        state: a.state, approver: a.approver, tool: `${a.mountAlias}.${a.tool}`, request: a.request,
+        state: a.state, approver: a.approver ?? null, tool: `${a.mountAlias}.${a.tool}`, request: a.request,
       };
     }
     return {
@@ -1932,6 +1932,24 @@ function avatarFor(agentId: string): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < agentId.length; i++) { h ^= agentId.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
   return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * What the transcript route answers, said concretely. The shape used to be
+ * inferred, and it carried \`Json\` (declared as \`unknown\`), which the Workers
+ * RPC types cannot classify as serialisable; across the object boundary the
+ * whole result collapsed to \`never\` and four call sites lost their checking.
+ * The object's own call was never affected, which is how it stayed hidden.
+ */
+export interface UiTranscript {
+  total: number;
+  shown: number;
+  // The two opaque fields are `any` on purpose: `unknown` is what the RPC
+  // rule cannot place, and a recursive JSON type is too deep for it. Both
+  // were already read through `as any` by every consumer.
+  events: Array<{ sequence: number; kind: string; payload: any; createdAt: number }>;
+  byOp: Record<string, { state: string; approver: string | null; tool: string; request: any }>;
+  busy: "thinking" | "waiting-for-approval" | null;
 }
 
 function uiAgent(who: string): string {
