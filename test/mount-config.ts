@@ -409,6 +409,9 @@ await check("a verification refuses a malformed credential in words, without cal
       const r = await plugin.checkCredential(ctx(value));
       if (r.ok) throw new Error(`${plugin.id} accepted a ${label} credential`);
       if (!r.reason || r.reason.length < 10) throw new Error(`${plugin.id} gave no usable reason for ${label}`);
+      // A malformed credential is a verdict, not a missing one: nothing was
+      // called, and the answer will not change by trying again.
+      if (r.kind !== "rejected") throw new Error(`${plugin.id} called a ${label} credential ${r.kind}`);
     }
   }
 });
@@ -426,6 +429,48 @@ await check("the plugins that take a credential are the plugins that can verify 
     }
     if (!takesOne && canCheck) {
       throw new Error(`${plugin.id} has a check but no credential to check`);
+    }
+  }
+});
+
+/**
+ * A provider that says no and a provider that says nothing are different news.
+ *
+ * Under the route's rule a rejected key is refused and an unreachable one is
+ * kept unverified, so getting this backwards either throws away a good key
+ * during an outage or keeps one that is known not to work. The connection is
+ * refused on the spot here — no DNS, no external network, ~90 ms.
+ */
+await check("a provider that cannot be reached is unreachable, not a rejection", async () => {
+  const dead = "http://127.0.0.1:1";
+  const ctx = (credential: string, publicConfig: any = {}): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" },
+    credential, publicConfig,
+    connection: { get: async () => null, set: async () => {} },
+    sibling: async () => null,
+  });
+  const cases = [
+    ["run9", run9, JSON.stringify({ ak: "a", sk: "b" }), { endpoint: dead }],
+    ["appworld", appworldPlugins(catalogue, { apiBaseUrl: dead })[0]!, JSON.stringify({ username: "u", password: "p" }), {}],
+  ] as const;
+  for (const [name, plugin, cred, cfg] of cases) {
+    const r = await plugin.checkCredential!(ctx(cred, cfg));
+    if (r.ok) throw new Error(`${name} verified a credential against a dead endpoint`);
+    if (r.kind !== "unreachable") {
+      throw new Error(`${name} called an unreachable provider "${r.kind}", so a good key would be refused during an outage`);
+    }
+  }
+});
+
+await check("every failure says which kind it is, because the field is not optional", () => {
+  // The guard against the shape drifting back to a bare reason: a plugin that
+  // returns no `kind` would be read as neither, and the route would have to
+  // guess which of the two behaviours to apply.
+  for (const plugin of everyPlugin) {
+    if (typeof plugin.checkCredential !== "function") continue;
+    const src = plugin.checkCredential.toString();
+    if (/ok:\s*false/.test(src) && !/kind:/.test(src)) {
+      throw new Error(`${plugin.id} returns a failure without a kind`);
     }
   }
 });

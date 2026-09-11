@@ -203,22 +203,28 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
        */
       async checkCredential(ctx: PluginContext) {
         if (!ctx.credential) {
-          return { ok: false as const, reason: `no credentials: this mount cannot act as a ${app} account` };
+          return { ok: false as const, kind: "rejected" as const, reason: `no credentials: this mount cannot act as a ${app} account` };
         }
         let cred: AppCredential;
         try {
           cred = JSON.parse(ctx.credential) as AppCredential;
         } catch {
-          return { ok: false as const, reason: "the stored value is not JSON; this needs an object with username and password" };
+          return { ok: false as const, kind: "rejected" as const, reason: "the stored value is not JSON; this needs an object with username and password" };
         }
         if (!cred.username || !cred.password) {
-          return { ok: false as const, reason: "both a username and a password are needed; one of them is missing" };
+          return { ok: false as const, kind: "rejected" as const, reason: "both a username and a password are needed; one of them is missing" };
         }
         try {
           await login(cfg.apiBaseUrl, app, cred);
           return { ok: true as const, account: cred.username };
         } catch (e) {
-          return { ok: false as const, reason: String((e as Error)?.message ?? e) };
+          const reason = String((e as Error)?.message ?? e);
+          // `login` puts the status in the message when the server answered.
+          // Only a 401 is the account saying no; a 5xx or a fetch that never
+          // arrived leaves the credentials unjudged.
+          const status = Number(/failed: (\d{3})/.exec(reason)?.[1] ?? 0);
+          const rejected = status === 401 || status === 403;
+          return { ok: false as const, kind: rejected ? "rejected" as const : "unreachable" as const, reason };
         }
       },
 
