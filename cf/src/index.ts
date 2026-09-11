@@ -252,6 +252,10 @@ export class AgentDO extends DurableObject<Env> {
   #offloadDefault = true;
   #identity: { tenantId: string; agentId: string } | null = null;
   #bench: BenchState | null = null;
+  /** Seed changes the reconcile declined, by alias, for the plugins page.
+   *  Derived state, not stored: every page open re-runs the reconcile, so an
+   *  evicted object rebuilds it on the next visit, and a later success clears it. */
+  #reconcileRefused = new Map<string, { at: string; reason: string }>();
   #benchRuntime: AgentRuntime | null = null;
   #benchPolicy = "";
   #benchOffload = true;
@@ -1222,10 +1226,15 @@ export class AgentDO extends DurableObject<Env> {
           const plugin = byId.get(d.plugin);
           const problems = plugin ? validateMount(plugin, config as any, have.secretRef) : [];
           if (problems.length) {
-            console.warn(`reconcile refused for ${agentId}/${d.alias}: ${problems.map((x) => x.message).join("; ")}`);
+            const reason = problems.map((x) => x.message).join("; ");
+            console.warn(`reconcile refused for ${agentId}/${d.alias}: ${reason}`);
+            this.#reconcileRefused.set(d.alias, { at: new Date().toISOString(), reason });
           } else {
             await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
+            this.#reconcileRefused.delete(d.alias);
           }
+        } else {
+          this.#reconcileRefused.delete(d.alias);
         }
         if (JSON.stringify(have.policy ?? null) !== JSON.stringify(d.policy ?? null)) {
           await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy ?? null);
@@ -1376,6 +1385,9 @@ export class AgentDO extends DurableObject<Env> {
           session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
           // Attached, verified, account, last four, dates. Never a value.
           credential: await rt.credentialMeta(tenantId, agentId, m),
+          // Why a seed change did not reach this mount, when it did not. The
+          // mount itself is fine, which is exactly why nothing else shows it.
+          reconcileRefused: this.#reconcileRefused.get(m.alias) ?? null,
           problems: plugin
             ? validateMount(plugin, m.publicConfig as any, m.secretRef).map((x) => x.message)
             : [`no plugin named ${m.plugin} is installed`],
