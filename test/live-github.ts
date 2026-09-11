@@ -22,7 +22,7 @@ await store.createAgent(T, "agent-1");
 await store.createTask(T, "agent-1", "task-1", {});
 await store.addMount({
   tenantId: T, agentId: "agent-1", alias: "gh_public", plugin: "github",
-  installationId: "inst-public", connectionId: null, toolVersion: "1.0.0",
+  installationId: "inst-public", connectionId: null, toolVersion: "2.0.0",
   publicConfig: { account: "unauthenticated" }, secretRef: null,
 });
 
@@ -30,9 +30,9 @@ const gw = new ToolGateway(store, [githubPlugin]);
 const ctx = { tenantId: T, agentId: "agent-1", taskId: "task-1" };
 
 const t0 = performance.now();
-const res = await gw.invoke(ctx, "gh_public.issues.list", { repo: "nodejs/node", perPage: 30 });
+const res = await gw.invoke(ctx, "gh_public.issue_list", { repo: "nodejs/node", perPage: 30 });
 const ms = Math.round(performance.now() - t0);
-console.log(`\n  gh_public.issues.list -> ${res.status}  (${ms}ms)`);
+console.log(`\n  gh_public.issue_list -> ${res.status}  (${ms}ms)`);
 if (res.status !== "succeeded") {
   console.log("  ", JSON.stringify((res as any).error));
   process.exit(1);
