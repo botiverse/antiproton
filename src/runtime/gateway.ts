@@ -318,7 +318,7 @@ export class ToolGateway {
    * plugin's call context.
    */
   async checkMount(tenantId: string, agentId: string, alias: string):
-    Promise<{ ok: true; account?: string } | { ok: false; reason: string } | null> {
+    Promise<{ ok: true; account?: string } | { ok: false; kind: "rejected" | "unreachable"; reason: string } | null> {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return null;
     const plugin = this.#plugins.get(mount.plugin);
@@ -338,7 +338,11 @@ export class ToolGateway {
         async sibling() { return null; },
       });
     } catch (e) {
-      return { ok: false, reason: String((e as Error).message ?? e).slice(0, 200) };
+      // A check that threw gave no verdict on the key: the provider was not
+      // reached, or the plugin failed before asking it. Either way it is not
+      // a rejection, and the route keeps the key unverified rather than
+      // refusing it. Said explicitly, since the route reads `kind`.
+      return { ok: false, kind: "unreachable", reason: String((e as Error).message ?? e).slice(0, 200) };
     }
   }
 }

@@ -19,7 +19,6 @@ cf/src/index.ts: error TS2339: Property 'shown' does not exist on type 'never'.
 cf/src/index.ts: error TS2339: Property 'total' does not exist on type 'never'.
 cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
 cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
-cf/src/runtime.ts: error TS2339: Property 'kind' does not exist on type '{ ok: false; reason: string; }'.
 cf/src/runtime.ts: error TS2459: Module '"../../src/core/store.ts"' declares 'MountPolicy' locally, but it is not exported.
 src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.
 src/plugins/run9.ts: error TS2339: Property 'liveMs' does not exist on type '{ boxId: string; freed: boolean; error?: string | undefined; }'.
