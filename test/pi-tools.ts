@@ -13,7 +13,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { bridgeTools, replayPolicy, qualifyMountedTools, withholdTools, type MountedTool } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
 import { offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -51,33 +51,46 @@ await check("供应商不接受的字符会被清洗,地址不受影响", async 
   for (const n of names) {
     if (!/^[a-zA-Z0-9_-]+$/.test(n)) throw new Error(`a provider would refuse ${n}`);
   }
-  if (names.join(",") !== "repos_get,issues_list") throw new Error(names.join(","));
+  if (names.join(",") !== "gh__repos_get,gh__issues_list") throw new Error(names.join(","));
 });
 
-await check("清洗造成的重名也会被限定", async () => {
-  const got = qualifyMountedTools([
+await check("清洗造成的重名在同一个挂载里也会被分开", async () => {
+  // Two mounts can no longer collide — the alias is in every name. What can
+  // still meet is two tools of the SAME mount whose names sanitise to one
+  // string, and that is the case the tie-break exists for.
+  const inOneMount = qualifyMountedTools([
     { name: "a.b", description: "", parameters: {}, address: "x.a.b" },
-    { name: "a-b", description: "", parameters: {}, address: "y.a-b" },
+    { name: "a_b", description: "", parameters: {}, address: "x.a_b" },
   ]);
-  // Both sanitise to a_b / a-b — different, so neither needs a prefix.
-  const clash = qualifyMountedTools([
+  const names = inOneMount.map((t) => t.name).join(",");
+  if (names !== "x__a_b,x__a_b2") throw new Error(`sanitising collapsed two tools into one name: ${names}`);
+  // Across mounts there is nothing to resolve: the alias already separates them.
+  const across = qualifyMountedTools([
     { name: "a.b", description: "", parameters: {}, address: "x.a.b" },
     { name: "a_b", description: "", parameters: {}, address: "y.a_b" },
   ]);
-  if (got.map((t) => t.name).join(",") !== "a_b,a-b") throw new Error(got.map((t) => t.name).join(","));
-  if (clash.map((t) => t.name).join(",") !== "x__a_b,y__a_b") {
-    throw new Error(`a clash created by sanitising was not qualified: ${clash.map((t) => t.name).join(",")}`);
-  }
+  if (across.map((t) => t.name).join(",") !== "x__a_b,y__a_b") throw new Error(across.map((t) => t.name).join(","));
 });
 
-await check("重名才限定,不重名保持裸名", async () => {
-  const clash = qualifyMountedTools([
+await check("每个工具都带挂载名,哪怕它本来不重名", async () => {
+  // The name a tool is offered under must not depend on what else is mounted.
+  // `only` is unique here and still qualified, because the alternative is that
+  // mounting something unrelated later renames it — and an agent that wrote the
+  // old name down has no way to learn that it changed.
+  const all = qualifyMountedTools([
     { name: "show", description: "", parameters: {}, address: "a.show" },
     { name: "show", description: "", parameters: {}, address: "b.show" },
     { name: "only", description: "", parameters: {}, address: "c.only" },
   ]);
-  const names = clash.map((t) => t.name).join(",");
-  if (names !== "a__show,b__show,only") throw new Error(names);
+  if (all.map((t) => t.name).join(",") !== "a__show,b__show,c__only") {
+    throw new Error(all.map((t) => t.name).join(","));
+  }
+  // The property, stated as the thing that used to fail: one tool's name is
+  // the same whether or not the others are there.
+  const alone = qualifyMountedTools([{ name: "only", description: "", parameters: {}, address: "c.only" }]);
+  if (alone[0]!.name !== all[2]!.name) {
+    throw new Error(`a mount changed another mount's tool name: ${alone[0]!.name} vs ${all[2]!.name}`);
+  }
 });
 
 function fixture(invoke: (call: any) => Promise<any>, reply: AssistantMessage) {
@@ -139,7 +152,7 @@ await check("共享资源的插件,其工具不允许并行", async () => {
 await check("工具调用落到 gateway,结果进 transcript", async () => {
   const calls: any[] = [];
   const f = fixture(async () => ({}), msg(
-    [{ type: "toolCall", id: "c1", name: "read_page", arguments: { url: "https://x" } } as any],
+    [{ type: "toolCall", id: "c1", name: "web__read_page", arguments: { url: "https://x" } } as any],
     "toolUse"));
   const tools = bridgeTools(CATALOGUE, {
     async invoke(call) { calls.push(call); return { status: "succeeded", operationId: "op1", result: { title: "hi" } }; },
@@ -156,7 +169,7 @@ await check("工具调用落到 gateway,结果进 transcript", async () => {
 
 await check("gateway 拒绝时,模型收到的是拒绝而不是结果", async () => {
   const f = fixture(async () => ({}), msg(
-    [{ type: "toolCall", id: "c1", name: "send", arguments: { url: "https://x" } } as any],
+    [{ type: "toolCall", id: "c1", name: "web__send", arguments: { url: "https://x" } } as any],
     "toolUse"));
   const tools = bridgeTools(CATALOGUE, {
     async invoke() { return { status: "rejected", error: { code: "approval_required" } }; },
@@ -185,6 +198,30 @@ await check("扣住的工具不会被提供,其余原样", async () => {
   }
   // Nothing withheld means nothing changes — the common case must be a no-op.
   if (withholdTools(cat, []).length !== 3) throw new Error("withholding nothing removed something");
+});
+
+await check("沙箱里用的是模型看到的名字,地址也仍然接受", async () => {
+  // The prompt tells the model the sandbox reaches "the same tools", so the
+  // string that works outside has to work inside. Before this, outside was the
+  // registered name and inside was the gateway's address, and nothing said so.
+  const calls: any[] = [];
+  const host = { async invoke(call: any) { calls.push(call.tool); return { status: "succeeded" }; } };
+  const sandbox = {
+    async execute(source: string, h: any) {
+      for (const name of source.split(",")) await h.invoke({ tool: name, args: {} });
+      return { status: "ok", outputs: [], hostCalls: 2 };
+    },
+  };
+  const tool = runJsTool(sandbox as any, host as any, {
+    tools: qualifyMountedTools([{ name: "get", description: "", parameters: {}, address: "web.get" }]),
+  });
+  await (tool as any).execute("c1", { source: "web__get,web.get" });
+  if (calls.join(",") !== "web.get,web.get") {
+    throw new Error(`the sandbox did not reach the same tool both ways: ${calls.join(",")}`);
+  }
+  // An unknown name is the gateway's to refuse, with its own message.
+  await (tool as any).execute("c2", { source: "nonsense" });
+  if (calls[2] !== "nonsense") throw new Error(`a lookup swallowed an unknown name: ${calls[2]}`);
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);

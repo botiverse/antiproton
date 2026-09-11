@@ -108,7 +108,9 @@ await check("工具轮次:模型要工具,工具走 gateway,再问一次模型,�
   await f.agent.step();
 
   f.w.answer(f.w.pending(f.host)[0]!.id,
-    { toolCalls: [{ id: "c1", name: "lookup", arguments: { q: "cats" } }] });
+    // The name the harness registered, which is mount-qualified: the model can
+    // only call what it was offered.
+    { toolCalls: [{ id: "c1", name: "demo__lookup", arguments: { q: "cats" } }] });
   const second = await f.agent.step();
   if (f.calls.length !== 1) throw new Error(`gateway not reached: ${f.calls.length}`);
   if (f.calls[0].tool !== "demo.lookup") throw new Error(`wrong address ${f.calls[0].tool}`);
