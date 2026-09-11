@@ -189,6 +189,39 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
         grants: "acting as that account — everything the app lets its owner do, reads and writes alike.",
       },
       tools,
+      /**
+       * The check this plugin already performs, moved to where a person is.
+       *
+       * `login` is exactly "do these credentials work" and it ran on the first
+       * authenticated call — which is to say, after the mount looked fine and
+       * an agent had already started a task. Doing it at attach time costs the
+       * same one request and answers while somebody is still looking at the
+       * form.
+       *
+       * It names the username, which is the account these credentials are, and
+       * the one string on the page a person can check against what they typed.
+       */
+      async checkCredential(ctx: PluginContext) {
+        if (!ctx.credential) {
+          return { ok: false as const, reason: `no credentials: this mount cannot act as a ${app} account` };
+        }
+        let cred: AppCredential;
+        try {
+          cred = JSON.parse(ctx.credential) as AppCredential;
+        } catch {
+          return { ok: false as const, reason: "the stored value is not JSON; this needs an object with username and password" };
+        }
+        if (!cred.username || !cred.password) {
+          return { ok: false as const, reason: "both a username and a password are needed; one of them is missing" };
+        }
+        try {
+          await login(cfg.apiBaseUrl, app, cred);
+          return { ok: true as const, account: cred.username };
+        } catch (e) {
+          return { ok: false as const, reason: String((e as Error)?.message ?? e) };
+        }
+      },
+
       async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
         const doc = docs.get(tool);
         if (!doc) throw new Error(`unknown tool: ${app}.${tool}`);
