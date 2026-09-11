@@ -175,6 +175,19 @@ check("the whole page renders every mount through the same block, and a missing 
   must(mountBlockId("a b/c") === "mount-a_b_c", "the id must be a usable selector");
 });
 
+check("a hostile error string cannot break out of the markup, attached or not", () => {
+  // `error` is the one string in the block a third party can influence: it is
+  // composed from the plugin's check, which for run9 lifts text out of the
+  // provider's HTTP response. It renders in two places; both must escape it.
+  const hostile = `<img src=x onerror=1>`;
+  const open = render(mount("gh", "github", { optionalAccount: true, credential: { attached: false, error: hostile } }));
+  const kept = render(mount("gh", "github", { connected: true, credential: { attached: true, verified: false, error: hostile } }));
+  for (const html of [open, kept]) {
+    must(!html.includes(hostile), "error must be escaped");
+    must(html.includes("&lt;img src=x onerror=1&gt;"), "the escaped text must still be shown, so the person reads the reason");
+  }
+});
+
 check("a hostile alias or summary cannot break out of the markup", () => {
   const d = { installed: [{ ...installed[0], credential: { ...installed[0]!.credential, summary: `<script>alert(1)</script>` } }],
     mounts: [mount(`x" onmouseover="1`, "github")], used: {} };
