@@ -120,6 +120,34 @@ await check("键名受限，且不是通往别人数据的路径", async () => {
   }
 });
 
+await check("注入的文字用挂载时的别名，不是写死的 state", async () => {
+  const { store, plugin, ctx } = await fixture();
+  await plugin.invoke("remember", { key: "memory", text: "部署窗口是周二" }, ctx());
+  // An operator is free to mount this under any name, and the harness
+  // dispatches on that name.
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "memo", plugin: "state",
+    installationId: "inst-memo", connectionId: null, toolVersion: "1.0.0",
+    publicConfig: { account: "agent memory" }, secretRef: null, policy: null,
+  });
+  const text = await workingSet(store, "t", "a");
+  if (!text.includes("memo.remember") || !text.includes("memo.forget")) {
+    throw new Error(`the prompt did not name the mounted alias: ${text.slice(0, 200)}`);
+  }
+  if (text.includes("state.remember")) throw new Error("the prompt still names an alias nobody mounted");
+});
+
+await check("没挂载时不会叫 agent 去调一个不存在的工具", async () => {
+  const { store, plugin, ctx } = await fixture();
+  await plugin.invoke("remember", { key: "memory", text: "部署窗口是周二" }, ctx());
+  // Nothing mounts the plugin: the memory is still worth reading, but a
+  // sentence telling the model to call `state.remember` would be an
+  // instruction it cannot follow, competing with the ones it can.
+  const text = await workingSet(store, "t", "a");
+  if (!text.includes("部署窗口是周二")) throw new Error("memory was withheld along with the tool names");
+  if (/\.remember|\.forget/.test(text)) throw new Error("named a tool that is not mounted");
+});
+
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
