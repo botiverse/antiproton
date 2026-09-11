@@ -5,8 +5,9 @@ They are here because the report's evidence column says so, and a claim of
 evidence should be checkable by someone who was not present.
 
 Each file names the object it ran against in its first three lines. They are
-the runner's own stdout, unedited apart from the removal of ANSI colour codes;
-no credentials appear in any of them.
+the runner's own stdout, byte-for-byte: the ANSI colour codes the runner emits
+are still in them; nothing has been stripped or reformatted. No credentials
+appear in any of them.
 
 **Each τ² log prints two lines both called `pass^1`, and they are not the same
 number:** one is over *tasks* (a task passing the first trial, out of 8), the
@@ -24,8 +25,9 @@ them in separate columns for exactly this reason.
 
 These are the terminal logs, not the per-task transcripts. The transcripts for
 each τ² run are archived in the object itself and read back through
-`/bench/trajectory`; pass the listing's `agent_id` **without** its `b_` prefix
-until the endpoints accept either form.
+`/bench/trajectory`; while the read path on `master` still expects the prefixed
+form, pass the listing's `agent_id` **without** its `b_` prefix (the fix that
+accepts either form is on `tau2-fidelity`).
 
 Run A, the 08:25Z matrix, is deliberately absent: it ran in process, before the
 on-object runner existed, so it is not part of any on-object comparison.
