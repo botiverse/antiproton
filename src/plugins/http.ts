@@ -149,10 +149,30 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 export const httpPlugin: Plugin = {
   id: "http",
   config: [
+    // "Unset means any public host" is the right default for an anonymous
+    // mount and the wrong one for a mount holding a key, and the difference is
+    // structural rather than a matter of care: for every other credential
+    // plugin the host is fixed by the plugin, while here the agent chooses the
+    // URL. So a credential on an http mount goes wherever the agent points it,
+    // and this setting is the only thing that bounds it.
+    //
+    // No http mount can carry a credential today — the plugin declares none.
+    // If that ever changes, the allowlist stops being advice: a
+    // credential-bearing mount should be refused at mount time when this is
+    // empty, rather than documented as a hazard someone configuring in a hurry
+    // will inherit. Written here because this is the line that would be
+    // inherited.
     { name: "allowedHosts", type: "string[]", summary: "When set, only these hosts may be reached. Unset means any public host." },
     // Nothing parks anything: this plugin has no object storage to park into,
     // and never had. What the setting decides is how much of the body comes
     // back; the result reports the full size beside it so the loss is visible.
+    //
+    // Named in bytes and applied in UTF-16 code units: `text.slice(0, maxBytes)`
+    // counts units, so 24,000 units of CJK is 72,000 bytes. Measured and left
+    // alone deliberately — the tool-result offload counts the same unit
+    // (`JSON.stringify(result).length` in cf/src/runtime.ts), so both sides are
+    // wrong in the same direction and agree, and a rename would refuse every
+    // mount already carrying the old key.
     { name: "maxBytes", type: "number", default: DEFAULT_MAX_BYTES,
       summary: "How much of a response body is returned. The rest is cut and discarded, not kept anywhere; `bytes` reports the full size, so a truncated result says how much went." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "How long one request may take." },
