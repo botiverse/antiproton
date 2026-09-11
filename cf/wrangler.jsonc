@@ -47,7 +47,12 @@
     "ARTIFACT_BUCKET": "antiproton-artifacts",
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.
-    "UI_ALLOW_ANONYMOUS": "0"
+    "UI_ALLOW_ANONYMOUS": "0",
+    // Login with Raft. The client is registered on our Raft server with this
+    // exact callback; the secret and SESSION_SECRET are Worker secrets.
+    "RAFT_CLIENT_ID": "antiproton",
+    "RAFT_SERVER_ID": "f94d930c-3ef7-45ac-a549-4898b957949f",
+    "UI_ORIGIN": "https://antiproton.ai"
   },
   "observability": { "enabled": true }
 }

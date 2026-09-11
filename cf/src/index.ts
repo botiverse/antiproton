@@ -28,6 +28,13 @@ import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
+import {
+  resolveViewer, admit, authorizeUrl, exchangeCode, fetchUserinfo, fetchJwks, verifyIdToken,
+  seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
+  constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, RAFT_ISSUER, QA_VIEWER,
+  type Viewer, type LoginState, type RaftConfig, type RefusalReason,
+} from "./auth.ts";
+import { loginPage, refusedPage } from "./login.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -48,10 +55,25 @@ export interface Env {
   HARNESS_MODE?: string;
   /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
   HARNESS_CONTEXT_WINDOW?: string;
-  /** "1" opens the demo UI with no Access identity. Off by default. */
+  /** "1" opens the demo UI with no identity at all. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
-  /** Lets automation reach the endpoints that spend money, since Access sits
-   *  on the custom hostname and scripts cannot sign in through it. */
+  /** Login with Raft: the OAuth client registered on our Raft server. */
+  RAFT_CLIENT_ID?: string;
+  RAFT_CLIENT_SECRET?: string;
+  /** The Raft server a signed-in person must belong to. */
+  RAFT_SERVER_ID?: string;
+  /** Defaults to https://api.raft.build. */
+  RAFT_ISSUER?: string;
+  /** The canonical origin, so the registered callback URL is built from a
+   *  constant and never from an inbound Host header. */
+  UI_ORIGIN?: string;
+  /** Seals the session cookie. Without it nobody can be signed in. */
+  SESSION_SECRET?: string;
+  /** A long key that mints a QA session for a browser. Not shown to anyone;
+   *  a distinct identity from AUTOMATION_TOKEN, and must differ from it. */
+  QA_ACCESS_KEY?: string;
+  /** Lets automation reach the endpoints that spend money, since a script
+   *  cannot sign in through a browser. */
   AUTOMATION_TOKEN?: string;
   LOADER: {
     load(code: WorkerCode): WorkerStub;
@@ -1869,20 +1891,159 @@ const html = (body: string) =>
   });
 
 /**
- * Who is signed in, according to Cloudflare Access.
+ * Who is signed in. The one place identity is decided; see auth.ts.
  *
- * Access verifies the identity and passes it in a header; the app must not
- * accept an identity from anywhere the caller controls. If the header is
- * missing the deployment is unprotected, and that is worth showing on the page
- * rather than hiding behind a default.
+ * A session this Worker sealed comes first. The Cloudflare Access header is
+ * still honoured while the two mechanisms overlap, and goes with the Access
+ * application. The app must not accept an identity from anywhere the caller
+ * controls, and after the overlap nothing on a request is one: only something
+ * this Worker signed.
  */
-function viewer(request: Request): string | null {
-  return request.headers.get("cf-access-authenticated-user-email");
+const viewerMemo = new WeakMap<Request, Promise<Viewer | null>>();
+async function viewer(request: Request, env: Env, allowAnonymous = false): Promise<Viewer | null> {
+  let p = viewerMemo.get(request);
+  if (!p) { p = resolveViewer(request, env); viewerMemo.set(request, p); }
+  const v = await p;
+  if (v || !allowAnonymous) return v;
+  return resolveViewer(request, env, { allowAnonymous: true });
+}
+
+function raftConfig(env: Env): RaftConfig | null {
+  if (!env.RAFT_CLIENT_ID || !env.RAFT_CLIENT_SECRET || !env.RAFT_SERVER_ID || !env.UI_ORIGIN || !env.SESSION_SECRET) return null;
+  return {
+    issuer: env.RAFT_ISSUER ?? RAFT_ISSUER,
+    clientId: env.RAFT_CLIENT_ID,
+    clientSecret: env.RAFT_CLIENT_SECRET,
+    redirectUri: `${env.UI_ORIGIN}/login/raft/callback`,
+    serverId: env.RAFT_SERVER_ID,
+  };
+}
+
+/** A refusal the browser sees as a page and a CLI sees as typed JSON. */
+function refuse(request: Request, reason: RefusalReason | "state" | "exchange" | "unconfigured", hint: string, status = 403): Response {
+  const wantsHtml = (request.headers.get("accept") ?? "").includes("text/html");
+  if (wantsHtml) {
+    return new Response(null, { status: 302, headers: { location: `/login/refused?reason=${encodeURIComponent(reason)}` } });
+  }
+  return Response.json({ error: reason.toUpperCase().replace(/-/g, "_"), hint }, { status });
+}
+
+// The key form has no page of its own: it is shown to nobody by design.
+const bare = (title: string, body: string, status = 200) => new Response(
+  `<!doctype html><meta charset="utf-8"><title>antiproton</title>` +
+  `<body style="font:14px ui-monospace,monospace;background:#0f1115;color:#d8dee9;padding:40px;max-width:44em">` +
+  `<h1 style="font-size:16px">${title}</h1>${body}`,
+  { status, headers: { "content-type": "text/html; charset=utf-8" } },
+);
+const REFUSALS: Record<string, string> = {
+  "not-human": "Only human accounts can use the console. Agents reach it through their runtime, not a browser.",
+  "no-email": "Your Raft account has no verified email, and the console keys your agents off one.",
+  "wrong-server": "Your Raft account is not a member of this server.",
+  state: "The sign-in did not start here, or took longer than ten minutes. Start again.",
+  exchange: "Raft did not accept the sign-in code. Start again.",
+  unconfigured: "Login with Raft is not configured on this deployment.",
+};
+
+/**
+ * The sign-in routes. None of them touches an agent object, so they run
+ * before one is chosen. Returns null for any other path.
+ */
+async function handleLogin(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const method = request.method;
+  switch (url.pathname) {
+    case "/login": {
+      if (await viewer(request, env)) return Response.redirect(new URL("/ui", url).toString(), 302);
+      return html(loginPage());
+    }
+    case "/login/refused": {
+      const reason = url.searchParams.get("reason") ?? "";
+      return new Response(refusedPage(reason), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    case "/login/raft": {
+      const cfg = raftConfig(env);
+      if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      const now = Date.now();
+      const st: LoginState = { state: randomToken(), nonce: randomToken(), verifier: randomToken(48), returnTo: "/ui", iat: now, exp: now + LOGIN_TTL_MS };
+      const location = await authorizeUrl(cfg, st);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location,
+          // Scoped to the callback path: the browser presents it once, there.
+          "set-cookie": cookieHeader(LOGIN_COOKIE, await seal(env.SESSION_SECRET!, st), LOGIN_TTL_MS / 1000, "/login/raft"),
+        },
+      });
+    }
+    case "/login/raft/callback": {
+      const cfg = raftConfig(env);
+      if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      // A human sign-in is stateful: no login cookie, or a state that does not
+      // match, and the code is not exchanged at all.
+      const st = await open<LoginState>(env.SESSION_SECRET!, readCookie(request, LOGIN_COOKIE));
+      const state = url.searchParams.get("state");
+      const code = url.searchParams.get("code");
+      if (!st || !state || !code || !constantTimeEqual(state, st.state)) {
+        return refuse(request, "state", REFUSALS.state, 400);
+      }
+      let identity;
+      try {
+        const tok = await exchangeCode(cfg, code, st.verifier);
+        // The id_token is checked against Raft's published keys, and the
+        // profile comes from userinfo under the access token; the two must
+        // name the same principal.
+        const info = await fetchUserinfo(cfg, tok.access_token);
+        if (tok.id_token) {
+          const claims = await verifyIdToken(tok.id_token, { issuer: cfg.issuer, clientId: cfg.clientId, nonce: st.nonce, jwks: await fetchJwks(cfg.issuer) });
+          if (claims.sub !== info.sub) throw new Error("id_token and userinfo disagree on the subject");
+          identity = { ...info, ...claims, name: info.name ?? claims.name, picture: info.picture ?? claims.picture };
+        } else {
+          identity = info;
+        }
+      } catch (e: any) {
+        console.error("login: exchange failed", String(e?.message ?? e));
+        return refuse(request, "exchange", REFUSALS.exchange, 502);
+      }
+      const verdict = admit(identity, cfg.serverId);
+      if (!verdict.ok) return refuse(request, verdict.reason, REFUSALS[verdict.reason]);
+      const headers = new Headers({ location: new URL(st.returnTo, url).toString() });
+      headers.append("set-cookie", await sessionCookieFor(env.SESSION_SECRET!, verdict.viewer, identity.sub));
+      headers.append("set-cookie", clearCookieHeader(LOGIN_COOKIE, "/login/raft"));
+      return new Response(null, { status: 302, headers });
+    }
+    case "/login/key": {
+      // The QA identity: a browser session minted from a long key that is
+      // shown to nobody. Its own identity, so audit tells it apart from
+      // automation, and it never reaches /admin, which stays header-only.
+      if (method !== "POST") return bare("sign in with a key",
+        `<form method="post"><input type="password" name="key" autocomplete="off" style="width:30em"> <button>sign in</button></form>`);
+      if (!env.SESSION_SECRET || !env.QA_ACCESS_KEY) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      // Two secrets that happen to be equal would let this key reach the
+      // admin routes through the other door; refuse rather than assume.
+      if (env.AUTOMATION_TOKEN && constantTimeEqual(env.QA_ACCESS_KEY, env.AUTOMATION_TOKEN)) {
+        return Response.json({ error: "MISCONFIGURED", hint: "QA_ACCESS_KEY must differ from AUTOMATION_TOKEN" }, { status: 500 });
+      }
+      const form = await formOf(request);
+      const key = String(form?.get("key") ?? "");
+      if (!key || !constantTimeEqual(key, env.QA_ACCESS_KEY)) {
+        return Response.json({ error: "BAD_KEY", hint: "the key does not match" }, { status: 401 });
+      }
+      return new Response(null, {
+        status: 302,
+        headers: { location: new URL("/ui", url).toString(), "set-cookie": await sessionCookieFor(env.SESSION_SECRET, QA_VIEWER, "qa") },
+      });
+    }
+    case "/logout": {
+      if (method !== "POST") return Response.json({ error: "METHOD", hint: "POST to sign out" }, { status: 405 });
+      return new Response(null, { status: 302, headers: { location: new URL("/login", url).toString(), "set-cookie": clearCookieHeader(SESSION_COOKIE) } });
+    }
+    default:
+      return null;
+  }
 }
 
 /**
  * The demo drives a real agent against the operator's own model account, so an
- * open endpoint is an open cheque. It fails closed: without an Access identity
+ * open endpoint is an open cheque. It fails closed: without a signed-in identity
  * the UI refuses, unless the deployment has explicitly said otherwise. A demo
  * that quietly spends money is worse than no demo.
  */
@@ -1999,42 +2160,36 @@ function uiAgent(who: string): string {
   return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
 }
 
-function requireViewer(request: Request, env: Env): { who: string } | Response {
-  const who = viewer(request);
-  if (who) return { who };
-  // A named automation identity, so the page stays testable after it has been
-  // closed to anonymous traffic. It is still an identity: it signs approvals
-  // under its own name, and it is not something a visitor can present.
-  if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") === env.AUTOMATION_TOKEN) {
-    return { who: "automation" };
+async function requireViewer(request: Request, env: Env): Promise<{ who: string; viewer: Viewer } | Response> {
+  // The anonymous switch opens the page to look at; the write routes refuse
+  // that identity by name further down.
+  const v = await viewer(request, env, true);
+  if (v) return { who: v.email, viewer: v };
+  // A page navigation goes to the sign-in page; a fragment request tells htmx
+  // to take the whole window there; anything else gets the plain refusal.
+  if (request.headers.get("hx-request")) {
+    return Response.json({ error: "NOT_SIGNED_IN", hint: "sign in at /login" }, { status: 401, headers: { "hx-redirect": "/login" } });
   }
-  if (env.UI_ALLOW_ANONYMOUS === "1") return { who: "anonymous (UNPROTECTED)" };
-  return new Response(
-    `<!doctype html><meta charset="utf-8"><title>antiproton</title>` +
-    `<body style="font:14px ui-monospace,monospace;background:#0f1115;color:#d8dee9;padding:40px;max-width:44em">` +
-    `<h1 style="font-size:16px">not signed in</h1>` +
-    `<p>This page drives a real agent against the operator's model account, so it will not` +
-    ` run without an identity. Reach it through the Cloudflare Access–protected hostname,` +
-    ` or set <code>UI_ALLOW_ANONYMOUS=1</code> on the Worker to open it deliberately.</p>`,
-    { status: 401, headers: { "content-type": "text/html; charset=utf-8" } },
-  );
+  if (request.method === "GET" && (request.headers.get("accept") ?? "").includes("text/html")) {
+    return new Response(null, { status: 302, headers: { location: "/login" } });
+  }
+  return Response.json({ error: "NOT_SIGNED_IN", hint: "sign in at /login, or present x-harness-token" }, { status: 401 });
 }
 
 /**
  * Guards the endpoints that spend the operator's model account.
  *
- * Access protects the custom hostnames (antiproton.botiverse.dev and antiproton.ai), but the workers.dev address bypasses them
- * entirely, and several routes there start a real agent. Either a Cloudflare
- * identity or the automation secret is required; anything else is refused. The
+ * Every hostname reaches this Worker, and several routes start a real agent.
+ * A signed-in identity or the automation secret is required; anything else is
+ * refused, and the anonymous switch does not open this door. The
  * diagnostics (conformance, isolation, eviction) stay open because they call no
  * provider and cost nothing.
  */
-function guardSpending(request: Request, env: Env): Response | null {
-  if (viewer(request)) return null;
-  const supplied = request.headers.get("x-harness-token");
-  if (env.AUTOMATION_TOKEN && supplied === env.AUTOMATION_TOKEN) return null;
+async function guardSpending(request: Request, env: Env): Promise<Response | null> {
+  // Never anonymous here, whatever the deployment says: this path spends.
+  if (await viewer(request, env)) return null;
   return Response.json(
-    { error: "this endpoint starts a real agent; sign in through Access or present x-harness-token" },
+    { error: "this endpoint starts a real agent; sign in at /login or present x-harness-token" },
     { status: 401 },
   );
 }
@@ -2099,6 +2254,8 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const login = await handleLogin(request, env, url);
+    if (login) return login;
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
     // Each benchmark arm gets its own object. Sharing one meant asynchronous
@@ -2115,7 +2272,7 @@ export default {
       // One demo agent per signed-in person, so two people trying it at once
       // do not share a conversation — and so the isolation is real, not a demo
       // shortcut.
-      const gate = requireViewer(request, env);
+      const gate = await requireViewer(request, env);
       if (gate instanceof Response) return gate;
       const who = gate.who;
       // The anonymous switch opens the page to look at, not to act on. Every
@@ -2163,7 +2320,7 @@ export default {
         case "/storage": return Response.json(await stub.verifyStorage());
         case "/conformance/executor": return Response.json(await stub.runExecutorSpec());
         case "/agent/message": {
-          const g = guardSpending(request, env);
+          const g = await guardSpending(request, env);
           if (g) return g;
           const body = (await request.json()) as any;
           await stub.setOffload(String(body.offload ?? "1") !== "0");
@@ -2191,13 +2348,13 @@ export default {
           return Response.json({ ok: true });
         }
         case "/bench/start": {
-          const g = guardSpending(request, env);
+          const g = await guardSpending(request, env);
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchStart(String(b.taskId), String(b.policy ?? ""), b.offload !== false));
         }
         case "/bench/say": {
-          const g = guardSpending(request, env);
+          const g = await guardSpending(request, env);
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSay(String(b.taskId), String(b.text)));
@@ -2208,19 +2365,19 @@ export default {
         // account, a metered machine), so they sit behind the same guard as
         // the τ² endpoints; stats only reads.
         case "/bench/swe/start": {
-          const g = guardSpending(request, env);
+          const g = await guardSpending(request, env);
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSweStart(String(b.taskId), b));
         }
         case "/bench/swe/shell": {
-          const g = guardSpending(request, env);
+          const g = await guardSpending(request, env);
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSweShell(String(b.taskId), String(b.command)));
         }
         case "/bench/swe/release": {
-          const g = guardSpending(request, env);
+          const g = await guardSpending(request, env);
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSweRelease(String(b.taskId)));
@@ -2282,9 +2439,11 @@ export default {
           } catch { out.guardSurvived = true; }
           return Response.json(out);
         }
-        // Confirms what Access actually injects, rather than trusting the
-        // header name. Also demonstrates that a client-supplied identity does
-        // not survive: Cloudflare strips cf-access-* from inbound requests.
+        // Confirms what identity a request actually resolves to (see
+        // /ui/whoami), rather than trusting a name. A client-supplied header
+        // is not one: while Access overlaps, Cloudflare strips cf-access-*
+        // from inbound requests; after it, only a session this Worker sealed
+        // counts.
         case "/admin/compact": {
           // The operator's way in, alongside /admin/diagnose. The UI button
           // derives the agent from whoever is signed in, which is right for a
@@ -2308,27 +2467,33 @@ export default {
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.diagnose(t, a, k));
         }
-        case "/ui/whoami":
+        case "/ui/whoami": {
+          // The probe: what identity this request actually resolves to, and
+          // the configuration facts that no branch would otherwise show.
+          const v = await viewer(request, env);
           return Response.json({
-            viewer: viewer(request),
+            viewer: v ? { email: v.email, name: v.name, source: v.source } : null,
             anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
+            loginConfigured: raftConfig(env) !== null,
+            qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
             cfHeaders: Object.fromEntries(
               [...request.headers].filter(([k]) => k.startsWith("cf-")),
             ),
           });
+        }
         case "/ui": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
           await stub.uiEnsure("demo", agentId, taskId);
-          return new Response(page(taskId, who, agentId), {
+          return new Response(page(taskId, who, agentId, gate.viewer), {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         }
         case "/ui/transcript": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
@@ -2352,7 +2517,7 @@ export default {
         }
         case "/ui/chat":
         case "/ui/events": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
@@ -2367,7 +2532,7 @@ export default {
             : eventList(t.events));
         }
         case "/ui/plugins": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           // One read, dispatched to the part the shell asked for: the mount
@@ -2383,7 +2548,7 @@ export default {
         case "/ui/credential": {
           // A value comes in; a re-rendered mount block goes out, and nothing
           // else does: not the value, not on success, not on failure.
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
@@ -2397,7 +2562,7 @@ export default {
           return html(mountFragment(d, alias));
         }
         case "/ui/credential/remove": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
@@ -2410,7 +2575,7 @@ export default {
         case "/ui/memory":
         case "/ui/sandbox":
         case "/ui/runtime": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
@@ -2432,7 +2597,7 @@ export default {
           // person's first object records it last, so a failure between the
           // two leaves an unlisted object rather than a listed one with no
           // persona. Both calls are idempotent.
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           if (request.method !== "POST") return new Response("POST", { status: 405 });
           if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
@@ -2448,7 +2613,7 @@ export default {
           return Response.json(made);
         }
         case "/ui/agents": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const home = uiAgent(gate.who);
           const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
@@ -2458,13 +2623,13 @@ export default {
           return request.headers.get("hx-request") ? html(agentList({ agents })) : Response.json({ agents });
         }
         case "/ui/inbox": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const d = await stub.uiInbox("demo", uiSelected?.agentId ?? uiAgent(gate.who));
           return html(inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/approvals": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
@@ -2473,7 +2638,7 @@ export default {
         case "/ui/message": {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
@@ -2494,7 +2659,7 @@ export default {
           return html(trajectory(t.events, t.byOp, t.busy));
         }
         case "/ui/compact": {
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const form = await formOf(request);
@@ -2507,7 +2672,7 @@ export default {
         case "/ui/decide": {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
-          const gate = requireViewer(request, env);
+          const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
@@ -2515,7 +2680,7 @@ export default {
           // The panel that posted names its conversation; an older page that
           // does not is the first one. Either way it is the viewer's own or 404.
           const taskId = String(form.get("taskId") ?? "").trim();
-          // The approver is whoever Access says is signed in — an audit record
+          // The approver is whoever is signed in — an audit record
           // with a name the caller chose would be worth nothing.
           return html(approvals(await stub.uiDecide("demo", agentId, taskId, String(form.get("operationId")), decision, who)));
         }
