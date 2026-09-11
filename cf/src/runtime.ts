@@ -252,13 +252,6 @@ export class AgentRuntime {
         await this.store.updateMountToolVersion(tenantId, agentId, m.alias, v);
         repinned.push(`${m.alias}: ${m.toolVersion} -> ${v}`);
       }
-      // A github mount seeded before the gate existed (`gh_public`, no
-      // policy) offers every write tool ungated the moment someone attaches
-      // a token to it. It gets the gate the seeds carry now.
-      if (m.plugin === "github" && !m.policy) {
-        await this.store.updateMountPolicy(tenantId, agentId, m.alias, { write: "approval" });
-        repinned.push(`${m.alias}: writes now wait for approval`);
-      }
     }
     return repinned;
   }
@@ -464,9 +457,10 @@ export class AgentRuntime {
     // Without this a parked result is a reference the agent cannot open.
     { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
       secretRef: null, policy: null },
-    // Writes that need a person: the policy is what the page exists to show.
+    // Open, like everything else seeded here. The page can still show a held
+    // call: the agent raises one itself with `confirm: true` on any call.
     { alias: "ops", plugin: "demo", config: { account: "demo-fleet" },
-      secretRef: null, policy: { write: "approval" as const } },
+      secretRef: null, policy: null },
     // Open on purpose: the agent holds no credential and writes need a
     // human. maxBytes stays under the offload threshold so an ordinary page
     // reaches the model directly rather than via a round trip to storage.
@@ -483,10 +477,12 @@ export class AgentRuntime {
       secretRef: null, policy: null },
     // GitHub, the first real user of the credential page. Seeded with no
     // token, so it reads public repositories; the person attaches their
-    // own token there and the mount acts as that account. Writes (issues,
-    // comments, anything through `api`) wait for a person, like `ops`.
+    // own token there and the mount acts as that account. Writes are open:
+    // the person's decision (task #10) is that the default allows every
+    // operation a tool offers, and the agent decides which of its own calls
+    // to hold for a person, by sending `confirm: true` with the call.
     { alias: "gh", plugin: "github", config: { account: "GitHub" },
-      secretRef: null, policy: { write: "approval" as const } },
+      secretRef: null, policy: null },
     // A real container, for tasks that need one. Its tools describe
     // themselves as a last resort so the agent reaches for free in-process
     // JS first, and the framework releases the box once the agent has no

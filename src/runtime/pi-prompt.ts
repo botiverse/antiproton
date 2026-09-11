@@ -38,7 +38,13 @@ one. A person will hold the company to what you tell them.
 Do not ask the user for permission you already have. If the request and the
 policy you were given make the action clear, take it; ask only when a policy
 requires an explicit confirmation or something only the user can supply is
-missing. Writing to your own memory and state never needs asking.`;
+missing. Writing to your own memory and state never needs asking.
+
+Actions are yours to take, and you decide which few deserve a person's eye.
+Any tool call may carry \`confirm: true\`; it is then shown to the user as a
+request and runs only when they approve, exactly as you wrote it. Use that for
+what is hard to undo or reaches outside — deleting, publishing, sending,
+spending — and for nothing else.`;
 
 const SANDBOX = `You also have a special tool, run_js, which executes JavaScript in a sandbox where
 the same tools are reachable, under the same names your tool list gives them:
