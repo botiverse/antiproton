@@ -115,8 +115,9 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .mount-link .meta{margin-top:4px}
 .side-link{display:block;color:var(--dim);font-size:11px;margin-top:12px;text-decoration:none}
 .side-link:hover{color:var(--ink)}
-main.main{grid-area:main;overflow:auto;padding:14px 16px;min-width:0}
-section.view{display:none;flex-direction:column;gap:12px;min-height:100%;background:none;border:0;border-radius:0;overflow:visible}
+main.main{grid-area:main;overflow:auto;padding:14px 16px;min-width:0;display:flex;flex-direction:column}
+section.view{display:none;flex-direction:column;gap:12px;flex:1;min-height:0;background:none;border:0;border-radius:0;overflow:visible}
+section.view[data-view=agents].on{height:100%}
 .view>.body{background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:none}
 .view.on{display:flex}
 .view-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
@@ -135,7 +136,7 @@ background:var(--sunk);color:var(--accent);font-size:12px}
 .inbox-card .open{margin-left:auto;color:var(--dim);font-size:12px}
 .conv{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;
 flex:1;min-height:0}
-.conv .body{flex:1;max-height:none}
+.conv .body{flex:1;min-height:0;max-height:none;overflow:auto}
 .held{border-top:1px solid var(--line);padding:0 13px}
 .held:empty{display:none}
 .held .card{margin:10px 0}
@@ -269,6 +270,23 @@ border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
+/* --- scrollbars, on rUI's ScrollArea recipe ------------------------------
+   A six-pixel rounded thumb inside a twelve-pixel transparent track, black
+   at 35% under Brutal and foreground-muted at 35% under Elegant, darker on
+   hover, no buttons. Native scrollbars styled to the same recipe, since a
+   server-rendered page has no ScrollArea component to wrap its regions in.
+   Applies to every region that scrolls: the panes, the panel bodies, the
+   transcript and code blocks. */
+/* Chromium ignores the ::-webkit-scrollbar rules once the standard properties
+   are set, so those go only to engines without the pseudo-elements. */
+@supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) transparent}}
+:root{--scroll-thumb:color-mix(in oklab,var(--foreground-muted) 35%,transparent);--scroll-thumb-hover:color-mix(in oklab,var(--foreground-muted) 55%,transparent)}
+[data-theme="brutal"]{--scroll-thumb:oklch(0 0 0/.35);--scroll-thumb-hover:oklch(0 0 0/.55)}
+::-webkit-scrollbar{width:12px;height:12px;background:transparent}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-thumb{background-color:var(--scroll-thumb);background-clip:padding-box;border:3px solid transparent;border-radius:999px;min-height:28px}
+::-webkit-scrollbar-thumb:hover{background-color:var(--scroll-thumb-hover)}
+::-webkit-scrollbar-button{display:none;width:0;height:0}
 /* --- Brutal: square corners, two-pixel line-strong borders, hard offset
    shadows, the family's own recipe. Elegant keeps the rounded, shadowed
    treatment above. Applied by attribute so switching themes changes shape
