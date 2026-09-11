@@ -1140,20 +1140,13 @@ export class AgentDO extends DurableObject<Env> {
       avatar TEXT NOT NULL, created_at INTEGER NOT NULL)`);
   }
 
-  async uiCreateAgent(tenantId: string, ownerAgentId: string, spec: { name: string; description: string; avatar?: string }) {
+  /** Records an agent the route has already had adopted by its own object. */
+  async uiRecordAgent(tenantId: string, ownerAgentId: string, rec: { agentId: string; name: string; description: string; avatar: string; createdAt: number }) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
-    const name = String(spec.name ?? "").trim();
-    const description = String(spec.description ?? "").trim();
-    if (!name) throw new Error("refused: an agent needs a name");
-    if (name.length > 60) throw new Error("refused: a name is at most 60 characters");
-    if (description.length > 2000) throw new Error("refused: a description is at most 2000 characters");
-    const avatar = /^[0-9a-f]{8}$/i.test(String(spec.avatar ?? "")) ? String(spec.avatar).toLowerCase() : mintAvatar();
-    const agentId = `${ownerAgentId}_${Date.now().toString(36)}`;
-    const createdAt = Date.now();
-    this.sql.exec("INSERT INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?)",
-      agentId, name, description, avatar, createdAt);
-    return { agentId, name, description, avatar, createdAt };
+    this.sql.exec("INSERT OR IGNORE INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?)",
+      rec.agentId, rec.name, rec.description, rec.avatar, rec.createdAt);
+    return rec;
   }
 
   async uiListAgents(tenantId: string, ownerAgentId: string) {
@@ -2007,6 +2000,21 @@ async function formOf(request: Request): Promise<FormData | null> {
 const LEGACY_TASK_ID = MAIN_SESSION;
 const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/conversation", "/ui/agent"]);
 
+/**
+ * What a person may name an agent. Checked in the route before any object is
+ * touched, so a refusal costs nothing and leaves nothing behind.
+ */
+function agentSpec(form: FormData, ownerAgentId: string): { agentId: string; name: string; description: string; avatar: string; createdAt: number } | string {
+  const name = String(form.get("name") ?? "").trim();
+  const description = String(form.get("description") ?? "").trim();
+  if (!name) return "an agent needs a name";
+  if (name.length > 60) return "a name is at most 60 characters";
+  if (description.length > 2000) return "a description is at most 2000 characters";
+  const given = String(form.get("avatar") ?? "");
+  const avatar = /^[0-9a-f]{8}$/i.test(given) ? given.toLowerCase() : mintAvatar();
+  return { agentId: `${ownerAgentId}_${Date.now().toString(36)}`, name, description, avatar, createdAt: Date.now() };
+}
+
 /** Eight hex characters, enough for a page to draw a stable face from. */
 function mintAvatar(): string {
   const b = new Uint8Array(4); crypto.getRandomValues(b);
@@ -2451,9 +2459,12 @@ export default {
         // renderers with `d`, the way /ui/plugins does. `viewer` is the
         // identity the gate resolved.
         case "/ui/agent": {
-          // The only way an agent id comes to exist for a person: minted in
-          // their first object's directory, then adopted by its own object,
-          // which is where the harness reads the persona from.
+          // The only way an agent id comes to exist for a person. Order
+          // matters: the new object adopts the record first, since that is
+          // where its harness reads the persona from; the directory in the
+          // person's first object records it last, so a failure between the
+          // two leaves an unlisted object rather than a listed one with no
+          // persona. Both calls are idempotent.
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           if (request.method !== "POST") return new Response("POST", { status: 405 });
@@ -2461,20 +2472,12 @@ export default {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const home = uiAgent(gate.who);
-          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
-          let made: { agentId: string; name: string; description: string; avatar: string; createdAt: number };
-          try {
-            made = await homeStub.uiCreateAgent("demo", home, {
-              name: String(form.get("name") ?? ""), description: String(form.get("description") ?? ""),
-              avatar: String(form.get("avatar") ?? ""),
-            });
-          } catch (e: any) {
-            const msg = String(e?.message ?? e);
-            if (msg.startsWith("refused:")) return new Response(msg.slice("refused:".length).trim(), { status: 400 });
-            throw e;
-          }
+          const made = agentSpec(form, home);
+          if (typeof made === "string") return new Response(made, { status: 400 });
           const own = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", made.agentId)));
           await own.uiAdoptAgent("demo", made.agentId, made);
+          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
+          await homeStub.uiRecordAgent("demo", home, made);
           return Response.json(made);
         }
         case "/ui/agents": {
