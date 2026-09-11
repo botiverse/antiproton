@@ -184,6 +184,25 @@ export type CredentialForm =
   /** Nothing to type: send the person to the provider. */
   | { kind: "signIn"; signIn: SignIn; accountRequired: boolean };
 
+/**
+ * A field with its defaults filled in, because "absent means true" is a rule a
+ * caller has to know and `undefined` is falsy.
+ *
+ * `secret` is the one that matters. It defaults to true — most of a credential
+ * is secret — but a page writing the obvious `if (field.secret) mask()` against
+ * an unset value shows the input in clear, and the values that ship unset today
+ * are run9's secret key and AppWorld's password. The declaration was right and
+ * the reading of it was a plaintext password on screen, so the default is
+ * resolved here rather than left for every caller to remember.
+ *
+ * Stated the safe way round: only an explicit `secret: false` reveals a field.
+ */
+const resolved = (f: CredentialField): CredentialField => ({
+  ...f,
+  secret: f.secret !== false,
+  required: f.required !== false,
+});
+
 export function credentialForm(credential: CredentialSpec | undefined | null): CredentialForm {
   if (!credential) return { kind: "none" };
   const { shape, required, summary } = credential;
@@ -194,10 +213,12 @@ export function credentialForm(credential: CredentialSpec | undefined | null): C
       // The declaration's own words: a plugin saying "a GitHub personal access
       // token" has already written the label, and repeating it generically as
       // "Token" throws away the only sentence written for this plugin.
-      fields: [{ name: "token", summary, secret: true, required: true }],
+      fields: [resolved({ name: "token", summary, secret: true, required: true })],
     };
   }
-  if ("keys" in shape) return { kind: "fields", fields: shape.keys, accountRequired: required };
+  if ("keys" in shape) {
+    return { kind: "fields", fields: shape.keys.map(resolved), accountRequired: required };
+  }
   return { kind: "signIn", signIn: shape.signIn, accountRequired: required };
 }
 
