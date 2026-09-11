@@ -115,13 +115,15 @@ itself decide where one may be *sent*, and for most plugins the host is fixed by
 the plugin rather than chosen by the agent — so the question does not arise. The
 `http` mount is the exception: the agent supplies the URL, so a credential on it
 would go wherever the agent points it, and a setting (`allowedHosts`) is the only
-thing bounding that. A mount therefore **may not hold a key unless it names the
-hosts it may reach**; one that holds a key with the list unset, `null`, or empty
-is refused when it is mounted, rather than warned about. The requirement is
-declared by the field, so it is checked against *this mount's* `secret_ref`
-rather than against what the plugin is able to carry — a mount can hold a key
-before its plugin ever declares one, and the hazard does not wait for the
-declaration.
+thing bounding that. A mount carrying a credential therefore **must bound where
+that credential may be sent**, and the bound is declared by the field the plugin
+requires — for `http`, `allowedHosts`. The check reads *this mount's*
+`secret_ref` rather than what the plugin is able to carry, because a mount can
+hold a key before its plugin ever declares one and the hazard does not wait for
+the declaration. It runs twice: when the mount is provisioned, and again when a
+credential is later attached to it, so that attaching afterwards is not a way
+around a refusal the seed path would have made. A mount carrying no credential
+may leave the list unset, and then any public host is reachable.
 
 [appworld]: https://github.com/StonyBrookNLP/appworld
 
