@@ -400,8 +400,14 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     },
   ],
 
-  /** Called by the framework when the task ends, so an idle box is not left
-   *  running on the tenant's quota because nobody thought to stop it. */
+  /** Called when the agent has nothing open, so an idle box is not left running
+   *  on the tenant's quota because nobody thought to stop it.
+   *
+   *  Not per task, despite what the gateway's `releaseTask` is called: the body
+   *  below reads the mount's connection state and never looks at the caller's
+   *  task. The comment used to say "when the task ends" while the code twenty
+   *  lines down was already mount-scoped — the two were written in one file
+   *  without meeting, which is why the wrong sentence cost nothing and stayed. */
   async release(ctx: PluginContext): Promise<boolean> {
     const r = await stopBox(ctx);
     if (r === null) return false;
