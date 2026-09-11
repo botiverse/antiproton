@@ -76,7 +76,7 @@ height:100vh;overflow:hidden}
 body.shell[data-view=inbox],body.shell[data-view=runtime]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 @media(max-width:1100px){body.shell[data-view=agents]{grid-template-columns:56px 0 minmax(0,1fr) 0}}
-@media(max-width:760px){body.shell{grid-template-columns:56px 0 minmax(0,1fr) 0}}
+
 .rail{grid-area:rail;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 0;
 background:var(--panel);border-right:1px solid var(--line)}
 .rail-brand{display:block;width:26px;height:27px;color:var(--ink);margin:0 0 14px}
@@ -265,6 +265,33 @@ border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
+.pane-btn{display:none;background:transparent;border:1px solid var(--line);color:var(--dim);box-shadow:none;padding:6px 10px;font-size:11.5px}
+.pane-btn.on{color:var(--accent);border-color:var(--accent)}
+.sidebar .pane-close,.inspector .pane-close{display:none}
+/* --- phone: one pane at a time, the rail as a bottom nav ------------------
+   rUI's MobileNav shape. body[data-pane] chooses which pane fills the
+   screen; the conversation head carries the two buttons that switch to the
+   sidebar and the inspector, and either one returns to main. */
+@media(max-width:760px){
+  body.shell,body.shell[data-view]{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) 58px;grid-template-areas:"main" "rail"}
+  .rail{flex-direction:row;justify-content:space-around;align-items:center;gap:0;padding:0 4px;border-right:0;border-top:1px solid var(--line)}
+  .rail-brand,.rail-foot .mode,.rail-item[href^="https"]{display:none}
+  .rail-foot{margin:0}
+  .rail-item{width:auto;min-width:60px;padding:6px 4px 5px;font-size:10px}
+  .sidebar,.inspector{grid-area:main;display:none;border:0}
+  body[data-pane=side] .sidebar,body[data-pane=insp] .inspector{display:block}
+  body[data-pane=side] main.main,body[data-pane=insp] main.main{display:none}
+  main.main{padding:12px}
+  .pane-btn{display:inline-flex}
+  button,.inbox-card .row button{min-height:40px;padding:9px 14px;font-size:13px}
+  input[type=text],input[type=password]{min-height:40px;font-size:15px}
+  .inbox-card .row{flex-wrap:wrap;gap:8px}
+  .inbox-card .open{margin-left:0;width:100%;padding-top:4px}
+  .view-head h2{font-size:14px}
+  .conv .body{max-height:none}
+  .banner{font-size:12px;padding:8px 10px}
+}
+@media(max-width:760px){.sidebar .pane-close,.inspector .pane-close{display:inline-flex;margin:10px 12px 0}}
 `;
 
 /**
@@ -300,7 +327,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   const rail = (view: string, label: string) =>
     `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico"></span><span>${label}</span></a>`;
   return `<!doctype html><html lang="en" data-theme="elegant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>antiproton</title>
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script>(function(){try{var m=localStorage.getItem('ap-mode')||'dark';if(m==='light'||m==='dark')document.documentElement.classList.add(m)}catch(e){}})()</script>
@@ -324,6 +351,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   </div>
 </nav>
 <aside class="sidebar" id="sidebar">
+  <button type="button" class="ghost pane-close" onclick="ap.pane('main')">← back</button>
   <div class="side-view" data-for="agents">
     <h3>${esc(agentId)}</h3>
     <div class="sub">tasks, latest activity first</div>
@@ -345,6 +373,8 @@ export function page(taskId: string, who: string, agentId: string): string {
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><h2>${t}</h2><span class="sub">${esc(agentId)}</span><span class="spacer"></span>
+      <button type="button" class="pane-btn" onclick="ap.pane('side')">tasks</button>
+      <button type="button" class="pane-btn" onclick="ap.pane('insp')">inspector</button>
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
         <input type="hidden" name="taskId" value="${t}">
         <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
@@ -387,6 +417,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   </section>
 </main>
 <aside class="inspector" id="inspector">
+  <button type="button" class="ghost pane-close" onclick="ap.pane('main')">← back</button>
   <h3>inspector</h3>
   <div class="sub">what happened, and what the object holds. Each section re-reads the store while it is open.</div>
   ${insp("trajectory", `/ui/transcript?taskId=${t}`)}
@@ -404,7 +435,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   // server; every panel is still a plain GET that reads the store.
   window.ap = {
     show(view) {
-      document.body.dataset.view = view;
+      document.body.dataset.view = view; delete document.body.dataset.pane;
       document.querySelectorAll('.rail-item[data-view]').forEach(a => a.classList.toggle('on', a.dataset.view === view));
       document.querySelectorAll('.view').forEach(v => v.classList.toggle('on', v.dataset.view === view));
       document.querySelectorAll('.side-view').forEach(v => v.classList.toggle('on', v.dataset.for === view));
@@ -439,6 +470,11 @@ export function page(taskId: string, who: string, agentId: string): string {
     markMount() {
       const a = new URL(location.href).searchParams.get('alias') || '';
       document.querySelectorAll('#mounts .mount-link').forEach(el => el.classList.toggle('on', el.dataset.alias === a));
+    },
+    pane(name) {
+      if (name === 'main') delete document.body.dataset.pane; else document.body.dataset.pane = name;
+      if (name === 'insp') document.querySelectorAll('details.insp[open] .body').forEach(el => htmx.trigger(el, 'ap:show'));
+      if (name === 'side') document.querySelectorAll('.side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
     },
     markTask() {
       const t = document.body.dataset.task;
