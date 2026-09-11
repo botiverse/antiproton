@@ -44,8 +44,10 @@ export interface Run9Config {
    */
   shellPrefix?: string;
   /**
-   * Whether commands can reach the network. A run9 box always has egress, so
-   * "none" is done in the box: every command runs under `unshare -n`, in a
+   * Whether commands can reach the network. A run9 box always has egress —
+   * its create call accepts `normal` or `managed` and nothing else, so there is
+   * no isolated mode to ask for — and "none" is done in the box instead: every
+   * command runs under `unshare -n`, in a
    * fresh network namespace with no interface, no route and no DNS. Measured
    * on a SWE-bench image: the box is root with the full capability set, GitHub
    * stops resolving, and the repository's own tests still pass. A benchmark

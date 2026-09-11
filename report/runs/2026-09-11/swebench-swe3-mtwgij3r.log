@@ -1,0 +1,53 @@
+
+  SWE-bench Verified — 10 instance(s), inside the deployed object, container network none
+  on https://antiproton.botiverse.workers.dev object bench-swe3
+  ────────────────────────────────────────────────────────────────────────────────
+  astropy__astropy-12907  (astropy/astropy)
+  ✓ 213s  12 model calls  106838 tok (91% cached)  [shell×11]  diff:  1 file changed, 1 insertion(+), 1 deletion(-)
+      106838 tok (9686 re-read)  ·  container 208s = 98% of wall
+      object billed 132.9s = 62% of wall (10.8s of it grading)
+  astropy__astropy-13033  (astropy/astropy)
+  ✗ 910s  31 model calls  782946 tok (97% cached)  [shell×35]  diff:  1 file changed, 3 insertions(+), 1 deletion(-)  ended: agent_stalled
+      782946 tok (20194 re-read)  ·  container 907s = 100% of wall
+      object billed 692.8s = 76% of wall (8.2s of it grading)
+      astropy/timeseries/tests/test_sampled.py:403: AssertionError | =========================== short test summary info ============================ | FAILED astropy/timeseries/tests/test_sampled.py::test_required_columns - a
+  astropy__astropy-13236  (astropy/astropy)
+  ✓ 547s  43 model calls  1049353 tok (97% cached)  [shell×65]  diff:  1 file changed, 7 deletions(-)
+      1049353 tok (27017 re-read)  ·  container 543s = 99% of wall
+      object billed 338.8s = 62% of wall (11.5s of it grading)
+  astropy__astropy-13398  (astropy/astropy)
+  ✗ 1139s  26 model calls  909798 tok (96% cached)  [shell×42 run×1]  ended: agent_stalled
+      909798 tok (36710 re-read)  ·  container 1133s = 99% of wall
+      object billed 1018.7s = 89% of wall (231.8s of it grading)
+      FAILED astropy/coordinates/tests/test_intermediate_transformations.py::test_itrs_topo_to_hadec_with_refraction | FAILED astropy/coordinates/tests/test_intermediate_transformations.py::test_cirs_itrs_topo | FAILED astropy
+  astropy__astropy-13453  (astropy/astropy)
+  ✓ 424s  38 model calls  906911 tok (97% cached)  [shell×37]  diff:  1 file changed, 7 insertions(+)
+      906911 tok (26271 re-read)  ·  container 419s = 99% of wall
+      object billed 262.7s = 62% of wall (9.4s of it grading)
+  astropy__astropy-13579  (astropy/astropy)
+  ✓ 483s  35 model calls  1076061 tok (98% cached)  [shell×35]  diff:  1 file changed, 13 insertions(+), 1 deletion(-)
+      1076061 tok (23133 re-read)  ·  container 477s = 99% of wall
+      object billed 281.4s = 58% of wall (9.7s of it grading)
+  astropy__astropy-13977  (astropy/astropy)
+  ✗ 1122s  35 model calls  1083156 tok (97% cached)  [shell×55]  ended: agent_stalled
+      1083156 tok (33428 re-read)  ·  container 1114s = 99% of wall
+      object billed 935.4s = 83% of wall (214.7s of it grading)
+      FAILED astropy/units/tests/test_quantity_ufuncs.py::TestUfuncReturnsNotImplemented::TestBinaryUfuncs::test_full[empty-duck_quantity0-quantity0-multiply] - astropy.units.core.UnitTypeError: Cannot store q
+  astropy__astropy-14096  (astropy/astropy)
+  ✓ 351s  21 model calls  315753 tok (96% cached)  [shell×20]  diff:  1 file changed, 8 insertions(+)
+      315753 tok (11625 re-read)  ·  container 347s = 99% of wall
+      object billed 230.0s = 66% of wall (11.0s of it grading)
+  astropy__astropy-14182  (astropy/astropy)
+  ✓ 439s  26 model calls  757849 tok (96% cached)  [shell×34]  diff:  1 file changed, 5 insertions(+), 3 deletions(-)
+      757849 tok (27353 re-read)  ·  container 431s = 98% of wall
+      object billed 240.2s = 55% of wall (11.1s of it grading)
+  astropy__astropy-14309  (astropy/astropy)
+  ✓ 431s  25 model calls  572471 tok (95% cached)  [shell×36 run×1]  diff:  1 file changed, 3 insertions(+), 1 deletion(-)
+      572471 tok (28343 re-read)  ·  container 422s = 98% of wall
+      object billed 286.3s = 66% of wall (8.9s of it grading)
+  ────────────────────────────────────────────────────────────────────────────────
+  resolved 7/10   6059s total   7561136 prompt tokens (97% served from cache)
+  tools: shell×370  run×2
+  object billed 4419.1s of 6059s wall (73%), of which 527.3s is this runner grading
+  recorded report/runs/2026-09-11/swebench-swe3-mtwgij3r.json
+

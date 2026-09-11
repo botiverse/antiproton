@@ -322,7 +322,12 @@ Benchmarks are not tests and are reported separately, because they measure a
 model as much as a harness. Each row says which environment produced it: only
 the on-object ones meet the standard above, and the in-process ones are marked
 as such. SWE-bench Verified, the same three astropy
-instances each time:
+instances each time. **Every row in this table was measured with the
+container's network open**, which SWE-bench's own runs never are: in the
+archived transcripts of the `bench-swe1` row the agent fetched the upstream fix
+for one of its three instances, and the in-process rows kept no transcripts to
+check. Read them as loop comparisons under one condition, not as solve rates. The
+ten-instance run below is the one measured under SWE-bench's own condition.
 
 | | model | resolved | wall clock | prompt tokens | measured in |
 |---|---|---|---|---|---|
@@ -331,7 +336,21 @@ instances each time:
 | pi's loop | deepseek-flash | 3/3 | 690 s | 550 k (94% cached) | Node process, in-memory SQLite |
 | pi's loop | **deepseek-flash** *(deployed model)* | **3/3** | 692 s | 446 k (93% cached) | **Durable Object** `bench-swe1`, 2026-09-10, `swe-on-object` |
 
-The first two rows compare loops; the last two change the model as well, and
+Ten instances, the container without network (every command runs in an empty
+network namespace, so nothing the agent does can reach GitHub, where the answer
+to each instance is a public commit):
+
+| | model | resolved | wall clock | prompt tokens | measured in |
+|---|---|---|---|---|---|
+| pi's loop | **deepseek-flash** *(deployed model)* | **7/10** | 6,059 s | 7.56 M (97% cached) | **Durable Object** `bench-swe3`, 2026-09-11, Worker `60580fd`, network none |
+
+Record: `report/runs/2026-09-11/swebench-swe3-mtwgij3r.json`. All ten
+transcripts were read: five commands tried to reach GitHub, none received
+anything. The three misses ran out of the fifteen-minute budget; every solve
+landed in one file. The object was billed for 4,419 s of the 6,059 s wall clock
+(73 %), 527 s of it the runner grading.
+
+The first two rows of the slice table compare loops; the last two change the model as well, and
 are here because it is the model the deployment runs. Only the last row meets
 the standard: it was driven through the deployed Worker (`bench/swebench/cf.ts`),
 the agent ran inside the object with the instance's image mounted as its

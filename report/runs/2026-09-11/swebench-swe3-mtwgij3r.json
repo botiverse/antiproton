@@ -1,0 +1,415 @@
+{
+ "bench": "swebench-verified",
+ "base": "https://antiproton.botiverse.workers.dev",
+ "object": "bench-swe3",
+ "offset": 0,
+ "n": 10,
+ "network": "none",
+ "startedAt": "2026-09-11T02:48:16.939Z",
+ "results": [
+  {
+   "id": "astropy__astropy-12907",
+   "taskId": "astropy__astropy-12907_mtwcwpik",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 1 insertion(+), 1 deletion(-)",
+   "failOut": "",
+   "seconds": 213,
+   "agentSeconds": 201,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 12,
+   "toolTurns": 11,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 11
+   },
+   "calls": 12,
+   "prompt": 106838,
+   "out": 5463,
+   "cached": 97152,
+   "meter": {
+    "containerSeconds": 208,
+    "containers": 1,
+    "wallSeconds": 213,
+    "containerShare": 0.9765258215962441,
+    "promptTokens": 106838,
+    "cachedTokens": 97152,
+    "outputTokens": 5463
+   },
+   "objectMs": 132869,
+   "gradingMs": 10829
+  },
+  {
+   "id": "astropy__astropy-13033",
+   "taskId": "astropy__astropy-13033_mtwd19vi",
+   "resolved": false,
+   "failToPass": false,
+   "passToPass": true,
+   "diff": " 1 file changed, 3 insertions(+), 1 deletion(-)",
+   "failOut": "astropy/timeseries/tests/test_sampled.py:403: AssertionError | =========================== short test summary info ============================ | FAILED astropy/timeseries/tests/test_sampled.py::test_required_columns - a",
+   "seconds": 910,
+   "agentSeconds": 900,
+   "ended": "agent_stalled",
+   "network": "none",
+   "modelTurns": 31,
+   "toolTurns": 35,
+   "toolErrors": 1,
+   "byTool": {
+    "shell": 35
+   },
+   "calls": 31,
+   "prompt": 782946,
+   "out": 29266,
+   "cached": 762752,
+   "meter": {
+    "containerSeconds": 907,
+    "containers": 1,
+    "wallSeconds": 910,
+    "containerShare": 0.9967032967032967,
+    "promptTokens": 782946,
+    "cachedTokens": 762752,
+    "outputTokens": 29266
+   },
+   "objectMs": 692788,
+   "gradingMs": 8218
+  },
+  {
+   "id": "astropy__astropy-13236",
+   "taskId": "astropy__astropy-13236_mtwdks34",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 7 deletions(-)",
+   "failOut": "",
+   "seconds": 547,
+   "agentSeconds": 533,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 43,
+   "toolTurns": 65,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 65
+   },
+   "calls": 43,
+   "prompt": 1049353,
+   "out": 24548,
+   "cached": 1022336,
+   "meter": {
+    "containerSeconds": 543,
+    "containers": 1,
+    "wallSeconds": 546,
+    "containerShare": 0.9945054945054945,
+    "promptTokens": 1049353,
+    "cachedTokens": 1022336,
+    "outputTokens": 24548
+   },
+   "objectMs": 338770,
+   "gradingMs": 11488
+  },
+  {
+   "id": "astropy__astropy-13398",
+   "taskId": "astropy__astropy-13398_mtwdwhua",
+   "resolved": false,
+   "failToPass": false,
+   "passToPass": false,
+   "diff": "",
+   "failOut": "FAILED astropy/coordinates/tests/test_intermediate_transformations.py::test_itrs_topo_to_hadec_with_refraction | FAILED astropy/coordinates/tests/test_intermediate_transformations.py::test_cirs_itrs_topo | FAILED astropy",
+   "seconds": 1139,
+   "agentSeconds": 900,
+   "ended": "agent_stalled",
+   "network": "none",
+   "modelTurns": 26,
+   "toolTurns": 43,
+   "toolErrors": 2,
+   "byTool": {
+    "shell": 42,
+    "run": 1
+   },
+   "calls": 26,
+   "prompt": 909798,
+   "out": 21958,
+   "cached": 873088,
+   "meter": {
+    "containerSeconds": 1133,
+    "containers": 1,
+    "wallSeconds": 1139,
+    "containerShare": 0.9947322212467077,
+    "promptTokens": 909798,
+    "cachedTokens": 873088,
+    "outputTokens": 21958
+   },
+   "objectMs": 1018730,
+   "gradingMs": 231789
+  },
+  {
+   "id": "astropy__astropy-13453",
+   "taskId": "astropy__astropy-13453_mtwekwja",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 7 insertions(+)",
+   "failOut": "",
+   "seconds": 424,
+   "agentSeconds": 412,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 38,
+   "toolTurns": 37,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 37
+   },
+   "calls": 38,
+   "prompt": 906911,
+   "out": 15771,
+   "cached": 880640,
+   "meter": {
+    "containerSeconds": 419,
+    "containers": 1,
+    "wallSeconds": 423,
+    "containerShare": 0.9905437352245863,
+    "promptTokens": 906911,
+    "cachedTokens": 880640,
+    "outputTokens": 15771
+   },
+   "objectMs": 262651,
+   "gradingMs": 9416
+  },
+  {
+   "id": "astropy__astropy-13579",
+   "taskId": "astropy__astropy-13579_mtwetzdf",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 13 insertions(+), 1 deletion(-)",
+   "failOut": "",
+   "seconds": 483,
+   "agentSeconds": 471,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 35,
+   "toolTurns": 35,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 35
+   },
+   "calls": 35,
+   "prompt": 1076061,
+   "out": 25886,
+   "cached": 1052928,
+   "meter": {
+    "containerSeconds": 477,
+    "containers": 1,
+    "wallSeconds": 483,
+    "containerShare": 0.9875776397515528,
+    "promptTokens": 1076061,
+    "cachedTokens": 1052928,
+    "outputTokens": 25886
+   },
+   "objectMs": 281391,
+   "gradingMs": 9715
+  },
+  {
+   "id": "astropy__astropy-13977",
+   "taskId": "astropy__astropy-13977_mtwf4bz7",
+   "resolved": false,
+   "failToPass": false,
+   "passToPass": true,
+   "diff": "",
+   "failOut": "\u001b[31mFAILED\u001b[0m astropy/units/tests/test_quantity_ufuncs.py::\u001b[1mTestUfuncReturnsNotImplemented::TestBinaryUfuncs::test_full[empty-duck_quantity0-quantity0-multiply]\u001b[0m - astropy.units.core.UnitTypeError: Cannot store q",
+   "seconds": 1122,
+   "agentSeconds": 900,
+   "ended": "agent_stalled",
+   "network": "none",
+   "modelTurns": 35,
+   "toolTurns": 55,
+   "toolErrors": 1,
+   "byTool": {
+    "shell": 55
+   },
+   "calls": 35,
+   "prompt": 1083156,
+   "out": 26152,
+   "cached": 1049728,
+   "meter": {
+    "containerSeconds": 1114,
+    "containers": 1,
+    "wallSeconds": 1121,
+    "containerShare": 0.9937555753791257,
+    "promptTokens": 1083156,
+    "cachedTokens": 1049728,
+    "outputTokens": 26152
+   },
+   "objectMs": 935382,
+   "gradingMs": 214728
+  },
+  {
+   "id": "astropy__astropy-14096",
+   "taskId": "astropy__astropy-14096_mtwfsdc0",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 8 insertions(+)",
+   "failOut": "",
+   "seconds": 351,
+   "agentSeconds": 339,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 21,
+   "toolTurns": 20,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 20
+   },
+   "calls": 21,
+   "prompt": 315753,
+   "out": 15537,
+   "cached": 304128,
+   "meter": {
+    "containerSeconds": 347,
+    "containers": 1,
+    "wallSeconds": 351,
+    "containerShare": 0.9886039886039886,
+    "promptTokens": 315753,
+    "cachedTokens": 304128,
+    "outputTokens": 15537
+   },
+   "objectMs": 229971,
+   "gradingMs": 11049
+  },
+  {
+   "id": "astropy__astropy-14182",
+   "taskId": "astropy__astropy-14182_mtwfzw9t",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 5 insertions(+), 3 deletions(-)",
+   "failOut": "",
+   "seconds": 439,
+   "agentSeconds": 425,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 26,
+   "toolTurns": 34,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 34
+   },
+   "calls": 26,
+   "prompt": 757849,
+   "out": 24570,
+   "cached": 730496,
+   "meter": {
+    "containerSeconds": 431,
+    "containers": 1,
+    "wallSeconds": 439,
+    "containerShare": 0.9817767653758542,
+    "promptTokens": 757849,
+    "cachedTokens": 730496,
+    "outputTokens": 24570
+   },
+   "objectMs": 240222,
+   "gradingMs": 11144
+  },
+  {
+   "id": "astropy__astropy-14309",
+   "taskId": "astropy__astropy-14309_mtwg9atd",
+   "resolved": true,
+   "failToPass": true,
+   "passToPass": true,
+   "diff": " 1 file changed, 3 insertions(+), 1 deletion(-)",
+   "failOut": "",
+   "seconds": 431,
+   "agentSeconds": 420,
+   "ended": "answered",
+   "network": "none",
+   "modelTurns": 25,
+   "toolTurns": 37,
+   "toolErrors": 0,
+   "byTool": {
+    "shell": 36,
+    "run": 1
+   },
+   "calls": 25,
+   "prompt": 572471,
+   "out": 17148,
+   "cached": 544128,
+   "meter": {
+    "containerSeconds": 422,
+    "containers": 1,
+    "wallSeconds": 430,
+    "containerShare": 0.9813953488372092,
+    "promptTokens": 572471,
+    "cachedTokens": 544128,
+    "outputTokens": 17148
+   },
+   "objectMs": 286287,
+   "gradingMs": 8916
+  }
+ ],
+ "totals": {
+  "prompt": 7561136,
+  "cached": 7317376,
+  "tools": {
+   "shell": 370,
+   "run": 2
+  }
+ },
+ "activity": {
+  "activeMs": 4419061,
+  "summedMs": 4786490,
+  "pollMs": 0,
+  "invocations": 657,
+  "spanMs": 6056729,
+  "byKind": [
+   {
+    "kind": "benchSweStart",
+    "n": 10,
+    "ms": 0
+   },
+   {
+    "kind": "benchSay",
+    "n": 10,
+    "ms": 0
+   },
+   {
+    "kind": "alarm",
+    "n": 302,
+    "ms": 4236849
+   },
+   {
+    "kind": "offload_dispatch",
+    "n": 295,
+    "ms": 0
+   },
+   {
+    "kind": "offload_provider",
+    "n": 292,
+    "ms": 1102633
+   },
+   {
+    "kind": "offload_rtt",
+    "n": 292,
+    "ms": 1102633
+   },
+   {
+    "kind": "deliver",
+    "n": 295,
+    "ms": 0
+   },
+   {
+    "kind": "benchSweShell",
+    "n": 30,
+    "ms": 527292
+   },
+   {
+    "kind": "benchSweRelease",
+    "n": 10,
+    "ms": 22349
+   }
+  ]
+ }
+}

@@ -170,9 +170,9 @@ footer a{color:var(--accent)}
 <div class="wrap">
 
 <header class="mast">
-  <div class="eyebrow">Antiproton &middot; measurement record &middot; 10 September 2026</div>
+  <div class="eyebrow">Antiproton &middot; measurement record &middot; 11 September 2026</div>
   <h1>What has actually been measured</h1>
-  <p class="standfirst">Every benchmark this project has run, what each one can tell you, and the three it cannot answer yet. Numbers are measured, never estimated &mdash; and &ldquo;measured&rdquo; means on the real serverless object, not a Node process. Any figure that is not on-object is labelled as in-process and is never shown in place of one that is.</p>
+  <p class="standfirst">What antiproton measures today, what each number can tell you, and what none of them cover yet. Every figure on this page was measured on the deployed serverless object, never estimated and never taken from a Node process, and each section names the object, the commit and the committed record its numbers come from.</p>
   <div class="mast-meta">
     <span><b>harness</b> pi-agent-core 0.85.1</span>
     <span><b>model</b> deepseek-flash</span>
@@ -181,45 +181,42 @@ footer a{color:var(--accent)}
 </header>
 
 <div class="thesis">
-  <p><b>Read the noise before reading the numbers.</b></p>
-  <p>Two in-process runs of the same commit, on the same model, over the same three instances both scored 3&thinsp;/&thinsp;3 and differed by a third in cost: <span class="fig">1,071&thinsp;s / 813&thinsp;k</span> against <span class="fig">690&thinsp;s / 550&thinsp;k</span>. Nothing changed between them but the reporting code. A single instance is a coin flip &mdash; <span class="fig">astropy-12907</span> has passed alone, failed in a slice, and passed twice since, all on the same commit.</p>
-  <p>Three instances measure that the loop runs. They do not measure how good it is, and no figure on this page should be read as a trend.</p>
+  <p><b>The standard, stated once.</b> A figure counts only when it was measured on the deployed Durable Object. Every figure names the run it came from, the run names its object and the record under <code>report/runs/</code> that a reader can open, and nothing measured in a Node process ever stands in for an on-object number.</p>
+  <p><b>Samples, not trends.</b> Eight tasks by three trials and ten instances are samples. Runs of the same code on the same benchmark differ, a single instance passes and fails on the same commit, and no figure here should be read as a trend.</p>
 </div>
 
 <section>
   <h2>SWE-bench Verified</h2>
-  <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring, inside a deployed Durable Object</p>
-  <p class="how">object <code>bench-swe2</code> &middot; 2026-09-10 &middot; branch <code>swe-on-object</code> &middot; model deepseek-flash &middot; driver <code>bench/swebench/cf.ts</code> &middot; raw output retained</p>
-  <p><b>The conditions were not SWE-bench's.</b> This run kept the container's network open, and a run9 box always has egress; SWE-bench's published runs are single-container with none. In <b>6 of the 9 archived transcripts the agent fetched the upstream fix</b> &mdash; the PR diff over <code>api.github.com</code>, or a shallow clone and <code>git show</code> of the fix commit &mdash; and applied it in at least four; three say so in their own words (&ldquo;I found the exact upstream fix (PR #13977)&rdquo;). The earlier three-instance slice has the same property: one of its two archived transcripts fetched the fix. <b>So 9&thinsp;/&thinsp;10 is not a solve rate</b>, and in the affected instances the wall clock includes the retrieval rather than the solve. The τ² numbers above are unaffected: those answers are not on the public internet, and its failures are the simulated customer's. The fix is a benchmark container without egress and a rebuilt number, or this number annotated &mdash; not this number standing as it is.</p>
+  <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring, the container without network, inside a deployed Durable Object</p>
+  <p class="how">object <code>bench-swe3</code> &middot; 2026-09-11 &middot; Worker at <code>60580fd</code> &middot; model deepseek-flash &middot; driver <code>bench/swebench/cf.ts</code> &middot; record <code>report/runs/2026-09-11/swebench-swe3-mtwgij3r.json</code></p>
+  <p><b>The container has no network.</b> Every command the agent runs starts in an empty network namespace: no interface, no route, no DNS. SWE-bench&rsquo;s answer is a public commit, and with the network open this agent fetches it &mdash; an earlier run of the same ten instances with egress, kept only as a record under <code>report/runs/2026-09-10</code>, had the upstream fix fetched in six of nine archived transcripts, and is not a solve rate. In this run all ten transcripts are archived and were read: five commands tried to reach GitHub, none received anything, and no patch came from outside the box. This is the condition SWE-bench&rsquo;s published runs use, so this is the first number on this page comparable to them.</p>
 
   <div class="scroll">
   <table>
     <thead><tr>
-      <th>instance</th><th class="n"></th><th class="n">wall</th><th class="n">calls</th>
+      <th>instance</th><th class="n"></th><th class="n">wall</th><th class="n">model calls</th>
       <th class="n">prompt tok</th><th class="n">cached</th><th class="n">container</th><th class="n">object</th><th>patch</th>
     </tr></thead>
     <tbody>
-      <tr><td class="k">12907</td><td class="n">✓</td><td class="n">78&thinsp;s</td><td class="n">8</td><td class="n">56,424</td><td class="n">91&thinsp;%</td><td class="n">92&thinsp;%</td><td class="n">46&thinsp;%</td><td class="k">1 file, 1 ins(+), 1 del(-)</td></tr>
-      <tr><td class="k">13033</td><td class="n">✓</td><td class="n">84&thinsp;s</td><td class="n">13</td><td class="n">96,580</td><td class="n">93&thinsp;%</td><td class="n">96&thinsp;%</td><td class="n">57&thinsp;%</td><td class="k">1 file, 11 inss(+), 3 dels(-)</td></tr>
-      <tr><td class="k">13236</td><td class="n">✓</td><td class="n">150&thinsp;s</td><td class="n">24</td><td class="n">236,787</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">60&thinsp;%</td><td class="k">2 files, 4 inss(+), 8 dels(-)</td></tr>
-      <tr><td class="k">13398</td><td class="n">✗</td><td class="n">785&thinsp;s</td><td class="n">60</td><td class="n">2,567,617</td><td class="n">98&thinsp;%</td><td class="n">100&thinsp;%</td><td class="n">75&thinsp;%</td><td class="k">3 files, 57 inss(+), 13 dels(-)</td></tr>
-      <tr><td class="k">13453</td><td class="n">✓</td><td class="n">332&thinsp;s</td><td class="n">35</td><td class="n">689,372</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">74&thinsp;%</td><td class="k">1 file, 2 inss(+)</td></tr>
-      <tr><td class="k">13579</td><td class="n">✓</td><td class="n">330&thinsp;s</td><td class="n">23</td><td class="n">401,761</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, 5 inss(+), 1 del(-)</td></tr>
-      <tr><td class="k">13977</td><td class="n">✓</td><td class="n">355&thinsp;s</td><td class="n">23</td><td class="n">497,231</td><td class="n">95&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">82&thinsp;%</td><td class="k">1 file, 56 inss(+), 39 dels(-)</td></tr>
-      <tr><td class="k">14096</td><td class="n">✓</td><td class="n">213&thinsp;s</td><td class="n">12</td><td class="n">89,958</td><td class="n">91&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">84&thinsp;%</td><td class="k">1 file, 2 inss(+), 4 dels(-)</td></tr>
-      <tr><td class="k">14182</td><td class="n">✓</td><td class="n">248&thinsp;s</td><td class="n">16</td><td class="n">204,370</td><td class="n">90&thinsp;%</td><td class="n">98&thinsp;%</td><td class="n">74&thinsp;%</td><td class="k">1 file, 8 inss(+), 4 dels(-)</td></tr>
-      <tr><td class="k">14309</td><td class="n">✓</td><td class="n">294&thinsp;s</td><td class="n">24</td><td class="n">390,381</td><td class="n">95&thinsp;%</td><td class="n">97&thinsp;%</td><td class="n">67&thinsp;%</td><td class="k">3 files, 7 inss(+), 3 dels(-)</td></tr>
-      <tr class="total"><td>9&thinsp;/&thinsp;10</td><td class="n"></td><td class="n">2,869&thinsp;s</td>
-        <td class="n">238</td><td class="n">5,230,481</td><td class="n">96&thinsp;%</td>
-        <td class="n">&mdash;</td><td class="n">73&thinsp;%</td><td class="k">shell&times;247 run&times;2</td></tr>
+      <tr><td class="k">12907</td><td class="n">✓</td><td class="n">213&thinsp;s</td><td class="n">12</td><td class="n">106,838</td><td class="n">91&thinsp;%</td><td class="n">98&thinsp;%</td><td class="n">62&thinsp;%</td><td class="k">1 file, +1 &minus;1</td></tr>
+      <tr><td class="k">13033</td><td class="n">✗</td><td class="n">910&thinsp;s</td><td class="n">31</td><td class="n">782,946</td><td class="n">97&thinsp;%</td><td class="n">100&thinsp;%</td><td class="n">76&thinsp;%</td><td class="k">1 file, +3 &minus;1 &middot; out of time</td></tr>
+      <tr><td class="k">13236</td><td class="n">✓</td><td class="n">547&thinsp;s</td><td class="n">43</td><td class="n">1,049,353</td><td class="n">97&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">62&thinsp;%</td><td class="k">1 file &minus;7</td></tr>
+      <tr><td class="k">13398</td><td class="n">✗</td><td class="n">1,139&thinsp;s</td><td class="n">26</td><td class="n">909,798</td><td class="n">96&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">89&thinsp;%</td><td class="k">no patch &middot; out of time</td></tr>
+      <tr><td class="k">13453</td><td class="n">✓</td><td class="n">424&thinsp;s</td><td class="n">38</td><td class="n">906,911</td><td class="n">97&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">62&thinsp;%</td><td class="k">1 file, +7</td></tr>
+      <tr><td class="k">13579</td><td class="n">✓</td><td class="n">483&thinsp;s</td><td class="n">35</td><td class="n">1,076,061</td><td class="n">98&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">58&thinsp;%</td><td class="k">1 file, +13 &minus;1</td></tr>
+      <tr><td class="k">13977</td><td class="n">✗</td><td class="n">1,122&thinsp;s</td><td class="n">35</td><td class="n">1,083,156</td><td class="n">97&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">83&thinsp;%</td><td class="k">no patch &middot; out of time</td></tr>
+      <tr><td class="k">14096</td><td class="n">✓</td><td class="n">351&thinsp;s</td><td class="n">21</td><td class="n">315,753</td><td class="n">96&thinsp;%</td><td class="n">99&thinsp;%</td><td class="n">66&thinsp;%</td><td class="k">1 file, +8</td></tr>
+      <tr><td class="k">14182</td><td class="n">✓</td><td class="n">439&thinsp;s</td><td class="n">26</td><td class="n">757,849</td><td class="n">96&thinsp;%</td><td class="n">98&thinsp;%</td><td class="n">55&thinsp;%</td><td class="k">1 file, +5 &minus;3</td></tr>
+      <tr><td class="k">14309</td><td class="n">✓</td><td class="n">431&thinsp;s</td><td class="n">25</td><td class="n">572,471</td><td class="n">95&thinsp;%</td><td class="n">98&thinsp;%</td><td class="n">66&thinsp;%</td><td class="k">1 file, +3 &minus;1</td></tr>
+      <tr class="total"><td>7&thinsp;/&thinsp;10</td><td class="n"></td><td class="n">6,059&thinsp;s</td><td class="n">292</td><td class="n">7,561,136</td><td class="n">97&thinsp;%</td><td class="n">&mdash;</td><td class="n">73&thinsp;%</td><td class="k">shell&times;370 run&times;2</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p><b>This run happened inside the deployment.</b> The agent ran in the object with the instance&rsquo;s own image mounted as its machine, the model calls went out through the production queue, the grader ran in the same container before the runner released it, and the container was never offered to the agent to destroy. The previous version of this table came from a Node process over an in-memory database; it is gone, and the only change in outcome is that <span class="fig">14182</span> resolves here and failed there. <span class="fig">13398</span> is the one instance that failed in both runs, and it is the over-reaching one: 785&thinsp;s, sixty calls, three files. Every success landed in one to three files.</p>
-    <p><b>The object was billed for 73&thinsp;% of wall clock</b> &mdash; 2,105&thinsp;s of 2,869, 165&thinsp;s of it the runner grading. &tau;&sup2; bills the object for 3&ndash;5&thinsp;%. Same substrate, opposite bill, and the difference is where the waiting happens: a model call leaves the object through the queue, a tool call runs inside it, and this task is 247 shell commands in a container. On the three instances that the in-process run and the earlier on-object slice share (object <code>bench-swe1</code>, same day, same branch: 3&thinsp;/&thinsp;3, 692&thinsp;s, 75&thinsp;% billed), wall clock is the same as in-process (692&thinsp;s against 690&thinsp;s): the cost moved onto a different meter, not onto more time. This is a property of what ships, measured, not something this change fixes.</p>
-    <p><b>96&thinsp;% of prompt tokens came from cache</b>, so the gross figure overstates the bill by more than twenty times &mdash; of 5.2&nbsp;M, roughly 204&nbsp;k were actually re-read. A cache rate is still not a cost measure on its own: the failed instance re-read the most at 98&thinsp;% cached. <b>The container is alive for 92&ndash;100&thinsp;% of wall clock</b>; whether stopping it between calls pays still depends on run9&rsquo;s compute-versus-storage rates, which we do not have. <code>run_js</code> was not used once in 247 tool calls; the two <code>run</code> calls are run9&rsquo;s JavaScript inside the container, not the sandbox.</p>
+    <p><b>The run happens inside the deployment.</b> The agent runs in the object with the instance&rsquo;s own image as its machine, the model calls go out through the production queue, the grader applies the official test patch and runs the official tests in the same container before the runner releases it, and the container is never offered to the agent to destroy. The three misses are the three instances that ran out of the fifteen-minute budget; two of them left no patch and the third&rsquo;s patch failed its test. Every solve landed in one file. With nothing to fetch the model works the task itself, which is why instances take four to nineteen minutes and why this number is lower than a number measured with the network open.</p>
+    <p><b>The object is billed for 73&thinsp;% of wall clock</b> &mdash; 4,419&thinsp;s of 6,059, 527&thinsp;s of it the runner grading. &tau;&sup2; bills the object for 3&thinsp;%. Same substrate, opposite bill, and the difference is where the waiting happens: a model call leaves the object through the queue (1,103&thinsp;s of provider time across 292 calls, none of it billed to the object), while a tool call runs inside it, and this task is 370 shell commands in a container. Whether long tool calls should leave the object the way model calls do is the open question below.</p>
+    <p><b>97&thinsp;% of prompt tokens come from cache</b>, so the gross figure overstates the bill by about thirty times: of 7.56&nbsp;M, roughly 244&nbsp;k were actually re-read. A cache rate is not a cost measure on its own; the instances that ran out of time re-read the most. The container is alive for 97&ndash;99&thinsp;% of wall clock, and whether stopping it between calls would pay depends on run9&rsquo;s compute-versus-storage rates, which are not known. <code>run_js</code> is not used in 372 tool calls; the two <code>run</code> calls are run9&rsquo;s JavaScript inside the container, not the sandbox.</p>
   </div>
 </section>
 
@@ -278,39 +275,39 @@ footer a{color:var(--accent)}
 </section>
 
 <section>
-  <h2>What the object was billed for</h2>
-  <p class="sec-note">the number the in-process runner could not produce &middot; measured over the same 24 tasks</p>
+  <h2>What the object is billed for</h2>
+  <p class="sec-note">the number an in-process runner cannot produce &middot; the two runs above, same substrate</p>
 
   <div class="col">
-    <p>Cloudflare bills a Durable Object for the wall clock during which it is active, with no exemption for waiting on the network. So the question is not how long the run took but how much of that the object was awake for &mdash; and a completion is almost entirely waiting.</p>
+    <p>Cloudflare bills a Durable Object for the wall clock during which it is active, with no exemption for waiting on the network. So the question is never how long a run took but how much of it the object was awake for &mdash; and a model completion is almost entirely waiting.</p>
   </div>
 
   <div class="delta">
-    <div class="plus"><span class="num">951&thinsp;s</span><span class="cap">wall clock</span></div>
-    <div class="minus"><span class="num">37.1&thinsp;s</span><span class="cap">object active</span></div>
-    <div class="plus"><span class="num">436&thinsp;s</span><span class="cap">spent in the provider</span></div>
-    <div class="plus"><span class="num">168&thinsp;ms</span><span class="cap">object time per model call</span></div>
+    <div class="plus"><span class="num">3&thinsp;%</span><span class="cap">of wall clock billed, &tau;&sup2; retail &middot; 27.7&thinsp;s of 999&thinsp;s</span></div>
+    <div class="plus"><span class="num">130&thinsp;ms</span><span class="cap">object time per model call, &tau;&sup2; &middot; 491&thinsp;s waited in the provider</span></div>
+    <div class="minus"><span class="num">73&thinsp;%</span><span class="cap">of wall clock billed, SWE-bench &middot; 4,419&thinsp;s of 6,059&thinsp;s</span></div>
+    <div class="minus"><span class="num">4,237&thinsp;s</span><span class="cap">of it inside tool calls, SWE-bench &middot; 1,103&thinsp;s waited in the provider, unbilled</span></div>
   </div>
 
   <div class="col">
-    <p>The 436 seconds of provider latency are billed as Workers CPU in the queue consumer, not as object duration &mdash; which is the whole reason the model call leaves the object. The remaining wall clock is the benchmark's own customer simulator, running here.</p>
-    <p><b>Two things were paid for and did not need to be.</b> The alarm rearmed on the deferred handle's poll interval, one second, so it woke roughly five times per model call to ask whether an answer had arrived &mdash; an answer the queue delivers and wakes the object for. And the sweep that re-sends unanswered jobs could not tell <i>never sent</i> from <i>still running</i>, so it re-sent calls that were in flight: one conversation dispatched eleven calls fifty-one times, and a duplicate is not free, because a second worker asks the provider again and the losing answer's tokens are billed the same.</p>
+    <p>Provider latency is billed as Workers CPU in the queue consumer, not as object duration, which is the whole reason the model call leaves the object. What stays inside is the tool call. On &tau;&sup2; the tools are a mounted plugin answering in milliseconds, so the object sleeps through almost the whole run; on SWE-bench the tool is a shell in a container, and the object is awake for as long as the command runs. The loop is the same in both; the bill is a property of what the tools do.</p>
   </div>
 
   <div class="scroll">
   <table>
-    <thead><tr><th>per &tau;&sup2; task</th><th>before</th><th>after</th></tr></thead>
+    <thead><tr><th></th><th>&tau;&sup2; retail, per task</th><th>SWE-bench, per instance</th></tr></thead>
     <tbody>
-      <tr><td class="k">object wakeups</td><td>64</td><td>27</td></tr>
-      <tr><td class="k">alarm passes per model call</td><td>5.0</td><td>1.4</td></tr>
-      <tr><td class="k">dispatches per model call</td><td>4.6</td><td>1.0</td></tr>
-      <tr><td class="k">object duration billed</td><td>4.7&thinsp;s</td><td>1.5&thinsp;s</td></tr>
+      <tr><td class="k">model calls</td><td>8.9</td><td>29.2</td></tr>
+      <tr><td class="k">object wakeups</td><td>27</td><td>66</td></tr>
+      <tr><td class="k">alarm passes per model call</td><td>1.4</td><td>1.0</td></tr>
+      <tr><td class="k">object duration billed</td><td>1.2&thinsp;s</td><td>442&thinsp;s</td></tr>
+      <tr><td class="k">of which the runner grading</td><td>&mdash;</td><td>53&thinsp;s</td></tr>
     </tbody>
   </table>
   </div>
 
   <div class="col">
-    <p>The benchmark waits the way the console waits. Polling would have measured the poller &mdash; every poll is a request that wakes the object &mdash; so it listens on the same hibernation-API socket the console uses, which costs the object nothing while it waits.</p>
+    <p>The benchmark waits the way the console waits. Polling would measure the poller &mdash; every poll is a request that wakes the object &mdash; so the runner listens on the same hibernation-API socket the console uses, which costs the object nothing while it waits.</p>
   </div>
 </section>
 
@@ -320,8 +317,8 @@ footer a{color:var(--accent)}
   <div class="tiers">
     <div class="tier loud">
       <h3>SWE-bench Verified</h3>
-      <p class="how">answered &middot; 10 instances &middot; inside the deployed object</p>
-      <p>Whether the loop can carry a multi-turn task on a real machine to a graded result. 9&thinsp;/&thinsp;10 on the deployed model, measured in the deployed object with the grader in the agent&rsquo;s container. Ten instances is a sample, not a submission.</p>
+      <p class="how">answered &middot; 10 instances &middot; container without network &middot; inside the deployed object</p>
+      <p>Whether the loop can carry a multi-turn task on a real machine to a graded result under SWE-bench&rsquo;s own conditions. 7&thinsp;/&thinsp;10 on the deployed model, measured in the deployed object with the grader in the agent&rsquo;s container and no route out of it. Ten instances is a sample, not a submission.</p>
     </div>
     <div class="tier loud">
       <h3>pi storage conformance</h3>
@@ -352,13 +349,13 @@ footer a{color:var(--accent)}
       <tr><td>AppWorld on the current loop</td><td><span class="pill open">unported</span></td>
         <td>The credential-custody property is asserted by tests that drove the old harness. The gateway is unchanged, but the assertion is not currently running.</td></tr>
       <tr><td>Whether <code>run_js</code> pays</td><td><span class="pill open">switch, no arm</span></td>
-        <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused on object in both benchmarks (SWE-bench 49 calls, &tau;&sup2; 24 trials), and the only run that reached for it was an earlier in-process matrix that is not on-object evidence. So there is no evidence yet that the sandbox pays on this substrate, in either direction.</td></tr>
-      <tr><td>Sample size</td><td><span class="pill open">4 runs &times; 8 &times; 3</span></td>
-        <td>Five on-object runs of the same benchmark and model, and they disagree: pass^1 over tasks 62.5&thinsp;%, 62.5&thinsp;%, 75&thinsp;%, 75&thinsp;% and 87.5&thinsp;%, with trial counts 21, 15, 19, 17 and 18 of 24. The two metrics differ by up to ten points in the same run. Four runs carry full evidence; B's record is a commit message and its vector has no source. That spread is itself the finding &mdash; one run cannot say how good the loop is, and no figure here should be read as a trend.</td></tr>
+        <td>The sandbox is a runtime switch rather than a constant, so the ablation is one flag away &mdash; but it has not been run. It went unused on object in both benchmarks (SWE-bench 372 tool calls, &tau;&sup2; 24 trials), and the only run that reached for it was an earlier in-process matrix that is not on-object evidence. So there is no evidence yet that the sandbox pays on this substrate, in either direction.</td></tr>
+      <tr><td>Sample size</td><td><span class="pill open">8 &times; 3 and 10</span></td>
+        <td>Eight tasks by three trials and ten instances, one model, one run each on the current code. The &tau;&sup2; section states how far two runs of the same code have differed; ten SWE-bench instances at up to nineteen minutes each are what one run affords. The numbers are samples of the harness, and the spread between samples is itself a finding this page does not yet have enough runs to state.</td></tr>
       <tr><td>Multi-tenant load</td><td><span class="pill open">not measured</span></td>
         <td>Every figure here is one agent at a time. Nothing measures many tenants at once, which is the system&rsquo;s whole premise.</td></tr>
       <tr><td>&tau;&sup2; against the old harnesses</td><td><span class="pill open">comment only</span></td>
-        <td>The one figure this project ever recorded for &tau;&sup2; under a domain policy on the prior harnesses &mdash; 8&thinsp;/&thinsp;8 vs 7&thinsp;/&thinsp;8 vs 5&thinsp;/&thinsp;8 over 8 tasks &mdash; is not a measurement of the current loop. It survives only as a comment in the deleted driver, and is kept here so it is not mistaken for one.</td></tr>
+        <td>The one figure ever recorded for &tau;&sup2; under a domain policy on the prior harnesses &mdash; 8&thinsp;/&thinsp;8 vs 7&thinsp;/&thinsp;8 vs 5&thinsp;/&thinsp;8 over 8 tasks &mdash; is not a measurement of the current loop. It survives only as a comment in the deleted driver, and is kept here so it is not mistaken for one.</td></tr>
     </tbody>
   </table>
   </div>
@@ -370,8 +367,9 @@ footer a{color:var(--accent)}
   <table>
     <thead><tr><th>what</th><th>command</th></tr></thead>
     <tbody>
-      <tr><td>SWE-bench, deployed model</td><td class="k">HARNESS_MODEL=deepseek-flash N=3 node bench/swebench/run.ts</td></tr>
-      <tr><td>&hellip; a single instance, with a trace</td><td class="k">N=1 TRACE=1 node bench/swebench/run.ts</td></tr>
+      <tr><td>SWE-bench, inside the deployed object, no network</td><td class="k">N=10 OBJ=swe3 node bench/swebench/cf.ts</td></tr>
+      <tr><td>&hellip; a single instance, with a trace</td><td class="k">N=1 TRACE=1 OBJ=x node bench/swebench/cf.ts</td></tr>
+      <tr><td>&hellip; the contaminated condition, on purpose</td><td class="k">NETWORK=open N=10 OBJ=x node bench/swebench/cf.ts</td></tr>
       <tr><td>&tau;&sup2;, inside the deployed object</td><td class="k">OBJ=do1 N=8 TRIALS=3 node bench/tau2/cf.ts</td></tr>
       <tr><td>&hellip; waiting by polling instead of push</td><td class="k">WAIT=poll node bench/tau2/cf.ts</td></tr>
       <tr><td>&hellip; a finished task&rsquo;s transcript, after the fact</td><td class="k">curl &quot;$BASE/bench/trajectory?obj=do1&amp;taskId=&hellip;&quot;</td></tr>
@@ -386,8 +384,8 @@ footer a{color:var(--accent)}
 </section>
 
 <footer>
-  Measured between 9 and 10 September 2026 against the commit deployed at
-  antiproton.botiverse.dev. Where a figure is a single sample the page says so.<br>
+  Measured on 10 and 11 September 2026 against the Worker deployed at
+  antiproton.botiverse.dev; each section names its object, commit and record. Where a figure is a single sample the page says so.<br>
   SWE-bench Verified &copy; Princeton NLP &middot; AppWorld &copy; Stony Brook NLP &middot;
   pi is MIT, &copy; 2025 Mario Zechner.
 </footer>
