@@ -72,7 +72,7 @@ font:14px/1.55 var(--mono-font)}
    rUI's AppShell, as CSS. Slots own placement only; the panels inside own
    their surfaces. Which columns exist depends on the section: the inbox is
    one wide column, a conversation has all four. */
-body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 380px;grid-template-areas:"rail side main insp";
+body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
 body.shell[data-view=inbox],body.shell[data-view=runtime]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
@@ -141,14 +141,21 @@ flex:1;min-height:0}
 .held:empty{display:none}
 .held .card{margin:10px 0}
 .inspector{grid-area:insp;overflow:auto;background:var(--panel);border-left:1px solid var(--line);padding:12px;min-width:0}
-.inspector h3{font-size:12px;color:var(--ink);text-transform:none;letter-spacing:0;margin:2px 0 10px}
-.inspector .sub{color:var(--dim);font-size:10.5px;margin:-6px 0 10px}
-details.insp{border:1px solid var(--line);border-radius:6px;margin:0 0 8px;background:var(--bg)}
-details.insp summary{cursor:pointer;padding:8px 10px;font-size:11.5px;color:var(--dim);list-style:none;display:flex;gap:8px}
-details.insp summary::before{content:"+";width:10px;color:var(--faint)}
-details.insp[open] summary{color:var(--ink);border-bottom:1px solid var(--line)}
-details.insp[open] summary::before{content:"\\2013"}
-details.insp .body{max-height:52vh;padding:10px}
+/* the inspector's tabs, on rUI's Tabs recipe: Elegant is an underline strip
+   over a hairline, Brutal a bordered bar with dividers and the active tab
+   in Source Yellow */
+.inspector .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line-hairline);margin:0 0 10px;overflow-x:auto;scrollbar-width:none}
+.inspector .tabs::-webkit-scrollbar{display:none}
+.inspector .tabs [role=tab]{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;box-shadow:none;
+color:var(--faint);font-size:11px;font-weight:500;padding:8px 6px 9px;margin-bottom:-1px;white-space:nowrap;letter-spacing:0}
+.inspector .tabs [role=tab]:hover{color:var(--dim);background:none}
+.inspector .tabs [role=tab].on{color:var(--ink);border-bottom-color:var(--primary-400)}
+[data-theme="brutal"] .inspector .tabs{gap:0;border:2px solid var(--line-strong);background:var(--layer-panel);padding:0;width:max-content;max-width:100%}
+[data-theme="brutal"] .inspector .tabs [role=tab]{padding:6px 6px;font-size:11px;font-weight:600;border:0;border-left:2px solid var(--line-strong);margin:0;color:var(--ink)}
+[data-theme="brutal"] .inspector .tabs [role=tab]:first-child{border-left:0}
+[data-theme="brutal"] .inspector .tabs [role=tab]:hover{background:color-mix(in oklch,var(--line-strong) 6%,var(--layer-panel))}
+[data-theme="brutal"] .inspector .tabs [role=tab].on{background:var(--primary-400);color:var(--primary-950)}
+.inspector #insp{max-height:none;padding:6px 2px}
 header .sub{color:var(--dim);font-size:12px}
 section{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 h2{font-size:12px;margin:0;padding:9px 13px;border-bottom:1px solid var(--line);
@@ -294,7 +301,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
    palettes. */
 [data-theme="brutal"] button,[data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password],
 [data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,
-[data-theme="brutal"] .view>.body,[data-theme="brutal"] .task,[data-theme="brutal"] .mount-link,[data-theme="brutal"] details.insp,
+[data-theme="brutal"] .view>.body,[data-theme="brutal"] .task,[data-theme="brutal"] .mount-link,
 [data-theme="brutal"] .banner,[data-theme="brutal"] .rail-item,[data-theme="brutal"] .mode,[data-theme="brutal"] pre,
 [data-theme="brutal"] .badge,[data-theme="brutal"] .tag,[data-theme="brutal"] .inbox-card{border-radius:0}
 [data-theme="brutal"] button{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-sm)}
@@ -303,7 +310,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] button:disabled{box-shadow:none}
 [data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password]{border:2px solid var(--line-strong);background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
 [data-theme="brutal"] input[type=text]:focus,[data-theme="brutal"] input[type=password]:focus{box-shadow:var(--theme-shadow-md)}
-[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body,[data-theme="brutal"] details.insp,[data-theme="brutal"] .banner{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body,[data-theme="brutal"] .banner{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
 [data-theme="brutal"] .card{border-left-width:2px}
 [data-theme="brutal"] .task,[data-theme="brutal"] .mount-link{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .task.on,[data-theme="brutal"] .mount-link.on{background:var(--primary-soft)}
@@ -368,12 +375,7 @@ export function page(taskId: string, who: string, agentId: string): string {
     `<div class="body" id="${id}" data-lazy hx-get="${path}" hx-swap="innerHTML"
           hx-trigger="ap:show, every ${every}[${cond}]">loading…</div>`;
   const inView = "this.closest('.view').classList.contains('on')";
-  const inOpen = "this.closest('details').open";
-  const insp = (name: string, path: string) => `
-    <details class="insp" hx-on:toggle="if(this.open)htmx.trigger(this.querySelector('.body'),'ap:show')">
-      <summary>${name}</summary>
-      ${lazy(`insp-${name}`, path, "3s", inOpen)}
-    </details>`;
+  const inspTab = (name: string) => `<button type="button" role="tab" data-insp="${name}" onclick="ap.insp('${name}')">${name}</button>`;
   const rail = (view: string, label: string) =>
     `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
   return `<!doctype html><html lang="en" data-theme="brutal"><head><meta charset="utf-8">
@@ -468,14 +470,12 @@ export function page(taskId: string, who: string, agentId: string): string {
 </main>
 <aside class="inspector" id="inspector">
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
-  <h3>inspector</h3>
-  <div class="sub">what happened, and what the object holds. Each section re-reads the store while it is open.</div>
-  ${insp("trajectory", `/ui/transcript?taskId=${t}`)}
-  ${insp("events", `/ui/events?taskId=${t}`)}
-  ${insp("storage", `/ui/storage?taskId=${t}`)}
-  ${insp("memory", `/ui/memory?taskId=${t}`)}
-  ${insp("sandbox", `/ui/sandbox?taskId=${t}`)}
-  ${insp("runtime", `/ui/runtime?taskId=${t}`)}
+  <div class="tabs" role="tablist" aria-label="inspector">
+    ${inspTab("trajectory")}${inspTab("events")}${inspTab("storage")}${inspTab("memory")}${inspTab("sandbox")}${inspTab("runtime")}
+  </div>
+  <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/transcript?taskId=${t}" hx-swap="innerHTML"
+       hx-trigger="ap:show, every 3s[document.body.dataset.view==='agents']">loading…</div>
+  <div class="hint" style="padding:8px 0 0">Every tab re-reads the store while it is showing; nothing is cached client-side.</div>
 </aside>
 <div hidden id="inbox-poll" hx-get="/ui/inbox" hx-swap="innerHTML" hx-trigger="load, every 5s"
      hx-on::after-swap="ap.count(this)"></div>
@@ -521,9 +521,20 @@ export function page(taskId: string, who: string, agentId: string): string {
       const a = new URL(location.href).searchParams.get('alias') || '';
       document.querySelectorAll('#mounts .mount-link').forEach(el => el.classList.toggle('on', el.dataset.alias === a));
     },
+    // The inspector's tabs: one panel, re-pointed at the chosen fragment. The
+    // choice lives on the URL, so a reload and a deep link land on the same tab.
+    insp(name) {
+      const paths = { trajectory: '/ui/transcript', events: '/ui/events', storage: '/ui/storage', memory: '/ui/memory', sandbox: '/ui/sandbox', runtime: '/ui/runtime' };
+      if (!paths[name]) name = 'trajectory';
+      document.querySelectorAll('.inspector [role=tab]').forEach(b => { const on = b.dataset.insp === name; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
+      const panel = document.getElementById('insp');
+      panel.setAttribute('hx-get', paths[name] + '?taskId=' + encodeURIComponent(document.body.dataset.task));
+      htmx.process(panel); htmx.trigger(panel, 'ap:show');
+      const u = new URL(location.href); u.searchParams.set('insp', name); history.replaceState(null, '', u);
+    },
     pane(name) {
       if (name === 'main') delete document.body.dataset.pane; else document.body.dataset.pane = name;
-      if (name === 'insp') document.querySelectorAll('details.insp[open] .body').forEach(el => htmx.trigger(el, 'ap:show'));
+      if (name === 'insp') htmx.trigger(document.getElementById('insp'), 'ap:show');
       if (name === 'side') document.querySelectorAll('.side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
     },
     markTask() {
@@ -554,6 +565,7 @@ export function page(taskId: string, who: string, agentId: string): string {
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
     ap.show(['inbox', 'agents', 'plugins', 'runtime'].includes(v) ? v : 'inbox');
+    ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
   // the server answers 304 when nothing has moved, and htmx leaves the DOM
