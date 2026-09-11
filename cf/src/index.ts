@@ -2032,6 +2032,22 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
         headers: { location: new URL("/ui", url).toString(), "set-cookie": await sessionCookieFor(env.SESSION_SECRET, QA_VIEWER, "qa") },
       });
     }
+    case "/ui/whoami": {
+      // The probe: what identity this request actually resolves to, and the
+      // configuration facts no branch would otherwise show. It answers anyone,
+      // ahead of the gate, because "nobody" is the reading a forged session
+      // must produce, and a refusal would hide it.
+      const v = await viewer(request, env);
+      return Response.json({
+        viewer: v ? { email: v.email, name: v.name, source: v.source } : null,
+        anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
+        loginConfigured: raftConfig(env) !== null,
+        qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
+        cfHeaders: Object.fromEntries(
+          [...request.headers].filter(([k]) => k.startsWith("cf-")),
+        ),
+      });
+    }
     case "/logout": {
       if (method !== "POST") return Response.json({ error: "METHOD", hint: "POST to sign out" }, { status: 405 });
       return new Response(null, { status: 302, headers: { location: new URL("/login", url).toString(), "set-cookie": clearCookieHeader(SESSION_COOKIE) } });
@@ -2466,20 +2482,6 @@ export default {
           const k = url.searchParams.get("taskId") ?? `t_${a}`;
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.diagnose(t, a, k));
-        }
-        case "/ui/whoami": {
-          // The probe: what identity this request actually resolves to, and
-          // the configuration facts that no branch would otherwise show.
-          const v = await viewer(request, env);
-          return Response.json({
-            viewer: v ? { email: v.email, name: v.name, source: v.source } : null,
-            anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
-            loginConfigured: raftConfig(env) !== null,
-            qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
-            cfHeaders: Object.fromEntries(
-              [...request.headers].filter(([k]) => k.startsWith("cf-")),
-            ),
-          });
         }
         case "/ui": {
           const gate = await requireViewer(request, env);
