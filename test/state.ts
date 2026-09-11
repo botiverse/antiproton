@@ -170,6 +170,28 @@ await check("装不下时给出的建议用的是这个挂载的名字", async (
   }
 });
 
+await check("list 真的把键列出来,而不是只报个数", async () => {
+  const { store, plugin, ctx } = await fixture();
+  await plugin.invoke("remember", { key: "memory", text: "部署窗口是周二" }, ctx());
+  await plugin.invoke("remember", { key: "todo", text: "确认 web-02" }, ctx());
+
+  // `stateUsage` returns `{ keys: <count>, bytes }`, so `{ keys: rows, ...usage }`
+  // silently replaced the listing with the number — the tool promised "what is
+  // stored, with sizes" and answered with a tally.
+  const out = await plugin.invoke("list", {}, ctx()) as any;
+  if (!Array.isArray(out.keys)) throw new Error(`list did not return rows: ${JSON.stringify(out)}`);
+  if (out.keys.map((r: any) => r.key).sort().join(",") !== "memory,todo") {
+    throw new Error(`wrong keys: ${JSON.stringify(out.keys)}`);
+  }
+  if (out.total?.keys !== 2) throw new Error(`the totals were lost: ${JSON.stringify(out.total)}`);
+
+  // The listing is what the prefix selected; the total is the whole store, and
+  // the two must not be read as the same number.
+  const filtered = await plugin.invoke("list", { prefix: "mem" }, ctx()) as any;
+  if (filtered.keys.length !== 1) throw new Error(`prefix did not filter: ${JSON.stringify(filtered.keys)}`);
+  if (filtered.total?.keys !== 2) throw new Error("the total followed the filter instead of the store");
+});
+
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
