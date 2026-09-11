@@ -355,6 +355,17 @@ check("the approvals panel shows pending calls only; decided ones are gone", () 
   must(/nothing waiting/.test(approvals(rows.slice(1))), "with nothing pending the panel says so, and lists nothing");
 });
 
+// #93 styled the sidebar's rows with a bare .agent rule; the transcript's
+// steps carry class "agent" too, so every turn was laid out as a row (#100
+// scoped it). Layout cannot be asserted here, but the selector can.
+check("no unscoped .agent rule reaches the transcript's steps", () => {
+  const html = page("t_u-x", "someone", "u-x");
+  const css = html.slice(html.indexOf("<style>"), html.indexOf("</style>"));
+  const bare = css.match(/(^|[\n;}])\s*\.agent(?![\w-])[^{]*\{/g) ?? [];
+  must(bare.length === 0, "a rule starting with .agent would also match .step.agent: " + bare.join(" | "));
+  must(/#agents \.agent\{/.test(css), "the sidebar row rule is scoped under #agents");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
