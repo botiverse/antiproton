@@ -24,6 +24,11 @@ const CSS = `
 .mount{border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:8px 0;background:var(--layer-card)}
 .mount-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px}
 .problems{border-left:2px solid var(--bad);padding:4px 0 4px 8px;margin:6px 0;font-size:12px;color:var(--bad)}
+/* A seed change the console refused to apply: the mount kept its previous,
+   valid settings, so nothing else on the block shows it. The line is present
+   only while the refusal stands; a later reconcile that succeeds clears it. */
+.problems.warn{border-color:var(--warn);color:var(--warn)}
+.problems.warn .when{color:var(--dim)}
 .plug{border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin:6px 0;background:var(--layer-card)}
 .plug summary{cursor:pointer;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
 .plug h4{margin:10px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
@@ -1493,6 +1498,9 @@ function mountBlock(d: any, m: any): string {
       ${(m.problems ?? []).length
         ? `<div class="problems">${(m.problems as string[]).map((p) =>
             `<div>${esc(p)}</div>`).join("")}</div>`
+        : ""}
+      ${m.reconcileRefused && typeof m.reconcileRefused.reason === "string"
+        ? `<div class="problems warn">seed change not applied: ${esc(m.reconcileRefused.reason)}${when(m.reconcileRefused.at) ? ` <span class="when">${esc(when(m.reconcileRefused.at)!)}</span>` : ""}</div>`
         : ""}
       ${settings()}
       ${credentialRegion(m, spec)}

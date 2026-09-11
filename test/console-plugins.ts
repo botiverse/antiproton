@@ -404,6 +404,17 @@ check("an agent-raised hold says the agent asked, a policy hold says held by", (
   must(count(panel, /the agent asked you to confirm/g) === 1, "only the agent-raised card carries the badge in the conversation panel");
 });
 
+// A refused seed reconcile leaves the mount valid and quiet; the block says
+// it happened while it stands (cody's #154 clears the field on success).
+check("a refused seed reconcile shows on the mount block, and only while it stands", () => {
+  const base = { installed: [{ id: "github", version: "2", tools: [], config: [], credential: null }], used: {} };
+  const with_ = mountFragment({ ...base, mounts: [{ alias: "gh", plugin: "github", version: "2", connected: true, config: {}, problems: [], tools: [], credential: { attached: false }, reconcileRefused: { at: "2026-09-11T13:40:00Z", reason: "github has no setting \"max_bytes\" <b>x</b>" } }] }, "gh");
+  must(/class="problems warn">seed change not applied: github has no setting &quot;max_bytes&quot; &lt;b&gt;x&lt;\/b&gt;/.test(with_), "the refusal is shown, escaped");
+  must(/2026-09-11 13:40Z/.test(with_), "with the time it was refused");
+  const without = mountFragment({ ...base, mounts: [{ alias: "gh", plugin: "github", version: "2", connected: true, config: {}, problems: [], tools: [], credential: { attached: false }, reconcileRefused: null }] }, "gh");
+  must(!/seed change not applied/.test(without), "a cleared refusal shows nothing");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
