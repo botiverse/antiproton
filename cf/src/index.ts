@@ -29,7 +29,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment,
+  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue,
 } from "./ui.ts";
 
 export interface Env {
@@ -1394,6 +1394,72 @@ export class AgentDO extends DurableObject<Env> {
       total, shown: events.length, events, byOp, busy };
   }
 
+  /**
+   * The inbox: every call held for a decision across this agent's tasks,
+   * oldest first, plus how many tasks there are and how many are still open.
+   * The same store method the per-task panel reads, without the task filter.
+   */
+  async uiInbox(tenantId: string, agentId: string) {
+    const rt = this.runtime();
+    await rt.ready();
+    const pending = (await rt.store.listApprovals(tenantId, "pending"))
+      .filter((a) => a.agentId === agentId)
+      .sort((x, y) => x.createdAt - y.createdAt)
+      .map((a) => ({
+        operationId: a.operationId, taskId: a.taskId, agentId: a.agentId,
+        tool: `${a.mountAlias}.${a.tool}`,
+        // The gateway holds the request as { tool, args }; the tool is already
+        // named above, so the card gets the arguments themselves.
+        args: (a.request as any)?.args ?? a.request,
+        requestedAt: new Date(a.createdAt).toISOString(),
+        heldBy: `${a.mountAlias} policy`,
+      }));
+    const tasks = await rt.store.listTasks(tenantId, agentId);
+    const running = tasks.filter((t) => t.status !== "completed" && t.status !== "failed").length;
+    return { pending, tasks: { total: tasks.length, running } };
+  }
+
+  /**
+   * The agent's tasks, latest activity first, each with its held-call count
+   * and whether the agent is mid-turn on it. `lastActivityAt` is the task's
+   * last checkpoint. `turns` is null: the per-task record is `events.task_id`,
+   * while the transcript is built from `pi_entries`, which has no task id, so
+   * a count would have to come from `events` — and what `events` holds today
+   * is prompts and compactions per task, not model turns, so it would count
+   * the person's messages rather than the agent's turns. `busy` is the agent's
+   * lane state, attributed to the most recently active open task, since one
+   * lane serves every task.
+   */
+  async uiTasks(tenantId: string, agentId: string) {
+    const rt = this.runtime();
+    await rt.ready();
+    const tasks = await rt.store.listTasks(tenantId, agentId);
+    const pendingByTask: Record<string, number> = {};
+    for (const a of await rt.store.listApprovals(tenantId, "pending")) {
+      if (a.agentId === agentId) pendingByTask[a.taskId] = (pendingByTask[a.taskId] ?? 0) + 1;
+    }
+    let running = false;
+    try {
+      const agent = await rt.agent(tenantId, agentId);
+      running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    } catch { /* an agent that has never run has no lane to inspect */ }
+    const open = tasks.filter((t) => t.status !== "completed" && t.status !== "failed");
+    const active = open.length ? open.reduce((m, t) => (t.updatedAt > m.updatedAt ? t : m)) : null;
+    return {
+      agentId,
+      tasks: tasks
+        .slice()
+        .sort((x, y) => y.updatedAt - x.updatedAt)
+        .map((t) => ({
+          taskId: t.taskId, status: t.status,
+          lastActivityAt: new Date(t.updatedAt).toISOString(),
+          pending: pendingByTask[t.taskId] ?? 0,
+          turns: null as number | null,
+          busy: running && active?.taskId === t.taskId,
+        })),
+    };
+  }
+
   /** The approvals panel. With a task, that task's approvals; without one,
    *  every approval the tenant has, which is what a cross-task view wants.
    *  The parameter was accepted and dropped before, so the per-task panel
@@ -2138,7 +2204,15 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
-          return html(plugins(await stub.uiPlugins("demo", agentId)));
+          // One read, dispatched to the part the shell asked for: the mount
+          // list, one mount's block, the catalogue, or the whole page.
+          const d = await stub.uiPlugins("demo", agentId);
+          switch (url.searchParams.get("part")) {
+            case "mounts": return html(mountList(d));
+            case "mount": return html(mountFragment(d, String(url.searchParams.get("alias") ?? "").trim()));
+            case "catalogue": return html(catalogue(d));
+            default: return html(plugins(d));
+          }
         }
         case "/ui/credential": {
           // A value comes in; a re-rendered mount block goes out, and nothing
@@ -2181,6 +2255,20 @@ export default {
             : url.pathname === "/ui/memory" ? memoryPanel(d)
             : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
             : runtimePanel(d));
+        }
+        // Data routes for the console shell, rendered by the shell's own
+        // renderers with `d`, the way /ui/plugins does. `viewer` is the
+        // identity the gate resolved.
+        case "/ui/inbox": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const d = await stub.uiInbox("demo", uiAgent(gate.who));
+          return html(inbox({ viewer: gate.who, ...d }));
+        }
+        case "/ui/tasks": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          return html(taskList(await stub.uiTasks("demo", uiAgent(gate.who))));
         }
         case "/ui/approvals": {
           const taskId = String(url.searchParams.get("taskId"));

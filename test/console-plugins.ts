@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { plugins, mountFragment, mountBlockId } from "../cf/src/ui.ts";
+import { plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -203,6 +203,74 @@ check("a hostile alias or summary cannot break out of the markup", () => {
   const html = mountFragment(d, `x" onmouseover="1`);
   must(!/<script>/.test(html), "summary must be escaped");
   must(!/alias" value="x" onmouseover/.test(html), "alias must be escaped in attributes");
+});
+
+
+// ---- the shell's inbox and task list ----------------------------------------
+check("the inbox renders each held call with the request verbatim, escaped, and its own count", () => {
+  const html = inbox({ viewer: "someone", pending: [
+    { operationId: "op-1", taskId: "t_a", agentId: "u-x", tool: "gh.issues.create", args: { title: `<img src=x onerror=1>` }, requestedAt: new Date(Date.now() - 120000).toISOString(), heldBy: "gh policy" },
+    { operationId: "op-2", taskId: "t_b", agentId: "u-x", tool: "node.exec", args: { cmd: "ls" }, requestedAt: new Date().toISOString(), heldBy: "node policy" },
+  ], tasks: { total: 3, running: 2 } });
+  must(/data-pending="2"/.test(html), "the root must carry the pending count");
+  must(/gh\.issues\.create/.test(html) && /node\.exec/.test(html), "both calls render");
+  must(!html.includes("<img src=x"), "arguments must be escaped");
+  must(html.includes("&lt;img src=x onerror=1&gt;"), "the escaped text must still be shown verbatim");
+  must(/waiting 2 min/.test(html), "how long it has waited");
+  must(/held by gh policy/.test(html), "who is holding it");
+  must(/hx-post="\/ui\/decide"[^>]*hx-target="#inbox"/.test(html.replace(/\n/g, " ")), "decisions re-render the inbox");
+  must(/t_a/.test(html) && /open the conversation/.test(html), "each card links to its conversation");
+});
+
+check("an empty inbox says nothing needs you and what is running", () => {
+  const html = inbox({ viewer: "someone", pending: [], tasks: { total: 3, running: 1 } });
+  must(/data-pending="0"/.test(html), "count is zero");
+  must(/Nothing is waiting on you\. 1 of 3 tasks running\./.test(html), "the empty state names the running count");
+});
+
+check("the task list shows status, activity, held count and busy, and never a turn count of zero", () => {
+  const html = taskList({ agentId: "u-x", tasks: [
+    { taskId: "t_a", status: "open", lastActivityAt: "2026-09-11T05:00:00Z", pending: 2, turns: null, busy: true },
+    { taskId: "t_b", status: "completed", lastActivityAt: "2026-09-10T05:00:00Z", pending: 0, turns: null, busy: false },
+  ] });
+  must(/data-task="t_a"/.test(html) && /data-task="t_b"/.test(html), "both tasks render");
+  must(/2 held/.test(html), "held count shows");
+  must(/working/.test(html), "busy shows");
+  must(!/turns/.test(html), "a null turn count is not rendered at all");
+  must(/2026-09-11 05:00Z/.test(html), "last activity renders");
+  must(!/undefined|null/.test(html), "nothing renders as undefined or null");
+});
+
+check("a hostile task id cannot break out of the task list", () => {
+  const html = taskList({ agentId: "u-x", tasks: [{ taskId: `t" onmouseover="1`, status: "open", lastActivityAt: null, pending: 0, turns: null, busy: false }] });
+  must(!/data-task="t" onmouseover/.test(html), "the id must be escaped in attributes");
+});
+
+check("the mount list names each mount, its plugin and its credential state, and the catalogue lists what is installed", () => {
+  const d = { installed, mounts: [
+    mount("gh", "github", { connected: true, credential: { attached: true, verified: true, account: "botiverse" } }),
+    mount("node", "run9", { connected: true, credential: { attached: true, operator: true } }),
+    mount("lab", "run9", { needsAccount: true }),
+    mount("h", "http"),
+  ], used: {} };
+  const list = mountList(d);
+  must(/data-alias="gh"/.test(list) && /data-alias="lab"/.test(list), "every mount is listed");
+  must(/verified/.test(list) && /operator/.test(list) && /needs an account/.test(list) && /no account/.test(list), "each state is named");
+  must(!/<input|acting as|botiverse/.test(list), "the list carries no credential detail, only the state");
+  const cat = catalogue(d);
+  must(/<details class="plug">/.test(cat) && /somewhere/.test(cat), "the catalogue lists the installed plugins");
+  must(/Mounting one is a separate, deliberate act/.test(cat), "and says mounting is separate");
+  must(plugins(d).includes(cat.slice(0, 60)), "the whole page still composes the catalogue");
+});
+
+check("an unknown mount alias is said back, escaped", () => {
+  const html = mountFragment({ installed: [], mounts: [], used: {} }, `<img src=x onerror=1>`);
+  must(!html.includes("<img src=x"), "the alias must be escaped");
+  must(html.includes("no mount named &lt;img src=x onerror=1&gt;"), "and still named");
+  // the alias also renders as the block's id, which is made safe by replacement rather than escaping;
+  // both mechanisms are asserted so a refactor that drops either one fails here
+  must(/id="mount-_img_src_x_onerror_1_"/.test(html), "the id must be the whitelisted form of the alias");
+  must(!/id="[^"]*<[^"]*"/.test(html), "no id may carry markup");
 });
 
 const failed = results.filter((r) => !r.ok);
