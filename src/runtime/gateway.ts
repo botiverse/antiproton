@@ -158,6 +158,7 @@ export class ToolGateway {
       try {
         const did = await plugin.release({
           caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+          alias: mount.alias,
           credential: mount.secretRef
             ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
             : null,
@@ -281,6 +282,7 @@ export class ToolGateway {
       });
       const result = await plugin.invoke(r.tool, args, {
         caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+        alias: mount.alias,
         credential,
         publicConfig: mount.publicConfig,
         // Scoped to the mount, not the plugin: two accounts of the same service
@@ -331,6 +333,7 @@ export class ToolGateway {
     try {
       return await plugin.checkCredential({
         caller: { tenantId, agentId, taskId: "credential-check" },
+        alias,
         credential, publicConfig: mount.publicConfig, connection: connectionFor(alias),
         async sibling() { return null; },
       });

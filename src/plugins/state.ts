@@ -229,7 +229,7 @@ export function statePlugin(
           if (usage.bytes - prior + body.length > cfg.maxTotalBytes) {
             throw new Error(
               `this would take the store past ${cfg.maxTotalBytes} bytes (currently ${usage.bytes}); ` +
-              `delete something with state.forget`,
+              `delete something with ${ctx.alias}.forget`,
             );
           }
           if (body.length <= INLINE_MAX) {

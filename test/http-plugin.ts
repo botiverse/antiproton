@@ -12,6 +12,7 @@ const eq = (a: unknown, b: unknown, w: string) =>
 
 const ctx = (allowedHosts: string[], extra = {}) => ({
   caller: { tenantId: "t", agentId: "a", taskId: "k" },
+  alias: "web",
   credential: null,
   publicConfig: { allowedHosts, ...extra },
   connection: { async get() { return null; }, async set() {} },

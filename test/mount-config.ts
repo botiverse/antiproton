@@ -399,7 +399,7 @@ await check("a plugin that holds nothing is not needlessly serialised", () => {
  */
 await check("a verification refuses a malformed credential in words, without calling anything", async () => {
   const ctx = (credential: string | null): any => ({
-    caller: { tenantId: "t", agentId: "a", taskId: "x" },
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "gh",
     credential, publicConfig: {},
     connection: { get: async () => null, set: async () => {} },
     sibling: async () => null,
@@ -445,7 +445,7 @@ await check("the plugins that take a credential are the plugins that can verify 
 await check("a provider that cannot be reached is unreachable, not a rejection", async () => {
   const dead = "http://127.0.0.1:1";
   const ctx = (credential: string, publicConfig: any = {}): any => ({
-    caller: { tenantId: "t", agentId: "a", taskId: "x" },
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "gh",
     credential, publicConfig,
     connection: { get: async () => null, set: async () => {} },
     sibling: async () => null,

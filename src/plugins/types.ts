@@ -19,6 +19,16 @@ export interface ConnectionState {
 export interface PluginContext {
   /** Read-only identity of the caller. Plugins cannot use it to escalate. */
   caller: { tenantId: string; agentId: string; taskId: string };
+  /**
+   * The name this mount was given, which is the only name the model knows.
+   *
+   * The harness dispatches on `<alias>.<tool>`, and the alias is the operator's
+   * to choose — so a plugin that writes "delete something with state.forget"
+   * into an error or a prompt is naming a tool nobody promised it. Supplied
+   * here because the gateway is the only place that knows it: `sibling(alias)`
+   * already hands a plugin another mount's name, and this is its own.
+   */
+  alias: string;
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
   publicConfig: Record<string, Json>;
