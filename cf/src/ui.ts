@@ -661,10 +661,14 @@ export function page(_taskId: string, who: string, agentId: string): string {
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
-  // the server answers 304 when nothing has moved, and htmx leaves the DOM
-  // alone. Without this a long conversation re-parses megabytes every few
-  // seconds and the page stops responding to scrolling.
+  // the server answers 304 when nothing has moved. htmx 1.9 swaps any 2xx or
+  // 3xx but 204, so a 304's empty body would empty the panel: the whole
+  // conversation went blank the moment polling went quiet (tygg, 2026-09-11).
+  // The swap is refused here, explicitly, so a 304 leaves the DOM alone.
   window.__ver = {};
+  document.body.addEventListener('htmx:beforeSwap', (e) => {
+    if (e.detail.xhr && e.detail.xhr.status === 304) e.detail.shouldSwap = false;
+  });
   document.body.addEventListener('htmx:configRequest', (e) => {
     const v = window.__ver[e.detail.path];
     if (v) e.detail.headers['x-ap-version'] = v;

@@ -360,6 +360,13 @@ check("a mount's tools show the model-visible name and the usage count under eit
   must(/<code class="hot">gh\.issue_list ×3<\/code>/.test(oldForm), "the old form still finds its count");
 });
 
+// A 304 poll must not swap: htmx 1.9 swaps 2xx and 3xx alike, and the empty
+// body emptied every panel once its content stopped changing.
+check("the shell refuses to swap a 304 poll response", () => {
+  const html = page("t_u-x", "someone", "u-x");
+  must(/htmx:beforeSwap/.test(html) && /status === 304\) e\.detail\.shouldSwap = false/.test(html), "a beforeSwap listener sets shouldSwap=false on 304");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
