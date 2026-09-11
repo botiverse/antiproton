@@ -163,7 +163,11 @@ await check("装不下时给出的建议用的是这个挂载的名字", async (
   try { await plugin.invoke("put", { key: "b", value: "y".repeat(20) }, small); }
   catch (e) { message = String((e as Error).message); }
   if (!message) throw new Error("the store took more than it holds");
-  if (!message.includes("memo.forget")) throw new Error(`the advice names the wrong tool: ${message}`);
+  // The tool and the mount it is on — not `memo.forget`, which is the dispatch
+  // address and not a name the model is offered.
+  if (!message.includes("`forget` tool on `memo`")) {
+    throw new Error(`the advice names the wrong tool: ${message}`);
+  }
 });
 
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);

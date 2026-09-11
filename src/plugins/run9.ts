@@ -229,7 +229,7 @@ export function execOutput(out: string, maxOutputBytes: number): {
     output: out.slice(0, maxOutputBytes),
     truncated: true,
     dropped: out.length - maxOutputBytes,
-    note: "the rest was discarded, not stored: re-run sending output to a file and node.save it",
+    note: "the rest was discarded, not stored: re-run sending output to a file and `save` it",
   };
 }
 
@@ -285,7 +285,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
         "few seconds of compute. The container is NOT the per-execution sandbox: it persists between " +
         "calls until you release it, so installs and files survive from one call to the next — do not " +
-        "reinstall. Work in as few calls as you can, save what matters with node.save, and release it. " +
+        "reinstall. Work in as few calls as you can, save what matters with `save`, and release it. " +
         "Everything inside is destroyed when it is released.",
       parameters: {
         type: "object",
@@ -306,7 +306,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     {
       name: "shell",
       summary:
-        "Shell in the same billed-by-the-second container as node.run, and the same one across calls " +
+        "Shell in the same billed-by-the-second container as `run`, and the same one across calls " +
         "— state, installed packages and files carry over. Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
@@ -324,7 +324,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       name: "save",
       summary:
         "Copy a file out of the container into durable storage before it is destroyed. Returns an " +
-        "r2:// reference you can read later with artifacts.read, and that outlives the box. Set " +
+        "r2:// reference the artifacts mount can read back, and that outlives the box. Set " +
         "archive for a directory. Do this for anything worth keeping — a build output, a report, a " +
         "diff — the moment it exists, not at the end.",
       parameters: {
@@ -347,7 +347,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       summary:
         "Save this container's filesystem under a name, so a later task can start from it instead " +
         "of installing everything again. Use it once the environment is set up — interpreter, " +
-        "packages, a cloned repository — not for the results, which belong in node.save. The " +
+        "packages, a cloned repository — not for the results, which belong in `save`. The " +
         "container keeps running; the snapshot is independent of it and survives its release.",
       parameters: {
         type: "object",
@@ -493,7 +493,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       if (!want) {
         return {
           kept: envs.map((e) => ({ name: e.name, note: e.note, savedAt: e.savedAt })),
-          note: envs.length ? "pass one of these as name" : "nothing kept yet; node.keep saves one",
+          note: envs.length ? "pass one of these as name" : "nothing kept yet; `keep` saves one",
         };
       }
       const env = envs.find((e) => e.name === want);
@@ -652,7 +652,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       return {
         kept: name, snapshot: snapId,
         note: "independent of this container and survives its release; " +
-          "start a later one from it with node.start_from",
+          "start a later one from it with `start_from`",
       };
     }
 
@@ -726,7 +726,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
           // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
           // nothing between executions" concluded this box was volatile too — which
           // would have it reinstalling packages on every call.
-          reminder: "this container persists between calls; run9.release destroys it",
+          reminder: `this container persists between calls; the \`release\` tool on \`${ctx.alias}\` destroys it`,
           ...execOutput(out, cfg.maxOutputBytes),
           box: state.boxId,
           // So the agent learns the environment from a result it already has,

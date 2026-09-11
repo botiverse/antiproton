@@ -136,7 +136,7 @@ export function statePlugin(
         name: "get",
         summary:
           "Read a key back. A value too large to return arrives as an r2:// reference; open it " +
-          "with artifacts.read, which can project fields and page.",
+          "from the artifacts mount, whose `read` can project fields and page.",
         parameters: {
           type: "object",
           properties: { key: { type: "string" } },
@@ -208,7 +208,7 @@ export function statePlugin(
           if (got.ref) {
             return {
               key, found: true, bytes: got.bytes, ref: got.ref,
-              note: "too large to return here; read it with artifacts.read { ref, fields, offset, limit }",
+              note: "too large to return here; the artifacts mount reads it back: `read { ref, fields, offset, limit }`",
             };
           }
           return { key, found: true, bytes: got.bytes, updatedAt: got.updatedAt, value: got.value };
@@ -229,7 +229,7 @@ export function statePlugin(
           if (usage.bytes - prior + body.length > cfg.maxTotalBytes) {
             throw new Error(
               `this would take the store past ${cfg.maxTotalBytes} bytes (currently ${usage.bytes}); ` +
-              `delete something with ${ctx.alias}.forget`,
+              `delete something with the \`forget\` tool on \`${ctx.alias}\``,
             );
           }
           if (body.length <= INLINE_MAX) {

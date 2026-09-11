@@ -541,6 +541,28 @@ await check("每个 agent 一开始就有记忆", () => {
   if (dupes.length) throw new Error(`the seed list repeats an alias: ${dupes.join(", ")}`);
 });
 
+await check("没有 summary 把分派地址当成工具名交给模型", () => {
+  // `<alias>.<tool>` is what the harness dispatches on. It is not what the model
+  // is offered: `qualifyMountedTools` gives it the bare tool name, and
+  // `<alias>__<tool>` only when a second mount has the same one — which depends
+  // on the whole mounted set, so no plugin can predict it. A summary naming
+  // `node.save` therefore names nothing callable, and the agent reading it
+  // spends a turn finding that out. Summaries only: a runtime string is not
+  // here to be read.
+  const toolNames = new Set(everyPlugin.flatMap((p) => p.tools.map((t) => t.name)));
+  const prose = everyPlugin.flatMap((p) => [
+    ...p.tools.map((t) => ({ where: `${p.id}.${t.name}`, text: t.summary })),
+    ...(p.config ?? []).map((f) => ({ where: `${p.id} config ${f.name}`, text: f.summary })),
+  ]);
+  for (const { where, text } of prose) {
+    for (const m of String(text).matchAll(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]+)\b/g)) {
+      if (toolNames.has(m[2]!)) {
+        throw new Error(`${where} offers "${m[0]}", which is a dispatch address and not a tool the model can call`);
+      }
+    }
+  }
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
