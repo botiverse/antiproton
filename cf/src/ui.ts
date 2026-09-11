@@ -109,6 +109,12 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .task.on{border-color:var(--accent);background:var(--sunk)}
 .task .id{font-size:12px}
 .task .meta{color:var(--dim);font-size:10.5px;margin-top:3px}
+.task .title{font-size:12px;color:var(--ink)}
+.task .tid{font-family:var(--mono-font)}
+.new-conv{width:100%;justify-content:center;margin:0 0 10px;gap:6px}
+.new-conv svg{width:14px;height:14px}
+.new-conv-err{font-size:11px;color:var(--bad);margin:-4px 0 10px}
+.new-conv-err[hidden]{display:none}
 .mount-link{display:block;padding:9px 12px;border:1px solid var(--line);border-radius:7px;margin:0 0 8px;color:var(--ink);text-decoration:none}
 .mount-link.on{border-color:var(--accent);background:var(--sunk)}
 .mount-link .id{font-size:12px}.mount-link .id .sub{color:var(--dim);font-size:11px}
@@ -404,7 +410,9 @@ export function page(taskId: string, who: string, agentId: string): string {
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
   <div class="side-view" data-for="agents">
     <h3>${esc(agentId)}</h3>
-    <div class="sub">tasks, latest activity first</div>
+    <div class="sub">conversations, latest activity first</div>
+    <button type="button" class="ghost new-conv" onclick="ap.newConversation(this)">${ICONS.plus}new conversation</button>
+    <div class="err new-conv-err" id="new-conv-err" hidden></div>
     <div id="tasks" data-lazy hx-get="/ui/tasks" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
          hx-on::after-swap="ap.markTask()"><a class="task on" data-task="${t}"><div class="id">${t}</div><div class="meta">this conversation</div></a></div>
   </div>
@@ -422,7 +430,7 @@ export function page(taskId: string, who: string, agentId: string): string {
     ${lazy("inbox", "/ui/inbox", "3s", inView)}
   </section>
   <section class="view" data-view="agents">
-    <div class="view-head"><h2>${t}</h2><span class="sub">${esc(agentId)}</span><span class="spacer"></span>
+    <div class="view-head"><h2 id="conv-title">${t}</h2><span class="sub" id="conv-id">${esc(agentId)}</span><span class="spacer"></span>
       <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}tasks</button>
       <button type="button" class="pane-btn" onclick="ap.pane('insp')">${ICONS.inspector}inspector</button>
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
@@ -529,6 +537,22 @@ export function page(taskId: string, who: string, agentId: string): string {
     markTask() {
       const t = document.body.dataset.task;
       document.querySelectorAll('#tasks .task').forEach(a => a.classList.toggle('on', a.dataset.task === t));
+      const row = document.querySelector('#tasks .task.on');
+      if (row && row.dataset.title && row.dataset.title !== '—') {
+        document.getElementById('conv-title').textContent = row.dataset.title;
+        document.getElementById('conv-id').textContent = t;
+      }
+    },
+    // Ids are minted by the server; the page never invents one. A refusal
+    // (the preview's anonymous viewer, or a gate) is said beside the button.
+    async newConversation(btn) {
+      const err = document.getElementById('new-conv-err'); err.hidden = true; btn.disabled = true;
+      try {
+        const r = await fetch('/ui/conversation', { method: 'POST', headers: { 'accept': 'application/json' } });
+        if (!r.ok) { err.textContent = 'could not start a conversation: ' + r.status + ' ' + (await r.text()).slice(0, 120); err.hidden = false; return; }
+        const d = await r.json(); if (d && d.taskId) ap.task(d.taskId); else { err.textContent = 'the server returned no conversation id'; err.hidden = false; }
+      } catch (e) { err.textContent = 'could not reach the server'; err.hidden = false; }
+      finally { btn.disabled = false; }
     },
     // rUI's three themes: Brutal, Elegant, Elegant dark. The family goes on
     // data-theme; Elegant's mode is a class; Brutal has no dark mode.
@@ -1160,14 +1184,19 @@ export function inbox(d: any): string {
  * so it is not shown rather than shown as zero: a zero would say "this task
  * ran nothing", which is a different and false claim. The current task is
  * marked client-side from the URL, so the route stays a plain store read.
+ * The title is the first line of the first user message when the route has
+ * one, since a person recognises a conversation by what they asked; when it
+ * has none the row shows a dash and the id stays in the meta line, so an id
+ * is never dressed up as a title.
  */
 export function taskList(d: any): string {
   const tasks: any[] = d?.tasks ?? [];
   const when = (iso: string) => { const t = Date.parse(iso); return Number.isNaN(t) ? "" : new Date(t).toISOString().slice(0, 16).replace("T", " ") + "Z"; };
   if (!tasks.length) return `<div class="empty">no tasks yet</div>`;
-  return tasks.map((t) => `<a class="task" data-task="${esc(t.taskId)}" href="/ui?view=agents&taskId=${encodeURIComponent(t.taskId)}" onclick="ap.task('${esc(t.taskId)}');return false">
-  <div class="id">${esc(t.taskId)}${t.busy ? ` <span class="tag ok">working</span>` : ""}${t.pending ? ` <span class="tag warn">${t.pending} held</span>` : ""}</div>
-  <div class="meta">${esc(t.status ?? "")}${t.lastActivityAt ? ` · ${esc(when(t.lastActivityAt))}` : ""}${typeof t.turns === "number" ? ` · ${t.turns} turns` : ""}</div>
+  const title = (t: any) => typeof t.title === "string" && t.title.trim() ? esc(t.title.trim().slice(0, 80)) : "—";
+  return tasks.map((t) => `<a class="task" data-task="${esc(t.taskId)}" data-title="${title(t)}" href="/ui?view=agents&taskId=${encodeURIComponent(t.taskId)}" onclick="ap.task('${esc(t.taskId)}');return false">
+  <div class="id"><span class="title">${title(t)}</span>${t.busy ? ` <span class="tag ok">working</span>` : ""}${t.pending ? ` <span class="tag warn">${t.pending} held</span>` : ""}</div>
+  <div class="meta"><span class="tid">${esc(t.taskId)}</span>${t.status ? ` · ${esc(t.status)}` : ""}${t.lastActivityAt ? ` · ${esc(when(t.lastActivityAt))}` : ""}${typeof t.turns === "number" ? ` · ${t.turns} turns` : ""}</div>
 </a>`).join("");
 }
 

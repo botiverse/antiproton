@@ -273,6 +273,18 @@ check("an unknown mount alias is said back, escaped", () => {
   must(!/id="[^"]*<[^"]*"/.test(html), "no id may carry markup");
 });
 
+check("a conversation row shows its title, or a dash, and never the id dressed as a title", () => {
+  const html = taskList({ agentId: "u-x", tasks: [
+    { taskId: "t_u-x_abc", title: "Open an issue on the repo about the flaky test.\nsecond line", status: "open", lastActivityAt: "2026-09-11T05:00:00Z", pending: 0, turns: null, busy: false },
+    { taskId: "t_u-x", title: null, status: "open", lastActivityAt: "2026-09-11T04:00:00Z", pending: 0, turns: null, busy: false },
+    { taskId: "t_u-x_xss", title: `<img src=x onerror=1>`, status: "open", lastActivityAt: null, pending: 0, turns: null, busy: false },
+  ] });
+  must(/<span class="title">Open an issue on the repo about the flaky test\.\nsecond line<\/span>/.test(html) || /<span class="title">Open an issue on the repo about the flaky test\./.test(html), "the title is shown");
+  must(/data-title="—"/.test(html) && /<span class="title">—<\/span>/.test(html), "a missing title is a dash");
+  must(/<span class="tid">t_u-x<\/span>/.test(html), "the id stays in the meta line");
+  must(!html.includes("<img src=x"), "titles are escaped");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);

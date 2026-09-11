@@ -4,7 +4,7 @@
  * rUI draws its icons with lucide, so the console does too, under lucide's
  * own names: inbox, bot, plug, cpu and chart-column for the rail; square, sun and moon
  * for the theme control (Brutal, Elegant, Elegant dark); chevron-left, list-todo and panel-right
- * for the phone's pane controls. Path data is from lucide-react 1.44.0
+ * for the phone's pane controls; plus for a new conversation. Path data is from lucide-react 1.44.0
  * (ISC), copied here because the Worker serves strings and has no bundle.
  * Copyright (c) 2026 Lucide Icons and Contributors; chevron-left, monitor and
  * moon derive from Feather, Copyright (c) 2013-present Cole Bemis (MIT). The
@@ -13,6 +13,7 @@
  * aria-label, so the SVG itself is aria-hidden.
  */
 export const ICONS: Record<string, string> = {
+  "plus": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M5 12h14\"/><path d=\"M12 5v14\"/></svg>",
   "brutal": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/></svg>",
   "inbox": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><polyline points=\"22 12 16 12 14 15 10 15 8 12 2 12\"/><path d=\"M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z\"/></svg>",
   "agents": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M12 8V4H8\"/><rect width=\"16\" height=\"12\" x=\"4\" y=\"8\" rx=\"2\"/><path d=\"M2 14h2\"/><path d=\"M20 14h2\"/><path d=\"M15 13v2\"/><path d=\"M9 13v2\"/></svg>",
