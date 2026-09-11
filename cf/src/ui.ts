@@ -432,7 +432,7 @@ export function page(_taskId: string, who: string, agentId: string): string {
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
   ${rail("runtime", "runtime")}
-  <a class="rail-item" href="https://report.botiverse.dev/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
+  <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
       <button type="button" data-theme-choice="brutal" onclick="ap.theme('brutal')" aria-label="Brutal" title="Brutal">${ICONS.brutal}</button>
