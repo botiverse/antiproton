@@ -511,7 +511,13 @@ them:
   handed to the model verbatim as the first section after the core prompt, so it
   is standing instructions rather than a label. What is not built is changing
   either afterwards: there is no edit or rename, and no way to delete one, so a
-  description written at creation is the description the agent keeps. The older
+  description written at creation is the description the agent keeps. Nor does an
+  agent have its mounts at the moment it is created — creation writes its record,
+  and the mounts arrive when it is first opened or first asked to run anything,
+  so a fresh id read before either looks unmounted. That is a window between two
+  steps rather than a fault: the record and the mounts are made by different
+  paths, and folding them together would make creation do seven things it does
+  not need to. Worth knowing before re-running a check that reads a mount list. The older
   threading layer is also still unused — `events.thread_id` is a column nothing
   reads, and the `threads`/`task_threads` tables with the `POST
   /agents/:id/threads` routes sit on `SqliteStore` in a file nothing calls, so
