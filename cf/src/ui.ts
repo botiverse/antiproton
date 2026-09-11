@@ -434,7 +434,10 @@ export function page(taskId: string, who: string, agentId: string): string {
       document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
     },
   };
-  (function () {
+  // htmx wires the page on DOMContentLoaded, after this script has run, so
+  // the first section-show must wait for it or its fetch fires into elements
+  // nobody is listening on yet; the next poll would catch up, seconds later.
+  document.addEventListener('DOMContentLoaded', function () {
     let m = 'dark'; try { m = localStorage.getItem('ap-mode') || 'dark'; } catch (e) {}
     document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
     const url = new URL(location.href), v = url.searchParams.get('view');
@@ -444,7 +447,7 @@ export function page(taskId: string, who: string, agentId: string): string {
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
     ap.show(['inbox', 'agents', 'plugins', 'runtime'].includes(v) ? v : 'inbox');
-  })();
+  });
   // Poll without re-rendering. Each panel remembers the version it last drew;
   // the server answers 304 when nothing has moved, and htmx leaves the DOM
   // alone. Without this a long conversation re-parses megabytes every few
