@@ -124,8 +124,8 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .avatar svg{width:100%;height:100%;display:block}
 .avatar.lg{width:28px;height:28px}
 .avatar[hidden]{display:none}
-/* Scoped to the sidebar list: the transcript's model turns are `.step.agent`
-   too, and an unscoped `.agent{display:flex}` laid every turn out as a row. */
+/* Scoped to the sidebar list: the transcript's model turns are .step.agent
+   too, and an unscoped .agent rule laid every turn out as a row. */
 #agents .agent{display:flex;align-items:center;gap:9px;padding:8px 10px}
 #agents .agent .who{min-width:0;display:flex;flex-direction:column;gap:1px}
 #agents .agent .name{font-size:12px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
