@@ -475,6 +475,30 @@ await check("every failure says which kind it is, because the field is not optio
   }
 });
 
+/**
+ * The escape hatch is two tools because a gate is decided per tool.
+ *
+ * `sideEffects` is a property of the schema, not of the arguments — the gateway
+ * reads `schema.sideEffects` and never the call — so one `api` that could GET or
+ * POST had to declare the wider of the two, and reading a label was held for a
+ * person exactly as deleting one was. A gate that stops the harmless thing is a
+ * gate people learn to wave through.
+ */
+await check("reading through the escape hatch does not wait for a person, writing does", () => {
+  const gated = { write: "approval" as const };
+  const verdict = (name: string) => {
+    const t = githubPlugin.tools.find((x) => x.name === name);
+    if (!t) throw new Error(`no tool ${name}`);
+    return policyFor(gated, name, t.sideEffects);
+  };
+  if (verdict("api_get") !== "allow") throw new Error("a read through api_get was held for approval");
+  if (verdict("api") !== "approval") throw new Error("a write through api was not held");
+  // The split is only safe while the read tool cannot write: no method, no body.
+  const get = githubPlugin.tools.find((t) => t.name === "api_get")!;
+  const props = Object.keys((get.parameters as any).properties ?? {});
+  if (props.join() !== "path") throw new Error(`api_get takes ${props.join(",")} — a read tool with a method is a write tool`);
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

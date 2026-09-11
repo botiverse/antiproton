@@ -97,6 +97,18 @@ function requireAccount(ctx: PluginContext, tool: string) {
   }
 }
 
+/** A path, not a URL: the host is ours to decide, so no amount of creativity in
+ *  this argument reaches another origin. */
+function apiPath(raw: unknown): string {
+  const path = String(raw ?? "");
+  if (!path.startsWith("/") || path.startsWith("//")) {
+    throw new Error(
+      `path must begin with a single "/" and carry no host, got ${JSON.stringify(path).slice(0, 60)}`,
+    );
+  }
+  return path;
+}
+
 const paging = (a: Record<string, any>) => new URLSearchParams({
   per_page: String(Math.min(Math.max(Number(a.perPage ?? 20), 1), MAX_PER_PAGE)),
   page: String(Math.max(Number(a.page ?? 1), 1)),
@@ -232,11 +244,20 @@ export const githubPlugin: Plugin = {
       query: { type: "string", description: 'e.g. "repo:owner/name is:open label:bug"' }, ...PAGE_ARGS,
     }, ["query"], "read"),
 
-    t("api", "Any GitHub REST endpoint, the way `gh api` works — for what the tools above do not cover. Path only, no host. Non-GET methods need an account and are not idempotent.", {
+    // Two tools rather than one, because `sideEffects` is a property of the
+    // tool and the gateway reads it to decide whether a call waits for a
+    // person. One `api` that could GET or POST had to declare the wider of the
+    // two, so reading a label through it was held for approval exactly as
+    // deleting one was — which is a gate nobody wants and everybody learns to
+    // wave through. Splitting them lets each declare what it actually is.
+    t("api_get", "Read any GitHub REST endpoint, the way `gh api` does — for what the read tools above do not cover. Path only, no host, no body. Works without an account on public data.", {
       path: { type: "string", description: '"/repos/owner/name/labels" — leading slash, no host' },
-      method: { type: "string", enum: ["GET", "POST", "PATCH", "PUT", "DELETE"] },
-      body: { type: "object", description: "JSON body for non-GET methods" },
-    }, ["path"], "write"),
+    }, ["path"], "read"),
+    t("api", "Write to any GitHub REST endpoint — POST, PATCH, PUT or DELETE, for what the write tools above do not cover. Path only, no host. Needs an account, is not idempotent, and a mount may hold it for a person. To read, use api_get.", {
+      path: { type: "string", description: '"/repos/owner/name/labels" — leading slash, no host' },
+      method: { type: "string", enum: ["POST", "PATCH", "PUT", "DELETE"] },
+      body: { type: "object", description: "JSON body" },
+    }, ["path", "method"], "write"),
   ],
 
   /**
@@ -412,21 +433,22 @@ export const githubPlugin: Plugin = {
         return { total: r.total_count, items: (r.items ?? []).map(issueOut) } as Json;
       }
 
+      case "api_get":
+        return (await call("GET", apiPath(a.path), ctx)) as Json;
+
       case "api": {
-        const method = String(a.method ?? "GET").toUpperCase();
-        if (!["GET", "POST", "PATCH", "PUT", "DELETE"].includes(method)) {
-          throw new Error("method must be one of GET, POST, PATCH, PUT, DELETE");
+        const method = String(a.method ?? "").toUpperCase();
+        // GET is refused rather than quietly served, because serving it here
+        // would run a read under this tool's `write` declaration and hold it
+        // for a person — the thing the split exists to stop.
+        if (method === "GET" || method === "HEAD") {
+          throw new Error(`api is for writes; read with api_get { path: ${JSON.stringify(String(a.path ?? "/…"))} }`);
         }
-        if (method !== "GET") requireAccount(ctx, "api");
-        const path = String(a.path ?? "");
-        // A path, not a URL: the host is ours to decide, so no amount of
-        // creativity in this argument reaches another origin.
-        if (!path.startsWith("/") || path.startsWith("//")) {
-          throw new Error(
-            `path must begin with a single "/" and carry no host, got ${JSON.stringify(path).slice(0, 60)}`,
-          );
+        if (!["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
+          throw new Error("method must be one of POST, PATCH, PUT, DELETE");
         }
-        return (await call(method, path, ctx, method === "GET" ? undefined : (a.body ?? {}))) as Json;
+        requireAccount(ctx, "api");
+        return (await call(method, apiPath(a.path), ctx, a.body ?? {})) as Json;
       }
 
       default:
