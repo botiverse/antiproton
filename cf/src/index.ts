@@ -30,7 +30,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue, agentList } from "./ui.ts";
+  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, mountList, catalogue, agentList } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -1183,19 +1183,6 @@ export class AgentDO extends DurableObject<Env> {
     return { ok: true };
   }
 
-  /** The only way a conversation id comes to exist. */
-  async uiNewConversation(tenantId: string, agentId: string) {
-    this.#claim(tenantId, agentId);
-    return this.#busy("uiNewConversation", async () => {
-      const rt = this.runtime();
-      await rt.ready();
-      const taskId = `t_${agentId}_${Date.now().toString(36)}`;
-      await rt.store.createTask(tenantId, agentId, taskId, {});
-      ensureAgentTables(this.sql, taskId);
-      return { taskId };
-    });
-  }
-
   async uiEnsure(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
     await this.#conversation(tenantId, agentId, taskId);
@@ -1490,66 +1477,6 @@ export class AgentDO extends DurableObject<Env> {
     const tasks = await rt.store.listTasks(tenantId, agentId);
     const running = tasks.filter((t) => t.status !== "completed" && t.status !== "failed").length;
     return { pending, tasks: { total: tasks.length, running } };
-  }
-
-  /**
-   * The agent's tasks, latest activity first, each with its held-call count
-   * and whether the agent is mid-turn on it. `lastActivityAt` is the task's
-   * last checkpoint. `turns` is null: the per-task record is `events.task_id`,
-   * while the transcript is built from `pi_entries`, which has no task id, so
-   * a count would have to come from `events` — and what `events` holds today
-   * is prompts and compactions per task, not model turns, so it would count
-   * the person's messages rather than the agent's turns. `busy` is the agent's
-   * lane state, attributed to the most recently active open task, since one
-   * lane serves every task.
-   */
-  async uiTasks(tenantId: string, agentId: string) {
-    const rt = this.runtime();
-    await rt.ready();
-    const tasks = await rt.store.listTasks(tenantId, agentId);
-    const pendingByTask: Record<string, number> = {};
-    for (const a of await rt.store.listApprovals(tenantId, "pending")) {
-      if (a.agentId === agentId) pendingByTask[a.taskId] = (pendingByTask[a.taskId] ?? 0) + 1;
-    }
-    let running = false;
-    try {
-      const agent = await rt.agent(tenantId, agentId);
-      running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
-    } catch { /* an agent that has never run has no lane to inspect */ }
-    const open = tasks.filter((t) => t.status !== "completed" && t.status !== "failed");
-    const active = open.length ? open.reduce((m, t) => (t.updatedAt > m.updatedAt ? t : m)) : null;
-    return {
-      agentId,
-      tasks: tasks
-        .slice()
-        .sort((x, y) => y.updatedAt - x.updatedAt)
-        .map((t) => ({
-          taskId: t.taskId, status: t.status,
-          title: this.#titleOf(agentId, t.taskId),
-          lastActivityAt: new Date(t.updatedAt).toISOString(),
-          pending: pendingByTask[this.#sessionOf(agentId, t.taskId)] ?? 0,
-          turns: null as number | null,
-          busy: running && active?.taskId === t.taskId,
-        })),
-    };
-  }
-
-  /** The first thing the person said in a conversation, first line, or null.
-   *  Read straight from the session's first entry so a list of conversations
-   *  does not build every transcript. */
-  #titleOf(agentId: string, taskId: string): string | null {
-    try {
-      const t = piTables(this.#sessionOf(agentId, taskId));
-      const rows = this.sql.exec(`SELECT body FROM ${t.entries} WHERE type = 'message' ORDER BY seq ASC LIMIT 3`).toArray() as any[];
-      for (const r of rows) {
-        const m = JSON.parse(String(r.body))?.message;
-        if (m?.role !== "user") continue;
-        const text = (Array.isArray(m.content) ? m.content : []).map((c: any) => c?.type === "text" ? String(c.text) : "").join(" ");
-        const line = text.trim().split("\n")[0]?.trim() ?? "";
-        return line ? line.slice(0, 80) : null;
-      }
-    } catch { /* a conversation with no table yet has no title */ }
-    return null;
   }
 
   #ownerAgent(): string | null {
@@ -1960,7 +1887,7 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/conversation", "/ui/agent"]);
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent"]);
 
 /**
  * What a person may name an agent. Checked in the route before any object is
@@ -2464,25 +2391,11 @@ export default {
           // The page swaps the rendered list in; anything else gets the data.
           return request.headers.get("hx-request") ? html(agentList({ agents })) : Response.json({ agents });
         }
-        case "/ui/conversation": {
-          // The only way a conversation id comes to exist; every route that
-          // takes one refuses an id this did not mint for the viewer's agent.
-          const gate = requireViewer(request, env);
-          if (gate instanceof Response) return gate;
-          if (request.method !== "POST") return new Response("POST", { status: 405 });
-          if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
-          return Response.json(await stub.uiNewConversation("demo", uiSelected?.agentId ?? uiAgent(gate.who)));
-        }
         case "/ui/inbox": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const d = await stub.uiInbox("demo", uiSelected?.agentId ?? uiAgent(gate.who));
           return html(inbox({ viewer: gate.who, ...d }));
-        }
-        case "/ui/tasks": {
-          const gate = requireViewer(request, env);
-          if (gate instanceof Response) return gate;
-          return html(taskList(await stub.uiTasks("demo", uiSelected?.agentId ?? uiAgent(gate.who))));
         }
         case "/ui/approvals": {
           const gate = requireViewer(request, env);
