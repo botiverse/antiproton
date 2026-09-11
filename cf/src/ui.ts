@@ -20,10 +20,10 @@ const esc = (s: unknown) =>
 
 const CSS = `
 
-.mount{border:1px solid var(--line);border-radius:4px;padding:10px 12px;margin:8px 0;background:var(--panel)}
+.mount{border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:8px 0;background:var(--layer-card)}
 .mount-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px}
 .problems{border-left:2px solid var(--bad);padding:4px 0 4px 8px;margin:6px 0;font-size:12px;color:var(--bad)}
-.plug{border:1px solid var(--line);border-radius:4px;padding:8px 12px;margin:6px 0;background:var(--panel)}
+.plug{border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin:6px 0;background:var(--layer-card)}
 .plug summary{cursor:pointer;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
 .plug h4{margin:10px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
 code.hot{color:var(--ok);border-color:var(--ok)}
@@ -38,11 +38,11 @@ code.hot{color:var(--ok);border-color:var(--ok)}
 .lbl{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.07em;
 display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .t{color:var(--faint);text-transform:none;letter-spacing:0}
-.badge{border:1px solid var(--line);border-radius:99px;padding:0 7px;font-size:10px;
-text-transform:none;letter-spacing:0;color:var(--dim)}
-.badge.ok{color:var(--ok);border-color:var(--ok)}
-.badge.bad{color:var(--bad);border-color:var(--bad)}
-.badge.warn{color:var(--warn);border-color:var(--warn)}
+.badge,.tag{display:inline-block;border:1px solid var(--line-muted);border-radius:99px;padding:1px 8px;font-size:10.5px;
+line-height:1.5;text-transform:none;letter-spacing:0;color:var(--dim);background:var(--fill-muted);vertical-align:middle}
+.badge.ok,.tag.ok{color:var(--success-strong);background:var(--success-soft);border-color:var(--success-muted)}
+.badge.bad,.tag.bad{color:var(--danger-strong);background:var(--danger-soft);border-color:var(--danger-muted)}
+.badge.warn,.tag.warn{color:var(--warning-strong);background:var(--warning-soft);border-color:var(--warning-muted)}
 .code{background:var(--sunk);border-left:2px solid var(--model);color:var(--strong)}
 .chip{border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11px;
 color:var(--ink);text-transform:none;letter-spacing:0}
@@ -89,7 +89,7 @@ color:var(--dim);text-decoration:none;font-size:9.5px;letter-spacing:.04em;borde
 .rail-item.on{color:var(--accent);border-color:var(--accent);background:var(--sunk)}
 .rail-item.on .ico{opacity:1}
 .rail-item .count{position:absolute;top:2px;right:6px;min-width:15px;height:15px;padding:0 4px;border-radius:8px;
-background:var(--accent);color:var(--action-ink);font-size:9px;font-weight:600;line-height:15px;text-align:center}
+background:var(--primary-400);color:var(--primary-950);font-size:9px;font-weight:600;line-height:15px;text-align:center}
 .rail-foot{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:8px}
 .mode{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:7px;padding:2px}
 .mode button{background:none;border:0;color:var(--dim);font:inherit;font-size:9px;padding:3px 5px;border-radius:5px;cursor:pointer}
@@ -154,13 +154,31 @@ color:var(--dim);text-transform:uppercase;letter-spacing:.09em;font-weight:600}
 .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 .msg{white-space:pre-wrap;word-break:break-word;margin-top:3px}
 form{display:flex;gap:8px;padding:13px;border-top:1px solid var(--line)}
-input[type=text],input[type=password]{flex:1;background:var(--sunk);border:1px solid var(--line);
-color:var(--ink);padding:9px 11px;border-radius:6px;font:inherit}
-button{background:var(--action);border:0;color:var(--action-ink);padding:9px 15px;
-border-radius:6px;font:inherit;font-weight:600;cursor:pointer}
-button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
-button.bad{background:var(--bad)}
-button:disabled{opacity:.45;cursor:not-allowed}
+/* --- primitives, on rUI's Elegant recipes ---------------------------------
+   Input: layer-card on dark with inset shadows and no visible border, a field
+   border on light, a one-pixel primary ring on focus. Button: the accent
+   family for a core action (send, approve, attach), outline for the quiet
+   ones, danger solid for the destructive one; all bordered with line-strong,
+   rounded 6, a hairline shadow. Badge: a soft wash with the strong text. */
+input[type=text],input[type=password]{flex:1;min-width:0;background:var(--layer-panel);border:1px solid var(--line-field);
+color:var(--ink);padding:8px 12px;border-radius:6px;font:inherit;font-size:13px;transition:border-color .2s ease-out,background .2s ease-out}
+.dark input[type=text],.dark input[type=password]{background:var(--layer-card);border-color:transparent;color:var(--strong);
+box-shadow:inset 0 1px 2px oklch(0 0 0/.3),inset 0 0 0 1px oklch(0 0 0/.35),0 1px 0 oklch(0.985 0.004 106.42/.04)}
+input::placeholder{color:var(--faint);opacity:.7}
+input[type=text]:hover,input[type=password]:hover{border-color:var(--line-field-hover)}
+.dark input[type=text]:hover,.dark input[type=password]:hover{border-color:var(--ink-8)}
+input[type=text]:focus,input[type=password]:focus{outline:0;box-shadow:0 0 0 1px var(--primary-400)}
+button{display:inline-flex;align-items:center;gap:6px;background:var(--accent-400);border:1px solid var(--line-strong);
+color:var(--accent-950);padding:7px 12px;border-radius:6px;font:inherit;font-size:12.5px;font-weight:600;
+line-height:1.2;cursor:pointer;box-shadow:var(--theme-shadow-xs);transition:background .15s ease-out,border-color .15s ease-out}
+button:hover{background:var(--accent-500)}
+button.ghost{background:transparent;color:var(--ink);box-shadow:none}
+button.ghost:hover{background:var(--fill-muted)}
+button.bad{background:var(--danger);color:var(--danger-foreground)}
+button.bad:hover{background:var(--danger);border-color:var(--danger)}
+button.primary{background:var(--primary-400);color:var(--primary-950)}
+button:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
+:focus-visible{outline:2px solid var(--primary-400);outline-offset:2px}
 /* a mount's credential: what is attached, never what it is */
 .cred{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px}
 .cred .state{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
@@ -168,23 +186,21 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .cred .state b.unverified{color:var(--warn)}
 .cred .when{color:var(--dim)}
 .cred form{display:flex;flex-direction:column;gap:7px;padding:6px 0 0;border:0}
-.cred label{display:flex;flex-direction:column;gap:3px;color:var(--dim)}
+.cred label{display:flex;flex-direction:column;gap:4px;color:var(--dim);font-size:11.5px}
 .cred label i{color:var(--faint);font-style:normal}
 .cred .row{display:flex;gap:8px;align-items:center}
 .cred .err{color:var(--bad)}
 .cred details{margin-top:4px}
 .cred details summary{margin-top:0}
 .cred form.inline{flex-direction:row;padding:0}
-.card{border:1px solid var(--warn);border-radius:7px;padding:11px;margin-bottom:11px}
+.card{border:1px solid var(--warning-muted);border-left:3px solid var(--warn);background:var(--layer-card);
+border-radius:8px;padding:12px 14px;margin-bottom:11px}
 .card .tool{color:var(--warn);font-weight:600}
 pre{background:var(--sunk);border:1px solid var(--line);border-radius:6px;
 padding:9px;overflow:auto;margin:8px 0;font-size:12px}
 .row{display:flex;gap:8px;margin-top:9px}
 .empty{color:var(--dim);padding:6px 0}
-.tag{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;
-border:1px solid var(--line);color:var(--dim)}
-.tag.ok{color:var(--ok);border-color:var(--ok)}
-.tag.bad{color:var(--bad);border-color:var(--bad)}
+
 .hint{color:var(--dim);font-size:12px;padding:0 13px 13px}
 
 /* --- rendered markdown ------------------------------------------------- */

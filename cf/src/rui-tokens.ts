@@ -5,8 +5,9 @@
  * stylesheet file; the token scopes are a string here instead. They are the
  * Elegant family's scopes of raft-ui 0.5.11's dist/styles.css, copied
  * verbatim (light, the explicit .light and .dark classes, and the
- * prefers-color-scheme fallback), plus the Source Yellow and pink ramp
- * values those scopes reference and the Elegant font names. The page puts
+ * prefers-color-scheme fallback), plus the ramp values and the solid state
+ * colours those scopes reference, which the package defines in the Brutal
+ * scope and the theme block, and the Elegant font names. The page puts
  * data-theme="elegant" on <html> and a .light or .dark class from the
  * viewer's stored choice; with neither, the system decides. Re-copy from the
  * package on upgrade rather than editing here.
@@ -23,6 +24,20 @@ export const RUI_TOKENS = `[data-theme="elegant"]{
   --color-brutal-pink-400: oklch(0.749 0.162 0.71);
   --accent-400: var(--color-brutal-pink-400);
   --accent: var(--accent-400);
+  --color-brutal-yellow-950: oklch(0.199 0.041 93.21);
+  --primary-950: var(--color-brutal-yellow-950);
+  --color-brutal-pink-500: oklch(0.662 0.244 0.59);
+  --color-brutal-pink-950: oklch(0.198 0.08 359.99);
+  --accent-500: var(--color-brutal-pink-500);
+  --accent-950: var(--color-brutal-pink-950);
+  --color-brutal-cyan-400: oklch(0.783 0.135 219.2);
+  --info: var(--color-brutal-cyan-400);
+  --success: oklch(0.714 0.176 153.079);
+  --success-foreground: oklch(1 0 0);
+  --warning: oklch(0.7 0.202 44.441);
+  --warning-foreground: oklch(1 0 0);
+  --danger: oklch(0.616 0.249 26.758);
+  --danger-foreground: oklch(1 0 0);
   --heading-font: "Inter", system-ui, sans-serif;
   --sans-font: "Geist", system-ui, sans-serif;
   --mono-font: "Geist Mono", ui-monospace, monospace;

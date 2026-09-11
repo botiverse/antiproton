@@ -263,6 +263,16 @@ check("the mount list names each mount, its plugin and its credential state, and
   must(plugins(d).includes(cat.slice(0, 60)), "the whole page still composes the catalogue");
 });
 
+check("an unknown mount alias is said back, escaped", () => {
+  const html = mountFragment({ installed: [], mounts: [], used: {} }, `<img src=x onerror=1>`);
+  must(!html.includes("<img src=x"), "the alias must be escaped");
+  must(html.includes("no mount named &lt;img src=x onerror=1&gt;"), "and still named");
+  // the alias also renders as the block's id, which is made safe by replacement rather than escaping;
+  // both mechanisms are asserted so a refactor that drops either one fails here
+  must(/id="mount-_img_src_x_onerror_1_"/.test(html), "the id must be the whitelisted form of the alias");
+  must(!/id="[^"]*<[^"]*"/.test(html), "no id may carry markup");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
