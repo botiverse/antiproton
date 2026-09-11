@@ -12,6 +12,7 @@ const eq = (a: unknown, b: unknown, w: string) =>
 
 const ctx = (allowedHosts: string[], extra = {}) => ({
   caller: { tenantId: "t", agentId: "a", taskId: "k" },
+  alias: "web",
   credential: null,
   publicConfig: { allowedHosts, ...extra },
   connection: { async get() { return null; }, async set() {} },
@@ -107,8 +108,10 @@ await test("读写分家", "safe verbs stay on the read tool and the rest on the
       assert(why.test(m), `wrong refusal: ${m}`);
     }
   };
-  await refuses("get", { url: "https://example.com/", method: "POST" }, /use web\.send/);
-  await refuses("send", { url: "https://example.com/", method: "GET" }, /use web\.get/);
+  // The refusal names the tool to use and the mount it is on, and not the
+  // dispatch address: `web.send` is not a name the model can call.
+  await refuses("get", { url: "https://example.com/", method: "POST" }, /use the `send` tool on `web`/);
+  await refuses("send", { url: "https://example.com/", method: "GET" }, /use the `get` tool on `web`/);
 });
 
 await test("凭据头不出门", "credential headers are refused and the refusal is reported", async () => {

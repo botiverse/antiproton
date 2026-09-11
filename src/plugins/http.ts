@@ -240,7 +240,7 @@ export const httpPlugin: Plugin = {
       summary:
         "Search the web and get back titles, urls and snippets. Use it when you do not already " +
         "know which page to read — guessing a url and fetching it is how a search becomes three " +
-        "wasted turns. Then read the ones that look right with web.get.",
+        "wasted turns. Then read the ones that look right with `get`.",
       parameters: {
         type: "object",
         properties: {
@@ -363,10 +363,10 @@ export const httpPlugin: Plugin = {
       // the safe verbs stay on the read tool and the rest on the write tool.
       const reads = ["GET", "HEAD", "OPTIONS"];
       if (tool === "send" && !["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
-        throw new Error(`send does not do ${method}; ${reads.join(", ")} are reads — use web.get`);
+        throw new Error(`send does not do ${method}; ${reads.join(", ")} are reads — use the \`get\` tool on \`${ctx.alias}\``);
       }
       if (tool === "get" && !reads.includes(method)) {
-        throw new Error(`get does ${reads.join(", ")}; ${method} changes things — use web.send`);
+        throw new Error(`get does ${reads.join(", ")}; ${method} changes things — use the \`send\` tool on \`${ctx.alias}\``);
       }
       const objectBody = a.body !== undefined && typeof a.body !== "string";
       const formBody = objectBody && a.form === true;

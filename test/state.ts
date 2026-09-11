@@ -25,7 +25,7 @@ async function fixture(agentId = "a") {
   const plugin = statePlugin(store, null, "local");
   const ctx = (over: Partial<PluginContext> = {}) => ({
     publicConfig: { account: "agent memory" }, credential: null,
-    caller: { tenantId: "t", agentId, taskId: "k" },
+    caller: { tenantId: "t", agentId, taskId: "k" }, alias: "state",
     connection: { get: async () => null, set: async () => {} },
     ...over,
   }) as unknown as PluginContext;
@@ -151,6 +151,23 @@ await check("没挂载时不会叫 agent 去调一个不存在的工具", async 
   const text = await workingSet(store, "t", "a");
   if (!text.includes("部署窗口是周二")) throw new Error("memory was withheld along with the tool names");
   if (/remember|forget/.test(text)) throw new Error("named a tool that is not mounted");
+});
+
+await check("装不下时给出的建议用的是这个挂载的名字", async () => {
+  const { plugin, ctx } = await fixture();
+  // Mounted as `memo`, so `state.forget` would be a tool the model cannot
+  // call. The plugin learns its own name the way it learns a sibling's.
+  const small = ctx({ alias: "memo", publicConfig: { account: "x", maxTotalBytes: 40 } } as any);
+  await plugin.invoke("put", { key: "a", value: "x".repeat(20) }, small);
+  let message = "";
+  try { await plugin.invoke("put", { key: "b", value: "y".repeat(20) }, small); }
+  catch (e) { message = String((e as Error).message); }
+  if (!message) throw new Error("the store took more than it holds");
+  // The tool and the mount it is on — not `memo.forget`, which is the dispatch
+  // address and not a name the model is offered.
+  if (!message.includes("`forget` tool on `memo`")) {
+    throw new Error(`the advice names the wrong tool: ${message}`);
+  }
 });
 
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);

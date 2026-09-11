@@ -399,7 +399,7 @@ await check("a plugin that holds nothing is not needlessly serialised", () => {
  */
 await check("a verification refuses a malformed credential in words, without calling anything", async () => {
   const ctx = (credential: string | null): any => ({
-    caller: { tenantId: "t", agentId: "a", taskId: "x" },
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "gh",
     credential, publicConfig: {},
     connection: { get: async () => null, set: async () => {} },
     sibling: async () => null,
@@ -445,7 +445,7 @@ await check("the plugins that take a credential are the plugins that can verify 
 await check("a provider that cannot be reached is unreachable, not a rejection", async () => {
   const dead = "http://127.0.0.1:1";
   const ctx = (credential: string, publicConfig: any = {}): any => ({
-    caller: { tenantId: "t", agentId: "a", taskId: "x" },
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "gh",
     credential, publicConfig,
     connection: { get: async () => null, set: async () => {} },
     sibling: async () => null,
@@ -539,6 +539,28 @@ await check("每个 agent 一开始就有记忆", () => {
   const aliases = seeded.map((m) => m.alias);
   const dupes = aliases.filter((a, i) => aliases.indexOf(a) !== i);
   if (dupes.length) throw new Error(`the seed list repeats an alias: ${dupes.join(", ")}`);
+});
+
+await check("没有 summary 把分派地址当成工具名交给模型", () => {
+  // `<alias>.<tool>` is what the harness dispatches on. It is not what the model
+  // is offered: `qualifyMountedTools` gives it the bare tool name, and
+  // `<alias>__<tool>` only when a second mount has the same one — which depends
+  // on the whole mounted set, so no plugin can predict it. A summary naming
+  // `node.save` therefore names nothing callable, and the agent reading it
+  // spends a turn finding that out. Summaries only: a runtime string is not
+  // here to be read.
+  const toolNames = new Set(everyPlugin.flatMap((p) => p.tools.map((t) => t.name)));
+  const prose = everyPlugin.flatMap((p) => [
+    ...p.tools.map((t) => ({ where: `${p.id}.${t.name}`, text: t.summary })),
+    ...(p.config ?? []).map((f) => ({ where: `${p.id} config ${f.name}`, text: f.summary })),
+  ]);
+  for (const { where, text } of prose) {
+    for (const m of String(text).matchAll(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]+)\b/g)) {
+      if (toolNames.has(m[2]!)) {
+        throw new Error(`${where} offers "${m[0]}", which is a dispatch address and not a tool the model can call`);
+      }
+    }
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
