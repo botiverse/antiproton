@@ -14,24 +14,52 @@ const obj = (props: Record<string, unknown>, required: string[]) =>
   ({ type: "object", properties: props, required }) as Json;
 const str = { type: "string" };
 const strs = { type: "array", items: { type: "string" } };
+/**
+ * Parameter descriptions, verbatim from upstream `retail/tools.py`.
+ *
+ * The first port kept the tool names and semantics and dropped every parameter
+ * description. On the object that cost 29 `Order not found` round trips in
+ * three runs — every one an order id passed without its leading `#`, which is
+ * exactly the thing upstream's description warns about. A benchmark plugin has
+ * to carry the benchmark's own hints, or it measures a harder task than the
+ * published one.
+ */
+const d = (description: string, schema: Record<string, unknown> = str) => ({ ...schema, description });
+const ORDER_ID = d("The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.");
+const USER_ID = d("The user id, such as 'sara_doe_496'.");
+const PRODUCT_ID = d("The product id, such as '6086499569'. Be careful the product id is different from the item id.");
+const ITEM_ID = d("The item id, such as '6086499569'. Be careful the item id is different from the product id.");
+const PAYMENT_ID = d("The payment method id, such as 'gift_card_0000000' or 'credit_card_0000000'. These can be looked up from the user or order details.");
+const ITEM_IDS = d("The item ids to be exchanged, each such as '1008292230'. There could be duplicate items in the list.", strs);
+const NEW_ITEM_IDS = d("The item ids to be exchanged for, each such as '1008292230'. There could be duplicate items in the list. Each new item id should match the item id in the same position and be a different variant of the same product.", strs);
+const RETURN_ITEM_IDS = d("The item ids to be returned, each such as '1008292230'. There could be duplicate items in the list.", strs);
+const MODIFY_ITEM_IDS = d("The item ids to be modified, each such as '1008292230'. There could be duplicate items in the list.", strs);
+const ADDRESS = {
+  address1: d("The first line of the address, such as '123 Main St'."),
+  address2: d("The second line of the address, such as 'Apt 1' or ''."),
+  city: d("The city, such as 'San Francisco'."),
+  state: d("The state, such as 'CA'."),
+  country: d("The country, such as 'USA'."),
+  zip: d("The zip code, such as '12345'."),
+};
 
 const SCHEMAS: Array<ToolSchema & { write: boolean }> = [
-  { name: "calculate", summary: "Evaluate an arithmetic expression.", parameters: obj({ expression: str }, ["expression"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "find_user_id_by_email", summary: "Find a user id by email.", parameters: obj({ email: str }, ["email"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "find_user_id_by_name_zip", summary: "Find a user id by first name, last name and zip. Use only when email is unknown.", parameters: obj({ first_name: str, last_name: str, zip: str }, ["first_name", "last_name", "zip"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "get_user_details", summary: "Get a user's details.", parameters: obj({ user_id: str }, ["user_id"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "get_order_details", summary: "Get an order's details.", parameters: obj({ order_id: str }, ["order_id"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "get_product_details", summary: "Get a product and its variants.", parameters: obj({ product_id: str }, ["product_id"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "get_item_details", summary: "Get one item variant by item id.", parameters: obj({ item_id: str }, ["item_id"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "calculate", summary: "Calculate the result of a mathematical expression.", parameters: obj({ expression: d("The mathematical expression to calculate, such as '2 + 2'. The expression can contain numbers, operators (+, -, *, /), parentheses, and spaces.") }, ["expression"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "find_user_id_by_email", summary: "Find user id by email. If the user is not found, the function will return an error message.", parameters: obj({ email: d("The email of the user, such as 'something@example.com'.") }, ["email"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "find_user_id_by_name_zip", summary: "Find user id by first name, last name, and zip code. If the user is not found, the function will return an error message. By default, find user id by email, and only call this function if the user is not found by email or cannot remember email.", parameters: obj({ first_name: d("The first name of the customer, such as 'John'."), last_name: d("The last name of the customer, such as 'Doe'."), zip: d("The zip code of the customer, such as '12345'.") }, ["first_name", "last_name", "zip"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "get_user_details", summary: "Get the details of a user, including their orders.", parameters: obj({ user_id: USER_ID }, ["user_id"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "get_order_details", summary: "Get the status and details of an order.", parameters: obj({ order_id: ORDER_ID }, ["order_id"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "get_product_details", summary: "Get the inventory details of a product.", parameters: obj({ product_id: PRODUCT_ID }, ["product_id"]), sideEffects: "read", idempotency: "native", write: false },
+  { name: "get_item_details", summary: "Get one item variant by item id.", parameters: obj({ item_id: ITEM_ID }, ["item_id"]), sideEffects: "read", idempotency: "native", write: false },
   { name: "list_all_product_types", summary: "List every product name and id.", parameters: obj({}, []), sideEffects: "read", idempotency: "native", write: false },
   { name: "transfer_to_human_agents", summary: "Hand off to a human agent.", parameters: obj({ summary: str }, ["summary"]), sideEffects: "read", idempotency: "native", write: false },
-  { name: "cancel_pending_order", summary: "Cancel a pending order. Reason must be 'no longer needed' or 'ordered by mistake'.", parameters: obj({ order_id: str, reason: str }, ["order_id", "reason"]), sideEffects: "write", idempotency: "none", write: true },
-  { name: "modify_pending_order_address", summary: "Change the shipping address of a pending order.", parameters: obj({ order_id: str, address1: str, address2: str, city: str, state: str, country: str, zip: str }, ["order_id", "address1", "address2", "city", "state", "country", "zip"]), sideEffects: "write", idempotency: "none", write: true },
-  { name: "modify_pending_order_items", summary: "Swap items in a pending order for other variants of the same product. Can only be called once per order.", parameters: obj({ order_id: str, item_ids: strs, new_item_ids: strs, payment_method_id: str }, ["order_id", "item_ids", "new_item_ids", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
-  { name: "modify_pending_order_payment", summary: "Change the payment method of a pending order.", parameters: obj({ order_id: str, payment_method_id: str }, ["order_id", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
-  { name: "modify_user_address", summary: "Change a user's default address.", parameters: obj({ user_id: str, address1: str, address2: str, city: str, state: str, country: str, zip: str }, ["user_id", "address1", "address2", "city", "state", "country", "zip"]), sideEffects: "write", idempotency: "none", write: true },
-  { name: "return_delivered_order_items", summary: "Request a return for items in a delivered order.", parameters: obj({ order_id: str, item_ids: strs, payment_method_id: str }, ["order_id", "item_ids", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
-  { name: "exchange_delivered_order_items", summary: "Request an exchange for items in a delivered order.", parameters: obj({ order_id: str, item_ids: strs, new_item_ids: strs, payment_method_id: str }, ["order_id", "item_ids", "new_item_ids", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "cancel_pending_order", summary: "Cancel a pending order. Reason must be 'no longer needed' or 'ordered by mistake'.", parameters: obj({ order_id: ORDER_ID, reason: d("The reason for cancellation, which should be either 'no longer needed' or 'ordered by mistake'.") }, ["order_id", "reason"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "modify_pending_order_address", summary: "Change the shipping address of a pending order.", parameters: obj({ order_id: ORDER_ID, ...ADDRESS }, ["order_id", "address1", "address2", "city", "state", "country", "zip"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "modify_pending_order_items", summary: "Swap items in a pending order for other variants of the same product. Can only be called once per order.", parameters: obj({ order_id: ORDER_ID, item_ids: MODIFY_ITEM_IDS, new_item_ids: NEW_ITEM_IDS, payment_method_id: PAYMENT_ID }, ["order_id", "item_ids", "new_item_ids", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "modify_pending_order_payment", summary: "Change the payment method of a pending order.", parameters: obj({ order_id: ORDER_ID, payment_method_id: PAYMENT_ID }, ["order_id", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "modify_user_address", summary: "Change a user's default address.", parameters: obj({ user_id: USER_ID, ...ADDRESS }, ["user_id", "address1", "address2", "city", "state", "country", "zip"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "return_delivered_order_items", summary: "Request a return for items in a delivered order.", parameters: obj({ order_id: ORDER_ID, item_ids: RETURN_ITEM_IDS, payment_method_id: d("The payment method id to receive the refund, which should be the original payment method, or an existing gift card.") }, ["order_id", "item_ids", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
+  { name: "exchange_delivered_order_items", summary: "Request an exchange for items in a delivered order.", parameters: obj({ order_id: ORDER_ID, item_ids: ITEM_IDS, new_item_ids: NEW_ITEM_IDS, payment_method_id: d("The payment method id to pay or receive refund for the item price difference, such as 'gift_card_0000000' or 'credit_card_0000000'. These can be looked up from the user or order details.") }, ["order_id", "item_ids", "new_item_ids", "payment_method_id"]), sideEffects: "write", idempotency: "none", write: true },
 ];
 
 export const WRITE_TOOLS = new Set(SCHEMAS.filter((s) => s.write).map((s) => s.name));
@@ -67,10 +95,12 @@ export function applyRetailAction(db: RetailDB, name: string, args: any): unknow
 
   switch (name) {
     case "calculate": {
-      const expr = String(args.expression);
-      if (!/^[0-9+\-*/(). ]+$/.test(expr)) throw new Error("Invalid characters in expression");
-      // eslint-disable-next-line no-new-func
-      return String(r2(Number(new Function(`return (${expr})`)())));
+      // Evaluated by a small parser, not by generating code: Workers refuse
+      // `new Function` ("Code generation from strings disallowed"), which made
+      // this tool fail on the object eight times in three runs while passing
+      // every in-process test. Upstream uses Python's eval with the same
+      // character set; the grammar is numbers, + - * /, parentheses.
+      return String(r2(arithmetic(String(args.expression))));
     }
     case "find_user_id_by_email": {
       for (const [uid, u] of Object.entries<any>(db.users)) if (u.email === args.email) return uid;
@@ -239,4 +269,54 @@ export function retailPlugin(db: RetailDB, log: Array<{ name: string; args: any 
       return applyRetailAction(db, tool, args) as Json;
     },
   };
+}
+
+
+/** Numbers, + - * /, unary minus, parentheses. Throws on anything else. */
+export function arithmetic(expr: string): number {
+  const src = expr.replace(/\s+/g, "");
+  if (!/^[0-9+\-*/().]+$/.test(src)) throw new Error("Invalid characters in expression");
+  let i = 0;
+  const peek = () => src[i];
+  const next = () => src[i++];
+  function number(): number {
+    const start = i;
+    while (i < src.length && /[0-9.]/.test(src[i]!)) i++;
+    if (start === i) throw new Error(`Expected a number at position ${start}`);
+    const n = Number(src.slice(start, i));
+    if (!Number.isFinite(n)) throw new Error(`Bad number: ${src.slice(start, i)}`);
+    return n;
+  }
+  function factor(): number {
+    if (peek() === "-") { next(); return -factor(); }
+    if (peek() === "+") { next(); return factor(); }
+    if (peek() === "(") {
+      next();
+      const v = expression();
+      if (next() !== ")") throw new Error("Expected ')'");
+      return v;
+    }
+    return number();
+  }
+  function term(): number {
+    let v = factor();
+    while (peek() === "*" || peek() === "/") {
+      const op = next();
+      const r = factor();
+      v = op === "*" ? v * r : v / r;
+    }
+    return v;
+  }
+  function expression(): number {
+    let v = term();
+    while (peek() === "+" || peek() === "-") {
+      const op = next();
+      const r = term();
+      v = op === "+" ? v + r : v - r;
+    }
+    return v;
+  }
+  const v = expression();
+  if (i !== src.length) throw new Error(`Unexpected '${src[i]}' at position ${i}`);
+  return v;
 }

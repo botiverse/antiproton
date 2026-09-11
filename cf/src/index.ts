@@ -931,7 +931,7 @@ export class AgentDO extends DurableObject<Env> {
   /** What the harness actually handed the provider. Guessing at this cost two
    *  bench runs; it is cheaper to be able to look. */
   async benchDebug(taskId: string) {
-    const agent = await this.#activeRuntime().agent("bench", `b_${taskId}`);
+    const agent = await this.#activeRuntime().agent("bench", this.#benchAgentId(taskId));
     const tools = await agent.harness.getTools(BACKGROUND_CONTEXT);
     const entries = await agent.storage.scanEntries({ order: "desc", limit: 4 }, BACKGROUND_CONTEXT);
     const execution = await agent.lane.inspectExecution(BACKGROUND_CONTEXT);
@@ -1015,6 +1015,16 @@ export class AgentDO extends DurableObject<Env> {
     return { purged: true };
   }
 
+  /**
+   * A bench task's agent id from whatever the caller has. The listing prints
+   * stored ids (`b_t_5_…`); the runners know bare task ids (`t_5_…`); the read
+   * paths used to accept only the bare form, so the listing's own id read as
+   * nothing. Both are accepted now, and nothing else changes.
+   */
+  #benchAgentId(taskId: string): string {
+    return taskId.startsWith("b_") ? taskId : `b_${taskId}`;
+  }
+
   /** A finished task's transcript, after the next one has taken the object.
    *  Without a task, what there is to ask for — an archive you cannot
    *  enumerate is one you have to already know the answer to use. */
@@ -1030,7 +1040,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     try {
       const rows = this.sql.exec(
-        "SELECT body FROM bench_archive WHERE agent_id=? ORDER BY seq ASC", `b_${taskId}`)
+        "SELECT body FROM bench_archive WHERE agent_id=? ORDER BY seq ASC", this.#benchAgentId(taskId))
         .toArray() as any[];
       return { taskId, entries: entriesToEvents(rows.map((r) => JSON.parse(r.body))) };
     } catch { return { taskId, entries: [] }; }
@@ -1039,7 +1049,8 @@ export class AgentDO extends DurableObject<Env> {
   async benchResult(taskId: string) {
     const rt = this.#activeRuntime();
     await rt.ready();
-    const agent = await rt.agent("bench", `b_${taskId}`);
+    const agentId = this.#benchAgentId(taskId);
+    const agent = await rt.agent("bench", agentId);
     const events = entriesToEvents(
       await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)) as any[];
     const usage = events.reduce(
@@ -1057,7 +1068,7 @@ export class AgentDO extends DurableObject<Env> {
       const name = e.message?.role === "toolResult" ? e.message.toolName : null;
       if (name) byTool[name] = (byTool[name] ?? 0) + 1;
     }
-    const r = await this.#benchState().result(`b_${taskId}`);
+    const r = await this.#benchState().result(agentId);
     return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds, byTool };
   }
 
