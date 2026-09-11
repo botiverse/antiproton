@@ -277,14 +277,29 @@ export interface Plugin {
   checkCredential?(ctx: PluginContext): Promise<CredentialCheck>;
   invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json>;
   /**
-   * Let go of anything held on the task's behalf, once the task is over.
+   * Let go of anything this mount is holding, once the agent has nothing left
+   * open.
    *
    * Some mounts reserve something real and metered — a container, a session, a
    * lease — and without a point to hand it back, it is held until something
-   * else notices. Called on a terminal task; must be safe to call twice.
+   * else notices. Must be safe to call twice.
+   *
+   * **The scope is the agent, not a task**, and this is worth stating because
+   * every name around it suggests otherwise: the gateway's entry point is
+   * called `releaseTask` and takes a `taskId`, but it iterates the mounts of
+   * `(tenantId, agentId)` and filters by nothing. `ctx.caller.taskId` is
+   * context for the audit record, not a selector — a plugin that released only
+   * "this task's" resources would be writing against a distinction the caller
+   * does not make.
+   *
+   * That mattered the moment an agent could hold more than one conversation:
+   * the previous wording here said "once the task is over", which read as
+   * per-conversation and never was. What the runtime guarantees is that this
+   * fires when nothing of the agent's is open — so a mount is never released
+   * out from under a conversation that is still working.
    *
    * It may throw, and should, when it could not let go of something that is
-   * still being billed. What must not happen is a finished task failing over
+   * still being billed. What must not happen is a finished run failing over
    * tidying up, and that is the gateway's job rather than this one's: it
    * records the failure and carries on. Returning `false` means there was
    * nothing to release, which is not a failure.
