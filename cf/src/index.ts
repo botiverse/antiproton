@@ -1214,10 +1214,18 @@ export class AgentDO extends DurableObject<Env> {
           // under a credential that is already there, so the check runs with
           // the ref that stayed. A seed that would leave the mount in a state
           // the runtime forbids — a credential and no host allowlist — is not
-          // applied; the page still shows the problem, it just does not cause it.
+          // applied: the mount keeps the config it had, which the page shows
+          // as fine because it is. So the refusal itself is logged; otherwise
+          // "refused" and "nothing to do" would be the same observable, and
+          // the only way to learn the seed and the mount disagree would be to
+          // notice the config never changed.
           const plugin = byId.get(d.plugin);
           const problems = plugin ? validateMount(plugin, config as any, have.secretRef) : [];
-          if (!problems.length) await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
+          if (problems.length) {
+            console.warn(`reconcile refused for ${agentId}/${d.alias}: ${problems.map((x) => x.message).join("; ")}`);
+          } else {
+            await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
+          }
         }
         if (JSON.stringify(have.policy ?? null) !== JSON.stringify(d.policy ?? null)) {
           await rt.store.updateMountPolicy(tenantId, agentId, d.alias, d.policy ?? null);
