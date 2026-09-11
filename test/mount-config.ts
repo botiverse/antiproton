@@ -6,6 +6,7 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
+import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { run9Plugin, execArgv, execOutput } from "../src/plugins/run9.ts";
@@ -497,6 +498,47 @@ await check("reading through the escape hatch does not wait for a person, writin
   const get = githubPlugin.tools.find((t) => t.name === "api_get")!;
   const props = Object.keys((get.parameters as any).properties ?? {});
   if (props.join() !== "path") throw new Error(`api_get takes ${props.join(",")} — a read tool with a method is a write tool`);
+});
+
+/**
+ * The seed list, checked against the plugins it names.
+ *
+ * `validateMount` exists to catch a mount carrying `timeout_ms` where the
+ * plugin reads `timeoutMs`, and the console runs it — but only to *show* the
+ * problem on the plugins page, to a person who happens to open it
+ * (`cf/src/index.ts:1370`). Nothing runs it over `DEFAULT_MOUNTS`, which is the
+ * one config every agent gets, written by hand, and seeded by both paths since
+ * #103. A typo there would reach every agent, be used as the plugin's default
+ * for ever, and say so only to whoever opened that page.
+ */
+const seeded = AgentRuntime.DEFAULT_MOUNTS as Array<{
+  alias: string; plugin: string; config?: Record<string, unknown>; secretRef?: string | null;
+}>;
+
+await check("每个默认挂载的设置都通过校验", () => {
+  for (const m of seeded) {
+    const plugin = everyPlugin.find((p) => p.id === m.plugin);
+    // A seed naming a plugin nobody installed is a mount whose every call the
+    // gateway refuses, and it looks fine in the list until something calls it.
+    if (!plugin) throw new Error(`${m.alias} seeds plugin "${m.plugin}", which is not installed`);
+    const problems = validateMount(plugin, (m.config ?? {}) as any, m.secretRef ?? null);
+    if (problems.length) {
+      throw new Error(`${m.alias}: ${problems.map((x) => x.message).join("; ")}`);
+    }
+  }
+});
+
+await check("每个 agent 一开始就有记忆", () => {
+  // What the README states since #101, held here rather than in prose: the
+  // memory plugin is part of the set every agent is seeded with, so an agent
+  // that has never been opened in the console can still write a note.
+  if (!seeded.some((m) => m.plugin === "state")) {
+    throw new Error("the seed list has no state mount, so a new agent cannot write anything down");
+  }
+  // Mounts are keyed by alias, so two entries sharing one are not two mounts.
+  const aliases = seeded.map((m) => m.alias);
+  const dupes = aliases.filter((a, i) => aliases.indexOf(a) !== i);
+  if (dupes.length) throw new Error(`the seed list repeats an alias: ${dupes.join(", ")}`);
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
