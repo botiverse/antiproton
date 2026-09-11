@@ -319,6 +319,44 @@ check("the mount's requirement and a field's requirement stay separate", () => {
   if ("required" in form) throw new Error("the mount-level flag is named `required`, which reads as the field's");
 });
 
+check("only an explicit secret:false reveals a field, so an unset flag never shows a password", () => {
+  // `undefined` is falsy, so a page writing `if (field.secret) mask()` against
+  // an unset value shows the input in clear — and the two that ship unset are
+  // run9's secret key and AppWorld's password. The declarations were right;
+  // the obvious reading of them was a plaintext password on screen.
+  const shown: string[] = [];
+  for (const plugin of everyPlugin) {
+    const form = credentialForm(plugin.credential);
+    if (form.kind !== "fields") continue;
+    for (const f of form.fields) {
+      if (typeof f.secret !== "boolean") throw new Error(`${plugin.id}.${f.name} left \`secret\` unresolved`);
+      if (typeof f.required !== "boolean") throw new Error(`${plugin.id}.${f.name} left \`required\` unresolved`);
+      if (!f.secret) shown.push(`${plugin.id}.${f.name}`);
+    }
+  }
+  // The allowlist is the point: anything new appearing here is a decision.
+  if (shown.join() !== "spotify.username") {
+    throw new Error(`fields rendered in clear: ${shown.join(", ") || "(none)"}`);
+  }
+});
+
+check("the resolver reads the declaration rather than overriding it", () => {
+  const form = credentialForm({
+    required: true, summary: "x",
+    shape: { keys: [
+      { name: "id", summary: "an identifier", secret: false },
+      { name: "key", summary: "unset, so secret" },
+      { name: "opt", summary: "explicitly optional", required: false },
+    ] },
+  });
+  if (form.kind !== "fields") throw new Error("expected fields");
+  const [id, key, opt] = form.fields;
+  if (id!.secret !== false) throw new Error("an explicit false was overridden");
+  if (key!.secret !== true) throw new Error("an unset secret did not default to true");
+  if (opt!.required !== false) throw new Error("an explicit optional was overridden");
+  if (opt!.secret !== true) throw new Error("optional is not the same question as secret");
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
