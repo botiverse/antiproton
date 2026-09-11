@@ -446,6 +446,15 @@ them:
 - **Plugin lifecycle.** A mount's config and policy are reconciled on every
   visit, so drift self-heals. Disabling and revoking one is still missing, as
   is any notion of installing a plugin at runtime.
+- **OAuth mounts.** An operator configures a credential by pasting it — a token,
+  a username and password, an access key and a secret key — and all three shapes
+  exist in the tree today. OAuth is a flow rather than a paste: it needs a
+  callback route and a refresh when the reference is resolved, and neither is
+  built. Until they are, a plugin can declare that its credential is a sign-in
+  (`mount-config` pins the rule at 16 cases), so the page greys the control
+  instead of offering a box that produces a mount which dies when the token
+  expires. No plugin declares one yet, so the declaration is a capability the
+  contract has rather than behaviour to observe.
 - **External events.** Nothing can wake an agent from the outside yet — no
   webhooks. An agent now remembers across tasks, but it still cannot be woken
   by the world; that is the remaining half of "long-running".
