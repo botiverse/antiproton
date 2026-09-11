@@ -15,6 +15,13 @@ The short version: the pin is exact on purpose, `node_modules` is never edited
 in place, and an upgrade is not finished until pi's own conformance suite and a
 benchmark have both run.
 
+## Conventions
+
+Anything named `…Bytes` counts `String.length` — UTF-16 code units — wherever
+what it bounds is a string, which is everywhere except binary payloads. They are
+coherent because they all count the same unit, and `src/store/artifacts.ts`
+measures real bytes on binary via `byteLength`.
+
 ## Which document is authoritative
 
 [`README.md`](README.md) describes the system as it is; its numbers are measured
