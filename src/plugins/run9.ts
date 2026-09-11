@@ -333,7 +333,11 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         },
         required: ["path"],
       },
-      sideEffects: "read",
+      // It reads from the box and writes to object storage, and the write is
+      // the part with consequences: a durable object that is billed and
+      // outlives the container. An operator who wants it free of approval says
+      // so per tool; the declaration's job is to be true.
+      sideEffects: "write",
       idempotency: "none",
     },
     {
@@ -383,7 +387,13 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
           },
         },
       },
-      sideEffects: "read",
+      // Irreversible, and declared as what it is. `sideEffects` is what the
+      // gateway maps to a mount's policy: read falls to `policy.read`, so
+      // declaring this a read meant an operator who gated writes had every
+      // ordinary command held for approval and the one call that destroys
+      // everything let straight through. Releasing twice is still safe, which
+      // is what `idempotency` says and is a different question.
+      sideEffects: "write",
       idempotency: "native",
     },
   ],

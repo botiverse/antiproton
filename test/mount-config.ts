@@ -6,6 +6,7 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
+import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { run9Plugin, execArgv, execOutput } from "../src/plugins/run9.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
@@ -267,6 +268,39 @@ check("no setting promises to park something the plugin cannot park", () => {
     for (const f of plugin.config ?? []) {
       if (/parked as an artifact/i.test(f.summary)) {
         throw new Error(`${plugin.id}.${f.name} promises parking; check the code actually parks before allowing this wording`);
+      }
+    }
+  }
+});
+
+/**
+ * `sideEffects` is not a label: the gateway maps it straight to a mount's
+ * policy, so a tool that changes something and says "read" is a tool an
+ * approval-gated mount lets through. `release` said read, and it destroys the
+ * container and everything in it.
+ */
+check("an approval-gated mount holds every run9 tool, because every one of them changes something", () => {
+  // All six touch the container: run and shell execute in it, save writes to
+  // object storage, keep and start_from fork and switch its filesystem, and
+  // release destroys it. None is a read, so none may fall to `policy.read`.
+  const gated = { write: "approval" as const };
+  const through = run9.tools
+    .filter((t) => policyFor(gated, t.name, t.sideEffects) !== "approval")
+    .map((t) => `${t.name} (${t.sideEffects})`);
+  if (through.length) {
+    throw new Error(`a mount gating writes lets these through: ${through.join(", ")}`);
+  }
+});
+
+check("a tool whose own summary says it destroys something is not declared a read", () => {
+  // One direction only. The reverse — "no destructive verb, so it must be a
+  // read" — flags twelve tools that correctly declare writes, so it would be
+  // noise. This direction has exactly one historical hit and it was real.
+  const DESTRUCTIVE = /\b(destroy|destroys|delete|deletes|remove|removes|overwrite|overwrites)\b/i;
+  for (const plugin of everyPlugin) {
+    for (const t of plugin.tools) {
+      if (t.sideEffects === "read" && DESTRUCTIVE.test(t.summary)) {
+        throw new Error(`${plugin.id}.${t.name} describes itself as destructive and declares "read"`);
       }
     }
   }
