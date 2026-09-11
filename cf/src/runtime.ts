@@ -215,6 +215,29 @@ export class AgentRuntime {
     return this.#plugins.find((p) => p.id === id)?.version;
   }
 
+  /**
+   * Re-pin every stored mount to the registry's version.
+   *
+   * A mount written before a plugin moved keeps the old pin, and nothing else
+   * repairs it: seeding runs once, and the gateway's answer to a stale pin is
+   * to refuse the call. github went to 2.0.0 and every mount seeded before
+   * that day was refused on every call after it, silently, because the one
+   * test that would have noticed died the same day. Every mount today is
+   * seeded by the operator (a person cannot add one from the console), so
+   * there is no person's pin to protect and following the registry is right;
+   * if a person ever pins a version on purpose, this is where that stops.
+   */
+  async repinMounts(tenantId: string, agentId: string): Promise<string[]> {
+    const repinned: string[] = [];
+    for (const m of await this.store.listMounts(tenantId, agentId)) {
+      const v = this.pluginVersion(m.plugin);
+      if (!v || v === m.toolVersion) continue;
+      await this.store.updateMountToolVersion(tenantId, agentId, m.alias, v);
+      repinned.push(`${m.alias}: ${m.toolVersion} -> ${v}`);
+    }
+    return repinned;
+  }
+
   #gateway: ToolGateway;
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
@@ -495,6 +518,10 @@ export class AgentRuntime {
 
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
+    // Before the catalogue is read: a stale pin is a mount whose every call
+    // the gateway refuses, and the harness opening is the one moment every
+    // agent passes through, console-made or API-made.
+    await this.repinMounts(tenantId, agentId);
     const { tools } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
     // The call context's task is the conversation, so held calls and audit

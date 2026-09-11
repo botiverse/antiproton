@@ -786,7 +786,8 @@ export class AgentDO extends DurableObject<Env> {
       // different repository is a different mount record, not different code.
       await rt.store.addMount({
         tenantId: "bench", agentId, alias: "node", plugin: "run9",
-        installationId: "inst-node", connectionId: null, toolVersion: "1.0.0",
+        installationId: "inst-node", connectionId: null,
+        toolVersion: rt.pluginVersion("run9") ?? "1.0.0",
         publicConfig: {
           account: "container",
           image: o.image,
@@ -1206,9 +1207,6 @@ export class AgentDO extends DurableObject<Env> {
             publicConfig: d.config, secretRef: d.secretRef, policy: d.policy,
           });
           continue;
-        }
-        if (have.toolVersion !== toolVersion) {
-          await rt.store.updateMountToolVersion(tenantId, agentId, d.alias, toolVersion);
         }
         if (JSON.stringify(have.publicConfig) !== JSON.stringify(d.config)) {
           await rt.store.updateMountConfig(tenantId, agentId, d.alias, d.config);
