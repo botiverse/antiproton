@@ -174,6 +174,20 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
     return {
       id: app,
       version: "1.0.0",
+      /**
+       * Declared, not discovered. Without this a mount with no `secret_ref`
+       * passes validation and fails on the agent's first authenticated call,
+       * and a console rendering the credential form has nothing to draw.
+       */
+      credential: {
+        required: true,
+        summary: `The AppWorld account this mount acts as: its username and password, as JSON.`,
+        shape: { keys: [
+          { name: "username", summary: "Username of the account.", secret: false },
+          { name: "password", summary: "Its password. Exchanged for a token server-side; the agent sees neither." },
+        ] },
+        grants: "acting as that account — everything the app lets its owner do, reads and writes alike.",
+      },
       tools,
       async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
         const doc = docs.get(tool);

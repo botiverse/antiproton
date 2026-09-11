@@ -214,7 +214,15 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
   credential: {
     required: true,
     summary: "run9 access and secret keys, as JSON.",
-    shape: { keys: ["ak", "sk"] },
+    // The credential also carries `secrets`: a value per injected secret the
+    // mount declares. Those names come from the `secrets` setting rather than
+    // from here, so a fixed list cannot name them and this one does not try.
+    // No mount injects secrets in production yet; when one does, the field
+    // gains a way to say "one entry per name in that setting".
+    shape: { keys: [
+      { name: "ak", summary: "run9 access key, from the run9 console." },
+      { name: "sk", summary: "run9 secret key, issued with the access key." },
+    ] },
     grants: "starting and destroying containers, which are billed by the second.",
     docs: "https://run.sys9.ai",
   },
@@ -417,6 +425,20 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
       const from = state?.startFrom ?? (prior as any)?.startFrom;
       const declared = cfg.secrets ?? [];
+      // Before the box exists, because after it exists a throw leaks it.
+      //
+      // A declared secret with no value used to be skipped. The box came up,
+      // the placeholder was never registered, and the agent wrote a string
+      // run9 had never heard of — so a half-filled credential surfaced as the
+      // far end rejecting the request, which points at everything except the
+      // mount. Saying it here costs nothing and names the actual mistake.
+      const missing = declared.filter((d) => !cred.secrets?.[d.name]);
+      if (missing.length) {
+        throw new Error(
+          `run9 mount declares ${missing.map((d) => `"${d.name}"`).join(", ")} in its secrets ` +
+          `setting, and the credential carries no value for ${missing.length > 1 ? "them" : "it"}`,
+        );
+      }
       try {
         await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
           box_id: boxId,
@@ -444,8 +466,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       // enters the box and never reaches the model: only the placeholder does.
       const placeholders: Placeholders = {};
       for (const d of declared) {
-        const value = cred.secrets?.[d.name];
-        if (!value) continue;
+        const value = cred.secrets![d.name]!;
         // Qualified by box, because a placeholder is unique across the project
         // and two agents would otherwise collide on the same name.
         const placeholder = `__AP_${d.name}_${boxId.slice(-8)}__`;
