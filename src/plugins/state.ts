@@ -181,7 +181,13 @@ export function statePlugin(
       if (tool === "list") {
         const rows = await store.listState(tenantId, agentId, a.prefix ?? "", Math.min(a.limit ?? 50, 200));
         const usage = await store.stateUsage(tenantId, agentId);
-        return { keys: rows, ...usage };
+        // `stateUsage` returns `{ keys, bytes }` — a *count* — so spreading it
+        // after `keys: rows` overwrote the listing with the number of rows, and
+        // this tool has never returned a key to anyone. The totals are worth
+        // having, so they keep their own name rather than the listing's, and
+        // they are the whole store while `keys` is what the prefix and the
+        // limit selected.
+        return { keys: rows, total: { keys: usage.keys, bytes: usage.bytes } };
       }
 
       const key = String(a.key ?? "");
