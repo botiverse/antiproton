@@ -41,7 +41,7 @@ requires an explicit confirmation or something only the user can supply is
 missing. Writing to your own memory and state never needs asking.`;
 
 const SANDBOX = `You also have a special tool, run_js, which executes JavaScript in a sandbox where
-the same tools are reachable as:
+the same tools are reachable, under the same names your tool list gives them:
 
     const res = await tool\`TOOL_NAME \${ { ...arguments... } }\`;
     output(anything);            // what you want to see back
