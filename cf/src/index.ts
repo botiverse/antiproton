@@ -1768,6 +1768,12 @@ async function notModified(
 let lastEtag: string | null = null;
 
 /** One identity, one agent. Was repeated at every route that needed it. */
+/** A form body, or null: a POST with no body or the wrong content type is a
+ *  bad request, not a crash. `formData()` throws on both. */
+async function formOf(request: Request): Promise<FormData | null> {
+  try { return await request.formData(); } catch { return null; }
+}
+
 /** Console routes that write: a message, a decision, a credential. */
 const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove"]);
 
@@ -2136,7 +2142,8 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
-          const form = await request.formData();
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
           const fields: Record<string, string> = {};
           for (const [k, v] of form.entries()) if (k !== "alias" && typeof v === "string") fields[k] = v;
@@ -2149,7 +2156,8 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
-          const form = await request.formData();
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
           if (alias) await stub.uiRemoveCredential("demo", agentId, alias);
           return html(mountFragment(await stub.uiPlugins("demo", agentId), alias));
@@ -2175,7 +2183,8 @@ export default {
           return html(approvals(await stub.uiApprovals("demo", taskId)));
         }
         case "/ui/message": {
-          const form = await request.formData();
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
@@ -2191,14 +2200,16 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiAgent(gate.who);
-          const form = await request.formData();
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
           const taskId = String(form.get("taskId"));
           await stub.uiCompact("demo", agentId, taskId);
           const t = await stub.uiTranscript("demo", agentId, taskId);
           return html(trajectory(conversation(t.events), t.byOp, t.busy));
         }
         case "/ui/decide": {
-          const form = await request.formData();
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
