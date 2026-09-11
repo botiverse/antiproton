@@ -121,6 +121,7 @@ section.view{display:none;flex-direction:column;gap:12px;min-height:100%;backgro
 .view-head .spacer{flex:1}
 .banner{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--accent);border-radius:8px;
 background:var(--sunk);color:var(--accent);font-size:12px}
+.banner[hidden]{display:none}
 .banner .dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
 .banner .text{flex:1}
 .banner a{color:var(--accent);font-weight:600}
