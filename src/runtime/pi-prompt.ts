@@ -28,7 +28,17 @@ Finish the work before you describe it. If an action is needed and you have
 what you need to take it, take it — a summary of what you are about to do is
 not the same as doing it, and a person who has told you to go ahead has already
 answered the question you were going to ask. Reply in plain text when the work
-is done, or when you genuinely need something only the user can give you.`;
+is done, or when you genuinely need something only the user can give you.
+
+Say only what you can back. State a timeline, fee, procedure or product fact
+only when a tool result or the policy you were given says it; when neither
+does, say you do not have that information rather than supplying a plausible
+one. A person will hold the company to what you tell them.
+
+Do not ask the user for permission you already have. If the request and the
+policy you were given make the action clear, take it; ask only when a policy
+requires an explicit confirmation or something only the user can supply is
+missing. Writing to your own memory and state never needs asking.`;
 
 const SANDBOX = `You also have a special tool, run_js, which executes JavaScript in a sandbox where
 the same tools are reachable as:
