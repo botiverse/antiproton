@@ -104,6 +104,26 @@ await check("remove forgets the value and the mount's reference", async () => {
   store.close();
 });
 
+await check("checkMount reports a refused key and an unanswered one as different kinds", async () => {
+  const store = new SqliteStore(":memory:"); await store.init();
+  const k = await importKek(KEK);
+  await store.putSecret("t", "a", "p", { ...(await seal(k, "whatever")) });
+  const mk = (id: string, fail: any): Plugin => ({
+    id, version: "1", tools: [],
+    async invoke() { return {}; },
+    async checkCredential() { return fail; },
+  } as any);
+  const rejected = mk("rej", { ok: false, kind: "rejected", reason: "no" });
+  const unreachable = mk("unr", { ok: false, kind: "unreachable", reason: "fetch failed" });
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "p", plugin: "rej", installationId: "i", connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: agentRef("p") });
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "q", plugin: "unr", installationId: "i", connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: agentRef("p") });
+  const gw = new ToolGateway(store, [rejected, unreachable], agentSecrets(store, k, { resolve: async () => null }));
+  const r1: any = await gw.checkMount("t", "a", "p"); const r2: any = await gw.checkMount("t", "a", "q");
+  if (!r1 || r1.ok || r1.kind !== "rejected") throw new Error(`rejected not reported: ${JSON.stringify(r1)}`);
+  if (!r2 || r2.ok || r2.kind !== "unreachable") throw new Error(`unreachable not reported: ${JSON.stringify(r2)}`);
+  store.close();
+});
+
 console.log(`\n  Per-agent secrets\n  ${"─".repeat(56)}`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const pass = results.filter((r) => r.ok).length;
