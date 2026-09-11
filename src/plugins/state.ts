@@ -27,8 +27,10 @@ import type { Json } from "../core/types.ts";
  * every turn. Measured on this deployment, editing the system message drops the
  * prompt cache from 84.9% to 0.0% — 6.6x the uncached tokens — so re-writing it
  * each turn would cost more than the memory is worth. The working set is
- * injected once when the task opens, where the prefix stays stable and cached;
- * changes made during a task are already in the transcript as tool results.
+ * injected once when the harness opens — `workingSet(store, tenantId, agentId)`,
+ * built from the agent and not from any task — where the prefix stays stable and
+ * cached; changes made after it opens are already in the transcript as tool
+ * results.
  *
  * Small values live in the object's own SQLite: transactional, strongly
  * consistent, and already isolated per (tenant, agent) by construction. Large
@@ -58,7 +60,7 @@ const DEFAULTS: Required<Omit<StateConfig, "account">> = {
   maxDocumentBytes: 64 * 1024,
 };
 
-/** The documents the harness injects when a task opens. Named here so the tool
+/** The documents the harness injects when it opens. Named here so the tool
  *  summaries, the injection and the operator view cannot drift apart. */
 export const WORKING_SET = [
   { key: "todo", budget: 2000, what: "open items" },
@@ -246,7 +248,7 @@ export function statePlugin(
 }
 
 /**
- * The working set, as it is shown to the agent when a task opens.
+ * The working set, as it is shown to the agent when the harness opens.
  *
  * Budgeted and ordered the way pi orders it — open items first, then durable
  * facts, then the log, which is the first thing to lose — because the reason to
