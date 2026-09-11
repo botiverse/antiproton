@@ -98,6 +98,33 @@ export type CredentialCheck =
   | { ok: false; reason: string };
 
 /**
+ * A credential nobody can paste.
+ *
+ * OAuth is a flow rather than a value: the person is sent to the provider,
+ * consents, and the provider calls back with a short-lived access token and a
+ * refresh token. The refresh then happens server-side, later, with nobody
+ * present — so what is kept is a grant that changes over time, not something
+ * someone typed. Asking a person to paste one is asking them to do the
+ * provider's job, and what they paste stops working within the hour.
+ *
+ * **Declared, not implemented.** Nothing reads this yet and no plugin declares
+ * it. It exists so that a page built from these declarations has a way to know
+ * the difference: it can show "Connect with GitHub", disabled, instead of a
+ * text box that produces a mount which dies in an hour. Without it every
+ * plugin looks like a paste, and the page carries that assumption silently.
+ *
+ * When the flow is built, what it needs — the authorization and token
+ * endpoints, the scopes — belongs here, beside the name of the thing being
+ * connected.
+ */
+export interface SignIn {
+  /** The account being connected, as a person would name it: "GitHub". */
+  provider: string;
+  /** What consenting will grant, in words someone can weigh. */
+  grants?: string;
+}
+
+/**
  * The credential a mount of this plugin needs, if it needs one.
  *
  * Declared rather than discovered. Without this, a mount with no `secret_ref`
@@ -114,8 +141,11 @@ export interface CredentialSpec {
   required: boolean;
   /** What to store, in words someone can act on. */
   summary: string;
-  /** A bare token, or a JSON object carrying these fields. */
-  shape: "token" | { keys: CredentialField[] };
+  /**
+   * A bare token, a JSON object carrying these fields, or a sign-in completed
+   * at the provider rather than typed here.
+   */
+  shape: "token" | { keys: CredentialField[] } | { signIn: SignIn };
   /** What an account can do here that an anonymous mount cannot. */
   grants?: string;
   /** Where to get one. */
