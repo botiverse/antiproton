@@ -34,6 +34,7 @@ import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
+import type { MountPolicy } from "../../src/core/store.ts";
 import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
@@ -231,9 +232,17 @@ export class AgentRuntime {
     const repinned: string[] = [];
     for (const m of await this.store.listMounts(tenantId, agentId)) {
       const v = this.pluginVersion(m.plugin);
-      if (!v || v === m.toolVersion) continue;
-      await this.store.updateMountToolVersion(tenantId, agentId, m.alias, v);
-      repinned.push(`${m.alias}: ${m.toolVersion} -> ${v}`);
+      if (v && v !== m.toolVersion) {
+        await this.store.updateMountToolVersion(tenantId, agentId, m.alias, v);
+        repinned.push(`${m.alias}: ${m.toolVersion} -> ${v}`);
+      }
+      // A github mount seeded before the gate existed (`gh_public`, no
+      // policy) offers every write tool ungated the moment someone attaches
+      // a token to it. It gets the gate the seeds carry now.
+      if (m.plugin === "github" && !m.policy) {
+        await this.store.updateMountPolicy(tenantId, agentId, m.alias, { write: "approval" });
+        repinned.push(`${m.alias}: writes now wait for approval`);
+      }
     }
     return repinned;
   }
@@ -419,10 +428,14 @@ export class AgentRuntime {
     };
   }
 
-  static readonly DEFAULT_MOUNTS = [
+  static readonly DEFAULT_MOUNTS: Array<{ alias: string; plugin: string; account: string; policy?: MountPolicy | null }> = [
     { alias: "tools", plugin: "tools", account: "builtin" },
     { alias: "artifacts", plugin: "artifacts", account: "builtin" },
-    { alias: "gh_public", plugin: "github", account: "unauthenticated" },
+    // One GitHub alias, the same one the console seeds, and gated the same
+    // way: a second alias for the same plugin with no policy is a door beside
+    // the gate, since a missing policy allows. No token, so it reads public
+    // repositories until a person attaches one on the credential page.
+    { alias: "gh", plugin: "github", account: "GitHub", policy: { write: "approval" } },
   ];
 
   /** What is installed, for a console that wants to show settings rather than
@@ -439,7 +452,7 @@ export class AgentRuntime {
   async provision(
     tenantId: string,
     agentId: string,
-    mounts: Array<{ alias: string; plugin: string; account: string }> = AgentRuntime.DEFAULT_MOUNTS,
+    mounts: Array<{ alias: string; plugin: string; account: string; policy?: MountPolicy | null }> = AgentRuntime.DEFAULT_MOUNTS,
   ) {
     await this.ready();
     if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false };
@@ -453,7 +466,7 @@ export class AgentRuntime {
         tenantId, agentId, alias: m.alias, plugin: m.plugin,
         installationId: `inst-${m.alias}`, connectionId: null,
         toolVersion: this.pluginVersion(m.plugin) ?? "1.0.0",
-        publicConfig: { account: m.account }, secretRef: null,
+        publicConfig: { account: m.account }, secretRef: null, policy: m.policy ?? null,
       });
     }
     return { agentId, created: true };
