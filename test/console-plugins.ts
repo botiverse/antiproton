@@ -9,8 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
-import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {

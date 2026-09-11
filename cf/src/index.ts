@@ -30,7 +30,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue,, agentList } from "./ui.ts";
+  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue, agentList } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
