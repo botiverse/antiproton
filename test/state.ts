@@ -131,10 +131,15 @@ await check("注入的文字用挂载时的别名，不是写死的 state", asyn
     publicConfig: { account: "agent memory" }, secretRef: null, policy: null,
   });
   const text = await workingSet(store, "t", "a");
-  if (!text.includes("memo.remember") || !text.includes("memo.forget")) {
+  if (!text.includes("`memo` mount")) {
     throw new Error(`the prompt did not name the mounted alias: ${text.slice(0, 200)}`);
   }
-  if (text.includes("state.remember")) throw new Error("the prompt still names an alias nobody mounted");
+  if (!text.includes("`remember`") || !text.includes("`forget`")) {
+    throw new Error("the prompt did not say which tools maintain it");
+  }
+  // The dispatch address is not a name the model can call, so it must not be
+  // handed one: neither the old literal nor a dotted form of the real alias.
+  if (/state\.remember|memo\.remember/.test(text)) throw new Error("the prompt handed the model a dispatch address");
 });
 
 await check("没挂载时不会叫 agent 去调一个不存在的工具", async () => {
@@ -145,7 +150,7 @@ await check("没挂载时不会叫 agent 去调一个不存在的工具", async 
   // instruction it cannot follow, competing with the ones it can.
   const text = await workingSet(store, "t", "a");
   if (!text.includes("部署窗口是周二")) throw new Error("memory was withheld along with the tool names");
-  if (/\.remember|\.forget/.test(text)) throw new Error("named a tool that is not mounted");
+  if (/remember|forget/.test(text)) throw new Error("named a tool that is not mounted");
 });
 
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);

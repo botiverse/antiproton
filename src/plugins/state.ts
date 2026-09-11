@@ -288,9 +288,15 @@ export async function workingSet(
   // Still injected when there is no mount: memory you can read but not edit is
   // worth reading. What is dropped is only the sentence that would tell the
   // agent to call something it has not got.
+  // Named as "the X tool on the Y mount" rather than as `Y.X`, because the
+  // dotted form is the harness's dispatch address and not a name the model can
+  // call: the tool it is offered is `remember`, qualified to `state__remember`
+  // only if another mount also has one. Which of those it is depends on the
+  // whole mounted set, so a plugin cannot know it — the mount and the tool it
+  // belongs to are the two facts that stay true under either.
   const correcting = alias
-    ? `Correct it with ${alias}.remember when it turns out to be wrong, and delete it with ` +
-      `${alias}.forget when it stops being true.`
+    ? `They are kept by the \`${alias}\` mount: correct one with its \`remember\` tool when it ` +
+      "turns out to be wrong, and drop one with `forget` when it stops being true."
     : "You have no tool mounted for changing it, so treat it as read-only and say so if it is wrong.";
   return (
     "\n\n# What you already know\n" +
