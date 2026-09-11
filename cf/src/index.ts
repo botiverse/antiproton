@@ -26,6 +26,7 @@ import { entriesToEvents } from "./pi-view.ts";
 import { ensureAgentTables } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
+import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -1304,6 +1305,13 @@ export class AgentDO extends DurableObject<Env> {
     await rt.ready();
     const installed = rt.plugins();
     const byId = new Map(installed.map((p) => [p.id, p]));
+    // The tools column means "what the agent can call", so the names come from
+    // the same function that names them for the model, over the whole catalogue
+    // at once: the tie-break at the length cap is a property of the set, and a
+    // per-mount join would print a name that exists nowhere.
+    const named = qualifyMountedTools(mounts.flatMap((m) =>
+      (byId.get(m.plugin)?.tools ?? []).map((t) => ({ name: t.name, address: `${m.alias}.${t.name}` })),
+    ));
     const mounts = await rt.store.listMounts(tenantId, agentId);
 
     // Which tools this agent has actually reached for. A catalogue says what is
@@ -1329,6 +1337,10 @@ export class AgentDO extends DurableObject<Env> {
           sideEffects: t.sideEffects, idempotency: t.idempotency,
         })),
       })),
+      // The column means "what the agent can call", so the names come from the
+      // same function that names them for the model, over the whole catalogue
+      // at once: the tie-break at the length cap is a property of the set, and
+      // a per-mount join would print a name that exists nowhere.
       mounts: await Promise.all(mounts.map(async (m) => {
         const plugin = byId.get(m.plugin);
         const conn = await rt.store.getConnection(tenantId, agentId, m.alias).catch(() => null);
@@ -1349,7 +1361,7 @@ export class AgentDO extends DurableObject<Env> {
           problems: plugin
             ? validateMount(plugin, m.publicConfig as any, m.secretRef).map((x) => x.message)
             : [`no plugin named ${m.plugin} is installed`],
-          tools: (plugin?.tools ?? []).map((t) => `${m.alias}.${t.name}`),
+          tools: named.filter((n) => n.address.startsWith(`${m.alias}.`)).map((n) => n.name),
         };
       })),
       used,
