@@ -184,6 +184,14 @@ is not performed: the operation is recorded, the task **parks on it**, and a
 person sees the request verbatim and signs it. The decision wakes the task,
 and the call is then performed exactly once.
 
+**A gate binds the mount it is set on, so two mounts of one plugin are two
+authorities.** That is worth stating because the default runs the other way: a
+mount with no policy at all allows every tool it exposes, so an ungated mount of
+the same plugin sitting beside a gated one is a door beside the gate rather than
+a second opinion. Nothing stops a second alias being added — that is what mounts
+are for — so the property to check is the agent's whole mount set, not the policy
+on the mount you are looking at.
+
 The parking matters more than it sounds. Answering a held call with an error
 made the agent announce it could not proceed and stop; told instead that it is
 paused and a decision is coming, the same task went from a 75s failure to a
