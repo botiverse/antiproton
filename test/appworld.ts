@@ -56,7 +56,7 @@ await store.createTask(T, AGENT, TASK_ID, {});
 for (const p of plugins) {
   await store.addMount({
     tenantId: T, agentId: AGENT, alias: p.id, plugin: p.id,
-    installationId: `inst-${p.id}`, connectionId: null, toolVersion: "1.0.0",
+    installationId: `inst-${p.id}`, connectionId: null, toolVersion: p.version,
     publicConfig: { account: profile.email }, secretRef: `aw:${p.id}`,
   });
 }
