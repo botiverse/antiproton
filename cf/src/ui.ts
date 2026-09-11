@@ -172,9 +172,14 @@ background:var(--sunk);color:var(--accent);font-size:12px}
 .conv{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;
 flex:1;min-height:0}
 .conv .body{flex:1;min-height:0;max-height:none;overflow:auto}
-.held{border-top:1px solid var(--line);padding:0 13px}
+/* Held calls sit between the transcript and the composer. Capped and
+   scrolling, so nine waiting calls cannot swallow the conversation and push
+   the composer out of the box (tygg, 2026-09-11); the inbox is the place to
+   read them all. */
+.held{border-top:1px solid var(--line);padding:0 13px;flex:none;max-height:min(40%,320px);overflow:auto}
 .held:empty{display:none}
 .held .card{margin:10px 0}
+.card pre,.inbox-card pre{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
 .inspector{grid-area:insp;overflow:auto;background:var(--panel);border-left:1px solid var(--line);padding:12px;min-width:0}
 /* the inspector's tabs, on rUI's Tabs recipe: Elegant is an underline strip
    over a hairline, Brutal a bordered bar with dividers and the active tab
