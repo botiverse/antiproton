@@ -2,8 +2,14 @@
 // A ratchet, not a gate on zero: the tree carries type errors that predate the
 // check, so the rule is "no new ones". Each error is reduced to a signature
 // without a line number (file, code, message), so a change that moves lines
-// does not trip it and a change that adds an error does. `--update` rewrites
-// the baseline; do that only when the new entries are understood.
+// does not trip it and a change that adds an error does.
+//
+// The baseline is a list of unread findings, not a list of things to ignore:
+// its first hour on master, one entry (TS2783, a spread overwriting `keys`)
+// turned out to be a tool that had never returned what it promised. So
+// `--update` means "I have read these and they are understood", never "let
+// it through", and the count is the length of a debt, not a health figure.
+// An entry that stops occurring is reported so the debt can shrink.
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
