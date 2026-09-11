@@ -32,7 +32,7 @@ const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, last4, seal } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
 import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
@@ -286,16 +286,13 @@ export class AgentRuntime {
     const value = plugin.credential.shape === "token"
       ? String(fields.token ?? "").trim()
       : JSON.stringify(Object.fromEntries(form.fields.map((f) => [f.name, String(fields[f.name] ?? "").trim()])));
-    const shown = plugin.credential.shape === "token"
-      ? value
-      : String(fields[form.fields.filter((f) => f.secret).map((f) => f.name).pop() ?? form.fields[form.fields.length - 1]!.name] ?? "");
     const sealed = await seal(kek, value);
     const name = alias;
     // Check before keeping, with the candidate in place: the check reads the
     // credential through the same resolver a call would, so the mount points
     // at the sealed candidate first and is pointed back if the plugin says no.
     const previous = mount.secretRef;
-    await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv, last4: last4(shown) });
+    await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
     await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
     const check = await this.#gateway.checkMount(tenantId, agentId, alias);
     if (check && !check.ok) {
@@ -305,7 +302,7 @@ export class AgentRuntime {
     }
     if (check?.ok) {
       await this.store.putSecret(tenantId, agentId, name, {
-        ciphertext: sealed.ciphertext, iv: sealed.iv, last4: last4(shown), account: check.account ?? null, verified: true,
+        ciphertext: sealed.ciphertext, iv: sealed.iv, account: check.account ?? null, verified: true,
       });
     }
     return { ok: true, verified: !!check?.ok, account: check?.ok ? (check.account ?? null) : null };
@@ -320,15 +317,18 @@ export class AgentRuntime {
     return true;
   }
 
-  /** What a page may show for a mount's credential. Never the value. */
+  /** What a page may show for a mount's credential. Never the value, and
+   *  nothing derived from it: an account name is the far end's label. */
   async credentialMeta(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null }) {
     const attached = !!mount.secretRef;
     const meta = isAgentRef(mount.secretRef) ? await this.store.secretMeta(tenantId, agentId, mount.alias) : null;
     return {
       attached,
+      // A reference the operator configured at deploy time, not one entered
+      // on the page: attached, and not something the page can replace.
+      operator: attached && !isAgentRef(mount.secretRef),
       verified: meta?.verified ?? false,
       account: meta?.account ?? null,
-      last4: meta?.last4 ?? null,
       setAt: meta?.updatedAt ?? null,
       lastUsedAt: meta?.lastUsedAt ?? null,
       storable: !!this.#deps.secretKek,

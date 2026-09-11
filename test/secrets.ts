@@ -4,7 +4,7 @@
  * properties the README's credential claim rests on.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
-import { agentRef, agentSecrets, importKek, last4, open, seal } from "../src/runtime/secrets.ts";
+import { agentRef, agentSecrets, importKek, open, seal } from "../src/runtime/secrets.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
@@ -33,18 +33,13 @@ await check("a short key is refused before it is used", async () => {
   if (!ok) throw new Error("accepted a 5-byte key");
 });
 
-await check("last4 is a suffix and never the whole of a short value", () => {
-  if (last4("abcdef") !== "cdef") throw new Error("wrong suffix");
-  if (last4("abcd") !== "") throw new Error("a four-character value would be shown whole");
-});
-
 await check("the value appears in no persisted row, in any table", async () => {
   const store = new SqliteStore(":memory:"); await store.init();
   const k = await importKek(KEK);
   const sealed = await seal(k, VALUE);
   await store.addMount({ tenantId: "t", agentId: "a", alias: "gh", plugin: "github", installationId: "i",
     connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: null });
-  await store.putSecret("t", "a", "gh", { ...sealed, last4: last4(VALUE) });
+  await store.putSecret("t", "a", "gh", { ...sealed });
   await store.setMountSecretRef("t", "a", "gh", agentRef("gh"));
   // Walk every table the way someone with the file would.
   const rows: string[] = [];
@@ -52,14 +47,16 @@ await check("the value appears in no persisted row, in any table", async () => {
   const hit = rows.find((r) => r.includes(VALUE));
   if (hit) throw new Error(`plaintext found: ${hit.slice(0, 120)}`);
   const meta = await store.secretMeta("t", "a", "gh");
-  if (!meta || meta.last4 !== "9f3e" || meta.lastUsedAt !== null) throw new Error(`meta wrong: ${JSON.stringify(meta)}`);
+  if (!meta || meta.lastUsedAt !== null || "last4" in meta) throw new Error(`meta wrong: ${JSON.stringify(meta)}`);
+  // Nothing derived from the value either: not a suffix, not a hash of it.
+  if (rows.some((r) => r.includes(VALUE.slice(-4)))) throw new Error("a fragment of the value is persisted");
   store.close();
 });
 
 await check("an agent: reference resolves only for the owner, and stamps last use", async () => {
   const store = new SqliteStore(":memory:"); await store.init();
   const k = await importKek(KEK);
-  await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)), last4: last4(VALUE) });
+  await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)) });
   const resolver = agentSecrets(store, k, { resolve: async () => null });
   if (await resolver.resolve(agentRef("gh"), { tenantId: "t", agentId: "a" }) !== VALUE) throw new Error("owner cannot resolve");
   if (await resolver.resolve(agentRef("gh"), { tenantId: "t", agentId: "b" }) !== null) throw new Error("another agent resolved it");
@@ -73,7 +70,7 @@ await check("an agent: reference resolves only for the owner, and stamps last us
 await check("the gateway hands the value to the plugin's call context and to nothing persisted", async () => {
   const store = new SqliteStore(":memory:"); await store.init();
   const k = await importKek(KEK);
-  await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)), last4: last4(VALUE) });
+  await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)) });
   let seen: string | null = null;
   const plugin: Plugin = {
     id: "echo", version: "1", tools: [{ name: "ping", summary: "ping", sideEffects: "read", idempotency: "idempotent", schema: { type: "object", properties: {} } } as any],
@@ -98,7 +95,7 @@ await check("remove forgets the value and the mount's reference", async () => {
   const k = await importKek(KEK);
   await store.addMount({ tenantId: "t", agentId: "a", alias: "gh", plugin: "github", installationId: "i",
     connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: null });
-  await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)), last4: last4(VALUE) });
+  await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)) });
   await store.setMountSecretRef("t", "a", "gh", agentRef("gh"));
   if (!(await store.removeSecret("t", "a", "gh"))) throw new Error("remove reported nothing removed");
   await store.setMountSecretRef("t", "a", "gh", null);
