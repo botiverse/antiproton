@@ -21,7 +21,7 @@ by @tygg on 2026-09-11 from the outlined cut of direction A.
 | `antiproton-wordmark-flat.svg` | One-colour wordmark, `currentColor`. |
 | `antiproton-lockup.svg` | Mark and wordmark together, outlined. |
 | `antiproton-lockup-flat.svg` | Same lockup, one colour, `currentColor`. For one-colour contexts. |
-| `favicon.svg`, `favicon-{16,32,48,180,512}.png` | Cream tile with an ink border and the outlined mark inside, square corners (tygg, 2026-09-11). 180 is the Apple touch icon, 512 the web-manifest size. |
+| `favicon.svg`, `favicon-{16,32,48,180,512}.png` | Cream tile, no border, the outlined mark inside, square corners (tygg, 2026-09-11). 180 is the Apple touch icon, 512 the web-manifest size. |
 | `antiproton-tile-dark.svg` | The tile for dark surfaces: Elegant-dark canvas, light mark, yellow bar. |
 | `antiproton-lockup.png`, `antiproton-lockup-dark.png` | Raster lockups for places that cannot take SVG. |
 
