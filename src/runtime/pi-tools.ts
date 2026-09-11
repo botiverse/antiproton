@@ -75,6 +75,24 @@ const MAX_NAME = 64;
  * The dotted `address` is untouched: that is the gateway's dispatch key and the
  * model never sees it.
  *
+ * **Changing what this returns is a migration, not a relabel.** pi records the
+ * tool names a session was opened with (`activeToolNames` on the generation's
+ * configuration) and checks them against the registered tools before every run:
+ *
+ *     harness/runtime/drive/generation.js  prepareGeneration()
+ *       missingTools = activeToolNames.filter((n) => !toolsByName.has(n))
+ *       if (missingTools.length) → configuration_failure
+ *                                  "configured_tools_unavailable"
+ *
+ * So a rename orphans every session opened before it: the message is accepted
+ * and durable, the run fails at admission, and nothing calls the model. That is
+ * what always-qualifying did on 11 September 2026 — every agent whose session
+ * predated the deploy stopped answering, while agents created after it were
+ * fine, which is also why two benchmark runs on fresh objects showed nothing.
+ * A rename needs the stored names reconciled with the current ones when the
+ * harness opens; benchmarks cannot see whether that reconciliation exists,
+ * because they never carry a session older than the code.
+ *
  * Sanitising happens first, because it can create a clash that did not exist in
  * the plugin's own names. Two names can still meet at the cap, so the last step
  * is a deterministic tie-break rather than a silent collapse — two tools sharing
