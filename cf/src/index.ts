@@ -1177,7 +1177,8 @@ export class AgentDO extends DurableObject<Env> {
           secretRef: null, policy: null },
         // A real container, for tasks that need one. Its tools describe
         // themselves as a last resort so the agent reaches for free in-process
-        // JS first, and the framework releases the box when the task ends.
+        // JS first, and the framework releases the box once the agent has no
+        // conversation with work open (the scope is the agent, not a task).
         { alias: "node", plugin: "run9", config: { account: "container" },
           secretRef: OPERATOR_RUN9_REF, policy: null },
         // The agent's own store. Deliberately not behind approval: an agent

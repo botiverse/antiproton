@@ -6,6 +6,7 @@
 import { piTables, MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { PiAgent, jobSession, sessionsWithWork } from "../src/runtime/pi-agent.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { SqliteStore } from "../src/store/sqlite.ts";
 
 const results: { name: string; ok: boolean; error?: string }[] = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -59,6 +60,42 @@ await check("two conversations in one object: each reads only its own transcript
   void bJobs;
   await A.close(); await B.close(); await M.close();
   host.dispose();
+});
+
+
+/**
+ * The other half, whose wrong version fails silently: a session threaded one
+ * layer too far makes mounts, connection state and credentials per
+ * conversation, and the symptom is a new conversation with an empty plugins
+ * panel rather than an error. So the rows are read back with no session in
+ * hand, and the tables are checked for never having grown a column for one.
+ */
+await check("mounts, connection state and credentials are the agent's, shared by every conversation", async () => {
+  const store = new SqliteStore(":memory:"); await store.init();
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "gh", plugin: "github", installationId: "i",
+    connectionId: null, toolVersion: "1", publicConfig: { account: "shared" }, secretRef: "agent:gh" });
+  await store.putConnection("t", "a", "gh", { boxId: "held-by-the-agent" });
+  await store.putSecret("t", "a", "gh", { ciphertext: "c", iv: "i", account: "octocat", verified: true });
+  // Read back the way the gateway does: tenant, agent, alias — nothing names a
+  // conversation, so there is nothing a second conversation could fail to match.
+  const mount = await store.getMountByAlias("t", "a", "gh");
+  if (mount?.secretRef !== "agent:gh") throw new Error(`mount not found without a session: ${JSON.stringify(mount)}`);
+  const conn = await store.getConnection("t", "a", "gh") as any;
+  if (conn?.boxId !== "held-by-the-agent") throw new Error(`connection state not found without a session: ${JSON.stringify(conn)}`);
+  const meta = await store.secretMeta("t", "a", "gh");
+  if (meta?.account !== "octocat") throw new Error(`credential not found without a session: ${JSON.stringify(meta)}`);
+  // And the discriminating check: none of the three tables has a column that
+  // could scope a row to a conversation. Adding one is where this would break.
+  const tables = store.dumpTables();
+  for (const name of ["mounts", "connections", "secrets"]) {
+    const rows = tables[name] as Record<string, unknown>[] | undefined;
+    if (!rows?.length) throw new Error(`${name} has no row to inspect`);
+    const cols = Object.keys(rows[0]!);
+    if (cols.some((c) => /session|conversation|task/i.test(c))) {
+      throw new Error(`${name} is scoped below the agent: ${cols.join(", ")}`);
+    }
+  }
+  await store.close();
 });
 
 console.log(`\n  Sessions\n  ${"─".repeat(56)}`);

@@ -138,6 +138,12 @@ export class ToolGateway {
   /**
    * Release whatever this agent's mounts are holding, now the task is done.
    *
+   * The scope is the agent, not the task, whatever the name suggests: every
+   * mount the agent holds is released, and `ctx.taskId` is carried for the
+   * audit record, not used to select. With one conversation the two coincided;
+   * with several, the runtime calls this only when no conversation has work
+   * open, which is what keeps the name honest.
+   *
    * Errors are swallowed on purpose: this runs after the work, and a mount that
    * cannot tidy up must not turn a finished task into a failed one.
    */
