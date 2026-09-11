@@ -24,6 +24,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
 import { ensureAgentTables } from "../../src/runtime/pi-agent.ts";
+import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -1099,8 +1100,48 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Provisions the demo agent once: a read-only fleet tool plus writes that
    *  need a human. The policy is what the whole page exists to show. */
+  /** The console's first conversation is the agent's first session, which
+   *  keeps the transcript it always had; every other conversation is a
+   *  session named by its task id. */
+  #sessionOf(agentId: string, taskId: string): string {
+    return taskId === `t_${agentId}` ? MAIN_SESSION : taskId;
+  }
+
+  /**
+   * A conversation the caller may address: the default one, created on first
+   * use, or one the create route minted for this agent. Anything else, an id
+   * another agent owns or one nobody minted, is refused, for reads and writes
+   * alike: a foreign id must neither disclose a transcript nor post into one.
+   */
+  async #conversation(tenantId: string, agentId: string, taskId: string): Promise<string> {
+    const rt = this.runtime();
+    await rt.ready();
+    const t = String(taskId ?? "").trim();
+    if (t === `t_${agentId}`) {
+      if (!(await rt.store.loadTask(tenantId, t))) await rt.store.createTask(tenantId, agentId, t, {});
+      return MAIN_SESSION;
+    }
+    const task = await rt.store.loadTask(tenantId, t);
+    if (!task || task.agentId !== agentId) throw new Error(`no such conversation: ${t} (not this viewer's, or never created)`);
+    return t;
+  }
+
+  /** The only way a conversation id comes to exist. */
+  async uiNewConversation(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiNewConversation", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      const taskId = `t_${agentId}_${Date.now().toString(36)}`;
+      await rt.store.createTask(tenantId, agentId, taskId, {});
+      ensureAgentTables(this.sql, taskId);
+      return { taskId };
+    });
+  }
+
   async uiEnsure(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
+    await this.#conversation(tenantId, agentId, taskId);
     return this.#busy("uiEnsure", async () => {
       const rt = this.runtime();
       await rt.ready();
@@ -1136,7 +1177,8 @@ export class AgentDO extends DurableObject<Env> {
           secretRef: null, policy: null },
         // A real container, for tasks that need one. Its tools describe
         // themselves as a last resort so the agent reaches for free in-process
-        // JS first, and the framework releases the box when the task ends.
+        // JS first, and the framework releases the box once the agent has no
+        // conversation with work open (the scope is the agent, not a task).
         { alias: "node", plugin: "run9", config: { account: "container" },
           secretRef: OPERATOR_RUN9_REF, policy: null },
         // The agent's own store. Deliberately not behind approval: an agent
@@ -1321,8 +1363,9 @@ export class AgentDO extends DurableObject<Env> {
 
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
+    const session = await this.#conversation(tenantId, agentId, taskId);
     return this.#busy("uiCompact", async () => {
-      const r = await this.runtime().requestCompaction(tenantId, agentId);
+      const r = await this.runtime().requestCompaction(tenantId, agentId, session);
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
@@ -1333,9 +1376,10 @@ export class AgentDO extends DurableObject<Env> {
     mode: "steer" | "followUp" = "steer",
   ) {
     this.#claim(tenantId, agentId);
+    const session = await this.#conversation(tenantId, agentId, taskId);
     return this.#busy("uiSay", async () => {
       const rt = this.runtime();
-      const r = await rt.postMessage(tenantId, agentId, text, mode);
+      const r = await rt.postMessage(tenantId, agentId, text, mode, session);
       await this.ctx.storage.setAlarm(Date.now());
       return r;
     });
@@ -1358,19 +1402,20 @@ export class AgentDO extends DurableObject<Env> {
    * and the browser a full re-parse of a megabyte.
    */
   async uiVersion(tenantId: string, agentId: string, taskId: string) {
-    const rt = this.runtime();
-    await rt.ready();
-    const row = this.sql.exec("SELECT MAX(seq) AS s, COUNT(*) AS n FROM pi_entries")
+    const session = await this.#conversation(tenantId, agentId, taskId);
+    ensureAgentTables(this.sql, session);
+    const t = piTables(session);
+    const row = this.sql.exec(`SELECT MAX(seq) AS s, COUNT(*) AS n FROM ${t.entries}`)
       .toArray()[0] as any;
-    const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL")
+    const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?", session)
       .toArray()[0] as any;
     return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}`;
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0) {
+    const session = await this.#conversation(tenantId, agentId, taskId);
     const rt = this.runtime();
-    await rt.ready();
-    const agent = await rt.agent(tenantId, agentId);
+    const agent = await rt.agent(tenantId, agentId, session);
     const all = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
     const total = all.length;
     const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
@@ -1452,35 +1497,77 @@ export class AgentDO extends DurableObject<Env> {
         .sort((x, y) => y.updatedAt - x.updatedAt)
         .map((t) => ({
           taskId: t.taskId, status: t.status,
+          title: this.#titleOf(agentId, t.taskId),
           lastActivityAt: new Date(t.updatedAt).toISOString(),
-          pending: pendingByTask[t.taskId] ?? 0,
+          pending: pendingByTask[this.#sessionOf(agentId, t.taskId)] ?? 0,
           turns: null as number | null,
           busy: running && active?.taskId === t.taskId,
         })),
     };
   }
 
+  /** The first thing the person said in a conversation, first line, or null.
+   *  Read straight from the session's first entry so a list of conversations
+   *  does not build every transcript. */
+  #titleOf(agentId: string, taskId: string): string | null {
+    try {
+      const t = piTables(this.#sessionOf(agentId, taskId));
+      const rows = this.sql.exec(`SELECT body FROM ${t.entries} WHERE type = 'message' ORDER BY seq ASC LIMIT 3`).toArray() as any[];
+      for (const r of rows) {
+        const m = JSON.parse(String(r.body))?.message;
+        if (m?.role !== "user") continue;
+        const text = (Array.isArray(m.content) ? m.content : []).map((c: any) => c?.type === "text" ? String(c.text) : "").join(" ");
+        const line = text.trim().split("\n")[0]?.trim() ?? "";
+        return line ? line.slice(0, 80) : null;
+      }
+    } catch { /* a conversation with no table yet has no title */ }
+    return null;
+  }
+
+  #ownerAgent(): string | null {
+    const row = this.sql.exec("SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+    return row ? String(row.agent_id) : null;
+  }
+
   /** The approvals panel. With a task, that task's approvals; without one,
    *  every approval the tenant has, which is what a cross-task view wants.
    *  The parameter was accepted and dropped before, so the per-task panel
    *  silently showed the tenant-wide set. */
-  async uiApprovals(tenantId: string, taskId: string) {
+  async uiApprovals(tenantId: string, agentId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
+    const raw = String(taskId ?? "").trim();
+    // No conversation named: everything the agent holds. One named: it must be
+    // the agent's own (404 otherwise, like every other route), and held calls
+    // carry the conversation as their task, the first one under the session
+    // name the single-conversation object always used.
+    const t = raw && raw !== "null" && raw !== "undefined" ? await this.#conversation(tenantId, agentId, raw) : "";
     const all = await rt.store.listApprovals(tenantId);
-    const t = String(taskId ?? "").trim();
-    return t && t !== "null" && t !== "undefined" ? all.filter((a) => a.taskId === t) : all;
+    return t ? all.filter((a) => a.taskId === t) : all;
   }
 
-  async uiDecide(tenantId: string, operationId: string, decision: "approved" | "denied", approver: string) {
-    return this.#busy("uiDecide", async () => {
-      const rt = this.runtime();
-      await rt.ready();
-      const out = await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
+  async uiDecide(
+    tenantId: string, agentId: string, taskId: string,
+    operationId: string, decision: "approved" | "denied", approver: string,
+  ) {
+    const rt = this.runtime();
+    await rt.ready();
+    // The conversation is checked before anything is decided, so a foreign id
+    // is refused rather than deciding first and refusing the redraw. A panel
+    // that names no conversation is answered with the one the held call is in.
+    let t = String(taskId ?? "").trim();
+    if (!t) {
+      const held = (await rt.store.listApprovals(tenantId)).find((a) => a.operationId === operationId);
+      t = held?.taskId === LEGACY_TASK_ID ? `t_${agentId}` : (held?.taskId ?? `t_${agentId}`);
+    }
+    await this.#conversation(tenantId, agentId, t);
+    taskId = t;
+    await this.#busy("uiDecide", async () => {
+      await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
       // The decision produced a completion event; let the agent pick it up.
       await this.ctx.storage.setAlarm(Date.now());
-      return out;
     });
+    return this.uiApprovals(tenantId, agentId, taskId);
   }
 
   async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
@@ -1843,7 +1930,9 @@ async function formOf(request: Request): Promise<FormData | null> {
 /** Console routes that write. Add a route here when it writes, whether it
  *  arms the object (message, decide, compact) or changes what the agent is
  *  authorised as (credential, credential/remove). */
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove"]);
+// What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
+const LEGACY_TASK_ID = MAIN_SESSION;
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/conversation"]);
 
 function uiAgent(who: string): string {
   return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
@@ -2259,6 +2348,15 @@ export default {
         // Data routes for the console shell, rendered by the shell's own
         // renderers with `d`, the way /ui/plugins does. `viewer` is the
         // identity the gate resolved.
+        case "/ui/conversation": {
+          // The only way a conversation id comes to exist; every route that
+          // takes one refuses an id this did not mint for the viewer's agent.
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          if (request.method !== "POST") return new Response("POST", { status: 405 });
+          if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
+          return Response.json(await stub.uiNewConversation("demo", uiAgent(gate.who)));
+        }
         case "/ui/inbox": {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
@@ -2271,8 +2369,10 @@ export default {
           return html(taskList(await stub.uiTasks("demo", uiAgent(gate.who))));
         }
         case "/ui/approvals": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
           const taskId = String(url.searchParams.get("taskId"));
-          return html(approvals(await stub.uiApprovals("demo", taskId)));
+          return html(approvals(await stub.uiApprovals("demo", uiAgent(gate.who), taskId)));
         }
         case "/ui/message": {
           const form = await formOf(request);
@@ -2305,12 +2405,14 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
+          const agentId = uiAgent(who);
           const decision = String(form.get("decision")) === "approved" ? "approved" : "denied";
+          // The panel that posted names its conversation; an older page that
+          // does not is the first one. Either way it is the viewer's own or 404.
+          const taskId = String(form.get("taskId") ?? "").trim();
           // The approver is whoever Access says is signed in — an audit record
           // with a name the caller chose would be worth nothing.
-          await stub.uiDecide("demo", String(form.get("operationId")), decision, who);
-          const taskId = `t_${uiAgent(who)}`;
-          return html(approvals(await stub.uiApprovals("demo", taskId)));
+          return html(approvals(await stub.uiDecide("demo", agentId, taskId, String(form.get("operationId")), decision, who)));
         }
         case "/isolation": {
           // Proves the property rather than asserting it: two tenants, two
@@ -2361,6 +2463,11 @@ export default {
           }, { status: 404 });
       }
     } catch (e: any) {
+      // A conversation the viewer may not address is a 404 for reads and
+      // writes alike, not a fault.
+      if (/^no such conversation:/.test(String(e?.message ?? ""))) {
+        return Response.json({ error: String(e.message) }, { status: 404 });
+      }
       return Response.json({ error: String(e?.message ?? e), stack: String(e?.stack ?? "").slice(0, 600) }, { status: 500 });
     }
   },

@@ -52,23 +52,48 @@ export type SqlHost = {
   transactionSync<T>(cb: () => T): T;
 };
 
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS pi_entries (
-     id TEXT PRIMARY KEY, parent_id TEXT, seq INTEGER NOT NULL UNIQUE,
-     timestamp INTEGER NOT NULL, type TEXT NOT NULL, custom_type TEXT, body TEXT NOT NULL)`,
-  `CREATE INDEX IF NOT EXISTS pi_entries_seq ON pi_entries(seq)`,
-  `CREATE INDEX IF NOT EXISTS pi_entries_parent ON pi_entries(parent_id)`,
-  `CREATE TABLE IF NOT EXISTS pi_usage (
-     id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, body TEXT NOT NULL)`,
-  `CREATE INDEX IF NOT EXISTS pi_usage_seq ON pi_usage(seq)`,
-  `CREATE TABLE IF NOT EXISTS pi_values (
-     namespace TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
-     PRIMARY KEY (namespace, key))`,
-  `CREATE TABLE IF NOT EXISTS pi_list (
-     namespace TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
-     PRIMARY KEY (namespace, key, seq))`,
-  `CREATE TABLE IF NOT EXISTS pi_meta (name TEXT PRIMARY KEY, body TEXT NOT NULL)`,
-];
+/**
+ * One transcript per session, kept apart by table rather than by column. The
+ * first session of an agent keeps the unprefixed tables it has always had, so
+ * nothing migrates; every later session gets its own set named from its id.
+ * A column would have needed every unique constraint rebuilt and every query
+ * to remember the predicate; a table cannot leak into another by omission.
+ */
+export interface PiTables { entries: string; usage: string; values: string; list: string; meta: string }
+
+export const MAIN_SESSION = "main";
+
+export function piTables(session: string = MAIN_SESSION): PiTables {
+  if (session === MAIN_SESSION) {
+    return { entries: "pi_entries", usage: "pi_usage", values: "pi_values", list: "pi_list", meta: "pi_meta" };
+  }
+  // A readable slug plus a hash of the whole id, so two ids that slug the same
+  // way still get different tables.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < session.length; i++) { h ^= session.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  const p = `pi_s_${session.replace(/[^a-z0-9]/gi, "_").slice(0, 40).toLowerCase()}_${h.toString(16)}_`;
+  return { entries: `${p}entries`, usage: `${p}usage`, values: `${p}values`, list: `${p}list`, meta: `${p}meta` };
+}
+
+function schemaFor(t: PiTables): string[] {
+  return [
+    `CREATE TABLE IF NOT EXISTS ${t.entries} (
+       id TEXT PRIMARY KEY, parent_id TEXT, seq INTEGER NOT NULL UNIQUE,
+       timestamp INTEGER NOT NULL, type TEXT NOT NULL, custom_type TEXT, body TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS ${t.entries}_seq ON ${t.entries}(seq)`,
+    `CREATE INDEX IF NOT EXISTS ${t.entries}_parent ON ${t.entries}(parent_id)`,
+    `CREATE TABLE IF NOT EXISTS ${t.usage} (
+       id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, body TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS ${t.usage}_seq ON ${t.usage}(seq)`,
+    `CREATE TABLE IF NOT EXISTS ${t.values} (
+       namespace TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
+       PRIMARY KEY (namespace, key))`,
+    `CREATE TABLE IF NOT EXISTS ${t.list} (
+       namespace TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
+       PRIMARY KEY (namespace, key, seq))`,
+    `CREATE TABLE IF NOT EXISTS ${t.meta} (name TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+  ];
+}
 
 /**
  * Create the tables if they are not there yet.
@@ -81,8 +106,8 @@ const SCHEMA = [
  * every panel answered 500 on an agent that had not yet spoken, and the page
  * simply spun.
  */
-export function ensurePiTables(sql: SqlHost["sql"]) {
-  for (const stmt of SCHEMA) sql.exec(stmt);
+export function ensurePiTables(sql: SqlHost["sql"], session: string = MAIN_SESSION) {
+  for (const stmt of schemaFor(piTables(session))) sql.exec(stmt);
 }
 
 const CLOSED = "pi storage is closed";
@@ -133,23 +158,26 @@ export class PiSqliteStorage implements Storage {
   #queue: Promise<unknown> = Promise.resolve();
   #closePromise: Promise<void> | undefined;
 
-  constructor(host: SqlHost, opts: { now?: () => number } = {}) {
+  #t: PiTables;
+
+  constructor(host: SqlHost, opts: { now?: () => number; session?: string } = {}) {
     this.#host = host;
     this.#now = opts.now ?? (() => Date.now());
-    ensurePiTables(host.sql);
+    this.#t = piTables(opts.session ?? MAIN_SESSION);
+    ensurePiTables(host.sql, opts.session ?? MAIN_SESSION);
   }
 
   #all(q: string, ...b: unknown[]): any[] { return this.#host.sql.exec(q, ...b).toArray(); }
   #one(q: string, ...b: unknown[]): any { return this.#all(q, ...b)[0]; }
 
   #meta<T>(name: string, fallback: T): T {
-    const row = this.#one("SELECT body FROM pi_meta WHERE name = ?", name);
+    const row = this.#one(`SELECT body FROM ${this.#t.meta} WHERE name = ?`, name);
     return row === undefined ? fallback : JSON.parse(row.body) as T;
   }
 
   #setMeta(name: string, body: unknown) {
     this.#host.sql.exec(
-      "INSERT INTO pi_meta(name, body) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET body = excluded.body",
+      `INSERT INTO ${this.#t.meta}(name, body) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET body = excluded.body`,
       name, JSON.stringify(body));
   }
 
@@ -187,9 +215,9 @@ export class PiSqliteStorage implements Storage {
       // sequence high-water mark where it was, along with everything else.
       validateCommittedWrites(prepared.writes, firstSeq, {
         hasEntryOrUsageId: (id) =>
-          this.#one("SELECT 1 AS x FROM pi_entries WHERE id = ?", id) !== undefined ||
-          this.#one("SELECT 1 AS x FROM pi_usage WHERE id = ?", id) !== undefined,
-        hasEntryId: (id) => this.#one("SELECT 1 AS x FROM pi_entries WHERE id = ?", id) !== undefined,
+          this.#one(`SELECT 1 AS x FROM ${this.#t.entries} WHERE id = ?`, id) !== undefined ||
+          this.#one(`SELECT 1 AS x FROM ${this.#t.usage} WHERE id = ?`, id) !== undefined,
+        hasEntryId: (id) => this.#one(`SELECT 1 AS x FROM ${this.#t.entries} WHERE id = ?`, id) !== undefined,
       });
       const stats = this.#apply(prepared.writes);
       return { ...prepared.result, stats };
@@ -206,7 +234,7 @@ export class PiSqliteStorage implements Storage {
         case "entry": {
           const { kind: _kind, ...entry } = write;
           this.#host.sql.exec(
-            `INSERT INTO pi_entries(id, parent_id, seq, timestamp, type, custom_type, body)
+            `INSERT INTO ${this.#t.entries}(id, parent_id, seq, timestamp, type, custom_type, body)
              VALUES (?,?,?,?,?,?,?)`,
             entry.id, entry.parentId, entry.seq, entry.timestamp, entry.type,
             entry.customType ?? null, JSON.stringify(entry));
@@ -215,18 +243,18 @@ export class PiSqliteStorage implements Storage {
         }
         case "usage": {
           const { kind: _kind, ...row } = write;
-          this.#host.sql.exec("INSERT INTO pi_usage(id, seq, body) VALUES (?,?,?)",
+          this.#host.sql.exec(`INSERT INTO ${this.#t.usage}(id, seq, body) VALUES (?,?,?)`,
             row.id, row.seq, JSON.stringify(row));
           usage = addUsage(usage, row.usage);
           break;
         }
         case "value": {
           if (write.op === "delete") {
-            this.#host.sql.exec("DELETE FROM pi_values WHERE namespace = ? AND key = ?",
+            this.#host.sql.exec(`DELETE FROM ${this.#t.values} WHERE namespace = ? AND key = ?`,
               write.namespace, write.key);
           } else {
             this.#host.sql.exec(
-              `INSERT INTO pi_values(namespace, key, seq, body) VALUES (?,?,?,?)
+              `INSERT INTO ${this.#t.values}(namespace, key, seq, body) VALUES (?,?,?,?)
                ON CONFLICT(namespace, key) DO UPDATE SET seq = excluded.seq, body = excluded.body`,
               write.namespace, write.key, write.seq, JSON.stringify(write.value ?? null));
           }
@@ -234,10 +262,10 @@ export class PiSqliteStorage implements Storage {
         }
         case "list": {
           if (write.op === "delete") {
-            this.#host.sql.exec("DELETE FROM pi_list WHERE namespace = ? AND key = ?",
+            this.#host.sql.exec(`DELETE FROM ${this.#t.list} WHERE namespace = ? AND key = ?`,
               write.namespace, write.key);
           } else {
-            this.#host.sql.exec("INSERT INTO pi_list(namespace, key, seq, body) VALUES (?,?,?,?)",
+            this.#host.sql.exec(`INSERT INTO ${this.#t.list}(namespace, key, seq, body) VALUES (?,?,?,?)`,
               write.namespace, write.key, write.seq, JSON.stringify(write.value ?? null));
           }
           break;
@@ -259,7 +287,7 @@ export class PiSqliteStorage implements Storage {
       const found = new Map<string, Entry>();
       if (ids.length === 0) return found;
       const rows = this.#all(
-        `SELECT body FROM pi_entries WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids);
+        `SELECT body FROM ${this.#t.entries} WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids);
       const byId = new Map<string, Entry>();
       for (const r of rows) { const e = JSON.parse(r.body) as Entry; byId.set(e.id, e); }
       // Requested order, not storage order, and absent ids simply stay absent.
@@ -270,7 +298,7 @@ export class PiSqliteStorage implements Storage {
 
   getValue<T>(address: Value<T>, _context: Context): Promise<StoredValue<T> | undefined> {
     return this.#read(() => {
-      const row = this.#one("SELECT seq, body FROM pi_values WHERE namespace = ? AND key = ?",
+      const row = this.#one(`SELECT seq, body FROM ${this.#t.values} WHERE namespace = ? AND key = ?`,
         address.namespace, address.key);
       if (row === undefined) return undefined;
       return { address, value: JSON.parse(row.body) as T, seq: Number(row.seq) };
@@ -283,7 +311,7 @@ export class PiSqliteStorage implements Storage {
       // match keys that are not under this prefix. ORDER BY uses BINARY, whose
       // byte order over UTF-8 is the code-point order pi sorts by.
       const rows = this.#all(
-        `SELECT key, seq, body FROM pi_values
+        `SELECT key, seq, body FROM ${this.#t.values}
           WHERE namespace = ? AND substr(key, 1, length(?)) = ? ORDER BY key`,
         prefix.namespace, prefix.key, prefix.key);
       return rows.map((r) => ({
@@ -304,7 +332,7 @@ export class PiSqliteStorage implements Storage {
         ? { clause: "", args: [] as unknown[] }
         : { clause: asc ? " AND seq > ?" : " AND seq < ?", args: [resolved.cursor.seq] };
       const rows = this.#all(
-        `SELECT seq, body FROM pi_list WHERE namespace = ? AND key = ?${bounds.clause}
+        `SELECT seq, body FROM ${this.#t.list} WHERE namespace = ? AND key = ?${bounds.clause}
           ORDER BY seq ${asc ? "ASC" : "DESC"} LIMIT ?`,
         address.namespace, address.key, ...bounds.args, resolved.limit);
       return rows.map((r) => ({ seq: Number(r.seq), value: JSON.parse(r.body) as T }));
@@ -335,9 +363,9 @@ export class PiSqliteStorage implements Storage {
   #branch(query: StorageBranchScan): Entry[] {
     const rows = this.#all(
       `WITH RECURSIVE ancestry(id, parent_id, body) AS (
-         SELECT id, parent_id, body FROM pi_entries WHERE id = ?
+         SELECT id, parent_id, body FROM ${this.#t.entries} WHERE id = ?
          UNION ALL
-         SELECT e.id, e.parent_id, e.body FROM pi_entries e
+         SELECT e.id, e.parent_id, e.body FROM ${this.#t.entries} e
            JOIN ancestry a ON e.id = a.parent_id)
        SELECT id, parent_id, body FROM ancestry`,
       query.start);
@@ -382,7 +410,7 @@ export class PiSqliteStorage implements Storage {
       if (query.fromSeq !== undefined) { where.push("seq >= ?"); args.push(query.fromSeq); }
       if (query.toSeq !== undefined) { where.push("seq <= ?"); args.push(query.toSeq); }
       const rows = this.#all(
-        `SELECT body FROM pi_entries ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        `SELECT body FROM ${this.#t.entries} ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
           ORDER BY seq ${query.order === "desc" ? "DESC" : "ASC"} ${limitClause(query.limit)}`,
         ...args);
       return rows.map((r) => JSON.parse(r.body) as Entry);
@@ -396,7 +424,7 @@ export class PiSqliteStorage implements Storage {
       if (query.fromSeq !== undefined) { where.push("seq >= ?"); args.push(query.fromSeq); }
       if (query.toSeq !== undefined) { where.push("seq <= ?"); args.push(query.toSeq); }
       const rows = this.#all(
-        `SELECT body FROM pi_usage ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        `SELECT body FROM ${this.#t.usage} ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
           ORDER BY seq ${query.order === "desc" ? "DESC" : "ASC"} ${limitClause(query.limit)}`,
         ...args);
       return rows.map((r) => JSON.parse(r.body) as UsageRow);
