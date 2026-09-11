@@ -440,7 +440,7 @@ export function page(taskId: string, who: string, agentId: string): string {
       document.querySelectorAll('.view').forEach(v => v.classList.toggle('on', v.dataset.view === view));
       document.querySelectorAll('.side-view').forEach(v => v.classList.toggle('on', v.dataset.for === view));
       const u = new URL(location.href); u.searchParams.set('view', view); history.replaceState(null, '', u);
-      const on = document.querySelector('.view.on'); if (on) on.querySelectorAll('[data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
+      document.querySelectorAll('.view.on [data-lazy], .side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
     },
     count(el) {
       const list = el.querySelector('.inbox-list');
