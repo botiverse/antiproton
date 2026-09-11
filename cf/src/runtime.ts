@@ -34,6 +34,14 @@ import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
+
+/** The persona fields of an agent record, if it carries any. */
+export function personaOf(config: unknown): { name?: string; description?: string } | null {
+  const c = (config ?? {}) as Record<string, unknown>;
+  const name = typeof c.name === "string" ? c.name : undefined;
+  const description = typeof c.description === "string" ? c.description : undefined;
+  return name || description ? { name, description } : null;
+}
 import type { MountPolicy } from "../../src/core/store.ts";
 import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
@@ -550,6 +558,9 @@ export class AgentRuntime {
       // Read here rather than inside the harness, so the harness keeps holding
       // no I/O of its own.
       systemPrompt: systemPrompt({
+        // The agent's own record: a person named and described it at creation,
+        // and that is the first thing the prompt says after the core.
+        persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
         workingSet: await workingSet(this.store, tenantId, agentId),
         policy: this.#deps.policy,
         // Each paragraph appears only where the thing it describes is really

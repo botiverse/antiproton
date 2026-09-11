@@ -10,6 +10,7 @@
  * ever reaches the markup.
  */
 import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -340,6 +341,17 @@ check("the shell carries the current agent and sends it with every panel request
   must(/fetch\('\/ui\/agent', \{ method: 'POST'/.test(html), "create posts to /ui/agent");
   must(/Nothing is copied from another agent/.test(html), "the form says credentials and memory are per agent");
   must(html.includes(AVATAR_JS), "the shell ships the avatar function");
+// task #7: a decided call leaves the approvals panel; only pending ones show.
+check("the approvals panel shows pending calls only; decided ones are gone", () => {
+  const rows: any[] = [
+    { operationId: "op-1", mountAlias: "gh", tool: "issues.create", state: "pending", request: { args: { title: "x" } } },
+    { operationId: "op-0", mountAlias: "gh", tool: "issues.list", state: "approved", approver: "someone", request: { args: {} } },
+    { operationId: "op-9", mountAlias: "node", tool: "exec", state: "denied", approver: "someone", request: { args: {} } },
+  ];
+  const html = approvals(rows);
+  must(count(html, /class="card"/g) === 1 && html.includes("op-1"), "the pending call is the only card");
+  must(!/>decided<|class="tag ok"|class="tag bad"|op-0|op-9/.test(html), "no decided call, no decided heading");
+  must(/nothing waiting/.test(approvals(rows.slice(1))), "with nothing pending the panel says so, and lists nothing");
 });
 
 const failed = results.filter((r) => !r.ok);

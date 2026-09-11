@@ -31,7 +31,7 @@ async function fixture(plugins: Plugin[]) {
   for (const p of plugins) {
     await store.addMount({
       tenantId: "t", agentId: "a", alias: p.id, plugin: p.id,
-      installationId: `i-${p.id}`, connectionId: null, toolVersion: "1.0.0",
+      installationId: `i-${p.id}`, connectionId: null, toolVersion: p.version,
       publicConfig: {}, secretRef: null, policy: null,
     });
   }
