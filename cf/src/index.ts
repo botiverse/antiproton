@@ -1305,6 +1305,7 @@ export class AgentDO extends DurableObject<Env> {
     await rt.ready();
     const installed = rt.plugins();
     const byId = new Map(installed.map((p) => [p.id, p]));
+    const mounts = await rt.store.listMounts(tenantId, agentId);
     // The tools column means "what the agent can call", so the names come from
     // the same function that names them for the model, over the whole catalogue
     // at once: the tie-break at the length cap is a property of the set, and a
@@ -1312,7 +1313,6 @@ export class AgentDO extends DurableObject<Env> {
     const named = qualifyMountedTools(mounts.flatMap((m) =>
       (byId.get(m.plugin)?.tools ?? []).map((t) => ({ name: t.name, address: `${m.alias}.${t.name}` })),
     ));
-    const mounts = await rt.store.listMounts(tenantId, agentId);
 
     // Which tools this agent has actually reached for. A catalogue says what is
     // possible; this says what happened.
