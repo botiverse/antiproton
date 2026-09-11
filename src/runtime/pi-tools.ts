@@ -53,25 +53,62 @@ export interface ToolHost {
  */
 const modelName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, "_");
 
+/** Providers cap a tool name; 64 is the smallest cap among the ones we target. */
+const MAX_NAME = 64;
+
 /**
- * Model-facing names must be unique, because that is all the model can say.
+ * Model-facing names must be unique, because that is all the model can say —
+ * and they must be *stable*, because the model writes them down.
  *
  * Bare API names are unique inside one service and collide across several:
- * `show_profile` exists in ten of AppWorld's apps. A bare name is friendlier, so
- * keep it where it is unambiguous and qualify only what actually clashes — the
- * same rule the gateway applies to mount resolution.
+ * `show_profile` exists in ten of AppWorld's apps. This used to qualify only
+ * what actually clashed, which made a bare name friendlier and made every name
+ * a function of the whole mounted set: mounting `web`, which has a `get`,
+ * renamed the memory plugin's `get` to `state__get`. So an operator attaching an
+ * unrelated mount could invalidate an agent's own note about which tool to call,
+ * and nothing anywhere would report it. A name that can change for a reason
+ * outside the tool is not a name.
+ *
+ * So every tool is qualified, always. `<alias>__<tool>` is one deterministic
+ * string that depends on this mount alone, and it is the same string discovery
+ * hands back — `builtin.ts` reads this function rather than formatting its own.
+ * The dotted `address` is untouched: that is the gateway's dispatch key and the
+ * model never sees it.
  *
  * Sanitising happens first, because it can create a clash that did not exist in
- * the plugin's own names.
+ * the plugin's own names. Two names can still meet at the cap, so the last step
+ * is a deterministic tie-break rather than a silent collapse — two tools sharing
+ * one name is the one outcome the model cannot work around.
+ *
+ * **Applying this twice must equal applying it once.** Two call sites qualify
+ * the same catalogue — the runtime builds it, and `bridgeTools` qualifies
+ * whatever it is handed so a caller cannot pass a provider a name with a dot in
+ * it. Under the old collision-only rule the second pass was a no-op on an
+ * already-unique name; under this one it re-prefixed, and a τ² run went out
+ * with `retail__retail__get_order_details` in front of the model. So a name
+ * that already belongs to its own mount is left exactly as it is — and it still
+ * takes its place in `used`, so it cannot be handed out twice.
  */
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
-  const named = tools.map((t) => (t.name === modelName(t.name) ? t : { ...t, name: modelName(t.name) }));
-  const counts = new Map<string, number>();
-  for (const t of named) counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
-  return named.map((t) => {
-    if ((counts.get(t.name) ?? 0) < 2) return t;
-    const prefix = modelName(t.address.split(".")[0]!);
-    return { ...t, name: `${prefix}__${t.name}`.slice(0, 64) };
+  const used = new Set<string>();
+  return tools.map((t) => {
+    const alias = modelName(t.address.split(".")[0]!);
+    // Recognised by the prefix rather than by re-deriving the whole string,
+    // because a name that went through the tie-break no longer equals what a
+    // second derivation would produce.
+    if (t.name.startsWith(`${alias}__`)) {
+      used.add(t.name);
+      return t;
+    }
+    const bare = modelName(t.name);
+    const room = Math.max(1, MAX_NAME - alias.length - 2);
+    let name = `${alias}__${bare.slice(0, room)}`;
+    for (let n = 2; used.has(name); n++) {
+      const tag = String(n);
+      name = `${name.slice(0, MAX_NAME - tag.length)}${tag}`;
+    }
+    used.add(name);
+    return t.name === name ? t : { ...t, name };
   });
 }
 
@@ -98,7 +135,10 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
         // harness can tell a refusal from an answer.
         const e = res.error;
         const message = typeof e === "string" ? e : (e?.message ?? e?.code ?? res.status);
-        throw new Error(`${t.address}: ${message}`);
+        // The model reads this, so it is named the way the model can name it
+        // back. The address is still in `details`, where the transcript and the
+        // audit record want it.
+        throw new Error(`${t.name}: ${message}`);
       }
       return {
         content: [{ type: "text" as const, text: JSON.stringify(res.result ?? null) }],
@@ -138,9 +178,24 @@ export const RUN_JS_DESCRIPTION =
 export function runJsTool(
   sandbox: Sandbox,
   host: ToolHost,
-  opts: { limits?: unknown; onCalls?: (n: number) => void | Promise<void> } = {},
+  opts: {
+    limits?: unknown;
+    onCalls?: (n: number) => void | Promise<void>;
+    /** The tools the model was offered, so a script may name them the way the
+     *  model's own tool list names them. Without this the prompt asks for two
+     *  different strings for one tool: `web__get` outside the sandbox, and the
+     *  gateway's `web.get` inside it, with nothing saying which is which. */
+    tools?: MountedTool[];
+  } = {},
 ): AgentHarnessTool<undefined> {
   let seq = 0;
+  // Unknown strings pass through untouched: an address still works, so a model
+  // that learned one from an older transcript is not punished for it, and a
+  // genuinely wrong name is refused by the gateway with its own message rather
+  // than by a lookup here.
+  const byName = new Map((opts.tools ?? []).map((t) => [t.name, t.address]));
+  const address = (name: unknown) =>
+    typeof name === "string" ? (byName.get(name) ?? name) : name;
   return {
     name: "run_js",
     label: "run_js",
@@ -150,7 +205,8 @@ export function runJsTool(
       properties: {
         source: {
           type: "string",
-          description: "JavaScript body. Use await tool`name ${args}` and output(value).",
+          description: "JavaScript body. Use await tool`name ${args}` and output(value), " +
+            "where `name` is the tool's name as it appears in your tool list.",
         },
       },
       required: ["source"],
@@ -163,6 +219,7 @@ export function runJsTool(
         // same operation rather than minting a new one.
         invoke: (call: any) => host.invoke({
           ...call,
+          tool: address(call.tool),
           opts: { ...(call.opts ?? {}), idempotencyKey: `${toolCallId}:${n++}` },
         }),
       }, opts.limits);

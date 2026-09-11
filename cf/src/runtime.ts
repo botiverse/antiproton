@@ -655,6 +655,8 @@ export class AgentRuntime {
       ...(sandbox
         ? [runJsTool(this.#executor as any, host, {
             onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+            // So a script names a tool the way the model's own list names it.
+            tools: tools as MountedTool[],
           })]
         : []),
     ] as any, BACKGROUND_CONTEXT);
