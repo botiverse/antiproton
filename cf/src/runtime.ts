@@ -207,6 +207,7 @@ export class AgentRuntime {
   #gateway: ToolGateway;
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
+  #unchecked = new Map<string, string>();
   #agent: PiAgent | null = null;
   #agentKey = "";
   #executor: DynamicWorkerExecutor;
@@ -270,7 +271,7 @@ export class AgentRuntime {
    * stored and the reason comes back instead.
    */
   async attachCredential(tenantId: string, agentId: string, alias: string, fields: Record<string, string>):
-    Promise<{ ok: true; verified: boolean; account: string | null } | { ok: false; error: string }> {
+    Promise<{ ok: true; verified: boolean; account: string | null; error: string | null } | { ok: false; error: string }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -295,7 +296,11 @@ export class AgentRuntime {
     await this.store.putSecret(tenantId, agentId, name, { ciphertext: sealed.ciphertext, iv: sealed.iv });
     await this.store.setMountSecretRef(tenantId, agentId, alias, agentRef(name));
     const check = await this.#gateway.checkMount(tenantId, agentId, alias);
-    if (check && !check.ok) {
+    // A refused key and an unanswered one are different news. Refused: the
+    // provider looked and said no, so nothing is kept and the reason is shown.
+    // Unreachable: nobody looked, so the key is kept unverified with the
+    // reason beside it, rather than lost and blamed for an outage.
+    if (check && !check.ok && check.kind === "rejected") {
       await this.store.removeSecret(tenantId, agentId, name);
       await this.store.setMountSecretRef(tenantId, agentId, alias, previous && !isAgentRef(previous) ? previous : null);
       return { ok: false, error: check.reason };
@@ -305,7 +310,10 @@ export class AgentRuntime {
         ciphertext: sealed.ciphertext, iv: sealed.iv, account: check.account ?? null, verified: true,
       });
     }
-    return { ok: true, verified: !!check?.ok, account: check?.ok ? (check.account ?? null) : null };
+    const unreachable = check && !check.ok ? `kept, could not be checked: ${check.reason}` : null;
+    if (unreachable) this.#unchecked.set(`${tenantId}/${agentId}/${alias}`, unreachable);
+    else this.#unchecked.delete(`${tenantId}/${agentId}/${alias}`);
+    return { ok: true, verified: !!check?.ok, account: check?.ok ? (check.account ?? null) : null, error: unreachable };
   }
 
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
@@ -332,7 +340,10 @@ export class AgentRuntime {
       setAt: meta?.updatedAt ?? null,
       lastUsedAt: meta?.lastUsedAt ?? null,
       storable: !!this.#deps.secretKek,
-      error: null as string | null,
+      // Why an attached key is still unverified, when the store knows: the
+      // provider could not be reached at attach time. Held in memory only, so
+      // it clears on the next successful check or the next object start.
+      error: this.#unchecked.get(`${tenantId}/${agentId}/${mount.alias}`) ?? null,
     };
   }
 
