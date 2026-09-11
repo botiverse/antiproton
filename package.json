@@ -13,13 +13,16 @@
     "pi-tools": "node test/pi-tools.ts",
     "pi-bridge": "node test/pi-bridge.ts",
     "pi-agent": "node test/pi-agent.ts",
-    "release": "node test/release.ts"
+    "release": "node test/release.ts",
+    "typecheck": "node scripts/typecheck.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.85.1",
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "typescript": "^7.0.2",
     "wrangler": "^4.129.0"
   }
 }

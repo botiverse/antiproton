@@ -1,0 +1,36 @@
+bench/swebench/cf.ts: error TS2339: Property 'onerror' does not exist on type 'WebSocket'.
+bench/swebench/cf.ts: error TS2339: Property 'onmessage' does not exist on type 'WebSocket'.
+bench/swebench/cf.ts: error TS2551: Property 'onclose' does not exist on type 'WebSocket'. Did you mean 'close'?
+bench/swebench/run.ts: error TS2345: Argument of type 'number | null' is not assignable to parameter of type 'number'.
+bench/tau2/cf.ts: error TS2339: Property 'onerror' does not exist on type 'WebSocket'.
+bench/tau2/cf.ts: error TS2339: Property 'onmessage' does not exist on type 'WebSocket'.
+bench/tau2/cf.ts: error TS2551: Property 'onclose' does not exist on type 'WebSocket'. Did you mean 'close'?
+bench/tau2/run.ts: error TS2339: Property 'exclusive' does not exist on type '{}'.
+bench/tau2/run.ts: error TS2339: Property 'tools' does not exist on type '{}'.
+bench/tau2/run.ts: error TS7006: Parameter 'pl' implicitly has an 'any' type.
+bench/tau2/run.ts: error TS7006: Parameter 't' implicitly has an 'any' type.
+bench/tau2/run.ts: error TS7022: 'plugins' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer.
+bench/tau2/run.ts: error TS7024: Function implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.
+cf/src/index.ts: error TS2339: Property 'ToolBinding' does not exist on type 'Exports'.
+cf/src/index.ts: error TS2339: Property 'busy' does not exist on type 'never'.
+cf/src/index.ts: error TS2339: Property 'byOp' does not exist on type 'never'.
+cf/src/index.ts: error TS2339: Property 'events' does not exist on type 'never'.
+cf/src/index.ts: error TS2339: Property 'shown' does not exist on type 'never'.
+cf/src/index.ts: error TS2339: Property 'total' does not exist on type 'never'.
+cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
+cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
+cf/src/runtime.ts: error TS2339: Property 'kind' does not exist on type '{ ok: false; reason: string; }'.
+cf/src/runtime.ts: error TS2459: Module '"../../src/core/store.ts"' declares 'MountPolicy' locally, but it is not exported.
+src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.
+src/plugins/run9.ts: error TS2339: Property 'liveMs' does not exist on type '{ boxId: string; freed: boolean; error?: string | undefined; }'.
+src/plugins/run9.ts: error TS2339: Property 'startFrom' does not exist on type 'never'.
+src/plugins/run9.ts: error TS2345: Argument of type '{ shape?: string; secrets?: InjectedSecret[]; workdir: string; shell: string; shellPrefix: string; network: string; endpoint: string; image: string; project: string; timeoutMs: number; maxOutputBytes: number; }' is not assignable to parameter of type '{ shell: string; shellPrefix?: string | undefined; network?: "none" | "open" | undefined; }'.
+src/plugins/run9.ts: error TS2353: Object literal may only specify known properties, and 'liveMs' does not exist in type '{ boxId: string; freed: boolean; error?: string | undefined; }'.
+src/plugins/state.ts: error TS2339: Property 'tail' does not exist on type '{ readonly key: "todo"; readonly budget: 2000; readonly what: "open items"; } | { readonly key: "memory"; readonly budget: 4000; readonly what: "durable facts"; } | { readonly key: "journal"; readonly budget: 3000; readonly what: "recent log"; readonly tail: true; }'.
+src/plugins/state.ts: error TS2783: 'keys' is specified more than once, so this usage will be overwritten.
+src/runtime/mount-config.ts: error TS2459: Module '"../plugins/types.ts"' declares 'Json' locally, but it is not exported.
+src/store/artifacts.ts: error TS2554: Expected 0 arguments, but got 1.
+test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap.
+test/secrets.ts: error TS7006: Parameter '_args' implicitly has an 'any' type.
+test/secrets.ts: error TS7006: Parameter '_tool' implicitly has an 'any' type.
+test/secrets.ts: error TS7006: Parameter 'ctx' implicitly has an 'any' type.
