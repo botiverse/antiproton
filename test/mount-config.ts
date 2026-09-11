@@ -129,18 +129,20 @@ check("a credential field carries a label and says which part is secret", () => 
 });
 
 /**
- * The one path that puts a value where the model can read it.
+ * The one path that puts a credential where the model can read it.
  *
  * `public_config` is rendered in the console *and* handed to the agent by the
  * builtin `tools.mounts`, while `secret_ref` is exposed in neither. So a
  * credential entered into a settings field rather than the credential field is
  * in the prompt, and nothing downstream can tell it apart from an image name.
  *
- * A list of names is not a value, which is why the check looks at string
- * fields: run9's `secrets` setting names the secrets to inject and carries
- * none of them.
+ * The check is a declaration rather than a guess about vocabulary. A name is
+ * not a value — run9's `secrets` setting names the secrets to inject and
+ * carries none of them — so a field whose name is credential-shaped says which
+ * of the two it is, and one that says nothing is refused. A new field that
+ * forgets to say fails here rather than in the console.
  */
-const SECRETISH = /^(token|password|secret|api_?key|access_?key|credential|auth)$/i;
+const CREDENTIAL_SHAPED = /token|secret|key|password|credential|auth|bearer/i;
 const everyPlugin: Plugin[] = [
   githubPlugin, httpPlugin, demoPlugin, run9,
   statePlugin(null as any, null, "local"),
@@ -159,11 +161,21 @@ check("no plugin takes a credential as a setting", () => {
       if (credentialKeys.has(f.name)) {
         throw new Error(`${plugin.id} declares "${f.name}" as both a setting and part of its credential`);
       }
-      if (f.type === "string" && SECRETISH.test(f.name)) {
-        throw new Error(`${plugin.id}'s setting "${f.name}" reads as a credential; settings are public`);
+      if (CREDENTIAL_SHAPED.test(f.name) && f.references !== "credential") {
+        throw new Error(
+          `${plugin.id}'s setting "${f.name}" reads as a credential and does not say it only names one; ` +
+          `settings are public, so if it holds a value it is in the prompt`,
+        );
       }
     }
   }
+});
+
+check("the marker is what makes run9's secrets setting legitimate, not its name", () => {
+  const field = run9.config!.find((f) => f.name === "secrets")!;
+  if (field.references !== "credential") throw new Error("run9's secrets setting lost its marker");
+  const { references, ...unmarked } = field;
+  if (!CREDENTIAL_SHAPED.test(unmarked.name)) throw new Error("the pattern stopped matching the case it exists for");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);

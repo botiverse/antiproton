@@ -54,6 +54,19 @@ export interface ConfigField {
   required?: boolean;
   /** When the value is one of a fixed set. */
   choices?: string[];
+  /**
+   * Say so when a setting's vocabulary is about credentials while its values
+   * are not one.
+   *
+   * A setting is public by definition — rendered in the console and handed to
+   * the agent by the builtin `tools.mounts` — so a credential *value* in one is
+   * always a mistake, and there is deliberately no way to declare that it is
+   * intended. run9's `secrets` is the legitimate case: it names which secrets
+   * to inject, and the values come from the mount's credential. This marker is
+   * how such a field says it names rather than holds, and the mount tests
+   * refuse a credential-shaped name that does not carry it.
+   */
+  references?: "credential";
 }
 
 /**
