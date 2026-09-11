@@ -443,16 +443,29 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
         signal: AbortSignal.timeout(cfg.timeoutMs),
       });
+      if (res.ok) return { ok: true as const, account: cfg.project };
+      const body = (await res.text()).slice(0, 200);
+      // Measured against the live API rather than assumed, because the first
+      // version of this guessed 404 for a missing project and run9 does not use
+      // it — every one of these is a 400, so the status alone cannot tell a bad
+      // key from a bad project name, and the body is what separates them:
+      //
+      //   bad keys            401  {"error":"invalid api key"}
+      //   project absent      400  {"error":"project not found"}
+      //   name not a name     400  {"error":"project_cid must match [a-z0-9_-]{3,20}"}
       if (res.status === 401 || res.status === 403) {
         return { ok: false as const, reason: "run9 rejected these keys" };
       }
-      if (res.status === 404) {
+      if (/project not found/i.test(body)) {
         return { ok: false as const, reason: `the keys work, but project "${cfg.project}" does not exist` };
       }
-      if (!res.ok) {
-        return { ok: false as const, reason: `run9 answered ${res.status}: ${(await res.text()).slice(0, 120)}` };
+      if (/project_cid must match/i.test(body)) {
+        return {
+          ok: false as const,
+          reason: `"${cfg.project}" is not a usable project name: run9 wants 3 to 20 characters of a-z, 0-9, dash or underscore`,
+        };
       }
-      return { ok: true as const, account: cfg.project };
+      return { ok: false as const, reason: `run9 answered ${res.status}: ${body.slice(0, 120)}` };
     } catch (e) {
       return { ok: false as const, reason: String((e as Error)?.message ?? e) };
     }
