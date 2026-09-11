@@ -3,7 +3,7 @@
  *
  * Identity used to arrive in a header that Cloudflare Access set and the app
  * trusted without checking, so the whole guarantee lived outside the code.
- * Now the app verifies: a person signs in through Raft (standard OpenID
+ * The app verifies: a person signs in through Raft (standard OpenID
  * Connect, authorization code + PKCE), the callback checks the signed id_token
  * against Raft's published keys, and what the browser carries afterwards is a
  * session sealed under a secret only this Worker holds. Nothing a caller can
@@ -13,7 +13,7 @@
  * `node test/auth.ts` and by the deployed Worker.
  */
 
-export type ViewerSource = "raft" | "access" | "automation" | "qa" | "anonymous";
+export type ViewerSource = "raft" | "automation" | "qa" | "anonymous";
 
 /** A resolved identity. `email` doubles as the stable key an agent hangs off. */
 export interface Viewer {
@@ -331,8 +331,9 @@ export const QA_VIEWER: Viewer = { email: "qa", name: "QA", username: null, pict
 
 /**
  * The single place identity is decided. In order: a session this Worker
- * sealed; the Access header (kept through the transition, removed after);
- * the automation token; and, only where the deployment says so, anonymous.
+ * sealed; the automation token; and, only where the deployment says so,
+ * anonymous. Nothing else on a request is an identity: the Cloudflare Access
+ * header that once was is no longer read.
  */
 export async function resolveViewer(request: Request, env: ViewerEnv, opts: { allowAnonymous?: boolean; now?: number } = {}): Promise<Viewer | null> {
   if (env.SESSION_SECRET) {
@@ -343,8 +344,6 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
         : { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "raft" };
     }
   }
-  const access = request.headers.get("cf-access-authenticated-user-email");
-  if (access) return { email: access, name: null, username: null, picture: null, source: "access" };
   const token = request.headers.get("x-harness-token");
   if (env.AUTOMATION_TOKEN && token && constantTimeEqual(token, env.AUTOMATION_TOKEN)) {
     return { email: "automation", name: "automation", username: null, picture: null, source: "automation" };
