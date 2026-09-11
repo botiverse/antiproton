@@ -11,7 +11,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
-import { bridgeTools, liftConfirm } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, liftConfirm, declaresConfirm } from "../src/runtime/pi-tools.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -72,6 +72,16 @@ await check("the bridge lifts confirm out of the model's arguments into the call
   must(calls[0].opts?.confirm === true, "the option did not travel");
   await run("c2", { x: 2 });
   must(calls[1].opts?.confirm !== true, "a call without confirm was marked");
+});
+
+await check("a tool that declares its own confirm parameter keeps it, and is never held by it", async () => {
+  const calls: any[] = [];
+  const host = { async invoke(call: any) { calls.push(call); return { status: "succeeded", operationId: "op", result: {} }; } };
+  const [own] = bridgeTools([{ name: "book", address: "p.book", description: "", parameters: { type: "object", properties: { confirm: { type: "boolean" } } }, sideEffects: "write", idempotency: "none" } as any], host as any);
+  await ((own as any).execute.bind(own) as (id: string, p: unknown) => Promise<unknown>)("c1", { confirm: true });
+  must(JSON.stringify(calls[0].args) === JSON.stringify({ confirm: true }), `the tool's own argument was taken: ${JSON.stringify(calls[0].args)}`);
+  must(calls[0].opts?.confirm !== true, "the tool's own argument raised a card");
+  must(declaresConfirm({ properties: { confirm: {} } }) && !declaresConfirm({ properties: { x: {} } }) && !declaresConfirm(null), "declaresConfirm");
 });
 
 await check("only a literal true asks; anything else is an ordinary argument", async () => {
