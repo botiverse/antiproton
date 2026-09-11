@@ -92,10 +92,26 @@ export interface CredentialField {
   required?: boolean;
 }
 
-/** What a plugin can say about a credential it has just been handed. */
+/**
+ * What a plugin can say about a credential it has just been handed.
+ *
+ * A failure says which of two things happened, because they are not the same
+ * news for the person who just pasted a key:
+ *
+ * - **`rejected`** — a definitive negative. Somebody answered, and the answer
+ *   was no: the key is wrong, or the account it names cannot do this. Storing
+ *   it would store something known not to work.
+ * - **`unreachable`** — no answer at all. A timeout, a refused connection, a
+ *   provider returning 500. The key is not the suspect, and refusing it tells
+ *   a person their key is bad when what is bad is the weather.
+ *
+ * Required rather than optional. An absent field defaulting to "rejected"
+ * would make the dangerous reading the silent one, which is the mistake
+ * `secret` and `accountRequired` were each fixed for.
+ */
 export type CredentialCheck =
   | { ok: true; account?: string }
-  | { ok: false; reason: string };
+  | { ok: false; kind: "rejected" | "unreachable"; reason: string };
 
 /**
  * A credential nobody can paste.

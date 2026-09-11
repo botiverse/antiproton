@@ -427,16 +427,16 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
    * grant and the thing a person can recognise on the page.
    */
   async checkCredential(ctx) {
-    if (!ctx.credential) return { ok: false as const, reason: "no keys: this mount cannot start a container" };
+    if (!ctx.credential) return { ok: false as const, kind: "rejected" as const, reason: "no keys: this mount cannot start a container" };
     const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
     let cred: Run9Credential;
     try {
       cred = JSON.parse(ctx.credential) as Run9Credential;
     } catch {
-      return { ok: false as const, reason: "the stored value is not JSON; run9 needs an object with ak and sk" };
+      return { ok: false as const, kind: "rejected" as const, reason: "the stored value is not JSON; run9 needs an object with ak and sk" };
     }
     if (!cred.ak || !cred.sk) {
-      return { ok: false as const, reason: "run9 needs both ak and sk; one of them is missing" };
+      return { ok: false as const, kind: "rejected" as const, reason: "run9 needs both ak and sk; one of them is missing" };
     }
     try {
       const res = await fetch(`${cfg.endpoint}/projects/${cfg.project}/workspace/boxes`, {
@@ -454,20 +454,23 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       //   project absent      400  {"error":"project not found"}
       //   name not a name     400  {"error":"project_cid must match [a-z0-9_-]{3,20}"}
       if (res.status === 401 || res.status === 403) {
-        return { ok: false as const, reason: "run9 rejected these keys" };
+        return { ok: false as const, kind: "rejected" as const, reason: "run9 rejected these keys" };
       }
       if (/project not found/i.test(body)) {
-        return { ok: false as const, reason: `the keys work, but project "${cfg.project}" does not exist` };
+        return { ok: false as const, kind: "rejected" as const, reason: `the keys work, but project "${cfg.project}" does not exist` };
       }
       if (/project_cid must match/i.test(body)) {
         return {
           ok: false as const,
+          kind: "rejected" as const,
           reason: `"${cfg.project}" is not a usable project name: run9 wants 3 to 20 characters of a-z, 0-9, dash or underscore`,
         };
       }
-      return { ok: false as const, reason: `run9 answered ${res.status}: ${body.slice(0, 120)}` };
+      // Reached but with no verdict: a 500 says nothing about the keys.
+      return { ok: false as const, kind: "unreachable" as const, reason: `run9 answered ${res.status}: ${body.slice(0, 120)}` };
     } catch (e) {
-      return { ok: false as const, reason: String((e as Error)?.message ?? e) };
+      // Nothing answered — a timeout, a refused connection, DNS. No verdict.
+      return { ok: false as const, kind: "unreachable" as const, reason: String((e as Error)?.message ?? e) };
     }
   },
 

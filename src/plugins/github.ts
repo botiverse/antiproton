@@ -248,13 +248,20 @@ export const githubPlugin: Plugin = {
    */
   async checkCredential(ctx) {
     if (!ctx.credential) {
-      return { ok: false, reason: "no token — this mount can only read public data" };
+      return { ok: false as const, kind: "rejected" as const, reason: "no token — this mount can only read public data" };
     }
     try {
       const u = await call("GET", "/user", ctx);
-      return { ok: true, account: u.login };
+      return { ok: true as const, account: u.login };
     } catch (e) {
-      return { ok: false, reason: String((e as Error)?.message ?? e) };
+      const reason = String((e as Error)?.message ?? e);
+      // Only an answer counts as a rejection. `call` puts the status in the
+      // message, so 401 and 403 are GitHub saying no; a 500, a rate limit or a
+      // fetch that never arrived are no verdict at all, and the token is not
+      // the thing at fault in any of them.
+      const status = Number(/^github (\d{3}):/.exec(reason)?.[1] ?? 0);
+      const rejected = status === 401 || (status === 403 && !/rate limit/i.test(reason));
+      return { ok: false as const, kind: rejected ? "rejected" as const : "unreachable" as const, reason };
     }
   },
 
