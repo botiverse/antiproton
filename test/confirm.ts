@@ -11,6 +11,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
+import { bridgeTools, liftConfirm } from "../src/runtime/pi-tools.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -46,7 +47,7 @@ await check("an open mount runs a write straight away", async () => {
 
 await check("confirm: true holds the same call for a person, and the plugin never sees it", async () => {
   const f = await fixture();
-  const r = await f.gw.invoke(f.ctx, "p.zap", { x: 1, confirm: true });
+  const r = await f.gw.invoke(f.ctx, "p.zap", { x: 1 }, { confirm: true });
   must(r.status === "pending" && (r as any).error?.code === "awaiting_approval", `expected a hold, got ${JSON.stringify(r)}`);
   must(f.seen.length === 0, "the plugin ran before anyone approved");
   const held = (await f.store.listApprovals("t", "pending"))[0];
@@ -55,17 +56,27 @@ await check("confirm: true holds the same call for a person, and the plugin neve
 
 await check("approval runs the recorded call without the confirm field", async () => {
   const f = await fixture();
-  const r = await f.gw.invoke(f.ctx, "p.zap", { x: 1, confirm: true });
+  const r = await f.gw.invoke(f.ctx, "p.zap", { x: 1 }, { confirm: true });
   const out = await f.gw.applyApproval("t", (r as any).operationId, "approved", "tygg");
   must(out.ok && out.executed && out.result?.status === "succeeded", `approval did not run it: ${JSON.stringify(out)}`);
   must(JSON.stringify(f.seen[0]) === JSON.stringify({ x: 1 }), `the plugin saw ${JSON.stringify(f.seen[0])}`);
 });
 
+await check("the bridge lifts confirm out of the model's arguments into the call's options", async () => {
+  const calls: any[] = [];
+  const host = { async invoke(call: any) { calls.push(call); return { status: "succeeded", operationId: "op", result: {} }; } };
+  const [zap] = bridgeTools([{ name: "zap", address: "p.zap", description: "", parameters: {}, sideEffects: "write", idempotency: "none" } as any], host as any);
+  await zap.execute("c1", { x: 1, confirm: true } as any);
+  must(JSON.stringify(calls[0].args) === JSON.stringify({ x: 1 }), `the plugin would have seen ${JSON.stringify(calls[0].args)}`);
+  must(calls[0].opts?.confirm === true, "the option did not travel");
+  await zap.execute("c2", { x: 2 } as any);
+  must(calls[1].opts?.confirm !== true, "a call without confirm was marked");
+});
+
 await check("only a literal true asks; anything else is an ordinary argument", async () => {
-  const f = await fixture();
-  const r = await f.gw.invoke(f.ctx, "p.zap", { confirm: "yes" });
-  must(r.status === "succeeded", "a string confirm was treated as a hold");
-  must(JSON.stringify(f.seen[0]) === JSON.stringify({ confirm: "yes" }), "an ordinary argument named confirm was stripped");
+  must(liftConfirm({ confirm: "yes" }).confirm === false, "a string confirm was treated as a hold");
+  must(JSON.stringify(liftConfirm({ confirm: "yes" }).args) === JSON.stringify({ confirm: "yes" }), "an ordinary argument named confirm was stripped");
+  must(liftConfirm(null).confirm === false && liftConfirm([1]).confirm === false, "non-objects");
 });
 
 await check("no seeded mount carries an approval policy", async () => {

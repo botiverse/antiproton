@@ -187,22 +187,17 @@ export class ToolGateway {
     ctx: CallContext,
     raw: string,
     args: Json,
-    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string } = {},
+    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string; confirm?: boolean } = {},
   ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
     if ("error" in r) return { status: "rejected", error: r.error };
-    // The agent's own hold. Any call may carry `confirm: true`; the gateway
-    // then treats it as a policy would, and the person decides. The field is
-    // the harness's, not the plugin's: it is stripped here, so what is recorded
-    // and later executed on approval is the call without it. Chosen over a
-    // per-tool policy because the person asked for the agent to judge which of
-    // its own actions deserve a card — a policy cannot tell "delete this
-    // branch" from "add a comment" when both go through one `api` tool.
-    let confirm = false;
-    if (args && typeof args === "object" && !Array.isArray(args) && (args as Record<string, unknown>).confirm === true) {
-      const { confirm: _c, ...rest } = args as Record<string, Json>;
-      args = rest; confirm = true;
-    }
+    // The agent's own hold: a call sent with `opts.confirm` is held exactly as
+    // a policy hold would be, and the person decides. It is an option, not an
+    // argument, so the plugin's parameter names stay its own (appworld
+    // forwards every argument it receives to an API whose names nobody here
+    // chose). The model can only write arguments; the bridge lifts the field
+    // out at the model boundary (pi-tools.ts, `liftConfirm`).
+    const confirm = opts.confirm === true;
 
     const plugin = this.#plugins.get(r.mount.plugin);
     if (!plugin) {
