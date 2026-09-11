@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { page, plugins, mountFragment, mountBlockId, inbox, mountList, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, mountList, bareTool, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -345,6 +345,19 @@ check("the sidebar has no conversations section and no new-conversation button",
   must(!/new conversation|id="tasks"|\/ui\/tasks|conversations<\/h3>|newConversation|markTask/.test(html), "no conversation list, button, route call or script");
   must(!/taskId|data-task/.test(html), "the page carries no task id: the routes default to the agent's one conversation");
   must(/<h2 id="agent-name">u-x<\/h2>\s*<span class="spacer">/.test(html), "the header is the agent, with no conversation title beside it");
+});
+
+// The plugins page prints the model-visible tool name as the route gives it
+// and looks usage up by the plugin's own name, whichever separator joined
+// the alias on (#118 moves it from "." to "__").
+check("a mount's tools show the model-visible name and the usage count under either separator", () => {
+  must(bareTool("gh__issue_list", "gh") === "issue_list" && bareTool("gh.issues.list", "gh") === "issues.list", "the alias is stripped under both separators");
+  must(bareTool("gh_public__api", "gh") === "gh_public__api" && bareTool("api", "gh") === "api", "another alias's tool, or a bare name, is left alone");
+  const d = (tools: string[]) => ({ installed: [{ id: "github", version: "2", tools: [{ name: "issue_list", summary: "List", sideEffects: "none", idempotency: "safe" }], config: [], credential: null }],
+    mounts: [{ alias: "gh", plugin: "github", version: "2", connected: true, config: {}, problems: [], tools, credential: { attached: false } }], used: { issue_list: 3 } });
+  const newForm = mountFragment(d(["gh__issue_list"]), "gh"), oldForm = mountFragment(d(["gh.issue_list"]), "gh");
+  must(/<code class="hot">gh__issue_list ×3<\/code>/.test(newForm), "the new form prints as given and finds its count");
+  must(/<code class="hot">gh\.issue_list ×3<\/code>/.test(oldForm), "the old form still finds its count");
 });
 
 const failed = results.filter((r) => !r.ok);
