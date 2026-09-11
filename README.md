@@ -44,15 +44,22 @@ Three things had to be true for the last row, and each was a bug first:
   acked and gives up into a dead-letter queue. The object does not stay awake to
   supervise it. (It used to: the sweeper, the give-up timer and the re-dispatch
   loop were a hand-rolled reimplementation of one line of a queue's contract.)
-- **The sandbox is handed back.** A container is destroyed when the task ends,
-  not stopped — `stop` returns 200, leaves the box and its storage in place, and
-  keeps billing. Thirteen boxes were live before that was noticed.
+- **The sandbox is handed back.** A container is destroyed when the agent has
+  nothing open, not stopped — `stop` returns 200, leaves the box and its storage
+  in place, and keeps billing. Thirteen boxes were live before that was noticed.
+  The release is scoped to the agent and covers every mount it holds, so it fires
+  when the *agent* has nothing open rather than when a particular task ends.
+  Those are the same moment while an agent has one conversation, and the scope is
+  what keeps a mount alive when it has several: one conversation going idle does
+  not hand back a container another is still working in.
 
 The other half of cost is tokens, and the number that decides it is prompt-cache
 hit rate. Measured here: editing the system message drops it from **84.9% to
 0.0%** — 6.6x the uncached tokens — while editing the tool block costs 1.1x. So
-the agent's memory is injected once when a task opens rather than before every
-turn, which is where a local harness would put it. The console draws the cache
+the agent's memory is injected once when the harness opens rather than before
+every turn, which is where a local harness would put it. Those are the same
+moment while an agent holds one conversation, and the injection is built from
+tenant and agent — so it is the harness that decides how often it is paid. The console draws the cache
 hit per call, so losing it is visible rather than merely expensive.
 
 The cache is not the whole story, though: on a long investigation it sits above
@@ -127,7 +134,7 @@ flowchart TB
     end
 
     sandbox["<b>Sandbox</b><br/><i>QuickJS · Dynamic Worker</i><br/>no network, no filesystem"]
-    box["<b>Container</b> <i>(a mount, not the sandbox)</i><br/>a real machine when one is needed<br/>destroyed when the task ends"]
+    box["<b>Container</b> <i>(a mount, not the sandbox)</i><br/>a real machine when one is needed<br/>destroyed when the agent goes idle"]
     saas([SaaS APIs]):::ext
     provider([Model provider]):::ext
 
@@ -166,7 +173,8 @@ Four things the picture is meant to make obvious:
 4. **A container is a mount, not a loophole.** Work that genuinely needs a real
    machine gets one, but it is reached the same way a SaaS API is — through the
    gateway, under the mount's policy — rather than by loosening the sandbox. It
-   holds no credential of the agent's, and it is destroyed when the task ends.
+   holds no credential of the agent's, and it is destroyed when the agent has
+   nothing open, on the same agent-wide scope as above.
 
 ### Policy, and the gate
 
@@ -281,7 +289,8 @@ The load-bearing part is theirs too: the working set is **pushed into the
 prompt**, not left to be pulled, because an agent that has to remember to go and
 look will not look. What does not carry over is doing it before every turn. That
 is affordable in a local CLI and not here — see the cache numbers above — so it
-is injected once when the task opens, where the prefix stays stable and cached.
+is injected once when the harness opens, where the prefix stays stable and
+cached.
 
 Demonstrated across two tasks: told a deploy window, a formatting preference and
 an unhandled certificate expiry in one, then asked in a *new* task when to ship,
