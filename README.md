@@ -87,9 +87,8 @@ call succeeds without the agent ever logging in, and the token never appears in
 a tool result.
 
 An operator attaches a credential for a mount from the console. It is stored in
-the agent's own object, sealed with AES-GCM under a Worker-held key: the table
-holds ciphertext, an IV and the last four characters of the value, written once at
-storage time so that no read path ever touches the secret itself. The reference
+the agent's own object, sealed with AES-GCM under a Worker-held key: the row
+holds ciphertext and an IV, and no fragment of the value. The reference
 takes the form `agent:<name>` beside `env:NAME`, and resolves only against the
 (tenant, agent) that owns the mount naming it — the resolver takes its scope from
 the mount, not from the reference, so no reference one agent can write reaches
