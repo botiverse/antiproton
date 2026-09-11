@@ -30,8 +30,7 @@ import { BenchState } from "./bench.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue,
-} from "./ui.ts";
+  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, taskList, mountList, catalogue, agentList } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -2501,7 +2500,8 @@ export default {
           const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
           const agents = (await homeStub.uiListAgents("demo", home))
             .map((a) => ({ ...a, current: a.agentId === (uiSelected?.agentId ?? home) }));
-          return Response.json({ agents });
+          // The page swaps the rendered list in; anything else gets the data.
+          return request.headers.get("hx-request") ? html(agentList({ agents })) : Response.json({ agents });
         }
         case "/ui/conversation": {
           // The only way a conversation id comes to exist; every route that

@@ -117,6 +117,34 @@ font-size:11px;display:flex;align-items:center;justify-content:center;text-trans
 .new-conv svg{width:14px;height:14px}
 .new-conv-err{font-size:11px;color:var(--bad);margin:-4px 0 10px}
 .new-conv-err[hidden]{display:none}
+.sidebar h3.later{margin-top:16px}
+/* --- agents: an avatar drawn from the agent's seed, a name, one line of
+   what it is for. The create form sits in the sidebar, no dialog. */
+.avatar{display:inline-block;width:22px;height:22px;flex:none;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--sunk);vertical-align:middle}
+.avatar svg{width:100%;height:100%;display:block}
+.avatar.lg{width:28px;height:28px}
+.avatar[hidden]{display:none}
+.agent{display:flex;align-items:center;gap:9px;padding:8px 10px}
+.agent .who{min-width:0;display:flex;flex-direction:column;gap:1px}
+.agent .name{font-size:12px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent .desc{font-size:10.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent .desc.faint{color:var(--faint)}
+.new-agent{width:100%;justify-content:center;margin:0 0 10px;gap:6px}
+.new-agent svg{width:14px;height:14px}
+.new-agent[hidden]{display:none}
+.new-agent-form{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--line);border-radius:7px;margin:0 0 10px;background:var(--panel)}
+.new-agent-form[hidden]{display:none}
+.new-agent-form label{display:flex;flex-direction:column;gap:4px;color:var(--dim);font-size:11.5px}
+.new-agent-form label i{color:var(--faint);font-style:normal}
+.new-agent-form .pick,.new-agent-form .row{display:flex;align-items:center;gap:8px}
+.new-agent-form .err{font-size:11px;color:var(--bad)}
+.new-agent-form .err[hidden]{display:none}
+.new-agent-form .hint{padding:0;font-size:10.5px}
+textarea{background:var(--layer-panel);border:1px solid var(--line-field);border-radius:6px;color:var(--ink);font:inherit;font-size:12px;padding:6px 8px;resize:vertical;min-height:56px;width:100%}
+textarea:hover{border-color:var(--line-field-hover)}
+textarea:focus{outline:0;box-shadow:0 0 0 1px var(--primary-400)}
+.view-head #agent-avatar{margin-right:2px}
+.view-head .sub.faint{color:var(--faint)}
 .mount-link{display:block;padding:9px 12px;border:1px solid var(--line);border-radius:7px;margin:0 0 8px;color:var(--ink);text-decoration:none}
 .mount-link.on{border-color:var(--accent);background:var(--sunk)}
 .mount-link .id{font-size:12px}.mount-link .id .sub{color:var(--dim);font-size:11px}
@@ -328,6 +356,9 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] .mode{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .mode button{border:0;box-shadow:none}
 [data-theme="brutal"] .mode button.on{background:var(--primary-400);color:var(--primary-950)}
+[data-theme="brutal"] .avatar,[data-theme="brutal"] textarea,[data-theme="brutal"] .new-agent-form{border-radius:0;border:2px solid var(--line-strong)}
+[data-theme="brutal"] textarea{background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
+[data-theme="brutal"] textarea:focus{box-shadow:var(--theme-shadow-md)}
 [data-theme="brutal"] h1.brand .bar{fill:var(--primary-400);stroke:var(--primary-400)}
 .pane-btn{display:none;background:transparent;border:1px solid var(--line);color:var(--dim);box-shadow:none;padding:6px 10px;font-size:11.5px;gap:5px}
 .pane-btn svg,.pane-close svg{width:14px;height:14px}
@@ -384,8 +415,9 @@ export function page(taskId: string, who: string, agentId: string): string {
           hx-trigger="ap:show, every ${every}[${cond}]">loading…</div>`;
   const inView = "this.closest('.view').classList.contains('on')";
   const inspTab = (name: string) => `<button type="button" role="tab" data-insp="${name}" onclick="ap.insp('${name}')">${name}</button>`;
+  const a = encodeURIComponent(agentId);
   const rail = (view: string, label: string) =>
-    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
+    `<a class="rail-item" data-view="${view}" href="/ui?view=${view}&agentId=${a}&taskId=${t}" onclick="ap.show('${view}');return false"><span class="ico">${ICONS[view]}</span><span>${label}</span></a>`;
   return `<!doctype html><html lang="en" data-theme="brutal"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>antiproton</title>
@@ -393,7 +425,7 @@ export function page(taskId: string, who: string, agentId: string): string {
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
-<style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}">
+<style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-task="${t}" data-agent="${esc(agentId)}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("inbox", "inbox").replace('</span><span>inbox', '</span><b class="count" id="inbox-count" hidden></b><span>inbox')}
@@ -413,8 +445,23 @@ export function page(taskId: string, who: string, agentId: string): string {
 <aside class="sidebar" id="sidebar">
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
   <div class="side-view" data-for="agents">
-    <h3>${esc(agentId)}</h3>
-    <div class="sub">conversations, latest activity first</div>
+    <h3>agents</h3>
+    <div class="sub">yours, newest first</div>
+    <button type="button" class="ghost new-agent" id="new-agent-btn" onclick="ap.newAgentForm(true)">${ICONS.plus}new agent</button>
+    <form class="new-agent-form" id="new-agent" hidden onsubmit="ap.createAgent(event)">
+      <div class="pick"><span class="avatar lg" id="new-agent-avatar"></span>
+        <button type="button" class="ghost" onclick="ap.reroll()" title="another avatar">another</button>
+        <input type="hidden" name="avatar" id="new-agent-seed"></div>
+      <label><span>name</span><input type="text" name="name" maxlength="60" required autocomplete="off" spellcheck="false" placeholder="what to call it"></label>
+      <label><span>description <i>(optional)</i></span><textarea name="description" maxlength="2000" rows="3" placeholder="what this agent is for. It goes into the agent's instructions, word for word."></textarea></label>
+      <div class="err" id="new-agent-err" hidden></div>
+      <div class="row"><button type="submit">create</button><button type="button" class="ghost" onclick="ap.newAgentForm(false)">cancel</button></div>
+      <div class="hint">Each agent starts with its own mounts, credentials and memory. Nothing is copied from another agent.</div>
+    </form>
+    <div id="agents" data-lazy hx-get="/ui/agents" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
+         hx-on::after-swap="ap.markAgent()"></div>
+    <h3 class="later">conversations</h3>
+    <div class="sub">of this agent, latest activity first</div>
     <button type="button" class="ghost new-conv" onclick="ap.newConversation(this)">${ICONS.plus}new conversation</button>
     <div class="err new-conv-err" id="new-conv-err" hidden></div>
     <div id="tasks" data-lazy hx-get="/ui/tasks" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
@@ -434,7 +481,8 @@ export function page(taskId: string, who: string, agentId: string): string {
     ${lazy("inbox", "/ui/inbox", "3s", inView)}
   </section>
   <section class="view" data-view="agents">
-    <div class="view-head"><h2 id="conv-title">${t}</h2><span class="sub" id="conv-id">${esc(agentId)}</span><span class="spacer"></span>
+    <div class="view-head"><span class="avatar lg" id="agent-avatar" hidden></span><h2 id="agent-name">${esc(agentId)}</h2>
+      <span class="sub" id="conv-title">${t}</span><span class="sub faint" id="conv-id"></span><span class="spacer"></span>
       <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}tasks</button>
       <button type="button" class="pane-btn" onclick="ap.pane('insp')">${ICONS.inspector}inspector</button>
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
@@ -493,6 +541,7 @@ export function page(taskId: string, who: string, agentId: string): string {
   // The shell's own state: which section is showing and which mode the
   // viewer chose. Both are on the URL or in localStorage, never in the
   // server; every panel is still a plain GET that reads the store.
+  ${AVATAR_JS}
   window.ap = {
     // A panel that polls replaces its own form under the person's cursor:
     // the credential box was emptied every three seconds. While any field
@@ -525,6 +574,48 @@ export function page(taskId: string, who: string, agentId: string): string {
     task(id) {
       const u = new URL(location.href); u.searchParams.set('taskId', id); u.searchParams.set('view', 'agents');
       location.href = u.toString();
+    },
+    // Switching agents drops the conversation: the server opens the agent's
+    // default one. The agent id stays on the URL from here on, and every
+    // panel request carries it (see the configRequest hook below).
+    agent(id) {
+      const u = new URL(location.href); u.searchParams.set('agentId', id); u.searchParams.delete('taskId'); u.searchParams.set('view', 'agents');
+      location.href = u.toString();
+    },
+    markAgent() {
+      const id = document.body.dataset.agent;
+      document.querySelectorAll('#agents .agent').forEach(a => a.classList.toggle('on', a.dataset.agent === id));
+      const row = document.querySelector('#agents .agent.on');
+      if (!row) return;
+      document.getElementById('agent-name').textContent = row.dataset.name || id;
+      const av = document.getElementById('agent-avatar'), src = row.querySelector('.avatar');
+      if (src) { av.innerHTML = src.innerHTML; av.hidden = false; }
+    },
+    newAgentForm(show) {
+      const f = document.getElementById('new-agent'); f.hidden = !show;
+      document.getElementById('new-agent-btn').hidden = show;
+      if (show) { if (!document.getElementById('new-agent-seed').value) ap.reroll(); f.querySelector('[name=name]').focus(); }
+    },
+    // The seed is eight hex characters, minted here, kept by the server on
+    // the agent. Drawing from it is the same function on both sides.
+    reroll() {
+      const b = new Uint8Array(4); crypto.getRandomValues(b);
+      const seed = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+      document.getElementById('new-agent-seed').value = seed;
+      document.getElementById('new-agent-avatar').innerHTML = apAvatar(seed);
+    },
+    // A refusal is said under the form and what was typed stays; only a
+    // created agent leaves the page.
+    async createAgent(ev) {
+      ev.preventDefault();
+      const f = ev.target, err = document.getElementById('new-agent-err'), btn = f.querySelector('[type=submit]');
+      err.hidden = true; btn.disabled = true;
+      try {
+        const r = await fetch('/ui/agent', { method: 'POST', headers: { 'accept': 'application/json' }, body: new URLSearchParams(new FormData(f)) });
+        if (!r.ok) { err.textContent = 'could not create the agent: ' + r.status + ' ' + (await r.text()).slice(0, 160); err.hidden = false; return; }
+        const d = await r.json(); if (d && d.agentId) ap.agent(d.agentId); else { err.textContent = 'the server returned no agent id'; err.hidden = false; }
+      } catch (e) { err.textContent = 'could not reach the server'; err.hidden = false; }
+      finally { btn.disabled = false; }
     },
     mount(alias) {
       const u = new URL(location.href); u.searchParams.set('view', 'plugins');
@@ -570,7 +661,7 @@ export function page(taskId: string, who: string, agentId: string): string {
     async newConversation(btn) {
       const err = document.getElementById('new-conv-err'); err.hidden = true; btn.disabled = true;
       try {
-        const r = await fetch('/ui/conversation', { method: 'POST', headers: { 'accept': 'application/json' } });
+        const r = await fetch('/ui/conversation', { method: 'POST', headers: { 'accept': 'application/json' }, body: new URLSearchParams({ agentId: document.body.dataset.agent }) });
         if (!r.ok) { err.textContent = 'could not start a conversation: ' + r.status + ' ' + (await r.text()).slice(0, 120); err.hidden = false; return; }
         const d = await r.json(); if (d && d.taskId) ap.task(d.taskId); else { err.textContent = 'the server returned no conversation id'; err.hidden = false; }
       } catch (e) { err.textContent = 'could not reach the server'; err.hidden = false; }
@@ -610,6 +701,8 @@ export function page(taskId: string, who: string, agentId: string): string {
   document.body.addEventListener('htmx:configRequest', (e) => {
     const v = window.__ver[e.detail.path];
     if (v) e.detail.headers['x-ap-version'] = v;
+    // Every panel reads or writes the current agent. One place, not forty.
+    if (!('agentId' in e.detail.parameters)) e.detail.parameters.agentId = document.body.dataset.agent;
   });
   document.body.addEventListener('htmx:afterRequest', (e) => {
     const v = e.detail.xhr && e.detail.xhr.getResponseHeader('x-ap-version');
@@ -1220,6 +1313,68 @@ export function taskList(d: any): string {
   <div class="id"><span class="title">${title(t)}</span>${t.busy ? ` <span class="tag ok">working</span>` : ""}${t.pending ? ` <span class="tag warn">${t.pending} held</span>` : ""}</div>
   <div class="meta"><span class="tid">${esc(t.taskId)}</span>${t.status ? ` · ${esc(t.status)}` : ""}${t.lastActivityAt ? ` · ${esc(when(t.lastActivityAt))}` : ""}${typeof t.turns === "number" ? ` · ${t.turns} turns` : ""}</div>
 </a>`).join("");
+}
+
+/**
+ * An agent's avatar, drawn from its seed.
+ *
+ * Eight hex characters, kept by the server on the agent, become a 5×5 block
+ * pattern mirrored left to right (fifteen bits) in one of five theme colours
+ * (three more bits). Colours are the shell's own variables, so the same
+ * avatar follows the theme, and the corners follow it too: the CSS rounds
+ * them in Elegant and squares them in Brutal. Sizes are the container's.
+ *
+ * The same drawing runs in the page, for the preview on the create form,
+ * so it exists twice: `avatarSvg` here and `AVATAR_JS`, the same drawing as
+ * plain page source. A test holds the two to the same output, seed by seed.
+ */
+export function avatarSvg(seed: unknown): string {
+  let hex = String(seed == null ? "" : seed).toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 8);
+  while (hex.length < 8) hex += "0";
+  let n = parseInt(hex, 16) >>> 0, cells = "";
+  const box = (c: number, r: number) => `<rect x="${c}" y="${r}" width="1" height="1"/>`;
+  if ((n & 0x7fff) === 0) n |= 0x40;
+  for (let r = 0; r < 5; r++) for (let c = 0; c < 3; c++) if ((n >>> (r * 3 + c)) & 1) { cells += box(c, r); if (c < 2) cells += box(4 - c, r); }
+  const tone = ["--accent", "--action", "--ink", "--js", "--ok"][(n >>> 15) % 5];
+  return `<svg viewBox="0 0 5 5" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><rect width="5" height="5" fill="var(--sunk)"/><g fill="var(${tone})">${cells}</g></svg>`;
+}
+// The page's copy, as plain source. Written out rather than taken from
+// avatarSvg.toString(): a bundler rewrites a function's body (esbuild adds a
+// __name helper), so the text of a compiled function is not shippable.
+// Not new Function either: a Worker refuses code built from strings. The
+// test holds this text to avatarSvg, seed by seed.
+export const AVATAR_JS = `function apAvatar(seed) {
+    var hex = String(seed == null ? '' : seed).toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 8);
+    while (hex.length < 8) hex += '0';
+    var n = parseInt(hex, 16) >>> 0, cells = '';
+    var box = function (c, r) { return '<rect x="' + c + '" y="' + r + '" width="1" height="1"/>'; };
+    if ((n & 0x7fff) === 0) n |= 0x40;
+    for (var r = 0; r < 5; r++) for (var c = 0; c < 3; c++) if ((n >>> (r * 3 + c)) & 1) { cells += box(c, r); if (c < 2) cells += box(4 - c, r); }
+    var tone = ['--accent', '--action', '--ink', '--js', '--ok'][(n >>> 15) % 5];
+    return '<svg viewBox="0 0 5 5" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><rect width="5" height="5" fill="var(--sunk)"/><g fill="var(' + tone + ')">' + cells + '</g></svg>';
+  }`;
+
+/**
+ * The person's agents for the sidebar, newest first, as the route lists
+ * them. The current one is marked by the route and again client-side from
+ * the page's own agent id, so a stale list still highlights the right row.
+ * A name is what the person typed, cut to the field's limit; an agent with
+ * no name shows its id, never a blank. The description is one line here;
+ * the whole of it belongs to the agent, not to the list.
+ */
+export function agentList(d: any): string {
+  const agents: any[] = d?.agents ?? [];
+  if (!agents.length) return `<div class="empty">no agents yet</div>`;
+  const line = (v: unknown) => typeof v === "string" && v.trim() ? esc(v.trim().split("\n")[0].slice(0, 90)) : "";
+  return agents.map((ag) => {
+    const id = String(ag.agentId ?? "");
+    const name = typeof ag.name === "string" && ag.name.trim() ? esc(ag.name.trim().slice(0, 60)) : esc(id);
+    const desc = line(ag.description);
+    return `<a class="task agent${ag.current ? " on" : ""}" data-agent="${esc(id)}" data-name="${name}" href="/ui?view=agents&agentId=${encodeURIComponent(id)}" onclick="ap.agent('${esc(id)}');return false">
+  <span class="avatar">${avatarSvg(String(ag.avatar ?? ""))}</span>
+  <span class="who"><span class="name">${name}</span><span class="desc${desc ? "" : " faint"}">${desc || "no description"}</span></span>
+</a>`;
+  }).join("");
 }
 
 /** The element a credential route swaps: one mount, re-rendered. */

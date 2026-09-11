@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -299,6 +299,47 @@ check("the plugins panel's poll waits while a person is typing in it", () => {
   // clicks away to check the token, and comes back must still find it.
   must(/el\.value/.test(fn), "ap.editing also looks at a non-empty value, not only focus");
   must(/type !== 'hidden'/.test(fn), "the hidden alias field does not count as typing");
+});
+
+// task #6: the sidebar lists the person's agents, and the shell carries the
+// current agent on every request it makes.
+check("the agent list shows name, one line of description, and marks the current one", () => {
+  const html = agentList({ agents: [
+    { agentId: "u-x", name: "default", description: "", avatar: "deadbeef", createdAt: "2026-09-11T09:00:00Z", current: true },
+    { agentId: "u-x_k3", name: "<b>reviewer</b>", description: "Reads PRs.\nSecond line never shows.", avatar: "0badf00d", createdAt: "2026-09-11T09:30:00Z", current: false },
+    { agentId: "u-x_k4", name: "", description: null, avatar: "", createdAt: null, current: false },
+  ] });
+  must(count(html, /class="task agent/g) === 3, "three rows");
+  must(/class="task agent on" data-agent="u-x"/.test(html), "the current agent is marked");
+  must(!html.includes("<b>reviewer</b>") && html.includes("&lt;b&gt;reviewer&lt;/b&gt;"), "names are escaped");
+  must(html.includes("Reads PRs.") && !html.includes("Second line"), "the description is its first line");
+  must(/data-name="u-x_k4"/.test(html) && /class="desc faint">no description</.test(html), "no name shows the id; no description says so");
+  must(count(html, /<svg viewBox="0 0 5 5"/g) === 3, "every row has an avatar, even from an empty seed");
+  must(!/undefined|null/.test(html), "nothing renders as undefined or null");
+});
+check("the agent list says so when there are none", () => {
+  must(/no agents yet/.test(agentList({ agents: [] })) && /no agents yet/.test(agentList(null)), "empty and missing both read as none");
+});
+check("the avatar is a pure function of its seed, on both sides of the wire", () => {
+  const seeds = ["deadbeef", "DEADBEEF", "00000000", "0badf00d", "ffffffff", "12", "not-hex", ""];
+  must(avatarSvg("deadbeef") === avatarSvg("DEADBEEF"), "case does not matter");
+  must(avatarSvg("deadbeef") !== avatarSvg("0badf00d"), "different seeds differ");
+  must(/<rect x=/.test(avatarSvg("00000000")), "an all-zero seed still draws something");
+  must(!/#[0-9a-f]{3,6}|rgb\(|hsl\(/i.test(avatarSvg("deadbeef")), "colours are the shell's variables, not literals");
+  const inPage = new Function(AVATAR_JS + "; return apAvatar;")();
+  must(seeds.every((x) => inPage(x) === avatarSvg(x)), "the shell's copy draws the same picture as the server's");
+  must(/^function apAvatar\(/.test(AVATAR_JS) && !/\bimport\b|\brequire\b|\besc\(|__name|toString/.test(AVATAR_JS), "the shipped source is self-contained under a fixed name, with no bundler helper in it");
+});
+check("the shell carries the current agent and sends it with every panel request", () => {
+  const html = page("t_u-x", "someone", "u-x_k3");
+  must(/<body[^>]*data-agent="u-x_k3"/.test(html), "the body names the agent");
+  must(/id="agents" data-lazy hx-get="\/ui\/agents"/.test(html), "the sidebar loads the agent list");
+  must(/e\.detail\.parameters\.agentId = document\.body\.dataset\.agent/.test(html), "the configRequest hook adds agentId");
+  must(/href="\/ui\?view=inbox&agentId=u-x_k3&taskId=t_u-x"/.test(html), "rail links keep the agent");
+  must(/<form class="new-agent-form" id="new-agent" hidden/.test(html) && /name="name" maxlength="60" required/.test(html) && /name="description" maxlength="2000"/.test(html), "the create form has name and description within the limits");
+  must(/fetch\('\/ui\/agent', \{ method: 'POST'/.test(html), "create posts to /ui/agent");
+  must(/Nothing is copied from another agent/.test(html), "the form says credentials and memory are per agent");
+  must(html.includes(AVATAR_JS), "the shell ships the avatar function");
 });
 
 // task #7: a decided call leaves the approvals panel; only pending ones show.
