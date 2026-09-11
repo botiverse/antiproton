@@ -485,6 +485,15 @@ them:
   instead of offering a box that produces a mount which dies when the token
   expires. No plugin declares one yet, so the declaration is a capability the
   contract has rather than behaviour to observe.
+- **Threads are storage and API, not console.** A task can hold several threads
+  (`task_threads` is many-to-many), events carry a `thread_id`, and the API can
+  create one (`POST /agents/:id/threads`) and post into it
+  (`POST /threads/:id/messages`, which makes a task if you do not name one). What
+  is missing is any surface that shows them: the console reads a task's
+  transcript with no notion of which thread a message belongs to, so a person
+  sees one conversation per task however many the store holds. The gap is a
+  route and a filter rather than a schema, which is the same shape as the inbox
+  and task-list routes were.
 - **External events.** Nothing can wake an agent from the outside yet — no
   webhooks. An agent now remembers across tasks, but it still cannot be woken
   by the world; that is the remaining half of "long-running".
