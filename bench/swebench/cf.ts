@@ -175,7 +175,11 @@ async function runOne(inst: Instance) {
     shell: "/bin/bash",
     shellPrefix: "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && ",
     offload: true,
+    // The object defaults to "none". NETWORK=open reproduces the contaminated
+    // condition on purpose, and the record says which one ran.
+    ...(process.env.NETWORK ? { network: process.env.NETWORK } : {}),
   });
+  const network = String(started?.network ?? "open");
   if (TRACE) console.log(`    started ${JSON.stringify(started)}`);
 
   // Everything after this point must release the container, whatever happens
@@ -236,7 +240,7 @@ async function runOne(inst: Instance) {
     ...grade,
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds,
     ended: answered ? "answered" : failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled",
-    modelTurns: stats.modelTurns, toolTurns: stats.toolTurns, byTool: stats.byTool ?? {},
+    network, modelTurns: stats.modelTurns, toolTurns: stats.toolTurns, toolErrors: stats.toolErrors ?? null, byTool: stats.byTool ?? {},
     calls: stats.usage?.calls ?? 0, prompt: stats.usage?.prompt ?? 0, out: stats.usage?.out ?? 0,
     cached: stats.usage?.cached ?? 0, meter: stats.meter as Meter | undefined,
     objectMs, gradingMs,
@@ -247,7 +251,7 @@ async function runOne(inst: Instance) {
 
 await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
-console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object` +
+console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object, container network ${process.env.NETWORK ?? "none"}` +
   `\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(80)}`);
 const out: any[] = [];
 const t0Run = Date.now();
@@ -305,6 +309,7 @@ if (act) {
 }
 const recorded = recordRun("swebench", OBJ, {
   bench: "swebench-verified", base: BASE, object: `bench-${OBJ}`, offset: OFFSET, n: instances.length,
+  network: out.map((r: any) => r.network).find(Boolean) ?? null,
   startedAt: new Date(t0Run).toISOString(), results: out, totals, activity: act,
 });
 console.log(`  recorded ${recorded}`);

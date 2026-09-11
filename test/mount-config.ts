@@ -7,7 +7,7 @@
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin } from "../src/plugins/run9.ts";
+import { run9Plugin, execArgv } from "../src/plugins/run9.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -70,6 +70,25 @@ check("assert 版本会抛,并且把问题都带上", () => {
   if (!msg.includes("timeoutMs") || !msg.includes("needs an account")) {
     throw new Error(`problems were dropped: ${msg}`);
   }
+});
+
+check("network none wraps the shell in an empty network namespace", () => {
+  const argv = execArgv({ shell: "/bin/bash", shellPrefix: "act && ", network: "none" }, "curl x");
+  if (JSON.stringify(argv) !== JSON.stringify(["unshare", "-n", "--", "/bin/bash", "-lc", "act && curl x"])) {
+    throw new Error(`got ${JSON.stringify(argv)}`);
+  }
+});
+
+check("network open, or unset, runs the shell as before", () => {
+  for (const network of ["open", undefined] as const) {
+    const argv = execArgv({ shell: "/bin/sh", network }, "ls");
+    if (JSON.stringify(argv) !== JSON.stringify(["/bin/sh", "-lc", "ls"])) throw new Error(`got ${JSON.stringify(argv)}`);
+  }
+});
+
+check("network is a mount setting", () => {
+  const p = validateMount(run9, { network: "none" } as any, "env:RUN9");
+  if (p.length) throw new Error(`unexpected problems: ${p.map((x) => x.message).join("; ")}`);
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);

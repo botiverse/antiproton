@@ -44,6 +44,16 @@ export interface Run9Config {
    */
   shellPrefix?: string;
   /**
+   * Whether commands can reach the network. A run9 box always has egress, so
+   * "none" is done in the box: every command runs under `unshare -n`, in a
+   * fresh network namespace with no interface, no route and no DNS. Measured
+   * on a SWE-bench image: the box is root with the full capability set, GitHub
+   * stops resolving, and the repository's own tests still pass. A benchmark
+   * whose answer is a public commit must run this way, and an agent that has
+   * no business on the internet may as well.
+   */
+  network?: "open" | "none";
+  /**
    * Credentials the container may use but not read. Declares the shape only —
    * the values come from the mount's own credential.
    */
@@ -130,6 +140,7 @@ const DEFAULTS = {
   workdir: "/work",
   shell: "/bin/sh",
   shellPrefix: "",
+  network: "open",
   endpoint: "https://api.run.sys9.ai",
   image: "public.ecr.aws/docker/library/node:22-alpine",
   project: "default",
@@ -185,6 +196,15 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
   return { boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt };
 }
 
+/** The argv one command becomes. With `network: "none"` the shell itself is
+ *  started inside an empty network namespace, so nothing the command spawns
+ *  can inherit a route out. */
+export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "open" | "none" }, command: string): string[] {
+  const line = cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command;
+  const argv = [cfg.shell, "-lc", line];
+  return cfg.network === "none" ? ["unshare", "-n", "--", ...argv] : argv;
+}
+
 export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
   return {
   id: "run9",
@@ -205,6 +225,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     { name: "shape", type: "string", summary: "Machine size, e.g. 2c4g. Larger costs more per second." },
     { name: "shell", type: "string", summary: "Shell the shell tool runs commands in.", default: "/bin/sh" },
     { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
+    { name: "network", type: "string", summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS.", default: "open" },
     { name: "timeoutMs", type: "number", summary: "How long one call may take.", default: 120000 },
     { name: "maxOutputBytes", type: "number", summary: "Output past this is parked as an artifact instead of returned.", default: 24000 },
     { name: "secrets", type: "string[]", summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
@@ -396,18 +417,29 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
       const from = state?.startFrom ?? (prior as any)?.startFrom;
       const declared = cfg.secrets ?? [];
-      await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
-        box_id: boxId,
-        // An environment kept earlier, or the bare image. Starting from a
-        // snapshot is the whole point of having kept one.
-        ...(from ? { source_snap_id: from } : { source_image_ref: cfg.image }),
-        // Injection happens on run9's egress proxy, which only exists in
-        // managed mode. Measured: under `normal` the placeholder goes out
-        // unchanged, which would look like a working credential and not be one.
-        ...(declared.length ? { network_mode: "managed" } : {}),
-        ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
-        description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
-      });
+      try {
+        await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
+          box_id: boxId,
+          // An environment kept earlier, or the bare image. Starting from a
+          // snapshot is the whole point of having kept one.
+          ...(from ? { source_snap_id: from } : { source_image_ref: cfg.image }),
+          // Injection happens on run9's egress proxy, which only exists in
+          // managed mode. Measured: under `normal` the placeholder goes out
+          // unchanged, which would look like a working credential and not be one.
+          ...(declared.length ? { network_mode: "managed" } : {}),
+          ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
+          description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
+        });
+      } catch (e) {
+        // Seen twice in one benchmark run: run9 answered 400 "already exists"
+        // (once as its own database's duplicate-key error) for an id this call
+        // had just minted. The box existed; only the answer was lost. Throwing
+        // here failed the agent's first command and leaked the box, since no
+        // record of it was ever written. If the box is there, it is ours.
+        if (!/already exists|duplicate key/i.test(String(e))) throw e;
+        const boxes = await api("GET", `/projects/${cfg.project}/workspace/boxes`);
+        if (!(Array.isArray(boxes) && boxes.some((b: any) => b.box_id === boxId))) throw e;
+      }
       // Register the declared credentials against the new box. The value never
       // enters the box and never reaches the model: only the placeholder does.
       const placeholders: Placeholders = {};
@@ -541,7 +573,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
 
     const started = await api(
       "POST", `/projects/${cfg.project}/workspace/boxes/${state.boxId}/execs`,
-      { command: [cfg.shell, "-lc", cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command] },
+      { command: execArgv(cfg, command) },
     );
     const execId = started.exec_id as string;
 

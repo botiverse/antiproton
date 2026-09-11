@@ -251,7 +251,7 @@ async function runTask(task: any) {
   return {
     id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
     turns: turns - 1, simCalls,
-    usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {},
+    usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
     seconds: Math.round((Date.now() - t0) / 1000),
     expectedWrites: expected.map((e) => e.name),
     performedWrites: writes.map((w: any) => w.name),

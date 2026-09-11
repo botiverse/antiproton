@@ -762,7 +762,7 @@ export class AgentDO extends DurableObject<Env> {
    */
   async benchSweStart(taskId: string, o: {
     policy: string; image: string; workdir?: string; shape?: string; timeoutMs?: number;
-    shell?: string; shellPrefix?: string; offload?: boolean;
+    shell?: string; shellPrefix?: string; offload?: boolean; network?: "open" | "none";
   }) {
     await this.setOffload(o.offload !== false);
     return this.#busy("benchSweStart", async () => {
@@ -790,10 +790,14 @@ export class AgentDO extends DurableObject<Env> {
           timeoutMs: o.timeoutMs ?? 300_000,
           ...(o.shell ? { shell: o.shell } : {}),
           ...(o.shellPrefix ? { shellPrefix: o.shellPrefix } : {}),
+          // No route out unless the runner says so. The answer to a SWE-bench
+          // instance is a public commit; a box that can reach GitHub measures
+          // retrieval, and in one run six of nine transcripts did exactly that.
+          network: o.network ?? "none",
         },
         secretRef: OPERATOR_RUN9_REF, policy: null,
       });
-      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe" };
+      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe", network: o.network ?? "none" };
     });
   }
 
@@ -850,10 +854,12 @@ export class AgentDO extends DurableObject<Env> {
     const modelTurns = usage.calls;
     const toolTurns = entries.filter((e: any) =>
       e.type === "message" && e.message?.role === "toolResult").length;
+    const toolErrors = entries.filter((e: any) =>
+      e.type === "message" && e.message?.role === "toolResult" && e.message.isError).length;
     const meter = await readMeter(rt.store as any, "bench", agentId, ["node"], wallMs, {
       promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
     });
-    return { taskId, usage, byTool, modelTurns, toolTurns, entries: entries.length, meter };
+    return { taskId, usage, byTool, modelTurns, toolTurns, toolErrors, entries: entries.length, meter };
   }
 
   async benchStart(taskId: string, policy: string, offload: boolean) {
@@ -1064,12 +1070,17 @@ export class AgentDO extends DurableObject<Env> {
     // object-side one did not, which left the one question the sandbox has
     // to answer — does anything reach for run_js — with no on-object evidence.
     const byTool: Record<string, number> = {};
+    let toolErrors = 0;
     for (const e of await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[]) {
       const name = e.message?.role === "toolResult" ? e.message.toolName : null;
       if (name) byTool[name] = (byTool[name] ?? 0) + 1;
+      if (name && e.message.isError) toolErrors += 1;
     }
     const r = await this.#benchState().result(agentId);
-    return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds, byTool };
+    // Errors are counted here so the run record carries them; a claim of
+    // "zero tool errors" that rests on a transcript dump in someone's
+    // workspace is not checkable once the workspace is gone.
+    return { writes: r.writes, dbHash: await sha256(canonJson(r.db)), usage, kinds, byTool, toolErrors };
   }
 
   async resetActivity() {
