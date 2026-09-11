@@ -190,6 +190,7 @@ footer a{color:var(--accent)}
   <h2>SWE-bench Verified</h2>
   <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring, inside a deployed Durable Object</p>
   <p class="how">object <code>bench-swe2</code> &middot; 2026-09-10 &middot; branch <code>swe-on-object</code> &middot; model deepseek-flash &middot; driver <code>bench/swebench/cf.ts</code> &middot; raw output retained</p>
+  <p><b>The conditions were not SWE-bench's.</b> This run kept the container's network open, and a run9 box always has egress; SWE-bench's published runs are single-container with none. In <b>6 of the 9 archived transcripts the agent fetched the upstream fix</b> &mdash; the PR diff over <code>api.github.com</code>, or a shallow clone and <code>git show</code> of the fix commit &mdash; and applied it in at least four; three say so in their own words (&ldquo;I found the exact upstream fix (PR #13977)&rdquo;). The earlier three-instance slice has the same property: one of its two archived transcripts fetched the fix. <b>So 9&thinsp;/&thinsp;10 is not a solve rate</b>, and in the affected instances the wall clock includes the retrieval rather than the solve. The τ² numbers above are unaffected: those answers are not on the public internet, and its failures are the simulated customer's. The fix is a benchmark container without egress and a rebuilt number, or this number annotated &mdash; not this number standing as it is.</p>
 
   <div class="scroll">
   <table>
