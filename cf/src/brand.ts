@@ -20,8 +20,10 @@ export const MARK_SVG = "<svg viewBox=\"0 0 100 104\" role=\"img\" aria-label=\"
 
 /**
  * The outlined cut, the logo as tygg chose it: ink outline, cream body, the
- * bar in Source Yellow, a hard offset shadow. Self-coloured, so it belongs on
- * light surfaces only; the flat forms above are for dark ones and for small
- * sizes. The mask id is suffixed so two copies on one page do not collide.
+ * bar in Source Yellow, a hard offset shadow. Self-coloured, and the logo on
+ * every surface: on a dark canvas the ink line merges into the background
+ * and the cream letterforms carry it, which is intended (tygg, 2026-09-11).
+ * The flat forms above are for small sizes and one-colour contexts. The mask
+ * id is suffixed so two copies on one page do not collide.
  */
 export const MARK_OUTLINED_SVG = "<svg viewBox=\"0 0 119 132\" role=\"img\" aria-label=\"antiproton\" focusable=\"false\"><g transform=\"translate(8,11)\"><defs><mask id=\"pbar-hole-rail\" maskUnits=\"userSpaceOnUse\" x=\"-20\" y=\"-20\" width=\"140\" height=\"140\"><rect x=\"-20\" y=\"-20\" width=\"140\" height=\"140\" fill=\"#fff\"/><circle cx=\"56\" cy=\"58\" r=\"10\" fill=\"#000\"/></mask></defs><g mask=\"url(#pbar-hole-rail)\"><g transform=\"translate(5,5)\"><line x1=\"27\" y1=\"9\" x2=\"81\" y2=\"9\" fill=\"none\" stroke=\"#141110\" stroke-width=\"24\" stroke-linecap=\"round\"/><line x1=\"34\" y1=\"36\" x2=\"34\" y2=\"96\" fill=\"none\" stroke=\"#141110\" stroke-width=\"24\" stroke-linecap=\"round\"/><circle cx=\"56\" cy=\"58\" r=\"22\" fill=\"none\" stroke=\"#141110\" stroke-width=\"24\" stroke-linecap=\"round\"/></g><line x1=\"27\" y1=\"9\" x2=\"81\" y2=\"9\" fill=\"none\" stroke=\"#141110\" stroke-width=\"24\" stroke-linecap=\"round\"/><line x1=\"34\" y1=\"36\" x2=\"34\" y2=\"96\" fill=\"none\" stroke=\"#141110\" stroke-width=\"24\" stroke-linecap=\"round\"/><circle cx=\"56\" cy=\"58\" r=\"22\" fill=\"none\" stroke=\"#141110\" stroke-width=\"24\" stroke-linecap=\"round\"/><line x1=\"27\" y1=\"9\" x2=\"81\" y2=\"9\" fill=\"none\" stroke=\"#ffd441\" stroke-width=\"14\" stroke-linecap=\"round\"/><line x1=\"34\" y1=\"36\" x2=\"34\" y2=\"96\" fill=\"none\" stroke=\"#fbfaf8\" stroke-width=\"14\" stroke-linecap=\"round\"/><circle cx=\"56\" cy=\"58\" r=\"22\" fill=\"none\" stroke=\"#fbfaf8\" stroke-width=\"14\" stroke-linecap=\"round\"/></g></g></svg>";
