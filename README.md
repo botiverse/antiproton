@@ -322,7 +322,13 @@ Benchmarks are not tests and are reported separately, because they measure a
 model as much as a harness. Each row says which environment produced it: only
 the on-object ones meet the standard above, and the in-process ones are marked
 as such. SWE-bench Verified, the same three astropy
-instances each time:
+instances each time. **Every row in this table was measured with the
+container's network open**, which SWE-bench's own runs never are: in the
+archived transcripts of the `bench-swe1` row the agent fetched the upstream fix
+for one of its three instances, and the in-process rows kept no transcripts to
+check. Read them as loop comparisons under one condition, not as solve rates;
+the rebuilt, no-egress ten-instance run is on the report page and its record
+is in `report/runs/`.
 
 | | model | resolved | wall clock | prompt tokens | measured in |
 |---|---|---|---|---|---|
