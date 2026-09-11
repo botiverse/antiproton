@@ -8,6 +8,13 @@ Each file names the object it ran against in its first three lines. They are
 the runner's own stdout, unedited apart from the removal of ANSI colour codes;
 no credentials appear in any of them.
 
+**Each τ² log prints two lines both called `pass^1`, and they are not the same
+number:** one is over *tasks* (a task passing the first trial, out of 8), the
+other over *trials* (out of 24). The table below and the report page use the
+over-tasks figure, so a run labelled `pass^1 75 %` will also show a line reading
+`pass^1 = 19/24 = 79.2 %`. Same name, different denominator — the report keeps
+them in separate columns for exactly this reason.
+
 | file | run | object | result |
 |---|---|---|---|
 | `tau2-run-C-verado1.log` | τ² run C | `bench-verado1` | pass^1 62.5 %, failures in tasks 2, 5, 6, 7 |
