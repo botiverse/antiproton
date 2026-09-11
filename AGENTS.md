@@ -42,7 +42,19 @@ Two ways this goes wrong, both of which produce an error that points at the code
 rather than at the setup:
 
 - **`npx tsx test/<name>.ts` is not the way.** The `pi-*` suites resolve their
-  imports through node, and under `tsx` they die with `ERR_MODULE_NOT_FOUND`.
+  imports through node and die with `ERR_MODULE_NOT_FOUND`, which is about the
+  runner and nothing else.
+
+- **`__name is not defined` is not a runner artefact, and do not dismiss it.**
+  It means a test is evaluating a function's **source text** —
+  `new Function(fn.toString())`, which is how a test runs JavaScript the shell
+  ships to the browser as a string — and the text came from a **bundler**, which
+  rewrites function bodies and adds a `__name` helper that does not exist inside
+  a bare `new Function`. `tsx` does it and so does wrangler's esbuild, so the
+  same failure reaches the browser with nothing to do with the test: the shipped
+  source throws. The fix is not to change the runner but to write the page's copy
+  out as plain source rather than deriving it from a compiled function, and to
+  assert that string carries no bundler helper.
 - **A fresh `git worktree` has no `node_modules`**, so the `pi-*` suites fail on
   `@earendil-works/pi-agent-core` — a package you have probably never heard of,
   failing for a reason that is about a directory and not about the branch. Link
