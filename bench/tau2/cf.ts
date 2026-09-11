@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
+import { recordRun } from "../record.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -298,6 +299,7 @@ console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} t
   `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
 
 const results: any[] = [];
+const t0Run = Date.now();
 for (let trial = 1; trial <= TRIALS; trial++) {
   for (const task of selected) {
     if (VERBOSE) console.log(`\n  task ${task.id} (trial ${trial})`);
@@ -365,4 +367,11 @@ if (act) {
     `(${wall ? Math.round((act.activeMs / 1000 / wall) * 100) : 0}%)` +
     (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
 }
+const recorded = recordRun("tau2", OBJ, {
+  bench: "tau2-retail", base: BASE, object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
+  tasks: selected.map((t) => t.id), trials: TRIALS, startedAt: new Date(t0Run).toISOString(),
+  results, passAtK: TRIALS > 1 ? Object.fromEntries([...Array(TRIALS)].map((_, k) => [k + 1, passAtK(results, k + 1)])) : undefined,
+  tools: toolTotals, endings, activity: act,
+});
+console.log(`  recorded ${recorded}`);
 console.log();

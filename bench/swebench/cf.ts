@@ -27,6 +27,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
+import { recordRun } from "../record.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -249,6 +250,7 @@ await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object` +
   `\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(80)}`);
 const out: any[] = [];
+const t0Run = Date.now();
 const RATES = ratesFromEnv();
 for (const inst of instances) {
   console.log(`  ${inst.instance_id}  (${inst.repo})`);
@@ -301,4 +303,9 @@ if (act) {
     `(${wall ? Math.round((act.activeMs / 1000 / wall) * 100) : 0}%)` +
     (grading ? `, of which ${(grading / 1000).toFixed(1)}s is this runner grading` : ""));
 }
+const recorded = recordRun("swebench", OBJ, {
+  bench: "swebench-verified", base: BASE, object: `bench-${OBJ}`, offset: OFFSET, n: instances.length,
+  startedAt: new Date(t0Run).toISOString(), results: out, totals, activity: act,
+});
+console.log(`  recorded ${recorded}`);
 console.log();
