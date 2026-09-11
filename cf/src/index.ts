@@ -1533,26 +1533,41 @@ export class AgentDO extends DurableObject<Env> {
    *  every approval the tenant has, which is what a cross-task view wants.
    *  The parameter was accepted and dropped before, so the per-task panel
    *  silently showed the tenant-wide set. */
-  async uiApprovals(tenantId: string, taskId: string) {
+  async uiApprovals(tenantId: string, agentId: string, taskId: string) {
     const rt = this.runtime();
     await rt.ready();
-    const all = await rt.store.listApprovals(tenantId);
     const raw = String(taskId ?? "").trim();
-    // Held calls carry the conversation as their task; the first conversation
-    // carries the session name the single-conversation object always used.
-    const t = raw && raw !== "null" && raw !== "undefined" ? this.#sessionOf(this.#ownerAgent() ?? "", raw) : "";
+    // No conversation named: everything the agent holds. One named: it must be
+    // the agent's own (404 otherwise, like every other route), and held calls
+    // carry the conversation as their task, the first one under the session
+    // name the single-conversation object always used.
+    const t = raw && raw !== "null" && raw !== "undefined" ? await this.#conversation(tenantId, agentId, raw) : "";
+    const all = await rt.store.listApprovals(tenantId);
     return t ? all.filter((a) => a.taskId === t) : all;
   }
 
-  async uiDecide(tenantId: string, operationId: string, decision: "approved" | "denied", approver: string) {
-    return this.#busy("uiDecide", async () => {
-      const rt = this.runtime();
-      await rt.ready();
-      const out = await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
+  async uiDecide(
+    tenantId: string, agentId: string, taskId: string,
+    operationId: string, decision: "approved" | "denied", approver: string,
+  ) {
+    const rt = this.runtime();
+    await rt.ready();
+    // The conversation is checked before anything is decided, so a foreign id
+    // is refused rather than deciding first and refusing the redraw. A panel
+    // that names no conversation is answered with the one the held call is in.
+    let t = String(taskId ?? "").trim();
+    if (!t) {
+      const held = (await rt.store.listApprovals(tenantId)).find((a) => a.operationId === operationId);
+      t = held?.taskId === LEGACY_TASK_ID ? `t_${agentId}` : (held?.taskId ?? `t_${agentId}`);
+    }
+    await this.#conversation(tenantId, agentId, t);
+    taskId = t;
+    await this.#busy("uiDecide", async () => {
+      await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
       // The decision produced a completion event; let the agent pick it up.
       await this.ctx.storage.setAlarm(Date.now());
-      return out;
     });
+    return this.uiApprovals(tenantId, agentId, taskId);
   }
 
   async startTask(tenantId: string, agentId: string, taskId: string, text: string) {
@@ -1915,6 +1930,8 @@ async function formOf(request: Request): Promise<FormData | null> {
 /** Console routes that write. Add a route here when it writes, whether it
  *  arms the object (message, decide, compact) or changes what the agent is
  *  authorised as (credential, credential/remove). */
+// What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
+const LEGACY_TASK_ID = MAIN_SESSION;
 const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/conversation"]);
 
 function uiAgent(who: string): string {
@@ -2352,8 +2369,10 @@ export default {
           return html(taskList(await stub.uiTasks("demo", uiAgent(gate.who))));
         }
         case "/ui/approvals": {
+          const gate = requireViewer(request, env);
+          if (gate instanceof Response) return gate;
           const taskId = String(url.searchParams.get("taskId"));
-          return html(approvals(await stub.uiApprovals("demo", taskId)));
+          return html(approvals(await stub.uiApprovals("demo", uiAgent(gate.who), taskId)));
         }
         case "/ui/message": {
           const form = await formOf(request);
@@ -2386,12 +2405,14 @@ export default {
           const gate = requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
+          const agentId = uiAgent(who);
           const decision = String(form.get("decision")) === "approved" ? "approved" : "denied";
+          // The panel that posted names its conversation; an older page that
+          // does not is the first one. Either way it is the viewer's own or 404.
+          const taskId = String(form.get("taskId") ?? "").trim();
           // The approver is whoever Access says is signed in — an audit record
           // with a name the caller chose would be worth nothing.
-          await stub.uiDecide("demo", String(form.get("operationId")), decision, who);
-          const taskId = `t_${uiAgent(who)}`;
-          return html(approvals(await stub.uiApprovals("demo", taskId)));
+          return html(approvals(await stub.uiDecide("demo", agentId, taskId, String(form.get("operationId")), decision, who)));
         }
         case "/isolation": {
           // Proves the property rather than asserting it: two tenants, two
