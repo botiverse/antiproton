@@ -41,8 +41,15 @@ whether or not it runs. Run them when you have the services, and treat "it is in
 Two ways this goes wrong, both of which produce an error that points at the code
 rather than at the setup:
 
-- **`npx tsx test/<name>.ts` is not the way.** The `pi-*` suites resolve their
-  imports through node, and under `tsx` they die with `ERR_MODULE_NOT_FOUND`.
+- **`npx tsx test/<name>.ts` is not the way.** It fails in two different ways,
+  neither of which is about the code under test. The `pi-*` suites resolve their
+  imports through node and die with `ERR_MODULE_NOT_FOUND`; and a case that
+  **evaluates source text** — `new Function(someSourceString)`, which is how a
+  test checks JavaScript the shell ships to the browser as a string — dies with
+  `__name is not defined`, because `tsx` compiles named functions to call a
+  helper that exists in its own scope and not inside a bare `new Function`.
+  That second one is worth knowing by name: the message reads like a typo in the
+  code under test, and the same file is green under `node test/<name>.ts`.
 - **A fresh `git worktree` has no `node_modules`**, so the `pi-*` suites fail on
   `@earendil-works/pi-agent-core` — a package you have probably never heard of,
   failing for a reason that is about a directory and not about the branch. Link
