@@ -25,12 +25,15 @@ measures real bytes on binary via `byteLength`.
 ## Running the tests
 
 **`npm run typecheck` first**, before the suites. It is a ratchet rather than a
-gate: the tree carries 36 type errors that predate any check, so `tsc` on its own
+gate: the tree carries type errors that predate any check, so `tsc` on its own
 never passes, and `scripts/typecheck.mjs` fails only on a signature that is not in
-`typecheck-baseline.txt`. That is what would have caught the use-before-declare
-that emptied three console routes today — a class no test could see, since the
-fixtures exercise each function once and the defect was in how the functions were
-reached.
+`typecheck-baseline.txt`. **An entry in that baseline is a finding still owed a
+reading, not one agreed to be harmless** — the first one read turned out to be a
+tool that had never once done what its own summary promised — so the file shrinks
+by somebody understanding an entry, and `--update` means understood, never
+ignored. That is also what would have caught the use-before-declare that emptied
+three console routes: a class no test could see, since the fixtures exercise each
+function once and the defect was in how the functions were reached.
 
 The suites in `test/` run with no external services; run them with
 `node test/<name>.ts`. How many there are and how many cases each holds moves as
