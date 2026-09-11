@@ -141,6 +141,20 @@ export async function executorSpec(exec: JsExecutor): Promise<SpecResult[]> {
     eq(r.outputs[1], "second", "later small output still recorded");
   });
 
+  test("输出按码元计", "the output cap counts UTF-16 code units, not bytes, like every …Bytes cap on a string", async () => {
+    // 50 CJK characters: 52 code units with the JSON quotes, 152 bytes. Under a
+    // cap of 100 the first fits by units and not by bytes, so this case fails
+    // the moment the cap goes back to counting bytes; the second takes the
+    // running total to 104 and is cut either way.
+    const r = await exec.execute(`output("汉".repeat(50)); output("汉".repeat(50)); output("tail");`, host(), {
+      ...DEFAULT_LIMITS,
+      maxOutputBytes: 100,
+    });
+    eq(r.outputs[0], "汉".repeat(50), "52 units fit under 100; 152 bytes would not");
+    eq((r.outputs[1] as any).truncated, true, "52 more units do not");
+    eq(r.outputs[2], "tail", "a small output after a truncation is still recorded");
+  });
+
   test("工具期间中断", "cancelling mid-call reports accepted operations rather than losing them", async () => {
     calls = [];
     const ac = new AbortController();
