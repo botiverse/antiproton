@@ -42,9 +42,12 @@ them at runtime, so their notices travel here.
 
   This one is ours rather than a third party's, and it is listed because the package
   ships no LICENSE file and no NOTICE of its own, so this repository is the only place
-  its notice can live. The console's `cf/src/rui-tokens.ts` and the report's
-  `report/public/rui-foundation.css` are copies of raft-ui 0.5.11's Elegant token
-  scopes, which is why neither is fetched at runtime.
+  its notice can live. Both copies come from raft-ui 0.5.11 and neither is
+  fetched at runtime, but they are no longer the same set: `cf/src/rui-tokens.ts`
+  carries all three of the package's theme scopes (Brutal, Elegant and Elegant
+  dark), while `report/public/rui-foundation.css` carries the Elegant scopes and
+  the Brutal ramp values the Elegant scope resolves through, without offering
+  Brutal as a theme.
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
