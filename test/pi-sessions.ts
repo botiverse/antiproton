@@ -98,6 +98,37 @@ await check("mounts, connection state and credentials are the agent's, shared by
   await store.close();
 });
 
+
+/**
+ * A session configured under one set of tool names, reopened under another.
+ * pi remembers the names and refuses every run whose names it cannot find;
+ * the rename that made every tool `alias__tool` did exactly that to every
+ * session opened before it, silently: message written, run admitted, run
+ * failed before the first model call. Open must bring the remembered names
+ * up to the offered ones.
+ */
+await check("a session that remembers old tool names runs again after the names change", async () => {
+  const host = sqliteHost();
+  const MODEL = { provider: "queue", id: "m", contextWindow: 128_000 };
+  const dispatched: string[] = [];
+  const tool = { name: "get", description: "fetch", parameters: { type: "object", properties: {} }, address: "web.get", sideEffects: "read" as const };
+  const open = () => PiAgent.open({ host, sessionId: "s", systemPrompt: "be brief", model: MODEL, tools: [tool] as any,
+    toolHost: { async invoke() { return { status: "succeeded", result: { ok: true } }; } },
+    async dispatch(id) { dispatched.push(id); } });
+  const A = await open();
+  // What a session opened before the rename remembers: the bare name.
+  await A.lane.setActiveTools(["get"], CTX);
+  await A.close();
+  const B = await open();
+  const remembered = await B.lane.getActiveTools(CTX);
+  if (!remembered.includes("web__get") || remembered.includes("get")) throw new Error(`open did not reconcile the names: ${remembered}`);
+  const said: any = await B.say("hello", "steer");
+  if (said?.ok === false) throw new Error(`say refused: ${JSON.stringify(said.error)}`);
+  const out = await B.step();
+  if (dispatched.length !== 1) throw new Error(`no model call after reopen: dispatched ${dispatched.length}, settled ${JSON.stringify(out.settled)}`);
+  await B.close(); host.dispose();
+});
+
 console.log(`\n  Sessions\n  ${"─".repeat(56)}`);
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const pass = results.filter((r) => r.ok).length;

@@ -191,17 +191,30 @@ export class PiAgent {
       }],
     }));
 
+    const bridged = bridgeTools(opts.tools, opts.toolHost);
     const { harness, open } = await AgentHarness.create({
       session: session as any,
       models,
       model: models.getModel(opts.model.provider, opts.model.id)!,
       systemPrompt: opts.systemPrompt,
-      tools: bridgeTools(opts.tools, opts.toolHost) as any,
+      tools: bridged as any,
       // There is no non-deferred path; this makes the intent explicit to pi.
       streamOptions: { deferred: true },
     }, CTX);
 
     const lane = await harness.lane(LANE, CTX);
+    // pi keeps the names of the tools a session was configured with, and
+    // refuses every run whose configured names are not all offered by this
+    // process (`configured_tools_unavailable`). The names are ours to choose
+    // and they have changed once already (every tool became alias__tool), so a
+    // session opened before that change failed silently on every message
+    // after it: the message was written, the run was admitted, and it ended
+    // failed before the first model call. The current tool list is the truth
+    // here; what the session remembers follows it.
+    const offered = bridged.map((t) => t.name);
+    const remembered = await lane.getActiveTools(CTX);
+    const same = remembered.length === offered.length && remembered.every((n) => offered.includes(n));
+    if (remembered.length && !same) await lane.setActiveTools(offered, CTX);
     const self = new PiAgent(opts, storage, harness, lane, open);
     agent.current = self;
     return self;
