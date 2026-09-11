@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="elegant">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -10,55 +10,41 @@
 <link rel="apple-touch-icon" href="/favicon-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/rui-foundation.css">
 <style>
+/* The page's own names, aliased onto rUI's tokens. Light and dark both come
+   from the foundation; nothing here names a colour. `accent` on this page is
+   the expressive role — the eyebrow, figures, the thesis rule — which in rUI is
+   the primary (Source Yellow) family, not the pink accent reserved for actions. */
 :root{
-  --ground:#F5F8F7; --surface:#FFFFFF; --sunk:#EDF2F1;
-  --ink:#131C1B; --muted:#586866; --faint:#7C8C8A;
-  --line:#D9E2E0; --line-strong:#BFCCC9;
-  --accent:#0E6E63; --accent-soft:#D7EBE7;
-  --good:#2F6B45; --warn:#8F5D0C; --bad:#9A2E2E;
-  --good-soft:#DEEDE2; --warn-soft:#F6E9D2; --bad-soft:#F3DEDC;
+  --ground:var(--layer-canvas); --surface:var(--layer-card); --sunk:var(--layer-inset);
+  --ink:var(--foreground); --muted:var(--foreground-muted); --faint:var(--foreground-hint);
+  --line:var(--line-muted); --line-strong:var(--line);
+  --accent:var(--primary-strong); --accent-soft:var(--primary-soft); --accent-mark:var(--primary-400);
+  --good:var(--success-strong); --warn:var(--warning-strong); --bad:var(--danger-strong);
+  --good-soft:var(--success-soft); --warn-soft:var(--warning-soft); --bad-soft:var(--danger-soft);
   --measure:34rem;
-}
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]){
-    --ground:#0E1413; --surface:#151D1C; --sunk:#111817;
-    --ink:#E1EAE8; --muted:#93A6A3; --faint:#748784;
-    --line:#232F2D; --line-strong:#31403D;
-    --accent:#4FC9B7; --accent-soft:#16302C;
-    --good:#79C494; --warn:#D6A559; --bad:#DE8A85;
-    --good-soft:#16281D; --warn-soft:#2A2114; --bad-soft:#2C1A19;
-  }
-}
-:root[data-theme="dark"]{
-  --ground:#0E1413; --surface:#151D1C; --sunk:#111817;
-  --ink:#E1EAE8; --muted:#93A6A3; --faint:#748784;
-  --line:#232F2D; --line-strong:#31403D;
-  --accent:#4FC9B7; --accent-soft:#16302C;
-  --good:#79C494; --warn:#D6A559; --bad:#DE8A85;
-  --good-soft:#16281D; --warn-soft:#2A2114; --bad-soft:#2C1A19;
 }
 
 *{box-sizing:border-box}
 body{
   background:var(--ground); color:var(--ink);
-  font-family:"Source Serif 4",Georgia,"Times New Roman",serif;
+  font-family:var(--sans-font);
   font-size:17px; line-height:1.62;
   -webkit-font-smoothing:antialiased;
 }
 .wrap{max-width:60rem; margin:0 auto; padding:0 1.5rem 6rem}
 .col{max-width:var(--measure)}
 
-h1,h2,h3,.lbl,.num,.pill,th{font-family:"Familjen Grotesk",system-ui,sans-serif}
-.mono,code,pre,.fig{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+h1,h2,h3,.lbl,.num,.pill,th{font-family:var(--heading-font)}
+.mono,code,pre,.fig{font-family:var(--mono-font)}
 
 /* ---- masthead ---------------------------------------------------- */
 .mast{border-bottom:1px solid var(--line-strong); padding:3.5rem 0 2rem; display:flex; flex-direction:column; gap:1.25rem}
 .mast .brand{display:block; color:var(--ink); width:fit-content; margin-bottom:-.25rem}
 .mast .brand svg{height:1.75rem; width:auto; display:block}
 .eyebrow{
-  font-family:"IBM Plex Mono",monospace; font-size:.72rem; letter-spacing:.14em;
+  font-family:var(--mono-font); font-size:.72rem; letter-spacing:.14em;
   text-transform:uppercase; color:var(--accent); font-weight:500;
 }
 h1{
@@ -66,13 +52,13 @@ h1{
   letter-spacing:-.022em; text-wrap:balance; max-width:20ch;
 }
 .standfirst{color:var(--muted); font-size:1.075rem; max-width:46ch; margin:0}
-.mast-meta{display:flex; flex-wrap:wrap; gap:.5rem 1.75rem; font-family:"IBM Plex Mono",monospace; font-size:.76rem; color:var(--faint)}
+.mast-meta{display:flex; flex-wrap:wrap; gap:.5rem 1.75rem; font-family:var(--mono-font); font-size:.76rem; color:var(--faint)}
 .mast-meta b{color:var(--muted); font-weight:500}
 
 /* ---- the one fact ------------------------------------------------ */
 .thesis{
   margin:2.5rem 0 0; padding:1.5rem 1.6rem; background:var(--surface);
-  border:1px solid var(--line); border-left:3px solid var(--accent);
+  border:1px solid var(--line); border-left:3px solid var(--accent-mark);
 }
 .thesis p{margin:0; max-width:52ch}
 .thesis p + p{margin-top:.8rem}
@@ -84,7 +70,7 @@ h2{
   text-wrap:balance;
 }
 .sec-note{color:var(--faint); font-size:.86rem; margin:0 0 1.5rem; max-width:52ch;
-  font-family:"IBM Plex Mono",monospace}
+  font-family:var(--mono-font)}
 p{margin:0 0 1rem}
 a{color:var(--accent)}
 
@@ -92,7 +78,7 @@ a{color:var(--accent)}
 .own{display:grid; gap:1px; background:var(--line); border:1px solid var(--line); margin:1.5rem 0}
 @media(min-width:46rem){.own{grid-template-columns:repeat(4,1fr)}}
 .own div{background:var(--surface); padding:1.05rem 1.15rem; display:flex; flex-direction:column; gap:.35rem}
-.own .who{font-family:"IBM Plex Mono",monospace; font-size:.72rem; letter-spacing:.1em;
+.own .who{font-family:var(--mono-font); font-size:.72rem; letter-spacing:.1em;
   text-transform:uppercase; color:var(--accent)}
 .own .what{font-size:.95rem; line-height:1.45}
 
@@ -105,11 +91,11 @@ th{
   white-space:nowrap;
 }
 td{padding:.62rem .9rem; border-bottom:1px solid var(--line); vertical-align:top;
-   font-family:"Source Serif 4",serif}
+   font-family:var(--sans-font)}
 tr:last-child td{border-bottom:none}
-td.n,th.n{text-align:right; font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+td.n,th.n{text-align:right; font-family:var(--mono-font); font-variant-numeric:tabular-nums;
   white-space:nowrap}
-td.k{font-family:"IBM Plex Mono",monospace; font-size:.82rem; white-space:nowrap}
+td.k{font-family:var(--mono-font); font-size:.82rem; white-space:nowrap}
 tr.total td{border-top:1px solid var(--line-strong); font-weight:600; background:var(--sunk)}
 
 /* ---- severity list ----------------------------------------------- */
@@ -120,7 +106,7 @@ tr.total td{border-top:1px solid var(--line-strong); font-weight:600; background
 .tier.quiet{border-left-color:var(--warn)}
 .tier.worst{border-left-color:var(--bad)}
 .tier h3{margin:0 0 .15rem; font-size:1rem; font-weight:600}
-.tier .how{font-family:"IBM Plex Mono",monospace; font-size:.7rem; letter-spacing:.09em;
+.tier .how{font-family:var(--mono-font); font-size:.7rem; letter-spacing:.09em;
   text-transform:uppercase; margin:0 0 .6rem}
 .tier.loud .how{color:var(--good)} .tier.quiet .how{color:var(--warn)} .tier.worst .how{color:var(--bad)}
 .tier p{margin:0; font-size:.92rem; max-width:58ch; color:var(--muted)}
@@ -132,7 +118,7 @@ code{background:var(--sunk); padding:.08em .34em; border-radius:2px; font-size:.
   border:1px solid var(--line)}
 
 /* ---- pills ------------------------------------------------------- */
-.pill{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:.68rem;
+.pill{display:inline-block; font-family:var(--mono-font); font-size:.68rem;
   letter-spacing:.06em; text-transform:uppercase; padding:.16em .5em; border-radius:2px;
   border:1px solid transparent; font-weight:500}
 .pill.ok{background:var(--good-soft); color:var(--good); border-color:var(--good)}
@@ -144,25 +130,25 @@ code{background:var(--sunk); padding:.08em .34em; border-radius:2px; font-size:.
 @media(min-width:56rem){.suites{grid-template-columns:repeat(4,1fr)}}
 .suite{background:var(--surface); padding:.85rem 1rem; display:flex; align-items:baseline;
   justify-content:space-between; gap:.75rem}
-.suite .nm{font-family:"IBM Plex Mono",monospace; font-size:.8rem}
-.suite .ct{font-family:"IBM Plex Mono",monospace; font-size:.95rem; font-weight:600;
+.suite .nm{font-family:var(--mono-font); font-size:.8rem}
+.suite .ct{font-family:var(--mono-font); font-size:.95rem; font-weight:600;
   font-variant-numeric:tabular-nums; color:var(--accent)}
 
 /* ---- deltas ------------------------------------------------------ */
 .delta{display:flex; flex-wrap:wrap; gap:1px; background:var(--line);
   border:1px solid var(--line); margin:1.4rem 0}
 .delta div{background:var(--surface); padding:1rem 1.25rem; flex:1 1 9rem}
-.delta .num{display:block; font-family:"IBM Plex Mono",monospace; font-size:1.5rem;
+.delta .num{display:block; font-family:var(--mono-font); font-size:1.5rem;
   font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-.02em}
-.delta .cap{display:block; font-family:"IBM Plex Mono",monospace; font-size:.7rem;
+.delta .cap{display:block; font-family:var(--mono-font); font-size:.7rem;
   letter-spacing:.09em; text-transform:uppercase; color:var(--faint); margin-top:.2rem}
 .delta .minus .num{color:var(--good)}
 .delta .plus .num{color:var(--muted)}
 
 footer{margin-top:4rem; padding-top:1.5rem; border-top:1px solid var(--line);
-  font-family:"IBM Plex Mono",monospace; font-size:.74rem; color:var(--faint); line-height:1.7}
+  font-family:var(--mono-font); font-size:.74rem; color:var(--faint); line-height:1.7}
 footer a{color:var(--accent)}
-:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+:focus-visible{outline:2px solid var(--accent-mark); outline-offset:2px}
 @media (prefers-reduced-motion:no-preference){
   .thesis{animation:rise .5s ease-out both}
   @keyframes rise{from{opacity:.5;transform:translateY(4px)}to{opacity:1;transform:none}}
