@@ -141,6 +141,8 @@ textarea{background:var(--layer-panel);border:1px solid var(--line-field);border
 textarea:hover{border-color:var(--line-field-hover)}
 textarea:focus{outline:0;box-shadow:0 0 0 1px var(--primary-400)}
 .view-head #agent-avatar{margin-right:2px}
+.send-err{font-size:11.5px;color:var(--bad);padding:0 13px 10px}
+.send-err[hidden]{display:none}
 .view-head .sub.faint{color:var(--faint)}
 .mount-link{display:block;padding:9px 12px;border:1px solid var(--line);border-radius:7px;margin:0 0 8px;color:var(--ink);text-decoration:none}
 .mount-link.on{border-color:var(--accent);background:var(--sunk)}
@@ -493,12 +495,13 @@ export function page(_taskId: string, who: string, agentId: string): string {
            >loading…</div>
       <div class="held" id="approvals" data-lazy hx-get="/ui/approvals" hx-swap="innerHTML"
            hx-trigger="ap:show, every 2s[${inView}]"></div>
-      <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-on::after-request="this.reset()">
+      <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-on::after-request="ap.sent(this, event)">
         <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
         <button type="submit" name="mode" value="steer">send</button>
         <button type="submit" name="mode" value="followUp" class="ghost"
                 title="Held back until the agent has finished everything it is doing">after</button>
       </form>
+      <div class="err send-err" id="send-err" hidden></div>
     </div>
     <div class="hint" style="padding:0">Sending while it works steers it: the message reaches the model before its next call.
       <b>after</b> holds the message until it has finished. A held call shows above the composer until you sign it.</div>
@@ -562,6 +565,16 @@ export function page(_taskId: string, who: string, agentId: string): string {
       banner.querySelector('.text').textContent = n === 1
         ? '1 call is waiting for you: ' + (first ? first.textContent : '')
         : n + ' calls are waiting for you';
+    },
+    // A send that the server refused must not vanish: htmx swaps nothing on
+    // a non-2xx, and a form that resets regardless would eat the text and say
+    // nothing. Keep what was typed and say why, under the composer.
+    sent(form, ev) {
+      const err = document.getElementById('send-err');
+      if (ev.detail.successful) { form.reset(); err.hidden = true; return; }
+      const xhr = ev.detail.xhr, body = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 200) : '';
+      err.textContent = 'not sent: ' + (xhr ? xhr.status + ' ' : '') + (body || (xhr && xhr.status ? '' : 'could not reach the server'));
+      err.hidden = false;
     },
     // Switching agents: the agent id goes on the URL and every panel
     // request carries it from there (the configRequest hook below).
