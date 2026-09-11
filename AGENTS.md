@@ -22,6 +22,36 @@ what it bounds is a string, which is everywhere except binary payloads. They are
 coherent because they all count the same unit, and `src/store/artifacts.ts`
 measures real bytes on binary via `byteLength`.
 
+## Running the tests
+
+Fifteen suites run with no external services; run them with `node test/<name>.ts`.
+(Which suites and how many cases move as work lands — count them rather than
+trusting a number in a document, including this one.) There are three more files
+in `test/` that are not part of that set and are meant to be skipped unless you
+have the services: `appworld` needs both AppWorld servers running locally
+(`appworld serve apis --port 8800`, `environment --port 8799`), and `live-e2e`
+and `live-github` reach out to live endpoints.
+
+Two ways this goes wrong, both of which produce an error that points at the code
+rather than at the setup:
+
+- **`npx tsx test/<name>.ts` is not the way.** The `pi-*` suites resolve their
+  imports through node, and under `tsx` they die with `ERR_MODULE_NOT_FOUND`.
+- **A fresh `git worktree` has no `node_modules`**, so the `pi-*` suites fail on
+  `@earendil-works/pi-agent-core` — a package you have probably never heard of,
+  failing for a reason that is about a directory and not about the branch. Link
+  the main checkout's copy before you run anything there:
+
+      ln -s "$(git rev-parse --git-common-dir)/../node_modules" node_modules
+
+  Not `--show-toplevel`: inside a linked worktree that prints the worktree, which
+  is the directory that has no `node_modules`, and the symlink would point at
+  itself.
+
+If you report a branch as green, **name the set you ran**. The suites nearest a
+change answer "is this change sound"; only the full fifteen answer "is this
+branch sound", and the two are different questions.
+
 ## Which document is authoritative
 
 [`README.md`](README.md) describes the system as it is; its numbers are measured
