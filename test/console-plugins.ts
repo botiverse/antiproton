@@ -97,7 +97,7 @@ check("attached and verified: the account, the dates, a remove that asks first, 
     credential: { attached: true, verified: true, account: "botiverse", setAt: "2026-09-11T04:00:00Z", lastUsedAt: "2026-09-11T04:30:00Z", last4: "wxyz", error: null } }));
   must(/attached · verified/.test(html), "must say verified");
   must(/acting as <code>botiverse<\/code>/.test(html), "must name the account");
-  must(!/wxyz/.test(html), "last4 must not show when there is an account to show");
+  must(!/wxyz/.test(html), "the suffix must never render");
   must(/set 2026-09-11 04:00Z/.test(html) && /last used 2026-09-11 04:30Z/.test(html), "dates must render when present");
   must(/hx-post="\/ui\/credential\/remove"[^>]*hx-confirm=/.test(html.replace(/\n/g, " ")), "remove must confirm");
   must(/<details><summary>replace<\/summary>/.test(html), "replace must be folded away");
@@ -108,7 +108,7 @@ check("verified is the store's fact, not an inference: a check that returned no 
   const html = render(mount("gh", "github", { connected: true, credential: { attached: true, verified: true, account: null, last4: "wxyz" } }));
   must(/attached · verified/.test(html), "verified without a name is still verified");
   must(!/acting as/.test(html), "no name means no acting-as");
-  must(!/wxyz/.test(html) || /ends in/.test(html), "the suffix may only appear with its label");
+  must(!/wxyz/.test(html), "the suffix must never render");
 });
 
 check("an account without verified is not promoted to verified", () => {
@@ -117,11 +117,11 @@ check("an account without verified is not promoted to verified", () => {
   must(/as <code>someone<\/code>/.test(html), "the name still shows");
 });
 
-check("attached and unverified: says so, shows the suffix, and never the word undefined", () => {
+check("attached and unverified: says so, shows no fragment of the key, and never the word undefined", () => {
   const html = render(mount("r9", "run9", { connected: true, credential: { attached: true, account: null, last4: "wxyz", setAt: null, lastUsedAt: null, error: null } }));
   must(/attached · unverified/.test(html), "must say unverified");
   must(/stored, not yet tried/.test(html), "must explain what unverified means");
-  must(/ends in <code>wxyz<\/code>/.test(html), "the suffix is the only handle when there is no account");
+  must(!/wxyz|ends in/.test(html), "the last four characters are part of the key and must never render");
   must(!/undefined|null|Invalid Date/.test(html), "nothing may render as undefined, null or an invalid date");
 });
 

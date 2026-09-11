@@ -833,7 +833,10 @@ const when = (v: unknown): string | null => {
  * TypeError, and every field's `secret` and `required` arrive as booleans. The
  * value itself is never here: inputs are never prefilled, the read block
  * carries only whether one is attached, who it acts as, and when. Each of
- * those renders only when the store actually produced it.
+ * those renders only when the store actually produced it. The store also
+ * keeps the value's last four characters; the page does not read them. An
+ * account name is a label the provider chose, while a suffix is a fragment of
+ * the secret, and nothing that is part of a key belongs on screen.
  *
  * Attached comes in two strengths — verified, when the plugin's check made a
  * call and returned who the key acts as, and unverified, when it was stored
@@ -883,12 +886,11 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   // one, is shown rather than being what the state is inferred from.
   const account = typeof c.account === "string" && c.account ? c.account : null;
   const verified = c.verified === true;
-  const last4 = !account && typeof c.last4 === "string" && c.last4 ? c.last4 : null;
   const setAt = when(c.setAt), usedAt = when(c.lastUsedAt);
   const times = [setAt ? `set ${setAt}` : "", usedAt ? `last used ${usedAt}` : ""].filter(Boolean).join(" · ");
   const state = verified
     ? `<b>attached · verified</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}`
-    : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">stored, not yet tried${last4 ? `; ends in <code>${esc(last4)}</code>` : ""}</span>`;
+    : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">stored, not yet tried</span>`;
   return `<div class="cred">
       <div class="state">${state}${times ? `<span class="when">${times}</span>` : ""}
         <form class="inline" hx-post="/ui/credential/remove" ${target}
