@@ -20,10 +20,6 @@ cf/src/index.ts: error TS2339: Property 'total' does not exist on type 'never'.
 cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
 cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
 src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.
-src/plugins/run9.ts: error TS2339: Property 'liveMs' does not exist on type '{ boxId: string; freed: boolean; error?: string | undefined; }'.
-src/plugins/run9.ts: error TS2339: Property 'startFrom' does not exist on type 'never'.
-src/plugins/run9.ts: error TS2353: Object literal may only specify known properties, and 'liveMs' does not exist in type '{ boxId: string; freed: boolean; error?: string | undefined; }'.
-src/plugins/state.ts: error TS2339: Property 'tail' does not exist on type '{ readonly key: "todo"; readonly budget: 2000; readonly what: "open items"; } | { readonly key: "memory"; readonly budget: 4000; readonly what: "durable facts"; } | { readonly key: "journal"; readonly budget: 3000; readonly what: "recent log"; readonly tail: true; }'.
 src/store/artifacts.ts: error TS2554: Expected 0 arguments, but got 1.
 test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap.
 test/secrets.ts: error TS7006: Parameter '_args' implicitly has an 'any' type.

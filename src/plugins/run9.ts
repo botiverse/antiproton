@@ -162,7 +162,9 @@ const DEFAULTS = {
  * on the theory that "the box stops itself eventually"; the result was thirteen
  * live boxes and a release path that had been announcing success the whole time.
  */
-async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: boolean; error?: string } | null> {
+async function stopBox(
+  ctx: PluginContext,
+): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number } | null> {
   const state = (await ctx.connection.get()) as BoxState | null;
   if (!state?.boxId || !ctx.credential) return null;
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
@@ -549,7 +551,11 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     if (!state) {
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
-      const from = state?.startFrom ?? (prior as any)?.startFrom;
+      // `state` is null in this branch by construction — the line above nulls an
+      // emptied record, and `start_from` writes exactly that — so the value can
+      // only come from the record read at the top of this call. `BoxState`
+      // declares the field, so there is nothing here to cast around either.
+      const from = prior?.startFrom;
       const declared = cfg.secrets ?? [];
       // Before the box exists, because after it exists a throw leaks it.
       //

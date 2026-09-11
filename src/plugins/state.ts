@@ -62,11 +62,15 @@ const DEFAULTS: Required<Omit<StateConfig, "account">> = {
 
 /** The documents the harness injects when it opens. Named here so the tool
  *  summaries, the injection and the operator view cannot drift apart. */
-export const WORKING_SET = [
+export const WORKING_SET: ReadonlyArray<{
+  key: string; budget: number; what: string;
+  /** Keep the end rather than the beginning when it does not fit. */
+  tail?: boolean;
+}> = [
   { key: "todo", budget: 2000, what: "open items" },
   { key: "memory", budget: 4000, what: "durable facts" },
   { key: "journal", budget: 3000, what: "recent log", tail: true },
-] as const;
+];
 
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
