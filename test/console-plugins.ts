@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, inbox, taskList, mountList, catalogue } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -283,6 +283,22 @@ check("a conversation row shows its title, or a dash, and never the id dressed a
   must(/data-title="—"/.test(html) && /<span class="title">—<\/span>/.test(html), "a missing title is a dash");
   must(/<span class="tid">t_u-x<\/span>/.test(html), "the id stays in the meta line");
   must(!html.includes("<img src=x"), "titles are escaped");
+});
+
+// The credential form lives inside a panel that polls, and a poll that swaps
+// the panel empties the form under the person's cursor (#86). The guard is one
+// attribute on the shell; this keeps a later edit to that attribute honest.
+check("the plugins panel's poll waits while a person is typing in it", () => {
+  const html = page("t_u-x", "someone", "u-x");
+  const panel = html.match(/<div class="body" id="plugins"[^>]*>/)?.[0] ?? "";
+  must(panel, "the plugins panel is in the shell");
+  must(/hx-trigger="[^"]*every \d+s\[[^\]]*!ap\.editing\('#plugins'\)/.test(panel), "the every-Ns trigger is gated on ap.editing('#plugins')");
+  const fn = html.match(/editing\(sel\) \{[\s\S]*?\n    \},/)?.[0] ?? "";
+  must(/document\.activeElement/.test(fn), "ap.editing looks at focus");
+  // The value half is the load-bearing one: a person who fills the box,
+  // clicks away to check the token, and comes back must still find it.
+  must(/el\.value/.test(fn), "ap.editing also looks at a non-empty value, not only focus");
+  must(/type !== 'hidden'/.test(fn), "the hidden alias field does not count as typing");
 });
 
 const failed = results.filter((r) => !r.ok);
