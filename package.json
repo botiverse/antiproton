@@ -14,6 +14,7 @@
     "pi-bridge": "node test/pi-bridge.ts",
     "pi-agent": "node test/pi-agent.ts",
     "release": "node test/release.ts",
+    "auth": "node test/auth.ts",
     "typecheck": "node scripts/typecheck.mjs"
   },
   "dependencies": {
