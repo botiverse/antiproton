@@ -1473,13 +1473,23 @@ function mountBlock(d: any, m: any): string {
       <div class="hint" style="padding-top:6px">${
         m.tools.length
           ? m.tools.map((t: string) => {
-              const bare = t.split(".").slice(1).join(".");
+              // The usage map is keyed by the plugin's own tool name; the
+              // list carries the model-visible one, alias first. Strip the
+              // alias whichever separator the route joined it with (#118
+              // moves it from "." to "__"), and print the name as given.
+              const bare = bareTool(t, String(m.alias ?? ""));
               const n = used[bare] ?? 0;
               return `<code class="${n ? "hot" : ""}">${esc(t)}${n ? ` ×${n}` : ""}</code>`;
             }).join(" ")
           : "no tools"
       }</div>
     </div>`;
+}
+
+/** A mount's tool name without its alias prefix, whether joined by "." or "__". */
+export function bareTool(name: string, alias: string): string {
+  for (const sep of ["__", "."]) if (alias && name.startsWith(alias + sep)) return name.slice(alias.length + sep.length);
+  return name;
 }
 
 /** The sidebar's list of mounts: alias, plugin, and whether an account is attached. */
