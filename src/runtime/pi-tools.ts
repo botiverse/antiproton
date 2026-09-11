@@ -147,7 +147,8 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
     // a plugin whose mount owns one container cannot survive that.
     ...(t.exclusive ? { executionMode: "sequential" as const } : {}),
     async execute(_toolCallId: string, params: Json) {
-      const res = await host.invoke({ tool: t.address, args: params });
+      const lifted = liftConfirm(params);
+      const res = await host.invoke({ tool: t.address, args: lifted.args, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
       if (res.status !== "succeeded") {
         // pi asks tools to throw rather than encode failure in content, so the
         // harness can tell a refusal from an answer.
@@ -186,6 +187,22 @@ export interface Sandbox {
     hostCalls?: number;
     acceptedOperationIds?: string[];
   }>;
+}
+
+/**
+ * The one word the model may add to any call: `confirm: true` asks for a
+ * person's approval before the call runs. It is lifted out here, at the
+ * boundary where the model's arguments become the gateway's call, and travels
+ * as an option — so no plugin ever sees it, and no plugin's own parameter
+ * named `confirm` is ever mistaken for it once it is past this point. Only a
+ * literal `true` counts; anything else is an ordinary argument.
+ */
+export function liftConfirm(args: Json): { args: Json; confirm: boolean } {
+  if (args && typeof args === "object" && !Array.isArray(args) && (args as Record<string, unknown>).confirm === true) {
+    const { confirm: _c, ...rest } = args as Record<string, Json>;
+    return { args: rest, confirm: true };
+  }
+  return { args, confirm: false };
 }
 
 export const RUN_JS_DESCRIPTION =
@@ -235,11 +252,15 @@ export function runJsTool(
       const r = await sandbox.execute(String(params.source), {
         // A stable key per call inside one execution, so a repeat reaches the
         // same operation rather than minting a new one.
-        invoke: (call: any) => host.invoke({
-          ...call,
-          tool: address(call.tool),
-          opts: { ...(call.opts ?? {}), idempotencyKey: `${toolCallId}:${n++}` },
-        }),
+        invoke: (call: any) => {
+          const lifted = liftConfirm(call.args);
+          return host.invoke({
+            ...call,
+            tool: address(call.tool),
+            args: lifted.args,
+            opts: { ...(call.opts ?? {}), ...(lifted.confirm ? { confirm: true } : {}), idempotencyKey: `${toolCallId}:${n++}` },
+          });
+        },
       }, opts.limits);
       await opts.onCalls?.(r.hostCalls ?? 0);
       if (r.status !== "ok" && r.status !== "succeeded") {

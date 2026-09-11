@@ -187,10 +187,17 @@ export class ToolGateway {
     ctx: CallContext,
     raw: string,
     args: Json,
-    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string } = {},
+    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string; confirm?: boolean } = {},
   ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
     if ("error" in r) return { status: "rejected", error: r.error };
+    // The agent's own hold: a call sent with `opts.confirm` is held exactly as
+    // a policy hold would be, and the person decides. It is an option, not an
+    // argument, so the plugin's parameter names stay its own (appworld
+    // forwards every argument it receives to an API whose names nobody here
+    // chose). The model can only write arguments; the bridge lifts the field
+    // out at the model boundary (pi-tools.ts, `liftConfirm`).
+    const confirm = opts.confirm === true;
 
     const plugin = this.#plugins.get(r.mount.plugin);
     if (!plugin) {
@@ -243,7 +250,7 @@ export class ToolGateway {
       toolVersion: r.mount.toolVersion,
     });
 
-    const verdict = opts.approved ? "allow" : policyFor(r.mount.policy, r.tool, schema.sideEffects);
+    const verdict = opts.approved ? "allow" : confirm ? "approval" : policyFor(r.mount.policy, r.tool, schema.sideEffects);
     if (verdict === "deny") {
       return {
         status: "rejected",
@@ -256,7 +263,9 @@ export class ToolGateway {
       // on the operation and is woken by the decision.
       await this.#store.requireApproval({
         tenantId: ctx.tenantId, operationId, agentId: ctx.agentId, taskId: ctx.taskId,
-        mountAlias: r.mount.alias, tool: r.tool, request: { tool: raw, args },
+        mountAlias: r.mount.alias, tool: r.tool,
+        // `heldBy` tells the card who asked for it: a policy, or the agent.
+        request: { tool: raw, args, heldBy: confirm ? "agent" : "policy" },
       });
       return {
         status: "pending",

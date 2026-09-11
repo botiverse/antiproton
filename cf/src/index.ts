@@ -1485,7 +1485,7 @@ export class AgentDO extends DurableObject<Env> {
         // named above, so the card gets the arguments themselves.
         args: (a.request as any)?.args ?? a.request,
         requestedAt: new Date(a.createdAt).toISOString(),
-        heldBy: `${a.mountAlias} policy`,
+        heldBy: (a.request as any)?.heldBy === "agent" ? "the agent" : `${a.mountAlias} policy`,
       }));
     const tasks = await rt.store.listTasks(tenantId, agentId);
     const running = tasks.filter((t) => t.status !== "completed" && t.status !== "failed").length;
