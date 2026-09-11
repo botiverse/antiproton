@@ -357,6 +357,36 @@ check("the resolver reads the declaration rather than overriding it", () => {
   if (opt!.secret !== true) throw new Error("optional is not the same question as secret");
 });
 
+/**
+ * A plugin that has something to hand back is a plugin that holds something per
+ * mount, and holding something per mount is exactly what `exclusive` exists for:
+ * two calls arriving together both find nothing, both create one, and only the
+ * last write to connection state survives. The rest become resources nobody
+ * will ever release, billed by the second — fifteen of them accumulated before
+ * the meter made it visible, which is why the flag exists at all.
+ *
+ * Neither declaration was pinned by anything until now: deleting `exclusive`
+ * from run9 broke no test, and the symptom is a bill rather than a failure.
+ */
+check("a plugin with something to release is exclusive, because holding is what exclusive is for", () => {
+  const holders = everyPlugin.filter((p) => typeof p.release === "function");
+  const unguarded = holders.filter((p) => !p.exclusive).map((p) => p.id);
+  if (unguarded.length) {
+    throw new Error(`${unguarded.join(", ")} release something per mount but allow concurrent calls`);
+  }
+  // Without this the rule above passes by having no holders at all.
+  if (!holders.some((p) => p.id === "run9")) {
+    throw new Error("run9 keeps one container per mount and must declare release; the rule is vacuous without it");
+  }
+});
+
+check("a plugin that holds nothing is not needlessly serialised", () => {
+  // The reverse is not the same rule: two http fetches do not interfere, and
+  // making everything exclusive would serialise calls that have no reason to be.
+  const idle = everyPlugin.filter((p) => p.exclusive && typeof p.release !== "function").map((p) => p.id);
+  if (idle.length) throw new Error(`${idle.join(", ")} serialise calls but hold nothing to release`);
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
