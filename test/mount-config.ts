@@ -101,6 +101,33 @@ await check("network is a mount setting", () => {
   if (p.length) throw new Error(`unexpected problems: ${p.map((x) => x.message).join("; ")}`);
 });
 
+await check("拼错的 network 会被拒绝,而不是悄悄给一张网", () => {
+  // The value came from prose — the summary said '"open" or "none"' and the
+  // field took any string — so "None" was a valid mount. The one caller that
+  // reads it from outside is `bench/swebench/cf.ts`, which passes
+  // `process.env.NETWORK` through unchecked to a benchmark whose own default
+  // is "none".
+  for (const bad of ["None", "NONE", "nome", "off"]) {
+    const p = validateMount(run9, { network: bad } as any, "env:RUN9");
+    if (!p.some((x) => x.message.includes("should be one of open, none"))) {
+      throw new Error(`${JSON.stringify(bad)} was accepted as a network: ${JSON.stringify(p)}`);
+    }
+  }
+});
+
+await check("网络开关失败时向关的一侧倒", () => {
+  // A mount written before the choices existed can still carry one of those
+  // words, so the gate itself has to hold. Anything present that is not "open"
+  // isolates; only "open" and an absent value leave the namespace alone, which
+  // is what every mount relies on today.
+  for (const bad of ["None", "NONE", "nome", "off", ""] as any[]) {
+    const argv = execArgv({ shell: "/bin/sh", network: bad }, "curl x");
+    if (argv[0] !== "unshare") {
+      throw new Error(`network ${JSON.stringify(bad)} got a route out: ${JSON.stringify(argv)}`);
+    }
+  }
+});
+
 // AppWorld's catalogue is gitignored, and a mount does not need it: one app
 // with one API is enough to build the plugin and ask it what it takes.
 const catalogue: Catalogue = {

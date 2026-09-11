@@ -142,7 +142,7 @@ const DEFAULTS = {
   workdir: "/work",
   shell: "/bin/sh",
   shellPrefix: "",
-  network: "open",
+  network: "open" as const,
   endpoint: "https://api.run.sys9.ai",
   image: "public.ecr.aws/docker/library/node:22-alpine",
   project: "default",
@@ -198,9 +198,20 @@ async function stopBox(ctx: PluginContext): Promise<{ boxId: string; freed: bool
   return { boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt };
 }
 
-/** The argv one command becomes. With `network: "none"` the shell itself is
- *  started inside an empty network namespace, so nothing the command spawns
- *  can inherit a route out. */
+/**
+ * The argv one command becomes. With `network: "none"` the shell itself is
+ * started inside an empty network namespace, so nothing the command spawns can
+ * inherit a route out.
+ *
+ * **Closed unless the value says open.** This used to isolate only on the exact
+ * word "none", so every other string — `"None"`, `"nome"`, `""` — got a network
+ * silently, and the one place that reads the setting from outside is
+ * `bench/swebench/cf.ts`, which passes `process.env.NETWORK` through unchecked
+ * to a benchmark whose own default is `"none"`. A gate that a typo opens is not
+ * a gate. An absent value is still open, because that is the declared default
+ * and mounts rely on it; a *present* value that is not `"open"` isolates, which
+ * is the direction a mistake should fail in.
+ */
 /**
  * What of a command's output the agent gets, and what it is told about the rest.
  *
@@ -236,7 +247,8 @@ export function execOutput(out: string, maxOutputBytes: number): {
 export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "open" | "none" }, command: string): string[] {
   const line = cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command;
   const argv = [cfg.shell, "-lc", line];
-  return cfg.network === "none" ? ["unshare", "-n", "--", ...argv] : argv;
+  const open = cfg.network === undefined || cfg.network === "open";
+  return open ? argv : ["unshare", "-n", "--", ...argv];
 }
 
 export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
@@ -267,7 +279,8 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     { name: "shape", type: "string", summary: "Machine size, e.g. 2c4g. Larger costs more per second." },
     { name: "shell", type: "string", summary: "Shell the shell tool runs commands in.", default: "/bin/sh" },
     { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
-    { name: "network", type: "string", summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS.", default: "open" },
+    { name: "network", type: "string", choices: ["open", "none"], default: "open",
+      summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS." },
     { name: "timeoutMs", type: "number", summary: "How long one call may take.", default: 120000 },
     { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
     { name: "secrets", type: "string[]", references: "credential",
