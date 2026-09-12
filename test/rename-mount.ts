@@ -12,7 +12,10 @@
  * the alias a call actually happened under.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
 import { agentRef } from "../src/runtime/secrets.ts";
+import { renameSafety } from "../src/plugins/types.ts";
+import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -129,6 +132,48 @@ await check("历史留在原地: 记录说的是【当时】那次调用挂在�
   if (op.mountAlias !== "node") {
     throw new Error(`history was rewritten to ${op.mountAlias}: the call happened under "node", and saying otherwise is a lie about the past`);
   }
+});
+
+await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不许改名", async () => {
+  // The rule this replaces was `state.boxId`, read by the framework. Three
+  // callers did that, each asserting that "something running" is one plugin's
+  // idea of it. Now the mount answers, and a plugin that keeps nothing answers
+  // "nothing" without knowing the question was about containers.
+  const store = await fixture();
+  const holding: Plugin = {
+    id: "run9", version: "1.0.0", tools: [],
+    async invoke() { return {}; },
+    async activity(ctx) {
+      const st: any = await ctx.connection.get();
+      // Deliberately not the plugin's own field name: whatever it keeps, the
+      // shape it answers in is the contract's.
+      return { live: st?.boxId ? { id: st.boxId, lastUsedAt: st.createdAt ?? 0 } : null };
+    },
+  };
+  const gw = new ToolGateway(store, [holding], { async resolve() { return null; } });
+  const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
+
+  const busy = await gw.mountActivity(ctx, "node");
+  if (!busy.live) throw new Error("the mount is holding b-1 and said it was holding nothing");
+  const no = renameSafety(busy, Date.now());
+  if (no.safe) throw new Error("a mount with a container running was cleared for renaming");
+  // The sentence is the contract's; which box it is and how long it has been
+  // idle come back beside it, because that is what the caller has to put in
+  // front of a person deciding between waiting and releasing.
+  if (no.live.id !== "b-1") throw new Error(`the refusal does not say what is in the way: ${JSON.stringify(no)}`);
+  if (typeof no.live.idleMs !== "number") throw new Error("the refusal does not say how long it has been idle");
+
+  // Hand the box back, and the same mount stops standing in the way.
+  await store.putConnection("t", "a", "node", { boxId: null });
+  const idle = await gw.mountActivity(ctx, "node");
+  if (idle.live) throw new Error("a mount with nothing running still reported a container");
+  if (!renameSafety(idle, Date.now()).safe) throw new Error("an idle mount was still refused");
+
+  // A plugin that never heard of containers, and a mount of a plugin that is
+  // not installed at all: both answer the true thing rather than throwing.
+  const quiet = new ToolGateway(store, [{ id: "run9", version: "1.0.0", tools: [], async invoke() { return {}; } }], { async resolve() { return null; } });
+  if ((await quiet.mountActivity(ctx, "node")).live) throw new Error("a plugin with no activity() was read as busy");
+  if ((await gw.mountActivity(ctx, "ghost")).live) throw new Error("a mount that does not exist was read as busy");
 });
 
 console.log(`\n  Renaming a mount\n  ${"─".repeat(56)}`);

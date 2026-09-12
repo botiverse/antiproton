@@ -51,7 +51,7 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm, pluginEnabled } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled, renameSafety } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -472,16 +472,17 @@ export class AgentRuntime {
    * nothing referring to it, for ever. An operator-configured reference is not
    * ours to move: it names something outside this agent.
    *
-   * **It does not yet refuse a mount with something running.** That check is
-   * written — `renameSafety` in the plugin contract — but reaching it means
-   * asking the mount whether it is busy, and the only adapter that can answer
-   * today (`activityOf`) lives inside the sandbox plugin. Calling it from here
-   * would put the framework back to importing one plugin's internals and
-   * knowing that "a container" is that plugin's idea, which is the coupling
-   * #209 removed and the one the console still owes. It waits for `activity?`
-   * on the contract, and until then nothing exposes this to a person: it is a
-   * store operation with no route and no button, so there is no path by which
-   * someone renames a machine out from under a running job.
+   * Refused while the mount is holding something. Not because the transaction
+   * could not survive it — it could — but because the thing being renamed is
+   * not only rows: a container goes on running while its state is re-keyed,
+   * and a person renaming a machine mid-run has lost track of which one it is.
+   * "Wait, or release it" is the better answer, and the refusal carries how
+   * long it has been idle, because that is the next thing they will ask.
+   *
+   * The question goes through the gateway rather than into the mount's state,
+   * so this stays ignorant of which plugin has containers and what it calls
+   * them. A plugin that keeps nothing answers "nothing", and that is correct
+   * rather than a special case.
    */
   async renameMount(
     tenantId: string, agentId: string, from: string, to: string,
@@ -489,6 +490,16 @@ export class AgentRuntime {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, from);
     if (!mount) return { ok: false, error: `no mount named ${from}` };
+    const safety = renameSafety(
+      await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, from),
+      Date.now(),
+    );
+    if (!safety.safe) {
+      // The contract's sentence, plus the two facts a person needs to choose
+      // between waiting and releasing: which one, and how long it has sat.
+      const idle = Math.round(safety.live.idleMs / 60_000);
+      return { ok: false, error: `${safety.reason} (${safety.live.id}, idle ${idle}m)` };
+    }
     // Only a credential this agent supplied moves. `operator:` references name
     // something the deployment owns, under a name that has nothing to do with
     // this mount's alias.
