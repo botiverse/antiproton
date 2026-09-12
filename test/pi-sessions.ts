@@ -113,6 +113,29 @@ await check("mounts, connection state and credentials are the agent's, shared by
  * after open, the reconcile above saw a list without it, judged the remembered
  * names stale, and switched run_js off for every agent on its second open.
  */
+/**
+ * pi remembers the model a session was configured with, and refuses every run
+ * whose remembered model this process does not register. An operator changing
+ * the binding — or a dated model id expiring — left every older session
+ * failing before its first model call, with the message written and the run
+ * admitted (`model_unavailable`, seen in production 2026-09-12).
+ */
+await check("a session that remembers another model runs again after the binding changes", async () => {
+  const host = sqliteHost();
+  const tool = { name: "get", description: "fetch", parameters: { type: "object", properties: {} }, address: "web.get", sideEffects: "read" as const };
+  const openWith = (id: string) => PiAgent.open({ host, sessionId: "s3", systemPrompt: "be brief", model: { provider: "queue", id, contextWindow: 128_000 }, tools: [tool] as any,
+    toolHost: { async invoke() { return { status: "succeeded", result: { ok: true } }; } },
+    async dispatch() {} });
+  const A = await openWith("model-of-yesterday");
+  await A.close();
+  const B = await openWith("model-of-today");
+  const model: any = await B.lane.getModel(CTX);
+  if (model?.id !== "model-of-today") throw new Error(`open did not reconcile the model: ${model?.id}`);
+  const said: any = await B.say("hello", "steer");
+  if (said?.ok === false) throw new Error(`say refused: ${JSON.stringify(said.error)}`);
+  await B.close(); host.dispose();
+});
+
 await check("a session that remembers run_js keeps it on reopen when run_js is offered", async () => {
   const host = sqliteHost();
   const MODEL = { provider: "queue", id: "m", contextWindow: 128_000 };

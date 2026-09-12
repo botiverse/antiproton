@@ -248,6 +248,20 @@ export class PiAgent {
     const remembered = await lane.getActiveTools(CTX);
     const same = remembered.length === offered.length && remembered.every((n) => offered.includes(n));
     if (remembered.length && !same) await lane.setActiveTools(offered, CTX);
+    // The same hazard, one field over: pi also remembers which model the
+    // session was configured with, and refuses every run whose remembered
+    // model this process does not register (`model_unavailable`). One
+    // process registers one model — the binding's — so a session opened
+    // under an earlier binding (a dated id that has since expired, a model
+    // the operator changed) failed on every message afterwards, silently and
+    // for ever. The binding is the truth; what the session remembers follows.
+    // `getModel` resolves what the session remembers through this process's
+    // registry, so `undefined` IS the broken state — the remembered model is
+    // one nothing here can run — and a different id is a binding that moved.
+    const current = await lane.getModel(CTX);
+    if ((current as any)?.id !== opts.model.id) {
+      await lane.setModel({ provider: opts.model.provider, modelId: opts.model.id }, CTX);
+    }
     const self = new PiAgent(opts, storage, harness, lane, open);
     agent.current = self;
     return self;
