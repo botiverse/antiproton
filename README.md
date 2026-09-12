@@ -535,16 +535,17 @@ them:
   Nothing can revoke today, which is why this is a property to preserve rather
   than a fault to fix.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,
-  a username and password, an access key and a secret key — and all three shapes
-  exist in the tree today. OAuth is a flow rather than a paste: it needs a
+  a username and password, an access key and a secret key. Those are two of the
+  three shapes a credential can have: a bare token, an object with named fields,
+  or a sign-in completed at the provider. Only the third is a flow, needing a
   callback route and a refresh when the reference is resolved, and neither is
-  built *for a mount*. The console does have a callback for signing in, which is
-  a different thing: it establishes who the person is rather than what an agent
-  may use. Until they are, a plugin can declare that its credential is a sign-in
-  (`mount-config` pins the rule at 16 cases), so the page greys the control
-  instead of offering a box that produces a mount which dies when the token
-  expires. No plugin declares one yet, so the declaration is a capability the
-  contract has rather than behaviour to observe.
+  built *for a mount* — the console has a callback for signing in, which
+  establishes who the person is rather than what an agent may use. Until they
+  exist, a plugin can declare that its credential is a sign-in (`mount-config`
+  pins the rule), so the page greys the control instead of offering a box that
+  produces a mount which dies when the token expires. No plugin declares one yet,
+  so the declaration is a capability the contract has rather than behaviour to
+  observe.
 - **Agents are named and described; nothing yet edits them.** A person owns
   several agents, each its own object with its own mounts, credentials and
   containers, and a name and description given at creation. The description is
