@@ -723,10 +723,10 @@ await check("an agent's own answer beats the plugin default, in both directions"
  * that starts claiming every agent without being seeded, or a seed for a plugin
  * that says it belongs to nobody.
  *
- * `demo` is deliberately on neither side. It was seeded for years and is being
- * taken off the seed list, so it is the one plugin where "declared" and
- * "seeded" are allowed to disagree while that lands — and when it does, this
- * test stops making an exception for it.
+ * `demo` needed an exception while it was leaving the seed list (#213). It has
+ * left, so the exception is gone: it now passes the same way every other opt-in
+ * plugin does — declared by nobody, seeded by nobody — and if anyone puts it
+ * back in either place without the other, this fails.
  */
 await check("the plugins that claim every agent are the ones actually seeded", async () => {
   const declared = new Set(
@@ -741,7 +741,7 @@ await check("the plugins that claim every agent are the ones actually seeded", a
     if (!seeded.has(id)) throw new Error(`${id} claims every agent but nothing seeds it`);
   }
   for (const id of seeded) {
-    if (id === "demo" || id === "tools" || id === "artifacts") continue;
+    if (id === "tools" || id === "artifacts") continue;
     if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
   }
 });
