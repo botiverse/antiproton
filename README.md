@@ -125,6 +125,17 @@ credential is later attached to it, so that attaching afterwards is not a way
 around a refusal the seed path would have made. A mount carrying no credential
 may leave the list unset, and then any public host is reachable.
 
+  **How a person gets in.** The console authenticates through a GitHub OAuth
+  app; there is no per-person password and no session the deployment keeps.
+  (An operator also has a long shared key a deployment can enable for
+  testing, which is an identity of its own and not a person's account.) A
+  sign-in that resolves to a row in the identity table lands on that row's
+  agent. The table is the whole of the admission rule: an account not on it
+  is refused, and a deployment can instead run open sign-up, in which a
+  first sign-in writes its own row and gets a new agent — seven seeded
+  mounts, an empty memory, and a **tenant of its own**, so one person's
+  quota and storage are not another's.
+
 [appworld]: https://github.com/StonyBrookNLP/appworld
 
 ## Architecture
@@ -527,7 +538,9 @@ them:
   a username and password, an access key and a secret key — and all three shapes
   exist in the tree today. OAuth is a flow rather than a paste: it needs a
   callback route and a refresh when the reference is resolved, and neither is
-  built. Until they are, a plugin can declare that its credential is a sign-in
+  built *for a mount*. The console does have a callback for signing in, which is
+  a different thing: it establishes who the person is rather than what an agent
+  may use. Until they are, a plugin can declare that its credential is a sign-in
   (`mount-config` pins the rule at 16 cases), so the page greys the control
   instead of offering a box that produces a mount which dies when the token
   expires. No plugin declares one yet, so the declaration is a capability the
