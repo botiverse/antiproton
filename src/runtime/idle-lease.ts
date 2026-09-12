@@ -86,12 +86,18 @@ export function idleDecision(i: IdleInput): IdleAction {
  * No configuration reaches that today, and the one that looks closest cannot:
  * the SWE benchmark withholds `release` so the agent cannot destroy the box
  * its grader is about to read, and the same decision sets `autoRelease:
- * false`, which turns this whole path off. The two flags are one requirement
- * written twice, so a run that reminds while withholding would be somebody
- * changing both. What the `null` does buy is the case that would be silent
- * rather than loud: a built name under a collision resolves to another
- * mount's tool and calls the wrong thing, while a read one is absent and the
- * type says so here rather than downstream.
+ * false`, which turns this whole path off. Both flags are on one line of
+ * `cf/src/index.ts` — one requirement written twice — so whoever runs the
+ * lease for a benchmark is un-pairing them and should read that comment
+ * first.
+ *
+ * So this is not a fix for a live path. It is why the names are read at all:
+ * reading makes every way they could diverge structurally impossible — a
+ * sanitised alias, a collision's numeric suffix, a withheld tool — rather
+ * than leaving them impossible only while two flags stay paired. One of the
+ * three would have been silent: a built name under a collision resolves to
+ * another mount's tool and calls the wrong thing, where a read one is absent
+ * and the type says so here instead of downstream.
  */
 export function nudgeText(
   alias: string,
