@@ -255,6 +255,13 @@ export class ToolGateway {
     // off still has the old tool list, and `run_js` dispatches by address —
     // both reach the mount without ever consulting a catalogue. The choke
     // point is here, as it is for credentials and policy.
+    //
+    // It costs one indexed read on the hottest path, and that is deliberate:
+    // it could be folded into the mount lookup above, which reads rows of the
+    // same agent, but then the switch would be enforced by a query written for
+    // something else. One choke point is worth more than one saved read, and
+    // this note exists so the cost reads as a decision rather than as an
+    // oversight nobody dares remove (Piper asked, 2026-09-12).
     const choices = await this.#store.pluginChoices(ctx.tenantId, ctx.agentId);
     if (!pluginEnabled(plugin, choices[r.mount.plugin])) {
       return {
