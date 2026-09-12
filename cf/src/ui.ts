@@ -195,7 +195,8 @@ flex:1;min-height:0}
    scrolling, so nine waiting calls cannot swallow the conversation and push
    the composer out of the box (tygg, 2026-09-11); the inbox is the place to
    read them all. */
-.held{border-top:1px solid var(--line);padding:0 13px;flex:none;max-height:min(40%,320px);overflow:auto}
+.held{position:sticky;bottom:-13px;margin:14px -13px -13px;padding:0 13px 3px;background:var(--panel);border-top:1px solid var(--line);max-height:min(40%,320px);overflow:auto}
+.held:has(>.empty){display:none}
 .held:empty{display:none}
 .held .card{margin:10px 0}
 .card pre,.inbox-card pre{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
@@ -542,14 +543,12 @@ ${HEAD_ASSETS}
       <a href="/ui?view=inbox" onclick="ap.show('inbox');return false">review</a></div>
     <div class="conv">
       <div class="body" id="transcript" data-lazy
-           hx-get="/ui/chat" hx-swap="innerHTML"
+           hx-get="/ui/chat?held=1" hx-swap="innerHTML"
            hx-trigger="ap:show, every 2s[${awake} && ${inView}]"
            hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
            onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
            >loading…</div>
-      <div class="held" id="approvals" data-lazy hx-get="/ui/approvals" hx-swap="innerHTML"
-           hx-trigger="ap:show, every 2s[${awake} && ${inView}]"></div>
-      <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-on::after-request="ap.sent(this, event)">
+      <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-vals='{"held":"1"}' hx-on::after-request="ap.sent(this, event)">
         <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
         <button type="submit" name="mode" value="steer">send</button>
         <button type="submit" name="mode" value="followUp" class="ghost"

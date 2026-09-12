@@ -51,6 +51,15 @@ check("the page catches up when the tab is shown again", () => {
     for (const m of reassigned) must(/delete panel\.dataset\.ver;/.test(m[1]), `a reassigned URL must forget the old version: ${m[0].slice(0, 80)}`);
   });
 
+check("the held cards ride with the chat, in one fragment under one version", () => {
+  must(!/hx-get="\/ui\/approvals"/.test(html), "no element may poll /ui/approvals on its own");
+  must(!/id="approvals"/.test(html), "the wrapper the decide buttons target arrives inside the chat fragment, not in the shell");
+  must(/id="transcript"[^>]*\s+hx-get="\/ui\/chat\?held=1"/.test(html), "the transcript must ask for the held cards");
+  must(/hx-post="\/ui\/message"[^>]*hx-vals='\{"held":"1"\}'/.test(html), "a sent message must redraw the transcript with the held cards too");
+  must(/\.held\{position:sticky;bottom:-13px;/.test(html), "inside the scrolling body the block must stick above the composer, as the old strip always showed");
+  must(/\.held:has\(>\.empty\)\{display:none\}/.test(html), "with nothing waiting the block must not draw; the hint under the composer already says where a held call shows");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);
