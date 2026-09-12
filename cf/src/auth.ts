@@ -13,7 +13,7 @@
  * `node test/auth.ts` and by the deployed Worker.
  */
 
-export type ViewerSource = "raft" | "automation" | "qa" | "anonymous";
+export type ViewerSource = "raft" | "github" | "automation" | "qa" | "anonymous";
 
 /** A resolved identity. `email` doubles as the stable key an agent hangs off. */
 export interface Viewer {
@@ -22,6 +22,9 @@ export interface Viewer {
   username: string | null;
   picture: string | null;
   source: ViewerSource;
+  /** The agent this person owns, when the sign-in resolved one through the
+   *  identity table (GitHub). Absent for identities keyed on their email. */
+  agentId?: string;
 }
 
 /** What the session cookie carries. Sealed, never trusted unsealed. */
@@ -32,7 +35,10 @@ export interface SessionClaims {
   username: string | null;
   picture: string | null;
   sub: string;
-  source: "raft" | "qa";
+  source: "raft" | "qa" | "github";
+  /** Resolved at sign-in from the identity table; a session carries it so
+   *  no request has to look it up again. */
+  agentId?: string;
   iat: number;
   exp: number;
 }
@@ -339,9 +345,14 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
   if (env.SESSION_SECRET) {
     const s = await open<SessionClaims>(env.SESSION_SECRET, readCookie(request, SESSION_COOKIE), opts.now);
     if (s && s.v === 1 && typeof s.who === "string" && s.who) {
-      return s.source === "qa"
-        ? QA_VIEWER
-        : { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "raft" };
+      if (s.source === "qa") return QA_VIEWER;
+      if (s.source === "github") {
+        // A GitHub session without its agent is not an identity: the key is
+        // the mapping, and a cookie that lost it names nobody.
+        if (typeof s.agentId !== "string" || !s.agentId) return null;
+        return { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "github", agentId: s.agentId };
+      }
+      return { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "raft" };
     }
   }
   const token = request.headers.get("x-harness-token");
@@ -357,8 +368,103 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
 export async function sessionCookieFor(secret: string, v: Viewer, sub: string, now = Date.now()): Promise<string> {
   const claims: SessionClaims = {
     v: 1, who: v.email, name: v.name, username: v.username, picture: v.picture, sub,
-    source: v.source === "qa" ? "qa" : "raft",
+    source: v.source === "qa" ? "qa" : v.source === "github" ? "github" : "raft",
+    ...(v.agentId ? { agentId: v.agentId } : {}),
     iat: now, exp: now + SESSION_TTL_MS,
   };
   return cookieHeader(SESSION_COOKIE, await seal(secret, claims), SESSION_TTL_MS / 1000);
+}
+
+// ---- Login with GitHub ---------------------------------------------------------
+//
+// The OAuth web flow, no OpenID: GitHub hands back an access token, and the
+// profile comes from its API under that token. The identity is GitHub's
+// numeric user id, never the login (a login can be renamed) and never the
+// email (GitHub need not expose one), and the console keys nothing off it
+// directly: the id is looked up in the identity table, and only an id that
+// maps to an agent is admitted. Everyone else is refused by default, because
+// an open door here would let any GitHub account start an agent on the
+// operator's model account.
+
+export interface GithubConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+}
+
+export const GITHUB_AUTHORIZE = "https://github.com/login/oauth/authorize";
+export const GITHUB_TOKEN = "https://github.com/login/oauth/access_token";
+export const GITHUB_API = "https://api.github.com";
+/** GitHub refuses API calls without a User-Agent; this names the caller. */
+const GITHUB_UA = "antiproton-console";
+
+export function githubAuthorizeUrl(cfg: GithubConfig, state: string): string {
+  const u = new URL(GITHUB_AUTHORIZE);
+  u.searchParams.set("client_id", cfg.clientId);
+  u.searchParams.set("redirect_uri", cfg.redirectUri);
+  u.searchParams.set("scope", "read:user user:email");
+  u.searchParams.set("state", state);
+  u.searchParams.set("allow_signup", "false");
+  return u.toString();
+}
+
+export async function githubExchangeCode(cfg: GithubConfig, code: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+  const r = await fetchImpl(GITHUB_TOKEN, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json", "user-agent": GITHUB_UA },
+    body: JSON.stringify({ client_id: cfg.clientId, client_secret: cfg.clientSecret, code, redirect_uri: cfg.redirectUri }),
+  });
+  if (!r.ok) throw new Error(`github token exchange failed: ${r.status} ${(await r.text()).slice(0, 300)}`);
+  const j = (await r.json()) as { access_token?: string; error?: string; error_description?: string };
+  // GitHub answers 200 with an error body for a bad code.
+  if (!j.access_token) throw new Error(`github token exchange refused: ${j.error ?? "no token"} ${j.error_description ?? ""}`.trim());
+  return j.access_token;
+}
+
+export interface GithubProfile {
+  id: number;
+  login: string;
+  name?: string | null;
+  avatar_url?: string | null;
+  email?: string | null;
+}
+
+export interface GithubEmail { email: string; primary: boolean; verified: boolean }
+
+export async function githubFetchProfile(accessToken: string, fetchImpl: typeof fetch = fetch): Promise<{ profile: GithubProfile; emails: GithubEmail[] }> {
+  const headers = { authorization: `Bearer ${accessToken}`, accept: "application/vnd.github+json", "user-agent": GITHUB_UA };
+  const u = await fetchImpl(`${GITHUB_API}/user`, { headers });
+  if (!u.ok) throw new Error(`github user failed: ${u.status}`);
+  const profile = (await u.json()) as GithubProfile;
+  if (typeof profile.id !== "number" || !profile.login) throw new Error("github user: no id");
+  // The emails endpoint needs user:email; a token without it answers 404,
+  // and a profile without an email is still an identity here.
+  let emails: GithubEmail[] = [];
+  const e = await fetchImpl(`${GITHUB_API}/user/emails`, { headers });
+  if (e.ok) emails = (await e.json()) as GithubEmail[];
+  return { profile, emails };
+}
+
+/** The key the identity table is looked up by: the numeric id, never the login. */
+export function githubIdentityKey(profile: Pick<GithubProfile, "id">): string {
+  return `github:${profile.id}`;
+}
+
+/**
+ * The viewer for an admitted GitHub sign-in. `email` is display and audit
+ * only: the verified primary address when GitHub exposes one, otherwise a
+ * name that can never be mistaken for one. The agent comes from the table.
+ */
+export function githubViewer(profile: GithubProfile, emails: GithubEmail[], agentId: string): Viewer {
+  const primary = emails.find((m) => m.primary && m.verified)?.email
+    ?? emails.find((m) => m.verified)?.email
+    ?? null;
+  return {
+    email: primary ?? `github:${profile.login}`,
+    name: profile.name ?? null,
+    username: profile.login,
+    picture: profile.avatar_url ?? null,
+    source: "github",
+    agentId,
+  };
 }
