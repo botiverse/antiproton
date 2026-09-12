@@ -9,6 +9,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { Ledger, secondsOf, usage, type BoxRow } from "../broker/src/ledger.ts";
 
+
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
   try { fn(); results.push({ name, ok: true }); }

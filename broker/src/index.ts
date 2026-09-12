@@ -17,7 +17,7 @@
  * No prices, no quotas, no invoices — quantities only.
  */
 import { DurableObject } from "cloudflare:workers";
-import { decide } from "./route.ts";
+import { decide, presented } from "./route.ts";
 import { Ledger, usage } from "./ledger.ts";
 
 export interface Env {
@@ -59,13 +59,13 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const ledger = env.LEDGER.get(env.LEDGER.idFromName("ledger")) as any;
-    const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+    const presentedToken = presented(request.headers.get("authorization"));
 
     // Operator routes first, and separated by their own secret: issuing a token
     // and using one are different authorities, and a service that muddles them
     // lets a tenant mint a tenant.
     if (url.pathname === "/admin/token" && request.method === "POST") {
-      if (!env.ADMIN_TOKEN || bearer !== env.ADMIN_TOKEN) return json({ error: "not an operator" }, 401);
+      if (!env.ADMIN_TOKEN || presentedToken !== env.ADMIN_TOKEN) return json({ error: "not an operator" }, 401);
       const body = (await request.json().catch(() => null)) as any;
       if (!body?.tenantId || !body?.agentId || !body?.token) {
         return json({ error: "tenantId, agentId and token are required" }, 400);
@@ -78,12 +78,12 @@ export default {
     }
 
     if (url.pathname === "/admin/usage" && request.method === "GET") {
-      if (!env.ADMIN_TOKEN || bearer !== env.ADMIN_TOKEN) return json({ error: "not an operator" }, 401);
+      if (!env.ADMIN_TOKEN || presentedToken !== env.ADMIN_TOKEN) return json({ error: "not an operator" }, 401);
       return json({ since: Number(url.searchParams.get("since") ?? 0), tenants: await ledger.call("usage", url.searchParams.get("since") ?? 0) });
     }
 
-    if (!bearer) return json({ error: "no token" }, 401);
-    const caller = await ledger.call("tokenFor", await hash(bearer));
+    if (!presentedToken) return json({ error: "no token" }, 401);
+    const caller = await ledger.call("tokenFor", await hash(presentedToken));
     if (!caller) return json({ error: "invalid api key" }, 401);
 
     // "Does my key work" is now a question about the token we issued, not about

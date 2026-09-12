@@ -7,7 +7,7 @@
  * list is answered, never forwarded; an id the caller did not create is not
  * theirs; and a path nobody has reasoned about is not served at all.
  */
-import { decide, type Owned } from "../broker/src/route.ts";
+import { decide, presented, type Owned } from "../broker/src/route.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -116,6 +116,22 @@ check("方法也在白名单里 —— 路径对、动词不对,不放行", () =
   if (decide("DELETE", `${P}/boxes`, mine, PROJECT).kind !== "refuse") throw new Error("DELETE on the collection was allowed");
   if (decide("PUT", `${P}/boxes/b-mine`, mine, PROJECT).kind !== "refuse") throw new Error("PUT on a box was allowed");
   if (decide("GET", `${P}/boxes/b-mine/stop`, mine, PROJECT).kind !== "refuse") throw new Error("GET on stop was allowed");
+});
+
+check("插件发什么头,broker 就认什么头", () => {
+  // The plugin sends `Basic base64(ak:sk)` on every call, because that is
+  // run9's scheme and this service is a drop-in `endpoint`. My first version
+  // read `Bearer`, which nothing sends: the two halves would not have spoken
+  // on the very first call, and no test I had written would have noticed —
+  // the route layer and the ledger were both fine.
+  if (presented("Basic " + btoa("ak-1:sk-1")) !== "ak-1:sk-1") throw new Error("the plugin's own header was not understood");
+  if (presented("Bearer tok-1") !== "tok-1") throw new Error("a bearer token was not understood");
+  // The pair is the credential. Splitting it would invite a lookup on the half
+  // that is not the secret one.
+  if (presented("Basic " + btoa("ak-1:sk-1")) === "ak-1") throw new Error("only the public half was taken");
+  for (const bad of [null, "", "Basic", "Basic !!!not base64", "Digest xyz"]) {
+    if (presented(bad as any)) throw new Error(`${JSON.stringify(bad)} was accepted as a credential`);
+  }
 });
 
 console.log(`\n  What the broker allows\n  ${"─".repeat(56)}`);

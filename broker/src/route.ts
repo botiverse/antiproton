@@ -145,3 +145,32 @@ const refuse = (status: number, method: string, path: string): Decision => ({
   status,
   reason: status === 405 ? `${method} is not allowed on ${path}` : `this service does not serve ${path}`,
 });
+
+/**
+ * The credential a tenant presents, whatever header it arrives in.
+ *
+ * The plugin sends `Basic base64(ak:sk)` on every call, because that is run9's
+ * scheme and this service is meant to be a drop-in `endpoint` — the mount's
+ * credential shape is declared per plugin and we deliberately did not change
+ * it. So a tenant's key is issued as an ak/sk pair like run9's, and the pair is
+ * what is hashed. Written after reading Piper's plugin-side change and finding
+ * that my first version read `Bearer`, which nothing sends: the two halves
+ * would have failed to speak on the first call.
+ *
+ * `Bearer` still works, for the operator routes and for anything of ours that
+ * is not the plugin.
+ */
+export function presented(header: string | null): string | null {
+  const raw = (header ?? "").trim();
+  const bearer = /^Bearer\s+(.+)$/i.exec(raw);
+  if (bearer) return bearer[1]!.trim();
+  const basic = /^Basic\s+(.+)$/i.exec(raw);
+  if (!basic) return null;
+  try {
+    // `ak:sk` as one string: the pair is the credential, and splitting it would
+    // invite a lookup on the half that is not secret.
+    return atob(basic[1]!.trim());
+  } catch {
+    return null;
+  }
+}
