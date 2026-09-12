@@ -3,7 +3,7 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin } from "../plugins/types.ts";
+import type { Plugin, MountActivity } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
@@ -192,6 +192,42 @@ export class ToolGateway {
       }
     }
     return out;
+  }
+
+  /**
+   * Ask one mount what it is holding, in the shape everyone asks in.
+   *
+   * Here because this is the only place that builds a `PluginContext`, and
+   * because the alternative is what it replaces: three callers reaching into
+   * one plugin's connection state for a field named `boxId`, each of them
+   * quietly asserting that "something running" is that plugin's idea of it.
+   *
+   * No credential is resolved. The contract says this must not need one — it is
+   * asked precisely when nobody is using the mount, which is when a credential
+   * may already have been taken away — so passing one would invite an
+   * implementation to depend on it.
+   */
+  async mountActivity(
+    ctx: { tenantId: string; agentId: string; taskId: string }, alias: string,
+  ): Promise<MountActivity> {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) : null;
+    // A mount that keeps nothing, a plugin that is not installed, and a plugin
+    // that does not implement this all answer the same thing, and it is the
+    // true one: nothing of this mount's is running.
+    if (!mount || !plugin?.activity) return { live: null };
+    return plugin.activity({
+      caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+      alias: mount.alias,
+      credential: null,
+      publicConfig: mount.publicConfig,
+      connection: {
+        get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
+        set: (state, expiresAt) =>
+          this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
+      },
+      async sibling() { return null; },
+    });
   }
 
   async releaseTask(

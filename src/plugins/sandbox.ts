@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext } from "./types.ts";
+import type { Plugin, PluginContext, MountActivity } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 
 /**
@@ -21,7 +21,9 @@ import type { R2Artifacts } from "../store/artifacts.ts";
  * The box is per mount and kept in connection state, so a package installed by
  * one call is still there for the next.
  */
-export interface Run9Config {
+export interface SandboxConfig {
+  /** Which provider runs the container. Only "run9" is implemented. */
+  provider?: string;
   endpoint?: string;
   /** Any image with node on the PATH. */
   image?: string;
@@ -127,7 +129,19 @@ interface BoxState {
   placeholders?: Placeholders;
   execs?: number;
   saved?: string[];
-  /** Most recent first, capped: this is a meter, not a second event log. */
+  /**
+   * The last few containers this mount finished with, most recent first.
+   *
+   * **Two limits, and anyone answering a question from this has to know both:**
+   * it keeps the most recent `SESSIONS_KEPT` and drops the rest without saying
+   * so, and a container only appears here if it was *released* — one that
+   * leaked, or whose worker died mid-call, never reaches this line at all.
+   *
+   * So it is a meter for the console — "what has this agent been running
+   * lately" — and it is not the record of what a tenant used. That record has
+   * to be written where nothing can go around it, which is why it belongs to
+   * whatever holds the provider's key rather than here (cody, 2026-09-12).
+   */
   sessions?: Session[];
   /**
    * Environments this agent has kept, by name.
@@ -144,7 +158,26 @@ interface BoxState {
 
 const SESSIONS_KEPT = 20;
 
+/**
+ * The provider this mount asked for, refused if we do not have it.
+ *
+ * The setting's `choices` stop a bad value at the page and at mount time, but a
+ * mount written before a provider was removed — or by anything that did not go
+ * through the validator — reaches here. Refusing is the same call as the
+ * network gate: a value we do not recognise must not fall through to the one we
+ * happen to implement, because "it ran on run9" would then be the answer to
+ * "run it on something else".
+ */
+export function providerOf(cfg: { provider?: string }): "run9" {
+  const asked = cfg.provider ?? "run9";
+  if (asked !== "run9") {
+    throw new Error(`this sandbox mount asks for the "${asked}" provider, and run9 is the only one implemented`);
+  }
+  return "run9";
+}
+
 const DEFAULTS = {
+  provider: "run9",
   /** Installs and scripts share one directory, or Node resolves modules from
    *  wherever the script sits and cannot find what npm just installed. */
   workdir: "/work",
@@ -175,7 +208,8 @@ async function stopBox(
 ): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number } | null> {
   const state = (await ctx.connection.get()) as BoxState | null;
   if (!state?.boxId || !ctx.credential) return null;
-  const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+  const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
+  providerOf(cfg);
   const cred = JSON.parse(ctx.credential) as Run9Credential;
   const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
   const base = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state.boxId}`;
@@ -196,7 +230,7 @@ async function stopBox(
   const session = sessionOf(state, Date.now());
   await ctx.connection.set({
     boxId: "", createdAt: 0, lastUsedAt: 0,
-    sessions: [session, ...(state.sessions ?? [])].slice(0, SESSIONS_KEPT),
+    sessions: keepSessions(state.sessions, session),
     // Kept environments outlive the container by construction — a forked
     // snapshot is independent of the box it came from — so losing the record of
     // them here would strand real storage under ids nobody can name any more.
@@ -230,6 +264,32 @@ async function stopBox(
  * correct and looks correct, which is the danger — extending it by one token
  * would be consistent with its neighbours and would quietly empty this record.
  */
+/**
+ * This mount's activity, in the shape everyone else asks in.
+ *
+ * The console, the idle sweep and the rename operation all want one fact — is
+ * something running here — and until now each read `boxId` and `lastUsedAt` out
+ * of this plugin's own state. That is the coupling the audit found in two
+ * places and the reason a mount could only be found by the alias `node`. The
+ * adapter is four lines and it is the whole fix: callers ask, this answers.
+ */
+export function activityOf(state: BoxState | null | undefined): MountActivity {
+  if (!state?.boxId) return { live: null };
+  return { live: { id: state.boxId, lastUsedAt: state.lastUsedAt || state.createdAt } };
+}
+
+/**
+ * The window after one more container finishes: newest first, oldest dropped.
+ *
+ * A function rather than a slice at the call site so the cap is a rule that can
+ * fail a test. The number itself is a choice about how much state to carry in a
+ * connection record, not about how much history matters — the history lives
+ * where the key does.
+ */
+export function keepSessions(prior: Session[] | undefined, next: Session): Session[] {
+  return [next, ...(prior ?? [])].slice(0, SESSIONS_KEPT);
+}
+
 export function sessionOf(
   state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
   endedAt: number,
@@ -285,9 +345,9 @@ export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "
   return open ? argv : ["unshare", "-n", "--", ...argv];
 }
 
-export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
+export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
   return {
-  id: "run9",
+  id: "sandbox",
   // Seeded despite being the only metered mount: a container the agent cannot
   // reach is a task it cannot finish, and it is meant to stay unused (tygg,
   // 2026-09-12). The lease is what keeps an idle one from being free to forget.
@@ -311,6 +371,13 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     docs: "https://run.sys9.ai",
   },
   config: [
+    // The capability is "a sandbox"; run9 is who provides it today. Declared as
+    // a choice rather than left implicit so that "the provider is run9" is a
+    // statement the mount validator can check, and so a mount asking for a
+    // provider we do not have is refused at the page rather than at the first
+    // call. Every setting below this line belongs to the run9 provider.
+    { name: "provider", type: "string", choices: ["run9"], default: "run9",
+      summary: "Which sandbox provider runs the container. Only run9 today." },
     { name: "image", type: "string", summary: "Container image to start from.",
       default: "public.ecr.aws/docker/library/node:22-alpine" },
     { name: "workdir", type: "string", summary: "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.", default: "/work" },
@@ -493,7 +560,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
    */
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false as const, kind: "rejected" as const, reason: "no keys: this mount cannot start a container" };
-    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
     let cred: Run9Credential;
     try {
       cred = JSON.parse(ctx.credential) as Run9Credential;
@@ -504,20 +571,35 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       return { ok: false as const, kind: "rejected" as const, reason: "run9 needs both ak and sk; one of them is missing" };
     }
     try {
-      const res = await fetch(`${cfg.endpoint}/projects/${cfg.project}/workspace/boxes`, {
-        headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
-        signal: AbortSignal.timeout(cfg.timeoutMs),
-      });
+      // Asks about one box that cannot exist, rather than listing the project.
+      //
+      // Verifying a key by listing every box means the answer to "does this key
+      // work" arrives with everyone else's containers attached — under a shared
+      // account that is every other tenant's. Nothing here read that list, but
+      // the boundary was our filter rather than their refusal (cody, 2026-09-12),
+      // and a broker in front of run9 would refuse this call outright, so the
+      // narrow question is also the one that keeps working.
+      //
+      // Measured against the live API, like the statuses below, because the
+      // first version of this file guessed and was wrong:
+      //
+      //   keys good, box absent   400  {"error":"box not found"}      ← reached and authorised
+      //   keys bad                401  {"error":"invalid api key"}
+      //   project absent          400  {"error":"project not found"}
+      const res = await fetch(
+        `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/b_credential_check_only`, {
+          headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
+          signal: AbortSignal.timeout(cfg.timeoutMs),
+        });
       if (res.ok) return { ok: true as const, account: cfg.project };
       const body = (await res.text()).slice(0, 200);
-      // Measured against the live API rather than assumed, because the first
-      // version of this guessed 404 for a missing project and run9 does not use
-      // it — every one of these is a 400, so the status alone cannot tell a bad
-      // key from a bad project name, and the body is what separates them:
-      //
-      //   bad keys            401  {"error":"invalid api key"}
-      //   project absent      400  {"error":"project not found"}
-      //   name not a name     400  {"error":"project_cid must match [a-z0-9_-]{3,20}"}
+      // The box is not there because nothing by that name ever is: reaching
+      // that answer means the keys were accepted and the project exists, which
+      // is the whole question.
+      if (/box not found/i.test(body)) return { ok: true as const, account: cfg.project };
+      // Status alone cannot separate a bad key from a bad project name — both
+      // arrive as 400 — so the body is what decides, and the name rule is
+      // quoted from run9's own message: project_cid must match [a-z0-9_-]{3,20}.
       if (res.status === 401 || res.status === 403) {
         return { ok: false as const, kind: "rejected" as const, reason: "run9 rejected these keys" };
       }
@@ -537,6 +619,12 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       // Nothing answered — a timeout, a refused connection, DNS. No verdict.
       return { ok: false as const, kind: "unreachable" as const, reason: String((e as Error)?.message ?? e) };
     }
+  },
+
+  /** What this mount is keeping alive, read from its own state and nothing
+   *  else: no credential, no call to run9. */
+  async activity(ctx: PluginContext): Promise<MountActivity> {
+    return activityOf((await ctx.connection.get()) as BoxState | null);
   },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
@@ -568,7 +656,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
-    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
     if (!ctx.credential) throw new Error("run9 mount has no credential");
     const cred = JSON.parse(ctx.credential) as Run9Credential;
     const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);

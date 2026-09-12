@@ -34,7 +34,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { runJsTool, bridgeTools, type MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
-import { run9Plugin } from "../../src/plugins/run9.ts";
+import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
@@ -146,9 +146,9 @@ async function runOne(inst: Instance) {
   await store.init();
   await store.createAgent(T, AGENT);
 
-  const plugins: Plugin[] = [run9Plugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
+  const plugins: Plugin[] = [sandboxPlugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
   await store.addMount({
-    tenantId: T, agentId: AGENT, alias: "node", plugin: "run9",
+    tenantId: T, agentId: AGENT, alias: "sandbox", plugin: "sandbox",
     installationId: "i-node", connectionId: null, toolVersion: "1.0.0",
     publicConfig: {
       image: imageFor(inst.instance_id), workdir: "/testbed", shape: "2c4g", timeoutMs: 300_000,
@@ -311,7 +311,7 @@ async function runOne(inst: Instance) {
 
   // Read after release: a session is written into the mount's connection state
   // when the box is handed back, precisely so the meter outlives the box.
-  const meter = await readMeter(store, T, AGENT, ["node"], Date.now() - t0, {
+  const meter = await readMeter(store, T, AGENT, ["sandbox"], Date.now() - t0, {
     promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
   });
 

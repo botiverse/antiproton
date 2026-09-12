@@ -1410,11 +1410,11 @@ ${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]
  */
 export function sandboxPanel(d: any): string {
   // Match the mount's plugin, not its alias: an alias is a name an operator can
-  // rebind, so "the sandbox" found by alias would go blind when the run9 mount
-  // hangs under another name, or see only one of two.
+  // rebind, so "the sandbox" found by alias would go blind when the sandbox
+  // plugin hangs under another name, or see only one of two.
   const aliases = new Set(
-    (d.mounts ?? []).filter((m: any) => m.plugin === "run9").map((m: any) => m.alias));
-  const name = [...aliases][0] ?? "node";
+    (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
+  const name = [...aliases][0] ?? "sandbox";
   const conn = (d.connections ?? []).find((c: any) => aliases.has(c.alias));
   let st: any = null;
   try { st = conn ? JSON.parse(conn.state) : null; } catch { st = null; }

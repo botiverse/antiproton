@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
-import { run9Plugin } from "../src/plugins/run9.ts";
+import { sandboxPlugin } from "../src/plugins/sandbox.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
@@ -65,7 +65,7 @@ const store: any = new Proxy({}, { get: () => async () => null });
 const plugins: Plugin[] = [];
 plugins.push(
   githubPlugin, demoPlugin, httpPlugin,
-  run9Plugin(bucket, "artifacts"),
+  sandboxPlugin(bucket, "artifacts"),
   statePlugin(store, bucket, "artifacts"),
   artifactsPlugin(bucket, "artifacts"),
   builtinToolsPlugin(store, () => plugins),
