@@ -582,6 +582,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     }
   },
 
+  /** What this mount is keeping alive, read from its own state and nothing
+   *  else: no credential, no call to run9. */
+  async activity(ctx: PluginContext): Promise<MountActivity> {
+    return activityOf((await ctx.connection.get()) as BoxState | null);
+  },
+
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
     // Checked before anything else: neither releasing nor choosing an
     // environment should be the thing that starts a container.

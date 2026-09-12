@@ -805,6 +805,39 @@ await check("a sandbox mount asking for a provider we do not have is refused, no
   }
 });
 
+/**
+ * The mount answers "is something running here", so nobody has to look inside it.
+ *
+ * The rename asks before it moves rows, the console panel asks before it draws,
+ * and the idle sweep asks before it nudges. Each of them used to read `boxId`
+ * out of the sandbox's connection state, which is why the panel could only find
+ * a container under the alias `node`. The two rules worth pinning are that it
+ * answers without a credential — it is asked precisely when a mount is unused,
+ * and an unused mount may have had its key removed — and that a mount holding
+ * nothing says so rather than throwing.
+ */
+await check("a mount reports what it is holding, with no credential and no call out", async () => {
+  const ctx = (state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: null, publicConfig: {},
+    connection: { get: async () => state, set: async () => {} },
+    sibling: async () => null,
+  });
+  if (typeof run9.activity !== "function") throw new Error("the sandbox no longer reports its activity");
+
+  const empty = await run9.activity!(ctx(null));
+  if (empty.live !== null) throw new Error(`an empty mount reported ${JSON.stringify(empty)}`);
+
+  const busy = await run9.activity!(ctx({ boxId: "b-7", createdAt: 1_000, lastUsedAt: 5_000 }));
+  if (busy.live?.id !== "b-7" || busy.live?.lastUsedAt !== 5_000) {
+    throw new Error(`a running container was not reported: ${JSON.stringify(busy)}`);
+  }
+  // And the decision built on it agrees, so the two halves cannot drift: the
+  // rename refuses exactly when the mount says something is live.
+  if (renameSafety(busy, 6_000).safe) throw new Error("a live container did not block a rename");
+  if (!renameSafety(empty, 6_000).safe) throw new Error("an empty mount blocked a rename");
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

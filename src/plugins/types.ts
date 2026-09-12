@@ -450,4 +450,26 @@ export interface Plugin {
    * Called once per harness open, per mount.
    */
   promptContribution?(ctx: PluginContext): Promise<string | null>;
+
+  /**
+   * Is this mount keeping something alive right now?
+   *
+   * Declared so that nothing outside has to know how a plugin stores it. Three
+   * callers want this one fact — renaming a mount must not move it while a
+   * container is running, the console draws a panel from it, and the idle sweep
+   * decides whether to ask — and each of them used to read `boxId` and
+   * `lastUsedAt` out of the sandbox plugin's own connection state. That is the
+   * coupling that made "the sandbox" findable only under the alias `node`.
+   *
+   * A plugin that keeps nothing does not implement it, and "not implemented"
+   * is the same answer as `{ live: null }`: nothing is running, so nothing is
+   * in the way.
+   *
+   * **It must not need a credential and must not call anything remote.** It is
+   * asked when nobody is using the mount — which is exactly when a credential
+   * may have been removed — and by a sweep that runs on a timer, where a
+   * network call per mount is a cost nobody asked for. Read your own connection
+   * state and answer.
+   */
+  activity?(ctx: PluginContext): Promise<MountActivity>;
 }
