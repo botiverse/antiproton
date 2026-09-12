@@ -1035,6 +1035,66 @@ await check("the container's wording and the lease switch say the same thing", a
   }
 });
 
+/**
+ * Who is asked whether a credential works, once something sits in front of run9.
+ *
+ * With our own service in the path the mount stops holding run9's key and
+ * starts holding a token we issued, so asking run9 proves nothing — it has
+ * never seen it — and passing the question through would make the service
+ * answer whether an id the caller does not own exists, which is what it is
+ * there to refuse. Which one answers is declared, not inferred from the
+ * endpoint's hostname, for the same reason the provider is a setting.
+ *
+ * The verdicts stay the three `checkCredential` has always had, because a page
+ * that cannot tell "your key is wrong" from "we could not ask" sends a person
+ * to re-type a key that was fine (#45).
+ */
+await check("the endpoint answers for the credential when it is not the provider", async () => {
+  const calls: string[] = [];
+  const original = globalThis.fetch;
+  const reply = (status: number, body: string) =>
+    ((url: any, init?: any) => {
+      calls.push(String(url));
+      return Promise.resolve(new Response(body, { status }));
+    }) as typeof fetch;
+
+  const ctx = (extra: Record<string, unknown>): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: JSON.stringify({ ak: "a", sk: "b" }),
+    publicConfig: { endpoint: "https://sandbox.example", ...extra },
+    connection: { get: async () => null, set: async () => {} }, sibling: async () => null,
+  });
+  try {
+    globalThis.fetch = reply(200, "{}");
+    const ok = await run9.checkCredential!(ctx({ verifyWith: "endpoint" }));
+    if (!ok.ok) throw new Error(`a good token was not accepted: ${JSON.stringify(ok)}`);
+    if (!calls[0]!.endsWith("/credential")) throw new Error(`asked the wrong place: ${calls[0]}`);
+    if (/workspace\/boxes/.test(calls[0]!)) throw new Error("the service was asked about a box it does not own");
+
+    calls.length = 0;
+    globalThis.fetch = reply(401, "nope");
+    const bad = await run9.checkCredential!(ctx({ verifyWith: "endpoint" }));
+    if (bad.ok || bad.kind !== "rejected") throw new Error(`a refused token was not rejected: ${JSON.stringify(bad)}`);
+
+    calls.length = 0;
+    globalThis.fetch = reply(503, "down");
+    const down = await run9.checkCredential!(ctx({ verifyWith: "endpoint" }));
+    if (down.ok || down.kind !== "unreachable") {
+      throw new Error(`a service outage was read as a verdict on the key: ${JSON.stringify(down)}`);
+    }
+
+    // And the default is unchanged: without the setting it still asks run9, so
+    // the deployment that has no service in front keeps working.
+    calls.length = 0;
+    globalThis.fetch = reply(400, '{"error":"box not found"}');
+    const direct = await run9.checkCredential!(ctx({}));
+    if (!direct.ok) throw new Error(`the provider path broke: ${JSON.stringify(direct)}`);
+    if (!/workspace\/boxes\//.test(calls[0]!)) throw new Error(`the default no longer asks run9: ${calls[0]}`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
