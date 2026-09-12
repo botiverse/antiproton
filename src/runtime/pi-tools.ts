@@ -40,6 +40,13 @@ export interface MountedTool {
    * somewhere else, which is exactly what an MCP server is. Required is better
    * than a safe default: a default is a second place to state the rule, and the
    * adapter that fills this in is then made to decide rather than inherit.
+   *
+   * When the far end does not say, write `write`. Being required makes someone
+   * choose; it does not say which way to choose, and the cost is not symmetric
+   * — all three branches are the permissive ones on the read side. A write
+   * taken for a read skips the mount's approval and is no longer stopped from
+   * repeating; a read taken for a write costs one approval and the ability to
+   * replay after a cancelled call (Piper, 2026-09-12).
    */
   sideEffects: "read" | "write";
   idempotency?: "native" | "key" | "none";
