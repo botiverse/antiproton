@@ -15,7 +15,8 @@
     "pi-agent": "node test/pi-agent.ts",
     "release": "node test/release.ts",
     "auth": "node test/auth.ts",
-    "typecheck": "node scripts/typecheck.mjs"
+    "typecheck": "node scripts/typecheck.mjs",
+    "typecheck-baseline": "node test/typecheck-baseline.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.85.1",
