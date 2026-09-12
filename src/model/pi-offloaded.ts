@@ -56,11 +56,19 @@ export interface OffloadPort {
 /**
  * A message that finished, as opposed to one abandoned mid-flight.
  *
- * `aborted` belongs to a stream someone cancelled while it was running. This
- * side of the queue only ever reads a stored answer, so the distinction is
- * real and worth keeping in the type.
+ * Two reasons are excluded, for the same kind of reason rather than the same
+ * reason. `aborted` belongs to a stream someone cancelled while it was
+ * running, and this side only ever reads a stored answer. `pending` is what a
+ * *partial* carries while a stream is still open — `settled` sets it on the
+ * `start` event it emits — so it describes the emission, never the message
+ * that was answered.
+ *
+ * Together they are exactly the two the `done` event refuses, which is why
+ * naming them here lets that line be checked instead of trusted.
  */
-export type Answered = AssistantMessage & { stopReason: Exclude<AssistantMessage["stopReason"], "aborted"> };
+export type Answered = AssistantMessage & {
+  stopReason: Exclude<AssistantMessage["stopReason"], "aborted" | "pending">;
+};
 
 const NO_USAGE: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -76,7 +84,12 @@ export interface OffloadedModelDefinition {
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
-function deferredMessage(model: Model<any>, handle: DeferredHandle): AssistantMessage {
+/**
+ * "Not yet", as a message. `deferred` is a finished shape in the sense that
+ * matters here — it is an answer this side produced, not a stream that was
+ * cut off — so it is `Answered` like everything else that leaves this file.
+ */
+function deferredMessage(model: Model<any>, handle: DeferredHandle): Answered {
   return {
     role: "assistant", content: [], api: model.api, provider: model.provider,
     model: model.id, usage: NO_USAGE, stopReason: "deferred", deferred: handle,
@@ -86,7 +99,17 @@ function deferredMessage(model: Model<any>, handle: DeferredHandle): AssistantMe
 
 /** One event stream carrying one already-decided message. Nothing streams here
  *  — the tokens arrive at the queue, not at this object. */
-function settled(message: AssistantMessage): AssistantMessageEventStream {
+/**
+ * Replay a message that is already complete as a one-shot stream.
+ *
+ * Takes `Answered` rather than any assistant message, which is what lets the
+ * `done` event below be checked instead of trusted: `reason` is the message's
+ * own stop reason, and `aborted` is not a reason anything on this path can
+ * report — it describes a stream that was cancelled while running, which by
+ * definition is not this one (@Rex: the port side alone left these two lines
+ * living on "upstream would not do that").
+ */
+function settled(message: Answered): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   queueMicrotask(() => {
     stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
@@ -135,7 +158,7 @@ export function offloadedProvider(opts: {
         outer.push({ type: "done", reason: "deferred", message });
         outer.end(message);
       } catch (e: any) {
-        const message: AssistantMessage = {
+        const message: Answered = {
           role: "assistant", content: [], api: model.api, provider: model.provider,
           model: model.id, usage: NO_USAGE, stopReason: "error",
           errorMessage: String(e?.message ?? e), timestamp: Date.now(),
@@ -160,7 +183,7 @@ export function offloadedProvider(opts: {
         else outer.push({ type: "done", reason: message.stopReason, message });
         outer.end(message);
       } catch (e: any) {
-        const message: AssistantMessage = {
+        const message: Answered = {
           role: "assistant", content: [], api: model.api, provider: model.provider,
           model: model.id, usage: NO_USAGE, stopReason: "error",
           errorMessage: String(e?.message ?? e), timestamp: Date.now(),
