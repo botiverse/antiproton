@@ -47,8 +47,8 @@ check("the control posts plugin/choice and rounds back to the panel", () => {
 });
 
 const d: any = {
-  installed: [{ id: "run9", tools: [] }],
-  mounts: [{ alias: "node", plugin: "run9", enabled: false, config: {}, tools: [], problems: [] }],
+  installed: [{ id: "sandbox", tools: [] }],
+  mounts: [{ alias: "node", plugin: "sandbox", enabled: false, config: {}, tools: [], problems: [] }],
   used: {},
 };
 

@@ -20,10 +20,10 @@ const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); 
 const count = (s: string, re: RegExp) => (s.match(re) ?? []).length;
 
 // Declarations in the shape the plugins actually use: github (a bare token, the
-// mount works without one), appworld (an identifier and a password), run9 (two
+// mount works without one), appworld (an identifier and a password), the sandbox plugin (two
 // secret keys), and a synthetic sign-in, which no plugin declares yet.
 //
-// appworld's `password` and run9's `ak`/`sk` deliberately carry no `secret`
+// appworld's `password` and the sandbox plugin's `ak`/`sk` deliberately carry no `secret`
 // flag. That is how the real plugins declare them, and an omitted flag is the
 // case that once rendered a password in clear: a page reading it truthily
 // inverts the documented default. `credentialForm` resolves it now (#31), and
@@ -39,8 +39,8 @@ const installed = [
     credential: { required: true, summary: "The supervisor's account", shape: { keys: [
       { name: "username", summary: "The account name", secret: false },
       { name: "password", summary: "The account password" } ] } } },
-  { id: "run9", version: "1", tools: [], config: [],
-    credential: { required: true, summary: "run9 access key and secret key", shape: { keys: [
+  { id: "sandbox", version: "1", tools: [], config: [],
+    credential: { required: true, summary: "Access key and secret key for the provider (today: run9)", shape: { keys: [
       { name: "ak", summary: "Access key" }, { name: "sk", summary: "Secret key" } ] } } },
   { id: "somewhere", version: "1", tools: [], config: [{ name: "workspace", type: "string", summary: "Which workspace to act in." }],
     credential: { required: true, summary: "Connect the account at the provider; there is nothing to paste here.",
@@ -87,9 +87,9 @@ check("an identifier is shown in clear and a password is masked", () => {
 });
 
 check("a secret key with no explicit flag is masked", () => {
-  const html = render(mount("r9", "run9", { needsAccount: true }));
+  const html = render(mount("r9", "sandbox", { needsAccount: true }));
   must(count(html, /<input type="password"/g) === 2, "ak and sk must both be masked");
-  must(!/<input type="text"/.test(html), "nothing in run9's credential is an identifier");
+  must(!/<input type="text"/.test(html), "nothing in the sandbox credential is an identifier");
 });
 
 check("attached and verified: the account, the dates, a remove that asks first, and a replace that is folded away", () => {
@@ -118,7 +118,7 @@ check("an account without verified is not promoted to verified", () => {
 });
 
 check("a reference the operator configured is attached by the operator, with no controls", () => {
-  const html = render(mount("node", "run9", { connected: true, credential: { attached: true, operator: true, verified: false, account: null } }));
+  const html = render(mount("node", "sandbox", { connected: true, credential: { attached: true, operator: true, verified: false, account: null } }));
   must(/attached by the operator/.test(html), "must say who attached it");
   must(/configured at deploy time/.test(html), "must say when");
   must(!/unverified|not yet tried/.test(html), "an operator reference is not an untried paste");
@@ -127,16 +127,16 @@ check("a reference the operator configured is attached by the operator, with no 
 });
 
 check("a paste rejected over an operator reference still says why", () => {
-  const hostile = `<b>run9 rejected these keys</b>`;
-  const html = render(mount("node", "run9", { connected: true, credential: { attached: true, operator: true, verified: false, account: null, error: hostile } }));
+  const hostile = `<b>the provider rejected these keys</b>`;
+  const html = render(mount("node", "sandbox", { connected: true, credential: { attached: true, operator: true, verified: false, account: null, error: hostile } }));
   must(/attached by the operator/.test(html), "the operator reference stays attached");
-  must(html.includes("&lt;b&gt;run9 rejected these keys&lt;/b&gt;"), "the reason must show, escaped");
+  must(html.includes("&lt;b&gt;the provider rejected these keys&lt;/b&gt;"), "the reason must show, escaped");
   must(!html.includes(hostile), "the reason must not render as markup");
   must(!/<input|<form/.test(html), "still no controls on an operator reference");
 });
 
 check("attached and unverified: says so, shows no fragment of the key, and never the word undefined", () => {
-  const html = render(mount("r9", "run9", { connected: true, credential: { attached: true, account: null, last4: "wxyz", setAt: null, lastUsedAt: null, error: null } }));
+  const html = render(mount("r9", "sandbox", { connected: true, credential: { attached: true, account: null, last4: "wxyz", setAt: null, lastUsedAt: null, error: null } }));
   must(/attached · unverified/.test(html), "must say unverified");
   must(/stored, not yet tried/.test(html), "must explain what unverified means");
   must(!/wxyz|ends in/.test(html), "the last four characters are part of the key and must never render");
@@ -186,7 +186,7 @@ check("the whole page renders every mount through the same block, and a missing 
 
 check("a hostile error string cannot break out of the markup, attached or not", () => {
   // `error` is the one string in the block a third party can influence: it is
-  // composed from the plugin's check, which for run9 lifts text out of the
+  // composed from the plugin's check, which for the sandbox plugin lifts text out of the
   // provider's HTTP response. It renders in two places; both must escape it.
   const hostile = `<img src=x onerror=1>`;
   const open = render(mount("gh", "github", { optionalAccount: true, credential: { attached: false, error: hostile } }));
@@ -233,8 +233,8 @@ check("an empty inbox says nothing needs you and what is running", () => {
 check("the mount list names each mount, its plugin and its credential state, and the catalogue lists what is installed", () => {
   const d = { installed, mounts: [
     mount("gh", "github", { connected: true, credential: { attached: true, verified: true, account: "botiverse" } }),
-    mount("node", "run9", { connected: true, credential: { attached: true, operator: true } }),
-    mount("lab", "run9", { needsAccount: true }),
+    mount("node", "sandbox", { connected: true, credential: { attached: true, operator: true } }),
+    mount("lab", "sandbox", { needsAccount: true }),
     mount("h", "http"),
   ], used: {} };
   const list = mountList(d);

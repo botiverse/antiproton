@@ -4,7 +4,7 @@
  * Two places the console used to recite a name the plugin owns. The memory
  * panel hardcoded which documents are read back into the prompt, so a change
  * to the state plugin's working set would silently drift the tag. The sandbox
- * panel looked its container up by alias, so a run9 mount under any other name
+ * panel looked its container up by alias, so the sandbox plugin under any other alias
  * read as "never started", and under two names showed only one.
  */
 import { memoryPanel, sandboxPanel } from "../cf/src/ui.ts";
@@ -39,13 +39,13 @@ const connState = JSON.stringify({ sessions: [], boxId: "b1", createdAt: Date.no
 
 check("the sandbox panel finds the container by plugin, under any alias", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "run9" }],
+    mounts: [{ alias: "box", plugin: "sandbox" }],
     connections: [{ alias: "box", state: connState, expires_at: null, updated_at: 0 }],
   });
-  must(html.includes("a container is running"), "run9 under a renamed alias went blind");
+  must(html.includes("a container is running"), "the sandbox plugin under a renamed alias went blind");
 });
 
-check("a node-named connection without a run9 mount is not a container", () => {
+check("a node-named connection without a sandbox mount is not a container", () => {
   const html = sandboxPanel({
     mounts: [],
     connections: [{ alias: "node", state: connState, expires_at: null, updated_at: 0 }],
@@ -54,9 +54,9 @@ check("a node-named connection without a run9 mount is not a container", () => {
   must(!html.includes("<span class=\"chip\">node</span>"), "the empty state named a mount that is not there");
 });
 
-check("an idle-but-present run9 mount is named in the empty state", () => {
+check("an idle-but-present sandbox mount is named in the empty state", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "run9" }],
+    mounts: [{ alias: "box", plugin: "sandbox" }],
     connections: [],
   });
   must(html.includes("no container has ever been started"), "wrong empty branch");
