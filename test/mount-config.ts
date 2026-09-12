@@ -9,7 +9,7 @@ import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin, execArgv, execOutput, sessionOf } from "../src/plugins/run9.ts";
+import { run9Plugin, execArgv, execOutput, sessionOf, boxReminder } from "../src/plugins/run9.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -717,6 +717,42 @@ await check("an accepted quiet request records when to ask again, and leaves the
   const none: any = await run9.invoke("quiet", { minutes: 5 } as any, ctx(null));
   if (none.quiet !== false) throw new Error(`quiet on an empty mount answered ${JSON.stringify(none)}`);
   if (saved) throw new Error("quiet wrote state for a box that does not exist");
+});
+
+/**
+ * The three places that tell the model how the box ends must end it the same way.
+ *
+ * `run` and `shell` describe the container before it exists; the per-execution
+ * reminder describes it while it does. An agent reads whichever it happens to
+ * be looking at, and it cannot tell which is stale — so a promise mended in one
+ * and left in another is worse than the original wrong sentence: it is wrong
+ * only sometimes. This is the test that failed to exist while "persists between
+ * calls until you release it" outlived the behaviour it described.
+ */
+await check("run, shell and the per-execution reminder end the container the same way", async () => {
+  const run = run9.tools.find((t) => t.name === "run")!.summary;
+  const shell = run9.tools.find((t) => t.name === "shell")!.summary;
+  const reminder = boxReminder("box");
+  for (const [where, text] of [["run", run], ["shell", shell], ["the reminder", reminder]] as const) {
+    // Each says the box survives calls…
+    if (!/persists between calls|across calls/.test(text)) {
+      throw new Error(`${where} no longer says the container survives calls: ${text.slice(0, 120)}`);
+    }
+    // …and each says what else can end it, so none of them reads as "it waits
+    // for you and nothing else".
+    if (!/idle/.test(text)) {
+      throw new Error(`${where} says the box survives calls without saying idling can end it: ${text.slice(0, 160)}`);
+    }
+  }
+  // The reminder is the one the agent reads while a box is running, so it also
+  // has to say what happens when nobody answers — the other two describe a box
+  // that may not exist yet.
+  if (!/released if nobody answers/.test(reminder)) {
+    throw new Error(`the reminder does not say silence has a consequence: ${reminder}`);
+  }
+  // And it names the mount, because an agent with two of them cannot act on
+  // "the container".
+  if (!reminder.includes("box")) throw new Error(`the reminder does not name the mount: ${reminder}`);
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
