@@ -430,10 +430,11 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
  * shell keeps only which section is showing and which mode the viewer chose.
  */
 /**
- * Who is looking, as the rail shows it. Every field is optional: the Access
- * identity is an email alone, the QA identity is a name alone, and a Raft
- * login carries all four with `picture` possibly null. `who` stays the
- * identity string the routes key on; this is only what is drawn.
+ * Who is looking, as the rail shows it. Every field is optional: the QA
+ * identity is a name alone, and a GitHub login carries all four with
+ * `picture` possibly null and `email` possibly a placeholder, so the card
+ * prefers the handle for its second line. `who` stays the identity string
+ * the routes key on; this is only what is drawn.
  */
 export type Viewer = { email?: string | null; name?: string | null; username?: string | null; picture?: string | null };
 
@@ -448,7 +449,7 @@ export function viewerBadge(who: string, viewer?: Viewer): string {
   // Without a viewer object there is no session to end (the identity came
   // from the edge, or from a header), so the face is all there is.
   if (!viewer) return face;
-  const sub = viewer.email && viewer.email !== viewer.name ? viewer.email : viewer.username ? `@${viewer.username}` : "";
+  const sub = viewer.username ? `@${viewer.username}` : viewer.email && viewer.email !== viewer.name ? viewer.email : "";
   return `<details class="me"><summary aria-label="signed in as ${esc(label)}">${face}</summary>
       <div class="me-card"><b>${esc(label)}</b>${sub ? `<span class="sub">${esc(sub)}</span>` : ""}
         <form method="post" action="/logout"><button type="submit" class="ghost">${ICONS.logout}sign out</button></form></div></details>`;
