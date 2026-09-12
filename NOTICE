@@ -153,8 +153,8 @@ them at runtime, so their notices travel here.
   this software for any purpose with or without fee. It carries no conditions
   and requires no retention of this notice. Unlike the other entries here it
   names no copyright holder: the upstream LICENSE is the grant alone, and
-  htmx's package.json declares no author, so none is asserted here. The text
-  is at https://github.com/bigskysoftware/htmx/blob/v1.9.12/LICENSE
+  htmx's package.json declares no author, so none is asserted here. The full
+  licence text is `cf/src/vendor/LICENSE-htmx.txt`, beside the file.
 
   Geist Mono — https://github.com/vercel/geist-font
   SIL Open Font License, Version 1.1, Copyright (c) 2023 Vercel,
