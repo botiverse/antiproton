@@ -6,11 +6,11 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
-import { pluginEnabled, type PluginChoice } from "../src/plugins/types.ts";
+import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin, execArgv, execOutput, sessionOf, boxReminder } from "../src/plugins/run9.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -26,7 +26,7 @@ async function check(name: string, fn: () => void | Promise<void>) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
-const run9 = run9Plugin(null as any, "local");
+const run9 = sandboxPlugin(null as any, "local");
 
 await check("拼错的键会被拒绝,并给出最接近的那个", () => {
   const p = validateMount(run9, { timeout_ms: 5000 } as any, "env:RUN9");
@@ -77,7 +77,7 @@ await check("assert 版本会抛,并且把问题都带上", () => {
   let msg = "";
   try { assertMountConfig(run9, { timeout_ms: 1, shel: "x" } as any, null); }
   catch (e) { msg = String((e as Error).message); }
-  if (!msg.includes("cannot mount run9")) throw new Error(`unexpected: ${msg}`);
+  if (!msg.includes("cannot mount sandbox")) throw new Error(`unexpected: ${msg}`);
   if (!msg.includes("timeoutMs") || !msg.includes("needs an account")) {
     throw new Error(`problems were dropped: ${msg}`);
   }
@@ -404,8 +404,8 @@ await check("a plugin with something to release is exclusive, because holding is
     throw new Error(`${unguarded.join(", ")} release something per mount but allow concurrent calls`);
   }
   // Without this the rule above passes by having no holders at all.
-  if (!holders.some((p) => p.id === "run9")) {
-    throw new Error("run9 keeps one container per mount and must declare release; the rule is vacuous without it");
+  if (!holders.some((p) => p.id === "sandbox")) {
+    throw new Error("the sandbox keeps one container per mount and must declare release; the rule is vacuous without it");
   }
 });
 
@@ -864,6 +864,128 @@ await check("the plugins that claim every agent are the ones actually seeded", a
     if (id === "tools" || id === "artifacts") continue;
     if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
   }
+});
+
+/**
+ * A mount with something running under it cannot be renamed yet.
+ *
+ * The operation moves rows in `mounts` and `connections`, both keyed by the
+ * alias. Doing that while a container is alive is the one case that hurts: the
+ * box keeps billing under a name nothing looks up any more, and `release` reads
+ * the new alias and finds nothing. So the rule is "wait", and the refusal has
+ * to carry the number the person needs next — how long it has been idle tells
+ * them whether to wait or to release it.
+ */
+await check("a mount is renamable only while nothing is running under it", async () => {
+  const now = 10_000;
+  const idle = renameSafety(activityOf(null), now);
+  if (!idle.safe) throw new Error("an empty mount refused a rename");
+  if (!renameSafety({ live: null }, now).safe) throw new Error("no live resource still refused");
+  if (!renameSafety(undefined, now).safe) throw new Error("an unknown mount refused a rename");
+
+  const busy = renameSafety(activityOf({ boxId: "b-9", createdAt: 1_000, lastUsedAt: 4_000 } as any), now);
+  if (busy.safe) throw new Error("a running container let the rename through");
+  if (busy.live.id !== "b-9") throw new Error(`the refusal does not name what is running: ${JSON.stringify(busy)}`);
+  if (busy.live.idleMs !== 6_000) throw new Error(`idle time is wrong: ${busy.live.idleMs}`);
+  if (!/release|idle/.test(busy.reason)) throw new Error(`the refusal does not say what to do: ${busy.reason}`);
+
+  // A box that has never been used dates from its creation, not from zero —
+  // the same rule the release record follows, so the two agree about age.
+  const fresh = renameSafety(activityOf({ boxId: "b-1", createdAt: 7_000 } as any), now);
+  if (fresh.safe || fresh.live.idleMs !== 3_000) throw new Error(`an unused box reported ${JSON.stringify(fresh)}`);
+});
+
+/**
+ * "The provider is run9" is a claim the code can refuse, not a comment.
+ *
+ * The plugin is the capability — a sandbox — and run9 is who supplies one
+ * today. Writing that as a setting with `choices` means a mount asking for
+ * something else is refused at the page; this test is about the other door,
+ * the mount that reaches the call anyway. It must not fall through to the
+ * provider we happen to implement: "it ran on run9" is the wrong answer to
+ * "run it somewhere else", and it is wrong silently.
+ */
+await check("a sandbox mount asking for a provider we do not have is refused, not quietly run on run9", async () => {
+  if (providerOf({}) !== "run9") throw new Error("the default provider is not run9");
+  if (providerOf({ provider: "run9" }) !== "run9") throw new Error("run9 was not accepted by name");
+
+  for (const asked of ["fly", "e2b", "", "RUN9"]) {
+    let refused = "";
+    try { providerOf({ provider: asked }); } catch (e) { refused = String((e as Error).message); }
+    if (!refused) throw new Error(`the "${asked}" provider was accepted, and would have run on run9`);
+    if (!refused.includes(asked)) throw new Error(`the refusal does not name what was asked for: ${refused}`);
+  }
+
+  // And the setting itself carries the list, so the console and the mount
+  // validator refuse the same values without repeating them.
+  const field = (run9.config ?? []).find((f) => f.name === "provider");
+  if (!field) throw new Error("the plugin no longer declares which provider a mount may ask for");
+  if (JSON.stringify(field.choices) !== JSON.stringify(["run9"])) {
+    throw new Error(`the declared choices and the implemented providers disagree: ${JSON.stringify(field.choices)}`);
+  }
+});
+
+/**
+ * The mount answers "is something running here", so nobody has to look inside it.
+ *
+ * The rename asks before it moves rows, the console panel asks before it draws,
+ * and the idle sweep asks before it nudges. Each of them used to read `boxId`
+ * out of the sandbox's connection state, which is why the panel could only find
+ * a container under the alias `node`. The two rules worth pinning are that it
+ * answers without a credential — it is asked precisely when a mount is unused,
+ * and an unused mount may have had its key removed — and that a mount holding
+ * nothing says so rather than throwing.
+ */
+await check("a mount reports what it is holding, with no credential and no call out", async () => {
+  const ctx = (state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: null, publicConfig: {},
+    connection: { get: async () => state, set: async () => {} },
+    sibling: async () => null,
+  });
+  if (typeof run9.activity !== "function") throw new Error("the sandbox no longer reports its activity");
+
+  const empty = await run9.activity!(ctx(null));
+  if (empty.live !== null) throw new Error(`an empty mount reported ${JSON.stringify(empty)}`);
+
+  const busy = await run9.activity!(ctx({ boxId: "b-7", createdAt: 1_000, lastUsedAt: 5_000 }));
+  if (busy.live?.id !== "b-7" || busy.live?.lastUsedAt !== 5_000) {
+    throw new Error(`a running container was not reported: ${JSON.stringify(busy)}`);
+  }
+  // And the decision built on it agrees, so the two halves cannot drift: the
+  // rename refuses exactly when the mount says something is live.
+  if (renameSafety(busy, 6_000).safe) throw new Error("a live container did not block a rename");
+  if (!renameSafety(empty, 6_000).safe) throw new Error("an empty mount blocked a rename");
+});
+
+/**
+ * The session window forgets, and that is why it is not the audit record.
+ *
+ * It keeps the newest handful and drops the rest with nothing saying so, and a
+ * container reaches it only by being released — a leaked one, or one whose
+ * worker died mid-call, never appears. Both limits are fine for a console
+ * meter and fatal for "what did this tenant use", which is why that record
+ * belongs where the provider's key is held.
+ *
+ * The test exists so the cap cannot quietly become "keep everything" (a
+ * connection record that grows without bound) or "keep one" (a panel that
+ * forgets what the agent did an hour ago) without someone deciding to.
+ */
+await check("the session window keeps the newest and drops the rest, which is why it is a meter", () => {
+  const at = (n: number) => sessionOf({ boxId: `b-${n}`, createdAt: n, lastUsedAt: n }, n + 10);
+  let window: ReturnType<typeof sessionOf>[] = [];
+  for (let n = 1; n <= 25; n++) window = keepSessions(window, at(n));
+
+  if (window.length !== 20) throw new Error(`the window holds ${window.length}, not the declared 20`);
+  if (window[0]!.boxId !== "b-25") throw new Error(`the newest is not first: ${window[0]!.boxId}`);
+  if (window.some((s) => s.boxId === "b-5")) throw new Error("an entry past the cap survived");
+  // The dropped ones leave nothing behind — no count, no marker. That is the
+  // property that makes reading this as a total wrong.
+  if (JSON.stringify(window).includes("dropped")) throw new Error("the window now claims to say what it lost");
+
+  // And an empty history is a first session, not a crash.
+  const first = keepSessions(undefined, at(1));
+  if (first.length !== 1 || first[0]!.boxId !== "b-1") throw new Error("the first release did not record");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);

@@ -136,6 +136,22 @@ export class DurableObjectStore implements StorageAdapter {
       try { this.#sql.exec(alter); } catch { /* already present */ }
     }
 
+    // The sandbox plugin was called `run9` until 2026-09-12, when the capability
+    // took the name and run9 became the provider behind it. Mount rows and the
+    // answers agents gave about the plugin both store the id, so both would go
+    // on naming a plugin the registry no longer has: every call refused with
+    // `plugin_unavailable`, and an agent's "disable" quietly forgotten.
+    //
+    // Written as an update rather than a version stamp because it describes
+    // itself: there is nothing left to do once no row says `run9`, so running
+    // it on every open costs one scan of a tiny table and cannot happen twice.
+    for (const rename of [
+      "UPDATE mounts SET plugin='sandbox' WHERE plugin='run9'",
+      "UPDATE agent_plugins SET plugin='sandbox' WHERE plugin='run9'",
+    ]) {
+      try { this.#sql.exec(rename); } catch { /* the table may predate this */ }
+    }
+
     this.#sql.exec("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)");
   }
 
@@ -728,6 +744,42 @@ export class DurableObjectStore implements StorageAdapter {
       `INSERT INTO agent_plugins(tenant_id, agent_id, plugin, state, updated_at) VALUES (?,?,?,?,?)
        ON CONFLICT(tenant_id, agent_id, plugin) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`,
       tenantId, agentId, plugin, choice, this.#now());
+  }
+
+  /** One transaction: the mount, its connection state, and its own secret. */
+  async renameMount(
+    tenantId: string, agentId: string, from: string, to: string,
+    secret: { newRef: string } | null,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (from === to) return { ok: true };
+    if (!to.trim()) return { ok: false, error: "a mount needs a name" };
+    try {
+      return this.#tx(() => {
+        if (!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, from)) {
+          return { ok: false as const, error: `no mount named ${from}` };
+        }
+        if (this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, to)) {
+          return { ok: false as const, error: `this agent already has a mount named ${to}` };
+        }
+        // Checked rather than left to the primary key, because a constraint
+        // failure inside the transaction would roll the whole rename back with
+        // a message about SQL rather than about the mount.
+        if (secret && this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, to)) {
+          return { ok: false as const, error: `a credential is already stored under the name ${to}` };
+        }
+        this.#sql.exec("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
+        this.#sql.exec("UPDATE connections SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
+        if (secret) {
+          this.#sql.exec("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?", to, tenantId, agentId, from);
+          this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?", secret.newRef, tenantId, agentId, to);
+        }
+        return { ok: true as const };
+      });
+    } catch (e) {
+      // The transaction is undone by the failure; say so, because "it failed"
+      // and "it half happened" are the two things a person needs told apart.
+      return { ok: false, error: `rename was not applied: ${String((e as Error)?.message ?? e)}` };
+    }
   }
 
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {

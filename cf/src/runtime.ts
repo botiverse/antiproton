@@ -52,12 +52,12 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm, pluginEnabled } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled, renameSafety } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { statePlugin } from "../../src/plugins/state.ts";
-import { run9Plugin } from "../../src/plugins/run9.ts";
+import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
@@ -357,7 +357,7 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
-      run9Plugin(this.#artifacts as any, deps.bucketName),
+      sandboxPlugin(this.#artifacts as any, deps.bucketName),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
@@ -464,6 +464,60 @@ export class AgentRuntime {
     await this.store.removeSecret(tenantId, agentId, alias);
     await this.store.setMountSecretRef(tenantId, agentId, alias, null);
     return true;
+  }
+
+  /**
+   * Rename a mount, with the one thing a rename must not do to a container.
+   *
+   * The alias is the operator's word for a mount, and until now it was the one
+   * thing about a mount that could not be changed — not by design, but because
+   * nothing implemented it. What made it look dangerous is that the alias keys
+   * two live things: the mount row and the connection state, and the second is
+   * where a running box's id sits. The store does both in one transaction, so
+   * "half a rename" is not a state this can reach.
+   *
+   * A third thing moves with them, and it is the one that is easy to miss:
+   * `attachCredential` stores a mount's own credential under the mount's
+   * alias, so `credentialMeta` and `removeCredential` look it up by whatever
+   * the mount is called now. Rename without it and the console shows a
+   * verified account as unverified with no name and no dates, while
+   * `removeCredential` clears the pointer and leaves the ciphertext row with
+   * nothing referring to it, for ever. An operator-configured reference is not
+   * ours to move: it names something outside this agent.
+   *
+   * Refused while the mount is holding something. Not because the transaction
+   * could not survive it — it could — but because the thing being renamed is
+   * not only rows: a container goes on running while its state is re-keyed,
+   * and a person renaming a machine mid-run has lost track of which one it is.
+   * "Wait, or release it" is the better answer, and the refusal carries how
+   * long it has been idle, because that is the next thing they will ask.
+   *
+   * The question goes through the gateway rather than into the mount's state,
+   * so this stays ignorant of which plugin has containers and what it calls
+   * them. A plugin that keeps nothing answers "nothing", and that is correct
+   * rather than a special case.
+   */
+  async renameMount(
+    tenantId: string, agentId: string, from: string, to: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    await this.ready();
+    const mount = await this.store.getMountByAlias(tenantId, agentId, from);
+    if (!mount) return { ok: false, error: `no mount named ${from}` };
+    const safety = renameSafety(
+      await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, from),
+      Date.now(),
+    );
+    if (!safety.safe) {
+      // The contract's sentence, plus the two facts a person needs to choose
+      // between waiting and releasing: which one, and how long it has sat.
+      const idle = Math.round(safety.live.idleMs / 60_000);
+      return { ok: false, error: `${safety.reason} (${safety.live.id}, idle ${idle}m)` };
+    }
+    // Only a credential this agent supplied moves. `operator:` references name
+    // something the deployment owns, under a name that has nothing to do with
+    // this mount's alias.
+    const own = isAgentRef(mount.secretRef);
+    return this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
   }
 
   /** What a page may show for a mount's credential. Never the value, and
@@ -586,7 +640,7 @@ export class AgentRuntime {
     // themselves as a last resort so the agent reaches for free in-process
     // JS first, and the framework releases the box once the agent has no
     // conversation with work open (the scope is the agent, not a task).
-    { alias: "node", plugin: "run9", config: { account: "container" },
+    { alias: "sandbox", plugin: "sandbox", config: { account: "container" },
       secretRef: OPERATOR_RUN9_REF, policy: null },
     // The agent's own store. Deliberately not behind approval: an agent
     // that must ask a person before writing a note will not keep notes, and

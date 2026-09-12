@@ -10,6 +10,7 @@
  */
 import type { ApprovalRecord } from "../../src/core/types.ts";
 import { credentialForm, type CredentialSpec } from "../../src/plugins/types.ts";
+import { WORKING_SET } from "../../src/plugins/state.ts";
 import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_OUTLINED_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
 import { ICONS } from "./icons.ts";
@@ -1334,12 +1335,13 @@ export function memoryPanel(d: any): string {
   if (!docs.length) {
     return `<div class="empty">the agent has written nothing yet</div>
       <div class="hint" style="padding:8px 0">It writes here with
-      <span class="chip">state.remember</span>; <span class="chip">memory</span>,
-      <span class="chip">todo</span> and <span class="chip">journal</span> are read back
-      into the system prompt when the agent's harness opens, once for every conversation,
+      <span class="chip">state.remember</span>; ${WORKING_SET.map((doc) => `<span class="chip">${esc(doc.key)}</span>`).join(" and ")}
+      are read back into the system prompt when the agent's harness opens, once for every conversation,
       since the working set belongs to the agent and not to any one conversation.</div>`;
   }
-  const known = new Set(["memory", "todo", "journal"]);
+  // The state plugin owns this list; the console imports it so a change on the
+  // plugin side changes here too.
+  const known = new Set(WORKING_SET.map((doc) => doc.key));
   const one = (r: any) => {
     let v: unknown = null;
     try { v = r.value === null || r.value === undefined ? null : JSON.parse(r.value); } catch { v = r.value; }
@@ -1407,7 +1409,13 @@ ${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]
  * and they were invisible until now.
  */
 export function sandboxPanel(d: any): string {
-  const conn = (d.connections ?? []).find((c: any) => c.alias === "node");
+  // Match the mount's plugin, not its alias: an alias is a name an operator can
+  // rebind, so "the sandbox" found by alias would go blind when the sandbox
+  // plugin hangs under another name, or see only one of two.
+  const aliases = new Set(
+    (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
+  const name = [...aliases][0] ?? "sandbox";
+  const conn = (d.connections ?? []).find((c: any) => aliases.has(c.alias));
   let st: any = null;
   try { st = conn ? JSON.parse(conn.state) : null; } catch { st = null; }
   const sessions: Array<{ boxId: string; startedAt: number; endedAt: number; execs: number; saved: string[] }> =
@@ -1417,9 +1425,12 @@ export function sandboxPanel(d: any): string {
 
   if (!sessions.length && !live) {
     return `<div class="empty">no container has ever been started for this agent</div>
-      <div class="hint" style="padding:8px 0">The <span class="chip">node</span> mount is a real
-      machine and the most expensive thing the agent can reach — billed for every second it
-      exists, not per call. It is meant to stay unused.</div>`;
+      <div class="hint" style="padding:8px 0">${aliases.size
+        ? `The <span class="chip">${esc(name)}</span> mount is a real machine and the
+        most expensive thing the agent can reach — billed for every second it exists,
+        not per call. It is meant to stay unused.`
+        : `This agent has no container mount at all, so the one thing here billed
+        for merely existing stays out of reach.`}</div>`;
   }
 
   const liveMs = live ? Date.now() - live.since : 0;
@@ -1470,7 +1481,7 @@ ${table(["started", "lived", "calls", "saved", "box"], sessions.map((x) =>
 ${allSaved.length
     ? allSaved.map(artifact).join("") +
       `<div class="hint" style="padding:8px 0">Everything else in those boxes is gone. These
-       survived because the agent called <span class="chip">node.save</span>; they are readable
+       survived because the agent called <span class="chip">${esc(name)}.save</span>; they are readable
        with <span class="chip">artifacts.read</span>.</div>`
     : `<div class="empty">nothing was saved out — everything those containers produced is gone</div>`}`;
 }

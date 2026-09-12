@@ -28,7 +28,7 @@ import { githubPlugin } from "../src/plugins/github.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
-import { run9Plugin } from "../src/plugins/run9.ts";
+import { sandboxPlugin } from "../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 
@@ -193,7 +193,7 @@ await check("种子只包含【用户什么都不用给就能用】的插件", a
   const artifacts: any = { put: async () => ({}), get: async () => null };
   const store: any = new Proxy({}, { get: () => async () => null });
   const registry: Plugin[] = [];
-  registry.push(githubPlugin, demoPlugin, httpPlugin, run9Plugin(artifacts, "b"),
+  registry.push(githubPlugin, demoPlugin, httpPlugin, sandboxPlugin(artifacts, "b"),
     statePlugin(store, artifacts, "b"), artifactsPlugin(artifacts, "b"),
     builtinToolsPlugin(store, () => registry));
 
