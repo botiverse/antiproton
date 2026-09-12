@@ -29,6 +29,24 @@ import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { pluginEnabled } from "../../src/plugins/types.ts";
+import type { MountActivity, MountUsage } from "../../src/plugins/types.ts";
+
+/**
+ * What the plugins page is handed about each mount that has something to say.
+ *
+ * Named here rather than left as `any`, because this is the side that *knows*:
+ * `#mountReports` is the only thing that builds it, out of two contract types
+ * it already has. @Rex's correction, and he is right — my argument for a loose
+ * type ("a second declaration nothing checks against") applies to the consumer
+ * writing its own copy of a shape, not to the producer naming the one it is
+ * already constructing.
+ *
+ * The page still reads it out of `any`, because what reaches the page is JSON
+ * that crossed a Durable Object boundary and no type here can promise what
+ * arrives. The honest split is: exact where it is built, checked where it is
+ * parsed.
+ */
+export type MountReports = Record<string, { activity: MountActivity; usage: MountUsage[] }>;
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import {
@@ -1533,9 +1551,11 @@ export class AgentDO extends DurableObject<Env> {
    * is read when a person opens a page, and the sweep that runs on a timer must
    * not pay for it.
    */
-  async #mountReports(rt: AgentRuntime, tenantId: string, agentId: string, taskId: string) {
+  async #mountReports(
+    rt: AgentRuntime, tenantId: string, agentId: string, taskId: string,
+  ): Promise<MountReports> {
     const gw = rt.gateway();
-    const out: Record<string, { activity: unknown; usage: unknown }> = {};
+    const out: MountReports = {};
     for (const m of await rt.store.listMounts(tenantId, agentId)) {
       try {
         const [activity, usage] = await Promise.all([
