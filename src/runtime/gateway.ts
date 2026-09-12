@@ -4,6 +4,7 @@ import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/typ
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin } from "../plugins/types.ts";
+import { pluginEnabled } from "../plugins/types.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
@@ -147,6 +148,52 @@ export class ToolGateway {
    * Errors are swallowed on purpose: this runs after the work, and a mount that
    * cannot tidy up must not turn a finished task into a failed one.
    */
+  /**
+   * The paragraphs the mounted plugins want in the system prompt.
+   *
+   * In registry order, not mount order: the prompt prefix is cached by the
+   * provider, and mounts are listed by alias, so a person renaming one would
+   * otherwise reorder the prompt and throw the cache away. The registry is an
+   * array that only ever grows at the end, so a new plugin's paragraph lands
+   * after every existing byte. Within one plugin, mounts keep their alias
+   * order, which is stable for a given set of mounts.
+   *
+   * No credential is resolved: a paragraph is a description of what the agent
+   * can do, and asking for a key to write one would make the prompt depend on
+   * a secret being present.
+   */
+  async promptContributions(ctx: CallContext): Promise<string[]> {
+    const mounts = await this.#store.listMounts(ctx.tenantId, ctx.agentId);
+    const out: string[] = [];
+    for (const [id, plugin] of this.#plugins) {
+      if (!plugin.promptContribution) continue;
+      for (const mount of mounts.filter((m) => m.plugin === id)) {
+        let text: string | null = null;
+        try {
+          text = await plugin.promptContribution({
+            caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+            alias: mount.alias,
+            credential: null,
+            publicConfig: mount.publicConfig,
+            connection: {
+              get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
+              set: (state, expiresAt) =>
+                this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
+            },
+            async sibling() { return null; },
+          });
+        } catch (e: any) {
+          // A plugin that cannot describe itself must not stop the agent from
+          // opening: the paragraph is dropped and the run continues.
+          console.warn(`promptContribution failed for ${mount.alias}: ${String(e?.message ?? e)}`);
+          text = null;
+        }
+        if (text?.trim()) out.push(text.trim());
+      }
+    }
+    return out;
+  }
+
   async releaseTask(
     ctx: CallContext,
     /** One mount rather than all of them. A plugin's `release` was always
@@ -208,6 +255,30 @@ export class ToolGateway {
     const plugin = this.#plugins.get(r.mount.plugin);
     if (!plugin) {
       return { status: "rejected", error: { code: "plugin_unavailable", message: r.mount.plugin } };
+    }
+    // Withholding the tools is not the same as refusing the call, and only the
+    // second one holds. A conversation opened before the plugin was switched
+    // off still has the old tool list, and `run_js` dispatches by address —
+    // both reach the mount without ever consulting a catalogue. The choke
+    // point is here, as it is for credentials and policy.
+    //
+    // It costs one indexed read on the hottest path, and that is deliberate:
+    // it could be folded into the mount lookup above, which reads rows of the
+    // same agent, but then the switch would be enforced by a query written for
+    // something else. One choke point is worth more than one saved read, and
+    // this note exists so the cost reads as a decision rather than as an
+    // oversight nobody dares remove (Piper asked, 2026-09-12).
+    const choices = await this.#store.pluginChoices(ctx.tenantId, ctx.agentId);
+    if (!pluginEnabled(plugin, choices[r.mount.plugin])) {
+      return {
+        status: "rejected",
+        // Addressed to the model, which must do something else now: it says
+        // the mount still exists and that a person, not the agent, reopens it.
+        error: {
+          code: "plugin_disabled",
+          message: `the \`${r.mount.alias}\` mount is switched off for this agent; someone has to turn it back on`,
+        },
+      };
     }
     // Version is pinned by the mount, so an update mid-flight cannot change the
     // contract an in-flight operation was accepted under.

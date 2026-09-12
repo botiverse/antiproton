@@ -6,6 +6,7 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
+import { pluginEnabled, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -568,6 +569,22 @@ await check("每个 agent 一开始就有记忆", () => {
   if (dupes.length) throw new Error(`the seed list repeats an alias: ${dupes.join(", ")}`);
 });
 
+await check("陌生人注册进来,拿到的不是一套假的运维工具", () => {
+  // `ops` (the demo plugin) was seeded until sign-up opened. Its tools are a
+  // fake fleet — `deploy` says "Changes production" and restarts a server that
+  // does not exist — and it sat on the first screen of every new account. A
+  // demonstration is something an operator chooses to show; being issued one is
+  // different. The plugin is still installed, so mounting it is one act away.
+  //
+  // Named plugin by plugin only until `availability: "opt-in"` exists; the
+  // general form of this check is "nothing opt-in is seeded", and it should
+  // replace this one rather than sit beside it.
+  const shown = seeded.filter((m) => m.plugin === "demo");
+  if (shown.length) {
+    throw new Error(`the seed list hands every new agent a demonstration: ${shown.map((m) => m.alias).join(", ")}`);
+  }
+});
+
 await check("没有 summary 把分派地址当成工具名交给模型", () => {
   // `<alias>.<tool>` is what the harness dispatches on. It is not what the model
   // is offered: `qualifyMountedTools` gives it the bare tool name, and
@@ -753,6 +770,98 @@ await check("run, shell and the per-execution reminder end the container the sam
   // And it names the mount, because an agent with two of them cannot act on
   // "the container".
   if (!reminder.includes("box")) throw new Error(`the reminder does not name the mount: ${reminder}`);
+});
+
+/**
+ * The artifacts paragraph follows its mount's name.
+ *
+ * It used to be the framework's sentence, printed whenever a flag said an
+ * artifacts tool was around, and it called the thing "the artifacts tool" — a
+ * name that is only right while the operator happens to have used it. Written
+ * by the mount, it can say the name that mount actually has. The test mounts it
+ * under a different alias for the same reason the bug existed: the default one
+ * hides the difference.
+ */
+await check("the artifacts paragraph names the mount it came from, whatever it is called", async () => {
+  const plugin = artifactsPlugin({} as any, "bucket");
+  const say = async (alias: string) =>
+    (await plugin.promptContribution!({ alias, caller: { tenantId: "t", agentId: "a", taskId: "k" } } as any)) ?? "";
+
+  for (const alias of ["artifacts", "files"]) {
+    const text = await say(alias);
+    if (!text.includes(`\`${alias}\``)) throw new Error(`mounted as ${alias}, the paragraph says: ${text}`);
+    if (!text.includes("read")) throw new Error(`the paragraph does not say which tool reads one back: ${text}`);
+    // The qualified form is for telling the model to call something now; a
+    // description names the mount and the bare tool.
+    if (text.includes("__")) throw new Error(`a description should not carry a qualified tool name: ${text}`);
+  }
+});
+
+/**
+ * Two layers, and the order between them is the design.
+ *
+ * The layers exist because "not mounted" could not say why: an agent that had
+ * never been offered a plugin and an agent that had turned it off looked the
+ * same, and provisioning — which adds whatever is missing on every console
+ * open — treated the second as the first and put it back. So silence has to be
+ * distinguishable from a decision, which is what `"inherit"` is for.
+ *
+ * The half worth a test is the precedence: an agent's own answer wins over the
+ * plugin's default, in both directions. A default that flips must not move an
+ * agent that has already chosen — otherwise turning a plugin on for everyone
+ * silently re-arms it for the people who turned it off.
+ */
+await check("an agent's own answer beats the plugin default, in both directions", async () => {
+  const onByDefault = { defaultForAllAgents: true };
+  const optIn = { defaultForAllAgents: false };
+  const undeclared = {};
+
+  const cases: Array<[typeof optIn | Record<string, never>, PluginChoice | null | undefined, boolean, string]> = [
+    [onByDefault, "inherit", true, "inherit follows a default of on"],
+    [onByDefault, null, true, "no record is the same as inherit"],
+    [onByDefault, undefined, true, "an absent record is the same as inherit"],
+    [onByDefault, "disable", false, "an agent may refuse what everyone else gets"],
+    [optIn, "inherit", false, "inherit follows a default of off"],
+    [optIn, "enable", true, "an agent may ask for what nobody else gets"],
+    [undeclared, "inherit", false, "a plugin that did not declare belongs to nobody by default"],
+    [undeclared, "enable", true, "and can still be asked for"],
+  ];
+  for (const [plugin, choice, want, why] of cases) {
+    const got = pluginEnabled(plugin as any, choice);
+    if (got !== want) throw new Error(`${why}: pluginEnabled(${JSON.stringify(plugin)}, ${JSON.stringify(choice)}) = ${got}`);
+  }
+});
+
+/**
+ * What the declarations say today, held against what is actually seeded.
+ *
+ * The flag is only worth having if it means the same thing the seed list means,
+ * and the two live in different files — one in each plugin, one in
+ * `cf/src/runtime.ts`. This is the test that notices when they drift: a plugin
+ * that starts claiming every agent without being seeded, or a seed for a plugin
+ * that says it belongs to nobody.
+ *
+ * `demo` needed an exception while it was leaving the seed list (#213). It has
+ * left, so the exception is gone: it now passes the same way every other opt-in
+ * plugin does — declared by nobody, seeded by nobody — and if anyone puts it
+ * back in either place without the other, this fails.
+ */
+await check("the plugins that claim every agent are the ones actually seeded", async () => {
+  const declared = new Set(
+    [statePlugin({} as any, null, "b"), httpPlugin, githubPlugin, run9, demoPlugin]
+      .filter((p) => (p as any).defaultForAllAgents === true)
+      .map((p) => p.id),
+  );
+  // The two builtin ones are constructed with runtime handles this suite does
+  // not have; their ids are checked against the seed list instead.
+  const seeded = new Set(AgentRuntime.DEFAULT_MOUNTS.map((m) => m.plugin));
+  for (const id of declared) {
+    if (!seeded.has(id)) throw new Error(`${id} claims every agent but nothing seeds it`);
+  }
+  for (const id of seeded) {
+    if (id === "tools" || id === "artifacts") continue;
+    if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);

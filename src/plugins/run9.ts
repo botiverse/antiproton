@@ -320,6 +320,10 @@ export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "
 export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
   return {
   id: "run9",
+  // Seeded despite being the only metered mount: a container the agent cannot
+  // reach is a task it cannot finish, and it is meant to stay unused (tygg,
+  // 2026-09-12). The lease is what keeps an idle one from being free to forget.
+  defaultForAllAgents: true,
   // One container per mount, created on demand — two calls at once would
   // create two, and only one of them would ever be released.
   exclusive: true,

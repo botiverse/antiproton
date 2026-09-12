@@ -13,6 +13,10 @@ import type {
   TaskRecord,
   WaitSpec,
 } from "./types.ts";
+// The vocabulary belongs to the plugin contract; the store persists it rather
+// than defining a second copy of the same three words. Type-only, and
+// `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
+import type { PluginChoice } from "../plugins/types.ts";
 
 /** A stored value: inline when small, a reference to object storage when not. */
 export interface StateEntry {
@@ -301,4 +305,24 @@ export interface StorageAdapter {
   removeSecret(tenantId: string, agentId: string, name: string): Promise<boolean>;
   findMountsByPlugin(tenantId: string, agentId: string, plugin: string): Promise<MountRecord[]>;
   listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;
+
+  /**
+   * What this agent has said about plugins, for the plugins it has said
+   * anything about.
+   *
+   * Only the answers that differ from the plugin's own default are stored, and
+   * a missing entry is `"inherit"` — so flipping a plugin's default moves
+   * everyone who never chose, rather than leaving each agent holding a copy of
+   * what the default happened to be on the day it was created. The same reason
+   * a derived page is generated rather than written down.
+   *
+   * The whole map at once, because every caller wants it that way: the
+   * catalogue resolves one answer per mount, and the console draws one control
+   * per installed plugin.
+   */
+  pluginChoices(tenantId: string, agentId: string): Promise<Record<string, PluginChoice>>;
+  /** `"inherit"` is stored as the absence of a row, not as a third value. */
+  setPluginChoice(
+    tenantId: string, agentId: string, plugin: string, choice: PluginChoice,
+  ): Promise<void>;
 }

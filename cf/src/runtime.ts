@@ -15,7 +15,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
 import {
-  bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -52,15 +52,15 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
-import { statePlugin, workingSet } from "../../src/plugins/state.ts";
+import { statePlugin } from "../../src/plugins/state.ts";
 import { run9Plugin } from "../../src/plugins/run9.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
-import type { Plugin } from "../../src/plugins/types.ts";
+import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
@@ -81,6 +81,27 @@ export interface ModelJob {
 }
 
 const OFFLOAD_BYTES = 32 * 1024;
+
+/**
+ * What the model gets instead of a result too big to put in the conversation.
+ *
+ * Two branches, and each says something true. Parked: here is a reference and
+ * the tool that opens it, named the way the model was offered it, because this
+ * is an instruction to call something now rather than a description. Not
+ * parked: the rest is gone, in the same words run9 uses when it truncates —
+ * because a reference nobody can open reads as though the content is still
+ * somewhere, and an agent will go looking for a tool it does not have.
+ */
+export function tooLargeResult(
+  preview: Json,
+  bytes: number,
+  parked: { ref: string; readBack: string } | null,
+): Record<string, Json> {
+  return parked
+    ? { ref: parked.ref, bytes, preview, note: `parked because it is large; read the rest with ${parked.readBack} { ref, fields, offset, limit }` }
+    : { bytes, preview, note: "too large for the conversation; the rest was discarded, not stored, because nothing is mounted that could read a parked result back" };
+}
+
 
 /**
  * What the agent is told about a result too big to hand it whole.
@@ -229,6 +250,50 @@ export interface RuntimeDeps {
    * — a reminder costs a model turn, a box costs seconds.
    */
   idle?: { afterMs: number; maxMs: number };
+}
+
+/**
+ * The mounts this agent still has, once its own answers are applied.
+ *
+ * A switched-off mount is still a mount: the credential reference, the
+ * connection state and the alias all survive, and switching the plugin back on
+ * returns them. It is only kept out of the catalogue, so the model is not
+ * offered tools it would be refused for using. Deleting instead would lose
+ * things that cannot be recovered, which is why nothing in this codebase
+ * unmounts.
+ *
+ * A mount naming a plugin nobody installed stays in, as it always has: it has
+ * its own refusal at the gateway and its own line in the console, and dropping
+ * it here would turn a mount that reports what is wrong into one that is
+ * silently absent.
+ *
+ * Extracted from the catalogue because the catalogue cannot be called without
+ * a model binding and a harness, and a rule nobody can exercise directly is a
+ * rule that gets deleted by a refactor without anything going red.
+ */
+export function enabledMounts<T extends { plugin: string }>(
+  mounts: T[],
+  installed: Map<string, Pick<Plugin, "defaultForAllAgents">>,
+  choices: Record<string, PluginChoice>,
+): T[] {
+  return mounts.filter((m) => {
+    const plugin = installed.get(m.plugin);
+    return !plugin || pluginEnabled(plugin, choices[m.plugin]);
+  });
+}
+
+/**
+ * One of the three words, or nothing.
+ *
+ * The console posts a form, so what arrives is a string of the user's shape
+ * rather than a `PluginChoice`, and the cast that would make it compile is the
+ * cast that would let `"disabled"` — a plausible typo for a real one — through
+ * as neither enable nor disable, to be stored and then read back as a value
+ * nothing resolves. Refusing at the edge keeps the store holding only words the
+ * resolver knows.
+ */
+export function parsePluginChoice(value: unknown): PluginChoice | null {
+  return value === "enable" || value === "disable" || value === "inherit" ? value : null;
 }
 
 export class AgentRuntime {
@@ -430,8 +495,23 @@ export class AgentRuntime {
     }
   }
 
-  /** §5.4 lives here: the sandbox never receives a large result, only a reference. */
-  #host(ctx: { tenantId: string; agentId: string; taskId: string }) {
+  /**
+   * §5.4 lives here: the sandbox never receives a large result, only a
+   * reference — but only where the agent can read one back.
+   *
+   * Parking assumed a reader. Where no artifacts tool is mounted (the SWE
+   * benchmark mounts `tools` and a container and nothing else) a large result
+   * became a reference the agent had no tool to open, with a note telling it
+   * to call one that was not in its list: the content was simply gone, and
+   * nothing said so. So the question "is there something that can read this
+   * back" is asked here, where the answer is known, and the two branches say
+   * different true things (Piper, 2026-09-12).
+   */
+  #host(
+    ctx: { tenantId: string; agentId: string; taskId: string },
+    /** The reader, as the model would name it, or null when it has none. */
+    readBack: string | null,
+  ) {
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
@@ -441,18 +521,20 @@ export class AgentRuntime {
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
         if (body.length <= OFFLOAD_BYTES) return res;
+        if (!readBack) {
+          return {
+            status: "succeeded",
+            operationId: res.operationId,
+            result: tooLargeResult(summarise(res.result), body.length, null),
+          };
+        }
         const key = `t/${ctx.tenantId}/${ctx.agentId}/${res.operationId}.json`;
         const stored = await artifacts.put(key, body);
         await store.completeOperation(ctx.tenantId, res.operationId, "succeeded", stored.ref);
         return {
           status: "succeeded",
           operationId: res.operationId,
-          result: {
-            ref: stored.ref,
-            bytes: stored.bytes,
-            preview: summarise(res.result),
-            note: "parked because it is large; read the rest with artifacts.read { ref, fields, offset, limit }",
-          },
+          result: tooLargeResult(summarise(res.result), stored.bytes, { ref: stored.ref, readBack }),
         };
       },
     };
@@ -470,10 +552,14 @@ export class AgentRuntime {
     // Without this a parked result is a reference the agent cannot open.
     { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
       secretRef: null, policy: null },
-    // Open, like everything else seeded here. The page can still show a held
-    // call: the agent raises one itself with `confirm: true` on any call.
-    { alias: "ops", plugin: "demo", config: { account: "demo-fleet" },
-      secretRef: null, policy: null },
+    // `ops` (the demo plugin) used to be seeded here, and stopped being
+    // defensible the day sign-up opened: it is a fake fleet — `list_servers`,
+    // `deploy`, `restart`, with summaries that say "Changes production" — and
+    // it was on the first screen a stranger saw. A demonstration is something
+    // an operator chooses to show, not something every new account is given.
+    // The plugin stays installed and mountable, so a demo is one mount away;
+    // and because provisioning only adds what is missing, every agent that
+    // already has `ops` keeps it. Nothing disappears from under anyone.
     // Open on purpose: the agent holds no credential and writes need a
     // human. maxBytes stays under the offload threshold so an ordinary page
     // reaches the model directly rather than via a round trip to storage.
@@ -538,12 +624,25 @@ export class AgentRuntime {
       await this.store.createAgent(tenantId, agentId, {});
       created = true;
     }
+    // Asked before anything is added, because this runs on every console open
+    // and not only at creation: without it, turning a plugin off would last
+    // until the next page load and then be undone by the reconcile, which
+    // would look like the switch not working rather than like a rule being
+    // applied twice.
+    const choices = await this.store.pluginChoices(tenantId, agentId);
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
       // mount being added, so an open of an agent that already has its seven
       // costs one read per seed and no validation. Moving the assert above
       // this line would run it on every open of every agent.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
+      // A seed the agent has turned off is not added. Only the adding is
+      // governed here: a mount that already exists is left alone, because
+      // switching a plugin off must not destroy the credential and the
+      // connection state behind it — the gateway and the catalogue withhold
+      // it instead, and switching it back on returns what was there.
+      const declared = this.#plugins.find((p) => p.id === m.plugin);
+      if (declared && !pluginEnabled(declared, choices[m.plugin])) continue;
       // The seed is hand-written and reaches every agent, and the console's
       // validator only shows problems to whoever opens the plugins page. The
       // throwing one had no caller at all. A misspelt setting is refused here,
@@ -583,8 +682,12 @@ export class AgentRuntime {
    *  address the harness dispatches to, because providers restrict name
    *  charsets. */
   async #catalogueFor(tenantId: string, agentId: string) {
-    const records = await this.store.listMounts(tenantId, agentId);
     const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
+    const records = enabledMounts(
+      await this.store.listMounts(tenantId, agentId),
+      byId,
+      await this.store.pluginChoices(tenantId, agentId),
+    );
     return {
       records,
       mounts: records.map((m) => ({
@@ -624,12 +727,17 @@ export class AgentRuntime {
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
     await this.repinMounts(tenantId, agentId);
-    const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const { tools, records } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
     // The call context's task is the conversation, so held calls and audit
     // rows say which conversation asked. The first session's id is the same
     // string the single-conversation object always used.
-    const host = this.#host({ tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session });
+    // Which tool, if any, can read a parked result back — by plugin, and named
+    // the way the model was offered it.
+    const reader = (tools as MountedTool[]).find((t) =>
+      offersPlugin(records, [t], "artifacts") && t.address.endsWith(".read"))?.name ?? null;
+    const host = this.#host(
+      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader);
     const store = this.store;
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
@@ -654,14 +762,19 @@ export class AgentRuntime {
         // The agent's own record: a person named and described it at creation,
         // and that is the first thing the prompt says after the core.
         persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
-        workingSet: await workingSet(this.store, tenantId, agentId),
+        // Whatever the mounted plugins have to say, in registry order. The
+        // framework no longer reaches into any one plugin for this (Piper,
+        // tygg, 2026-09-12).
+        contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
         policy: this.#deps.policy,
         // Each paragraph appears only where the thing it describes is really
-        // there. Telling an agent to read a result back "with the artifacts
-        // tool" when no artifacts tool is mounted is not a hint, it is a wrong
-        // instruction competing with the ones that matter.
+        // there — telling an agent to read a result back with a tool it has not
+        // got is a wrong instruction competing with the right ones. That used
+        // to be a question this file asked about one plugin; the artifacts
+        // paragraph is now the artifacts mount's own contribution, so the
+        // condition is "the mount is there" and nobody has to check it.
+        // `sandbox` stays: run_js is the harness's, not a mount's.
         sandbox,
-        artifacts: (tools as MountedTool[]).some((t) => t.address.startsWith("artifacts.")),
       }),
       model: {
         provider: binding.provider,

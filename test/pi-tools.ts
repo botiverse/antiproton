@@ -13,7 +13,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { bridgeTools, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, offersPlugin, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
 import { offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -36,6 +36,15 @@ const CATALOGUE: MountedTool[] = [
     sideEffects: "write", idempotency: "native" },
 ];
 
+/**
+ * A tool that exists only to be named. The naming tests do not care what it
+ * does, but `MountedTool` now insists that someone says — so they say the
+ * strict thing, which is also what an adapter should say when a remote
+ * descriptor does not tell it.
+ */
+const named = (name: string, address: string, extra: Partial<MountedTool> = {}): MountedTool =>
+  ({ name, address, description: "", parameters: {}, sideEffects: "write", ...extra });
+
 await check("重放策略来自我们已经记录、却一直没用的字段", async () => {
   const got = CATALOGUE.map((t) => `${t.address}=${replayPolicy(t)}`).join(" ");
   const want = "web.read_page=safe web.send=never pay.charge=safe";
@@ -44,8 +53,8 @@ await check("重放策略来自我们已经记录、却一直没用的字段", a
 
 await check("供应商不接受的字符会被清洗,地址不受影响", async () => {
   const got = bridgeTools([
-    { name: "repos.get", description: "", parameters: {}, address: "gh.repos.get" },
-    { name: "issues.list", description: "", parameters: {}, address: "gh.issues.list" },
+    named("repos.get", "gh.repos.get"),
+    named("issues.list", "gh.issues.list"),
   ], { async invoke() { return { status: "succeeded" }; } });
   const names = got.map((t: any) => t.name);
   for (const n of names) {
@@ -59,15 +68,15 @@ await check("清洗造成的重名在同一个挂载里也会被分开", async (
   // still meet is two tools of the SAME mount whose names sanitise to one
   // string, and that is the case the tie-break exists for.
   const inOneMount = qualifyMountedTools([
-    { name: "a.b", description: "", parameters: {}, address: "x.a.b" },
-    { name: "a_b", description: "", parameters: {}, address: "x.a_b" },
+    named("a.b", "x.a.b"),
+    named("a_b", "x.a_b"),
   ]);
   const names = inOneMount.map((t) => t.name).join(",");
   if (names !== "x__a_b,x__a_b2") throw new Error(`sanitising collapsed two tools into one name: ${names}`);
   // Across mounts there is nothing to resolve: the alias already separates them.
   const across = qualifyMountedTools([
-    { name: "a.b", description: "", parameters: {}, address: "x.a.b" },
-    { name: "a_b", description: "", parameters: {}, address: "y.a_b" },
+    named("a.b", "x.a.b"),
+    named("a_b", "y.a_b"),
   ]);
   if (across.map((t) => t.name).join(",") !== "x__a_b,y__a_b") throw new Error(across.map((t) => t.name).join(","));
 });
@@ -78,16 +87,16 @@ await check("每个工具都带挂载名,哪怕它本来不重名", async () => 
   // mounting something unrelated later renames it — and an agent that wrote the
   // old name down has no way to learn that it changed.
   const all = qualifyMountedTools([
-    { name: "show", description: "", parameters: {}, address: "a.show" },
-    { name: "show", description: "", parameters: {}, address: "b.show" },
-    { name: "only", description: "", parameters: {}, address: "c.only" },
+    named("show", "a.show"),
+    named("show", "b.show"),
+    named("only", "c.only"),
   ]);
   if (all.map((t) => t.name).join(",") !== "a__show,b__show,c__only") {
     throw new Error(all.map((t) => t.name).join(","));
   }
   // The property, stated as the thing that used to fail: one tool's name is
   // the same whether or not the others are there.
-  const alone = qualifyMountedTools([{ name: "only", description: "", parameters: {}, address: "c.only" }]);
+  const alone = qualifyMountedTools([named("only", "c.only")]);
   if (alone[0]!.name !== all[2]!.name) {
     throw new Error(`a mount changed another mount's tool name: ${alone[0]!.name} vs ${all[2]!.name}`);
   }
@@ -100,7 +109,7 @@ await check("限定两次等于限定一次", async () => {
   // was a no-op; under always-qualify it re-prefixed, and a τ² run went out
   // with `retail__retail__get_order_details` in front of the model — the
   // measurement priced a name nobody intended.
-  const t = (name: string, address: string) => ({ name, address, description: "", parameters: {} });
+  const t = named;
   const catalogue = [
     t("get_order_details", "retail.get_order_details"),
     t("a.b", "x.a.b"),   // sanitises into
@@ -168,8 +177,8 @@ await check("共享资源的插件,其工具不允许并行", async () => {
   // last write to the connection state survives. Fifteen containers
   // accumulated that way before the meter made it visible.
   const [shared, plain] = bridgeTools([
-    { name: "shell", description: "", parameters: {}, address: "node.shell", exclusive: true },
-    { name: "get", description: "", parameters: {}, address: "web.get" },
+    named("shell", "node.shell", { exclusive: true }),
+    named("get", "web.get"),
   ], { async invoke() { return { status: "succeeded" }; } }) as any[];
   if (shared.executionMode !== "sequential") {
     throw new Error(`a shared-resource tool was left parallel: ${shared.executionMode}`);
@@ -216,9 +225,9 @@ await check("gateway 拒绝时,模型收到的是拒绝而不是结果", async (
 
 await check("扣住的工具不会被提供,其余原样", async () => {
   const cat = [
-    { name: "shell", address: "node.shell" },
-    { name: "release", address: "node.release" },
-    { name: "get", address: "web.get" },
+    named("shell", "node.shell"),
+    named("release", "node.release"),
+    named("get", "web.get"),
   ];
   const left = withholdTools(cat, ["node.release"]);
   if (left.length !== 2) throw new Error(`expected 2 tools left, got ${left.length}`);
@@ -243,7 +252,7 @@ await check("沙箱里用的是模型看到的名字,地址也仍然接受", asy
     },
   };
   const tool = runJsTool(sandbox as any, host as any, {
-    tools: qualifyMountedTools([{ name: "get", description: "", parameters: {}, address: "web.get" }]),
+    tools: qualifyMountedTools([named("get", "web.get")]),
   });
   // What the model is handed back. The executor's success status is
   // "completed"; a tool that tests for any other word turns every script that
@@ -262,6 +271,25 @@ await check("沙箱里用的是模型看到的名字,地址也仍然接受", asy
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
+await check("a plugin's presence is asked by plugin and answered from the offered tools", async () => {
+  const tool = (alias: string) => [{ name: "put", description: "", parameters: {}, address: `${alias}.put` }] as MountedTool[];
+  const rec = (alias: string, plugin: string) => [{ alias, plugin }];
+  // The alias is the person's word for the mount, so it cannot be the question.
+  if (!offersPlugin(rec("files", "artifacts"), tool("files"), "artifacts")) {
+    throw new Error("artifacts under another alias must still count");
+  }
+  if (offersPlugin(rec("artifacts", "state"), tool("artifacts"), "artifacts")) {
+    throw new Error("another plugin under the artifacts alias must not count");
+  }
+  // Withheld: the mount is there, the tool was not offered.
+  if (offersPlugin(rec("files", "artifacts"), [], "artifacts")) {
+    throw new Error("a withheld tool must not count as offered");
+  }
+  if (!offersPlugin(rec("artifacts", "artifacts"), tool("artifacts"), "artifacts")) {
+    throw new Error("the ordinary case must still be true");
+  }
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

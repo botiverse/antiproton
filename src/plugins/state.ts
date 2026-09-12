@@ -85,6 +85,31 @@ export function statePlugin(
 ): Plugin {
   return {
     id: PLUGIN_ID,
+    // Seeded to every agent since there has been a seed list: an agent with no
+    // memory is the failure this plugin exists to prevent.
+    defaultForAllAgents: true,
+
+    /**
+     * The working set, put in front of the agent when its harness opens.
+     *
+     * The runtime used to import `workingSet` from this file by name, which is
+     * why no other plugin could say anything in the prompt. Now the mount
+     * declares it and the framework asks every mount the same question.
+     *
+     * **Contributed once per agent, not once per mount.** What is written here
+     * lives in `agent_state`, which is keyed by agent rather than by mount, so
+     * two mounts of this plugin read the same documents — and two mounts would
+     * otherwise put the same paragraph in the prompt twice. The first mount, in
+     * the order the gateway itself resolves them, is the one that speaks.
+     */
+    async promptContribution(ctx) {
+      const first = (await store.findMountsByPlugin(
+        ctx.caller.tenantId, ctx.caller.agentId, PLUGIN_ID))[0]?.alias;
+      if (first && first !== ctx.alias) return null;
+      const text = await workingSet(store, ctx.caller.tenantId, ctx.caller.agentId);
+      return text.trim() ? text : null;
+    },
+
     config: [
       // Two thresholds, and only one of them is this setting. A value over
       // INLINE_MAX spills to object storage and comes back as a reference; a

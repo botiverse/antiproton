@@ -27,7 +27,28 @@ export interface MountedTool {
   parameters: Json;
   /** `alias.tool` — what the gateway resolves. Never shown to the model. */
   address: string;
-  sideEffects?: "read" | "write";
+  /**
+   * Required here, as it is on `ToolSchema`, because the whole runtime branches
+   * on it and every branch is permissive on the read side: `replayPolicy` lets
+   * a read repeat, `policyFor` applies the mount's read policy, and the
+   * idempotency guard only protects a write from a duplicate operation id.
+   *
+   * It was optional, and `replayPolicy` filled the gap with `?? "read"` — so a
+   * tool that did not say became a tool that repeats safely. Nothing reached
+   * that default, since every mounted tool is built from a `ToolSchema` where
+   * the field is required; it was waiting for a tool list that comes from
+   * somewhere else, which is exactly what an MCP server is. Required is better
+   * than a safe default: a default is a second place to state the rule, and the
+   * adapter that fills this in is then made to decide rather than inherit.
+   *
+   * When the far end does not say, write `write`. Being required makes someone
+   * choose; it does not say which way to choose, and the cost is not symmetric
+   * — all three branches are the permissive ones on the read side. A write
+   * taken for a read skips the mount's approval and is no longer stopped from
+   * repeating; a read taken for a write costs one approval and the ability to
+   * replay after a cancelled call (Piper, 2026-09-12).
+   */
+  sideEffects: "read" | "write";
   idempotency?: "native" | "key" | "none";
   /** Set when the plugin's mount owns a shared resource, so its calls must not
    *  overlap. pi executes a turn's tool calls in parallel by default. */
@@ -107,6 +128,37 @@ const MAX_NAME = 64;
  * that already belongs to its own mount is left exactly as it is — and it still
  * takes its place in `used`, so it cannot be handed out twice.
  */
+/**
+ * Does this agent actually have a tool from this plugin?
+ *
+ * Asked by plugin and answered from the offered tool list, because the two
+ * obvious shortcuts are each wrong in one direction. An alias is the person's
+ * word for a mount — artifacts mounted as `files` would lose the prompt
+ * paragraph that says results can be parked, and anything mounted as
+ * `artifacts` would gain it — so the alias cannot be the question. And the
+ * mount list alone would answer yes for a tool withheld from the model, which
+ * is what that paragraph exists to avoid: telling an agent to use a tool it
+ * was not given is a wrong instruction competing with the right ones (Piper,
+ * 2026-09-12).
+ *
+ * It was written for the prompt, which asked whether an artifacts tool was
+ * really mounted before telling the agent it could read results back. That
+ * paragraph belongs to the artifacts plugin now, so the prompt no longer asks;
+ * the caller today is the offload path, which parks a large result as a
+ * reference only where something can open one and truncates honestly where
+ * nothing can (cf/src/runtime.ts). "What was the model actually offered" is
+ * the general form of a question three defects have turned on, which is why it
+ * is a function rather than an expression.
+ */
+export function offersPlugin(
+  records: Array<{ alias: string; plugin: string }>,
+  tools: MountedTool[],
+  plugin: string,
+): boolean {
+  const pluginOf = new Map(records.map((m) => [m.alias, m.plugin]));
+  return tools.some((t) => pluginOf.get(t.address.split(".")[0]!) === plugin);
+}
+
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   const used = new Set<string>();
   return tools.map((t) => {
@@ -132,7 +184,7 @@ export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
 
 /** A read repeats safely; a write repeats only if the plugin makes it so. */
 export function replayPolicy(t: MountedTool): "never" | "safe" {
-  if ((t.sideEffects ?? "read") === "read") return "safe";
+  if (t.sideEffects === "read") return "safe";
   return t.idempotency === "native" ? "safe" : "never";
 }
 

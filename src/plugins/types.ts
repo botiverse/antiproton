@@ -244,6 +244,36 @@ const resolved = (f: CredentialField): CredentialField => ({
   required: f.required !== false,
 });
 
+/**
+ * What one agent has said about one plugin.
+ *
+ * `"inherit"` and "no record at all" are the same answer and both are spelled
+ * out: the console needs a value it can put on a control, and the store has
+ * nothing to write for a preference that was never expressed.
+ */
+export type PluginChoice = "enable" | "disable" | "inherit";
+
+/**
+ * The two layers resolved into the only question anyone asks: does this agent
+ * have this plugin?
+ *
+ * One function rather than a rule each caller applies, because there are at
+ * least three callers — provisioning decides whether to create the mount, the
+ * gateway decides whether to offer the tools, and the console decides what to
+ * show — and a rule stated three times is three chances to state it
+ * differently. The order matters and is the whole design: **an agent's own
+ * answer wins, and only silence inherits.** A plugin whose default flips must
+ * not move an agent that has already chosen.
+ */
+export function pluginEnabled(
+  plugin: Pick<Plugin, "defaultForAllAgents">,
+  choice: PluginChoice | null | undefined,
+): boolean {
+  if (choice === "enable") return true;
+  if (choice === "disable") return false;
+  return plugin.defaultForAllAgents === true;
+}
+
 export function credentialForm(credential: CredentialSpec | undefined | null): CredentialForm {
   if (!credential) return { kind: "none" };
   const { shape, required, summary } = credential;
@@ -280,6 +310,23 @@ export interface Plugin {
    * Fifteen of them accumulated before the meter made it visible.
    */
   exclusive?: boolean;
+  /**
+   * Does a new agent get this plugin without anyone asking for it?
+   *
+   * The first of two layers: this is the plugin's own answer for every agent,
+   * and an agent may override it (see `pluginEnabled`). Absent means no — a
+   * plugin has to say it belongs to everyone, because the cost of the wrong
+   * default runs one way. A plugin nobody wanted appears in every new agent's
+   * tool list, spending context on every turn and, if it writes anywhere,
+   * offering an action the person never asked for; a plugin somebody wanted is
+   * one switch away.
+   *
+   * `demo` is the case that named this: a deliberately fake operations domain
+   * with `deploy` and `restart`, seeded to every agent since before strangers
+   * could sign up.
+   */
+  defaultForAllAgents?: boolean;
+
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
   /** What credential it needs, if any. Absent means it never uses one. */
@@ -330,4 +377,30 @@ export interface Plugin {
    * nothing to release, which is not a failure.
    */
   release?(ctx: PluginContext): Promise<boolean | void>;
+
+  /**
+   * A paragraph this mount adds to the agent's system prompt, or null.
+   *
+   * Declared rather than wired: before this, the runtime imported one plugin's
+   * function by name to put the working set in the prompt, so `state` could
+   * speak to the agent and no other plugin could. A mount that keeps something
+   * the agent should know about at the start of every conversation says so
+   * here, and the framework does not have to know which plugin that is.
+   *
+   * **Where it lands, and why it is not negotiable.** Contributions are
+   * appended after everything static — core, persona, policy — in the order
+   * the plugins are *registered*, never the order the mounts are named. The
+   * prompt prefix is cached by the provider, so an operator renaming a mount
+   * must not be able to reorder it: registry order is append-only, a new
+   * plugin adds its paragraph at the end, and every byte before it is
+   * unchanged. Alphabetical order by plugin id does not have that property —
+   * one new plugin whose id sorts early moves everyone.
+   *
+   * For the same reason a contribution that changes often belongs after one
+   * that rarely does: the working set changes whenever the agent writes to its
+   * memory, and everything after it in the prompt is re-read on the next turn.
+   *
+   * Called once per harness open, per mount.
+   */
+  promptContribution?(ctx: PluginContext): Promise<string | null>;
 }
