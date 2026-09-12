@@ -14,7 +14,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import {
-  bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -80,6 +80,27 @@ export interface ModelJob {
 }
 
 const OFFLOAD_BYTES = 32 * 1024;
+
+/**
+ * What the model gets instead of a result too big to put in the conversation.
+ *
+ * Two branches, and each says something true. Parked: here is a reference and
+ * the tool that opens it, named the way the model was offered it, because this
+ * is an instruction to call something now rather than a description. Not
+ * parked: the rest is gone, in the same words run9 uses when it truncates —
+ * because a reference nobody can open reads as though the content is still
+ * somewhere, and an agent will go looking for a tool it does not have.
+ */
+export function tooLargeResult(
+  preview: Json,
+  bytes: number,
+  parked: { ref: string; readBack: string } | null,
+): Record<string, Json> {
+  return parked
+    ? { ref: parked.ref, bytes, preview, note: `parked because it is large; read the rest with ${parked.readBack} { ref, fields, offset, limit }` }
+    : { bytes, preview, note: "too large for the conversation; the rest was discarded, not stored, because nothing is mounted that could read a parked result back" };
+}
+
 
 /**
  * What the agent is told about a result too big to hand it whole.
@@ -417,8 +438,23 @@ export class AgentRuntime {
     }
   }
 
-  /** §5.4 lives here: the sandbox never receives a large result, only a reference. */
-  #host(ctx: { tenantId: string; agentId: string; taskId: string }) {
+  /**
+   * §5.4 lives here: the sandbox never receives a large result, only a
+   * reference — but only where the agent can read one back.
+   *
+   * Parking assumed a reader. Where no artifacts tool is mounted (the SWE
+   * benchmark mounts `tools` and a container and nothing else) a large result
+   * became a reference the agent had no tool to open, with a note telling it
+   * to call one that was not in its list: the content was simply gone, and
+   * nothing said so. So the question "is there something that can read this
+   * back" is asked here, where the answer is known, and the two branches say
+   * different true things (Piper, 2026-09-12).
+   */
+  #host(
+    ctx: { tenantId: string; agentId: string; taskId: string },
+    /** The reader, as the model would name it, or null when it has none. */
+    readBack: string | null,
+  ) {
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
@@ -428,18 +464,20 @@ export class AgentRuntime {
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
         if (body.length <= OFFLOAD_BYTES) return res;
+        if (!readBack) {
+          return {
+            status: "succeeded",
+            operationId: res.operationId,
+            result: tooLargeResult(summarise(res.result), body.length, null),
+          };
+        }
         const key = `t/${ctx.tenantId}/${ctx.agentId}/${res.operationId}.json`;
         const stored = await artifacts.put(key, body);
         await store.completeOperation(ctx.tenantId, res.operationId, "succeeded", stored.ref);
         return {
           status: "succeeded",
           operationId: res.operationId,
-          result: {
-            ref: stored.ref,
-            bytes: stored.bytes,
-            preview: summarise(res.result),
-            note: "parked because it is large; read the rest with artifacts.read { ref, fields, offset, limit }",
-          },
+          result: tooLargeResult(summarise(res.result), stored.bytes, { ref: stored.ref, readBack }),
         };
       },
     };
@@ -616,7 +654,12 @@ export class AgentRuntime {
     // The call context's task is the conversation, so held calls and audit
     // rows say which conversation asked. The first session's id is the same
     // string the single-conversation object always used.
-    const host = this.#host({ tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session });
+    // Which tool, if any, can read a parked result back — by plugin, and named
+    // the way the model was offered it.
+    const reader = (tools as MountedTool[]).find((t) =>
+      offersPlugin(records, [t], "artifacts") && t.address.endsWith(".read"))?.name ?? null;
+    const host = this.#host(
+      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader);
     const store = this.store;
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a

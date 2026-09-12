@@ -815,6 +815,11 @@ export class AgentDO extends DurableObject<Env> {
       await rt.bindOperatorModel("bench", agentId);
       await rt.provision("bench", agentId, [
         { alias: "tools", plugin: "tools", account: "builtin" },
+        // Production seeds this, and without it a result over the offload
+        // threshold is truncated rather than parked: the benchmark would be
+        // measuring an agent that loses large tool output, which production
+        // agents do not (2026-09-12).
+        { alias: "artifacts", plugin: "artifacts", account: "builtin" },
       ]);
       // The machine, from the instance's own image. Config is per mount, so a
       // different repository is a different mount record, not different code.

@@ -10,6 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
+import { tooLargeResult } from "../cf/src/runtime.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -93,6 +94,21 @@ await check("no credential is resolved to write a paragraph", async () => {
   await gw.promptContributions({ tenantId: "t", agentId: "a", taskId: "k" } as any);
   must(asked === 0, "a paragraph must not make the gateway resolve a secret");
   must(sawCredential === null, `the plugin must see no credential, saw ${JSON.stringify(sawCredential)}`);
+});
+
+await check("a result too large to send says something true in both cases", async () => {
+  // With a reader: a reference, and the tool named as the model was offered it
+  // — this sentence is an instruction to call something, so it must be a name
+  // the model can copy rather than the gateway's `artifacts.read` address.
+  const parked = tooLargeResult({ head: "…" } as any, 40_000, { ref: "r2://x", readBack: "files__read" });
+  must(parked.ref === "r2://x" && String(parked.note).includes("files__read"), `parked note: ${JSON.stringify(parked)}`);
+  must(!String(parked.note).includes("artifacts.read"), "the note must not name a dispatch address");
+  // Without one: no reference at all, and the loss stated. A reference nobody
+  // can open reads as though the content is still somewhere.
+  const gone = tooLargeResult({ head: "…" } as any, 40_000, null);
+  must(!("ref" in gone), `nothing to read it back with, so no reference: ${JSON.stringify(gone)}`);
+  must(/discarded, not stored/.test(String(gone.note)), `the loss must be stated: ${gone.note}`);
+  must(gone.bytes === 40_000 && "preview" in gone, "how much there was, and what the start of it looked like");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
