@@ -8,6 +8,7 @@
  * file behind a row. Small JSON, committed by hand with the numbers it backs.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 /**
  * Which code the Worker at `base` is running: its deploy-time commit, read
@@ -20,6 +21,22 @@ export async function workerBuild(base: string): Promise<string | null> {
     const r = await fetch(`${base}/ui/whoami`);
     const j: any = await r.json();
     return typeof j?.build === "string" && j.build ? j.build : null;
+  } catch { return null; }
+}
+
+/**
+ * Which code the driver itself ran from. Two witnesses write a record: the
+ * Worker reports its build, the driver computes the per-task fields from its
+ * own checkout, and the two can differ (a driver ahead of or behind the
+ * harness). `dirty` says whether the tree had uncommitted changes, in which
+ * case the commit does not describe the code that ran; null when the driver
+ * is not in a git checkout.
+ */
+export function driverCommit(): { commit: string; dirty: boolean } | null {
+  try {
+    const cwd = new URL("./", import.meta.url).pathname;
+    const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return { commit: git("rev-parse", "--short=7", "HEAD"), dirty: git("status", "--porcelain").length > 0 };
   } catch { return null; }
 }
 
