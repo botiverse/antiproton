@@ -51,7 +51,7 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -59,7 +59,7 @@ import { statePlugin } from "../../src/plugins/state.ts";
 import { run9Plugin } from "../../src/plugins/run9.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
-import type { Plugin } from "../../src/plugins/types.ts";
+import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
@@ -237,6 +237,36 @@ export interface RuntimeDeps {
    * bill for forgetting it, on themselves.
    */
   autoRelease?: boolean;
+}
+
+/**
+ * The mounts this agent still has, once its own answers are applied.
+ *
+ * A switched-off mount is still a mount: the credential reference, the
+ * connection state and the alias all survive, and switching the plugin back on
+ * returns them. It is only kept out of the catalogue, so the model is not
+ * offered tools it would be refused for using. Deleting instead would lose
+ * things that cannot be recovered, which is why nothing in this codebase
+ * unmounts.
+ *
+ * A mount naming a plugin nobody installed stays in, as it always has: it has
+ * its own refusal at the gateway and its own line in the console, and dropping
+ * it here would turn a mount that reports what is wrong into one that is
+ * silently absent.
+ *
+ * Extracted from the catalogue because the catalogue cannot be called without
+ * a model binding and a harness, and a rule nobody can exercise directly is a
+ * rule that gets deleted by a refactor without anything going red.
+ */
+export function enabledMounts<T extends { plugin: string }>(
+  mounts: T[],
+  installed: Map<string, Pick<Plugin, "defaultForAllAgents">>,
+  choices: Record<string, PluginChoice>,
+): T[] {
+  return mounts.filter((m) => {
+    const plugin = installed.get(m.plugin);
+    return !plugin || pluginEnabled(plugin, choices[m.plugin]);
+  });
 }
 
 export class AgentRuntime {
@@ -563,12 +593,25 @@ export class AgentRuntime {
       await this.store.createAgent(tenantId, agentId, {});
       created = true;
     }
+    // Asked before anything is added, because this runs on every console open
+    // and not only at creation: without it, turning a plugin off would last
+    // until the next page load and then be undone by the reconcile, which
+    // would look like the switch not working rather than like a rule being
+    // applied twice.
+    const choices = await this.store.pluginChoices(tenantId, agentId);
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
       // mount being added, so an open of an agent that already has its seven
       // costs one read per seed and no validation. Moving the assert above
       // this line would run it on every open of every agent.
       if (await this.store.getMountByAlias(tenantId, agentId, m.alias)) continue;
+      // A seed the agent has turned off is not added. Only the adding is
+      // governed here: a mount that already exists is left alone, because
+      // switching a plugin off must not destroy the credential and the
+      // connection state behind it — the gateway and the catalogue withhold
+      // it instead, and switching it back on returns what was there.
+      const declared = this.#plugins.find((p) => p.id === m.plugin);
+      if (declared && !pluginEnabled(declared, choices[m.plugin])) continue;
       // The seed is hand-written and reaches every agent, and the console's
       // validator only shows problems to whoever opens the plugins page. The
       // throwing one had no caller at all. A misspelt setting is refused here,
@@ -608,8 +651,12 @@ export class AgentRuntime {
    *  address the harness dispatches to, because providers restrict name
    *  charsets. */
   async #catalogueFor(tenantId: string, agentId: string) {
-    const records = await this.store.listMounts(tenantId, agentId);
     const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
+    const records = enabledMounts(
+      await this.store.listMounts(tenantId, agentId),
+      byId,
+      await this.store.pluginChoices(tenantId, agentId),
+    );
     return {
       records,
       mounts: records.map((m) => ({

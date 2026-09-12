@@ -1,4 +1,5 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
+import type { PluginChoice } from "../plugins/types.ts";
 import type {
   AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
@@ -80,6 +81,13 @@ const SCHEMA = [
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL,
      connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL,
      secret_ref TEXT, policy TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
+    // Only the agents that said something appear here. No row is `"inherit"`,
+    // which is why `"inherit"` is never written: a stored copy of today's
+    // default would keep answering after the default changed.
+    `CREATE TABLE IF NOT EXISTS agent_plugins (
+     tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, plugin TEXT NOT NULL,
+     state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+     PRIMARY KEY (tenant_id, agent_id, plugin))`,
     `CREATE TABLE IF NOT EXISTS secrets (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, name TEXT NOT NULL,
      ciphertext TEXT NOT NULL, iv TEXT NOT NULL,
@@ -701,6 +709,25 @@ export class DurableObjectStore implements StorageAdapter {
   async listMounts(tenantId: string, agentId: string) {
     return this.#all("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias",
       tenantId, agentId).map((r) => this.#mount(r));
+  }
+
+  async pluginChoices(tenantId: string, agentId: string) {
+    const out: Record<string, PluginChoice> = {};
+    for (const r of this.#all("SELECT plugin, state FROM agent_plugins WHERE tenant_id=? AND agent_id=?",
+      tenantId, agentId)) out[r.plugin] = r.state as PluginChoice;
+    return out;
+  }
+
+  async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {
+    if (choice === "inherit") {
+      this.#sql.exec("DELETE FROM agent_plugins WHERE tenant_id=? AND agent_id=? AND plugin=?",
+        tenantId, agentId, plugin);
+      return;
+    }
+    this.#sql.exec(
+      `INSERT INTO agent_plugins(tenant_id, agent_id, plugin, state, updated_at) VALUES (?,?,?,?,?)
+       ON CONFLICT(tenant_id, agent_id, plugin) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`,
+      tenantId, agentId, plugin, choice, this.#now());
   }
 
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
