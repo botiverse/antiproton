@@ -217,6 +217,7 @@ footer a{color:var(--accent)}
   <h2>&tau;&sup2;-bench retail</h2>
   <p class="sec-note">does it follow a written policy while a person changes their mind &middot; 8 tasks &times; 3 trials, inside a deployed Durable Object</p>
   <p class="how">object <code>bench-gid1</code> &middot; 2026-09-11 &middot; model deepseek-flash &middot; driver <code>bench/tau2/cf.ts</code> &middot; record <code>report/runs/2026-09-11/tau2-gid1-mtwc7ppm.json</code></p>
+    <p class="how">The τ² records behind this section carry the object, the time and the model, and none of them carries the commit. The driver began writing the Worker&rsquo;s build into the record afterwards, and a record cannot be backfilled &mdash; that is also why <code>toolErrors</code> is absent from two of them. So what the records say and what was inferred from the git history are stated separately below.</p>
 
   <div class="col">
     <p><b>What it measures.</b> The domain is a mounted plugin, the customer is a second model, and the score is the database &mdash; whether the agent left the world in the state the annotated solution leaves it in. The agent's own account of what it did is not evidence; the ending of every failed conversation is recorded beside the result so a zero can be attributed rather than guessed at.</p>
