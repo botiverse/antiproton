@@ -333,6 +333,27 @@ border-radius:6px;margin:4px 0 2px;overflow:hidden}
 .bar .v{color:var(--dim);flex:none;font-variant-numeric:tabular-nums}
 .legend{display:flex;gap:12px;color:var(--dim);font-size:11px;margin-top:6px;flex-wrap:wrap}
 .legend b{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
+/* The events trace: a waterfall of turns and calls, then call rows in the turn cards. */
+.wf{display:flex;flex-direction:column;gap:2px;background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+.wf-row{display:grid;grid-template-columns:minmax(88px,26%) 1fr 52px;align-items:center;gap:8px;color:inherit;text-decoration:none;font-size:11px;min-height:16px}
+.wf-row:hover .wf-label{color:var(--strong)}
+.wf-label{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wf-label.sub{padding-left:12px}
+.wf-track{position:relative;height:10px;background:var(--panel);border-radius:2px;overflow:hidden}
+.wf-track i{position:absolute;top:0;height:10px;border-radius:2px;background:var(--fill-strong);min-width:2px}
+.wf-track i.model{background:var(--model)}.wf-track i.js{background:var(--js)}.wf-track i.op{background:var(--fill-strong)}.wf-track i.bad{background:var(--bad)}
+.wf-dur{color:var(--faint);font-size:10px;text-align:right;white-space:nowrap}
+.call{margin:8px 0 0;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+.call.js{border-left:3px solid var(--js)}.call.tool{border-left:3px solid var(--fill-strong)}
+.call .k{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px}
+.call .k b{color:var(--strong);font-weight:600;text-transform:none;letter-spacing:0}
+.call .kind{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);border:1px solid var(--line);border-radius:3px;padding:0 4px}
+.call details{margin-top:4px}.call pre{margin:4px 0 0;max-height:320px;overflow:auto}
+.step.note{border-color:var(--line);color:var(--dim)}
+.chip.bad{color:var(--danger-strong);border-color:var(--danger-muted);background:var(--danger-soft)}
+details.raw{margin-top:14px;color:var(--dim)}details.raw>summary{cursor:pointer}
+[data-theme="brutal"] .wf,[data-theme="brutal"] .call{border-radius:0;border-width:2px;border-color:var(--line-strong)}
+[data-theme="brutal"] .call.js,[data-theme="brutal"] .call.tool{border-left-width:4px}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12px}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
@@ -1078,17 +1099,171 @@ export function conversation(
 }
 
 /** The raw log. The trajectory is a reading of this; when they disagree, this wins. */
-export function eventList(
-  events: Array<{ sequence: number; kind: string; payload: any; createdAt: number }>,
-): string {
+type Ev = { sequence: number; kind: string; payload: any; createdAt: number };
+
+/** One thing the agent asked for: a tool call or a sandbox run, paired with its result when one arrived. */
+type Call = {
+  id: string; name: string; js: boolean; args: unknown;
+  issuedAt: number; result?: Ev; turn: number;
+};
+
+/**
+ * Pairs each model response's tool calls with the results that came back for
+ * them, by call id. A result with no call (an older record, a call the model
+ * did not log) becomes a call of its own so nothing is hidden.
+ */
+function pairCalls(events: Ev[]): { calls: Call[]; turns: Ev[] } {
+  const calls: Call[] = []; const byId = new Map<string, Call>(); const turns: Ev[] = [];
+  for (const e of events) {
+    if (e.kind === "model.response") {
+      turns.push(e);
+      for (const c of (e.payload?.toolCalls ?? []) as Array<{ id: string; name: string; arguments: unknown }>) {
+        const call: Call = { id: String(c.id), name: String(c.name), js: c.name === "run_js", args: c.arguments, issuedAt: e.createdAt, turn: turns.length };
+        calls.push(call); byId.set(call.id, call);
+      }
+    } else if (e.kind === "tool.result" || e.kind === "js.result") {
+      const id = String(e.payload?.callId ?? "");
+      const call = byId.get(id);
+      if (call && !call.result) call.result = e;
+      else calls.push({ id, name: String(e.payload?.tool ?? e.kind), js: e.kind === "js.result", args: undefined, issuedAt: e.createdAt, result: e, turn: turns.length });
+    }
+  }
+  return { calls, turns };
+}
+
+const callStatus = (c: Call): { cls: string; word: string } => {
+  if (!c.result) return { cls: "warn", word: "no result" };
+  const p = c.result.payload ?? {};
+  const bad = p.isError || (p.status && p.status !== "succeeded" && p.status !== "completed");
+  return bad ? { cls: "bad", word: String(p.status ?? "failed") } : { cls: "ok", word: c.js ? "ran" : "ok" };
+};
+
+/** One call, as a row: what, how long, how it ended, and the two things worth opening. */
+function callRow(c: Call, t0: number): string {
+  const st = callStatus(c);
+  const dur = c.result ? secs(c.result.createdAt - c.issuedAt) : "";
+  const src = c.js ? (c.args as any)?.source : undefined;
+  const argsBlock = c.args === undefined ? ""
+    : c.js && typeof src === "string"
+      ? `<details open><summary>source</summary><pre class="code">${esc(src)}</pre></details>`
+      : `<details><summary>arguments</summary><pre>${esc(pretty(c.args, 4000))}</pre></details>`;
+  const rp = c.result?.payload ?? {};
+  const body = c.js ? rp.outputs : rp.result;
+  const resultBlock = !c.result ? ""
+    : `<details${st.cls === "bad" ? " open" : ""}><summary>${c.js ? "outputs" : "result"}${rp.error ? ` · ${esc(String(rp.error?.message ?? rp.error))}` : ""}</summary>
+        <pre>${esc(typeof body === "string" ? body.slice(0, 6000) : pretty(body, 6000))}</pre></details>`;
+  return `<div class="call ${c.js ? "js" : "tool"}" id="call-${esc(c.id)}">
+      <div class="k"><span class="kind">${c.js ? "js" : "tool"}</span> <b>${esc(c.js ? "run_js" : c.name)}</b>
+        <span class="badge ${st.cls}">${esc(st.word)}</span>
+        <span class="t" title="issued ${esc(clock(c.issuedAt))}">+${esc(secs(c.issuedAt - t0))}${dur ? ` · ${esc(dur)}` : ""}</span></div>
+      ${argsBlock}${resultBlock}</div>`;
+}
+
+/**
+ * The waterfall: every model turn and every call as a bar on one time axis,
+ * so where the seconds went is visible before any card is opened. A model
+ * turn's bar runs from the event before it (the moment the model was asked)
+ * to its response; a call's bar from the response that issued it to its
+ * result. Clicking a bar jumps to the card.
+ */
+function waterfall(events: Ev[], calls: Call[], turns: Ev[]): string {
+  const t0 = events[0]!.createdAt;
+  const end = Math.max(events[events.length - 1]!.createdAt, ...calls.map((c) => c.result?.createdAt ?? 0));
+  const span = Math.max(1, end - t0);
+  const pct = (ms: number) => `${(ms / span * 100).toFixed(2)}%`;
+  const rows: string[] = [];
+  const prevAt = new Map<Ev, number>();
+  for (let i = 0; i < events.length; i++) prevAt.set(events[i]!, i ? events[i - 1]!.createdAt : events[i]!.createdAt);
+  turns.forEach((t, i) => {
+    const from = prevAt.get(t) ?? t.createdAt, to = t.createdAt;
+    const u = t.payload?.usage;
+    rows.push(`<a class="wf-row" href="#turn-${i + 1}"><span class="wf-label">turn ${i + 1}</span>
+      <span class="wf-track"><i class="model" style="left:${pct(from - t0)};width:${pct(Math.max(to - from, span / 400))}"
+        title="model · ${esc(secs(to - from))}${u ? ` · ${u.promptTokens ?? 0} in / ${u.completionTokens ?? 0} out` : ""}"></i></span>
+      <span class="wf-dur">${esc(secs(to - from))}</span></a>`);
+    for (const c of calls.filter((c) => c.turn === i + 1)) {
+      const to2 = c.result?.createdAt ?? end;
+      const st = callStatus(c);
+      rows.push(`<a class="wf-row" href="#call-${esc(c.id)}"><span class="wf-label sub">${esc(c.js ? "run_js" : c.name)}</span>
+        <span class="wf-track"><i class="${c.js ? "js" : "op"}${st.cls === "bad" ? " bad" : ""}" style="left:${pct(c.issuedAt - t0)};width:${pct(Math.max(to2 - c.issuedAt, span / 400))}"
+          title="${esc(c.name)} · ${esc(secs(to2 - c.issuedAt))} · ${esc(st.word)}"></i></span>
+        <span class="wf-dur">${esc(secs(to2 - c.issuedAt))}</span></a>`);
+    }
+  });
+  return `<div class="wf">${rows.join("")}</div>
+    <div class="axis"><span>0</span><span>${esc(secs(span))}</span></div>`;
+}
+
+/**
+ * The events tab. What the agent did, as calls rather than as payloads: a
+ * waterfall of turns and calls on one time axis, then a card per model turn
+ * with the calls it made under it, each paired with its result, its
+ * duration and how it ended. The JavaScript the agent ran is shown as code,
+ * open by default, because it is the thing a person reading a trace most
+ * wants to see. The raw records stay at the bottom, closed, for the day the
+ * cards hide something.
+ */
+export function eventList(events: Ev[]): string {
   if (!events.length) return `<div class="empty">no events</div>`;
   const t0 = events[0]!.createdAt;
-  return `<h3>timeline</h3>${timeline(events)}
-    <h3>${events.length} events</h3>` + events.slice().reverse().map((e) =>
-    `<div class="ev"><div class="k">#${e.sequence} · ${esc(e.kind)}
-       <span class="t" title="${esc(clock(e.createdAt))}">+${esc(secs(e.createdAt - t0))}</span></div>
-     <details><summary>${esc(pretty(e.payload, 160).replace(/\s+/g, " "))}</summary>
-       <pre>${esc(pretty(e.payload, 6000))}</pre></details></div>`).join("");
+  const { calls, turns } = pairCalls(events);
+  const js = calls.filter((c) => c.js), tools = calls.filter((c) => !c.js);
+  const failed = events.filter((e) => e.kind === "model.failed").length + calls.filter((c) => callStatus(c).cls === "bad").length;
+  const usage = turns.reduce((a, t) => {
+    const u = t.payload?.usage ?? {};
+    return { p: a.p + (u.promptTokens ?? 0), c: a.c + (u.completionTokens ?? 0), cached: a.cached + (u.cachedPromptTokens ?? 0) };
+  }, { p: 0, c: 0, cached: 0 });
+  const chips = [
+    `<span class="chip">${turns.length} model turn${turns.length === 1 ? "" : "s"}</span>`,
+    `<span class="chip">${tools.length} tool call${tools.length === 1 ? "" : "s"}</span>`,
+    `<span class="chip">${js.length} js run${js.length === 1 ? "" : "s"}</span>`,
+    failed ? `<span class="chip bad">${failed} failed</span>` : "",
+    `<span class="chip">${esc(secs(events[events.length - 1]!.createdAt - t0))}</span>`,
+    usage.p || usage.c ? `<span class="chip" title="prompt / completion / cached">${usage.p} in · ${usage.c} out${usage.cached ? ` · ${Math.round(usage.cached / Math.max(usage.p, 1) * 100)}% cached` : ""}</span>` : "",
+  ].filter(Boolean).join(" ");
+
+  // The cards, in order. A turn card owns the calls it issued; everything
+  // else (what the person said, a failure, a compaction, an orphan result)
+  // is its own row between them.
+  const cards: string[] = []; let turnNo = 0;
+  for (const e of events) {
+    const rel = `<span class="t" title="${esc(clock(e.createdAt))}">+${esc(secs(e.createdAt - t0))}</span>`;
+    const p = e.payload ?? {};
+    if (e.kind === "message") {
+      cards.push(`<div class="step user"><div class="lbl">you ${rel}</div><div class="msg">${esc(String(p.text ?? "")).slice(0, 2000)}</div></div>`);
+    } else if (e.kind === "model.response") {
+      turnNo++;
+      const u = p.usage;
+      const mine = calls.filter((c) => c.turn === turnNo && c.args !== undefined);
+      cards.push(`<div class="step agent turn" id="turn-${turnNo}">
+        <div class="lbl">turn ${turnNo} ${rel}
+          ${u ? `<span class="badge">${u.promptTokens ?? 0} in · ${u.completionTokens ?? 0} out${u.cachedPromptTokens ? ` · ${Math.round((u.cachedPromptTokens / Math.max(u.promptTokens ?? 1, 1)) * 100)}% cached` : ""}${u.reasoningTokens ? ` · ${u.reasoningTokens} reasoning` : ""}</span>` : ""}
+          ${p.finishReason && p.finishReason !== "stop" && p.finishReason !== "toolUse" ? `<span class="badge warn">${esc(String(p.finishReason))}</span>` : ""}</div>
+        ${p.reasoning ? `<details class="think"><summary>thinking</summary><div class="msg">${esc(String(p.reasoning)).slice(0, 4000)}</div></details>` : ""}
+        ${p.text ? `<div class="msg">${esc(String(p.text)).slice(0, 4000)}</div>` : ""}
+        ${mine.map((c) => callRow(c, t0)).join("")}
+      </div>`);
+    } else if (e.kind === "tool.result" || e.kind === "js.result") {
+      const orphan = calls.find((c) => c.result === e && c.args === undefined);
+      if (orphan) cards.push(callRow(orphan, t0));
+    } else if (e.kind === "model.failed") {
+      cards.push(`<div class="step fail"><div class="lbl">model failed ${rel}</div><div class="msg">${esc(String(p.error ?? ""))}</div></div>`);
+    } else if (e.kind === "compaction") {
+      cards.push(`<div class="step note"><div class="lbl">compaction ${rel} <span class="badge">${esc(String(p.tokensBefore ?? "?"))} tokens before</span></div>
+        <details><summary>summary</summary><div class="msg">${esc(String(p.summary ?? "")).slice(0, 4000)}</div></details></div>`);
+    } else {
+      cards.push(`<div class="step note"><div class="lbl">${esc(e.kind)} ${rel}</div><details><summary>payload</summary><pre>${esc(pretty(p, 2000))}</pre></details></div>`);
+    }
+  }
+
+  return `<div class="calls">${chips}</div>
+    <h3>where the time went</h3>${waterfall(events, calls, turns)}
+    <h3>what happened</h3>${cards.join("")}
+    <details class="raw"><summary>raw records · ${events.length}</summary>${events.slice().reverse().map((e) =>
+      `<div class="ev"><div class="k">#${e.sequence} · ${esc(e.kind)}
+         <span class="t" title="${esc(clock(e.createdAt))}">+${esc(secs(e.createdAt - t0))}</span></div>
+       <details><summary>${esc(pretty(e.payload, 160).replace(/\s+/g, " "))}</summary>
+         <pre>${esc(pretty(e.payload, 6000))}</pre></details></div>`).join("")}</details>`;
 }
 
 /** Everything the object is holding for this agent and task. */
