@@ -34,7 +34,8 @@ import {
   resolveViewer, admit, authorizeUrl, exchangeCode, fetchUserinfo, fetchJwks, verifyIdToken,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, RAFT_ISSUER, QA_VIEWER,
-  type Viewer, type LoginState, type RaftConfig, type RefusalReason,
+  type Viewer, type LoginState, type RaftConfig, type RefusalReason, type GithubConfig,
+  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { staticAsset } from "./static.ts";
@@ -62,6 +63,8 @@ export interface Env {
   UI_ALLOW_ANONYMOUS?: string;
   /** Login with Raft: the OAuth client registered on our Raft server. */
   RAFT_CLIENT_ID?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
   RAFT_CLIENT_SECRET?: string;
   /** The Raft server a signed-in person must belong to. */
   RAFT_SERVER_ID?: string;
@@ -1183,6 +1186,38 @@ export class AgentDO extends DurableObject<Env> {
     return rec;
   }
 
+  // ---- the identity table ---------------------------------------------------
+  // One object, named "identities", consulted at sign-in only: which agent a
+  // provider-scoped identity (github:<numeric id>) owns here. A row is the
+  // operator's invitation; without one the sign-in is refused. The row for a
+  // person who already had an agent points at that agent, so a new front door
+  // opens onto the same mounts, credentials and memory.
+  #identities() {
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS identities(
+      provider_key TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+      added_by TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+  }
+
+  async identityLookup(key: string): Promise<string | null> {
+    this.#identities();
+    const r = this.sql.exec("SELECT agent_id FROM identities WHERE provider_key = ?", key).toArray()[0] as any;
+    return r ? String(r.agent_id) : null;
+  }
+
+  async identityUpsert(key: string, agentId: string, by: string) {
+    this.#identities();
+    this.sql.exec(
+      "INSERT INTO identities(provider_key, agent_id, added_by, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(provider_key) DO UPDATE SET agent_id = excluded.agent_id, added_by = excluded.added_by",
+      key, agentId, by, Date.now());
+    return { ok: true as const };
+  }
+
+  async identityList() {
+    this.#identities();
+    return this.sql.exec("SELECT provider_key, agent_id, added_by, created_at FROM identities ORDER BY created_at").toArray()
+      .map((r: any) => ({ key: String(r.provider_key), agentId: String(r.agent_id), addedBy: String(r.added_by), createdAt: Number(r.created_at) }));
+  }
+
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
@@ -1924,8 +1959,18 @@ function raftConfig(env: Env): RaftConfig | null {
   };
 }
 
+function githubConfig(env: Env): GithubConfig | null {
+  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET || !env.UI_ORIGIN || !env.SESSION_SECRET) return null;
+  return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET, redirectUri: `${env.UI_ORIGIN}/login/github/callback` };
+}
+
+/** The one object that holds the identity table (see AgentDO.identityLookup). */
+function identities(env: Env) {
+  return env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", "identities")));
+}
+
 /** A refusal the browser sees as a page and a CLI sees as typed JSON. */
-function refuse(request: Request, reason: RefusalReason | "state" | "exchange" | "unconfigured", hint: string, status = 403): Response {
+function refuse(request: Request, reason: RefusalReason | "not-invited" | "state" | "exchange" | "unconfigured", hint: string, status = 403): Response {
   const wantsHtml = (request.headers.get("accept") ?? "").includes("text/html");
   if (wantsHtml) {
     return new Response(null, { status: 302, headers: { location: `/login/refused?reason=${encodeURIComponent(reason)}` } });
@@ -1937,9 +1982,10 @@ const REFUSALS: Record<string, string> = {
   "not-human": "Only human accounts can use the console. Agents reach it through their runtime, not a browser.",
   "no-email": "Your Raft account has no verified email, and the console keys your agents off one.",
   "wrong-server": "Your Raft account is not a member of this server.",
+  "not-invited": "This GitHub account is not on this deployment's list. Ask the operator to add it.",
   state: "The sign-in did not start here, or took longer than ten minutes. Start again.",
-  exchange: "Raft did not accept the sign-in code. Start again.",
-  unconfigured: "Login with Raft is not configured on this deployment.",
+  exchange: "The sign-in provider did not accept the code. Start again.",
+  unconfigured: "This sign-in is not configured on this deployment.",
 };
 
 /**
@@ -2008,6 +2054,52 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       headers.append("set-cookie", clearCookieHeader(LOGIN_COOKIE, "/login/raft"));
       return new Response(null, { status: 302, headers });
     }
+    case "/login/github": {
+      const cfg = githubConfig(env);
+      if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      const now = Date.now();
+      // No nonce or verifier: GitHub's flow has neither. The state alone
+      // binds the callback to this browser.
+      const st: LoginState = { state: randomToken(), nonce: "", verifier: "", returnTo: "/ui", iat: now, exp: now + LOGIN_TTL_MS };
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: githubAuthorizeUrl(cfg, st.state),
+          "set-cookie": cookieHeader(LOGIN_COOKIE, await seal(env.SESSION_SECRET!, st), LOGIN_TTL_MS / 1000, "/login/github"),
+        },
+      });
+    }
+    case "/login/github/callback": {
+      const cfg = githubConfig(env);
+      if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      const st = await open<LoginState>(env.SESSION_SECRET!, readCookie(request, LOGIN_COOKIE));
+      const state = url.searchParams.get("state");
+      const code = url.searchParams.get("code");
+      if (!st || !state || !code || !constantTimeEqual(state, st.state)) {
+        return refuse(request, "state", REFUSALS.state, 400);
+      }
+      let profile, emails;
+      try {
+        const token = await githubExchangeCode(cfg, code);
+        ({ profile, emails } = await githubFetchProfile(token));
+      } catch (e: any) {
+        console.error("login: github exchange failed", String(e?.message ?? e));
+        return refuse(request, "exchange", REFUSALS.exchange, 502);
+      }
+      // The id is the identity; the table says whether it owns an agent here.
+      // No row, no entry: the console is one operator's, and a GitHub account
+      // is not an invitation.
+      const key = githubIdentityKey(profile);
+      const agentId = await identities(env).identityLookup(key);
+      if (!agentId) {
+        console.warn(`login: ${key} (${profile.login}) is not on the identity table`);
+        return refuse(request, "not-invited", REFUSALS["not-invited"]);
+      }
+      const headers = new Headers({ location: new URL(st.returnTo, url).toString() });
+      headers.append("set-cookie", await sessionCookieFor(env.SESSION_SECRET!, githubViewer(profile, emails, agentId), key));
+      headers.append("set-cookie", clearCookieHeader(LOGIN_COOKIE, "/login/github"));
+      return new Response(null, { status: 302, headers });
+    }
     case "/login/key": {
       // The QA identity: a browser session minted from a long key that is
       // shown to nobody. Its own identity, so audit tells it apart from
@@ -2041,7 +2133,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // must produce, and a refusal would hide it.
       const v = await viewer(request, env);
       return Response.json({
-        viewer: v ? { email: v.email, name: v.name, source: v.source } : null,
+        viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v) } : null,
         build: env.GIT_COMMIT ?? null,
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
         loginConfigured: raftConfig(env) !== null,
@@ -2172,11 +2264,17 @@ function uiAgent(who: string): string {
   return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
 }
 
-async function requireViewer(request: Request, env: Env): Promise<{ who: string; viewer: Viewer } | Response> {
+/** The agent a viewer owns: the one the identity table resolved at sign-in
+ *  (GitHub), else the one derived from the email (everything older). */
+function agentOf(v: Viewer): string {
+  return v.agentId ?? uiAgent(v.email);
+}
+
+async function requireViewer(request: Request, env: Env): Promise<{ who: string; agentId: string; viewer: Viewer } | Response> {
   // The anonymous switch opens the page to look at; the write routes refuse
   // that identity by name further down.
   const v = await viewer(request, env, true);
-  if (v) return { who: v.email, viewer: v };
+  if (v) return { who: v.email, agentId: agentOf(v), viewer: v };
   // A page navigation goes to the sign-in page; a fragment request tells htmx
   // to take the whole window there; anything else gets the plain refusal.
   if (request.headers.get("hx-request")) {
@@ -2304,7 +2402,7 @@ export default {
       // any other must be in that first object's directory, or it is 404,
       // reads and writes alike, so "not yours" and "does not exist" look the
       // same from outside.
-      const home = uiAgent(who);
+      const home = gate.agentId;
       const peek = request.method === "POST" ? await formOf(request.clone()) : null;
       const asked = String(url.searchParams.get("agentId") ?? peek?.get("agentId") ?? "").trim();
       const agentId = asked || home;
@@ -2458,6 +2556,26 @@ export default {
         // What identity a request actually resolves to is /ui/whoami's
         // business; here only the automation token opens the door, and a
         // client-supplied header never does.
+        case "/admin/identity": {
+          // Who may sign in with GitHub, and as which agent. Header-only like
+          // the other /admin routes, and closed when no token is configured:
+          // the operator adds a row before a person's first sign-in.
+          if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const dir = identities(env);
+          if (request.method === "POST") {
+            const body: any = await request.json().catch(() => null);
+            const key = String(body?.key ?? "").trim();
+            const agentId = String(body?.agentId ?? "").trim();
+            if (!/^github:\d+$/.test(key) || !/^u-[A-Za-z0-9._-]{1,48}$/.test(agentId)) {
+              return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>" }, { status: 400 });
+            }
+            await dir.identityUpsert(key, agentId, "automation");
+            return Response.json({ ok: true, key, agentId });
+          }
+          return Response.json({ identities: await dir.identityList() });
+        }
         case "/admin/compact": {
           // The operator's way in, alongside /admin/diagnose. The UI button
           // derives the agent from whoever is signed in, which is right for a
@@ -2485,7 +2603,7 @@ export default {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiSelected?.agentId ?? uiAgent(who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
           await stub.uiEnsure("demo", agentId, taskId);
           return new Response(page(taskId, who, agentId, gate.viewer), {
@@ -2496,7 +2614,7 @@ export default {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiSelected?.agentId ?? uiAgent(who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const v = await versionOf(request, stub, agentId, taskId);
           if (v.unchanged) return v.unchanged;
@@ -2519,7 +2637,7 @@ export default {
         case "/ui/events": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const v = await versionOf(request, stub, agentId, taskId);
           if (v.unchanged) return v.unchanged;
@@ -2538,7 +2656,7 @@ export default {
         case "/ui/plugins": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           // One read, dispatched to the part the shell asked for: the mount
           // list, one mount's block, the catalogue, or the whole page.
           const d = await stub.uiPlugins("demo", agentId);
@@ -2554,7 +2672,7 @@ export default {
           // else does: not the value, not on success, not on failure.
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
@@ -2568,7 +2686,7 @@ export default {
         case "/ui/credential/remove": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
@@ -2581,7 +2699,7 @@ export default {
         case "/ui/runtime": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           const v = await versionOf(request, stub, agentId, taskId);
           if (v.unchanged) return v.unchanged;
@@ -2607,7 +2725,7 @@ export default {
           if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
-          const home = uiAgent(gate.who);
+          const home = gate.agentId;
           const made = agentSpec(form, home);
           if (typeof made === "string") return new Response(made, { status: 400 });
           const own = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", made.agentId)));
@@ -2619,7 +2737,7 @@ export default {
         case "/ui/agents": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const home = uiAgent(gate.who);
+          const home = gate.agentId;
           const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
           const agents = (await homeStub.uiListAgents("demo", home))
             .map((a) => ({ ...a, current: a.agentId === (uiSelected?.agentId ?? home) }));
@@ -2629,13 +2747,13 @@ export default {
         case "/ui/inbox": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const d = await stub.uiInbox("demo", uiSelected?.agentId ?? uiAgent(gate.who));
+          const d = await stub.uiInbox("demo", uiSelected?.agentId ?? gate.agentId);
           return conditional(request, inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/approvals": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
           return conditional(request, approvals(await stub.uiApprovals("demo", agentId, taskId)));
         }
@@ -2645,7 +2763,7 @@ export default {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiSelected?.agentId ?? uiAgent(who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
           const text = String(form.get("text") ?? "").trim();
           const mode = String(form.get("mode")) === "followUp" ? "followUp" as const : "steer" as const;
@@ -2668,7 +2786,7 @@ export default {
         case "/ui/compact": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
@@ -2682,7 +2800,7 @@ export default {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const who = gate.who;
-          const agentId = uiSelected?.agentId ?? uiAgent(who);
+          const agentId = uiSelected?.agentId ?? gate.agentId;
           const decision = String(form.get("decision")) === "approved" ? "approved" : "denied";
           // The panel that posted names its conversation; an older page that
           // does not is the first one. Either way it is the viewer's own or 404.

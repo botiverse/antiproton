@@ -10,6 +10,8 @@
 import {
   seal, open, admit, resolveViewer, sessionCookieFor, verifyIdToken, b64url, unb64url,
   readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
+  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer,
+  GITHUB_TOKEN, GITHUB_API,
 } from "../cf/src/auth.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -141,6 +143,88 @@ await check("small helpers", async () => {
   assert(constantTimeEqual("abc", "abc") && !constantTimeEqual("abc", "abd") && !constantTimeEqual("abc", "ab"), "constantTimeEqual");
   const bytes = new Uint8Array([0, 255, 1, 2, 3, 250]);
   assert(unb64url(b64url(bytes)).join(",") === bytes.join(","), "b64url round trip");
+});
+
+
+// ---- Login with GitHub -------------------------------------------------------
+
+const GH = { clientId: "iv1.abc", clientSecret: "s3cret", redirectUri: "https://antiproton.ai/login/github/callback" };
+const fakeFetch = (routes: Record<string, (init?: RequestInit) => Response>) =>
+  (async (input: string | URL | Request, init?: RequestInit) => {
+    const u = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const h = routes[u];
+    if (!h) throw new Error(`unexpected fetch ${u}`);
+    return h(init);
+  }) as typeof fetch;
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+await check("github: the authorize URL carries client, callback, scopes, state and no sign-up", async () => {
+  const u = new URL(githubAuthorizeUrl(GH, "st-1"));
+  assert(u.origin + u.pathname === "https://github.com/login/oauth/authorize", "wrong endpoint");
+  assert(u.searchParams.get("client_id") === "iv1.abc" && u.searchParams.get("redirect_uri") === GH.redirectUri, "client/callback");
+  assert(u.searchParams.get("scope") === "read:user user:email" && u.searchParams.get("state") === "st-1", "scope/state");
+  assert(u.searchParams.get("allow_signup") === "false", "the door must not create GitHub accounts");
+});
+
+await check("github: the code exchange sends the secret, and a 200 with an error body is a refusal", async () => {
+  let seen: any = null;
+  const ok = fakeFetch({ [GITHUB_TOKEN]: (init) => { seen = init; return json({ access_token: "gho_x", token_type: "bearer" }); } });
+  assert(await githubExchangeCode(GH, "code-1", ok) === "gho_x", "token not returned");
+  assert((seen.headers as any).accept === "application/json" && (seen.headers as any)["user-agent"], "accept json + user-agent required");
+  const body = JSON.parse(String(seen.body));
+  assert(body.client_secret === "s3cret" && body.code === "code-1" && body.redirect_uri === GH.redirectUri, "exchange body");
+  const bad = fakeFetch({ [GITHUB_TOKEN]: () => json({ error: "bad_verification_code", error_description: "The code passed is incorrect or expired." }) });
+  let threw = false;
+  try { await githubExchangeCode(GH, "code-2", bad); } catch { threw = true; }
+  assert(threw, "a 200 with an error body must not become a token");
+});
+
+await check("github: the profile is fetched under the token with a User-Agent; emails are optional", async () => {
+  const withEmails = fakeFetch({
+    [`${GITHUB_API}/user`]: (init) => {
+      const h = init!.headers as any;
+      assert(h.authorization === "Bearer gho_x" && h["user-agent"], "bearer + user-agent");
+      return json({ id: 1024025, login: "torvalds", name: "Linus", avatar_url: "https://a/x.png", email: null });
+    },
+    [`${GITHUB_API}/user/emails`]: () => json([{ email: "old@x.test", primary: false, verified: true }, { email: "linus@x.test", primary: true, verified: true }]),
+  });
+  const r = await githubFetchProfile("gho_x", withEmails);
+  assert(r.profile.id === 1024025 && r.emails.length === 2, "profile + emails");
+  const noEmails = fakeFetch({
+    [`${GITHUB_API}/user`]: () => json({ id: 7, login: "nobody" }),
+    [`${GITHUB_API}/user/emails`]: () => json({ message: "Not Found" }, 404),
+  });
+  const r2 = await githubFetchProfile("gho_y", noEmails);
+  assert(r2.profile.id === 7 && r2.emails.length === 0, "a 404 on emails is not a failure");
+  const noId = fakeFetch({ [`${GITHUB_API}/user`]: () => json({ login: "ghost" }) });
+  let threw = false;
+  try { await githubFetchProfile("gho_z", noId); } catch { threw = true; }
+  assert(threw, "a profile without a numeric id is not an identity");
+});
+
+await check("github: the identity key is the numeric id; the viewer shows the verified primary email or a non-email name", async () => {
+  assert(githubIdentityKey({ id: 1024025 }) === "github:1024025", "key must be github:<id>");
+  const v = githubViewer({ id: 1024025, login: "torvalds", name: "Linus", avatar_url: "https://a/x.png" },
+    [{ email: "old@x.test", primary: false, verified: true }, { email: "linus@x.test", primary: true, verified: true }, { email: "un@x.test", primary: false, verified: false }], "u-linus_x.test");
+  assert(v.email === "linus@x.test" && v.username === "torvalds" && v.picture === "https://a/x.png" && v.source === "github" && v.agentId === "u-linus_x.test", "viewer fields");
+  const v2 = githubViewer({ id: 7, login: "nobody" }, [], "u-someone");
+  assert(v2.email === "github:nobody" && v2.name === null && v2.picture === null, "no email: a name that cannot be mistaken for one");
+  const v3 = githubViewer({ id: 8, login: "x" }, [{ email: "only@x.test", primary: false, verified: true }], "u-x");
+  assert(v3.email === "only@x.test", "a verified non-primary email still beats the placeholder");
+});
+
+await check("github: a session carries the mapped agent and resolves with it; one that lost it names nobody", async () => {
+  const v = githubViewer({ id: 1024025, login: "torvalds" }, [], "u-tygg_example.test");
+  const cookie = await sessionCookieFor(SECRET, v, "github:1024025", now);
+  const r = await resolveViewer(req(cookie.split(";")[0]), { SESSION_SECRET: SECRET }, { now });
+  assert(r && r.source === "github" && r.agentId === "u-tygg_example.test" && r.username === "torvalds", "github session must resolve with its agent");
+  const claims = await open<any>(SECRET, cookie.split(";")[0].split("=")[1], now);
+  assert(claims.agentId === "u-tygg_example.test" && claims.source === "github", "claims carry agentId + source");
+  const lost = await seal(SECRET, { ...claims, agentId: undefined });
+  assert(await resolveViewer(req(`${SESSION_COOKIE}=${lost}`), { SESSION_SECRET: SECRET }, { now }) === null, "a github session without an agent is nobody");
+  const raft = await sessionCookieFor(SECRET, { email: "a@b.test", name: null, username: null, picture: null, source: "raft" }, "sub", now);
+  const rr = await resolveViewer(req(raft.split(";")[0]), { SESSION_SECRET: SECRET }, { now });
+  assert(rr && rr.source === "raft" && rr.agentId === undefined, "older sessions are unchanged");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
