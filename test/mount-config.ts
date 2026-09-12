@@ -637,6 +637,31 @@ await check("释放记录带着最后一次使用的时间,所以闲置时长算
   if (never.execs !== 0 || never.saved.length !== 0) throw new Error("defaults are wrong");
 });
 
+/**
+ * The artifacts paragraph follows its mount's name.
+ *
+ * It used to be the framework's sentence, printed whenever a flag said an
+ * artifacts tool was around, and it called the thing "the artifacts tool" — a
+ * name that is only right while the operator happens to have used it. Written
+ * by the mount, it can say the name that mount actually has. The test mounts it
+ * under a different alias for the same reason the bug existed: the default one
+ * hides the difference.
+ */
+await check("the artifacts paragraph names the mount it came from, whatever it is called", async () => {
+  const plugin = artifactsPlugin({} as any, "bucket");
+  const say = async (alias: string) =>
+    (await plugin.promptContribution!({ alias, caller: { tenantId: "t", agentId: "a", taskId: "k" } } as any)) ?? "";
+
+  for (const alias of ["artifacts", "files"]) {
+    const text = await say(alias);
+    if (!text.includes(`\`${alias}\``)) throw new Error(`mounted as ${alias}, the paragraph says: ${text}`);
+    if (!text.includes("read")) throw new Error(`the paragraph does not say which tool reads one back: ${text}`);
+    // The qualified form is for telling the model to call something now; a
+    // description names the mount and the bare tool.
+    if (text.includes("__")) throw new Error(`a description should not carry a qualified tool name: ${text}`);
+  }
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

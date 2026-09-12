@@ -14,7 +14,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import {
-  bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -55,7 +55,7 @@ import { credentialForm } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
-import { statePlugin, workingSet } from "../../src/plugins/state.ts";
+import { statePlugin } from "../../src/plugins/state.ts";
 import { run9Plugin } from "../../src/plugins/run9.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
@@ -641,14 +641,19 @@ export class AgentRuntime {
         // The agent's own record: a person named and described it at creation,
         // and that is the first thing the prompt says after the core.
         persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
-        workingSet: await workingSet(this.store, tenantId, agentId),
+        // Whatever the mounted plugins have to say, in registry order. The
+        // framework no longer reaches into any one plugin for this (Piper,
+        // tygg, 2026-09-12).
+        contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
         policy: this.#deps.policy,
         // Each paragraph appears only where the thing it describes is really
-        // there. Telling an agent to read a result back "with the artifacts
-        // tool" when no artifacts tool is mounted is not a hint, it is a wrong
-        // instruction competing with the ones that matter.
+        // there — telling an agent to read a result back with a tool it has not
+        // got is a wrong instruction competing with the right ones. That used
+        // to be a question this file asked about one plugin; the artifacts
+        // paragraph is now the artifacts mount's own contribution, so the
+        // condition is "the mount is there" and nobody has to check it.
+        // `sandbox` stays: run_js is the harness's, not a mount's.
         sandbox,
-        artifacts: offersPlugin(records, tools as MountedTool[], "artifacts"),
       }),
       model: {
         provider: binding.provider,

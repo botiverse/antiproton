@@ -147,6 +147,52 @@ export class ToolGateway {
    * Errors are swallowed on purpose: this runs after the work, and a mount that
    * cannot tidy up must not turn a finished task into a failed one.
    */
+  /**
+   * The paragraphs the mounted plugins want in the system prompt.
+   *
+   * In registry order, not mount order: the prompt prefix is cached by the
+   * provider, and mounts are listed by alias, so a person renaming one would
+   * otherwise reorder the prompt and throw the cache away. The registry is an
+   * array that only ever grows at the end, so a new plugin's paragraph lands
+   * after every existing byte. Within one plugin, mounts keep their alias
+   * order, which is stable for a given set of mounts.
+   *
+   * No credential is resolved: a paragraph is a description of what the agent
+   * can do, and asking for a key to write one would make the prompt depend on
+   * a secret being present.
+   */
+  async promptContributions(ctx: CallContext): Promise<string[]> {
+    const mounts = await this.#store.listMounts(ctx.tenantId, ctx.agentId);
+    const out: string[] = [];
+    for (const [id, plugin] of this.#plugins) {
+      if (!plugin.promptContribution) continue;
+      for (const mount of mounts.filter((m) => m.plugin === id)) {
+        let text: string | null = null;
+        try {
+          text = await plugin.promptContribution({
+            caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+            alias: mount.alias,
+            credential: null,
+            publicConfig: mount.publicConfig,
+            connection: {
+              get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
+              set: (state, expiresAt) =>
+                this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
+            },
+            async sibling() { return null; },
+          });
+        } catch (e: any) {
+          // A plugin that cannot describe itself must not stop the agent from
+          // opening: the paragraph is dropped and the run continues.
+          console.warn(`promptContribution failed for ${mount.alias}: ${String(e?.message ?? e)}`);
+          text = null;
+        }
+        if (text?.trim()) out.push(text.trim());
+      }
+    }
+    return out;
+  }
+
   async releaseTask(
     ctx: CallContext,
   ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
