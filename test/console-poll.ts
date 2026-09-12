@@ -42,7 +42,17 @@ check("the page catches up when the tab is shown again", () => {
   must(/'\.view\.on \[data-lazy\], \.side-view\.on \[data-lazy\], #inbox'/.test(html), "the shown panels and the inbox must be re-triggered");
 });
 
+  check("a panel's version lives on the panel, not in a map keyed by path", () => {
+    must(!/__ver/.test(html), "the path-keyed map is gone: its read and store keys never matched for a URL with a query");
+    must(/htmx:configRequest[\s\S]{0,120}const v = e\.detail\.elt\.dataset\.ver;\s*if \(v\) e\.detail\.headers\['x-ap-version'\] = v;/.test(html), "the request must send the element's own version");
+    must(/htmx:afterRequest[\s\S]{0,200}if \(v\) e\.detail\.elt\.dataset\.ver = v;/.test(html), "the response's version must be stored on the element");
+    const reassigned = [...html.matchAll(/setAttribute\('hx-get', [^;]*\);([^\n]*)/g)];
+    must(reassigned.length === 3, `expected 3 URL reassignments, found ${reassigned.length}`);
+    for (const m of reassigned) must(/delete panel\.dataset\.ver;/.test(m[1]), `a reassigned URL must forget the old version: ${m[0].slice(0, 80)}`);
+  });
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);
 if (failed.length) process.exit(1);
+

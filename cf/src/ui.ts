@@ -674,7 +674,7 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
       if (alias) u.searchParams.set('alias', alias); else u.searchParams.delete('alias');
       history.replaceState(null, '', u);
       const panel = document.getElementById('plugins');
-      panel.setAttribute('hx-get', alias ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(alias) : '/ui/plugins?part=catalogue');
+      panel.setAttribute('hx-get', alias ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(alias) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver;
       htmx.process(panel); htmx.trigger(panel, 'ap:show');
       document.getElementById('plugins-title').textContent = alias || 'Installed';
       ap.markMount();
@@ -690,7 +690,7 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
       if (!paths[name]) name = 'trajectory';
       document.querySelectorAll('.inspector [role=tab]').forEach(b => { const on = b.dataset.insp === name; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
       const panel = document.getElementById('insp');
-      panel.setAttribute('hx-get', paths[name]);
+      panel.setAttribute('hx-get', paths[name]); delete panel.dataset.ver;
       htmx.process(panel); htmx.trigger(panel, 'ap:show');
       const u = new URL(location.href); u.searchParams.set('insp', name); history.replaceState(null, '', u);
     },
@@ -719,7 +719,7 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
     const url = new URL(location.href), v = url.searchParams.get('view');
     if (url.searchParams.has('alias')) {
       const panel = document.getElementById('plugins'), a = url.searchParams.get('alias');
-      panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue');
+      panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver;
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
     ap.show(['inbox', 'agents', 'plugins', 'runtime'].includes(v) ? v : 'inbox');
@@ -730,19 +730,26 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   // 3xx but 204, so a 304's empty body would empty the panel: the whole
   // conversation went blank the moment polling went quiet (tygg, 2026-09-11).
   // The swap is refused here, explicitly, so a 304 leaves the DOM alone.
-  window.__ver = {};
+  //
+  // The version lives on the element that made the request, not in a map
+  // keyed by path: the path htmx reports before a request (the hx-get value)
+  // and after it (with the query and the agentId it appended) are not the
+  // same string, and a map keyed by one and read by the other never hit for
+  // a URL with a query, so ?part=mounts re-rendered every poll (cody,
+  // 2026-09-12). One panel, one URL, one version; a panel whose URL is
+  // reassigned forgets its version there.
   document.body.addEventListener('htmx:beforeSwap', (e) => {
     if (e.detail.xhr && e.detail.xhr.status === 304) e.detail.shouldSwap = false;
   });
   document.body.addEventListener('htmx:configRequest', (e) => {
-    const v = window.__ver[e.detail.path];
+    const v = e.detail.elt.dataset.ver;
     if (v) e.detail.headers['x-ap-version'] = v;
     // Every panel reads or writes the current agent. One place, not forty.
     if (!('agentId' in e.detail.parameters)) e.detail.parameters.agentId = document.body.dataset.agent;
   });
   document.body.addEventListener('htmx:afterRequest', (e) => {
     const v = e.detail.xhr && e.detail.xhr.getResponseHeader('x-ap-version');
-    if (v) window.__ver[e.detail.pathInfo.requestPath.split('?')[0]] = v;
+    if (v) e.detail.elt.dataset.ver = v;
   });
   // Polling stops while the tab is hidden (every trigger tests document.hidden);
   // on return, the shown panels and the inbox refresh at once rather than
