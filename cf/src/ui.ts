@@ -32,6 +32,8 @@ const CSS = `
 .problems.warn .when{color:var(--dim)}
 .plug{border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin:6px 0;background:var(--layer-card)}
 .plug summary{cursor:pointer;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.plug-choice{display:flex;align-items:baseline;gap:8px;margin:4px 0 2px}
+.plug-choice select{background:var(--layer-card);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:1px 4px;font:inherit;font-size:12px}
 .plug h4{margin:10px 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
 code.hot{color:var(--ok);border-color:var(--ok)}
 
@@ -1708,6 +1710,7 @@ function mountBlock(d: any, m: any): string {
   const spec = installed.find((p) => p.id === m.plugin)?.credential ?? null;
 
   const account = () => {
+    if (m.enabled === false) return `<span class="tag bad">closed</span>`;
     if (m.problems?.length) return `<span class="tag bad">misconfigured</span>`;
     const attached = typeof m.credential?.attached === "boolean" ? m.credential.attached : m.connected;
     if (attached) return `<span class="tag ok">account attached</span>`;
@@ -1768,6 +1771,7 @@ export function mountList(d: any): string {
   const mounts: any[] = d.mounts ?? [];
   if (!mounts.length) return `<div class="empty">nothing mounted</div>`;
   const state = (m: any) => {
+    if (m.enabled === false) return `<span class="tag bad">closed</span>`;
     if (m.problems?.length) return `<span class="tag bad">misconfigured</span>`;
     const c = m.credential ?? {};
     const attached = typeof c.attached === "boolean" ? c.attached : m.connected;
@@ -1788,6 +1792,16 @@ export function mountList(d: any): string {
 export function catalogue(d: any): string {
   const installed: any[] = d.installed ?? [];
   const toolRow = (t: any) => [t.name, t.sideEffects, t.idempotency, t.summary];
+  // The switch belongs to the plugin, so it lives in the catalogue; the mount
+  // rows only read the result back as a "closed" chip. `inherit` has to say
+  // what it currently resolves to, or it is indistinguishable from "off".
+  const switchChip = (p: any) =>
+    (p.choice ?? "inherit") === "inherit"
+      ? `<span class="tag ${p.enabled ? "ok" : ""}">${p.enabled ? "on" : "off"} by inheritance — the plugin is ${
+          p.defaultForAllAgents ? "default for all agents" : "opt-in"}</span>`
+      : p.enabled
+        ? `<span class="tag ok">on — this agent answered "enable"</span>`
+        : `<span class="tag bad">off — this agent answered "disable"</span>`;
   const pluginBlock = (p: any) => `
     <details class="plug">
       <summary><b>${esc(p.id)}</b> <span class="sub">${esc(p.version)} · ${p.tools.length} tools</span>
@@ -1795,6 +1809,14 @@ export function catalogue(d: any): string {
           ? `<span class="tag ${p.credential.required ? "bad" : ""}">${
               p.credential.required ? "account required" : "account optional"}</span>`
           : ""}</summary>
+      <form class="plug-choice">
+        <input type="hidden" name="plugin" value="${esc(p.id)}">
+        <select name="choice" hx-post="/ui/plugin/choice" hx-target="#plugins" hx-swap="innerHTML" hx-trigger="change">
+          ${["inherit", "enable", "disable"].map((c) =>
+            `<option value="${c}"${(p.choice ?? "inherit") === c ? " selected" : ""}>${c}</option>`).join("")}
+        </select>
+        ${switchChip(p)}
+      </form>
       ${p.credential ? `<div class="hint">${esc(p.credential.summary)}${
         p.credential.grants ? ` — an account adds ${esc(p.credential.grants)}` : ""}</div>` : ""}
       ${p.config.length ? `<h4>settings</h4>${table(

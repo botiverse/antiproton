@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
+import type { PluginChoice } from "../plugins/types.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -135,6 +136,10 @@ CREATE TABLE IF NOT EXISTS mounts (
   installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
   tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT, policy TEXT,
   PRIMARY KEY (tenant_id, agent_id, alias));
+CREATE TABLE IF NOT EXISTS agent_plugins (
+  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, plugin TEXT NOT NULL,
+  state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, agent_id, plugin));
 CREATE TABLE IF NOT EXISTS secrets (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, name TEXT NOT NULL,
   ciphertext TEXT NOT NULL, iv TEXT NOT NULL,
@@ -1022,6 +1027,26 @@ export class SqliteStore implements StorageAdapter {
         .prepare("SELECT * FROM mounts WHERE tenant_id=? AND agent_id=? ORDER BY alias")
         .all(tenantId, agentId) as any[]
     ).map((r) => this.#mountRow(r));
+  }
+
+  async pluginChoices(tenantId: string, agentId: string) {
+    const out: Record<string, PluginChoice> = {};
+    for (const r of this.#db
+      .prepare("SELECT plugin, state FROM agent_plugins WHERE tenant_id=? AND agent_id=?")
+      .all(tenantId, agentId) as any[]) out[r.plugin] = r.state as PluginChoice;
+    return out;
+  }
+
+  async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {
+    if (choice === "inherit") {
+      this.#db.prepare("DELETE FROM agent_plugins WHERE tenant_id=? AND agent_id=? AND plugin=?")
+        .run(tenantId, agentId, plugin);
+      return;
+    }
+    this.#db.prepare(
+      `INSERT INTO agent_plugins(tenant_id, agent_id, plugin, state, updated_at) VALUES (?,?,?,?,?)
+       ON CONFLICT(tenant_id, agent_id, plugin) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`,
+    ).run(tenantId, agentId, plugin, choice, now());
   }
 
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {

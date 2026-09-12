@@ -148,6 +148,8 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 export const httpPlugin: Plugin = {
   id: "http",
+  // Reading the open web is what most tasks start with.
+  defaultForAllAgents: true,
   config: [
     // "Unset means any public host" is the right default for an anonymous
     // mount and the wrong one for a mount holding a key, and the difference is

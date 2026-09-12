@@ -18,7 +18,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF,
+  AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice,
 } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -28,6 +28,7 @@ import { entriesToEvents } from "./pi-view.ts";
 import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
+import { pluginEnabled } from "../../src/plugins/types.ts";
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import {
@@ -1429,10 +1430,22 @@ export class AgentDO extends DurableObject<Env> {
       }
     } catch { /* an agent with no transcript yet has used nothing */ }
 
+    // What this agent has said, and only that: a plugin it never spoke about
+    // has no entry, which is `inherit`. The page needs both halves — the
+    // answer and the default it would fall back to — because "inherit" and
+    // "off" look identical on a control unless the page can say which way the
+    // inheritance currently goes.
+    const choices = await rt.store.pluginChoices(tenantId, agentId);
     return {
       installed: installed.map((p) => ({
         id: p.id,
         version: p.version,
+        defaultForAllAgents: p.defaultForAllAgents === true,
+        choice: choices[p.id] ?? "inherit",
+        // Resolved here rather than in the page, so the rule stays in the one
+        // function that states it. A page that recomputes it is a second copy
+        // that can disagree with what the gateway does.
+        enabled: pluginEnabled(p, choices[p.id]),
         credential: p.credential ?? null,
         config: p.config ?? [],
         tools: p.tools.map((t) => ({
@@ -1457,6 +1470,12 @@ export class AgentDO extends DurableObject<Env> {
           needsAccount: plugin?.credential?.required ?? false,
           optionalAccount: plugin?.credential ? !plugin.credential.required : false,
           policy: m.policy ?? null,
+          // A switched-off mount is still here, with its account and its
+          // session: the tools are withheld and the gateway refuses, and
+          // switching back on returns everything. So the page marks it rather
+          // than dropping it — a row that vanishes reads as a bug, and this
+          // one is deliberately not a deletion.
+          enabled: plugin ? pluginEnabled(plugin, choices[m.plugin]) : true,
           config: m.publicConfig ?? {},
           session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
           // Attached, verified, account, last four, dates. Never a value.
@@ -1480,6 +1499,26 @@ export class AgentDO extends DurableObject<Env> {
   async uiAttachCredential(tenantId: string, agentId: string, alias: string, fields: Record<string, string>) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiAttachCredential", () => this.runtime().attachCredential(tenantId, agentId, alias, fields));
+  }
+
+  /**
+   * One agent's answer about one plugin, from the console.
+   *
+   * `"inherit"` is passed through rather than filtered out here: the store
+   * turns it into the absence of a row, which is what inheriting means, and a
+   * caller that had to know that would be the second place the rule lives.
+   */
+  async uiSetPluginChoice(tenantId: string, agentId: string, plugin: string, choice: string) {
+    this.#claim(tenantId, agentId);
+    const parsed = parsePluginChoice(choice);
+    if (!parsed) return { ok: false as const, error: `not a choice: ${choice}` };
+    const rt = this.runtime();
+    await rt.ready();
+    if (!rt.plugins().some((p) => p.id === plugin)) {
+      return { ok: false as const, error: `no plugin named ${plugin} is installed` };
+    }
+    await this.#busy("uiSetPluginChoice", () => rt.store.setPluginChoice(tenantId, agentId, plugin, parsed));
+    return { ok: true as const };
   }
 
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
@@ -2671,6 +2710,24 @@ export default {
           const d: any = await stub.uiPlugins(gate.tenantId, agentId);
           if (!r.ok) for (const m of d.mounts ?? []) if (m.alias === alias && m.credential) m.credential.error = r.error;
           return html(mountFragment(d, alias));
+        }
+        case "/ui/plugin/choice": {
+          // enable / disable / inherit for one plugin, then the page again.
+          // Which fragment to send back is @Nova's call; the whole panel is
+          // the safe default because turning a plugin off changes several
+          // mounts' rows at once, not just one.
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
+          const r = await stub.uiSetPluginChoice(
+            gate.tenantId, agentId,
+            String(form.get("plugin") ?? "").trim(),
+            String(form.get("choice") ?? "").trim(),
+          );
+          if (!r.ok) return new Response(r.error, { status: 400 });
+          return html(plugins(await stub.uiPlugins(gate.tenantId, agentId)));
         }
         case "/ui/credential/remove": {
           const gate = await requireViewer(request, env);
