@@ -2543,8 +2543,20 @@ export default {
             // stay where they are; the person just cannot sign in to it.
             const key = String(url.searchParams.get("key") ?? "").trim();
             if (!/^github:\d+$/.test(key)) return Response.json({ error: "BAD_KEY", hint: "?key=github:<numeric id>" }, { status: 400 });
+            // The same button is two operations. A self-registered row is
+            // rebuilt by the next sign-in as the same tenant/agent pair (the
+            // derivations are pure in the id), so deleting it is an un-invite
+            // the person undoes themselves. A row that lives elsewhere (the
+            // pre-tenant rows in "demo") is rebuilt as a FRESH pair: the old
+            // object keeps the data and nothing reads it. Say so in the reply
+            // (Piper, Vera, Dora, 2026-09-12).
+            const row = await dir.identityLookup(key);
+            const rebuiltAs = githubDefaultTenantId({ id: Number(key.slice("github:".length)) });
+            const warning = row && row.tenantId !== rebuiltAs
+              ? `this row lives in tenant ${row.tenantId}; a re-registration under open sign-up lands in ${rebuiltAs}, a fresh object, and the data in ${row.tenantId}/${row.agentId} stays there unread. To restore access to the old object, POST the same row back with tenantId ${row.tenantId}.`
+              : null;
             await dir.identityDelete(key);
-            return Response.json({ ok: true, key });
+            return Response.json({ ok: true, key, removed: row, ...(warning ? { warning } : {}) });
           }
           return Response.json({ identities: await dir.identityList() });
         }
