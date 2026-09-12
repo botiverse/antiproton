@@ -35,7 +35,7 @@ import {
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, RAFT_ISSUER, QA_VIEWER,
   type Viewer, type LoginState, type RaftConfig, type RefusalReason, type GithubConfig,
-  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer,
+  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { staticAsset } from "./static.ts";
@@ -65,6 +65,9 @@ export interface Env {
   RAFT_CLIENT_ID?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  /** "1" lets a GitHub account not on the identity table register itself
+   *  on first sign-in (tygg, 2026-09-12: 可以放开了). Absent: refused. */
+  GITHUB_OPEN_SIGNUP?: string;
   RAFT_CLIENT_SECRET?: string;
   /** The Raft server a signed-in person must belong to. */
   RAFT_SERVER_ID?: string;
@@ -2094,7 +2097,17 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // No row, no entry: the console is one operator's, and a GitHub account
       // is not an invitation.
       const key = githubIdentityKey(profile);
-      const agentId = await identities(env).identityLookup(key);
+      const dir = identities(env);
+      let agentId = await dir.identityLookup(key);
+      if (!agentId && env.GITHUB_OPEN_SIGNUP === "1") {
+        // Open sign-up: the first sign-in writes its own row, and the agent
+        // is a new one (default mounts, empty memory), never an existing
+        // person's. The operator's rows still win, since they are looked up
+        // first.
+        agentId = githubDefaultAgentId(profile);
+        await dir.identityUpsert(key, agentId, "self");
+        console.log(`login: ${key} (${profile.login}) registered as ${agentId}`);
+      }
       if (!agentId) {
         console.warn(`login: ${key} (${profile.login}) is not on the identity table`);
         return refuse(request, "not-invited", REFUSALS["not-invited"]);

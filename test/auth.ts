@@ -10,7 +10,7 @@
 import {
   seal, open, admit, resolveViewer, sessionCookieFor, verifyIdToken, b64url, unb64url,
   readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
-  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer,
+  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId,
   GITHUB_TOKEN, GITHUB_API,
 } from "../cf/src/auth.ts";
 
@@ -204,6 +204,7 @@ await check("github: the profile is fetched under the token with a User-Agent; e
 
 await check("github: the identity key is the numeric id; the viewer shows the verified primary email or a non-email name", async () => {
   assert(githubIdentityKey({ id: 1024025 }) === "github:1024025", "key must be github:<id>");
+  assert(githubDefaultAgentId({ id: 1024025 }) === "u-github_1024025" && /^u-[A-Za-z0-9._-]{1,48}$/.test(githubDefaultAgentId({ id: 1024025 })), "a self-registered agent id names the numeric id and passes the admin route's shape");
   const v = githubViewer({ id: 1024025, login: "torvalds", name: "Linus", avatar_url: "https://a/x.png" },
     [{ email: "old@x.test", primary: false, verified: true }, { email: "linus@x.test", primary: true, verified: true }, { email: "un@x.test", primary: false, verified: false }], "u-linus_x.test");
   assert(v.email === "linus@x.test" && v.username === "torvalds" && v.picture === "https://a/x.png" && v.source === "github" && v.agentId === "u-linus_x.test", "viewer fields");
