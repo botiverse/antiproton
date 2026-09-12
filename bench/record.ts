@@ -36,7 +36,14 @@ export function driverCommit(): { commit: string; dirty: boolean } | null {
   try {
     const cwd = new URL("./", import.meta.url).pathname;
     const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    return { commit: git("rev-parse", "--short=7", "HEAD"), dirty: git("status", "--porcelain").length > 0 };
+    // Scoped to the trees the driver runs code from, like deploy.sh: a
+    // repository-wide status reads an untracked node_modules as dirty and the
+    // field would say "cannot describe" of every clean checkout that has
+    // installed its dependencies (Vera, 2026-09-12).
+    // `:(top)` anchors the pathspecs at the repository root; the command runs
+    // from bench/, where a bare "bench" would name nothing and hide every edit.
+    const dirty = git("status", "--porcelain", "--", ":(top)bench", ":(top)src").length > 0;
+    return { commit: git("rev-parse", "--short=7", "HEAD"), dirty };
   } catch { return null; }
 }
 
