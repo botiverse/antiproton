@@ -15,8 +15,8 @@ cf/src/index.ts: error TS2339: Property 'ToolBinding' does not exist on type 'Ex
 cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
 cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
 src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.
-src/store/artifacts.ts: error TS2554: Expected 0 arguments, but got 1.
-test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap.
+src/store/artifacts.ts: error TS2554: Expected 0 arguments, but got 1. # not a code error: one tsc program carries both runtimes' globals, so whichever lib loads second wins — cody diagnosed it 2026-09-12; a real fix is two programs
+test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap. # correct comparison of two literal types; fixing it would weaken the test (Rex, 2026-09-12)
 test/secrets.ts: error TS7006: Parameter '_args' implicitly has an 'any' type.
 test/secrets.ts: error TS7006: Parameter '_tool' implicitly has an 'any' type.
 test/secrets.ts: error TS7006: Parameter 'ctx' implicitly has an 'any' type.
