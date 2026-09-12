@@ -2521,8 +2521,13 @@ export default {
             const key = String(body?.key ?? "").trim();
             const agentId = String(body?.agentId ?? "").trim();
             const tenantId = String(body?.tenantId ?? "demo").trim();
-            if (!/^github:\d+$/.test(key) || !/^u-[A-Za-z0-9._-]{1,48}$/.test(agentId) || !/^[A-Za-z0-9._-]{1,48}$/.test(tenantId)) {
-              return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo) is [A-Za-z0-9._-]" }, { status: 400 });
+            // Admission equals the naming rule: a row the object name would
+            // refuse must not be written, or it fails at sign-in instead
+            // (Piper, 2026-09-12).
+            let named = "";
+            try { named = agentObjectName(tenantId, agentId); } catch (e: any) { named = ""; }
+            if (!/^github:\d+$/.test(key) || !agentId.startsWith("u-") || !named) {
+              return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo); both must be valid object-name parts" }, { status: 400 });
             }
             await dir.identityUpsert(key, agentId, tenantId, "automation");
             return Response.json({ ok: true, key, agentId, tenantId });
