@@ -68,6 +68,47 @@ await check("memory 按租户和 agent 隔离", async () => {
   if (!(await workingSet(a.store, "t", "b")).trim() === false) throw new Error("b inherited a's working set");
 });
 
+/**
+ * The mount says its own paragraph now, instead of the runtime importing one.
+ *
+ * Two things have to hold and neither is visible from the prompt text alone:
+ * an agent that has written nothing contributes *nothing* — a heading with no
+ * body under it is a paragraph the model has to read past every turn — and two
+ * mounts of this plugin contribute *once*, because what they read is keyed by
+ * agent rather than by mount and the second would repeat the first word for
+ * word.
+ */
+await check("挂载自己贡献那段提示词，写空时不贡献，挂两次也只贡献一次", async () => {
+  const { store, plugin, ctx } = await fixture();
+  if (typeof plugin.promptContribution !== "function") throw new Error("state no longer declares promptContribution");
+
+  // Nothing written yet: no paragraph at all, not an empty one.
+  const before = await plugin.promptContribution!(ctx());
+  if (before !== null) throw new Error(`an agent with nothing written contributed ${JSON.stringify(before)}`);
+
+  await plugin.invoke("remember", { key: "memory", text: "部署窗口是周二 02:00 UTC" }, ctx());
+  const after = await plugin.promptContribution!(ctx());
+  if (!after || !after.includes("部署窗口")) throw new Error(`the working set is not in the contribution: ${after}`);
+
+  // Two mounts of the same plugin read the same documents, so exactly one of
+  // them speaks; without this the prompt would carry the working set twice.
+  // Which one is the gateway's own resolution order and not this test's
+  // business — what matters is that the total is one.
+  for (const alias of ["state", "memory2"]) {
+    await store.addMount({
+      tenantId: "t", agentId: "a", alias, installationId: "i", connectionId: null,
+      plugin: "state", toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+    } as any);
+  }
+  const spoke = [];
+  for (const alias of ["state", "memory2"]) {
+    if (await plugin.promptContribution!(ctx({ alias } as any))) spoke.push(alias);
+  }
+  if (spoke.length !== 1) {
+    throw new Error(`two mounts of one plugin contributed ${spoke.length} paragraphs (${spoke.join(", ")}), not 1`);
+  }
+});
+
 await check("工作集有字节预算，日志最先被裁", async () => {
   const { store } = await fixture();
   await store.putState("t", "a", "memory", { value: "M".repeat(9000), ref: null, bytes: 9000 });

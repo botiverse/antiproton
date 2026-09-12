@@ -330,4 +330,30 @@ export interface Plugin {
    * nothing to release, which is not a failure.
    */
   release?(ctx: PluginContext): Promise<boolean | void>;
+
+  /**
+   * A paragraph this mount adds to the agent's system prompt, or null.
+   *
+   * Declared rather than wired: before this, the runtime imported one plugin's
+   * function by name to put the working set in the prompt, so `state` could
+   * speak to the agent and no other plugin could. A mount that keeps something
+   * the agent should know about at the start of every conversation says so
+   * here, and the framework does not have to know which plugin that is.
+   *
+   * **Where it lands, and why it is not negotiable.** Contributions are
+   * appended after everything static — core, persona, policy — in the order
+   * the plugins are *registered*, never the order the mounts are named. The
+   * prompt prefix is cached by the provider, so an operator renaming a mount
+   * must not be able to reorder it: registry order is append-only, a new
+   * plugin adds its paragraph at the end, and every byte before it is
+   * unchanged. Alphabetical order by plugin id does not have that property —
+   * one new plugin whose id sorts early moves everyone.
+   *
+   * For the same reason a contribution that changes often belongs after one
+   * that rarely does: the working set changes whenever the agent writes to its
+   * memory, and everything after it in the prompt is re-read on the next turn.
+   *
+   * Called once per harness open, per mount.
+   */
+  promptContribution?(ctx: PluginContext): Promise<string | null>;
 }
