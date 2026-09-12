@@ -11,7 +11,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -1192,6 +1192,44 @@ await check("a mount answers what it is running and what it has finished", async
   } finally {
     globalThis.fetch = original;
   }
+});
+
+/**
+ * A row this version cannot read means "nothing is running", not a broken mount.
+ *
+ * `connection.get()` returns `Json`, which is `unknown`, so the `as BoxState`
+ * this replaced was an assertion the compiler could not check — on data that
+ * outlives the code that wrote it. The failure that matters is not a mistyped
+ * call site but this call site reading something an older version stored, and a
+ * generic type parameter would have hidden exactly that (Rex).
+ *
+ * The direction of the failure is the part worth pinning: unrecognised
+ * degrades to "no container", which every path already handles and which heals
+ * itself on the next call. Throwing would turn one unreadable row into a mount
+ * nobody can use again.
+ */
+await check("an unreadable row reads as no container, and a usable one still reads", () => {
+  const good = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 3 };
+  if (asBoxState(good)?.boxId !== "b-1") throw new Error("a usable row was rejected");
+  // Fields this version does not know about are not a reason to refuse: a row
+  // written by a newer version still has everything this one reads.
+  if (asBoxState({ ...good, somethingNew: true })?.boxId !== "b-1") throw new Error("an extra field was fatal");
+
+  for (const bad of [
+    null, undefined, 42, "b-1", [], {},
+    { boxId: 7, createdAt: 1, lastUsedAt: 1 },          // id of the wrong type
+    { boxId: "b", createdAt: "1", lastUsedAt: 1 },      // a clock that is a string
+    { boxId: "b", createdAt: 1 },                       // half the clocks
+  ]) {
+    if (asBoxState(bad as any) !== null) throw new Error(`accepted ${JSON.stringify(bad)} as a container record`);
+  }
+
+  // And the whole point: what an unreadable row does downstream. Every path
+  // begins at `state?.boxId`, so null is the answer that lets the next call
+  // start a fresh container instead of failing forever.
+  const a = activityOf(asBoxState({ boxId: 7 } as any));
+  if (a.live !== null) throw new Error("an unreadable row reported a running container");
+  if (usageOf(asBoxState("nonsense" as any)).length !== 0) throw new Error("an unreadable row produced history");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
