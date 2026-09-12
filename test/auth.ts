@@ -59,6 +59,16 @@ await check("a sealed session resolves; forged / tampered / expired sessions res
   assert((await resolveViewer(req(`${SESSION_COOKIE}=${value}`), env, { now: now + 8 * 24 * 3600_000 })) === null, "expired session accepted");
   // No secret configured: sessions cannot exist at all.
   assert((await resolveViewer(req(`${SESSION_COOKIE}=${value}`), {}, { now })) === null, "session accepted without a secret");
+  // The other shapes a stranger can send: empty, two-part garbage, overlong,
+  // and well-formed JSON under a wrong signature.
+  for (const bad of ["", "a.b", "x".repeat(200), `${b64url(new TextEncoder().encode('{"v":1,"who":"a@b.c","source":"raft","exp":9e15}'))}.fake`]) {
+    assert((await resolveViewer(req(`${SESSION_COOKIE}=${bad}`), env, { now })) === null, `accepted cookie shape: ${bad.slice(0, 20)}`);
+  }
+});
+
+await check("the Cloudflare Access header is not an identity any more", async () => {
+  const v = await resolveViewer(req(undefined, { "cf-access-authenticated-user-email": "someone@example.com" }), { SESSION_SECRET: SECRET }, { now });
+  assert(v === null, `header resolved to ${JSON.stringify(v)}`);
 });
 
 await check("the QA key session is its own identity, not automation", async () => {

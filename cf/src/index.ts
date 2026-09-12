@@ -1900,11 +1900,9 @@ export class AgentDO extends DurableObject<Env> {
 /**
  * Who is signed in. The one place identity is decided; see auth.ts.
  *
- * A session this Worker sealed comes first. The Cloudflare Access header is
- * still honoured while the two mechanisms overlap, and goes with the Access
- * application. The app must not accept an identity from anywhere the caller
- * controls, and after the overlap nothing on a request is one: only something
- * this Worker signed.
+ * A session this Worker sealed, or the automation token. The app must not
+ * accept an identity from anywhere the caller controls, and nothing else on a
+ * request is one: only something this Worker signed.
  */
 const viewerMemo = new WeakMap<Request, Promise<Viewer | null>>();
 async function viewer(request: Request, env: Env, allowAnonymous = false): Promise<Viewer | null> {
@@ -2048,9 +2046,6 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
         loginConfigured: raftConfig(env) !== null,
         qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
-        cfHeaders: Object.fromEntries(
-          [...request.headers].filter(([k]) => k.startsWith("cf-")),
-        ),
       });
     }
     case "/logout": {
@@ -2460,11 +2455,9 @@ export default {
           } catch { out.guardSurvived = true; }
           return Response.json(out);
         }
-        // Confirms what identity a request actually resolves to (see
-        // /ui/whoami), rather than trusting a name. A client-supplied header
-        // is not one: while Access overlaps, Cloudflare strips cf-access-*
-        // from inbound requests; after it, only a session this Worker sealed
-        // counts.
+        // What identity a request actually resolves to is /ui/whoami's
+        // business; here only the automation token opens the door, and a
+        // client-supplied header never does.
         case "/admin/compact": {
           // The operator's way in, alongside /admin/diagnose. The UI button
           // derives the agent from whoever is signed in, which is right for a
