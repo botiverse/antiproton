@@ -1214,12 +1214,18 @@ await check("an unreadable row reads as no container, and a usable one still rea
   // Fields this version does not know about are not a reason to refuse: a row
   // written by a newer version still has everything this one reads.
   if (asBoxState({ ...good, somethingNew: true })?.boxId !== "b-1") throw new Error("an extra field was fatal");
+  // Absent is not the same as malformed: every reader defaults these.
+  if (asBoxState({ ...good, sessions: [] })?.boxId !== "b-1") throw new Error("an empty session list was rejected");
 
   for (const bad of [
     null, undefined, 42, "b-1", [], {},
     { boxId: 7, createdAt: 1, lastUsedAt: 1 },          // id of the wrong type
     { boxId: "b", createdAt: "1", lastUsedAt: 1 },      // a clock that is a string
     { boxId: "b", createdAt: 1 },                       // half the clocks
+    // Present but not an array: `usage` maps over `sessions` and `start_from`
+    // searches `envs`, so this is the shape that throws rather than misses.
+    { boxId: "b", createdAt: 1, lastUsedAt: 1, sessions: { 0: {} } },
+    { boxId: "b", createdAt: 1, lastUsedAt: 1, envs: "none" },
   ]) {
     if (asBoxState(bad as any) !== null) throw new Error(`accepted ${JSON.stringify(bad)} as a container record`);
   }

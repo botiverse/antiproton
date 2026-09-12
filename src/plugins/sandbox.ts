@@ -215,6 +215,12 @@ export function asBoxState(v: Json): BoxState | null {
   const o = v as Record<string, unknown>;
   if (typeof o.boxId !== "string") return null;
   if (typeof o.createdAt !== "number" || typeof o.lastUsedAt !== "number") return null;
+  // Present but the wrong shape is the case that throws: `usage` maps over
+  // `sessions` and `start_from` searches `envs`, so an object where an array
+  // belongs is a crash rather than a miss. Absent stays fine — every reader
+  // already defaults it (Rex, 2026-09-12).
+  if (o.sessions !== undefined && !Array.isArray(o.sessions)) return null;
+  if (o.envs !== undefined && !Array.isArray(o.envs)) return null;
   return v as BoxState;
 }
 
