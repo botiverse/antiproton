@@ -36,10 +36,11 @@ export function driverCommit(): { commit: string; dirty: boolean } | null {
   try {
     const cwd = new URL("./", import.meta.url).pathname;
     const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    // Scoped to the trees the driver runs code from, like deploy.sh: a
-    // repository-wide status reads an untracked node_modules as dirty and the
-    // field would say "cannot describe" of every clean checkout that has
-    // installed its dependencies (Vera, 2026-09-12).
+    // Scoped to the driver's trees, like deploy.sh: a repository-wide status
+    // would count untracked entries elsewhere in the checkout (a symlinked
+    // node_modules escapes the "node_modules/" ignore rule, a real directory
+    // does not), and the field would then depend on the checkout's shape
+    // rather than on the code that ran (Vera, Dora, 2026-09-12).
     // `:(top)` anchors the pathspecs at the repository root; the command runs
     // from bench/, where a bare "bench" would name nothing and hide every edit.
     const dirty = git("status", "--porcelain", "--", ":(top)bench", ":(top)src").length > 0;
