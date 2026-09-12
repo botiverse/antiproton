@@ -101,6 +101,14 @@ interface Session {
   boxId: string;
   startedAt: number;
   endedAt: number;
+  /**
+   * When the box was last actually used, so idle time is computable after the
+   * fact: `endedAt - lastUsedAt`. `endedAt - startedAt` is how long it lived,
+   * which is the wrong segment for deciding a release policy — the two
+   * policies differ only in how long a box sits unused, and without this the
+   * record could not tell them apart.
+   */
+  lastUsedAt: number;
   execs: number;
   saved: string[];
 }
@@ -185,10 +193,7 @@ async function stopBox(
   // delete only means the next call tries to reuse something that may not be
   // there — but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
-  const session: Session = {
-    boxId: state.boxId, startedAt: state.createdAt, endedAt: Date.now(),
-    execs: state.execs ?? 0, saved: state.saved ?? [],
-  };
+  const session = sessionOf(state, Date.now());
   await ctx.connection.set({
     boxId: "", createdAt: 0, lastUsedAt: 0,
     sessions: [session, ...(state.sessions ?? [])].slice(0, SESSIONS_KEPT),
@@ -214,6 +219,33 @@ async function stopBox(
  * and mounts rely on it; a *present* value that is not `"open"` isolates, which
  * is the direction a mistake should fail in.
  */
+/**
+ * What a finished container leaves behind, as one readable thing.
+ *
+ * Extracted so the record's contents can be asserted without a live box —
+ * `stopBox` needs a credential and a network, so nothing in the suite reaches
+ * the object literal this used to be. The field that makes that worth doing is
+ * `lastUsedAt`: it is carried *from* the live state while the line just below
+ * its old home resets every other field of that state to zero. That line is
+ * correct and looks correct, which is the danger — extending it by one token
+ * would be consistent with its neighbours and would quietly empty this record.
+ */
+export function sessionOf(
+  state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
+  endedAt: number,
+): Session {
+  return {
+    boxId: state.boxId,
+    startedAt: state.createdAt,
+    endedAt,
+    // Held-while-working versus held-while-idle is the only term that separates
+    // the two release policies, and it is computable only from here.
+    lastUsedAt: state.lastUsedAt || state.createdAt,
+    execs: state.execs ?? 0,
+    saved: state.saved ?? [],
+  };
+}
+
 /**
  * What of a command's output the agent gets, and what it is told about the rest.
  *
@@ -415,14 +447,22 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     },
   ],
 
-  /** Called when the agent has nothing open, so an idle box is not left running
-   *  on the tenant's quota because nobody thought to stop it.
+  /** Hands this mount's box back, so an idle one is not left running on the
+   *  tenant's quota because nobody thought to stop it. Safe to call when there
+   *  is no box: it reports that nothing was released rather than failing.
+   *
+   *  **When** it is called is the framework's decision and deliberately not
+   *  described here. It was, twice: the comment said "when the task ends" while
+   *  the body twenty lines down was already mount-scoped, and then it said "when
+   *  the agent has nothing open", which was true only while the gateway released
+   *  at exactly that step. Both sentences were correct when written, went stale
+   *  in a file nobody had reason to reread, and cost nothing until someone
+   *  relied on them. The trigger lives at the call site — today
+   *  `cf/src/runtime.ts` — so that is where it is stated and where it changes.
    *
    *  Not per task, despite what the gateway's `releaseTask` is called: the body
    *  below reads the mount's connection state and never looks at the caller's
-   *  task. The comment used to say "when the task ends" while the code twenty
-   *  lines down was already mount-scoped — the two were written in one file
-   *  without meeting, which is why the wrong sentence cost nothing and stayed. */
+   *  task. */
   async release(ctx: PluginContext): Promise<boolean> {
     const r = await stopBox(ctx);
     if (r === null) return false;

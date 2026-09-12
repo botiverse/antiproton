@@ -9,7 +9,7 @@ import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin, execArgv, execOutput } from "../src/plugins/run9.ts";
+import { run9Plugin, execArgv, execOutput, sessionOf } from "../src/plugins/run9.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -615,6 +615,26 @@ await check("带凭据的 http 挂载必须点名它的 host", () => {
   try { assertMountConfig(httpPlugin, { account: "x" } as any, "secret:web"); }
   catch (e) { threw = String((e as Error).message); }
   if (!/cannot mount http/.test(threw)) throw new Error(`it validates but does not refuse: ${threw || "no throw"}`);
+});
+
+await check("释放记录带着最后一次使用的时间,所以闲置时长算得出来", () => {
+  // `endedAt - startedAt` is how long the box lived; the release policy turns on
+  // how long it sat unused, and that is only computable if the record carries
+  // `lastUsedAt`. The live state maintains it on every call and the release path
+  // resets every other field of that state to zero — so the danger is not a
+  // deleted line, it is one more token on a line that already looks right.
+  const s = sessionOf(
+    { boxId: "b-1", createdAt: 1_000, lastUsedAt: 4_000, execs: 3, saved: ["r2://x"] }, 10_000);
+  if (s.lastUsedAt !== 4_000) throw new Error(`lastUsedAt was dropped: ${JSON.stringify(s)}`);
+  if (s.endedAt - s.lastUsedAt !== 6_000) throw new Error("idle time is not computable from the record");
+  if (s.endedAt - s.startedAt !== 9_000) throw new Error("lifetime changed meaning");
+  if (s.execs !== 3 || s.saved.join() !== "r2://x") throw new Error("the rest of the record moved");
+
+  // A box that was never used after it was created: idle since creation, not
+  // zero, because a zero here would read as "used a moment ago".
+  const never = sessionOf({ boxId: "b-2", createdAt: 2_000 }, 5_000);
+  if (never.lastUsedAt !== 2_000) throw new Error(`an unused box reported ${never.lastUsedAt}`);
+  if (never.execs !== 0 || never.saved.length !== 0) throw new Error("defaults are wrong");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
