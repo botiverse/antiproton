@@ -147,7 +147,7 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
       const st: any = await ctx.connection.get();
       // Deliberately not the plugin's own field name: whatever it keeps, the
       // shape it answers in is the contract's.
-      return { live: st?.boxId ? { id: st.boxId, lastUsedAt: st.createdAt ?? 0 } : null };
+      return { live: st?.boxId ? { id: st.boxId, startedAt: st.createdAt ?? 0, lastUsedAt: st.createdAt ?? 0 } : null };
     },
   };
   const gw = new ToolGateway(store, [holding], { async resolve() { return null; } });
