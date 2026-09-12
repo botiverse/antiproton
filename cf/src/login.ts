@@ -8,10 +8,9 @@
  * identity: the pages carry the brand, one button, and words.
  *
  * The button goes to `/login/github`, which starts the OAuth flow against
- * GitHub. Only invited accounts get in (anyone else is refused after the
- * exchange, see `REFUSALS`), and everything a person owns is keyed on their
- * GitHub account rather than on an email, so the page says both up front
- * rather than after the round trip. The QA entrance (`/login/key`) is deliberately absent from the
+ * GitHub. Any GitHub account can sign in and gets an agent of its own, and
+ * everything a person owns is keyed on that account rather than on an email,
+ * so the page says both up front rather than after the round trip. The QA entrance (`/login/key`) is deliberately absent from the
  * sign-in page: it is a secret, not a choice. Its own form is rendered here
  * too (`keyPage`), so the one person who does reach it sees the same product.
  */
@@ -99,7 +98,7 @@ export function loginPage(): string {
     `<h1>Sign in to the console</h1>
   <p>This console drives a real agent against the operator's model account, so it needs to know who you are.</p>
   <a class="btn" href="/login/github" rel="nofollow">${GITHUB_MARK}Sign in with GitHub</a>
-  <p class="fine">Invited GitHub accounts only. GitHub shares your username, name and avatar with antiproton; everything you create here is keyed on that account.
+  <p class="fine">Any GitHub account can sign in; your first sign-in creates an agent of your own. GitHub shares your username, name and avatar with antiproton; everything you create here is keyed on that account.
   New to this? <a href="https://report.antiproton.ai/" target="_blank" rel="noopener">Read what antiproton is</a> first.</p>`);
 }
 
