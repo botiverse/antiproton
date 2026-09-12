@@ -30,6 +30,8 @@ export interface SandboxConfig {
   project?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  /** Who verifies the credential: the provider's API, or the endpoint itself. */
+  verifyWith?: "provider" | "endpoint";
   /** Ceiling on one `quiet` request, in minutes. */
   maxQuietMinutes?: number;
   /** Where commands run. A prepared image usually has its own checkout. */
@@ -211,6 +213,7 @@ export function providerOf(cfg: { provider?: string }): "run9" {
 
 const DEFAULTS = {
   provider: "run9",
+  verifyWith: "provider" as const,
   /** Installs and scripts share one directory, or Node resolves modules from
    *  wherever the script sits and cannot find what npm just installed. */
   workdir: "/work",
@@ -428,6 +431,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       summary: "Longest a single quiet request may last. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
     { name: "endpoint", type: "string", summary: "API endpoint.", default: "https://api.run.sys9.ai" },
+    // Who can say whether this mount's credential works, which stops being run9
+    // the moment the endpoint is our own service in front of it: the mount then
+    // holds a token we issued, and "is my key good" is a question for whoever
+    // issued it rather than something to infer by bouncing off the provider.
+    // Declared, not guessed from the endpoint's hostname — the same reason the
+    // provider is a setting instead of something read out of a URL.
+    { name: "verifyWith", type: "string", choices: ["provider", "endpoint"], default: "provider",
+      summary: "Who answers whether the credential works: the provider's own API, or the endpoint's `/credential`." },
   ],
   version: "1.0.0",
   tools: [
@@ -630,6 +641,27 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       return { ok: false as const, kind: "rejected" as const, reason: "run9 needs both ak and sk; one of them is missing" };
     }
     try {
+      // The endpoint answers for itself when it is not the provider.
+      //
+      // Once our own service sits in front, the mount holds a token we issued,
+      // and asking run9 about it proves nothing: the provider has never seen
+      // it. Worse, passing the question through would make the service answer
+      // whether an id the caller does not own exists, which is the thing it was
+      // put there to refuse (cody, 2026-09-12).
+      if (cfg.verifyWith === "endpoint") {
+        const res = await fetch(`${cfg.endpoint}/credential`, {
+          headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
+          signal: AbortSignal.timeout(cfg.timeoutMs),
+        });
+        if (res.ok) return { ok: true as const, account: cfg.project };
+        const said = (await res.text()).slice(0, 200);
+        if (res.status === 401 || res.status === 403) {
+          return { ok: false as const, kind: "rejected" as const, reason: "this key was not accepted" };
+        }
+        // Anything else is the service having trouble, not a verdict on the key:
+        // the difference `checkCredential` exists to keep (#45).
+        return { ok: false as const, kind: "unreachable" as const, reason: `the sandbox service answered ${res.status}: ${said.slice(0, 120)}` };
+      }
       // Asks about one box that cannot exist, rather than listing the project.
       //
       // Verifying a key by listing every box means the answer to "does this key
