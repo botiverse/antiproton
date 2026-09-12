@@ -37,7 +37,7 @@ await check("写下的东西会出现在下一个任务的系统提示里", asyn
   await plugin.invoke("remember", { key: "memory", text: "部署窗口是周二 02:00 UTC" }, ctx());
   await plugin.invoke("remember", { key: "todo", text: "还要确认 web-02" }, ctx());
 
-  const sys = systemPrompt({ workingSet: await workingSet(store, "t", "a") });
+  const sys = systemPrompt({ contributions: [await workingSet(store, "t", "a")] });
   if (!sys.includes("部署窗口是周二 02:00 UTC")) throw new Error("a durable fact did not reach the next task");
   if (!sys.includes("还要确认 web-02")) throw new Error("an open item did not reach the next task");
 });

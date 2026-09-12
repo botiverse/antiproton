@@ -75,7 +75,10 @@ export interface PromptParts {
   /** Who this agent is, as the person who created it said: a name, and a
    *  description handed over verbatim as its standing instructions. */
   persona?: { name?: string; description?: string } | null;
-  workingSet?: string;
+  /** Paragraphs the mounted plugins contributed, already in the order the
+   *  gateway decided (registry order). They come last: the prompt before them
+   *  is the part that does not move, and a provider caches by prefix. */
+  contributions?: string[];
   policy?: string;
   /** Whether `run_js` is actually offered. A page about a sandbox the agent
    *  does not have is noise competing with the instructions that matter. */
@@ -91,7 +94,7 @@ export function systemPrompt(parts: PromptParts = {}): string {
   if (parts.sandbox) out.push(SANDBOX);
   if (parts.artifacts ?? parts.sandbox) out.push(ARTIFACTS);
   if (parts.policy?.trim()) out.push(parts.policy.trim());
-  if (parts.workingSet?.trim()) out.push(parts.workingSet.trim());
+  for (const c of parts.contributions ?? []) if (c.trim()) out.push(c.trim());
   return out.join("\n\n");
 }
 
