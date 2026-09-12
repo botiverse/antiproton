@@ -755,18 +755,20 @@ await check("run, shell and the per-execution reminder end the container the sam
     if (!/persists between calls|across calls/.test(text)) {
       throw new Error(`${where} no longer says the container survives calls: ${text.slice(0, 120)}`);
     }
-    // …and each says what else can end it, so none of them reads as "it waits
-    // for you and nothing else".
-    if (!/idle/.test(text)) {
-      throw new Error(`${where} says the box survives calls without saying idling can end it: ${text.slice(0, 160)}`);
+    // …and each says the same thing about how it ends. Today that is "when you
+    // release it", because the lease is off until the two numbers are set; the
+    // day they are, all three gain the idle clause together and this assertion
+    // changes with them. What must never differ is the three of them.
+    if (!/release/.test(text)) {
+      throw new Error(`${where} says the box survives calls without saying what ends it: ${text.slice(0, 160)}`);
+    }
+    if (/goes idle|idle long enough/.test(text)) {
+      throw new Error(`${where} promises the idle question while the lease is off: ${text.slice(0, 160)}`);
     }
   }
-  // The reminder is the one the agent reads while a box is running, so it also
-  // has to say what happens when nobody answers — the other two describe a box
-  // that may not exist yet.
-  if (!/released if nobody answers/.test(reminder)) {
-    throw new Error(`the reminder does not say silence has a consequence: ${reminder}`);
-  }
+  // When the lease is switched on, the reminder is also the one that has to say
+  // silence has a consequence — the other two describe a box that may not exist
+  // yet. That assertion belongs to the change that sets the numbers.
   // And it names the mount, because an agent with two of them cannot act on
   // "the container".
   if (!reminder.includes("box")) throw new Error(`the reminder does not name the mount: ${reminder}`);

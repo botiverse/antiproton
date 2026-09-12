@@ -163,14 +163,16 @@ interface BoxState {
  * two with nothing failing, which is how "persists between calls" outlived the
  * behaviour it described.
  *
- * Three clauses because the box now has three possible ends, and an agent that
- * knows only the first will leave work in a machine that goes away: it survives
- * calls, it is asked about when it goes quiet, and it is taken if nobody
- * answers.
+ * **It says what is true of the deployment it is running in.** The lease in this
+ * PR is off until someone sets the two numbers, and while it is off the box
+ * really does wait for the agent — so the sentence waits too. The three-clause
+ * version ("you are asked when it goes quiet, and taken if nobody answers")
+ * lands in the same change that sets `RUN9_IDLE_MINUTES` and
+ * `RUN9_MAX_IDLE_MINUTES`, because a promise the mechanism is not keeping is
+ * the defect this file has already carried twice.
  */
 export function boxReminder(alias: string): string {
-  return `this container persists between calls; if it goes idle you are asked whether to keep it, ` +
-    `and released if nobody answers; the \`release\` tool on \`${alias}\` destroys it now`;
+  return `this container persists between calls; the \`release\` tool on \`${alias}\` destroys it`;
 }
 
 const SESSIONS_KEPT = 20;
@@ -369,8 +371,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         "starts a container that is billed for every second it exists, and it cannot call your other " +
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
         "few seconds of compute. The container is NOT the per-execution sandbox: it persists between " +
-        "calls until you release it or leave it idle long enough to be asked about, so installs and " +
-        "files survive from one call to the next — do not " +
+        "calls until you release it, so installs and files survive from one call to the next — do not " +
         "reinstall. Work in as few calls as you can, save what matters with `save`, and release it. " +
         "Everything inside is destroyed when it is released.",
       parameters: {
@@ -393,8 +394,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       name: "shell",
       summary:
         "Shell in the same billed-by-the-second container as `run`, and the same one across calls " +
-        "until you release it or it goes idle — state, installed packages and files carry over. " +
-        "Only for what needs a real " +
+        "— state, installed packages and files carry over. Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
