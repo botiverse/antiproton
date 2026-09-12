@@ -8,7 +8,7 @@
  * says otherwise.
  */
 import {
-  seal, open, admit, resolveViewer, sessionCookieFor, verifyIdToken, b64url, unb64url,
+  seal, open, resolveViewer, sessionCookieFor, b64url, unb64url,
   readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId,
   GITHUB_TOKEN, GITHUB_API,
@@ -43,12 +43,12 @@ await check("seal/open round-trips and rejects tampering, wrong secret, expiry",
 
 await check("a sealed session resolves; forged / tampered / expired sessions resolve to nobody", async () => {
   const env = { SESSION_SECRET: SECRET };
-  const viewer = { email: "tygg@example.com", name: "tygg", username: "tygg", picture: null, source: "raft" as const };
+  const viewer = { email: "tygg@example.com", name: "tygg", username: "tygg", picture: null, source: "github" as const, agentId: "u-tygg_example.com" };
   const setCookie = await sessionCookieFor(SECRET, viewer, "sub-1", now);
   assert(/HttpOnly/.test(setCookie) && /Secure/.test(setCookie) && /SameSite=Lax/.test(setCookie), "cookie attributes");
   const value = setCookie.split(";")[0].split("=")[1];
   const v = await resolveViewer(req(`${SESSION_COOKIE}=${value}`), env, { now });
-  assert(v?.email === "tygg@example.com" && v.source === "raft" && v.name === "tygg", `resolved ${JSON.stringify(v)}`);
+  assert(v?.email === "tygg@example.com" && v.source === "github" && v.name === "tygg" && v.agentId === "u-tygg_example.com", `resolved ${JSON.stringify(v)}`);
   // Forged: signed under a secret the attacker chose.
   const forgedSet = await sessionCookieFor("attacker", viewer, "sub-1", now);
   const forged = forgedSet.split(";")[0].split("=")[1];
@@ -90,51 +90,6 @@ await check("the anonymous branch is unreachable unless the deployment opens it"
   assert((await resolveViewer(req(), { SESSION_SECRET: SECRET, UI_ALLOW_ANONYMOUS: "1" }, { allowAnonymous: false })) === null, "anonymous where the route forbids it");
   const v = await resolveViewer(req(), { SESSION_SECRET: SECRET, UI_ALLOW_ANONYMOUS: "1" }, { allowAnonymous: true });
   assert(v?.source === "anonymous", "anonymous where opened");
-});
-
-await check("admission: humans with a verified email on our server; everyone else refused by reason", async () => {
-  const base = { sub: "s", type: "human", email: "a@b.c", email_verified: true, server_id: "srv", name: "A", preferred_username: "a", picture: null };
-  const ok = admit(base, "srv");
-  assert(ok.ok && ok.viewer.email === "a@b.c" && ok.viewer.source === "raft", "human admitted");
-  assert(!admit({ ...base, type: "agent" }, "srv").ok, "agent admitted");
-  assert((admit({ ...base, type: "agent" }, "srv") as any).reason === "not-human", "agent reason");
-  assert((admit({ ...base, email_verified: false }, "srv") as any).reason === "no-email", "unverified email");
-  assert((admit({ ...base, email: null }, "srv") as any).reason === "no-email", "missing email");
-  assert((admit({ ...base, server_id: "other" }, "srv") as any).reason === "wrong-server", "other server");
-  assert((admit({ ...base, server_id: undefined }, "srv") as any).reason === "wrong-server", "no server");
-});
-
-await check("id_token: ES256 signature, issuer, audience, expiry and nonce all checked", async () => {
-  const kp = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
-  const pub = (await crypto.subtle.exportKey("jwk", kp.publicKey)) as JsonWebKey;
-  const jwks = { keys: [{ ...pub, kid: "k1", alg: "ES256" }] };
-  const mk = async (claims: object, key = kp.privateKey, header: object = { alg: "ES256", kid: "k1" }) => {
-    const h = b64url(new TextEncoder().encode(JSON.stringify(header)));
-    const p = b64url(new TextEncoder().encode(JSON.stringify(claims)));
-    const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(`${h}.${p}`));
-    return `${h}.${p}.${b64url(sig)}`;
-  };
-  const good = { iss: "https://api.raft.build", aud: "antiproton", exp: now / 1000 + 60, nonce: "n1", sub: "u1", type: "human", email: "a@b.c", email_verified: true, server_id: "srv" };
-  const expect = { issuer: "https://api.raft.build", clientId: "antiproton", nonce: "n1", jwks, now };
-  const c = await verifyIdToken(await mk(good), expect);
-  assert(c.sub === "u1" && c.type === "human", "claims returned");
-  const fails = async (t: string, why: string) => {
-    try { await verifyIdToken(t, expect); } catch (e) { assert(String((e as Error).message).includes(why), `expected ${why}, got ${(e as Error).message}`); return; }
-    throw new Error(`accepted: ${why}`);
-  };
-  const other = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
-  await fails(await mk(good, other.privateKey), "bad signature");
-  await fails(await mk({ ...good, iss: "https://evil" }), "issuer");
-  await fails(await mk({ ...good, aud: "someone-else" }), "audience");
-  await fails(await mk({ ...good, exp: now / 1000 - 1 }), "expired");
-  await fails(await mk({ ...good, nonce: "n2" }), "nonce");
-  await fails(await mk(good, kp.privateKey, { alg: "HS256", kid: "k1" }), "alg");
-  await fails(await mk(good, kp.privateKey, { alg: "ES256", kid: "unknown" }), "no matching key");
-  // Tampered payload under a valid signature.
-  const t = await mk(good);
-  const [h, , s] = t.split(".");
-  const p2 = b64url(new TextEncoder().encode(JSON.stringify({ ...good, type: "agent", email: "x@y.z" })));
-  await fails(`${h}.${p2}.${s}`, "bad signature");
 });
 
 await check("small helpers", async () => {
@@ -223,9 +178,10 @@ await check("github: a session carries the mapped agent and resolves with it; on
   assert(claims.agentId === "u-tygg_example.test" && claims.source === "github", "claims carry agentId + source");
   const lost = await seal(SECRET, { ...claims, agentId: undefined });
   assert(await resolveViewer(req(`${SESSION_COOKIE}=${lost}`), { SESSION_SECRET: SECRET }, { now }) === null, "a github session without an agent is nobody");
-  const raft = await sessionCookieFor(SECRET, { email: "a@b.test", name: null, username: null, picture: null, source: "raft" }, "sub", now);
-  const rr = await resolveViewer(req(raft.split(";")[0]), { SESSION_SECRET: SECRET }, { now });
-  assert(rr && rr.source === "raft" && rr.agentId === undefined, "older sessions are unchanged");
+  // A session from the Raft login that once existed: well-formed, correctly
+  // signed, and nobody — its holder signs in with GitHub instead.
+  const legacy = await seal(SECRET, { v: 1, who: "a@b.test", name: null, username: null, picture: null, sub: "sub", source: "raft", iat: now, exp: now + 3600_000 });
+  assert(await resolveViewer(req(`${SESSION_COOKIE}=${legacy}`), { SESSION_SECRET: SECRET }, { now }) === null, "a Raft-era session must resolve to nobody");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

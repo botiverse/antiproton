@@ -48,16 +48,12 @@
     // Access now sits in front of antiproton.botiverse.dev; the UI fails closed
     // anywhere without an identity, including the workers.dev address.
     "UI_ALLOW_ANONYMOUS": "0",
-    // Login with Raft. The client is registered on our Raft server with this
-    // exact callback; the secret and SESSION_SECRET are Worker secrets.
-    "RAFT_CLIENT_ID": "antiproton",
     "GITHUB_CLIENT_ID": "Ov23li8aFQIqXYjGrrp1",
     // Open sign-up: any GitHub account registers itself on first sign-in.
     // The operator knows what a new agent inherits (operator run9 credential
     // on the node mount, operator model account, a shared tenant quota) and
     // will tighten when needed (tygg, 2026-09-12 04:54Z). Set to 0 to close.
     "GITHUB_OPEN_SIGNUP": "1",
-    "RAFT_SERVER_ID": "f94d930c-3ef7-45ac-a549-4898b957949f",
     "UI_ORIGIN": "https://antiproton.ai"
   },
   "observability": { "enabled": true }
