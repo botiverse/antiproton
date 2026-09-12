@@ -2004,6 +2004,10 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       return new Response(refusedPage(reason), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
     }
     case "/login/raft": {
+      // INTERIM (2026-09-12): the login page no longer links here, but this
+      // route is kept on purpose. Until the GitHub OAuth App exists and one
+      // GitHub sign-in has been confirmed, it is the only browser way in;
+      // open it by URL. It goes, with everything Raft, in the change after.
       const cfg = raftConfig(env);
       if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       const now = Date.now();
