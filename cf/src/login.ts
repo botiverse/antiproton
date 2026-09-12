@@ -95,7 +95,8 @@ ${THEME_BOOT}
  */
 export function loginPage(opts: { open: boolean }): string {
   // The first sentence follows the deployment's switch (GITHUB_OPEN_SIGNUP),
-  // which was flipped twice in ten minutes on the day it was added: a door
+  // which was turned off and back on within four minutes on the day it was
+  // added (2026-09-12 00:53Z, 00:55Z, 00:56Z): a door
   // that says "anyone" while the switch is off sends people to a refusal.
   // No default on purpose: a call site that forgets the switch must fail to
   // compile rather than render the permissive sentence.
