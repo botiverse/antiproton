@@ -137,3 +137,28 @@ them at runtime, so their notices travel here.
   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
+
+
+  htmx — https://github.com/bigskysoftware/htmx
+  Zero-Clause BSD (SPDX: 0BSD)
+
+  `cf/src/vendor/htmx.ts` carries htmx 1.9.12, fetched from cdnjs and checked
+  against the hash cdnjs publishes for that release before it was written. The
+  licence name is recorded here although 0BSD asks for no notice: this file is
+  the one place that answers "what is in here, and under what terms", and a
+  reader looking for a licence name would otherwise find one missing rather
+  than absent on purpose.
+
+  Zero-Clause BSD grants permission to use, copy, modify, and/or distribute
+  this software for any purpose with or without fee. It carries no conditions
+  and requires no retention of this notice. Unlike the other entries here it
+  names no copyright holder: the upstream LICENSE is the grant alone, and
+  htmx's package.json declares no author, so none is asserted here. The full
+  licence text is `cf/src/vendor/LICENSE-htmx.txt`, beside the file.
+
+  Geist Mono — https://github.com/vercel/geist-font
+  SIL Open Font License, Version 1.1, Copyright (c) 2023 Vercel,
+  in collaboration with basement.studio
+
+  `cf/src/vendor/geist-mono.ts` carries the latin subset at variable weight.
+  The full licence text is `cf/src/vendor/LICENSE-geist.txt`, beside the file.
