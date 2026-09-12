@@ -22,7 +22,7 @@ const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); 
 const count = (s: string, re: RegExp) => (s.match(re) ?? []).length;
 
 check("the sign-in page offers one way in, to /login/github, and says so in GitHub's words", () => {
-  const h = loginPage();
+  const h = loginPage({ open: true });
   must(/<a class="btn" href="\/login\/github"[^>]*>[\s\S]*?Sign in with GitHub<\/a>/.test(h), "the button goes to /login/github and reads 'Sign in with GitHub'");
   must(count(h, /href="\/login\//g) === 1, "exactly one sign-in link");
   must(/Any GitHub account can sign in; your first sign-in creates an agent of your own/.test(h), "it says any account can sign in and what the first sign-in does, before the round trip");
@@ -37,13 +37,13 @@ check("the login provider that came before is gone from every page a person sees
   // The design library the tokens come from is also called raft-ui; that
   // name lives in a TypeScript comment, never in the served markup, so the
   // pages can be held to zero mentions of the word.
-  for (const [name, h] of [["login", loginPage()], ["refused", refusedPage("state")], ["key", keyPage()]] as const) {
+  for (const [name, h] of [["login", loginPage({ open: true })], ["refused", refusedPage("state")], ["key", keyPage()]] as const) {
     must(!/raft/i.test(h), `${name} page still names the old provider`);
   }
 });
 
 check("the sign-in page names neither the old door nor the secret one", () => {
-  const h = loginPage();
+  const h = loginPage({ open: true });
   for (const word of [/cloudflare/i, /access[- ]protected/i, /UI_ALLOW_ANONYMOUS/, /login\/key/, /harness/i, /automation/i, /QA_ACCESS_KEY/, /x-harness-token/]) {
     must(!word.test(h), `the page must not mention ${word}`);
   }
@@ -76,7 +76,7 @@ check("the key page is a form to /login/key and nothing else; the error is ours,
   const bad = keyPage('the key does not match <b>x</b>');
   must(/<p class="err" role="alert">the key does not match &lt;b&gt;x&lt;\/b&gt;<\/p>/.test(bad), "the error is shown, escaped");
   must(!/value=/.test(bad), "the key typed is never echoed back");
-  must(!/login\/key/.test(loginPage()), "the sign-in page still does not lead here");
+  must(!/login\/key/.test(loginPage({ open: true })), "the sign-in page still does not lead here");
 });
 
 check("an unknown reason renders the generic page with the reason escaped, never as markup", () => {

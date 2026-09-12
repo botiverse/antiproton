@@ -27,7 +27,7 @@ const CDNJS_SHA512 = "sha512-JvpjarJlOl4sW26MnEb3IdSAcGdeTeOaAlu2gUZtfFrRgnChdzE
 
 const pages: Record<string, string> = {
   console: page("t_demo", "someone@botiverse", "agent-1"),
-  login: loginPage(),
+  login: loginPage({ open: true }),
   refused: refusedPage("not-human"),
   key: keyPage(),
   "key-error": keyPage("that key did not match"),
