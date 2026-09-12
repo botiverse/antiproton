@@ -14,6 +14,7 @@ import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_OUTLINED_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
 import { ICONS } from "./icons.ts";
 import { md } from "./md.ts";
+import { FONT_CSS, HEAD_ASSETS } from "./static.ts";
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -478,9 +479,8 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
 <title>antiproton</title>
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
-<style>${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-agent="${esc(agentId)}">
+${HEAD_ASSETS}
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-agent="${esc(agentId)}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("inbox", "inbox").replace('</span><span>inbox', '</span><b class="count" id="inbox-count" hidden></b><span>inbox')}

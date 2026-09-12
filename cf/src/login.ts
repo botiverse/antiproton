@@ -17,6 +17,7 @@
  */
 import { FAVICON_DATA_URI, LOCKUP_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
+import { FONT_CSS, GEIST_MONO_SRC } from "./static.ts";
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -78,8 +79,8 @@ function shell(title: string, body: string): string {
 <meta name="robots" content="noindex">
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 ${THEME_BOOT}
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
-<style>${RUI_TOKENS}${CSS}</style></head><body>
+<link rel="preload" href="${GEIST_MONO_SRC}" as="font" type="font/woff2" crossorigin>
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}</style></head><body>
 <main class="door">
   <div class="lockup">${LOCKUP_SVG}</div>
   ${body}
