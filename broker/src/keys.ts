@@ -27,6 +27,8 @@
  * absence of per-key revocation is noticed. The escape, if that day comes, is a
  * small deny list in the ledger, checked after the signature.
  */
+import { constantTimeEqual } from "../../cf/src/auth.ts";
+
 export interface Caller {
   tenantId: string;
   agentId: string;
@@ -67,19 +69,9 @@ export async function callerOf(secret: string, presented: string | null): Promis
   const who = { tenantId: ak.slice(3, dot), agentId: ak.slice(dot + 1) };
   if (!who.tenantId || !who.agentId) return null;
   const expected = await mac(secret, `${who.tenantId}/${who.agentId}`);
-  return timingSafe(expected, sk) ? who : null;
-}
-
-/**
- * Compared in constant time over the whole string.
- *
- * `===` on a secret leaks its prefix through how long the comparison takes.
- * The lengths are equal by construction here — both are hex of the same digest
- * — so the length check is only a guard against a malformed presentation.
- */
-function timingSafe(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+  // The comparison is the repository's own, not a second one written here:
+  // `constantTimeEqual` already exists for exactly this, it handles unequal
+  // lengths without an early return, and two implementations of one rule is
+  // how they come to disagree.
+  return constantTimeEqual(expected, sk) ? who : null;
 }
