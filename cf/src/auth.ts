@@ -445,6 +445,15 @@ export async function githubFetchProfile(accessToken: string, fetchImpl: typeof 
   return { profile, emails };
 }
 
+/**
+ * The agent a first-time GitHub sign-in registers for itself when the
+ * deployment allows open sign-up. Written into the identity table by the
+ * sign-in, so from then on it is a row like any other and never derived.
+ */
+export function githubDefaultAgentId(profile: Pick<GithubProfile, "id">): string {
+  return `u-github_${profile.id}`;
+}
+
 /** The key the identity table is looked up by: the numeric id, never the login. */
 export function githubIdentityKey(profile: Pick<GithubProfile, "id">): string {
   return `github:${profile.id}`;
