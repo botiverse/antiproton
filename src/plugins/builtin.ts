@@ -13,6 +13,8 @@ import { qualifyMountedTools } from "../runtime/pi-tools.ts";
 export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin[]): Plugin {
   return {
     id: "tools",
+    // The catalogue of what else is mounted; useless to withhold.
+    defaultForAllAgents: true,
     version: "1.0.0",
     tools: [
       { name: "search", summary: "Search available tools by keyword.", parameters: { type: "object", properties: { query: { type: "string" } } }, sideEffects: "read", idempotency: "native" },

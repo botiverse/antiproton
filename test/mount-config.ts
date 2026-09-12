@@ -6,6 +6,7 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
+import { pluginEnabled, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -659,6 +660,73 @@ await check("the artifacts paragraph names the mount it came from, whatever it i
     // The qualified form is for telling the model to call something now; a
     // description names the mount and the bare tool.
     if (text.includes("__")) throw new Error(`a description should not carry a qualified tool name: ${text}`);
+  }
+});
+
+/**
+ * Two layers, and the order between them is the design.
+ *
+ * The layers exist because "not mounted" could not say why: an agent that had
+ * never been offered a plugin and an agent that had turned it off looked the
+ * same, and provisioning — which adds whatever is missing on every console
+ * open — treated the second as the first and put it back. So silence has to be
+ * distinguishable from a decision, which is what `"inherit"` is for.
+ *
+ * The half worth a test is the precedence: an agent's own answer wins over the
+ * plugin's default, in both directions. A default that flips must not move an
+ * agent that has already chosen — otherwise turning a plugin on for everyone
+ * silently re-arms it for the people who turned it off.
+ */
+await check("an agent's own answer beats the plugin default, in both directions", async () => {
+  const onByDefault = { defaultForAllAgents: true };
+  const optIn = { defaultForAllAgents: false };
+  const undeclared = {};
+
+  const cases: Array<[typeof optIn | Record<string, never>, PluginChoice | null | undefined, boolean, string]> = [
+    [onByDefault, "inherit", true, "inherit follows a default of on"],
+    [onByDefault, null, true, "no record is the same as inherit"],
+    [onByDefault, undefined, true, "an absent record is the same as inherit"],
+    [onByDefault, "disable", false, "an agent may refuse what everyone else gets"],
+    [optIn, "inherit", false, "inherit follows a default of off"],
+    [optIn, "enable", true, "an agent may ask for what nobody else gets"],
+    [undeclared, "inherit", false, "a plugin that did not declare belongs to nobody by default"],
+    [undeclared, "enable", true, "and can still be asked for"],
+  ];
+  for (const [plugin, choice, want, why] of cases) {
+    const got = pluginEnabled(plugin as any, choice);
+    if (got !== want) throw new Error(`${why}: pluginEnabled(${JSON.stringify(plugin)}, ${JSON.stringify(choice)}) = ${got}`);
+  }
+});
+
+/**
+ * What the declarations say today, held against what is actually seeded.
+ *
+ * The flag is only worth having if it means the same thing the seed list means,
+ * and the two live in different files — one in each plugin, one in
+ * `cf/src/runtime.ts`. This is the test that notices when they drift: a plugin
+ * that starts claiming every agent without being seeded, or a seed for a plugin
+ * that says it belongs to nobody.
+ *
+ * `demo` is deliberately on neither side. It was seeded for years and is being
+ * taken off the seed list, so it is the one plugin where "declared" and
+ * "seeded" are allowed to disagree while that lands — and when it does, this
+ * test stops making an exception for it.
+ */
+await check("the plugins that claim every agent are the ones actually seeded", async () => {
+  const declared = new Set(
+    [statePlugin({} as any, null, "b"), httpPlugin, githubPlugin, run9, demoPlugin]
+      .filter((p) => (p as any).defaultForAllAgents === true)
+      .map((p) => p.id),
+  );
+  // The two builtin ones are constructed with runtime handles this suite does
+  // not have; their ids are checked against the seed list instead.
+  const seeded = new Set(AgentRuntime.DEFAULT_MOUNTS.map((m) => m.plugin));
+  for (const id of declared) {
+    if (!seeded.has(id)) throw new Error(`${id} claims every agent but nothing seeds it`);
+  }
+  for (const id of seeded) {
+    if (id === "demo" || id === "tools" || id === "artifacts") continue;
+    if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
   }
 });
 

@@ -85,6 +85,9 @@ export function statePlugin(
 ): Plugin {
   return {
     id: PLUGIN_ID,
+    // Seeded to every agent since there has been a seed list: an agent with no
+    // memory is the failure this plugin exists to prevent.
+    defaultForAllAgents: true,
 
     /**
      * The working set, put in front of the agent when its harness opens.
