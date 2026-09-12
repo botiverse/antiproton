@@ -12,6 +12,7 @@
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
 import { html, conditional, holds, notModified } from "./version.ts";
+import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
@@ -2525,10 +2526,14 @@ export default {
           if (v.unchanged) return v.unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
           const t = await stub.uiTranscript("demo", agentId, taskId, tail);
+          // With `held=1` the held calls ride along, in one fragment under one
+          // version (uiVersion counts them), instead of a second poll that
+          // never answered 304.
+          const held = url.searchParams.get("held") === "1" ? await stub.uiApprovals("demo", agentId, taskId) : null;
           return html(url.pathname === "/ui/chat"
             // The conversation alone; everything else about the run is in the
             // panels on the right.
-            ? trajectory(conversation(t.events), t.byOp, t.busy)
+            ? chatPanel(trajectory(conversation(t.events), t.byOp, t.busy), held)
             : eventList(t.events), v.etag);
         }
         case "/ui/plugins": {
@@ -2656,7 +2661,10 @@ export default {
             }
           }
           const t = await stub.uiTranscript("demo", agentId, taskId);
-          return html(trajectory(t.events, t.byOp, t.busy));
+          // The same shape the chat poll returns, so a page that asked for the
+          // held cards there keeps them here (`held=1` in the form).
+          const held = form.get("held") === "1" ? await stub.uiApprovals("demo", agentId, taskId) : null;
+          return html(chatPanel(trajectory(t.events, t.byOp, t.busy), held));
         }
         case "/ui/compact": {
           const gate = await requireViewer(request, env);
