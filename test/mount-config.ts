@@ -5,6 +5,7 @@
  * where the plugin reads `timeoutMs` is not rejected by anything, so the plugin
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
+import { readFile } from "node:fs/promises";
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
@@ -986,6 +987,48 @@ await check("the session window keeps the newest and drops the rest, which is wh
   // And an empty history is a first session, not a crash.
   const first = keepSessions(undefined, at(1));
   if (first.length !== 1 || first[0]!.boxId !== "b-1") throw new Error("the first release did not record");
+});
+
+/**
+ * The three strings say what this deployment does, in both directions.
+ *
+ * Half of this was already structural: writing the lease promise while the
+ * lease is off turns the test above red. The other half was a comment and a
+ * memory — nothing stopped someone setting the two numbers and leaving the
+ * sentences describing the old behaviour, which is the same defect the
+ * reminder itself carried for months, only pointing the other way (Vera).
+ *
+ * So the configuration is the input. Whether the lease runs is decided by
+ * `RUN9_IDLE_MINUTES` and `RUN9_MAX_IDLE_MINUTES` being set to something
+ * positive (`cf/src/index.ts`), and the wording has to agree with them. Turning
+ * the lease on without rewriting the strings fails here, and rewriting them
+ * without turning it on fails above. Neither direction needs anyone to
+ * remember anything.
+ */
+await check("the container's wording and the lease switch say the same thing", async () => {
+  const jsonc = await readFile(new URL("../cf/wrangler.jsonc", import.meta.url), "utf8");
+  // A deliberately dumb read: the question is whether a positive number is
+  // configured under these names, and a comment mentioning them is not that.
+  const setting = (name: string) => {
+    const m = jsonc.match(new RegExp(`^\\s*"${name}"\\s*:\\s*"?(\\d+)"?`, "m"));
+    return m ? Number(m[1]) : 0;
+  };
+  const leaseOn = setting("RUN9_IDLE_MINUTES") > 0 && setting("RUN9_MAX_IDLE_MINUTES") > 0;
+
+  const says = [
+    ["run", run9.tools.find((t) => t.name === "run")!.summary],
+    ["shell", run9.tools.find((t) => t.name === "shell")!.summary],
+    ["the reminder", boxReminder("box")],
+  ] as const;
+  for (const [where, text] of says) {
+    const promises = /goes idle|idle long enough|asked whether to keep/.test(text);
+    if (leaseOn && !promises) {
+      throw new Error(`the lease is configured but ${where} still describes a box that only you can end: ${text.slice(0, 140)}`);
+    }
+    if (!leaseOn && promises) {
+      throw new Error(`${where} promises the idle question, and no lease is configured to ask it: ${text.slice(0, 140)}`);
+    }
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
