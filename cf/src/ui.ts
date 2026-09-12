@@ -1415,9 +1415,12 @@ export function sandboxPanel(d: any): string {
   const aliases = new Set(
     (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
   const name = [...aliases][0] ?? "sandbox";
-  const reports = d.mountReports ?? {};
-  const alias = [...aliases].find((a) => reports[a]);
-  const rep = alias ? reports[alias] : null;
+  // Typed loosely on purpose, like the rest of this file's `d`: the payload is
+  // built by the Durable Object and the page is handed it as JSON, so a precise
+  // type here would be a second declaration of a shape nothing checks against.
+  const reports: Record<string, any> = (d.mountReports ?? {}) as Record<string, any>;
+  const alias = [...aliases].find((a) => reports[a as string]);
+  const rep = alias ? reports[alias as string] : null;
   const live: any = rep?.activity?.live ?? null;
   const quietUntil = rep?.activity?.quietUntil ?? null;
   const billing = rep?.activity?.billing ?? null;
