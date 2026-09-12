@@ -21,7 +21,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { AgentRuntime, enabledMounts } from "../cf/src/runtime.ts";
+import { AgentRuntime, enabledMounts, parsePluginChoice } from "../cf/src/runtime.ts";
 import { pluginEnabled, credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -168,6 +168,19 @@ await check("关掉的挂载不出现在目录里,但装不出来的插件仍然
   if (kept({ off: "enable" }) !== "abcd") throw new Error(`switching one on did not bring it back: ${kept({ off: "enable" })}`);
   if (!kept({ on: "disable", off: "disable" }).includes("d")) {
     throw new Error("a mount pinned to an uninstalled plugin was dropped, so nothing reports it any more");
+  }
+});
+
+await check("表单里来的字符串,不是三个词就不收", async () => {
+  // The console posts a form, so what arrives is whatever the page sent. A
+  // near miss is the dangerous one: `"disabled"` stored as-is resolves to
+  // neither enable nor disable, and the agent's answer becomes a word nothing
+  // reads.
+  for (const good of ["enable", "disable", "inherit"]) {
+    if (parsePluginChoice(good) !== good) throw new Error(`${good} was refused`);
+  }
+  for (const bad of ["disabled", "Enable", "off", "", null, undefined, 1, true]) {
+    if (parsePluginChoice(bad) !== null) throw new Error(`${JSON.stringify(bad)} was accepted as a choice`);
   }
 });
 

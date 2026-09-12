@@ -269,6 +269,20 @@ export function enabledMounts<T extends { plugin: string }>(
   });
 }
 
+/**
+ * One of the three words, or nothing.
+ *
+ * The console posts a form, so what arrives is a string of the user's shape
+ * rather than a `PluginChoice`, and the cast that would make it compile is the
+ * cast that would let `"disabled"` — a plausible typo for a real one — through
+ * as neither enable nor disable, to be stored and then read back as a value
+ * nothing resolves. Refusing at the edge keeps the store holding only words the
+ * resolver knows.
+ */
+export function parsePluginChoice(value: unknown): PluginChoice | null {
+  return value === "enable" || value === "disable" || value === "inherit" ? value : null;
+}
+
 export class AgentRuntime {
   readonly store: DurableObjectStore;
   #deps: RuntimeDeps;
