@@ -776,6 +776,12 @@ export class AgentRuntime {
     let wakeInMs: number | null = null;
     let releaseFailed: Array<{ alias: string; error: string }> = [];
     const soon = (ms: number) => { wakeInMs = wakeInMs === null ? ms : Math.min(wakeInMs, ms); };
+    // The names the model was actually offered, read from the same list it was
+    // offered them from: qualification sanitises the alias and breaks ties, so
+    // a name rebuilt here would be a copy that is right only until it is not.
+    const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const offeredName = (alias: string, tool: string) =>
+      (tools as MountedTool[]).find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
 
     for (const mount of await this.store.listMounts(tenantId, agentId)) {
       const state = (await this.store.getConnection(tenantId, agentId, mount.alias)) as any;
@@ -794,16 +800,17 @@ export class AgentRuntime {
         // The reminder is a turn the agent takes, so it is a message rather
         // than a signal: the model has to be able to answer it with a call.
         await this.postMessage(tenantId, agentId,
-          nudgeText(mount.alias, d.idleMs, lastUsedAt + maxMs - now), "prompt");
+          nudgeText(mount.alias,
+            { release: offeredName(mount.alias, "release"), quiet: offeredName(mount.alias, "quiet") },
+            d.idleMs, lastUsedAt + maxMs - now), "prompt");
         sql.exec("INSERT INTO box_reminders(alias, box_id, sent) VALUES (?,?,?) " +
           "ON CONFLICT(alias, box_id) DO UPDATE SET sent = excluded.sent", mount.alias, boxId, d.nth);
         soon(d.wakeInMs);
         continue;
       }
-      // Past the ceiling. The gateway releases every mount the agent holds —
-      // its scope has always been the agent — so with a second metered mount
-      // the earliest ceiling takes both; per-mount release is run9's to add.
-      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
+      // Past the ceiling. This box only: each mount has its own idle clock, so
+      // one reaching its ceiling says nothing about another's.
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: mount.alias });
       releaseFailed = [...releaseFailed, ...r.failed];
       sql.exec("DELETE FROM box_reminders WHERE alias = ? AND box_id = ?", mount.alias, boxId);
     }

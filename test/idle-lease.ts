@@ -69,11 +69,21 @@ check("using the box resets everything: the clock is the last use, not the first
   must(d.wakeInMs === T - 60_000, `a used box starts again, got ${d.wakeInMs}`);
 });
 
-check("the reminder names the tools the way the model is offered them", () => {
-  const t = nudgeText("node", 12 * 60_000, 30 * 60_000);
-  must(t.includes("`node__release`") && t.includes("`node__quiet`"), `the model must be able to copy the names: ${t}`);
+check("the reminder carries the names it was given, not names it built", () => {
+  // The caller reads these from the list the model was offered. Here they are
+  // deliberately NOT `alias__tool`: a collision takes a numeric suffix, and a
+  // reminder that rebuilt the string would name another mount's tool.
+  const t = nudgeText("node", { release: "node__release2", quiet: "node__quiet2" }, 12 * 60_000, 30 * 60_000);
+  must(t.includes("`node__release2`") && t.includes("`node__quiet2`"), `the given names must be the ones printed: ${t}`);
+  must(!/node__release`/.test(t), "it must not print a name it derived itself");
   must(/12 minutes/.test(t) && /30 minutes/.test(t), `both durations must be stated: ${t}`);
   must(/not saved goes with it/.test(t), "it must say what is lost");
+});
+
+check("a mount that offers no release tool still gets a reminder that is true", () => {
+  const t = nudgeText("node", { release: null, quiet: null }, 5 * 60_000, 10 * 60_000);
+  must(!/Call `/.test(t), `nothing to call, so it must not say to call anything: ${t}`);
+  must(/released in 10 minutes/.test(t), "the consequence still holds");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

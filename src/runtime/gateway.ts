@@ -149,10 +149,16 @@ export class ToolGateway {
    */
   async releaseTask(
     ctx: CallContext,
+    /** One mount rather than all of them. A plugin's `release` was always
+     *  per-mount — it is handed the alias and that mount's own connection —
+     *  and the fan-out is here, so this is where a caller that means one box
+     *  says so (Piper, 2026-09-12). */
+    opts?: { alias?: string },
   ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
     const released: string[] = [];
     const failed: Array<{ alias: string; error: string }> = [];
     for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
+      if (opts?.alias && mount.alias !== opts.alias) continue;
       const plugin = this.#plugins.get(mount.plugin);
       if (!plugin?.release) continue;
       try {

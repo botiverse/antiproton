@@ -68,13 +68,30 @@ export function idleDecision(i: IdleInput): IdleAction {
   return { do: "wait", wakeInMs: Math.max(1, Math.min(due, ceiling) - i.now) };
 }
 
-/** What the reminder says. The strings are the ones the model can copy: a
- *  tool is offered to it as `alias__tool`, so that is what an instruction to
- *  call one must contain. */
-export function nudgeText(alias: string, idleMs: number, untilReleaseMs: number): string {
+/**
+ * What the reminder says.
+ *
+ * The two tool names are passed in rather than built here. A model-facing
+ * name is decided over the whole catalogue — the alias is sanitised and a
+ * collision takes a numeric suffix — so a second derivation is right only
+ * until it is not, and the way it fails is silent: `alias__release` with a
+ * collision elsewhere names another mount's tool, which resolves and calls
+ * the wrong thing (Piper, Dora, 2026-09-12). The caller reads them from the
+ * same list the model was offered.
+ */
+export function nudgeText(
+  alias: string,
+  names: { release: string | null; quiet: string | null },
+  idleMs: number,
+  untilReleaseMs: number,
+): string {
   const mins = (ms: number) => Math.max(1, Math.round(ms / 60_000));
+  const call = names.release && names.quiet
+    ? `Call \`${names.release}\` to free it — it can save files out in the same call — or \`${names.quiet}\` if you are coming back to it. `
+    : names.release
+      ? `Call \`${names.release}\` to free it — it can save files out in the same call. `
+      : "";
   return `The container on the \`${alias}\` mount has been idle for ${mins(idleMs)} minutes and is billed for every second. `
-    + `Call \`${alias}__release\` to free it — it can save files out in the same call — or \`${alias}__quiet\` `
-    + `if you are coming back to it. If nothing is done it is released in ${mins(untilReleaseMs)} minutes, `
-    + `and anything not saved goes with it.`;
+    + call
+    + `If nothing is done it is released in ${mins(untilReleaseMs)} minutes, and anything not saved goes with it.`;
 }
