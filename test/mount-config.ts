@@ -1095,6 +1095,41 @@ await check("the endpoint answers for the credential when it is not the provider
   }
 });
 
+/**
+ * The model never names a container, so it can never name someone else's.
+ *
+ * Every sandbox tool acts on *this mount's* box, found in this mount's own
+ * connection state — none of them takes an id. That is what makes the isolation
+ * hold without anything in front of run9: a shared account and a shared key are
+ * safe here only because the agent has no way to say which box it means (tygg,
+ * 2026-09-12: "the tool simply cannot see other people's").
+ *
+ * The rule is worth a test rather than a comment because breaking it looks like
+ * a feature. `release(boxId)`, `logs(boxId)`, a `list` that takes a project —
+ * each is an obvious thing to add, and any of them turns a shared project into
+ * a reachable one. If a tool ever does need an id, the id has to be checked
+ * against this mount's state before it is used, and this test is the place that
+ * says so.
+ */
+await check("no sandbox tool lets the model name a container", () => {
+  const suspect = /^(box|box_id|boxId|container|id|project|snap|snapshot|exec|execId)$/i;
+  for (const t of run9.tools) {
+    const props = Object.keys(((t.parameters as any) ?? {}).properties ?? {});
+    const named = props.filter((p) => suspect.test(p));
+    if (named.length) {
+      throw new Error(
+        `the \`${t.name}\` tool takes ${named.join(", ")}: the model can now say which container it means, ` +
+        "and every agent shares one run9 project — check it against this mount's state first",
+      );
+    }
+  }
+  // And the property that makes the rule meaningful: the tools that act on a
+  // container act on the one in this mount's state, which is the only one it
+  // knows about.
+  const acts = run9.tools.filter((t) => ["run", "shell", "save", "release", "quiet"].includes(t.name));
+  if (acts.length !== 5) throw new Error(`the acting tools changed: ${acts.map((t) => t.name).join(", ")}`);
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
