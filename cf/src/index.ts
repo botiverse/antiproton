@@ -11,6 +11,7 @@
  *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
+import { html, conditional, holds, notModified } from "./version.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
@@ -1481,7 +1482,18 @@ export class AgentDO extends DurableObject<Env> {
       .toArray()[0] as any;
     const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?", session)
       .toArray()[0] as any;
-    return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}`;
+    // Held calls and their decisions move the conversation too: the chat is
+    // about to carry the held cards beside the turns, and a decision is
+    // otherwise invisible to a version built from entries alone. Before the
+    // store has made its tables there are no approvals to count.
+    let held = "0";
+    try {
+      const a = this.sql.exec(
+        "SELECT COUNT(*) AS n, MAX(created_at) AS c, MAX(decided_at) AS d FROM approvals WHERE tenant_id = ? AND agent_id = ?",
+        tenantId, agentId).toArray()[0] as any;
+      held = `${a?.n ?? 0}.${a?.c ?? 0}.${a?.d ?? 0}`;
+    } catch { /* no approvals table yet */ }
+    return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}.${held}`;
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0): Promise<UiTranscript> {
@@ -1877,18 +1889,6 @@ export class AgentDO extends DurableObject<Env> {
   }
 }
 
-const html = (body: string) =>
-  new Response(body, {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      // Set by notModified for this request, so the next poll can be answered
-      // with a 304 instead of a re-render.
-      // Not `etag`: Cloudflare strips that one on the way out, so a
-      // conditional request could never match. Measured, not assumed — the
-      // same value survives under a name the edge does not manage.
-      ...(lastEtag ? { "x-ap-version": lastEtag } : {}),
-    },
-  });
 
 /**
  * Who is signed in. The one place identity is decided; see auth.ts.
@@ -2072,25 +2072,21 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
  * condition could then never match. That was found by sending both and seeing
  * which arrived.
  */
-async function notModified(
+async function versionOf(
   request: Request,
   stub: { uiVersion(t: string, a: string, k: string): Promise<string> },
   agentId: string,
   taskId: string,
-): Promise<Response | null> {
-  if (!taskId || taskId === "null" || taskId === "undefined") return null;
+): Promise<{ unchanged: Response | null; etag: string | null }> {
+  if (!taskId || taskId === "null" || taskId === "undefined") return { unchanged: null, etag: null };
   const etag = await stub.uiVersion("demo", agentId, taskId);
-  if (request.headers.get("x-ap-version") === etag) {
-    return new Response(null, { status: 304, headers: { "x-ap-version": etag } });
-  }
-  // Stashed for the response below; the routes set it via the html() helper.
-  lastEtag = etag;
-  return null;
+  // The version rides with the route's own response, passed explicitly: a
+  // module-level stash was written after an await, so under two overlapping
+  // requests one route's response could carry the other's version. Never a
+  // wrong 304 (the comparison is always against a fresh value), just a
+  // meaningless header and an extra 200.
+  return { unchanged: holds(request, etag) ? notModified(etag) : null, etag };
 }
-
-/** Set by notModified for the response that follows it. Single-threaded per
- *  request in a Worker, so this cannot interleave. */
-let lastEtag: string | null = null;
 
 /** One identity, one agent. Was repeated at every route that needed it. */
 /** A form body, or null: a POST with no body or the wrong content type is a
@@ -2497,8 +2493,8 @@ export default {
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? uiAgent(who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const unchanged = await notModified(request, stub, agentId, taskId);
-          if (unchanged) return unchanged;
+          const v = await versionOf(request, stub, agentId, taskId);
+          if (v.unchanged) return v.unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
           const t = await stub.uiTranscript("demo", agentId, taskId, tail);
           return html(
@@ -2512,7 +2508,7 @@ export default {
               : "") +
             `<h3>where the time went</h3>${timeline(t.events)}` +
             `<h3>prompt cache, per model call</h3>${tokens(t.events)}` +
-            `<h3>trajectory</h3>${trajectory(t.events, t.byOp, t.busy)}`);
+            `<h3>trajectory</h3>${trajectory(t.events, t.byOp, t.busy)}`, v.etag);
         }
         case "/ui/chat":
         case "/ui/events": {
@@ -2520,15 +2516,15 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const unchanged = await notModified(request, stub, agentId, taskId);
-          if (unchanged) return unchanged;
+          const v = await versionOf(request, stub, agentId, taskId);
+          if (v.unchanged) return v.unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
           const t = await stub.uiTranscript("demo", agentId, taskId, tail);
           return html(url.pathname === "/ui/chat"
             // The conversation alone; everything else about the run is in the
             // panels on the right.
             ? trajectory(conversation(t.events), t.byOp, t.busy)
-            : eventList(t.events));
+            : eventList(t.events), v.etag);
         }
         case "/ui/plugins": {
           const gate = await requireViewer(request, env);
@@ -2538,10 +2534,10 @@ export default {
           // list, one mount's block, the catalogue, or the whole page.
           const d = await stub.uiPlugins("demo", agentId);
           switch (url.searchParams.get("part")) {
-            case "mounts": return html(mountList(d));
-            case "mount": return html(mountFragment(d, String(url.searchParams.get("alias") ?? "").trim()));
-            case "catalogue": return html(catalogue(d));
-            default: return html(plugins(d));
+            case "mounts": return conditional(request, mountList(d));
+            case "mount": return conditional(request, mountFragment(d, String(url.searchParams.get("alias") ?? "").trim()));
+            case "catalogue": return conditional(request, catalogue(d));
+            default: return conditional(request, plugins(d));
           }
         }
         case "/ui/credential": {
@@ -2578,13 +2574,13 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const unchanged = await notModified(request, stub, agentId, taskId);
-          if (unchanged) return unchanged;
+          const v = await versionOf(request, stub, agentId, taskId);
+          if (v.unchanged) return v.unchanged;
           const d = await stub.uiStorage("demo", agentId, taskId);
           return html(url.pathname === "/ui/storage" ? storage(d)
             : url.pathname === "/ui/memory" ? memoryPanel(d)
             : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
-            : runtimePanel(d));
+            : runtimePanel(d), v.etag);
         }
         // Data routes for the console shell, rendered by the shell's own
         // renderers with `d`, the way /ui/plugins does. `viewer` is the
@@ -2619,20 +2615,20 @@ export default {
           const agents = (await homeStub.uiListAgents("demo", home))
             .map((a) => ({ ...a, current: a.agentId === (uiSelected?.agentId ?? home) }));
           // The page swaps the rendered list in; anything else gets the data.
-          return request.headers.get("hx-request") ? html(agentList({ agents })) : Response.json({ agents });
+          return request.headers.get("hx-request") ? conditional(request, agentList({ agents })) : Response.json({ agents });
         }
         case "/ui/inbox": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const d = await stub.uiInbox("demo", uiSelected?.agentId ?? uiAgent(gate.who));
-          return html(inbox({ viewer: gate.who, ...d }));
+          return conditional(request, inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/approvals": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? uiAgent(gate.who);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          return html(approvals(await stub.uiApprovals("demo", agentId, taskId)));
+          return conditional(request, approvals(await stub.uiApprovals("demo", agentId, taskId)));
         }
         case "/ui/message": {
           const form = await formOf(request);
