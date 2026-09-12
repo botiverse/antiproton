@@ -343,6 +343,17 @@ export class ToolGateway {
     // Resolved before queueing, because which queue a call belongs in is a
     // property of the mount it names, and refusals should not wait behind
     // someone else's container.
+    //
+    // So the name is resolved twice: once here to pick the queue, and again
+    // inside, which is deliberate. The queue key has to be fixed *before*
+    // waiting, and handing the resolution down would make `#invoke` trust a
+    // caller's view of the mount — a precondition that is only sometimes met
+    // costs more than a second cheap read. What it leaves is theoretical: if a
+    // mount's plugin changed between the two reads, the queue would have been
+    // chosen on the old plugin's `exclusive` while dispatch used the new one.
+    // Nothing re-points a mount at a different plugin mid-call, and if
+    // something ever does, this is the note that says where to look
+    // (@Rex spotted the gap, 2026-09-12).
     const r0 = await this.resolve(ctx, raw);
     if ("error" in r0) return { status: "rejected", error: r0.error };
     if (!this.#plugins.get(r0.mount.plugin)?.exclusive) return this.#invoke(ctx, raw, args, opts);
