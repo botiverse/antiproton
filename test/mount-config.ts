@@ -1007,10 +1007,14 @@ await check("the session window keeps the newest and drops the rest, which is wh
  */
 await check("the container's wording and the lease switch say the same thing", async () => {
   const jsonc = await readFile(new URL("../cf/wrangler.jsonc", import.meta.url), "utf8");
-  // A deliberately dumb read: the question is whether a positive number is
-  // configured under these names, and a comment mentioning them is not that.
+  // Deliberately dumb, but not dumb about where the value sits: the first
+  // version anchored to the start of a line, so two variables written on one
+  // line hid the second one and the test went quiet instead of red (Vera found
+  // this by breaking it and getting green). Comment lines are dropped, since a
+  // comment naming the variable is not the variable being set.
+  const code = jsonc.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
   const setting = (name: string) => {
-    const m = jsonc.match(new RegExp(`^\\s*"${name}"\\s*:\\s*"?(\\d+)"?`, "m"));
+    const m = code.match(new RegExp(`"${name}"\\s*:\\s*"?(\\d+)"?`));
     return m ? Number(m[1]) : 0;
   };
   const leaseOn = setting("RUN9_IDLE_MINUTES") > 0 && setting("RUN9_MAX_IDLE_MINUTES") > 0;
