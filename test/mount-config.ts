@@ -10,7 +10,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -652,6 +652,126 @@ await check("释放记录带着最后一次使用的时间,所以闲置时长算
   const never = sessionOf({ boxId: "b-2", createdAt: 2_000 }, 5_000);
   if (never.lastUsedAt !== 2_000) throw new Error(`an unused box reported ${never.lastUsedAt}`);
   if (never.execs !== 0 || never.saved.length !== 0) throw new Error("defaults are wrong");
+});
+
+/**
+ * A quiet request that is too long is refused, not shortened.
+ *
+ * The ceiling is the only thing between "remind me later" and "never release
+ * it", and an agent silently given an hour when it asked for a day plans
+ * against the day: it will not come back in time, and the box is billed for
+ * every second in between. So the refusal has to be a refusal, and it has to
+ * say the number the mount actually allows — a "no" without the ceiling leaves
+ * the agent guessing at a second request.
+ */
+await check("a quiet request over the mount's ceiling is refused, and the refusal names the ceiling", async () => {
+  const ctx = (config: Record<string, unknown>, state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
+    credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: config,
+    connection: { get: async () => state, set: async () => { written.push(true); } },
+    sibling: async () => null,
+  });
+  const written: boolean[] = [];
+  const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 };
+
+  // Over the default ceiling of 60.
+  let refused = "";
+  try { await run9.invoke("quiet", { minutes: 1440 } as any, ctx({}, live)); }
+  catch (e) { refused = String((e as Error).message); }
+  if (!refused) throw new Error("a day-long quiet request was accepted");
+  if (!refused.includes("60")) throw new Error(`the refusal does not name the ceiling: ${refused}`);
+  if (!refused.includes("box")) throw new Error(`the refusal does not name the mount: ${refused}`);
+  if (written.length) throw new Error("a refused request still wrote state");
+
+  // The operator's own ceiling, not the default.
+  let ownRefusal = "";
+  try { await run9.invoke("quiet", { minutes: 20 } as any, ctx({ maxQuietMinutes: 10 }, live)); }
+  catch (e) { ownRefusal = String((e as Error).message); }
+  if (!ownRefusal.includes("10")) throw new Error(`the mount's own ceiling was not used: ${ownRefusal}`);
+
+  // Not a number, and zero: both are refusals rather than "quiet forever".
+  for (const bad of [undefined, null, "30", 0, -5, Infinity, NaN]) {
+    let threw = false;
+    try { await run9.invoke("quiet", { minutes: bad } as any, ctx({}, live)); } catch { threw = true; }
+    if (!threw) throw new Error(`quiet accepted ${JSON.stringify(bad)} as a duration`);
+  }
+  if (written.length) throw new Error("a refused request still wrote state");
+});
+
+/**
+ * An accepted quiet request records an instant, and only that.
+ *
+ * `quietUntil` is written by this plugin and read by the framework's idle wake,
+ * so the two halves meet on this field and on nothing else. The test pins the
+ * shape rather than the wording: an instant in the future, the rest of the
+ * state carried over, and no box invented when there is none.
+ */
+await check("an accepted quiet request records when to ask again, and leaves the rest of the state alone", async () => {
+  let saved: any = null;
+  const ctx = (state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
+    credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
+    connection: { get: async () => state, set: async (v: unknown) => { saved = v; } },
+    sibling: async () => null,
+  });
+  const before = Date.now();
+  const r: any = await run9.invoke("quiet", { minutes: 30 } as any,
+    ctx({ boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 4, envs: [] }));
+  if (r.quiet !== true) throw new Error(`a request inside the ceiling was not accepted: ${JSON.stringify(r)}`);
+  if (!saved?.quietUntil) throw new Error("nothing was recorded for the wake to read");
+  const minutes = (saved.quietUntil - before) / 60_000;
+  if (minutes < 29 || minutes > 31) throw new Error(`quietUntil is ${minutes} minutes out, not 30`);
+  if (saved.boxId !== "b-1" || saved.execs !== 4) throw new Error("the rest of the box state was dropped");
+  // The one field it must not move. Every other handler in the plugin bumps
+  // `lastUsedAt`, so "make quiet consistent with the rest" is a plausible edit
+  // — and it would defeat the absolute ceiling, because an agent could push the
+  // idle clock forward indefinitely with legal requests under the cap.
+  if (saved.lastUsedAt !== 2_000) throw new Error(`quiet moved lastUsedAt to ${saved.lastUsedAt}, so the idle ceiling can be pushed forever`);
+
+  // No box: nothing will be asked about, so there is nothing to put off. It
+  // answers instead of throwing, the way `release` does on an empty mount.
+  saved = null;
+  const none: any = await run9.invoke("quiet", { minutes: 5 } as any, ctx(null));
+  if (none.quiet !== false) throw new Error(`quiet on an empty mount answered ${JSON.stringify(none)}`);
+  if (saved) throw new Error("quiet wrote state for a box that does not exist");
+});
+
+/**
+ * The three places that tell the model how the box ends must end it the same way.
+ *
+ * `run` and `shell` describe the container before it exists; the per-execution
+ * reminder describes it while it does. An agent reads whichever it happens to
+ * be looking at, and it cannot tell which is stale — so a promise mended in one
+ * and left in another is worse than the original wrong sentence: it is wrong
+ * only sometimes. This is the test that failed to exist while "persists between
+ * calls until you release it" outlived the behaviour it described.
+ */
+await check("run, shell and the per-execution reminder end the container the same way", async () => {
+  const run = run9.tools.find((t) => t.name === "run")!.summary;
+  const shell = run9.tools.find((t) => t.name === "shell")!.summary;
+  const reminder = boxReminder("box");
+  for (const [where, text] of [["run", run], ["shell", shell], ["the reminder", reminder]] as const) {
+    // Each says the box survives calls…
+    if (!/persists between calls|across calls/.test(text)) {
+      throw new Error(`${where} no longer says the container survives calls: ${text.slice(0, 120)}`);
+    }
+    // …and each says the same thing about how it ends. Today that is "when you
+    // release it", because the lease is off until the two numbers are set; the
+    // day they are, all three gain the idle clause together and this assertion
+    // changes with them. What must never differ is the three of them.
+    if (!/release/.test(text)) {
+      throw new Error(`${where} says the box survives calls without saying what ends it: ${text.slice(0, 160)}`);
+    }
+    if (/goes idle|idle long enough/.test(text)) {
+      throw new Error(`${where} promises the idle question while the lease is off: ${text.slice(0, 160)}`);
+    }
+  }
+  // When the lease is switched on, the reminder is also the one that has to say
+  // silence has a consequence — the other two describe a box that may not exist
+  // yet. That assertion belongs to the change that sets the numbers.
+  // And it names the mount, because an agent with two of them cannot act on
+  // "the container".
+  if (!reminder.includes("box")) throw new Error(`the reminder does not name the mount: ${reminder}`);
 });
 
 /**

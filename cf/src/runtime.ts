@@ -13,6 +13,7 @@
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
+import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
 import {
   bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
@@ -237,6 +238,18 @@ export interface RuntimeDeps {
    * bill for forgetting it, on themselves.
    */
   autoRelease?: boolean;
+  /**
+   * Keep a metered container between passes, ask the agent about it when it
+   * goes quiet, and take it back at a ceiling the agent cannot move.
+   *
+   * Absent means the behaviour this had before: release after every pass that
+   * settles with nothing open, which never bills for an idle box and makes
+   * "the container persists between calls" false wherever the tools say it.
+   * Present means the lease: see src/runtime/idle-lease.ts for the schedule.
+   * A deployment turns it on by setting both numbers, because both are prices
+   * — a reminder costs a model turn, a box costs seconds.
+   */
+  idle?: { afterMs: number; maxMs: number };
 }
 
 /**
@@ -889,13 +902,86 @@ export class AgentRuntime {
       if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
       markSession(sql, session, out.open > 0 || out.wakeInMs !== null);
     }
-    // A finished run should not still be holding a metered container.
+    // A finished run should not still be holding a metered container — either
+    // by handing it back at once, or, where the deployment leases them, by
+    // asking the agent first and taking it at the ceiling.
     let releaseFailed: Array<{ alias: string; error: string }> = [];
-    if (this.#deps.autoRelease !== false && open === 0 && settled.length) {
-      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
-      releaseFailed = r.failed;
+    if (this.#deps.autoRelease !== false && open === 0) {
+      if (!this.#deps.idle) {
+        if (settled.length) {
+          const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
+          releaseFailed = r.failed;
+        }
+      } else {
+        // Runs on every idle pass, not only after work settles: the reminder
+        // that matters is the one nothing else would have woken us for.
+        const idle = await this.#idlePass(tenantId, agentId);
+        releaseFailed = idle.releaseFailed;
+        if (idle.wakeInMs !== null) wakeInMs = wakeInMs === null ? idle.wakeInMs : Math.min(wakeInMs, idle.wakeInMs);
+      }
     }
     return { open, wakeInMs, settled, releaseFailed };
+  }
+
+  /**
+   * One look at every metered mount: remind, take, or come back later.
+   *
+   * The state is the plugin's (run9 writes `boxId`, `lastUsedAt`, and the
+   * agent's `quietUntil`); the schedule is the framework's, which is why this
+   * reads that state rather than the plugin reading a clock. A mount with no
+   * live box says nothing and costs nothing.
+   */
+  async #idlePass(tenantId: string, agentId: string): Promise<{
+    wakeInMs: number | null; releaseFailed: Array<{ alias: string; error: string }>;
+  }> {
+    const { afterMs, maxMs } = this.#deps.idle!;
+    const now = Date.now();
+    const sql = this.#deps.ctx.storage.sql;
+    sql.exec(`CREATE TABLE IF NOT EXISTS box_reminders(
+      alias TEXT NOT NULL, box_id TEXT NOT NULL, sent INTEGER NOT NULL,
+      PRIMARY KEY (alias, box_id))`);
+    let wakeInMs: number | null = null;
+    let releaseFailed: Array<{ alias: string; error: string }> = [];
+    const soon = (ms: number) => { wakeInMs = wakeInMs === null ? ms : Math.min(wakeInMs, ms); };
+    // The names the model was actually offered, read from the same list it was
+    // offered them from: qualification sanitises the alias and breaks ties, so
+    // a name rebuilt here would be a copy that is right only until it is not.
+    const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const offeredName = (alias: string, tool: string) =>
+      (tools as MountedTool[]).find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
+
+    for (const mount of await this.store.listMounts(tenantId, agentId)) {
+      const state = (await this.store.getConnection(tenantId, agentId, mount.alias)) as any;
+      const boxId = typeof state?.boxId === "string" ? state.boxId : "";
+      const lastUsedAt = Number(state?.lastUsedAt) || 0;
+      // No box, or a state that cannot say when it was last used: nothing to
+      // schedule from, and inventing a clock here is how a box in use gets
+      // taken mid-task.
+      if (!boxId || !lastUsedAt) continue;
+      const row = sql.exec("SELECT sent FROM box_reminders WHERE alias = ? AND box_id = ?", mount.alias, boxId)
+        .toArray()[0] as any;
+      const sent = Number(row?.sent) || 0;
+      const d = idleDecision({ lastUsedAt, quietUntil: Number(state?.quietUntil) || 0, sent, now, afterMs, maxMs });
+      if (d.do === "wait") { soon(d.wakeInMs); continue; }
+      if (d.do === "nudge") {
+        // The reminder is a turn the agent takes, so it is a message rather
+        // than a signal: the model has to be able to answer it with a call.
+        await this.postMessage(tenantId, agentId,
+          nudgeText(mount.alias,
+            { release: offeredName(mount.alias, "release"), quiet: offeredName(mount.alias, "quiet") },
+            d.idleMs, lastUsedAt + maxMs - now), "prompt");
+        sql.exec("INSERT INTO box_reminders(alias, box_id, sent) VALUES (?,?,?) " +
+          "ON CONFLICT(alias, box_id) DO UPDATE SET sent = excluded.sent", mount.alias, boxId, d.nth);
+        soon(d.wakeInMs);
+        continue;
+      }
+      // Past the ceiling. This box only: each mount has its own idle clock, so
+      // one reaching its ceiling says nothing about another's.
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: mount.alias });
+      releaseFailed = [...releaseFailed, ...r.failed];
+      sql.exec("DELETE FROM box_reminders WHERE alias = ? AND box_id = ?", mount.alias, boxId);
+    }
+    return { wakeInMs, releaseFailed };
   }
 
   /** What the worker asks for, and what it hands back. The job row says which
