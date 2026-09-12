@@ -123,10 +123,11 @@ const MAX_NAME = 64;
  * **No production caller as of 2026-09-12.** It was written for one: the prompt
  * asked whether an artifacts tool was really mounted before telling the agent
  * to read results back. That paragraph now belongs to the artifacts plugin, so
- * the question answers itself. Kept because "what was the model actually
- * offered" is the general form of a question three defects have turned on, and
- * its tests still pin the four answers — but a reader looking for the prompt's
- * dependency on it will not find one.
+ * the prompt no longer asks. The caller today is the offload path: a large
+ * result is parked as a reference only where something can read one back, and
+ * truncated honestly where nothing can (cf/src/runtime.ts). "What was the
+ * model actually offered" is the general form of a question three defects have
+ * turned on, which is why it is a function rather than an expression.
  */
 export function offersPlugin(
   records: Array<{ alias: string; plugin: string }>,
