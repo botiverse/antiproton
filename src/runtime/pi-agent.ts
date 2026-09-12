@@ -26,7 +26,7 @@ import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendi
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
-import { offloadedProvider, type OffloadPort } from "../model/pi-offloaded.ts";
+import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, type MountedTool, type ToolHost } from "./pi-tools.ts";
 
 const JOBS = `CREATE TABLE IF NOT EXISTS pi_model_jobs (
@@ -327,10 +327,33 @@ export class PiAgent {
     return Number(row?.n ?? 0);
   }
 
-  #pollJob(id: string): AssistantMessage | null {
+  /**
+   * The stored answer to one offloaded model call, or null while it is out.
+   *
+   * The row is JSON somebody else wrote, so the cast used to be the only thing
+   * standing between storage and the harness. It now has to earn one claim:
+   * that what comes back is a message that *finished*. `aborted` is a fact
+   * about a live stream being cancelled, and nothing on this path can produce
+   * it — an abandoned request has no answer to read at all.
+   *
+   * So a row that says otherwise is not a case to handle, it is an invariant
+   * that broke, and it says so loudly rather than travelling on as a message
+   * the harness will treat as ordinary. Silence here is how the last two
+   * offload failures stayed invisible: written, admitted, and wrong before the
+   * model call (@Vera established the unreachability; this is where the claim
+   * is checked).
+   */
+  #pollJob(id: string): Answered | null {
     const row = this.#sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", id).toArray()[0] as any;
     if (!row?.answer) return null;
-    return JSON.parse(row.answer) as AssistantMessage;
+    const message = JSON.parse(row.answer) as AssistantMessage;
+    if (message.stopReason === "aborted") {
+      throw new Error(
+        `the stored answer for ${id} says "aborted", which nothing that writes this row can produce; ` +
+        "something upstream is passing a cancelled stream through as an answer",
+      );
+    }
+    return message as Answered;
   }
 
   #dropJob(id: string) {

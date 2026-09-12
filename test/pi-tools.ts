@@ -8,6 +8,7 @@
  * getting that wrong would make every rejection look like a result.
  */
 import { createModels } from "@earendil-works/pi-ai";
+import type { Answered } from "../src/model/pi-offloaded.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
@@ -132,7 +133,7 @@ await check("限定两次等于限定一次", async () => {
   }
 });
 
-function fixture(invoke: (call: any) => Promise<any>, reply: AssistantMessage) {
+function fixture(invoke: (call: any) => Promise<any>, reply: Answered) {
   const host = sqliteHost();
   const storage = new PiSqliteStorage(host);
   const session = new StorageBackedSession(
@@ -150,7 +151,10 @@ function fixture(invoke: (call: any) => Promise<any>, reply: AssistantMessage) {
   return { storage, session, models, invoke };
 }
 
-const msg = (content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage => ({
+// Builds a message that FINISHED. The offload port cannot produce an aborted
+// one — that belongs to a live stream someone cancelled — so a helper feeding
+// this fake should not be able to build one either.
+const msg = (content: AssistantMessage["content"], stopReason: Answered["stopReason"]): Answered => ({
   role: "assistant", content, api: "offloaded", provider: PROVIDER, model: MODEL,
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },

@@ -17,7 +17,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
+import { type Answered, offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -32,7 +32,10 @@ const MODEL = "test-model";
 /** Stands in for the queue: a job is started, and answers only when told. */
 function fakeQueue() {
   const started: string[] = [];
-  const answers = new Map<string, AssistantMessage>();
+  // `Answered`, not `AssistantMessage`: the port promises a message that
+  // finished, and a fake that could hand back an `aborted` one would be
+  // promising something the real port cannot.
+  const answers = new Map<string, Answered>();
   let n = 0;
   const port: OffloadPort = {
     async start() { const id = `job-${++n}`; started.push(id); return id; },
