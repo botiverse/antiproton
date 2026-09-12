@@ -31,11 +31,36 @@ export interface OffloadPort {
    * per id from the caller's point of view: the harness may re-drive a pass.
    */
   start(request: { model: Model<any>; context: Context; options?: StreamOptions }): Promise<string>;
-  /** The finished message, or null while the request is still out. */
-  poll(id: string): Promise<AssistantMessage | null>;
+  /**
+   * The finished message, or null while the request is still out.
+   *
+   * **Never `aborted`.** That stop reason is produced by pi's own driver, one
+   * layer above, when a response comes back while a cancel is in flight — it
+   * is a fact about a live stream. Nothing on this path can carry it: what
+   * comes back here was read out of storage by whoever answered the queue, and
+   * a cancelled request simply has no answer to read.
+   *
+   * Stated in the type rather than handled in a branch. @Vera established the
+   * unreachability from the records (task #1, 2026-09-12) and the choice is
+   * hers: a branch for it would assert that the value can arrive, which is
+   * false, and would then be dead code that looks like caution. Narrowing
+   * instead means a port that ever tries to return one does not compile — the
+   * claim is checked at the boundary where it is made, not read out of a
+   * comment.
+   */
+  poll(id: string): Promise<Answered | null>;
   /** Best-effort; the harness calls this when an operation is abandoned. */
   cancel?(id: string): Promise<void>;
 }
+
+/**
+ * A message that finished, as opposed to one abandoned mid-flight.
+ *
+ * `aborted` belongs to a stream someone cancelled while it was running. This
+ * side of the queue only ever reads a stored answer, so the distinction is
+ * real and worth keeping in the type.
+ */
+export type Answered = AssistantMessage & { stopReason: Exclude<AssistantMessage["stopReason"], "aborted"> };
 
 const NO_USAGE: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
