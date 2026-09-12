@@ -1600,6 +1600,12 @@ export class AgentDO extends DurableObject<Env> {
     return { ok: true as const };
   }
 
+  /** Rename one mount. Refused while it is holding something; see the runtime. */
+  async uiRenameMount(tenantId: string, agentId: string, from: string, to: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiRenameMount", () => this.runtime().renameMount(tenantId, agentId, from, to));
+  }
+
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
@@ -2695,6 +2701,28 @@ export default {
           const k = url.searchParams.get("taskId") ?? `t_${a}`;
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.uiCompact(t, a, k));
+        }
+        case "/admin/rename-mount": {
+          // Renaming a mount is an operator act, not something an agent or a
+          // page does: it moves the mount row, the connection state and the
+          // credential together, and it is refused while the mount is holding
+          // a container. There is no button for it on purpose — the one
+          // occasion it exists for is a deployment-wide rename someone decided
+          // to apply, and that decision does not belong to whoever has the
+          // page open.
+          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId"));
+          const from = String(url.searchParams.get("from") ?? "");
+          const to = String(url.searchParams.get("to") ?? "");
+          if (!a || !from || !to) {
+            return Response.json({ error: "agentId, from and to are required" }, { status: 400 });
+          }
+          const s3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          return Response.json(await s3.uiRenameMount(t, a, from, to));
         }
         case "/admin/diagnose": {
           if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
