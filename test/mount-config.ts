@@ -10,7 +10,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -836,6 +836,36 @@ await check("a mount reports what it is holding, with no credential and no call 
   // rename refuses exactly when the mount says something is live.
   if (renameSafety(busy, 6_000).safe) throw new Error("a live container did not block a rename");
   if (!renameSafety(empty, 6_000).safe) throw new Error("an empty mount blocked a rename");
+});
+
+/**
+ * The session window forgets, and that is why it is not the audit record.
+ *
+ * It keeps the newest handful and drops the rest with nothing saying so, and a
+ * container reaches it only by being released — a leaked one, or one whose
+ * worker died mid-call, never appears. Both limits are fine for a console
+ * meter and fatal for "what did this tenant use", which is why that record
+ * belongs where the provider's key is held.
+ *
+ * The test exists so the cap cannot quietly become "keep everything" (a
+ * connection record that grows without bound) or "keep one" (a panel that
+ * forgets what the agent did an hour ago) without someone deciding to.
+ */
+await check("the session window keeps the newest and drops the rest, which is why it is a meter", () => {
+  const at = (n: number) => sessionOf({ boxId: `b-${n}`, createdAt: n, lastUsedAt: n }, n + 10);
+  let window: ReturnType<typeof sessionOf>[] = [];
+  for (let n = 1; n <= 25; n++) window = keepSessions(window, at(n));
+
+  if (window.length !== 20) throw new Error(`the window holds ${window.length}, not the declared 20`);
+  if (window[0]!.boxId !== "b-25") throw new Error(`the newest is not first: ${window[0]!.boxId}`);
+  if (window.some((s) => s.boxId === "b-5")) throw new Error("an entry past the cap survived");
+  // The dropped ones leave nothing behind — no count, no marker. That is the
+  // property that makes reading this as a total wrong.
+  if (JSON.stringify(window).includes("dropped")) throw new Error("the window now claims to say what it lost");
+
+  // And an empty history is a first session, not a crash.
+  const first = keepSessions(undefined, at(1));
+  if (first.length !== 1 || first[0]!.boxId !== "b-1") throw new Error("the first release did not record");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);

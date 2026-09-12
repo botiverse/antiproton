@@ -129,7 +129,19 @@ interface BoxState {
   placeholders?: Placeholders;
   execs?: number;
   saved?: string[];
-  /** Most recent first, capped: this is a meter, not a second event log. */
+  /**
+   * The last few containers this mount finished with, most recent first.
+   *
+   * **Two limits, and anyone answering a question from this has to know both:**
+   * it keeps the most recent `SESSIONS_KEPT` and drops the rest without saying
+   * so, and a container only appears here if it was *released* — one that
+   * leaked, or whose worker died mid-call, never reaches this line at all.
+   *
+   * So it is a meter for the console — "what has this agent been running
+   * lately" — and it is not the record of what a tenant used. That record has
+   * to be written where nothing can go around it, which is why it belongs to
+   * whatever holds the provider's key rather than here (cody, 2026-09-12).
+   */
   sessions?: Session[];
   /**
    * Environments this agent has kept, by name.
@@ -218,7 +230,7 @@ async function stopBox(
   const session = sessionOf(state, Date.now());
   await ctx.connection.set({
     boxId: "", createdAt: 0, lastUsedAt: 0,
-    sessions: [session, ...(state.sessions ?? [])].slice(0, SESSIONS_KEPT),
+    sessions: keepSessions(state.sessions, session),
     // Kept environments outlive the container by construction — a forked
     // snapshot is independent of the box it came from — so losing the record of
     // them here would strand real storage under ids nobody can name any more.
@@ -264,6 +276,18 @@ async function stopBox(
 export function activityOf(state: BoxState | null | undefined): MountActivity {
   if (!state?.boxId) return { live: null };
   return { live: { id: state.boxId, lastUsedAt: state.lastUsedAt || state.createdAt } };
+}
+
+/**
+ * The window after one more container finishes: newest first, oldest dropped.
+ *
+ * A function rather than a slice at the call site so the cap is a rule that can
+ * fail a test. The number itself is a choice about how much state to carry in a
+ * connection record, not about how much history matters — the history lives
+ * where the key does.
+ */
+export function keepSessions(prior: Session[] | undefined, next: Session): Session[] {
+  return [next, ...(prior ?? [])].slice(0, SESSIONS_KEPT);
 }
 
 export function sessionOf(
