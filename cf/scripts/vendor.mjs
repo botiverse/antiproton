@@ -6,7 +6,7 @@
 // htmx is checked against the hash cdnjs publishes for the release before it
 // is written. The font is the latin subset Google serves for Geist Mono, one
 // variable-weight file covering 400–600; Geist is under the SIL OFL 1.1, and
-// the licence sits next to it. Re-run to bump either; the served paths carry
+// the licence sits next to it, as does htmx's (Zero-Clause BSD). Re-run to bump either; the served paths carry
 // the version, so a new file gets a new name and the old one falls out of
 // caches on its own.
 import { writeFileSync } from "node:fs";
@@ -45,3 +45,4 @@ writeFileSync(join(out, "geist-mono.ts"), header(`Geist Mono ${FONT_VERSION}, la
   `export const GEIST_MONO_WOFF2_BASE64 = ${JSON.stringify(woff2.toString("base64"))};\n`);
 writeFileSync(join(out, "LICENSE-geist.txt"), licence);
 console.log(`htmx ${HTMX_VERSION} ${htmx.length} chars (${sha512}); Geist Mono ${FONT_VERSION} ${woff2.length} bytes; ${range.split(",").length} ranges`);
+writeFileSync(join(out, "LICENSE-htmx.txt"), await (await fetch(`https://raw.githubusercontent.com/bigskysoftware/htmx/v${HTMX_VERSION}/LICENSE`)).text());
