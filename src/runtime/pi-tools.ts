@@ -107,6 +107,28 @@ const MAX_NAME = 64;
  * that already belongs to its own mount is left exactly as it is — and it still
  * takes its place in `used`, so it cannot be handed out twice.
  */
+/**
+ * Does this agent actually have a tool from this plugin?
+ *
+ * Asked by plugin and answered from the offered tool list, because the two
+ * obvious shortcuts are each wrong in one direction. An alias is the person's
+ * word for a mount — artifacts mounted as `files` would lose the prompt
+ * paragraph that says results can be parked, and anything mounted as
+ * `artifacts` would gain it — so the alias cannot be the question. And the
+ * mount list alone would answer yes for a tool withheld from the model, which
+ * is what that paragraph exists to avoid: telling an agent to use a tool it
+ * was not given is a wrong instruction competing with the right ones (Piper,
+ * 2026-09-12).
+ */
+export function offersPlugin(
+  records: Array<{ alias: string; plugin: string }>,
+  tools: MountedTool[],
+  plugin: string,
+): boolean {
+  const pluginOf = new Map(records.map((m) => [m.alias, m.plugin]));
+  return tools.some((t) => pluginOf.get(t.address.split(".")[0]!) === plugin);
+}
+
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   const used = new Set<string>();
   return tools.map((t) => {

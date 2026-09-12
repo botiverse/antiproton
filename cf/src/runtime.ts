@@ -14,7 +14,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import {
-  bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -611,7 +611,7 @@ export class AgentRuntime {
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
     await this.repinMounts(tenantId, agentId);
-    const { tools } = await this.#catalogueFor(tenantId, agentId);
+    const { tools, records } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
     // The call context's task is the conversation, so held calls and audit
     // rows say which conversation asked. The first session's id is the same
@@ -648,7 +648,7 @@ export class AgentRuntime {
         // tool" when no artifacts tool is mounted is not a hint, it is a wrong
         // instruction competing with the ones that matter.
         sandbox,
-        artifacts: (tools as MountedTool[]).some((t) => t.address.startsWith("artifacts.")),
+        artifacts: offersPlugin(records, tools as MountedTool[], "artifacts"),
       }),
       model: {
         provider: binding.provider,

@@ -13,7 +13,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { bridgeTools, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, offersPlugin, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
 import { offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -262,6 +262,25 @@ await check("沙箱里用的是模型看到的名字,地址也仍然接受", asy
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
+await check("a plugin's presence is asked by plugin and answered from the offered tools", async () => {
+  const tool = (alias: string) => [{ name: "put", description: "", parameters: {}, address: `${alias}.put` }] as MountedTool[];
+  const rec = (alias: string, plugin: string) => [{ alias, plugin }];
+  // The alias is the person's word for the mount, so it cannot be the question.
+  if (!offersPlugin(rec("files", "artifacts"), tool("files"), "artifacts")) {
+    throw new Error("artifacts under another alias must still count");
+  }
+  if (offersPlugin(rec("artifacts", "state"), tool("artifacts"), "artifacts")) {
+    throw new Error("another plugin under the artifacts alias must not count");
+  }
+  // Withheld: the mount is there, the tool was not offered.
+  if (offersPlugin(rec("files", "artifacts"), [], "artifacts")) {
+    throw new Error("a withheld tool must not count as offered");
+  }
+  if (!offersPlugin(rec("artifacts", "artifacts"), tool("artifacts"), "artifacts")) {
+    throw new Error("the ordinary case must still be true");
+  }
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
