@@ -568,6 +568,22 @@ await check("每个 agent 一开始就有记忆", () => {
   if (dupes.length) throw new Error(`the seed list repeats an alias: ${dupes.join(", ")}`);
 });
 
+await check("陌生人注册进来,拿到的不是一套假的运维工具", () => {
+  // `ops` (the demo plugin) was seeded until sign-up opened. Its tools are a
+  // fake fleet — `deploy` says "Changes production" and restarts a server that
+  // does not exist — and it sat on the first screen of every new account. A
+  // demonstration is something an operator chooses to show; being issued one is
+  // different. The plugin is still installed, so mounting it is one act away.
+  //
+  // Named plugin by plugin only until `availability: "opt-in"` exists; the
+  // general form of this check is "nothing opt-in is seeded", and it should
+  // replace this one rather than sit beside it.
+  const shown = seeded.filter((m) => m.plugin === "demo");
+  if (shown.length) {
+    throw new Error(`the seed list hands every new agent a demonstration: ${shown.map((m) => m.alias).join(", ")}`);
+  }
+});
+
 await check("没有 summary 把分派地址当成工具名交给模型", () => {
   // `<alias>.<tool>` is what the harness dispatches on. It is not what the model
   // is offered: `qualifyMountedTools` gives it the bare tool name, and
