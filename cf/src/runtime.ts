@@ -14,7 +14,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import {
-  bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -647,11 +647,13 @@ export class AgentRuntime {
         contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
         policy: this.#deps.policy,
         // Each paragraph appears only where the thing it describes is really
-        // there. Telling an agent to read a result back "with the artifacts
-        // tool" when no artifacts tool is mounted is not a hint, it is a wrong
-        // instruction competing with the ones that matter.
+        // there — telling an agent to read a result back with a tool it has not
+        // got is a wrong instruction competing with the right ones. That used
+        // to be a question this file asked about one plugin; the artifacts
+        // paragraph is now the artifacts mount's own contribution, so the
+        // condition is "the mount is there" and nobody has to check it.
+        // `sandbox` stays: run_js is the harness's, not a mount's.
         sandbox,
-        artifacts: offersPlugin(records, tools as MountedTool[], "artifacts"),
       }),
       model: {
         provider: binding.provider,

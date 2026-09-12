@@ -64,10 +64,6 @@ Inside run_js: every call returns { status, ... }. "succeeded" carries .result,
 "rejected" carries .error.code. There is no fetch, require, fs or process — the
 tool tag is the only way out. Nothing persists between runs.`;
 
-const ARTIFACTS = `Large results may come back summarised with an artifact reference instead of the
-full payload; read them back with the artifacts tool, projecting only the fields
-you need.`;
-
 /** Kept for tests and for anything that wants the unadorned text. */
 export const BASE_SYSTEM = CORE;
 
@@ -83,8 +79,6 @@ export interface PromptParts {
   /** Whether `run_js` is actually offered. A page about a sandbox the agent
    *  does not have is noise competing with the instructions that matter. */
   sandbox?: boolean;
-  /** Whether large results can be parked and read back. */
-  artifacts?: boolean;
 }
 
 export function systemPrompt(parts: PromptParts = {}): string {
@@ -92,7 +86,6 @@ export function systemPrompt(parts: PromptParts = {}): string {
   const persona = personaSection(parts.persona);
   if (persona) out.push(persona);
   if (parts.sandbox) out.push(SANDBOX);
-  if (parts.artifacts ?? parts.sandbox) out.push(ARTIFACTS);
   if (parts.policy?.trim()) out.push(parts.policy.trim());
   for (const c of parts.contributions ?? []) if (c.trim()) out.push(c.trim());
   return out.join("\n\n");

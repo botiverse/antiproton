@@ -119,6 +119,14 @@ const MAX_NAME = 64;
  * is what that paragraph exists to avoid: telling an agent to use a tool it
  * was not given is a wrong instruction competing with the right ones (Piper,
  * 2026-09-12).
+ *
+ * **No production caller as of 2026-09-12.** It was written for one: the prompt
+ * asked whether an artifacts tool was really mounted before telling the agent
+ * to read results back. That paragraph now belongs to the artifacts plugin, so
+ * the question answers itself. Kept because "what was the model actually
+ * offered" is the general form of a question three defects have turned on, and
+ * its tests still pin the four answers — but a reader looking for the prompt's
+ * dependency on it will not find one.
  */
 export function offersPlugin(
   records: Array<{ alias: string; plugin: string }>,

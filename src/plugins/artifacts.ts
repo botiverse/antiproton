@@ -12,6 +12,28 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
   return {
     id: "artifacts",
     version: "1.0.0",
+
+    /**
+     * The sentence that makes an `r2://` reference actionable.
+     *
+     * It lived in the framework's prompt, behind a flag the runtime computed by
+     * asking whether an artifacts tool was mounted — which is the plugin's own
+     * question, asked from outside. Now the paragraph exists exactly when this
+     * mount does, which is the same condition without anybody having to check
+     * it.
+     *
+     * The tool is named the way the prose elsewhere names one — this mount and
+     * the bare tool on it — rather than the qualified string, which is for
+     * telling the model to call something right now, not for describing what it
+     * has. `ctx.alias` because an operator may have mounted this under any name
+     * and a sentence about "the artifacts tool" is wrong the moment they do.
+     */
+    async promptContribution(ctx) {
+      return "Large results may come back summarised with an artifact reference instead of the "
+        + `full payload; read them back with the \`read\` tool on \`${ctx.alias}\`, projecting only `
+        + "the fields you need.";
+    },
+
     tools: [
       {
         name: "read",
