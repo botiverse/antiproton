@@ -618,6 +618,18 @@ export class AgentRuntime {
     // string the single-conversation object always used.
     const host = this.#host({ tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session });
     const store = this.store;
+    // The tools the model is offered are the mounts plus the sandbox. run_js is
+    // not a mount — it is the one tool whose body is this object rather than a
+    // plugin — so it is built here and handed to open beside the mounts. It
+    // has to be in that list: open reconciles the names a session remembers
+    // against it, and a tool added afterwards was removed on every reopen.
+    const extraTools = sandbox
+      ? [runJsTool(this.#executor as any, host, {
+          onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+          // So a script names a tool the way the model's own list names it.
+          tools: tools as MountedTool[],
+        })]
+      : [];
 
     const agent = await PiAgent.open({
       host: this.#deps.ctx.storage,
@@ -644,6 +656,7 @@ export class AgentRuntime {
         contextWindow: this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW,
       },
       tools: tools as MountedTool[],
+      extraTools: extraTools as any,
       toolHost: host,
       dispatch: async (jobId) => {
         const send = this.#deps.offloadModel;
@@ -651,20 +664,6 @@ export class AgentRuntime {
         await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
       },
     });
-    // The tools the model is offered are the mounts plus the sandbox. run_js is
-    // not a mount — it is the one tool whose body is this object rather than a
-    // plugin — so it is added here rather than resolved through the gateway.
-    agent.harness.setTools([
-      ...bridgeTools(tools as MountedTool[], host),
-      ...(sandbox
-        ? [runJsTool(this.#executor as any, host, {
-            onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
-            // So a script names a tool the way the model's own list names it.
-            tools: tools as MountedTool[],
-          })]
-        : []),
-    ] as any, BACKGROUND_CONTEXT);
-
     this.#agents.set(cacheKey, agent);
     return agent;
   }
