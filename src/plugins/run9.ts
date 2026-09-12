@@ -624,6 +624,11 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       }
       if (!prior?.boxId) return { quiet: false, note: "nothing is running, so nothing will be asked about" };
       const quietUntil = Date.now() + asked * 60_000;
+      // `lastUsedAt` is deliberately NOT touched, unlike every other handler
+      // here. It is what the absolute idle ceiling is measured from, so bumping
+      // it would let an agent hold a box forever by asking for quiet again and
+      // again — each request legal, each under the ceiling, and the ceiling
+      // never reached. Deferring the question is not using the machine.
       await ctx.connection.set({ ...prior, quietUntil } as unknown as Json);
       return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
     }

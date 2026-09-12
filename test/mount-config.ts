@@ -705,6 +705,11 @@ await check("an accepted quiet request records when to ask again, and leaves the
   const minutes = (saved.quietUntil - before) / 60_000;
   if (minutes < 29 || minutes > 31) throw new Error(`quietUntil is ${minutes} minutes out, not 30`);
   if (saved.boxId !== "b-1" || saved.execs !== 4) throw new Error("the rest of the box state was dropped");
+  // The one field it must not move. Every other handler in the plugin bumps
+  // `lastUsedAt`, so "make quiet consistent with the rest" is a plausible edit
+  // — and it would defeat the absolute ceiling, because an agent could push the
+  // idle clock forward indefinitely with legal requests under the cap.
+  if (saved.lastUsedAt !== 2_000) throw new Error(`quiet moved lastUsedAt to ${saved.lastUsedAt}, so the idle ceiling can be pushed forever`);
 
   // No box: nothing will be asked about, so there is nothing to put off. It
   // answers instead of throwing, the way `release` does on an empty mount.
