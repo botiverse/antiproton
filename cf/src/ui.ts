@@ -1689,13 +1689,11 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   // person who pasted wrong keys over the operator's is shown no change at all.
   if (c.operator === true) {
     // "Included": an operator-attached credential means the deployment covers
-    // this mount — there is nothing to configure and nothing acting "as" an
-    // account here. The label comes from the mount's own config (operator
-    // references carry no credential meta, so c.account is always null here):
-    // the plan's name, today "Limited Free".
-    const plan = typeof m.account === "string" && m.account ? m.account : account;
+    // this mount — there is nothing to configure, and nothing acting "as" an
+    // account. "Limited Free" names the deployment's plan; it lives here and
+    // nowhere else, because it is presentation, not a field.
     return `<div class="cred">
-      <div class="state"><b>included</b>${plan ? `<span class="tag">${esc(plan)}</span>` : ""}<span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
+      <div class="state"><b>included</b><span class="tag">Limited Free</span><span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
       ${error ? `<div class="err">${esc(error)}</div>` : ""}
     </div>`;
   }

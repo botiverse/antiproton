@@ -127,13 +127,11 @@ check("a reference the operator configured is included by the deployment, with n
   must(!/undefined|null/.test(html), "nothing may render as undefined");
 });
 
-check("the plan name comes from the mount's config, not the credential meta", () => {
-  // Operator references carry no credential meta, so c.account is null; the
-  // label must come from the mount-level account the seed wrote.
-  const html = render(mount("node", "sandbox", { account: "Limited Free", connected: true,
+check("an included mount names the deployment's plan", () => {
+  const html = render(mount("node", "sandbox", { connected: true,
     credential: { attached: true, operator: true, verified: false, account: null } }));
   must(html.includes('<span class="tag">Limited Free</span>'), "the plan name must be a tag");
-  must(!html.includes("acting as"), "the plan name must not read as an account");
+  must(!html.includes("acting as"), "an included credential is not an account to act as");
 });
 
 check("a paste rejected over an operator reference still says why", () => {
