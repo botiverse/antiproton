@@ -56,6 +56,13 @@ const fresh = now.filter((s) => !base.has(s));
 const gone = [...base].filter((s) => !now.includes(s));
 console.log(`typecheck: ${now.length} error signature(s), ${base.size} in baseline, ${fresh.length} new, ${gone.length} cleared`);
 for (const s of fresh) console.log(`  NEW  ${s}`);
-if (gone.length) console.log(`  (${gone.length} baseline entries no longer occur; run with --update to drop them)`);
+// Named, not counted. An entry that stops occurring may be carrying a reason
+// someone wrote next to it, and a reason whose signature is gone has to be
+// read again rather than dropped with it — otherwise it outlives the thing it
+// explained (Rex, 2026-09-12). Naming them is also what makes "the cause was
+// diagnosed correctly" checkable: a real fix clears the signature it aimed at,
+// and a wrong one clears something else.
+for (const s of gone) console.log(`  GONE ${s}`);
+if (gone.length) console.log(`  (${gone.length} no longer occur; run with --update once their reasons have been re-read)`);
 process.exit(fresh.length ? 1 : 0);
 }
