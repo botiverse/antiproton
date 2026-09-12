@@ -36,6 +36,7 @@ import {
   type Viewer, type LoginState, type RaftConfig, type RefusalReason,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
+import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -2263,6 +2264,10 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    // The page's own script and font, public and immutable; the sign-in
+    // page needs them before anyone is signed in.
+    const asset = staticAsset(url.pathname);
+    if (asset) return asset;
     const login = await handleLogin(request, env, url);
     if (login) return login;
     // Conformance gets its own object: the P0 probe created an incompatible
