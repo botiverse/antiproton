@@ -466,6 +466,11 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   // costs nothing, and neither does a tab nobody is looking at: every poll
   // on the page starts with `awake`, and the visibilitychange listener at
   // the bottom catches the panels up the moment the tab is shown again.
+  // The inbox is the one panel that polls in every view, because the rail
+  // badge it feeds is in every view; it does so at two speeds, every 5s
+  // while the inbox is showing and every 30s elsewhere, since a 304 still
+  // wakes the object and a badge may lag half a minute (Vera, 2026-09-12:
+  // 720 wakes an hour per idle tab at one speed, 120 at two).
   const awake = "!document.hidden";
   const lazy = (id: string, path: string, every: string, cond: string) =>
     `<div class="body" id="${id}" data-lazy hx-get="${path}" hx-swap="innerHTML"
@@ -529,7 +534,8 @@ ${HEAD_ASSETS}
   <section class="view" data-view="inbox">
     <div class="view-head"><h2>Inbox</h2><span class="sub">calls held by the gateway, waiting for your signature</span></div>
     <div class="body" id="inbox" data-lazy hx-get="/ui/inbox" hx-swap="innerHTML"
-         hx-trigger="load, ap:show, every 5s[${awake}]" hx-on::after-swap="ap.count(this)">loading…</div>
+         hx-trigger="load, ap:show, every 5s[${awake} && document.body.dataset.view==='inbox'], every 30s[${awake} && document.body.dataset.view!=='inbox']"
+         hx-on::after-swap="ap.count(this)">loading…</div>
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><span class="avatar lg" id="agent-avatar" hidden></span><h2 id="agent-name">${esc(agentId)}</h2>

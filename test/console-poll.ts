@@ -23,7 +23,7 @@ const polls = triggers.filter((t) => /every \d+s/.test(t));
 
 check("every poll pauses while the tab is hidden", () => {
   must(polls.length >= 8, `expected the panels' polls, found ${polls.length}`);
-  for (const t of polls) must(/every \d+s\[!document\.hidden( &&|\])/.test(t), `poll without a visibility guard: ${t}`);
+  for (const t of polls) for (const clause of t.match(/every \d+s\[[^\]]*\]/g) ?? []) must(/every \d+s\[!document\.hidden( &&|\])/.test(clause), `poll without a visibility guard: ${clause}`);
 });
 
 check("the inbox is fetched by exactly one element", () => {
@@ -31,7 +31,8 @@ check("the inbox is fetched by exactly one element", () => {
   must(els.length === 1, `expected one inbox fetcher, found ${els.length}`);
   const el = els[0];
   must(/id="inbox"/.test(el), "the fetcher must be the visible inbox panel");
-  must(/hx-trigger="load, ap:show, every 5s\[!document\.hidden\]"/.test(el), `the inbox polls in every view, only the tab matters: ${el}`);
+  must(/hx-trigger="load, ap:show, every 5s\[!document\.hidden && document\.body\.dataset\.view==='inbox'\], every 30s\[!document\.hidden && document\.body\.dataset\.view!=='inbox'\]"/.test(el),
+    `the inbox polls in every view, fast while it is showing and slow elsewhere: ${el}`);
   must(/hx-on::after-swap="ap\.count\(this\)"/.test(el), "the same swap must update the badge");
   must(!/inbox-poll/.test(html), "the hidden conduit is gone");
 });
