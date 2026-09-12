@@ -76,8 +76,16 @@ export function idleDecision(i: IdleInput): IdleAction {
  * collision takes a numeric suffix — so a second derivation is right only
  * until it is not, and the way it fails is silent: `alias__release` with a
  * collision elsewhere names another mount's tool, which resolves and calls
- * the wrong thing (Piper, Dora, 2026-09-12). The caller reads them from the
- * same list the model was offered.
+ * the wrong thing (Piper, Dora, 2026-09-12).
+ *
+ * Reading them does more than make them correct. A withheld tool has no
+ * address in the catalogue at all — withholding is applied before names are
+ * qualified — so a `null` here is the fact that the model was not offered it,
+ * which a built name could not have seen. That case ships: the SWE benchmark
+ * withholds `release` precisely so the agent cannot destroy the box the
+ * grader is about to read, and a reminder telling it to call that tool would
+ * be an instruction it cannot carry out. A reminder that names no tool and
+ * states only the consequence is right in every one of these cases.
  */
 export function nudgeText(
   alias: string,
