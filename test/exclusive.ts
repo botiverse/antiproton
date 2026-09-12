@@ -113,14 +113,19 @@ await check("不同 agent 的同名挂载互不排队", async () => {
     installationId: "i2", connectionId: null, toolVersion: "1.0.0",
     publicConfig: {}, secretRef: null, policy: null,
   });
-  const t0 = Date.now();
   await Promise.all([
     gw.invoke(ctx, "node.touch", { mark: "a" } as any),
     gw.invoke({ ...ctx, agentId: "b" }, "node.touch", { mark: "b" } as any),
   ]);
   // Two agents are two machines. Serialising them together would make one
   // agent's container wait on another's, which is not what the mount asked for.
-  if (Date.now() - t0 > 40) throw new Error("two different agents were serialised against each other");
+  //
+  // Asserted by overlap, not by the clock. This read `Date.now() - t0 > 40`
+  // once, and it failed exactly once — while a deploy was running on the same
+  // machine — which is a test reporting on the host rather than on the code.
+  // A wall-clock threshold is a claim about how busy the box is; overlap is
+  // the property itself, and the racer already watches it.
+  if (!r.overlapped()) throw new Error("two different agents were serialised against each other");
 });
 
 await check("队列住在实例上 —— 所以【一个 agent 一个 gateway】是它的前提,不是巧合", async () => {
