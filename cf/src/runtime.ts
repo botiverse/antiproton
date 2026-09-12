@@ -56,7 +56,7 @@ import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { statePlugin } from "../../src/plugins/state.ts";
-import { run9Plugin } from "../../src/plugins/run9.ts";
+import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
@@ -344,7 +344,7 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
-      run9Plugin(this.#artifacts as any, deps.bucketName),
+      sandboxPlugin(this.#artifacts as any, deps.bucketName),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
@@ -472,11 +472,16 @@ export class AgentRuntime {
    * nothing referring to it, for ever. An operator-configured reference is not
    * ours to move: it names something outside this agent.
    *
-   * Refused while a box is running. Nothing here can make a rename hurt a live
-   * container — the transaction sees to that — but a person who renames a
-   * machine mid-run has almost certainly lost track of which one it is, and the
-   * cheap answer ("it is busy, release it or wait") is better than the clever
-   * one.
+   * **It does not yet refuse a mount with something running.** That check is
+   * written — `renameSafety` in the plugin contract — but reaching it means
+   * asking the mount whether it is busy, and the only adapter that can answer
+   * today (`activityOf`) lives inside the sandbox plugin. Calling it from here
+   * would put the framework back to importing one plugin's internals and
+   * knowing that "a container" is that plugin's idea, which is the coupling
+   * #209 removed and the one the console still owes. It waits for `activity?`
+   * on the contract, and until then nothing exposes this to a person: it is a
+   * store operation with no route and no button, so there is no path by which
+   * someone renames a machine out from under a running job.
    */
   async renameMount(
     tenantId: string, agentId: string, from: string, to: string,
@@ -484,23 +489,11 @@ export class AgentRuntime {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, from);
     if (!mount) return { ok: false, error: `no mount named ${from}` };
-    const running = await this.#runningBox(tenantId, agentId, from);
-    if (running) {
-      return { ok: false, error: `\`${from}\` has a container running (${running}); release it or wait until it is idle` };
-    }
     // Only a credential this agent supplied moves. `operator:` references name
     // something the deployment owns, under a name that has nothing to do with
     // this mount's alias.
     const own = isAgentRef(mount.secretRef);
     return this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
-  }
-
-  /** The id of a box this mount is holding, if it is holding one. */
-  async #runningBox(tenantId: string, agentId: string, alias: string): Promise<string | null> {
-    // `getConnection` hands back the state itself, already parsed, and null
-    // once it has expired — an expired session is not one a box outlives.
-    const state: any = await this.store.getConnection(tenantId, agentId, alias).catch(() => null);
-    return typeof state?.boxId === "string" ? state.boxId : null;
   }
 
   /** What a page may show for a mount's credential. Never the value, and

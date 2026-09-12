@@ -34,7 +34,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { runJsTool, bridgeTools, type MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
-import { run9Plugin } from "../../src/plugins/run9.ts";
+import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
@@ -146,7 +146,7 @@ async function runOne(inst: Instance) {
   await store.init();
   await store.createAgent(T, AGENT);
 
-  const plugins: Plugin[] = [run9Plugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
+  const plugins: Plugin[] = [sandboxPlugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
   await store.addMount({
     tenantId: T, agentId: AGENT, alias: "sandbox", plugin: "sandbox",
     installationId: "i-node", connectionId: null, toolVersion: "1.0.0",

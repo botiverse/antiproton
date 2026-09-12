@@ -6,11 +6,11 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
-import { pluginEnabled, type PluginChoice } from "../src/plugins/types.ts";
+import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin, execArgv, execOutput, sessionOf } from "../src/plugins/run9.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -26,7 +26,7 @@ async function check(name: string, fn: () => void | Promise<void>) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
-const run9 = run9Plugin(null as any, "local");
+const run9 = sandboxPlugin(null as any, "local");
 
 await check("拼错的键会被拒绝,并给出最接近的那个", () => {
   const p = validateMount(run9, { timeout_ms: 5000 } as any, "env:RUN9");
@@ -77,7 +77,7 @@ await check("assert 版本会抛,并且把问题都带上", () => {
   let msg = "";
   try { assertMountConfig(run9, { timeout_ms: 1, shel: "x" } as any, null); }
   catch (e) { msg = String((e as Error).message); }
-  if (!msg.includes("cannot mount run9")) throw new Error(`unexpected: ${msg}`);
+  if (!msg.includes("cannot mount sandbox")) throw new Error(`unexpected: ${msg}`);
   if (!msg.includes("timeoutMs") || !msg.includes("needs an account")) {
     throw new Error(`problems were dropped: ${msg}`);
   }
@@ -404,8 +404,8 @@ await check("a plugin with something to release is exclusive, because holding is
     throw new Error(`${unguarded.join(", ")} release something per mount but allow concurrent calls`);
   }
   // Without this the rule above passes by having no holders at all.
-  if (!holders.some((p) => p.id === "run9")) {
-    throw new Error("run9 keeps one container per mount and must declare release; the rule is vacuous without it");
+  if (!holders.some((p) => p.id === "sandbox")) {
+    throw new Error("the sandbox keeps one container per mount and must declare release; the rule is vacuous without it");
   }
 });
 
@@ -743,6 +743,65 @@ await check("the plugins that claim every agent are the ones actually seeded", a
   for (const id of seeded) {
     if (id === "tools" || id === "artifacts") continue;
     if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
+  }
+});
+
+/**
+ * A mount with something running under it cannot be renamed yet.
+ *
+ * The operation moves rows in `mounts` and `connections`, both keyed by the
+ * alias. Doing that while a container is alive is the one case that hurts: the
+ * box keeps billing under a name nothing looks up any more, and `release` reads
+ * the new alias and finds nothing. So the rule is "wait", and the refusal has
+ * to carry the number the person needs next — how long it has been idle tells
+ * them whether to wait or to release it.
+ */
+await check("a mount is renamable only while nothing is running under it", async () => {
+  const now = 10_000;
+  const idle = renameSafety(activityOf(null), now);
+  if (!idle.safe) throw new Error("an empty mount refused a rename");
+  if (!renameSafety({ live: null }, now).safe) throw new Error("no live resource still refused");
+  if (!renameSafety(undefined, now).safe) throw new Error("an unknown mount refused a rename");
+
+  const busy = renameSafety(activityOf({ boxId: "b-9", createdAt: 1_000, lastUsedAt: 4_000 } as any), now);
+  if (busy.safe) throw new Error("a running container let the rename through");
+  if (busy.live.id !== "b-9") throw new Error(`the refusal does not name what is running: ${JSON.stringify(busy)}`);
+  if (busy.live.idleMs !== 6_000) throw new Error(`idle time is wrong: ${busy.live.idleMs}`);
+  if (!/release|idle/.test(busy.reason)) throw new Error(`the refusal does not say what to do: ${busy.reason}`);
+
+  // A box that has never been used dates from its creation, not from zero —
+  // the same rule the release record follows, so the two agree about age.
+  const fresh = renameSafety(activityOf({ boxId: "b-1", createdAt: 7_000 } as any), now);
+  if (fresh.safe || fresh.live.idleMs !== 3_000) throw new Error(`an unused box reported ${JSON.stringify(fresh)}`);
+});
+
+/**
+ * "The provider is run9" is a claim the code can refuse, not a comment.
+ *
+ * The plugin is the capability — a sandbox — and run9 is who supplies one
+ * today. Writing that as a setting with `choices` means a mount asking for
+ * something else is refused at the page; this test is about the other door,
+ * the mount that reaches the call anyway. It must not fall through to the
+ * provider we happen to implement: "it ran on run9" is the wrong answer to
+ * "run it somewhere else", and it is wrong silently.
+ */
+await check("a sandbox mount asking for a provider we do not have is refused, not quietly run on run9", async () => {
+  if (providerOf({}) !== "run9") throw new Error("the default provider is not run9");
+  if (providerOf({ provider: "run9" }) !== "run9") throw new Error("run9 was not accepted by name");
+
+  for (const asked of ["fly", "e2b", "", "RUN9"]) {
+    let refused = "";
+    try { providerOf({ provider: asked }); } catch (e) { refused = String((e as Error).message); }
+    if (!refused) throw new Error(`the "${asked}" provider was accepted, and would have run on run9`);
+    if (!refused.includes(asked)) throw new Error(`the refusal does not name what was asked for: ${refused}`);
+  }
+
+  // And the setting itself carries the list, so the console and the mount
+  // validator refuse the same values without repeating them.
+  const field = (run9.config ?? []).find((f) => f.name === "provider");
+  if (!field) throw new Error("the plugin no longer declares which provider a mount may ask for");
+  if (JSON.stringify(field.choices) !== JSON.stringify(["run9"])) {
+    throw new Error(`the declared choices and the implemented providers disagree: ${JSON.stringify(field.choices)}`);
   }
 });
 

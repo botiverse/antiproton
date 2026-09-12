@@ -251,6 +251,53 @@ const resolved = (f: CredentialField): CredentialField => ({
  * out: the console needs a value it can put on a control, and the store has
  * nothing to write for a preference that was never expressed.
  */
+/**
+ * What anything asking "is this mount busy?" needs to know, and nothing more.
+ *
+ * A rename moves a mount's rows; the console draws a panel; the idle sweep
+ * decides whether to ask. All three want the same fact and none of them should
+ * learn a plugin's private state to get it — the console knowing run9 keeps
+ * `boxId` and `sessions` is the coupling this shape exists to end. It is
+ * deliberately the smallest thing the callers share, so `meter()` can return it
+ * later without any of them changing.
+ */
+export interface MountActivity {
+  /** What this mount is keeping alive at a cost, or null when nothing. */
+  live: { id: string; lastUsedAt: number } | null;
+}
+
+/** Whether a mount can be renamed right now, and if not, what to say. */
+export type RenameSafety =
+  | { safe: true }
+  | { safe: false; reason: string; live: { id: string; idleMs: number } };
+
+/**
+ * Renaming moves a mount's rows; a live resource under the old name is the one
+ * thing that makes that dangerous.
+ *
+ * Not because the move is hard — it is one transaction — but because the thing
+ * being moved is not only rows: a container keeps running while its state is
+ * being re-keyed, and a half-moved mount leaves it billing with nothing able to
+ * release it. So the answer is "wait", not "try carefully".
+ *
+ * A pure function because the decision is worth testing and the operation that
+ * uses it is not: it needs a store, a transaction and a live agent. This is the
+ * same split as `idleDecision` and for the same reason — the rule can go red on
+ * its own.
+ */
+export function renameSafety(activity: MountActivity | null | undefined, now: number): RenameSafety {
+  const live = activity?.live;
+  if (!live) return { safe: true };
+  return {
+    safe: false,
+    // The message is for a person, and the number is the one they will ask for
+    // next: not "it is busy" but "it was last used this long ago", which is
+    // what tells them whether to wait or to release it.
+    reason: "something is still running under this mount; release it or wait until it is idle",
+    live: { id: live.id, idleMs: Math.max(0, now - live.lastUsedAt) },
+  };
+}
+
 export type PluginChoice = "enable" | "disable" | "inherit";
 
 /**
