@@ -104,6 +104,24 @@ check("token 认得出来,而且认不出没发过的", () => {
   if (l.tokenFor("hash-unknown")) throw new Error("an unissued token was accepted");
 });
 
+check("一个租户有没有 key,问得出来 —— 这样第一次用的时候可以自动发", () => {
+  // Nobody types a sandbox credential today: the mount carries the operator's
+  // reference and the console shows it as not theirs to change. Per-tenant keys
+  // exist so the broker can tell callers apart; that is a reason for us to hold
+  // one each, not a reason to start asking anyone for one.
+  const l = fresh();
+  if (l.keyOf("t-a")) throw new Error("a tenant that was never issued a key appears to have one");
+  l.issue("hash-a", "t-a", "a1", "minted on first use");
+  if (l.keyOf("t-a") !== "hash-a") throw new Error("the key a tenant holds could not be found again");
+  if (l.keyOf("t-b")) throw new Error("one tenant's key answered for another");
+
+  // Minting twice must not silently replace the first: an agent holding the
+  // old one would start failing with nothing saying why.
+  l.issue("hash-a2", "t-a", "a1", "second");
+  if (l.keyOf("t-a") !== "hash-a") throw new Error("issuing again replaced the key a tenant is already using");
+  if (!l.tokenFor("hash-a2")) throw new Error("a second key was refused outright; it should be additional, not a replacement");
+});
+
 console.log(`\n  The broker's ledger\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

@@ -64,6 +64,29 @@ export default {
     // Operator routes first, and separated by their own secret: issuing a token
     // and using one are different authorities, and a service that muddles them
     // lets a tenant mint a tenant.
+    // Minting one, for a tenant that does not have one yet. Called by our own
+    // runtime the first time an agent of that tenant reaches for a sandbox, so
+    // that "the user configures nothing" stays true: per-tenant keys exist so
+    // this service can tell callers apart, which is a reason for us to hold one
+    // each and not a reason to ask anybody for one.
+    //
+    // Behind the operator secret, like the manual route, because minting is an
+    // operator act however it is triggered.
+    if (url.pathname === "/admin/key" && request.method === "POST") {
+      if (!env.ADMIN_TOKEN || presentedToken !== env.ADMIN_TOKEN) return json({ error: "not an operator" }, 401);
+      const body = (await request.json().catch(() => null)) as any;
+      if (!body?.tenantId || !body?.agentId) return json({ error: "tenantId and agentId are required" }, 400);
+      // A pair, shaped like run9's, so the plugin's credential declaration does
+      // not have to change. See `presented` for why that matters.
+      const ak = `ak_${crypto.randomUUID().replace(/-/g, "")}`;
+      const sk = `sk_${crypto.randomUUID().replace(/-/g, "")}`;
+      await ledger.call("issue", await hash(`${ak}:${sk}`), String(body.tenantId), String(body.agentId), body.note ?? "minted on first use");
+      // Returned exactly once, to the caller that asked for it. There is no
+      // route that reads a key back: the hash is all this service keeps, so a
+      // lost key is re-minted rather than recovered.
+      return json({ ak, sk });
+    }
+
     if (url.pathname === "/admin/token" && request.method === "POST") {
       if (!env.ADMIN_TOKEN || presentedToken !== env.ADMIN_TOKEN) return json({ error: "not an operator" }, 401);
       const body = (await request.json().catch(() => null)) as any;

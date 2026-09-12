@@ -122,6 +122,24 @@ export class Ledger {
     return r ? { tenantId: String(r.tenant_id), agentId: String(r.agent_id) } : null;
   }
 
+  /**
+   * The key this tenant already has, if it has one.
+   *
+   * Asked so that a key can be minted the first time a tenant needs one, with
+   * nobody typing anything: a person configures no credential for the sandbox
+   * today and must not start — the mount has always carried the operator's
+   * reference, and the console has always shown it as not theirs to change.
+   * Per-tenant keys exist so the broker can tell callers apart, which is the
+   * whole point of it; that is a reason for us to have one each, not a reason
+   * for anyone to be asked for one.
+   */
+  keyOf(tenantId: string): string | null {
+    const r = this.#sql
+      .exec("SELECT hash FROM tokens WHERE tenant_id=? ORDER BY issued_at LIMIT 1", tenantId)
+      .toArray()[0];
+    return r ? String(r.hash) : null;
+  }
+
   issue(hash: string, tenantId: string, agentId: string, note: string | null) {
     this.#sql.exec(
       `INSERT INTO tokens(hash, tenant_id, agent_id, issued_at, note) VALUES (?,?,?,?,?)
