@@ -19,12 +19,14 @@ import { run9Plugin } from "../src/plugins/run9.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
+import { appworldPlugins } from "../src/plugins/appworld.ts";
 import { credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const read = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url).pathname, "utf8");
 const TYPES = read("src/plugins/types.ts");
 const PITOOLS = read("src/runtime/pi-tools.ts");
+const APPWORLD = read("src/plugins/appworld.ts");
 
 /** The JSDoc immediately above a position: only whitespace may separate them. */
 function docBefore(src: string, at: number): string {
@@ -68,6 +70,23 @@ plugins.push(
   artifactsPlugin(bucket, "artifacts"),
   builtinToolsPlugin(store, () => plugins),
 );
+
+/* `appworldPlugins` is a family, not a plugin: it returns one plugin per app in
+ * a catalogue, and the catalogue is AppWorld's data rather than ours, so it is
+ * not in this tree. The page cannot list its apps and must not quietly drop it
+ * — a count that skips what it could not build is how "eight" got written above
+ * a table of seven. So it is constructed from a one-API stand-in, which is
+ * enough to read the shape every app of it has, and the row says so. */
+const STANDIN = {
+  "«app»": {
+    description: "one app of the catalogue",
+    apis: [{
+      app_name: "«app»", api_name: "«api»", path: "/", method: "GET", description: "",
+      parameters: [{ name: "access_token", type: "string", required: true, description: "", default: null, constraints: [] }],
+    }],
+  },
+};
+const family = appworldPlugins(STANDIN as any, { apiBaseUrl: "http://localhost:8800" })[0]!;
 
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!));
 /** JSDoc is markdown-ish: paragraphs, `code`, **bold**. Render that much. */
@@ -183,6 +202,8 @@ process.stdout.write(`<!doctype html>
   .card h4 { margin:0 0 6px; font-size:13px; font-family:ui-monospace,Menlo,monospace }
   .card p { font-size:13.5px; color:var(--dim); margin:0 }
   a { color:var(--acc) }
+  tr.family th, tr.family td { background:var(--soft) }
+  section.family { border-style:dashed }
 </style></head><body>
 
 <h1>The plugin contract</h1>
@@ -193,16 +214,29 @@ and the tools, settings and credential shapes from the plugin modules, construct
 If it disagrees with the code, the generator is wrong.</p>
 
 <h2>What a plugin provides</h2>
-<p class="lede">Three members are required; six are how a mount says it needs something more than a
+<p class="lede">${membersOf(TYPES, "Plugin").filter((m) => !m.optional).length} members are required;
+${membersOf(TYPES, "Plugin").filter((m) => m.optional).length} are how a mount says it needs something more than a
 function call. The right-hand column names the plugins that declare each optional one.</p>
 ${memberList(TYPES, "Plugin")}
 
-<h2>The eight, at a glance</h2>
+<h2>${plugins.length} registered, and one family, at a glance</h2>
 <table>
   <thead><tr><th>plugin</th><th class="num">tools</th><th>credential</th>
     ${OPTIONAL.map((k) => `<th class="mark"><span class="rot">${esc(k)}</span></th>`).join("")}</tr></thead>
-  <tbody>${overview}</tbody>
+  <tbody>${overview}
+    <tr class="family">
+      <th scope="row"><code>appworld</code><span class="v">id is the app's name</span></th>
+      <td class="num">per app</td>
+      <td>${credCell(family)}</td>
+      ${OPTIONAL.map((k) => `<td class="mark ${has(family, k) ? "yes" : "no"}">${has(family, k) ? "●" : "·"}</td>`).join("")}
+    </tr>
+  </tbody>
 </table>
+<p class="note dim"><strong>Why that last row is different.</strong> <code>appworldPlugins(catalogue, cfg)</code>
+returns one plugin per app, and the catalogue is AppWorld's data rather than ours, so it is not in this tree
+and this page cannot name the apps or count the tools. The marks on that row are real — they are read from a
+plugin built with a one-API stand-in, and every app of the family has that same shape. Skipping it silently is
+how the heading above this table used to say "eight" over a list of seven.</p>
 
 <h2>Two names for one tool</h2>
 <div class="cols">
@@ -224,6 +258,17 @@ ${md(docOf(TYPES, "export type CredentialForm ="))}
 
 <h2>What each plugin declares</h2>
 ${detail}
+<section class="plugin family">
+  <h3><code>appworld</code><span class="v">${esc(family.version)}, one id per app</span>
+    <span class="tag">one plugin per app</span>
+    <span class="tag">not expanded here</span></h3>
+  ${/* the module's own doc, which sits above the first declaration in the file */
+    md(docOf(APPWORLD, "export interface ApiDoc {"))}
+  <p class="note"><strong>Credential.</strong> ${esc(dot((family as any).credential.summary))}
+    <span class="dim">Having one buys ${esc(dot((family as any).credential.grants))}</span></p>
+  <p class="note dim">Its tools are the catalogue's APIs, minus the ones the harness owns — the token
+    endpoint and the withheld list. A deployment with the catalogue gets that count; this page cannot.</p>
+</section>
 
 </body></html>
 `);
