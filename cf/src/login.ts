@@ -93,12 +93,18 @@ ${THEME_BOOT}
  * whether to press a button deserves to know both before the redirect, not
  * on GitHub's consent screen.
  */
-export function loginPage(): string {
+export function loginPage(opts: { open: boolean } = { open: true }): string {
+  // The first sentence follows the deployment's switch (GITHUB_OPEN_SIGNUP),
+  // which was flipped twice in ten minutes on the day it was added: a door
+  // that says "anyone" while the switch is off sends people to a refusal.
+  const who = opts.open
+    ? "Any GitHub account can sign in; your first sign-in creates an agent of your own."
+    : "Invited GitHub accounts only.";
   return shell("sign in",
     `<h1>Sign in to the console</h1>
   <p>This console drives a real agent against the operator's model account, so it needs to know who you are.</p>
   <a class="btn" href="/login/github" rel="nofollow">${GITHUB_MARK}Sign in with GitHub</a>
-  <p class="fine">Any GitHub account can sign in; your first sign-in creates an agent of your own. GitHub shares your username, name and avatar with antiproton; everything you create here is keyed on that account.
+  <p class="fine">${who} GitHub shares your username, name and avatar with antiproton; everything you create here is keyed on that account.
   New to this? <a href="https://report.antiproton.ai/" target="_blank" rel="noopener">Read what antiproton is</a> first.</p>`);
 }
 

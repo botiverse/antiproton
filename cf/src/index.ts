@@ -1989,7 +1989,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
   switch (url.pathname) {
     case "/login": {
       if (await viewer(request, env)) return Response.redirect(new URL("/ui", url).toString(), 302);
-      return html(loginPage());
+      return html(loginPage({ open: env.GITHUB_OPEN_SIGNUP === "1" }));
     }
     case "/login/refused": {
       const reason = url.searchParams.get("reason") ?? "";
