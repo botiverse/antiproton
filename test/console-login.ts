@@ -25,7 +25,8 @@ check("the sign-in page offers one way in, to /login/github, and says so in GitH
   const h = loginPage();
   must(/<a class="btn" href="\/login\/github"[^>]*>[\s\S]*?Sign in with GitHub<\/a>/.test(h), "the button goes to /login/github and reads 'Sign in with GitHub'");
   must(count(h, /href="\/login\//g) === 1, "exactly one sign-in link");
-  must(/Invited GitHub accounts only/.test(h), "it says invited accounts only before the round trip");
+  must(/Any GitHub account can sign in; your first sign-in creates an agent of your own/.test(h), "it says any account can sign in and what the first sign-in does, before the round trip");
+  must(!/[Ii]nvited/.test(h), "the door no longer claims an invitation is needed");
   must(/username, name and avatar/.test(h), "it says what GitHub shares");
 });
 
