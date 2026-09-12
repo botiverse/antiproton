@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext } from "./types.ts";
+import type { Plugin, PluginContext, MountActivity } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 
 /**
@@ -230,6 +230,20 @@ async function stopBox(
  * correct and looks correct, which is the danger — extending it by one token
  * would be consistent with its neighbours and would quietly empty this record.
  */
+/**
+ * This mount's activity, in the shape everyone else asks in.
+ *
+ * The console, the idle sweep and the rename operation all want one fact — is
+ * something running here — and until now each read `boxId` and `lastUsedAt` out
+ * of this plugin's own state. That is the coupling the audit found in two
+ * places and the reason a mount could only be found by the alias `node`. The
+ * adapter is four lines and it is the whole fix: callers ask, this answers.
+ */
+export function activityOf(state: BoxState | null | undefined): MountActivity {
+  if (!state?.boxId) return { live: null };
+  return { live: { id: state.boxId, lastUsedAt: state.lastUsedAt || state.createdAt } };
+}
+
 export function sessionOf(
   state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
   endedAt: number,

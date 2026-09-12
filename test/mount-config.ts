@@ -6,11 +6,11 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
-import { pluginEnabled, type PluginChoice } from "../src/plugins/types.ts";
+import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { run9Plugin, execArgv, execOutput, sessionOf } from "../src/plugins/run9.ts";
+import { run9Plugin, execArgv, execOutput, sessionOf, activityOf } from "../src/plugins/run9.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -744,6 +744,35 @@ await check("the plugins that claim every agent are the ones actually seeded", a
     if (id === "tools" || id === "artifacts") continue;
     if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
   }
+});
+
+/**
+ * A mount with something running under it cannot be renamed yet.
+ *
+ * The operation moves rows in `mounts` and `connections`, both keyed by the
+ * alias. Doing that while a container is alive is the one case that hurts: the
+ * box keeps billing under a name nothing looks up any more, and `release` reads
+ * the new alias and finds nothing. So the rule is "wait", and the refusal has
+ * to carry the number the person needs next — how long it has been idle tells
+ * them whether to wait or to release it.
+ */
+await check("a mount is renamable only while nothing is running under it", async () => {
+  const now = 10_000;
+  const idle = renameSafety(activityOf(null), now);
+  if (!idle.safe) throw new Error("an empty mount refused a rename");
+  if (!renameSafety({ live: null }, now).safe) throw new Error("no live resource still refused");
+  if (!renameSafety(undefined, now).safe) throw new Error("an unknown mount refused a rename");
+
+  const busy = renameSafety(activityOf({ boxId: "b-9", createdAt: 1_000, lastUsedAt: 4_000 } as any), now);
+  if (busy.safe) throw new Error("a running container let the rename through");
+  if (busy.live.id !== "b-9") throw new Error(`the refusal does not name what is running: ${JSON.stringify(busy)}`);
+  if (busy.live.idleMs !== 6_000) throw new Error(`idle time is wrong: ${busy.live.idleMs}`);
+  if (!/release|idle/.test(busy.reason)) throw new Error(`the refusal does not say what to do: ${busy.reason}`);
+
+  // A box that has never been used dates from its creation, not from zero —
+  // the same rule the release record follows, so the two agree about age.
+  const fresh = renameSafety(activityOf({ boxId: "b-1", createdAt: 7_000 } as any), now);
+  if (fresh.safe || fresh.live.idleMs !== 3_000) throw new Error(`an unused box reported ${JSON.stringify(fresh)}`);
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
