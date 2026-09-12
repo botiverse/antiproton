@@ -35,7 +35,7 @@ import {
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
-  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId,
+  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { staticAsset } from "./static.ts";
@@ -1193,26 +1193,29 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS identities(
       provider_key TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
       added_by TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+    // Rows written before tenants were per person live in "demo", and stay
+    // there: moving an agent between tenants is moving it to another object.
+    try { this.sql.exec("ALTER TABLE identities ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'demo'"); } catch { /* already there */ }
   }
 
-  async identityLookup(key: string): Promise<string | null> {
+  async identityLookup(key: string): Promise<{ agentId: string; tenantId: string } | null> {
     this.#identities();
-    const r = this.sql.exec("SELECT agent_id FROM identities WHERE provider_key = ?", key).toArray()[0] as any;
-    return r ? String(r.agent_id) : null;
+    const r = this.sql.exec("SELECT agent_id, tenant_id FROM identities WHERE provider_key = ?", key).toArray()[0] as any;
+    return r ? { agentId: String(r.agent_id), tenantId: String(r.tenant_id) } : null;
   }
 
-  async identityUpsert(key: string, agentId: string, by: string) {
+  async identityUpsert(key: string, agentId: string, tenantId: string, by: string) {
     this.#identities();
     this.sql.exec(
-      "INSERT INTO identities(provider_key, agent_id, added_by, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(provider_key) DO UPDATE SET agent_id = excluded.agent_id, added_by = excluded.added_by",
-      key, agentId, by, Date.now());
+      "INSERT INTO identities(provider_key, agent_id, tenant_id, added_by, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(provider_key) DO UPDATE SET agent_id = excluded.agent_id, tenant_id = excluded.tenant_id, added_by = excluded.added_by",
+      key, agentId, tenantId, by, Date.now());
     return { ok: true as const };
   }
 
   async identityList() {
     this.#identities();
-    return this.sql.exec("SELECT provider_key, agent_id, added_by, created_at FROM identities ORDER BY created_at").toArray()
-      .map((r: any) => ({ key: String(r.provider_key), agentId: String(r.agent_id), addedBy: String(r.added_by), createdAt: Number(r.created_at) }));
+    return this.sql.exec("SELECT provider_key, agent_id, tenant_id, added_by, created_at FROM identities ORDER BY created_at").toArray()
+      .map((r: any) => ({ key: String(r.provider_key), agentId: String(r.agent_id), tenantId: String(r.tenant_id), addedBy: String(r.added_by), createdAt: Number(r.created_at) }));
   }
 
   async uiListAgents(tenantId: string, ownerAgentId: string) {
@@ -2023,22 +2026,22 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // is not an invitation.
       const key = githubIdentityKey(profile);
       const dir = identities(env);
-      let agentId = await dir.identityLookup(key);
-      if (!agentId && env.GITHUB_OPEN_SIGNUP === "1") {
+      let row: { agentId: string; tenantId: string } | null = await dir.identityLookup(key);
+      if (!row && env.GITHUB_OPEN_SIGNUP === "1") {
         // Open sign-up: the first sign-in writes its own row, and the agent
-        // is a new one (default mounts, empty memory), never an existing
-        // person's. The operator's rows still win, since they are looked up
-        // first.
-        agentId = githubDefaultAgentId(profile);
-        await dir.identityUpsert(key, agentId, "self");
-        console.log(`login: ${key} (${profile.login}) registered as ${agentId}`);
+        // is a new one (default mounts, empty memory) in a tenant of its own
+        // (quota and data per person), never an existing person's. The
+        // operator's rows still win, since they are looked up first.
+        row = { agentId: githubDefaultAgentId(profile), tenantId: githubDefaultTenantId(profile) };
+        await dir.identityUpsert(key, row.agentId, row.tenantId, "self");
+        console.log(`login: ${key} (${profile.login}) registered as ${row.tenantId}/${row.agentId}`);
       }
-      if (!agentId) {
+      if (!row) {
         console.warn(`login: ${key} (${profile.login}) is not on the identity table`);
         return refuse(request, "not-invited", REFUSALS["not-invited"]);
       }
       const headers = new Headers({ location: new URL(st.returnTo, url).toString() });
-      headers.append("set-cookie", await sessionCookieFor(env.SESSION_SECRET!, githubViewer(profile, emails, agentId), key));
+      headers.append("set-cookie", await sessionCookieFor(env.SESSION_SECRET!, githubViewer(profile, emails, row.agentId, row.tenantId), key));
       headers.append("set-cookie", clearCookieHeader(LOGIN_COOKIE, "/login/github"));
       return new Response(null, { status: 302, headers });
     }
@@ -2075,7 +2078,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // must produce, and a refusal would hide it.
       const v = await viewer(request, env);
       return Response.json({
-        viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v) } : null,
+        viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v), tenantId: tenantOf(v) } : null,
         build: env.GIT_COMMIT ?? null,
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
         loginConfigured: githubConfig(env) !== null,
@@ -2112,11 +2115,12 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
 async function versionOf(
   request: Request,
   stub: { uiVersion(t: string, a: string, k: string): Promise<string> },
+  tenantId: string,
   agentId: string,
   taskId: string,
 ): Promise<{ unchanged: Response | null; etag: string | null }> {
   if (!taskId || taskId === "null" || taskId === "undefined") return { unchanged: null, etag: null };
-  const etag = await stub.uiVersion("demo", agentId, taskId);
+  const etag = await stub.uiVersion(tenantId, agentId, taskId);
   // The version rides with the route's own response, passed explicitly: a
   // module-level stash was written after an await, so under two overlapping
   // requests one route's response could carry the other's version. Never a
@@ -2212,11 +2216,17 @@ function agentOf(v: Viewer): string {
   return v.agentId ?? uiAgent(v.email);
 }
 
-async function requireViewer(request: Request, env: Env): Promise<{ who: string; agentId: string; viewer: Viewer } | Response> {
+/** The tenant a viewer's agents live in: their own when the identity table
+ *  says so (self-registered GitHub accounts), else the original "demo". */
+function tenantOf(v: Viewer): string {
+  return v.tenantId ?? "demo";
+}
+
+async function requireViewer(request: Request, env: Env): Promise<{ who: string; agentId: string; tenantId: string; viewer: Viewer } | Response> {
   // The anonymous switch opens the page to look at; the write routes refuse
   // that identity by name further down.
   const v = await viewer(request, env, true);
-  if (v) return { who: v.email, agentId: agentOf(v), viewer: v };
+  if (v) return { who: v.email, agentId: agentOf(v), tenantId: tenantOf(v), viewer: v };
   // A page navigation goes to the sign-in page; a fragment request tells htmx
   // to take the whole window there; anything else gets the plain refusal.
   if (request.headers.get("hx-request")) {
@@ -2321,7 +2331,7 @@ export default {
     // Agent traffic is addressed by identity; probes and the benchmark keep
     // their own fixed objects.
     let name: string;
-    let uiSelected: { who: string; home: string; agentId: string } | null = null;
+    let uiSelected: { who: string; home: string; agentId: string; tenantId: string } | null = null;
     if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
     else if (url.pathname.startsWith("/bench")) name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
     else if (url.pathname.startsWith("/ui")) {
@@ -2349,14 +2359,14 @@ export default {
       const asked = String(url.searchParams.get("agentId") ?? peek?.get("agentId") ?? "").trim();
       const agentId = asked || home;
       if (agentId !== home) {
-        const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
-        if (!(await homeStub.uiOwnsAgent("demo", home, agentId))) {
+        const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, home)));
+        if (!(await homeStub.uiOwnsAgent(gate.tenantId, home, agentId))) {
           return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
         }
       }
-      uiSelected = { who, home, agentId };
+      uiSelected = { who, home, agentId, tenantId: gate.tenantId };
       try {
-        name = agentObjectName("demo", agentId);
+        name = agentObjectName(gate.tenantId, agentId);
       } catch (e: any) {
         return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
       }
@@ -2510,11 +2520,12 @@ export default {
             const body: any = await request.json().catch(() => null);
             const key = String(body?.key ?? "").trim();
             const agentId = String(body?.agentId ?? "").trim();
-            if (!/^github:\d+$/.test(key) || !/^u-[A-Za-z0-9._-]{1,48}$/.test(agentId)) {
-              return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>" }, { status: 400 });
+            const tenantId = String(body?.tenantId ?? "demo").trim();
+            if (!/^github:\d+$/.test(key) || !/^u-[A-Za-z0-9._-]{1,48}$/.test(agentId) || !/^[A-Za-z0-9._-]{1,48}$/.test(tenantId)) {
+              return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo) is [A-Za-z0-9._-]" }, { status: 400 });
             }
-            await dir.identityUpsert(key, agentId, "automation");
-            return Response.json({ ok: true, key, agentId });
+            await dir.identityUpsert(key, agentId, tenantId, "automation");
+            return Response.json({ ok: true, key, agentId, tenantId });
           }
           return Response.json({ identities: await dir.identityList() });
         }
@@ -2547,7 +2558,7 @@ export default {
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
-          await stub.uiEnsure("demo", agentId, taskId);
+          await stub.uiEnsure(gate.tenantId, agentId, taskId);
           return new Response(page(taskId, who, agentId, gate.viewer), {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
@@ -2558,10 +2569,10 @@ export default {
           const who = gate.who;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const v = await versionOf(request, stub, agentId, taskId);
+          const v = await versionOf(request, stub, gate.tenantId, agentId, taskId);
           if (v.unchanged) return v.unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
-          const t = await stub.uiTranscript("demo", agentId, taskId, tail);
+          const t = await stub.uiTranscript(gate.tenantId, agentId, taskId, tail);
           return html(
             (t.total > t.shown
               ? `<div class="hint" style="padding:0 0 8px">Showing the last ${t.shown} of
@@ -2581,14 +2592,14 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const v = await versionOf(request, stub, agentId, taskId);
+          const v = await versionOf(request, stub, gate.tenantId, agentId, taskId);
           if (v.unchanged) return v.unchanged;
           const tail = url.searchParams.get("all") === "1" ? 0 : 120;
-          const t = await stub.uiTranscript("demo", agentId, taskId, tail);
+          const t = await stub.uiTranscript(gate.tenantId, agentId, taskId, tail);
           // With `held=1` the held calls ride along, in one fragment under one
           // version (uiVersion counts them), instead of a second poll that
           // never answered 304.
-          const held = url.searchParams.get("held") === "1" ? await stub.uiApprovals("demo", agentId, taskId) : null;
+          const held = url.searchParams.get("held") === "1" ? await stub.uiApprovals(gate.tenantId, agentId, taskId) : null;
           return html(url.pathname === "/ui/chat"
             // The conversation alone; everything else about the run is in the
             // panels on the right.
@@ -2601,7 +2612,7 @@ export default {
           const agentId = uiSelected?.agentId ?? gate.agentId;
           // One read, dispatched to the part the shell asked for: the mount
           // list, one mount's block, the catalogue, or the whole page.
-          const d = await stub.uiPlugins("demo", agentId);
+          const d = await stub.uiPlugins(gate.tenantId, agentId);
           switch (url.searchParams.get("part")) {
             case "mounts": return conditional(request, mountList(d));
             case "mount": return conditional(request, mountFragment(d, String(url.searchParams.get("alias") ?? "").trim()));
@@ -2620,8 +2631,8 @@ export default {
           const alias = String(form.get("alias") ?? "").trim();
           const fields: Record<string, string> = {};
           for (const [k, v] of form.entries()) if (k !== "alias" && typeof v === "string") fields[k] = v;
-          const r = alias ? await stub.uiAttachCredential("demo", agentId, alias, fields) : { ok: false as const, error: "no mount named" };
-          const d: any = await stub.uiPlugins("demo", agentId);
+          const r = alias ? await stub.uiAttachCredential(gate.tenantId, agentId, alias, fields) : { ok: false as const, error: "no mount named" };
+          const d: any = await stub.uiPlugins(gate.tenantId, agentId);
           if (!r.ok) for (const m of d.mounts ?? []) if (m.alias === alias && m.credential) m.credential.error = r.error;
           return html(mountFragment(d, alias));
         }
@@ -2632,8 +2643,8 @@ export default {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const alias = String(form.get("alias") ?? "").trim();
-          if (alias) await stub.uiRemoveCredential("demo", agentId, alias);
-          return html(mountFragment(await stub.uiPlugins("demo", agentId), alias));
+          if (alias) await stub.uiRemoveCredential(gate.tenantId, agentId, alias);
+          return html(mountFragment(await stub.uiPlugins(gate.tenantId, agentId), alias));
         }
         case "/ui/storage":
         case "/ui/memory":
@@ -2643,9 +2654,9 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const v = await versionOf(request, stub, agentId, taskId);
+          const v = await versionOf(request, stub, gate.tenantId, agentId, taskId);
           if (v.unchanged) return v.unchanged;
-          const d = await stub.uiStorage("demo", agentId, taskId);
+          const d = await stub.uiStorage(gate.tenantId, agentId, taskId);
           return html(url.pathname === "/ui/storage" ? storage(d)
             : url.pathname === "/ui/memory" ? memoryPanel(d)
             : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
@@ -2670,18 +2681,18 @@ export default {
           const home = gate.agentId;
           const made = agentSpec(form, home);
           if (typeof made === "string") return new Response(made, { status: 400 });
-          const own = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", made.agentId)));
-          await own.uiAdoptAgent("demo", made.agentId, made);
-          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
-          await homeStub.uiRecordAgent("demo", home, made);
+          const own = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, made.agentId)));
+          await own.uiAdoptAgent(gate.tenantId, made.agentId, made);
+          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, home)));
+          await homeStub.uiRecordAgent(gate.tenantId, home, made);
           return Response.json(made);
         }
         case "/ui/agents": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
           const home = gate.agentId;
-          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", home)));
-          const agents = (await homeStub.uiListAgents("demo", home))
+          const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, home)));
+          const agents = (await homeStub.uiListAgents(gate.tenantId, home))
             .map((a) => ({ ...a, current: a.agentId === (uiSelected?.agentId ?? home) }));
           // The page swaps the rendered list in; anything else gets the data.
           return request.headers.get("hx-request") ? conditional(request, agentList({ agents })) : Response.json({ agents });
@@ -2689,7 +2700,7 @@ export default {
         case "/ui/inbox": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
-          const d = await stub.uiInbox("demo", uiSelected?.agentId ?? gate.agentId);
+          const d = await stub.uiInbox(gate.tenantId, uiSelected?.agentId ?? gate.agentId);
           return conditional(request, inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/approvals": {
@@ -2697,7 +2708,7 @@ export default {
           if (gate instanceof Response) return gate;
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          return conditional(request, approvals(await stub.uiApprovals("demo", agentId, taskId)));
+          return conditional(request, approvals(await stub.uiApprovals(gate.tenantId, agentId, taskId)));
         }
         case "/ui/message": {
           const form = await formOf(request);
@@ -2713,16 +2724,16 @@ export default {
             // A refusal returned as a value is still a refusal: the page shows
             // it only if the status says so (Vera, after the day the lane
             // refused every message and the route answered 200 each time).
-            const r: any = await stub.uiSay("demo", agentId, taskId, text, mode);
+            const r: any = await stub.uiSay(gate.tenantId, agentId, taskId, text, mode);
             if (r?.result?.ok === false) {
               const err = r.result.error;
               return new Response(`refused: ${err?.code ?? ""} ${err?.message ?? JSON.stringify(err)}`.trim(), { status: 409 });
             }
           }
-          const t = await stub.uiTranscript("demo", agentId, taskId);
+          const t = await stub.uiTranscript(gate.tenantId, agentId, taskId);
           // The same shape the chat poll returns, so a page that asked for the
           // held cards there keeps them here (`held=1` in the form).
-          const held = form.get("held") === "1" ? await stub.uiApprovals("demo", agentId, taskId) : null;
+          const held = form.get("held") === "1" ? await stub.uiApprovals(gate.tenantId, agentId, taskId) : null;
           return html(chatPanel(trajectory(t.events, t.byOp, t.busy), held));
         }
         case "/ui/compact": {
@@ -2732,8 +2743,8 @@ export default {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
-          await stub.uiCompact("demo", agentId, taskId);
-          const t = await stub.uiTranscript("demo", agentId, taskId);
+          await stub.uiCompact(gate.tenantId, agentId, taskId);
+          const t = await stub.uiTranscript(gate.tenantId, agentId, taskId);
           return html(trajectory(conversation(t.events), t.byOp, t.busy));
         }
         case "/ui/decide": {
@@ -2749,7 +2760,7 @@ export default {
           const taskId = String(form.get("taskId") ?? "").trim();
           // The approver is whoever is signed in — an audit record
           // with a name the caller chose would be worth nothing.
-          return html(approvals(await stub.uiDecide("demo", agentId, taskId, String(form.get("operationId")), decision, who)));
+          return html(approvals(await stub.uiDecide(gate.tenantId, agentId, taskId, String(form.get("operationId")), decision, who)));
         }
         case "/isolation": {
           // Proves the property rather than asserting it: two tenants, two
