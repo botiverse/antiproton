@@ -239,13 +239,20 @@ await check("沙箱里用的是模型看到的名字,地址也仍然接受", asy
   const sandbox = {
     async execute(source: string, h: any) {
       for (const name of source.split(",")) await h.invoke({ tool: name, args: {} });
-      return { status: "ok", outputs: [], hostCalls: 2 };
+      return { status: "completed", outputs: ["ran"], hostCalls: 2 };
     },
   };
   const tool = runJsTool(sandbox as any, host as any, {
     tools: qualifyMountedTools([{ name: "get", description: "", parameters: {}, address: "web.get" }]),
   });
-  await (tool as any).execute("c1", { source: "web__get,web.get" });
+  // What the model is handed back. The executor's success status is
+  // "completed"; a tool that tests for any other word turns every script that
+  // ran into a thrown failure, which is what production did (tygg,
+  // 2026-09-12: run_js 返回 "run_js completed: null").
+  const done: any = await (tool as any).execute("c1", { source: "web__get,web.get" });
+  if (JSON.parse(done.content[0].text)[0] !== "ran") {
+    throw new Error(`a completed execution must hand its outputs back: ${JSON.stringify(done)}`);
+  }
   if (calls.join(",") !== "web.get,web.get") {
     throw new Error(`the sandbox did not reach the same tool both ways: ${calls.join(",")}`);
   }
