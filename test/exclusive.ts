@@ -123,6 +123,29 @@ await check("不同 agent 的同名挂载互不排队", async () => {
   if (Date.now() - t0 > 40) throw new Error("two different agents were serialised against each other");
 });
 
+await check("队列住在实例上 —— 所以【一个 agent 一个 gateway】是它的前提,不是巧合", async () => {
+  // The guarantee lives in another file: cf/src/index.ts:377 builds the runtime
+  // once per Durable Object, and a Durable Object is one single-threaded
+  // instance per (tenant, agent). This case does not test that line; it makes
+  // the *consequence* of losing it visible, so a future "new AgentRuntime per
+  // request" shows up here as overlap rather than as a container nobody can
+  // release six weeks later.
+  const r = racer("node", true);
+  const { store, gw } = await fixture(r.plugin);
+  const second = new ToolGateway(store, [r.plugin], { async resolve() { return null; } });
+
+  await Promise.all([
+    gw.invoke(ctx, "node.touch", { mark: "one" } as any),
+    second.invoke(ctx, "node.touch", { mark: "two" } as any),
+  ]);
+  if (!r.overlapped()) {
+    throw new Error(
+      "two gateways serialised against each other, so this test no longer describes the design: " +
+      "the queue is per instance, and its correctness rests on there being one",
+    );
+  }
+});
+
 console.log(`\n  Exclusive mounts\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

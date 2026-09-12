@@ -67,6 +67,15 @@ export class ToolGateway {
    * That is the same argument as every other check here: the gateway is the
    * choke point precisely because the paths that reach it are not all the same
    * path (Rex found the read-modify-write; the reachability is ours).
+   *
+   * **This is an instance field, so it holds only while one agent has one
+   * gateway.** Today that is true because `cf/src/index.ts:377` builds the
+   * runtime once per Durable Object (`this.#runtime ??= new AgentRuntime`) and
+   * a Durable Object is one single-threaded instance per `(tenant, agent)`.
+   * The property is real, but it lives in another file — so `test/exclusive.ts`
+   * pins it: two gateways over one store do not serialise against each other,
+   * which is the failure anyone would get by making a runtime per request
+   * (Piper asked for this to be nailed down rather than described).
    */
   #queues = new Map<string, Promise<unknown>>();
 
