@@ -191,6 +191,39 @@ export function boxReminder(alias: string): string {
   return `this container persists between calls; the \`release\` tool on \`${alias}\` destroys it`;
 }
 
+/**
+ * The stored state, or null when what came back is not it.
+ *
+ * `ConnectionState` hands back `Json`, which is `unknown` — so `as BoxState`
+ * was never a narrowing, it was an assertion the compiler cannot check, on
+ * data that outlives the code that wrote it. The risk is not a mistyped call
+ * site; it is this call site reading a row written by an older version, which
+ * is exactly what a generic parameter would hide (Rex, 2026-09-12).
+ *
+ * **Unrecognised is "nothing is running", not an error.** Every path here
+ * starts by asking `state?.boxId`, so a shape we cannot read degrades to the
+ * answer that is both true and self-healing: the mount starts a new container
+ * and writes a shape this version does know. Throwing instead would turn one
+ * bad row into a mount nobody can use.
+ *
+ * It checks what every path depends on and not one field more: the id, and
+ * that the two clocks are numbers. A checker that insisted on the whole record
+ * would reject rows this code can in fact use.
+ */
+export function asBoxState(v: Json): BoxState | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.boxId !== "string") return null;
+  if (typeof o.createdAt !== "number" || typeof o.lastUsedAt !== "number") return null;
+  // Present but the wrong shape is the case that throws: `usage` maps over
+  // `sessions` and `start_from` searches `envs`, so an object where an array
+  // belongs is a crash rather than a miss. Absent stays fine — every reader
+  // already defaults it (Rex, 2026-09-12).
+  if (o.sessions !== undefined && !Array.isArray(o.sessions)) return null;
+  if (o.envs !== undefined && !Array.isArray(o.envs)) return null;
+  return v as BoxState;
+}
+
 const SESSIONS_KEPT = 20;
 
 /**
@@ -243,7 +276,7 @@ const DEFAULTS = {
 async function stopBox(
   ctx: PluginContext,
 ): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number } | null> {
-  const state = (await ctx.connection.get()) as BoxState | null;
+  const state = asBoxState(await ctx.connection.get());
   if (!state?.boxId || !ctx.credential) return null;
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
   providerOf(cfg);
@@ -738,19 +771,19 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
   /** What this mount is keeping alive, read from its own state and nothing
    *  else: no credential, no call to run9. */
   async activity(ctx: PluginContext): Promise<MountActivity> {
-    return activityOf((await ctx.connection.get()) as BoxState | null);
+    return activityOf(asBoxState(await ctx.connection.get()));
   },
 
   /** The window this mount still holds. Bounded on purpose, which is why it is
    *  the console's history and not anybody's ledger. */
   async usage(ctx: PluginContext): Promise<MountUsage[]> {
-    return usageOf((await ctx.connection.get()) as BoxState | null);
+    return usageOf(asBoxState(await ctx.connection.get()));
   },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
     // Checked before anything else: neither releasing nor choosing an
     // environment should be the thing that starts a container.
-    const prior = (await ctx.connection.get()) as BoxState | null;
+    const prior = asBoxState(await ctx.connection.get());
     if (tool === "release" && !prior?.boxId) {
       return { released: false, note: "nothing was running" };
     }
@@ -769,7 +802,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       // Releasing first, because the choice applies to the next container and
       // silently leaving the old one running is how a machine gets forgotten.
       const released = prior?.boxId ? await stopBox(ctx) : null;
-      const after = (await ctx.connection.get()) as BoxState | null;
+      const after = asBoxState(await ctx.connection.get());
       await ctx.connection.set({ ...(after ?? { boxId: "", createdAt: 0, lastUsedAt: 0 }),
         startFrom: env.snapId } as unknown as Json);
       return {
@@ -826,7 +859,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     };
 
     // One box per mount, remembered, so an install survives to the next call.
-    let state = (await ctx.connection.get()) as BoxState | null;
+    let state = asBoxState(await ctx.connection.get());
     // An emptied record keeps the session history but has no box.
     const history = state?.sessions ?? [];
     if (state && !state.boxId) state = null;
