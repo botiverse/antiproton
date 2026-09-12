@@ -3,7 +3,7 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, MountActivity } from "../plugins/types.ts";
+import type { Plugin, MountActivity, MountUsage } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
@@ -217,6 +217,41 @@ export class ToolGateway {
     // true one: nothing of this mount's is running.
     if (!mount || !plugin?.activity) return { live: null };
     return plugin.activity({
+      caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+      alias: mount.alias,
+      credential: null,
+      publicConfig: mount.publicConfig,
+      connection: {
+        get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
+        set: (state, expiresAt) =>
+          this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
+      },
+      async sibling() { return null; },
+    });
+  }
+
+  /**
+   * What one mount has finished with, in the shape everyone asks in.
+   *
+   * Separate from `mountActivity` rather than a flag on it, because the two
+   * have different callers and different costs: the alarm asks what is running
+   * on every pass and must not pay for history nobody reads, while a page asks
+   * for history once when a person opens it. A flag would also make the return
+   * shape depend on an argument, which is a signature you cannot read without
+   * finding the call site.
+   *
+   * **Not a ledger.** A mount answers from what it kept, and what it kept is
+   * bounded and only holds what was handed back properly — so this says
+   * "recently, and only the tidy ones". The complete record has to be written
+   * where the thing happens, not read back from the thing that did it.
+   */
+  async mountUsage(
+    ctx: { tenantId: string; agentId: string; taskId: string }, alias: string,
+  ): Promise<MountUsage[]> {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) : null;
+    if (!mount || !plugin?.usage) return [];
+    return plugin.usage({
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
       credential: null,

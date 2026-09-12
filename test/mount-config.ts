@@ -1167,6 +1167,31 @@ await check("a mount answers what it is running and what it has finished", async
   const empty = activityOf(null);
   if (empty.live !== null || !empty.billing) throw new Error(`an empty mount answered ${JSON.stringify(empty)}`);
   if (usageOf(null).length !== 0) throw new Error("an empty mount invented a history");
+
+  // And neither call goes anywhere. The contract says so because of when they
+  // are asked: a sweep on a timer, about a mount nobody is using, whose
+  // credential may already have been taken away. A network call here would be
+  // paid per mount per tick, and would fail exactly when the answer matters.
+  // cody found the credential half of this rule unwatched for `usage`; this is
+  // the other half, watched for both.
+  const original = globalThis.fetch;
+  const reached: string[] = [];
+  globalThis.fetch = ((url: any) => {
+    reached.push(String(url));
+    return Promise.resolve(new Response("{}"));
+  }) as typeof fetch;
+  try {
+    const ctx = (): any => ({
+      caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+      credential: null, publicConfig: {},
+      connection: { get: async () => state, set: async () => {} }, sibling: async () => null,
+    });
+    await run9.activity!(ctx());
+    await run9.usage!(ctx());
+    if (reached.length) throw new Error(`answering cost a network call: ${reached.join(", ")}`);
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
