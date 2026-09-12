@@ -16,7 +16,7 @@ cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string
 cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
 src/model/pi-offloaded.ts: error TS2322: Type '"aborted" | "deferred" | "length" | "pending" | "stop" | "toolUse"' is not assignable to type '"deferred" | "length" | "stop" | "toolUse"'.
 src/store/artifacts.ts: error TS2554: Expected 0 arguments, but got 1.
-test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap.
+test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap. # correct comparison of two literal types; fixing it would weaken the test (Rex, 2026-09-12)
 test/secrets.ts: error TS7006: Parameter '_args' implicitly has an 'any' type.
 test/secrets.ts: error TS7006: Parameter '_tool' implicitly has an 'any' type.
 test/secrets.ts: error TS7006: Parameter 'ctx' implicitly has an 'any' type.
