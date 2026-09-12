@@ -159,6 +159,14 @@ const refuse = (status: number, method: string, path: string): Decision => ({
  *
  * `Bearer` still works, for the operator routes and for anything of ours that
  * is not the plugin.
+ *
+ * **Why a pair and not one token.** Issuing an ak/sk pair, shaped like run9's,
+ * keeps the plugin's `CredentialSpec` — two keys — exactly as it is. A single
+ * token would have been a different shape, and a different shape per
+ * deployment is the thing that forces `credential` to become a per-mount
+ * declaration. That change is real and is coming, but it is owed to MCP and to
+ * a second sandbox provider; this service does not need it and should not be
+ * the reason it arrives early (Piper, 2026-09-12).
  */
 export function presented(header: string | null): string | null {
   const raw = (header ?? "").trim();
