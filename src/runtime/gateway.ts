@@ -231,8 +231,15 @@ export class ToolGateway {
           operationId,
           error: {
             code: "already_attempted",
+            // These three messages reach the model, so they must not name the
+            // dispatch address: `alias.tool` is how the gateway routes, while
+            // the model was offered `alias__tool`, and the qualifier is not a
+            // rule this file could apply anyway (it truncates and breaks ties
+            // over the whole catalogue). The call it just made is the subject;
+            // it does not need to be named back (Piper, Vera, Dora, #113's
+            // class, 2026-09-12).
             message:
-              `${r.mount.alias}.${r.tool} was already attempted under this key ` +
+              `this call was already attempted under this key ` +
               `(status ${prior.status}); it may have landed, so it is not repeated`,
           },
         };
@@ -254,7 +261,9 @@ export class ToolGateway {
     if (verdict === "deny") {
       return {
         status: "rejected",
-        error: { code: "policy_denied", message: `${r.mount.alias}.${r.tool} is denied by policy` },
+        // The one the model must act on: it says the road is closed, so the
+        // next thing it does is choose another tool or explain to a person.
+        error: { code: "policy_denied", message: `this call is denied by the \`${r.mount.alias}\` mount's policy` },
       };
     }
     if (verdict === "approval") {
@@ -272,7 +281,7 @@ export class ToolGateway {
         operationId,
         error: {
           code: "awaiting_approval",
-          message: `${r.mount.alias}.${r.tool} is held for approval`,
+          message: `this call is held for approval`,
         },
       } as ToolResult;
     }
