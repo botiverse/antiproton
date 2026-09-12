@@ -1,0 +1,25 @@
+// The sandbox broker.
+//
+// No route and no workers.dev subdomain on purpose: nothing reaches this until
+// someone adds one deliberately. Standing up a service that holds the shared
+// run9 key is an act, not a side effect of a deploy.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "antiproton-sandbox-broker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-05",
+  "workers_dev": false,
+  "durable_objects": {
+    "bindings": [{ "name": "LEDGER", "class_name": "LedgerObject" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LedgerObject"] }],
+  "vars": {
+    // Where run9 is, and the one project our key belongs to. The project is
+    // checked against every path: an id is unique only inside its project, so
+    // a path naming another one would point our key somewhere nobody meant.
+    "RUN9_ENDPOINT": "https://api.run.sys9.ai",
+    "RUN9_PROJECT": "antiproton"
+  }
+  // RUN9_AK, RUN9_SK and ADMIN_TOKEN are Worker secrets, set with
+  // `wrangler secret put`. They are not in this file and must never be.
+}
