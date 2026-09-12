@@ -154,6 +154,25 @@ interface BoxState {
   quietUntil?: number;
 }
 
+/**
+ * What every execution tells the model about the box it just used.
+ *
+ * Extracted so a test can hold it: the same fact is stated in three places the
+ * model reads — this line and the `run` and `shell` summaries — and they have
+ * to end the box the same way. A string built inline could drift from the other
+ * two with nothing failing, which is how "persists between calls" outlived the
+ * behaviour it described.
+ *
+ * Three clauses because the box now has three possible ends, and an agent that
+ * knows only the first will leave work in a machine that goes away: it survives
+ * calls, it is asked about when it goes quiet, and it is taken if nobody
+ * answers.
+ */
+export function boxReminder(alias: string): string {
+  return `this container persists between calls; if it goes idle you are asked whether to keep it, ` +
+    `and released if nobody answers; the \`release\` tool on \`${alias}\` destroys it now`;
+}
+
 const SESSIONS_KEPT = 20;
 
 const DEFAULTS = {
@@ -346,7 +365,8 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         "starts a container that is billed for every second it exists, and it cannot call your other " +
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
         "few seconds of compute. The container is NOT the per-execution sandbox: it persists between " +
-        "calls until you release it, so installs and files survive from one call to the next — do not " +
+        "calls until you release it or leave it idle long enough to be asked about, so installs and " +
+        "files survive from one call to the next — do not " +
         "reinstall. Work in as few calls as you can, save what matters with `save`, and release it. " +
         "Everything inside is destroyed when it is released.",
       parameters: {
@@ -369,7 +389,8 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       name: "shell",
       summary:
         "Shell in the same billed-by-the-second container as `run`, and the same one across calls " +
-        "— state, installed packages and files carry over. Only for what needs a real " +
+        "until you release it or it goes idle — state, installed packages and files carry over. " +
+        "Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
@@ -853,7 +874,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
           // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
           // nothing between executions" concluded this box was volatile too — which
           // would have it reinstalling packages on every call.
-          reminder: `this container persists between calls; the \`release\` tool on \`${ctx.alias}\` destroys it`,
+          reminder: boxReminder(ctx.alias),
           ...execOutput(out, cfg.maxOutputBytes),
           box: state.boxId,
           // So the agent learns the environment from a result it already has,
