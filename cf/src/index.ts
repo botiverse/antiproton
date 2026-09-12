@@ -1391,6 +1391,18 @@ export class AgentDO extends DurableObject<Env> {
         tenantId, agentId),
       connections: rows("SELECT alias, state, expires_at, updated_at FROM connections WHERE tenant_id=? AND agent_id=?",
         tenantId, agentId),
+      // What each mount says about itself, rather than what the page can infer
+      // from the JSON in `connections`. The sandbox panel used to read a run9
+      // box id, its exec count and its saved refs straight out of that blob,
+      // which is one plugin's private shape sitting in a page — the last of the
+      // reach-ins Piper's audit found. Asked of every mount that answers, so
+      // the page never learns which plugins have containers.
+      //
+      // `billing` is a sentence and not a number on purpose: "billed for every
+      // second it exists" is true of a container and false of an API key, and
+      // only the plugin knows which it is. A console composing that line would
+      // have to know too.
+      mountReports: await this.#mountReports(rt, tenantId, agentId, taskId),
       modelBinding: rows("SELECT * FROM model_bindings WHERE tenant_id=? AND agent_id=?", tenantId, agentId)[0] ?? null,
       quotas: rows("SELECT * FROM quotas WHERE tenant_id=?", tenantId),
       // The agent's own memory, whole rather than sampled: seeing what it
@@ -1507,6 +1519,37 @@ export class AgentDO extends DurableObject<Env> {
       })),
       used,
     };
+  }
+
+  /**
+   * Every mount's own answer about what it is running and what it has finished.
+   *
+   * One pass over the mounts, asked through the gateway — the only place that
+   * builds a plugin context. A mount whose plugin answers neither question
+   * simply is not in the map, so a page iterating it gets exactly the mounts
+   * that have something to say.
+   *
+   * `usage` is deliberately included here and not on the alarm's path: history
+   * is read when a person opens a page, and the sweep that runs on a timer must
+   * not pay for it.
+   */
+  async #mountReports(rt: AgentRuntime, tenantId: string, agentId: string, taskId: string) {
+    const gw = rt.gateway();
+    const out: Record<string, { activity: unknown; usage: unknown }> = {};
+    for (const m of await rt.store.listMounts(tenantId, agentId)) {
+      try {
+        const [activity, usage] = await Promise.all([
+          gw.mountActivity({ tenantId, agentId, taskId }, m.alias),
+          gw.mountUsage({ tenantId, agentId, taskId }, m.alias),
+        ]);
+        // Nothing running and nothing finished is not a report; leaving it out
+        // keeps the page's own emptiness check honest.
+        if (activity?.live || (usage as unknown[]).length) out[m.alias] = { activity, usage };
+      } catch {
+        // One mount that cannot answer must not blank the panel for the rest.
+      }
+    }
+    return out;
   }
 
   /** The console attaches a credential to one of this agent's mounts. The
