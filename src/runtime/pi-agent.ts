@@ -144,6 +144,12 @@ export interface PiAgentOptions {
   model: ModelChoice;
   tools: MountedTool[];
   toolHost: ToolHost;
+  /** Tools that are not mounts — run_js, whose body is the object itself —
+   *  offered beside the bridged ones. They must be here rather than added
+   *  after open: open reconciles the names a session remembers against the
+   *  list it is given, and a tool added later is a tool the reconcile
+   *  removes on every reopen (2026-09-12: every agent lost run_js). */
+  extraTools?: ReturnType<typeof bridgeTools>;
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
@@ -218,7 +224,7 @@ export class PiAgent {
       }],
     }));
 
-    const bridged = bridgeTools(opts.tools, opts.toolHost);
+    const bridged = [...bridgeTools(opts.tools, opts.toolHost), ...(opts.extraTools ?? [])];
     const { harness, open } = await AgentHarness.create({
       session: session as any,
       models,

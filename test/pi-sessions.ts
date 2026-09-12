@@ -107,6 +107,29 @@ await check("mounts, connection state and credentials are the agent's, shared by
  * failed before the first model call. Open must bring the remembered names
  * up to the offered ones.
  */
+/**
+ * run_js is not a mount; it reaches the session beside the mounts. A session
+ * that remembers it must keep it on reopen: when the sandbox tool was added
+ * after open, the reconcile above saw a list without it, judged the remembered
+ * names stale, and switched run_js off for every agent on its second open.
+ */
+await check("a session that remembers run_js keeps it on reopen when run_js is offered", async () => {
+  const host = sqliteHost();
+  const MODEL = { provider: "queue", id: "m", contextWindow: 128_000 };
+  const tool = { name: "get", description: "fetch", parameters: { type: "object", properties: {} }, address: "web.get", sideEffects: "read" as const };
+  const runJs = { name: "run_js", label: "run_js", description: "sandbox", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [], details: {} }) };
+  const open = () => PiAgent.open({ host, sessionId: "s2", systemPrompt: "be brief", model: MODEL, tools: [tool] as any, extraTools: [runJs] as any,
+    toolHost: { async invoke() { return { status: "succeeded", result: { ok: true } }; } },
+    async dispatch() {} });
+  const A = await open();
+  await A.lane.setActiveTools(["web__get", "run_js"], CTX);
+  await A.close();
+  const B = await open();
+  const remembered = await B.lane.getActiveTools(CTX);
+  if (!remembered.includes("run_js") || !remembered.includes("web__get")) throw new Error(`reopen dropped a tool: ${remembered}`);
+  await B.close(); host.dispose();
+});
+
 await check("a session that remembers old tool names runs again after the names change", async () => {
   const host = sqliteHost();
   const MODEL = { provider: "queue", id: "m", contextWindow: 128_000 };
