@@ -136,6 +136,22 @@ export class DurableObjectStore implements StorageAdapter {
       try { this.#sql.exec(alter); } catch { /* already present */ }
     }
 
+    // The sandbox plugin was called `run9` until 2026-09-12, when the capability
+    // took the name and run9 became the provider behind it. Mount rows and the
+    // answers agents gave about the plugin both store the id, so both would go
+    // on naming a plugin the registry no longer has: every call refused with
+    // `plugin_unavailable`, and an agent's "disable" quietly forgotten.
+    //
+    // Written as an update rather than a version stamp because it describes
+    // itself: there is nothing left to do once no row says `run9`, so running
+    // it on every open costs one scan of a tiny table and cannot happen twice.
+    for (const rename of [
+      "UPDATE mounts SET plugin='sandbox' WHERE plugin='run9'",
+      "UPDATE agent_plugins SET plugin='sandbox' WHERE plugin='run9'",
+    ]) {
+      try { this.#sql.exec(rename); } catch { /* the table may predate this */ }
+    }
+
     this.#sql.exec("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)");
   }
 

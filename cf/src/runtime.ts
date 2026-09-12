@@ -623,7 +623,7 @@ export class AgentRuntime {
     // themselves as a last resort so the agent reaches for free in-process
     // JS first, and the framework releases the box once the agent has no
     // conversation with work open (the scope is the agent, not a task).
-    { alias: "node", plugin: "run9", config: { account: "container" },
+    { alias: "sandbox", plugin: "sandbox", config: { account: "container" },
       secretRef: OPERATOR_RUN9_REF, policy: null },
     // The agent's own store. Deliberately not behind approval: an agent
     // that must ask a person before writing a note will not keep notes, and

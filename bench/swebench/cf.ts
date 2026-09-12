@@ -218,7 +218,7 @@ async function runOne(inst: Instance) {
       failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
     };
   } finally {
-    const release: any = await post("/bench/swe/release", { taskId }).catch((e) => ({ failed: [{ alias: "node", error: String(e) }] }));
+    const release: any = await post("/bench/swe/release", { taskId }).catch((e) => ({ failed: [{ alias: "sandbox", error: String(e) }] }));
     for (const f of release?.failed ?? []) {
       console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
     }

@@ -825,9 +825,9 @@ export class AgentDO extends DurableObject<Env> {
       // The machine, from the instance's own image. Config is per mount, so a
       // different repository is a different mount record, not different code.
       await rt.store.addMount({
-        tenantId: "bench", agentId, alias: "node", plugin: "run9",
+        tenantId: "bench", agentId, alias: "sandbox", plugin: "sandbox",
         installationId: "inst-node", connectionId: null,
-        toolVersion: rt.pluginVersion("run9") ?? "1.0.0",
+        toolVersion: rt.pluginVersion("sandbox") ?? "1.0.0",
         publicConfig: {
           account: "container",
           image: o.image,
@@ -902,7 +902,7 @@ export class AgentDO extends DurableObject<Env> {
       e.type === "message" && e.message?.role === "toolResult").length;
     const toolErrors = entries.filter((e: any) =>
       e.type === "message" && e.message?.role === "toolResult" && e.message.isError).length;
-    const meter = await readMeter(rt.store as any, "bench", agentId, ["node"], wallMs, {
+    const meter = await readMeter(rt.store as any, "bench", agentId, ["sandbox"], wallMs, {
       promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
     });
     return { taskId, usage, byTool, modelTurns, toolTurns, toolErrors, entries: entries.length, meter };

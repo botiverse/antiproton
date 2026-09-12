@@ -181,6 +181,16 @@ export class SqliteStore implements StorageAdapter {
     ]) {
       try { this.#db.exec(alter); } catch { /* already present */ }
     }
+
+    // The sandbox plugin was called `run9` until 2026-09-12. See the same pair
+    // in durable-object.ts: rows keep the id, so without this a mount goes on
+    // naming a plugin the registry no longer has.
+    for (const rename of [
+      "UPDATE mounts SET plugin='sandbox' WHERE plugin='run9'",
+      "UPDATE agent_plugins SET plugin='sandbox' WHERE plugin='run9'",
+    ]) {
+      try { this.#db.exec(rename); } catch { /* the table may predate this */ }
+    }
     this.#db
       .prepare("INSERT OR IGNORE INTO counters(name, value) VALUES ('fencing', 0)")
       .run();
