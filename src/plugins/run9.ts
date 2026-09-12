@@ -28,6 +28,8 @@ export interface Run9Config {
   project?: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+  /** Ceiling on one `quiet` request, in minutes. */
+  maxQuietMinutes?: number;
   /** Where commands run. A prepared image usually has its own checkout. */
   workdir?: string;
   shape?: string;
@@ -140,6 +142,16 @@ interface BoxState {
   envs?: Env[];
   /** Set by restore: the next box starts from this snapshot rather than the image. */
   startFrom?: string;
+  /**
+   * Until when the agent has asked not to be reminded about this box.
+   *
+   * Written here and read by the framework's idle wake rather than by this
+   * plugin: the plugin's part is to record the request and to refuse one longer
+   * than the mount allows. A box is billed for existing, so the ceiling is not
+   * a formality — it is the only thing standing between "remind me later" and
+   * "never release it".
+   */
+  quietUntil?: number;
 }
 
 const SESSIONS_KEPT = 20;
@@ -156,6 +168,7 @@ const DEFAULTS = {
   project: "default",
   timeoutMs: 120_000,
   maxOutputBytes: 24_000,
+  maxQuietMinutes: 60,
 };
 
 /**
@@ -319,6 +332,8 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
     { name: "secrets", type: "string[]", references: "credential",
       summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
+    { name: "maxQuietMinutes", type: "number", default: 60,
+      summary: "Longest a single quiet request may last. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
     { name: "endpoint", type: "string", summary: "API endpoint.", default: "https://api.run.sys9.ai" },
   ],
@@ -445,6 +460,29 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       sideEffects: "write",
       idempotency: "native",
     },
+    {
+      name: "quiet",
+      summary:
+        "Put off the next reminder about this container. Use it when you know you will come back to " +
+        "the machine — a long download, a build you are waiting on, work you are returning to after " +
+        "reading something. It does not extend anything: the container is billed for every second " +
+        "either way, and the operator's ceiling still ends it. If you are not coming back, `release` " +
+        "is the cheaper answer, and it can save files out in the same call.",
+      parameters: {
+        type: "object",
+        properties: {
+          minutes: {
+            type: "number",
+            description: "how long to stay quiet; a request over the mount's ceiling is refused, not shortened",
+          },
+        },
+        required: ["minutes"],
+      },
+      // A write: it changes when the box is asked about, which changes what the
+      // box costs. Not idempotent, because each call moves the instant.
+      sideEffects: "write",
+      idempotency: "none",
+    },
   ],
 
   /** Hands this mount's box back, so an idle one is not left running on the
@@ -542,6 +580,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     if (tool === "release" && !prior?.boxId) {
       return { released: false, note: "nothing was running" };
     }
+
     if (tool === "start_from") {
       const envs = prior?.envs ?? [];
       const want = String((args as any)?.name ?? "");
@@ -565,6 +604,30 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
       };
     }
     const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+
+    // Before the credential check on purpose: putting off a reminder calls
+    // nothing at run9, so a mount whose key was removed can still answer it.
+    if (tool === "quiet") {
+      const cap = cfg.maxQuietMinutes ?? DEFAULTS.maxQuietMinutes;
+      const asked = (args as any)?.minutes;
+      // Refused rather than clamped, for the reason the config field states: an
+      // agent given less than it asked for, silently, plans against the number
+      // it asked for. The same reason the network gate fails closed.
+      if (typeof asked !== "number" || !Number.isFinite(asked) || asked <= 0) {
+        throw new Error(`minutes must be a positive number of minutes; the \`quiet\` tool on \`${ctx.alias}\` got ${JSON.stringify(asked)}`);
+      }
+      if (asked > cap) {
+        throw new Error(
+          `\`${ctx.alias}\` allows a quiet request of at most ${cap} minutes and ${asked} was asked for. ` +
+          `Ask for ${cap} or fewer, or release the container — it is billed for every second either way.`,
+        );
+      }
+      if (!prior?.boxId) return { quiet: false, note: "nothing is running, so nothing will be asked about" };
+      const quietUntil = Date.now() + asked * 60_000;
+      await ctx.connection.set({ ...prior, quietUntil } as unknown as Json);
+      return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
+    }
+
     if (!ctx.credential) throw new Error("run9 mount has no credential");
     const cred = JSON.parse(ctx.credential) as Run9Credential;
     const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);

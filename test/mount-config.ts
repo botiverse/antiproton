@@ -637,6 +637,83 @@ await check("释放记录带着最后一次使用的时间,所以闲置时长算
   if (never.execs !== 0 || never.saved.length !== 0) throw new Error("defaults are wrong");
 });
 
+/**
+ * A quiet request that is too long is refused, not shortened.
+ *
+ * The ceiling is the only thing between "remind me later" and "never release
+ * it", and an agent silently given an hour when it asked for a day plans
+ * against the day: it will not come back in time, and the box is billed for
+ * every second in between. So the refusal has to be a refusal, and it has to
+ * say the number the mount actually allows — a "no" without the ceiling leaves
+ * the agent guessing at a second request.
+ */
+await check("a quiet request over the mount's ceiling is refused, and the refusal names the ceiling", async () => {
+  const ctx = (config: Record<string, unknown>, state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
+    credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: config,
+    connection: { get: async () => state, set: async () => { written.push(true); } },
+    sibling: async () => null,
+  });
+  const written: boolean[] = [];
+  const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 };
+
+  // Over the default ceiling of 60.
+  let refused = "";
+  try { await run9.invoke("quiet", { minutes: 1440 } as any, ctx({}, live)); }
+  catch (e) { refused = String((e as Error).message); }
+  if (!refused) throw new Error("a day-long quiet request was accepted");
+  if (!refused.includes("60")) throw new Error(`the refusal does not name the ceiling: ${refused}`);
+  if (!refused.includes("box")) throw new Error(`the refusal does not name the mount: ${refused}`);
+  if (written.length) throw new Error("a refused request still wrote state");
+
+  // The operator's own ceiling, not the default.
+  let ownRefusal = "";
+  try { await run9.invoke("quiet", { minutes: 20 } as any, ctx({ maxQuietMinutes: 10 }, live)); }
+  catch (e) { ownRefusal = String((e as Error).message); }
+  if (!ownRefusal.includes("10")) throw new Error(`the mount's own ceiling was not used: ${ownRefusal}`);
+
+  // Not a number, and zero: both are refusals rather than "quiet forever".
+  for (const bad of [undefined, null, "30", 0, -5, Infinity, NaN]) {
+    let threw = false;
+    try { await run9.invoke("quiet", { minutes: bad } as any, ctx({}, live)); } catch { threw = true; }
+    if (!threw) throw new Error(`quiet accepted ${JSON.stringify(bad)} as a duration`);
+  }
+  if (written.length) throw new Error("a refused request still wrote state");
+});
+
+/**
+ * An accepted quiet request records an instant, and only that.
+ *
+ * `quietUntil` is written by this plugin and read by the framework's idle wake,
+ * so the two halves meet on this field and on nothing else. The test pins the
+ * shape rather than the wording: an instant in the future, the rest of the
+ * state carried over, and no box invented when there is none.
+ */
+await check("an accepted quiet request records when to ask again, and leaves the rest of the state alone", async () => {
+  let saved: any = null;
+  const ctx = (state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
+    credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
+    connection: { get: async () => state, set: async (v: unknown) => { saved = v; } },
+    sibling: async () => null,
+  });
+  const before = Date.now();
+  const r: any = await run9.invoke("quiet", { minutes: 30 } as any,
+    ctx({ boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 4, envs: [] }));
+  if (r.quiet !== true) throw new Error(`a request inside the ceiling was not accepted: ${JSON.stringify(r)}`);
+  if (!saved?.quietUntil) throw new Error("nothing was recorded for the wake to read");
+  const minutes = (saved.quietUntil - before) / 60_000;
+  if (minutes < 29 || minutes > 31) throw new Error(`quietUntil is ${minutes} minutes out, not 30`);
+  if (saved.boxId !== "b-1" || saved.execs !== 4) throw new Error("the rest of the box state was dropped");
+
+  // No box: nothing will be asked about, so there is nothing to put off. It
+  // answers instead of throwing, the way `release` does on an empty mount.
+  saved = null;
+  const none: any = await run9.invoke("quiet", { minutes: 5 } as any, ctx(null));
+  if (none.quiet !== false) throw new Error(`quiet on an empty mount answered ${JSON.stringify(none)}`);
+  if (saved) throw new Error("quiet wrote state for a box that does not exist");
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
