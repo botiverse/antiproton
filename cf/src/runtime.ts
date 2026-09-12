@@ -539,10 +539,14 @@ export class AgentRuntime {
     // Without this a parked result is a reference the agent cannot open.
     { alias: "artifacts", plugin: "artifacts", config: { account: "builtin" },
       secretRef: null, policy: null },
-    // Open, like everything else seeded here. The page can still show a held
-    // call: the agent raises one itself with `confirm: true` on any call.
-    { alias: "ops", plugin: "demo", config: { account: "demo-fleet" },
-      secretRef: null, policy: null },
+    // `ops` (the demo plugin) used to be seeded here, and stopped being
+    // defensible the day sign-up opened: it is a fake fleet — `list_servers`,
+    // `deploy`, `restart`, with summaries that say "Changes production" — and
+    // it was on the first screen a stranger saw. A demonstration is something
+    // an operator chooses to show, not something every new account is given.
+    // The plugin stays installed and mountable, so a demo is one mount away;
+    // and because provisioning only adds what is missing, every agent that
+    // already has `ops` keeps it. Nothing disappears from under anyone.
     // Open on purpose: the agent holds no credential and writes need a
     // human. maxBytes stays under the offload threshold so an ordinary page
     // reaches the model directly rather than via a round trip to storage.
