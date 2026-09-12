@@ -53,6 +53,9 @@ check("the page catches up when the tab is shown again", () => {
 
 check("the held cards ride with the chat, in one fragment under one version", () => {
   must(!/hx-get="\/ui\/approvals"/.test(html), "no element may poll /ui/approvals on its own");
+  // Scope: after this change the element is not in the shell at all. It is
+  // in the chat fragment (chat.ts); test/console-chat.ts holds what it may
+  // be there. Looking for it on /ui and not finding it is the intended state.
   must(!/id="approvals"/.test(html), "the wrapper the decide buttons target arrives inside the chat fragment, not in the shell");
   must(/id="transcript"[^>]*\s+hx-get="\/ui\/chat\?held=1"/.test(html), "the transcript must ask for the held cards");
   must(/hx-post="\/ui\/message"[^>]*hx-vals='\{"held":"1"\}'/.test(html), "a sent message must redraw the transcript with the held cards too");

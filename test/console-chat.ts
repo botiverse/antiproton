@@ -32,6 +32,17 @@ check("with held, the cards follow the turns inside the block the decide buttons
   must(/gh\.issue_create/.test(html), "the pending card must render");
 });
 
+check("the wrapper is inert: the chat poll redraws it, it never fetches for itself", () => {
+  // Before #169 the shell carried this element as a poller of its own
+  // (data-lazy, hx-get, hx-trigger). It now arrives here, and a reader of
+  // this file should learn that nothing may make it fetch again.
+  for (const rows of [[held("pending")], []]) {
+    const open = /<div class="held" id="approvals"([^>]*)>/.exec(chatPanel("t", rows));
+    must(open, "the wrapper must be there, or the decide buttons have no target");
+    must(!/\bhx-|data-lazy/.test(open![1]), `no hx- attribute and no data-lazy on the wrapper: <div${open![1]}>`);
+  }
+});
+
 check("with held but nothing pending, the block says so rather than vanishing", () => {
   const html = chatPanel("t", [held("approved")]);
   must(/id="approvals"/.test(html) && /nothing waiting/.test(html), "the empty state must render inside the block");
