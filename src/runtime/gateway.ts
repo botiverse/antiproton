@@ -51,6 +51,24 @@ export class ToolGateway {
   #store: StorageAdapter;
   #plugins: Map<string, Plugin>;
   #secrets: SecretResolver;
+  /**
+   * One queue per mount that declared it cannot overlap, keyed
+   * `tenant/agent/alias`.
+   *
+   * `exclusive` was being honoured by the harness and nowhere else: pi runs a
+   * turn's tool calls in parallel unless a tool says otherwise, and
+   * `bridgeTools` marks these `executionMode: "sequential"`. But `run_js`
+   * dispatches by address and its sandbox allows eight host calls in flight
+   * (`maxConcurrentHostCalls`), so a script doing two shells at once never
+   * passes through the harness that was enforcing this — and the plugin's own
+   * state is read-modify-write, so the second write wins and the first box is
+   * forgotten while it goes on being billed.
+   *
+   * That is the same argument as every other check here: the gateway is the
+   * choke point precisely because the paths that reach it are not all the same
+   * path (Rex found the read-modify-write; the reachability is ours).
+   */
+  #queues = new Map<string, Promise<unknown>>();
 
   constructor(store: StorageAdapter, plugins: Plugin[], secrets: SecretResolver = envSecrets) {
     this.#store = store;
@@ -308,6 +326,35 @@ export class ToolGateway {
   }
 
   async invoke(
+    ctx: CallContext,
+    raw: string,
+    args: Json,
+    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string; confirm?: boolean } = {},
+  ): Promise<ToolResult> {
+    // Resolved before queueing, because which queue a call belongs in is a
+    // property of the mount it names, and refusals should not wait behind
+    // someone else's container.
+    const r0 = await this.resolve(ctx, raw);
+    if ("error" in r0) return { status: "rejected", error: r0.error };
+    if (!this.#plugins.get(r0.mount.plugin)?.exclusive) return this.#invoke(ctx, raw, args, opts);
+
+    const key = `${ctx.tenantId}/${ctx.agentId}/${r0.mount.alias}`;
+    // The chain is the lock: each call waits for the one before it to settle.
+    // A failure must not break the chain — the caller behind a refused call is
+    // owed its turn, not the refusal.
+    const tail = this.#queues.get(key) ?? Promise.resolve();
+    const run = tail.then(() => this.#invoke(ctx, raw, args, opts), () => this.#invoke(ctx, raw, args, opts));
+    const settled = run.then(() => {}, () => {});
+    this.#queues.set(key, settled);
+    // Dropped when it settles, but only if nobody queued behind it — otherwise
+    // a finishing call would remove the queue its successor is waiting on.
+    void settled.then(() => {
+      if (this.#queues.get(key) === settled) this.#queues.delete(key);
+    });
+    return run;
+  }
+
+  async #invoke(
     ctx: CallContext,
     raw: string,
     args: Json,
