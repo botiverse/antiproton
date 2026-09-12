@@ -42,11 +42,6 @@ const SCHEMA = [
      exec_id TEXT PRIMARY KEY, box_id TEXT NOT NULL, tenant_id TEXT NOT NULL, at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS snaps (
      snap_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, at INTEGER NOT NULL)`,
-  // A token is a name for a tenant, kept as a hash: the broker can recognise
-  // one presented to it and cannot reproduce one it was never given.
-  `CREATE TABLE IF NOT EXISTS tokens (
-     hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
-     issued_at INTEGER NOT NULL, note TEXT)`,
 ];
 
 export class Ledger {
@@ -117,36 +112,8 @@ export class Ledger {
     return this.#sql.exec("SELECT * FROM boxes WHERE started_at >= ? ORDER BY started_at", from).toArray().map(row);
   }
 
-  tokenFor(hash: string): { tenantId: string; agentId: string } | null {
-    const r = this.#sql.exec("SELECT tenant_id, agent_id FROM tokens WHERE hash=?", hash).toArray()[0];
-    return r ? { tenantId: String(r.tenant_id), agentId: String(r.agent_id) } : null;
-  }
 
-  /**
-   * The key this tenant already has, if it has one.
-   *
-   * Asked so that a key can be minted the first time a tenant needs one, with
-   * nobody typing anything: a person configures no credential for the sandbox
-   * today and must not start — the mount has always carried the operator's
-   * reference, and the console has always shown it as not theirs to change.
-   * Per-tenant keys exist so the broker can tell callers apart, which is the
-   * whole point of it; that is a reason for us to have one each, not a reason
-   * for anyone to be asked for one.
-   */
-  keyOf(tenantId: string): string | null {
-    const r = this.#sql
-      .exec("SELECT hash FROM tokens WHERE tenant_id=? ORDER BY issued_at LIMIT 1", tenantId)
-      .toArray()[0];
-    return r ? String(r.hash) : null;
-  }
 
-  issue(hash: string, tenantId: string, agentId: string, note: string | null) {
-    this.#sql.exec(
-      `INSERT INTO tokens(hash, tenant_id, agent_id, issued_at, note) VALUES (?,?,?,?,?)
-       ON CONFLICT(hash) DO UPDATE SET tenant_id=excluded.tenant_id, agent_id=excluded.agent_id`,
-      hash, tenantId, agentId, this.#now(), note,
-    );
-  }
 }
 
 const row = (r: any): BoxRow => ({

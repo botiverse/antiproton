@@ -20,6 +20,10 @@
     "RUN9_ENDPOINT": "https://api.run.sys9.ai",
     "RUN9_PROJECT": "antiproton"
   }
-  // RUN9_AK, RUN9_SK and ADMIN_TOKEN are Worker secrets, set with
+  // RUN9_AK, RUN9_SK, ADMIN_TOKEN and KEY_SECRET are Worker secrets, set with
   // `wrangler secret put`. They are not in this file and must never be.
+  //
+  // KEY_SECRET derives every tenant's key (see src/keys.ts). Changing it is
+  // how rotation works, and it rotates everyone at once — there is no way to
+  // cut off a single tenant, which is written next to the function too.
 }
