@@ -162,3 +162,14 @@ them at runtime, so their notices travel here.
 
   `cf/src/vendor/geist-mono.ts` carries the latin subset at variable weight.
   The full licence text is `cf/src/vendor/LICENSE-geist.txt`, beside the file.
+
+  Octicons — https://github.com/primer/octicons
+  The MIT License (MIT), Copyright (c) 2026 GitHub Inc.
+
+  `cf/src/login.ts` carries the path data for one glyph, `mark-github`, drawn
+  small for the sign-in button. Inlined as a string for the same reason the
+  other icons are: the console serves HTML from strings and cannot link a
+  sprite. Octicons is MIT, whose condition is that copyright notice and
+  permission notice be included wherever the material is: unlike htmx, which
+  is 0BSD and asks for nothing, this one has a term that has to be met. The
+  MIT text is the same text quoted for Feather above, with the holder above.
