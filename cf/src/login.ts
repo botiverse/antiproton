@@ -93,10 +93,12 @@ ${THEME_BOOT}
  * whether to press a button deserves to know both before the redirect, not
  * on GitHub's consent screen.
  */
-export function loginPage(opts: { open: boolean } = { open: true }): string {
+export function loginPage(opts: { open: boolean }): string {
   // The first sentence follows the deployment's switch (GITHUB_OPEN_SIGNUP),
   // which was flipped twice in ten minutes on the day it was added: a door
   // that says "anyone" while the switch is off sends people to a refusal.
+  // No default on purpose: a call site that forgets the switch must fail to
+  // compile rather than render the permissive sentence.
   const who = opts.open
     ? "Any GitHub account can sign in; your first sign-in creates an agent of your own."
     : "Invited GitHub accounts only.";
