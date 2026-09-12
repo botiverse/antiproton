@@ -185,7 +185,11 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
  */
 export interface Sandbox {
   execute(source: string, host: { invoke(call: any): Promise<any> }, limits?: unknown): Promise<{
-    status: string;
+    /** An execution's own vocabulary (`ExecutionResult`), which is not a tool
+     *  call's. A `string` here let this tool test for a tool call's
+     *  "succeeded" — a word no executor has ever returned — so every script
+     *  that ran to completion was reported to the model as a failure. */
+    status: "completed" | "failed" | "interrupted";
     outputs?: unknown[];
     error?: unknown;
     hostCalls?: number;
@@ -275,7 +279,10 @@ export function runJsTool(
         },
       }, opts.limits);
       await opts.onCalls?.(r.hostCalls ?? 0);
-      if (r.status !== "ok" && r.status !== "succeeded") {
+      // "completed" is the whole of success here. Both executors return it
+      // (executor.ts, dynamic-worker-executor.ts); "failed" and "interrupted"
+      // are the other two, and each carries its reason.
+      if (r.status !== "completed") {
         throw new Error(`run_js ${r.status}: ${JSON.stringify(r.error ?? null).slice(0, 300)}`);
       }
       return {
