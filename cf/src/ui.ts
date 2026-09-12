@@ -1409,21 +1409,21 @@ ${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]
  * and they were invisible until now.
  */
 export function sandboxPanel(d: any): string {
-  // Match the mount's plugin, not its alias: an alias is a name an operator can
-  // rebind, so "the sandbox" found by alias would go blind when the sandbox
-  // plugin hangs under another name, or see only one of two.
+  // Ask the mount, never its plugin's private state. `mountReports[alias]` is
+  // written by whoever can answer, so the page no longer knows which plugin a
+  // container comes from — and a mount with nothing to report is simply absent.
   const aliases = new Set(
     (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
   const name = [...aliases][0] ?? "sandbox";
-  const conn = (d.connections ?? []).find((c: any) => aliases.has(c.alias));
-  let st: any = null;
-  try { st = conn ? JSON.parse(conn.state) : null; } catch { st = null; }
-  const sessions: Array<{ boxId: string; startedAt: number; endedAt: number; execs: number; saved: string[] }> =
-    st?.sessions ?? [];
-  const live = st?.boxId ? { boxId: st.boxId, since: Number(st.createdAt),
-    execs: Number(st.execs ?? 0), saved: (st.saved ?? []) as string[] } : null;
+  const reports = d.mountReports ?? {};
+  const alias = [...aliases].find((a) => reports[a]);
+  const rep = alias ? reports[alias] : null;
+  const live: any = rep?.activity?.live ?? null;
+  const quietUntil = rep?.activity?.quietUntil ?? null;
+  const billing = rep?.activity?.billing ?? null;
+  const sessions: any[] = rep?.usage ?? [];
 
-  if (!sessions.length && !live) {
+  if (!live && !sessions.length) {
     return `<div class="empty">no container has ever been started for this agent</div>
       <div class="hint" style="padding:8px 0">${aliases.size
         ? `The <span class="chip">${esc(name)}</span> mount is a real machine and the
@@ -1433,9 +1433,9 @@ export function sandboxPanel(d: any): string {
         for merely existing stays out of reach.`}</div>`;
   }
 
-  const liveMs = live ? Date.now() - live.since : 0;
-  const total = sessions.reduce((a, x) => a + (x.endedAt - x.startedAt), 0) + liveMs;
-  const widest = Math.max(liveMs, ...sessions.map((x) => x.endedAt - x.startedAt), 1);
+  const liveMs = live ? Date.now() - Number(live.startedAt) : 0;
+  const total = sessions.reduce((a: number, x: any) => a + (x.endedAt - x.startedAt), 0) + liveMs;
+  const widest = Math.max(liveMs, ...sessions.map((x: any) => x.endedAt - x.startedAt), 1);
   const when = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19) + "Z";
 
   const bar = (ms: number, right: string, colour: string) =>
@@ -1449,33 +1449,33 @@ export function sandboxPanel(d: any): string {
     return `<div class="ev"><div class="k">${esc(path)}</div>
       <div class="msg" style="color:var(--dim);font-size:11px">${esc(ref)}</div></div>`;
   };
-  const allSaved = [...(live?.saved ?? []), ...sessions.flatMap((x) => x.saved ?? [])];
+  // Each session's `kept` is only what that one carried out; the mount's whole
+  // yield is the union.
+  const allSaved: string[] = sessions.flatMap((x: any) => x.kept ?? []);
 
   return `
 <h3>right now</h3>
 ${live
     ? `<div class="card"><div class="tool">a container is running</div>
        <div class="kv" style="margin-top:6px">
-         <div>box</div><div>${esc(live.boxId)}</div>
+         <div>box</div><div>${esc(live.id)}</div>
          <div>alive for</div><div>${esc(secs(liveMs))} <span class="tag bad">still billing</span></div>
-         <div>calls so far</div><div>${esc(live.execs)}</div>
-         <div>saved so far</div><div>${esc(live.saved.length)}</div>
+         <div>last used</div><div>${esc(ago(Number(live.lastUsedAt)))}</div>
+         ${quietUntil ? `<div>quiet until</div><div>${esc(when(Number(quietUntil)))} — the agent asked not to be asked</div>` : ""}
        </div>
-       <div class="hint" style="padding:8px 0 0">It costs the same whether or not anything is
-       running inside it. If the agent has finished with the machine and not released it,
-       that is the bug to look at.</div></div>`
+       <div class="hint" style="padding:8px 0 0">${billing ? esc(billing) + "." : "It costs the same whether or not anything is running inside it."} If the agent has finished with the machine and not released it, that is the bug to look at.</div></div>`
     : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
 
 <h3>sessions — ${esc(secs(total))} of container time across ${sessions.length + (live ? 1 : 0)}</h3>
 <div class="bars">
-  ${live ? bar(liveMs, `<span class="tag bad">live</span> ${esc(live.execs)} call(s)`, "var(--bad)") : ""}
-  ${sessions.map((x) => bar(x.endedAt - x.startedAt,
-      `${x.execs} call(s)${x.saved?.length ? ` · ${x.saved.length} saved` : ""}`,
+  ${live ? bar(liveMs, `<span class="tag bad">live</span>`, "var(--bad)") : ""}
+  ${sessions.map((x: any) => bar(x.endedAt - x.startedAt,
+      `${x.uses ?? 0} call(s)${x.kept?.length ? ` · ${x.kept.length} saved` : ""}`,
       "var(--ok)")).join("")}
 </div>
-${table(["started", "lived", "calls", "saved", "box"], sessions.map((x) =>
-    [when(x.startedAt), secs(x.endedAt - x.startedAt), x.execs, (x.saved ?? []).length,
-     String(x.boxId).slice(-14)]))}
+${table(["started", "lived", "calls", "saved", "box"], sessions.map((x: any) =>
+    [when(x.startedAt), secs(x.endedAt - x.startedAt), x.uses ?? "—", (x.kept ?? []).length,
+     String(x.id).slice(-14)]))}
 
 <h3>what came out — ${allSaved.length} artifact(s)</h3>
 ${allSaved.length

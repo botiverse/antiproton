@@ -4,8 +4,10 @@
  * Two places the console used to recite a name the plugin owns. The memory
  * panel hardcoded which documents are read back into the prompt, so a change
  * to the state plugin's working set would silently drift the tag. The sandbox
- * panel looked its container up by alias, so the sandbox plugin under any other alias
- * read as "never started", and under two names showed only one.
+ * panel now asks the mount (`mountReports`) instead of reading the sandbox
+ * plugin's private connection state — a mount with nothing to report is
+ * simply absent, and `kept` unions across sessions because each usage entry
+ * only carries what that one session saved out.
  */
 import { memoryPanel, sandboxPanel } from "../cf/src/ui.ts";
 import { WORKING_SET } from "../src/plugins/state.ts";
@@ -35,32 +37,53 @@ check("the prompt tag on a document follows the plugin's working set", () => {
   must(otherHead && !otherHead.includes("tag ok"), "an outside document got tagged");
 });
 
-const connState = JSON.stringify({ sessions: [], boxId: "b1", createdAt: Date.now() - 1000, execs: 3, saved: [] });
+const report = {
+  activity: { live: { id: "b1", startedAt: Date.now() - 1000, lastUsedAt: Date.now() - 200 },
+    quietUntil: null, billing: "billed for every second it exists, not per call" },
+  usage: [],
+};
 
-check("the sandbox panel finds the container by plugin, under any alias", () => {
+check("the sandbox panel asks the mount, under any alias", () => {
   const html = sandboxPanel({
     mounts: [{ alias: "box", plugin: "sandbox" }],
-    connections: [{ alias: "box", state: connState, expires_at: null, updated_at: 0 }],
+    mountReports: { box: report },
   });
-  must(html.includes("a container is running"), "the sandbox plugin under a renamed alias went blind");
+  must(html.includes("a container is running"), "a live container from a mount report did not render");
+  must(html.includes("billed for every second it exists"), "the billing sentence from the plugin did not show");
 });
 
-check("a node-named connection without a sandbox mount is not a container", () => {
+check("a mount with no report is not a container, whatever its connection says", () => {
+  // A report is written only when something runs or ran; a stale connection row
+  // in the old shape must not reach the panel at all.
   const html = sandboxPanel({
-    mounts: [],
-    connections: [{ alias: "node", state: connState, expires_at: null, updated_at: 0 }],
+    mounts: [{ alias: "box", plugin: "sandbox" }],
+    connections: [{ alias: "box", state: JSON.stringify({ boxId: "b1", createdAt: Date.now() - 1000 }), expires_at: null, updated_at: 0 }],
   });
-  must(html.includes("no container has ever been started"), "a foreign 'node' alias passed for the sandbox");
-  must(!html.includes("<span class=\"chip\">node</span>"), "the empty state named a mount that is not there");
+  must(html.includes("no container has ever been started"), "the old connection shape leaked through");
 });
 
 check("an idle-but-present sandbox mount is named in the empty state", () => {
   const html = sandboxPanel({
     mounts: [{ alias: "box", plugin: "sandbox" }],
-    connections: [],
   });
   must(html.includes("no container has ever been started"), "wrong empty branch");
   must(html.includes("<span class=\"chip\">box</span>"), "the hint did not name the mount it has");
+});
+
+check("the quiet-until notice shows when the agent postponed, and artifacts union across sessions", () => {
+  const html = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mountReports: { box: {
+      activity: { live: { id: "b1", startedAt: Date.now() - 60_000, lastUsedAt: Date.now() - 5_000 },
+        quietUntil: Date.now() + 3_600_000, billing: "billed" },
+      usage: [
+        { id: "b0", startedAt: 1, endedAt: 2, lastUsedAt: 2, uses: 3, kept: ["r2://a", "r2://b"] },
+        { id: "b-1", startedAt: 3, endedAt: 4, lastUsedAt: 4, uses: 1, kept: ["r2://c"] },
+      ],
+    } },
+  });
+  must(html.includes("quiet until"), "the postponed notice did not render");
+  must(html.includes("3 artifact(s)"), "kept was not unioned across sessions");
 });
 
 let failures = 0;
