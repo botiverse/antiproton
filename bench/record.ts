@@ -9,6 +9,20 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 
+/**
+ * Which code the Worker at `base` is running: its deploy-time commit, read
+ * from the ungated probe. Null when the deploy did not say (older Workers),
+ * and null rather than a throw when the probe is unreachable, so a record
+ * is still written; the field is then an honest "unknown".
+ */
+export async function workerBuild(base: string): Promise<string | null> {
+  try {
+    const r = await fetch(`${base}/ui/whoami`);
+    const j: any = await r.json();
+    return typeof j?.build === "string" && j.build ? j.build : null;
+  } catch { return null; }
+}
+
 export function recordRun(bench: string, obj: string, body: unknown): string {
   const day = new Date().toISOString().slice(0, 10);
   const dir = new URL(`../report/runs/${day}/`, import.meta.url).pathname;

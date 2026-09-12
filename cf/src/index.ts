@@ -70,6 +70,11 @@ export interface Env {
   /** The canonical origin, so the registered callback URL is built from a
    *  constant and never from an inbound Host header. */
   UI_ORIGIN?: string;
+  /** The commit this Worker was built from, set per deploy by
+   *  cf/scripts/deploy.sh (`--var GIT_COMMIT:<sha>`); whoami shows it, and
+   *  the bench drivers write it into every record. A record that names its
+   *  object and time but not its code cannot be compared with another. */
+  GIT_COMMIT?: string;
   /** Seals the session cookie. Without it nobody can be signed in. */
   SESSION_SECRET?: string;
   /** A long key that mints a QA session for a browser. Not shown to anyone;
@@ -2039,6 +2044,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       const v = await viewer(request, env);
       return Response.json({
         viewer: v ? { email: v.email, name: v.name, source: v.source } : null,
+        build: env.GIT_COMMIT ?? null,
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
         loginConfigured: raftConfig(env) !== null,
         qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),

@@ -23,7 +23,7 @@ import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
-import { recordRun } from "../record.ts";
+import { recordRun, workerBuild } from "../record.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -368,7 +368,7 @@ if (act) {
     (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
 }
 const recorded = recordRun("tau2", OBJ, {
-  bench: "tau2-retail", base: BASE, object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
+  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
   tasks: selected.map((t) => t.id), trials: TRIALS, startedAt: new Date(t0Run).toISOString(),
   results, passAtK: TRIALS > 1 ? Object.fromEntries([...Array(TRIALS)].map((_, k) => [k + 1, passAtK(results, k + 1)])) : undefined,
   tools: toolTotals, endings, activity: act,
