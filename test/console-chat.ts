@@ -25,6 +25,10 @@ check("with held, the cards follow the turns inside the block the decide buttons
   must(html.startsWith("<div class=step>hi</div>"), "turns must come first");
   must(/<div class="held" id="approvals">/.test(html), "the wrapper must carry id=approvals");
   must(/hx-target="#approvals"/.test(html), "the decide buttons must target the wrapper");
+  // The wrapper arrives with the chat fragment; it fetches nothing itself.
+  // `data-lazy` and any `hx-` attribute would each claim otherwise.
+  const tag = /<div class="held" id="approvals"([^>]*)>/.exec(html);
+  must(tag && !/\bhx-|\bdata-lazy\b/.test(tag[1]), `the wrapper must be inert, not a poller: <div${tag?.[1] ?? ""}>`);
   must(/gh\.issue_create/.test(html), "the pending card must render");
 });
 
