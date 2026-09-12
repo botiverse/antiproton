@@ -1212,6 +1212,12 @@ export class AgentDO extends DurableObject<Env> {
     return { ok: true as const };
   }
 
+  async identityDelete(key: string) {
+    this.#identities();
+    this.sql.exec("DELETE FROM identities WHERE provider_key = ?", key);
+    return { ok: true as const };
+  }
+
   async identityList() {
     this.#identities();
     return this.sql.exec("SELECT provider_key, agent_id, tenant_id, added_by, created_at FROM identities ORDER BY created_at").toArray()
@@ -2531,6 +2537,14 @@ export default {
             }
             await dir.identityUpsert(key, agentId, tenantId, "automation");
             return Response.json({ ok: true, key, agentId, tenantId });
+          }
+          if (request.method === "DELETE") {
+            // Removes the invitation, not the agent: the object and its data
+            // stay where they are; the person just cannot sign in to it.
+            const key = String(url.searchParams.get("key") ?? "").trim();
+            if (!/^github:\d+$/.test(key)) return Response.json({ error: "BAD_KEY", hint: "?key=github:<numeric id>" }, { status: 400 });
+            await dir.identityDelete(key);
+            return Response.json({ ok: true, key });
           }
           return Response.json({ identities: await dir.identityList() });
         }
