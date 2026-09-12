@@ -56,7 +56,7 @@ import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { statePlugin } from "../../src/plugins/state.ts";
-import { run9Plugin } from "../../src/plugins/run9.ts";
+import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
@@ -344,7 +344,7 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
-      run9Plugin(this.#artifacts as any, deps.bucketName),
+      sandboxPlugin(this.#artifacts as any, deps.bucketName),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),
@@ -573,7 +573,7 @@ export class AgentRuntime {
     // themselves as a last resort so the agent reaches for free in-process
     // JS first, and the framework releases the box once the agent has no
     // conversation with work open (the scope is the agent, not a task).
-    { alias: "node", plugin: "run9", config: { account: "container" },
+    { alias: "sandbox", plugin: "sandbox", config: { account: "container" },
       secretRef: OPERATOR_RUN9_REF, policy: null },
     // The agent's own store. Deliberately not behind approval: an agent
     // that must ask a person before writing a note will not keep notes, and

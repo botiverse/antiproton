@@ -21,7 +21,9 @@ import type { R2Artifacts } from "../store/artifacts.ts";
  * The box is per mount and kept in connection state, so a package installed by
  * one call is still there for the next.
  */
-export interface Run9Config {
+export interface SandboxConfig {
+  /** Which provider runs the container. Only "run9" is implemented. */
+  provider?: string;
   endpoint?: string;
   /** Any image with node on the PATH. */
   image?: string;
@@ -144,7 +146,26 @@ interface BoxState {
 
 const SESSIONS_KEPT = 20;
 
+/**
+ * The provider this mount asked for, refused if we do not have it.
+ *
+ * The setting's `choices` stop a bad value at the page and at mount time, but a
+ * mount written before a provider was removed — or by anything that did not go
+ * through the validator — reaches here. Refusing is the same call as the
+ * network gate: a value we do not recognise must not fall through to the one we
+ * happen to implement, because "it ran on run9" would then be the answer to
+ * "run it on something else".
+ */
+export function providerOf(cfg: { provider?: string }): "run9" {
+  const asked = cfg.provider ?? "run9";
+  if (asked !== "run9") {
+    throw new Error(`this sandbox mount asks for the "${asked}" provider, and run9 is the only one implemented`);
+  }
+  return "run9";
+}
+
 const DEFAULTS = {
+  provider: "run9",
   /** Installs and scripts share one directory, or Node resolves modules from
    *  wherever the script sits and cannot find what npm just installed. */
   workdir: "/work",
@@ -175,7 +196,8 @@ async function stopBox(
 ): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number } | null> {
   const state = (await ctx.connection.get()) as BoxState | null;
   if (!state?.boxId || !ctx.credential) return null;
-  const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+  const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
+  providerOf(cfg);
   const cred = JSON.parse(ctx.credential) as Run9Credential;
   const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
   const base = `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state.boxId}`;
@@ -299,9 +321,9 @@ export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "
   return open ? argv : ["unshare", "-n", "--", ...argv];
 }
 
-export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
+export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
   return {
-  id: "run9",
+  id: "sandbox",
   // Seeded despite being the only metered mount: a container the agent cannot
   // reach is a task it cannot finish, and it is meant to stay unused (tygg,
   // 2026-09-12). The lease is what keeps an idle one from being free to forget.
@@ -325,6 +347,13 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
     docs: "https://run.sys9.ai",
   },
   config: [
+    // The capability is "a sandbox"; run9 is who provides it today. Declared as
+    // a choice rather than left implicit so that "the provider is run9" is a
+    // statement the mount validator can check, and so a mount asking for a
+    // provider we do not have is refused at the page rather than at the first
+    // call. Every setting below this line belongs to the run9 provider.
+    { name: "provider", type: "string", choices: ["run9"], default: "run9",
+      summary: "Which sandbox provider runs the container. Only run9 today." },
     { name: "image", type: "string", summary: "Container image to start from.",
       default: "public.ecr.aws/docker/library/node:22-alpine" },
     { name: "workdir", type: "string", summary: "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.", default: "/work" },
@@ -507,7 +536,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
    */
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false as const, kind: "rejected" as const, reason: "no keys: this mount cannot start a container" };
-    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
     let cred: Run9Credential;
     try {
       cred = JSON.parse(ctx.credential) as Run9Credential;
@@ -582,7 +611,7 @@ export function run9Plugin(artifacts: R2Artifacts | null, bucket: string): Plugi
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
-    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as Run9Config) };
+    const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
     if (!ctx.credential) throw new Error("run9 mount has no credential");
     const cred = JSON.parse(ctx.credential) as Run9Credential;
     const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);

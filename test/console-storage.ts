@@ -39,7 +39,7 @@ const connState = JSON.stringify({ sessions: [], boxId: "b1", createdAt: Date.no
 
 check("the sandbox panel finds the container by plugin, under any alias", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "run9" }],
+    mounts: [{ alias: "box", plugin: "sandbox" }],
     connections: [{ alias: "box", state: connState, expires_at: null, updated_at: 0 }],
   });
   must(html.includes("a container is running"), "run9 under a renamed alias went blind");
@@ -56,7 +56,7 @@ check("a node-named connection without a run9 mount is not a container", () => {
 
 check("an idle-but-present run9 mount is named in the empty state", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "run9" }],
+    mounts: [{ alias: "box", plugin: "sandbox" }],
     connections: [],
   });
   must(html.includes("no container has ever been started"), "wrong empty branch");

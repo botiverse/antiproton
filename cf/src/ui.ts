@@ -1413,7 +1413,7 @@ export function sandboxPanel(d: any): string {
   // rebind, so "the sandbox" found by alias would go blind when the run9 mount
   // hangs under another name, or see only one of two.
   const aliases = new Set(
-    (d.mounts ?? []).filter((m: any) => m.plugin === "run9").map((m: any) => m.alias));
+    (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
   const name = [...aliases][0] ?? "node";
   const conn = (d.connections ?? []).find((c: any) => aliases.has(c.alias));
   let st: any = null;
