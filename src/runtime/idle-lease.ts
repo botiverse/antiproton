@@ -81,11 +81,17 @@ export function idleDecision(i: IdleInput): IdleAction {
  * Reading them does more than make them correct. A withheld tool has no
  * address in the catalogue at all — withholding is applied before names are
  * qualified — so a `null` here is the fact that the model was not offered it,
- * which a built name could not have seen. That case ships: the SWE benchmark
- * withholds `release` precisely so the agent cannot destroy the box the
- * grader is about to read, and a reminder telling it to call that tool would
- * be an instruction it cannot carry out. A reminder that names no tool and
- * states only the consequence is right in every one of these cases.
+ * which a built name could not have seen.
+ *
+ * No configuration reaches that today, and the one that looks closest cannot:
+ * the SWE benchmark withholds `release` so the agent cannot destroy the box
+ * its grader is about to read, and the same decision sets `autoRelease:
+ * false`, which turns this whole path off. The two flags are one requirement
+ * written twice, so a run that reminds while withholding would be somebody
+ * changing both. What the `null` does buy is the case that would be silent
+ * rather than loud: a built name under a collision resolves to another
+ * mount's tool and calls the wrong thing, while a read one is absent and the
+ * type says so here rather than downstream.
  */
 export function nudgeText(
   alias: string,
