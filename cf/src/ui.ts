@@ -461,10 +461,13 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   // A lazily loaded, polled fragment: loads when its view or section is shown,
   // then re-reads the store every few seconds while it stays shown. The
   // condition is evaluated by htmx against the element, so a hidden view
-  // costs nothing.
+  // costs nothing, and neither does a tab nobody is looking at: every poll
+  // on the page starts with `awake`, and the visibilitychange listener at
+  // the bottom catches the panels up the moment the tab is shown again.
+  const awake = "!document.hidden";
   const lazy = (id: string, path: string, every: string, cond: string) =>
     `<div class="body" id="${id}" data-lazy hx-get="${path}" hx-swap="innerHTML"
-          hx-trigger="ap:show, every ${every}[${cond}]">loading…</div>`;
+          hx-trigger="ap:show, every ${every}[${awake} && ${cond}]">loading…</div>`;
   const inView = "this.closest('.view').classList.contains('on')";
   const inspTab = (name: string) => `<button type="button" role="tab" data-insp="${name}" onclick="ap.insp('${name}')">${name}</button>`;
   const a = encodeURIComponent(agentId);
@@ -510,21 +513,22 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
       <div class="row"><button type="submit">create</button><button type="button" class="ghost" onclick="ap.newAgentForm(false)">cancel</button></div>
       <div class="hint">Each agent starts with its own mounts, credentials and memory. Nothing is copied from another agent.</div>
     </form>
-    <div id="agents" data-lazy hx-get="/ui/agents" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[document.body.dataset.view==='agents']"
+    <div id="agents" data-lazy hx-get="/ui/agents" hx-swap="innerHTML" hx-trigger="ap:show, every 5s[${awake} && document.body.dataset.view==='agents']"
          hx-on::after-swap="ap.markAgent()"></div>
   </div>
   <div class="side-view" data-for="plugins">
     <h3>mounts</h3>
     <div class="sub">this agent's authorities</div>
     <div id="mounts" data-lazy hx-get="/ui/plugins?part=mounts" hx-swap="innerHTML"
-         hx-trigger="ap:show, every 5s[document.body.dataset.view==='plugins']" hx-on::after-swap="ap.markMount()"></div>
+         hx-trigger="ap:show, every 5s[${awake} && document.body.dataset.view==='plugins']" hx-on::after-swap="ap.markMount()"></div>
     <a class="side-link" href="/ui?view=plugins&alias=" onclick="ap.mount('');return false">installed on this deployment →</a>
   </div>
 </aside>
 <main class="main" id="main">
   <section class="view" data-view="inbox">
     <div class="view-head"><h2>Inbox</h2><span class="sub">calls held by the gateway, waiting for your signature</span></div>
-    ${lazy("inbox", "/ui/inbox", "3s", inView)}
+    <div class="body" id="inbox" data-lazy hx-get="/ui/inbox" hx-swap="innerHTML"
+         hx-trigger="load, ap:show, every 5s[${awake}]" hx-on::after-swap="ap.count(this)">loading…</div>
   </section>
   <section class="view" data-view="agents">
     <div class="view-head"><span class="avatar lg" id="agent-avatar" hidden></span><h2 id="agent-name">${esc(agentId)}</h2>
@@ -539,12 +543,12 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
     <div class="conv">
       <div class="body" id="transcript" data-lazy
            hx-get="/ui/chat" hx-swap="innerHTML"
-           hx-trigger="ap:show, every 2s[${inView}]"
+           hx-trigger="ap:show, every 2s[${awake} && ${inView}]"
            hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
            onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
            >loading…</div>
       <div class="held" id="approvals" data-lazy hx-get="/ui/approvals" hx-swap="innerHTML"
-           hx-trigger="ap:show, every 2s[${inView}]"></div>
+           hx-trigger="ap:show, every 2s[${awake} && ${inView}]"></div>
       <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-on::after-request="ap.sent(this, event)">
         <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
         <button type="submit" name="mode" value="steer">send</button>
@@ -559,7 +563,7 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   <section class="view" data-view="plugins">
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
     <div class="body" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
-         hx-trigger="ap:show, every 3s[${inView} && !ap.editing('#plugins')]">loading…</div>
+         hx-trigger="ap:show, every 3s[${awake} && ${inView} && !ap.editing('#plugins')]">loading…</div>
   </section>
   <section class="view" data-view="runtime">
     <div class="view-head"><h2>Runtime</h2><span class="sub">what the object is billed for, and what it is holding</span></div>
@@ -577,11 +581,9 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
     ${inspTab("trajectory")}${inspTab("events")}${inspTab("storage")}${inspTab("memory")}${inspTab("sandbox")}${inspTab("runtime")}
   </div>
   <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/transcript" hx-swap="innerHTML"
-       hx-trigger="ap:show, every 3s[document.body.dataset.view==='agents']">loading…</div>
+       hx-trigger="ap:show, every 3s[${awake} && document.body.dataset.view==='agents']">loading…</div>
   <div class="hint" style="padding:8px 0 0">Every tab re-reads the store while it is showing; nothing is cached client-side.</div>
 </aside>
-<div hidden id="inbox-poll" hx-get="/ui/inbox" hx-swap="innerHTML" hx-trigger="load, every 5s"
-     hx-on::after-swap="ap.count(this)"></div>
 <script>
   // The shell's own state: which section is showing and which mode the
   // viewer chose. Both are on the URL or in localStorage, never in the
@@ -741,6 +743,13 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   document.body.addEventListener('htmx:afterRequest', (e) => {
     const v = e.detail.xhr && e.detail.xhr.getResponseHeader('x-ap-version');
     if (v) window.__ver[e.detail.pathInfo.requestPath.split('?')[0]] = v;
+  });
+  // Polling stops while the tab is hidden (every trigger tests document.hidden);
+  // on return, the shown panels and the inbox refresh at once rather than
+  // waiting out the rest of their interval.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    document.querySelectorAll('.view.on [data-lazy], .side-view.on [data-lazy], #inbox').forEach(el => htmx.trigger(el, 'ap:show'));
   });
 </script>
 </body></html>`;
