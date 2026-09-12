@@ -117,19 +117,29 @@ check("an account without verified is not promoted to verified", () => {
   must(/as <code>someone<\/code>/.test(html), "the name still shows");
 });
 
-check("a reference the operator configured is attached by the operator, with no controls", () => {
+check("a reference the operator configured is included by the deployment, with no controls", () => {
   const html = render(mount("node", "sandbox", { connected: true, credential: { attached: true, operator: true, verified: false, account: null } }));
-  must(/attached by the operator/.test(html), "must say who attached it");
+  must(/included/.test(html), "must say the deployment covers it");
   must(/configured at deploy time/.test(html), "must say when");
+  must(!/acting as/.test(html), "an included credential is not an account to act as");
   must(!/unverified|not yet tried/.test(html), "an operator reference is not an untried paste");
   must(!/<input|<form|<details/.test(html), "nothing on the page can replace or remove an operator reference");
   must(!/undefined|null/.test(html), "nothing may render as undefined");
 });
 
+check("the plan name comes from the mount's config, not the credential meta", () => {
+  // Operator references carry no credential meta, so c.account is null; the
+  // label must come from the mount-level account the seed wrote.
+  const html = render(mount("node", "sandbox", { account: "Limited Free", connected: true,
+    credential: { attached: true, operator: true, verified: false, account: null } }));
+  must(html.includes('<span class="tag">Limited Free</span>'), "the plan name must be a tag");
+  must(!html.includes("acting as"), "the plan name must not read as an account");
+});
+
 check("a paste rejected over an operator reference still says why", () => {
   const hostile = `<b>the provider rejected these keys</b>`;
   const html = render(mount("node", "sandbox", { connected: true, credential: { attached: true, operator: true, verified: false, account: null, error: hostile } }));
-  must(/attached by the operator/.test(html), "the operator reference stays attached");
+  must(/included/.test(html), "the operator reference stays included");
   must(html.includes("&lt;b&gt;the provider rejected these keys&lt;/b&gt;"), "the reason must show, escaped");
   must(!html.includes(hostile), "the reason must not render as markup");
   must(!/<input|<form/.test(html), "still no controls on an operator reference");

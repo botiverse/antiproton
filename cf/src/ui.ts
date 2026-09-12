@@ -1684,12 +1684,18 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
 
   // A reference the operator configured at deploy time is attached, but it is
   // not in this agent's store: nothing here set it, and nothing here can
-  // replace or remove it. Say who attached it and offer no controls. A paste
-  // rejected on top of it still reports its reason, or the person who pasted
-  // wrong keys over the operator's is shown no change at all.
+  // replace or remove it. Say it is included by the deployment and offer no
+  // controls. A paste rejected on top of it still reports its reason, or the
+  // person who pasted wrong keys over the operator's is shown no change at all.
   if (c.operator === true) {
+    // "Included": an operator-attached credential means the deployment covers
+    // this mount — there is nothing to configure and nothing acting "as" an
+    // account here. The label comes from the mount's own config (operator
+    // references carry no credential meta, so c.account is always null here):
+    // the plan's name, today "Limited Free".
+    const plan = typeof m.account === "string" && m.account ? m.account : account;
     return `<div class="cred">
-      <div class="state"><b>attached by the operator</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}<span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
+      <div class="state"><b>included</b>${plan ? `<span class="tag">${esc(plan)}</span>` : ""}<span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
       ${error ? `<div class="err">${esc(error)}</div>` : ""}
     </div>`;
   }
