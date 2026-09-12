@@ -1423,9 +1423,12 @@ export function sandboxPanel(d: any): string {
 
   if (!sessions.length && !live) {
     return `<div class="empty">no container has ever been started for this agent</div>
-      <div class="hint" style="padding:8px 0">The <span class="chip">${esc(name)}</span> mount is a real
-      machine and the most expensive thing the agent can reach — billed for every second it
-      exists, not per call. It is meant to stay unused.</div>`;
+      <div class="hint" style="padding:8px 0">${aliases.size
+        ? `The <span class="chip">${esc(name)}</span> mount is a real machine and the
+        most expensive thing the agent can reach — billed for every second it exists,
+        not per call. It is meant to stay unused.`
+        : `This agent has no container mount at all, so the one thing here billed
+        for merely existing stays out of reach.`}</div>`;
   }
 
   const liveMs = live ? Date.now() - live.since : 0;
