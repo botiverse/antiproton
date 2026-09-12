@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext, MountActivity } from "./types.ts";
+import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 
 /**
@@ -311,8 +311,31 @@ async function stopBox(
  * adapter is four lines and it is the whole fix: callers ask, this answers.
  */
 export function activityOf(state: BoxState | null | undefined): MountActivity {
-  if (!state?.boxId) return { live: null };
-  return { live: { id: state.boxId, lastUsedAt: state.lastUsedAt || state.createdAt } };
+  const billing = "billed for every second it exists, not per call";
+  if (!state?.boxId) return { live: null, billing };
+  return {
+    live: {
+      id: state.boxId,
+      startedAt: state.createdAt,
+      // An unused box is idle from when it started, not from zero: the same
+      // rule the release record follows, so the two agree about its age.
+      lastUsedAt: state.lastUsedAt || state.createdAt,
+    },
+    quietUntil: state.quietUntil ?? null,
+    billing,
+  };
+}
+
+/** What this mount has finished with, newest first, from its own window. */
+export function usageOf(state: BoxState | null | undefined): MountUsage[] {
+  return (state?.sessions ?? []).map((s) => ({
+    id: s.boxId,
+    startedAt: s.startedAt,
+    endedAt: s.endedAt,
+    lastUsedAt: s.lastUsedAt,
+    uses: s.execs,
+    kept: s.saved,
+  }));
 }
 
 /**
@@ -716,6 +739,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
    *  else: no credential, no call to run9. */
   async activity(ctx: PluginContext): Promise<MountActivity> {
     return activityOf((await ctx.connection.get()) as BoxState | null);
+  },
+
+  /** The window this mount still holds. Bounded on purpose, which is why it is
+   *  the console's history and not anybody's ledger. */
+  async usage(ctx: PluginContext): Promise<MountUsage[]> {
+    return usageOf((await ctx.connection.get()) as BoxState | null);
   },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {

@@ -263,7 +263,32 @@ const resolved = (f: CredentialField): CredentialField => ({
  */
 export interface MountActivity {
   /** What this mount is keeping alive at a cost, or null when nothing. */
-  live: { id: string; lastUsedAt: number } | null;
+  live: { id: string; startedAt: number; lastUsedAt: number } | null;
+  /** Until when the agent asked not to be reminded about it, if it did. */
+  quietUntil?: number | null;
+  /**
+   * How this is charged, in a sentence a person reads.
+   *
+   * Here rather than in the console because the plugin is the only thing that
+   * knows: "billed for every second it exists, not per call" is true of a
+   * container and false of an API key, and a page that writes that sentence
+   * itself has to know which mounts are which — the coupling this interface
+   * exists to end.
+   */
+  billing?: string;
+}
+
+/** One finished stretch of whatever a mount keeps alive. */
+export interface MountUsage {
+  id: string;
+  startedAt: number;
+  endedAt: number;
+  /** When it was last actually used, so idle time is computable after the fact. */
+  lastUsedAt: number;
+  /** How many times it was used, when the mount counts that. */
+  uses?: number;
+  /** What was carried out of it, when anything was. */
+  kept?: string[];
 }
 
 /** Whether a mount can be renamed right now, and if not, what to say. */
@@ -472,4 +497,19 @@ export interface Plugin {
    * state and answer.
    */
   activity?(ctx: PluginContext): Promise<MountActivity>;
+
+  /**
+   * What this mount has finished with, newest first — the console's history.
+   *
+   * Separate from `activity` because their callers are different: the idle
+   * sweep and a rename ask on a timer and want one fact, while a person opening
+   * a page wants the list. A single call with a flag would make both of them
+   * pay for whichever they did not ask for, and would give a reader a shape
+   * that depends on an argument.
+   *
+   * A mount may keep less than it has done — a rolling window is a legitimate
+   * answer — so this is what the mount can still show, not a ledger. Anything
+   * that has to be complete has to be written where it happens.
+   */
+  usage?(ctx: PluginContext): Promise<MountUsage[]>;
 }

@@ -11,7 +11,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -1128,6 +1128,45 @@ await check("no sandbox tool lets the model name a container", () => {
   // knows about.
   const acts = run9.tools.filter((t) => ["run", "shell", "save", "release", "quiet"].includes(t.name));
   if (acts.length !== 5) throw new Error(`the acting tools changed: ${acts.map((t) => t.name).join(", ")}`);
+});
+
+/**
+ * Everything the console needs about a container, asked of the mount.
+ *
+ * The panel used to read `boxId`, `sessions`, `execs` and `saved` out of this
+ * plugin's own connection state — the second half of the coupling the audit
+ * found, and the reason it could only find a container under the alias `node`.
+ * `activity` answers what is running and `usage` what has finished, so a page
+ * can draw any mount that answers and skip the ones that do not.
+ *
+ * The two are separate calls because their callers are: a sweep on a timer
+ * wants one fact and must not pay for a history it will not read.
+ */
+await check("a mount answers what it is running and what it has finished", async () => {
+  const state = {
+    boxId: "b-live", createdAt: 1_000, lastUsedAt: 4_000, quietUntil: 9_000,
+    sessions: [
+      { boxId: "b-2", startedAt: 500, endedAt: 900, lastUsedAt: 800, execs: 3, saved: ["r2://a"] },
+      { boxId: "b-1", startedAt: 100, endedAt: 400, lastUsedAt: 300, execs: 0, saved: [] },
+    ],
+  };
+  const now = activityOf(state as any);
+  if (now.live?.id !== "b-live") throw new Error(`the running container was not reported: ${JSON.stringify(now)}`);
+  if (now.live.startedAt !== 1_000 || now.live.lastUsedAt !== 4_000) throw new Error("the live times are wrong");
+  if (now.quietUntil !== 9_000) throw new Error("a deferred reminder is invisible to the page");
+  // The sentence about cost belongs to the plugin: a console that writes it
+  // has to know which mounts are containers, which is the coupling this ends.
+  if (!/second/.test(now.billing ?? "")) throw new Error(`the mount does not say how it is charged: ${now.billing}`);
+
+  const past = usageOf(state as any);
+  if (past.length !== 2 || past[0]!.id !== "b-2") throw new Error(`the history is wrong: ${JSON.stringify(past)}`);
+  if (past[0]!.uses !== 3 || past[0]!.kept?.[0] !== "r2://a") throw new Error("what a session did was dropped");
+  if (past[1]!.endedAt - past[1]!.lastUsedAt !== 100) throw new Error("idle time is no longer computable from history");
+
+  // An empty mount answers, rather than throwing or inventing a container.
+  const empty = activityOf(null);
+  if (empty.live !== null || !empty.billing) throw new Error(`an empty mount answered ${JSON.stringify(empty)}`);
+  if (usageOf(null).length !== 0) throw new Error("an empty mount invented a history");
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
