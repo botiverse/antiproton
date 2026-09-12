@@ -69,6 +69,11 @@ export interface Env {
   /** "1" lets a GitHub account not on the identity table register itself
    *  on first sign-in (tygg, 2026-09-12: 可以放开了). Absent: refused. */
   GITHUB_OPEN_SIGNUP?: string;
+  /** Minutes a container may sit unused before the agent is reminded about
+   *  it, and the ceiling after which it is taken however the agent answered.
+   *  Both unset: containers are handed back after every pass. */
+  RUN9_IDLE_MINUTES?: string;
+  RUN9_MAX_IDLE_MINUTES?: string;
   UI_ORIGIN?: string;
   /** The commit this Worker was built from, set per deploy by
    *  cf/scripts/deploy.sh (`--var GIT_COMMIT:<sha>`); whoami shows it, and
@@ -376,6 +381,17 @@ export class AgentDO extends DurableObject<Env> {
       contextWindow: Number(this.env.HARNESS_CONTEXT_WINDOW)
         || contextWindowFor(this.env.HARNESS_MODEL),
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
+      // Both numbers or neither: without them a container is handed back after
+      // the pass that stops using it, which is what this deployment has always
+      // done. With them it is leased — kept, asked about, and taken at the
+      // ceiling. They are prices, not preferences (a reminder costs a model
+      // turn, a box costs seconds), so the operator sets them.
+      idle: Number(this.env.RUN9_IDLE_MINUTES) > 0 && Number(this.env.RUN9_MAX_IDLE_MINUTES) > 0
+        ? {
+            afterMs: Number(this.env.RUN9_IDLE_MINUTES) * 60_000,
+            maxMs: Number(this.env.RUN9_MAX_IDLE_MINUTES) * 60_000,
+          }
+        : undefined,
     });
     return this.#runtime;
   }

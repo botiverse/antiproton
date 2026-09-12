@@ -1,0 +1,80 @@
+/**
+ * When to ask about a container that is sitting there, and when to take it.
+ *
+ * A box is billed for every second it exists, so leaving one for an agent that
+ * may come back is a real cost. The answer is neither "release after every
+ * pass" (which is what the code did, and it makes the tool descriptions' "the
+ * container persists between calls" false) nor "keep it until asked" (which
+ * bills for a box nobody will touch again). It is: keep it, ask the agent, and
+ * take it anyway at a ceiling the agent cannot move.
+ *
+ * Three quantities, and each answers a different question:
+ *
+ *   afterMs   how long idle before the FIRST reminder. Each reminder costs a
+ *             model turn, so this is a price comparison rather than a taste:
+ *             below it, reminding costs more than the seconds it saves.
+ *   maxMs     the absolute ceiling on idleness. `quiet` cannot defer it; that
+ *             is the whole difference between a lever the agent holds and a
+ *             property the operator holds.
+ *   quietUntil the agent's own request, already capped by the mount when it
+ *             was written (run9's `maxQuietMinutes`). It moves the reminders,
+ *             never the ceiling.
+ *
+ * Reminders escalate — the gap doubles — because an agent that has not
+ * answered twice is unlikely to answer the third one sooner, and each one is
+ * a turn. So they fall at lastUsedAt + T, + 3T, + 7T … which is the cumulative
+ * sum of T, 2T, 4T.
+ */
+
+export interface IdleInput {
+  /** When the box was last actually used. Always set on live state; see run9. */
+  lastUsedAt: number;
+  /** The agent's deferral, or 0. Already capped where it was written. */
+  quietUntil?: number;
+  /** How many reminders this box has already had. */
+  sent: number;
+  now: number;
+  afterMs: number;
+  maxMs: number;
+}
+
+export type IdleAction =
+  /** Take the box: it has been idle longer than the operator allows. */
+  | { do: "release"; idleMs: number }
+  /** Ask the agent, then come back later. */
+  | { do: "nudge"; nth: number; idleMs: number; wakeInMs: number }
+  /** Nothing to say yet. */
+  | { do: "wait"; wakeInMs: number };
+
+/** The instant the nth reminder (1-based) is due, measured from last use. */
+export function nudgeDueAt(lastUsedAt: number, afterMs: number, nth: number): number {
+  return lastUsedAt + (2 ** nth - 1) * afterMs;
+}
+
+export function idleDecision(i: IdleInput): IdleAction {
+  const idleMs = i.now - i.lastUsedAt;
+  const ceiling = i.lastUsedAt + i.maxMs;
+  // The ceiling first, and without consulting `quietUntil`: a deferral the
+  // agent asked for is a request about reminders, not about the box's life.
+  if (i.now >= ceiling) return { do: "release", idleMs };
+
+  const quietUntil = i.quietUntil ?? 0;
+  const due = Math.max(nudgeDueAt(i.lastUsedAt, i.afterMs, i.sent + 1), quietUntil);
+  if (i.now >= due) {
+    const nth = i.sent + 1;
+    const next = Math.min(Math.max(nudgeDueAt(i.lastUsedAt, i.afterMs, nth + 1), quietUntil), ceiling);
+    return { do: "nudge", nth, idleMs, wakeInMs: Math.max(1, next - i.now) };
+  }
+  return { do: "wait", wakeInMs: Math.max(1, Math.min(due, ceiling) - i.now) };
+}
+
+/** What the reminder says. The strings are the ones the model can copy: a
+ *  tool is offered to it as `alias__tool`, so that is what an instruction to
+ *  call one must contain. */
+export function nudgeText(alias: string, idleMs: number, untilReleaseMs: number): string {
+  const mins = (ms: number) => Math.max(1, Math.round(ms / 60_000));
+  return `The container on the \`${alias}\` mount has been idle for ${mins(idleMs)} minutes and is billed for every second. `
+    + `Call \`${alias}__release\` to free it — it can save files out in the same call — or \`${alias}__quiet\` `
+    + `if you are coming back to it. If nothing is done it is released in ${mins(untilReleaseMs)} minutes, `
+    + `and anything not saved goes with it.`;
+}
