@@ -31,10 +31,10 @@ import { validateMount } from "../../src/runtime/mount-config.ts";
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import {
-  resolveViewer, admit, authorizeUrl, exchangeCode, fetchUserinfo, fetchJwks, verifyIdToken,
+  resolveViewer,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
-  constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, RAFT_ISSUER, QA_VIEWER,
-  type Viewer, type LoginState, type RaftConfig, type RefusalReason, type GithubConfig,
+  constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER,
+  type Viewer, type LoginState, type RefusalReason, type GithubConfig,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
@@ -61,20 +61,14 @@ export interface Env {
   HARNESS_CONTEXT_WINDOW?: string;
   /** "1" opens the demo UI with no identity at all. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
-  /** Login with Raft: the OAuth client registered on our Raft server. */
-  RAFT_CLIENT_ID?: string;
+  /** The canonical origin, so the registered callback URL is built from a
+   *  constant and never from an inbound Host header. */
+  /** Login with GitHub: the OAuth App tygg owns, callback /login/github/callback. */
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   /** "1" lets a GitHub account not on the identity table register itself
    *  on first sign-in (tygg, 2026-09-12: 可以放开了). Absent: refused. */
   GITHUB_OPEN_SIGNUP?: string;
-  RAFT_CLIENT_SECRET?: string;
-  /** The Raft server a signed-in person must belong to. */
-  RAFT_SERVER_ID?: string;
-  /** Defaults to https://api.raft.build. */
-  RAFT_ISSUER?: string;
-  /** The canonical origin, so the registered callback URL is built from a
-   *  constant and never from an inbound Host header. */
   UI_ORIGIN?: string;
   /** The commit this Worker was built from, set per deploy by
    *  cf/scripts/deploy.sh (`--var GIT_COMMIT:<sha>`); whoami shows it, and
@@ -1951,17 +1945,6 @@ async function viewer(request: Request, env: Env, allowAnonymous = false): Promi
   return resolveViewer(request, env, { allowAnonymous: true });
 }
 
-function raftConfig(env: Env): RaftConfig | null {
-  if (!env.RAFT_CLIENT_ID || !env.RAFT_CLIENT_SECRET || !env.RAFT_SERVER_ID || !env.UI_ORIGIN || !env.SESSION_SECRET) return null;
-  return {
-    issuer: env.RAFT_ISSUER ?? RAFT_ISSUER,
-    clientId: env.RAFT_CLIENT_ID,
-    clientSecret: env.RAFT_CLIENT_SECRET,
-    redirectUri: `${env.UI_ORIGIN}/login/raft/callback`,
-    serverId: env.RAFT_SERVER_ID,
-  };
-}
-
 function githubConfig(env: Env): GithubConfig | null {
   if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET || !env.UI_ORIGIN || !env.SESSION_SECRET) return null;
   return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET, redirectUri: `${env.UI_ORIGIN}/login/github/callback` };
@@ -1973,7 +1956,7 @@ function identities(env: Env) {
 }
 
 /** A refusal the browser sees as a page and a CLI sees as typed JSON. */
-function refuse(request: Request, reason: RefusalReason | "not-invited" | "state" | "exchange" | "unconfigured", hint: string, status = 403): Response {
+function refuse(request: Request, reason: RefusalReason, hint: string, status = 403): Response {
   const wantsHtml = (request.headers.get("accept") ?? "").includes("text/html");
   if (wantsHtml) {
     return new Response(null, { status: 302, headers: { location: `/login/refused?reason=${encodeURIComponent(reason)}` } });
@@ -1982,9 +1965,6 @@ function refuse(request: Request, reason: RefusalReason | "not-invited" | "state
 }
 
 const REFUSALS: Record<string, string> = {
-  "not-human": "Only human accounts can use the console. Agents reach it through their runtime, not a browser.",
-  "no-email": "Your Raft account has no verified email, and the console keys your agents off one.",
-  "wrong-server": "Your Raft account is not a member of this server.",
   "not-invited": "This GitHub account is not on this deployment's list. Ask the operator to add it.",
   state: "The sign-in did not start here, or took longer than ten minutes. Start again.",
   exchange: "The sign-in provider did not accept the code. Start again.",
@@ -2006,68 +1986,13 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       const reason = url.searchParams.get("reason") ?? "";
       return new Response(refusedPage(reason), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
     }
-    case "/login/raft": {
-      // INTERIM (2026-09-12): the login page no longer links here, but this
-      // route is kept on purpose. Until the GitHub OAuth App exists and one
-      // GitHub sign-in has been confirmed, it is the only browser way in;
-      // open it by URL. It goes, with everything Raft, in the change after.
-      const cfg = raftConfig(env);
-      if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
-      const now = Date.now();
-      const st: LoginState = { state: randomToken(), nonce: randomToken(), verifier: randomToken(48), returnTo: "/ui", iat: now, exp: now + LOGIN_TTL_MS };
-      const location = await authorizeUrl(cfg, st);
-      return new Response(null, {
-        status: 302,
-        headers: {
-          location,
-          // Scoped to the callback path: the browser presents it once, there.
-          "set-cookie": cookieHeader(LOGIN_COOKIE, await seal(env.SESSION_SECRET!, st), LOGIN_TTL_MS / 1000, "/login/raft"),
-        },
-      });
-    }
-    case "/login/raft/callback": {
-      const cfg = raftConfig(env);
-      if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
-      // A human sign-in is stateful: no login cookie, or a state that does not
-      // match, and the code is not exchanged at all.
-      const st = await open<LoginState>(env.SESSION_SECRET!, readCookie(request, LOGIN_COOKIE));
-      const state = url.searchParams.get("state");
-      const code = url.searchParams.get("code");
-      if (!st || !state || !code || !constantTimeEqual(state, st.state)) {
-        return refuse(request, "state", REFUSALS.state, 400);
-      }
-      let identity;
-      try {
-        const tok = await exchangeCode(cfg, code, st.verifier);
-        // The id_token is checked against Raft's published keys, and the
-        // profile comes from userinfo under the access token; the two must
-        // name the same principal.
-        const info = await fetchUserinfo(cfg, tok.access_token);
-        if (tok.id_token) {
-          const claims = await verifyIdToken(tok.id_token, { issuer: cfg.issuer, clientId: cfg.clientId, nonce: st.nonce, jwks: await fetchJwks(cfg.issuer) });
-          if (claims.sub !== info.sub) throw new Error("id_token and userinfo disagree on the subject");
-          identity = { ...info, ...claims, name: info.name ?? claims.name, picture: info.picture ?? claims.picture };
-        } else {
-          identity = info;
-        }
-      } catch (e: any) {
-        console.error("login: exchange failed", String(e?.message ?? e));
-        return refuse(request, "exchange", REFUSALS.exchange, 502);
-      }
-      const verdict = admit(identity, cfg.serverId);
-      if (!verdict.ok) return refuse(request, verdict.reason, REFUSALS[verdict.reason]);
-      const headers = new Headers({ location: new URL(st.returnTo, url).toString() });
-      headers.append("set-cookie", await sessionCookieFor(env.SESSION_SECRET!, verdict.viewer, identity.sub));
-      headers.append("set-cookie", clearCookieHeader(LOGIN_COOKIE, "/login/raft"));
-      return new Response(null, { status: 302, headers });
-    }
     case "/login/github": {
       const cfg = githubConfig(env);
       if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       const now = Date.now();
-      // No nonce or verifier: GitHub's flow has neither. The state alone
-      // binds the callback to this browser.
-      const st: LoginState = { state: randomToken(), nonce: "", verifier: "", returnTo: "/ui", iat: now, exp: now + LOGIN_TTL_MS };
+      // The state alone binds the callback to this browser (GitHub's flow has
+      // no nonce or PKCE verifier).
+      const st: LoginState = { state: randomToken(), returnTo: "/ui", iat: now, exp: now + LOGIN_TTL_MS };
       return new Response(null, {
         status: 302,
         headers: {
@@ -2153,7 +2078,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
         viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v) } : null,
         build: env.GIT_COMMIT ?? null,
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
-        loginConfigured: raftConfig(env) !== null,
+        loginConfigured: githubConfig(env) !== null,
         qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
       });
     }
