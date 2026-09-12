@@ -27,7 +27,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
-import { recordRun } from "../record.ts";
+import { recordRun, workerBuild } from "../record.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -308,7 +308,7 @@ if (act) {
     (grading ? `, of which ${(grading / 1000).toFixed(1)}s is this runner grading` : ""));
 }
 const recorded = recordRun("swebench", OBJ, {
-  bench: "swebench-verified", base: BASE, object: `bench-${OBJ}`, offset: OFFSET, n: instances.length,
+  bench: "swebench-verified", base: BASE, build: await workerBuild(BASE), object: `bench-${OBJ}`, offset: OFFSET, n: instances.length,
   network: out.map((r: any) => r.network).find(Boolean) ?? null,
   startedAt: new Date(t0Run).toISOString(), results: out, totals, activity: act,
 });
