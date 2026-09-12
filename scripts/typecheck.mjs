@@ -39,6 +39,33 @@ export function baselineSignatures(text) {
     .map((l) => l.split(" #")[0].trim())
     .filter(Boolean);
 }
+
+/**
+ * The reason written beside each signature, by signature.
+ *
+ * Reasons used to be dropped by `--update`, on the argument that rewriting the
+ * file is the moment to decide again whether a reason still holds. The first
+ * real `--update` disproved it: an unrelated entry was retired and both reasons
+ * went with it, unremarked, while both were still true — one of them cody's
+ * diagnosis of a build problem nobody has fixed. Nothing prompted anyone,
+ * because a thing that vanishes prompts nobody.
+ *
+ * So `--update` carries them and says which ones it carried. That keeps the
+ * re-reading it was supposed to force — it is now something you see rather than
+ * something you were meant to remember — and stops the file losing the only
+ * copy of why an entry is not a debt.
+ */
+export function baselineReasons(text) {
+  const out = new Map();
+  for (const line of text.split("\n")) {
+    const at = line.indexOf(" #");
+    if (at < 0) continue;
+    const sig = line.slice(0, at).trim();
+    const why = line.slice(at + 2).trim();
+    if (sig && why) out.set(sig, why);
+  }
+  return out;
+}
 if (process.argv[1] && fileURLToPath(import.meta.url) !== process.argv[1]) {
   // Imported, not run: the caller wants the helpers above and not a type check.
 } else {
@@ -47,8 +74,16 @@ const text = (out.stdout ?? "") + (out.stderr ?? "");
 const sig = (l) => l.replace(/^([^(]+)\(\d+,\d+\): (error TS\d+: .*)$/, "$1: $2");
 const now = [...new Set(text.split("\n").filter((l) => /error TS\d+/.test(l)).map(sig))].sort();
 if (process.argv.includes("--update")) {
-  writeFileSync(BASELINE, now.join("\n") + "\n");
+  const kept = existsSync(BASELINE) ? baselineReasons(readFileSync(BASELINE, "utf8")) : new Map();
+  const carried = now.filter((s) => kept.has(s));
+  writeFileSync(BASELINE, now.map((s) => (kept.has(s) ? `${s} # ${kept.get(s)}` : s)).join("\n") + "\n");
   console.log(`baseline written: ${now.length} signatures`);
+  // Named, because the point of carrying a reason forward is that somebody
+  // sees it again. A reason whose signature is gone is not carried, and that
+  // is the one worth noticing: it was explaining something that no longer
+  // happens.
+  for (const s of carried) console.log(`  KEPT ${s} # ${kept.get(s)}`);
+  for (const [s, why] of kept) if (!now.includes(s)) console.log(`  DROPPED ${s} # ${why}`);
   process.exit(0);
 }
 const base = new Set(existsSync(BASELINE) ? baselineSignatures(readFileSync(BASELINE, "utf8")) : []);

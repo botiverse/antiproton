@@ -13,7 +13,7 @@
  * command line, where nothing could check it. The parse is a function now and
  * this is the thing that fails when it changes.
  */
-import { baselineSignatures } from "../scripts/typecheck.mjs";
+import { baselineSignatures, baselineReasons } from "../scripts/typecheck.mjs";
 
 let failed = 0;
 const check = (name: string, fn: () => void) => {
@@ -50,5 +50,29 @@ check("the real baseline parses to as many signatures as it has entries", async 
   }
 });
 
-console.log(`\n  ${"─".repeat(56)}\n  ${4 - failed} passed, ${failed} failed\n`);
+check("a reason is readable by signature, so --update can carry it", () => {
+  const text = [
+    "a.ts: error TS1: x # still true, and not a debt",
+    "b.ts: error TS2: y",
+    "c.ts: error TS3: z # another reason",
+  ].join("\n");
+  const reasons = baselineReasons(text);
+  if (reasons.size !== 2) throw new Error(`${reasons.size} reasons found, not 2`);
+  if (reasons.get("a.ts: error TS1: x") !== "still true, and not a debt") throw new Error("the wrong reason came back");
+  if (reasons.has("b.ts: error TS2: y")) throw new Error("an entry with no reason invented one");
+});
+
+check("a reason is keyed by the signature alone, so it survives a rewrite", () => {
+  // The file is rewritten by `--update`, and the only thing that connects the
+  // old line to the new one is the signature. A reason keyed on anything else
+  // — position, order, the full line — would not survive, which is how both
+  // reasons were lost the first time --update ran.
+  const before = "x.ts: error TS4: m # why it stays";
+  const sig = baselineSignatures(before)[0]!;
+  if (baselineReasons(before).get(sig) !== "why it stays") {
+    throw new Error("the reason does not come back under the signature the rewrite would use");
+  }
+});
+
+console.log(`\n  ${"─".repeat(56)}\n  ${6 - failed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

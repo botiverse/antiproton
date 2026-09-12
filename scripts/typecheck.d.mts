@@ -5,3 +5,4 @@
  * in the very file that counts them.
  */
 export function baselineSignatures(text: string): string[];
+export function baselineReasons(text: string): Map<string, string>;
