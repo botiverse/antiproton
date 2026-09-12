@@ -1049,6 +1049,38 @@ export class SqliteStore implements StorageAdapter {
     ).run(tenantId, agentId, plugin, choice, now());
   }
 
+  /** One transaction: the mount, its connection state, and its own secret. */
+  async renameMount(
+    tenantId: string, agentId: string, from: string, to: string,
+    secret: { newRef: string } | null,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (from === to) return { ok: true };
+    if (!to.trim()) return { ok: false, error: "a mount needs a name" };
+    const one = (q: string, ...b: unknown[]) => this.#db.prepare(q).get(...(b as any[]));
+    try {
+      return this.#tx(() => {
+        if (!one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, from)) {
+          return { ok: false as const, error: `no mount named ${from}` };
+        }
+        if (one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, to)) {
+          return { ok: false as const, error: `this agent already has a mount named ${to}` };
+        }
+        if (secret && one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, to)) {
+          return { ok: false as const, error: `a credential is already stored under the name ${to}` };
+        }
+        this.#db.prepare("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?").run(to, tenantId, agentId, from);
+        this.#db.prepare("UPDATE connections SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?").run(to, tenantId, agentId, from);
+        if (secret) {
+          this.#db.prepare("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?").run(to, tenantId, agentId, from);
+          this.#db.prepare("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?").run(secret.newRef, tenantId, agentId, to);
+        }
+        return { ok: true as const };
+      });
+    } catch (e) {
+      return { ok: false, error: `rename was not applied: ${String((e as Error)?.message ?? e)}` };
+    }
+  }
+
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
     const r = this.#db
       .prepare("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?")

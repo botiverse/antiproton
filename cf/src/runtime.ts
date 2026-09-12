@@ -453,6 +453,56 @@ export class AgentRuntime {
     return true;
   }
 
+  /**
+   * Rename a mount, with the one thing a rename must not do to a container.
+   *
+   * The alias is the operator's word for a mount, and until now it was the one
+   * thing about a mount that could not be changed — not by design, but because
+   * nothing implemented it. What made it look dangerous is that the alias keys
+   * two live things: the mount row and the connection state, and the second is
+   * where a running box's id sits. The store does both in one transaction, so
+   * "half a rename" is not a state this can reach.
+   *
+   * A third thing moves with them, and it is the one that is easy to miss:
+   * `attachCredential` stores a mount's own credential under the mount's
+   * alias, so `credentialMeta` and `removeCredential` look it up by whatever
+   * the mount is called now. Rename without it and the console shows a
+   * verified account as unverified with no name and no dates, while
+   * `removeCredential` clears the pointer and leaves the ciphertext row with
+   * nothing referring to it, for ever. An operator-configured reference is not
+   * ours to move: it names something outside this agent.
+   *
+   * Refused while a box is running. Nothing here can make a rename hurt a live
+   * container — the transaction sees to that — but a person who renames a
+   * machine mid-run has almost certainly lost track of which one it is, and the
+   * cheap answer ("it is busy, release it or wait") is better than the clever
+   * one.
+   */
+  async renameMount(
+    tenantId: string, agentId: string, from: string, to: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    await this.ready();
+    const mount = await this.store.getMountByAlias(tenantId, agentId, from);
+    if (!mount) return { ok: false, error: `no mount named ${from}` };
+    const running = await this.#runningBox(tenantId, agentId, from);
+    if (running) {
+      return { ok: false, error: `\`${from}\` has a container running (${running}); release it or wait until it is idle` };
+    }
+    // Only a credential this agent supplied moves. `operator:` references name
+    // something the deployment owns, under a name that has nothing to do with
+    // this mount's alias.
+    const own = isAgentRef(mount.secretRef);
+    return this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
+  }
+
+  /** The id of a box this mount is holding, if it is holding one. */
+  async #runningBox(tenantId: string, agentId: string, alias: string): Promise<string | null> {
+    // `getConnection` hands back the state itself, already parsed, and null
+    // once it has expired — an expired session is not one a box outlives.
+    const state: any = await this.store.getConnection(tenantId, agentId, alias).catch(() => null);
+    return typeof state?.boxId === "string" ? state.boxId : null;
+  }
+
   /** What a page may show for a mount's credential. Never the value, and
    *  nothing derived from it: an account name is the far end's label. */
   async credentialMeta(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null }) {

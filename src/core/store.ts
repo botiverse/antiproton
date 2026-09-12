@@ -325,4 +325,32 @@ export interface StorageAdapter {
   setPluginChoice(
     tenantId: string, agentId: string, plugin: string, choice: PluginChoice,
   ): Promise<void>;
+
+  /**
+   * Give a mount a different name, moving everything keyed by the old one.
+   *
+   * The alias is part of the primary key of both `mounts` and `connections`,
+   * and the second of those is where a running container's id lives. Renaming
+   * one and not the other leaves a box nothing can reach and nothing can
+   * release, billed by the second — so this is one transaction or none of it,
+   * and that atomicity is the only reason it belongs in the store rather than
+   * in three calls from the runtime.
+   *
+   * History is not moved. `operations` and `approvals` carry the alias a call
+   * actually happened under, and rewriting that would make the record say
+   * something that never happened.
+   *
+   * `secret` is passed in rather than derived here, because "a mount's own
+   * credential is stored under the mount's alias" is the runtime's convention
+   * (`attachCredential`), and this is not the place to state it a second time.
+   * When given, the row named `from` is renamed to `to` and the mount's
+   * reference is repointed. Without it a renamed mount keeps a reference to a
+   * secret named after a name it no longer has, and every lookup that goes by
+   * the current alias — the console's account panel, removing a credential —
+   * quietly finds nothing.
+   */
+  renameMount(
+    tenantId: string, agentId: string, from: string, to: string,
+    secret: { newRef: string } | null,
+  ): Promise<{ ok: true } | { ok: false; error: string }>;
 }

@@ -730,6 +730,42 @@ export class DurableObjectStore implements StorageAdapter {
       tenantId, agentId, plugin, choice, this.#now());
   }
 
+  /** One transaction: the mount, its connection state, and its own secret. */
+  async renameMount(
+    tenantId: string, agentId: string, from: string, to: string,
+    secret: { newRef: string } | null,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (from === to) return { ok: true };
+    if (!to.trim()) return { ok: false, error: "a mount needs a name" };
+    try {
+      return this.#tx(() => {
+        if (!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, from)) {
+          return { ok: false as const, error: `no mount named ${from}` };
+        }
+        if (this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, to)) {
+          return { ok: false as const, error: `this agent already has a mount named ${to}` };
+        }
+        // Checked rather than left to the primary key, because a constraint
+        // failure inside the transaction would roll the whole rename back with
+        // a message about SQL rather than about the mount.
+        if (secret && this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, to)) {
+          return { ok: false as const, error: `a credential is already stored under the name ${to}` };
+        }
+        this.#sql.exec("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
+        this.#sql.exec("UPDATE connections SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
+        if (secret) {
+          this.#sql.exec("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?", to, tenantId, agentId, from);
+          this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?", secret.newRef, tenantId, agentId, to);
+        }
+        return { ok: true as const };
+      });
+    } catch (e) {
+      // The transaction is undone by the failure; say so, because "it failed"
+      // and "it half happened" are the two things a person needs told apart.
+      return { ok: false, error: `rename was not applied: ${String((e as Error)?.message ?? e)}` };
+    }
+  }
+
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
     this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?",
       secretRef, tenantId, agentId, alias);
