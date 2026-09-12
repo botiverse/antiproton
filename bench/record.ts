@@ -49,10 +49,17 @@ export function driverCommit(): { commit: string; dirty: boolean } | null {
 }
 
 export function recordRun(bench: string, obj: string, body: unknown): string {
-  const day = new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const day = now.toISOString().slice(0, 10);
   const dir = new URL(`../report/runs/${day}/`, import.meta.url).pathname;
   mkdirSync(dir, { recursive: true });
   const file = `${dir}${bench}-${obj}-${Date.now().toString(36)}.json`;
-  writeFileSync(file, JSON.stringify(body, null, 1));
-  return file.replace(/^.*\/report\//, "report/");
+  const rel = file.replace(/^.*\/report\//, "report/");
+  // Where and when this file was written, inside the bytes: a record that is
+  // copied elsewhere keeps the testimony that otherwise lives only in its
+  // path and mtime (Dora, Vera, 2026-09-12). `file` is relative to the tree
+  // the driver ran in; `driver` (from the callers) names that tree.
+  const written = { at: now.toISOString(), file: rel };
+  writeFileSync(file, JSON.stringify({ ...(body as object), written }, null, 1));
+  return rel;
 }
