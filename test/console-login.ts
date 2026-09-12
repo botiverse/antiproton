@@ -2,8 +2,8 @@
  * The door and the rail's corner, checked where a person would read them.
  *
  * The sign-in page is the one page an unknown visitor sees, so the checks
- * are about what it offers and what it withholds: one way in (Login with
- * Raft), no mention of the mechanism it replaces, and no trace of the QA
+ * are about what it offers and what it withholds: one way in (sign in with
+ * GitHub), no mention of the mechanisms it replaces, and no trace of the QA
  * entrance, which is a secret rather than a choice. A refused sign-in says
  * what happened and what to do, and an unknown reason is shown escaped
  * rather than trusted. In the console, a signed-in person sees their name
@@ -21,12 +21,21 @@ function check(name: string, fn: () => void) {
 const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); };
 const count = (s: string, re: RegExp) => (s.match(re) ?? []).length;
 
-check("the sign-in page offers one way in, to /login/raft, and says so in Raft's words", () => {
+check("the sign-in page offers one way in, to /login/github, and says so in GitHub's words", () => {
   const h = loginPage();
-  must(/<a class="btn" href="\/login\/raft"[^>]*>[\s\S]*?Login with Raft<\/a>/.test(h), "the button goes to /login/raft and reads 'Login with Raft'");
+  must(/<a class="btn" href="\/login\/github"[^>]*>[\s\S]*?Sign in with GitHub<\/a>/.test(h), "the button goes to /login/github and reads 'Sign in with GitHub'");
   must(count(h, /href="\/login\//g) === 1, "exactly one sign-in link");
-  must(/Human accounts only/.test(h), "it says humans only before the round trip");
-  must(/name and email/.test(h), "it says what Raft shares");
+  must(/Invited GitHub accounts only/.test(h), "it says invited accounts only before the round trip");
+  must(/username, name and avatar/.test(h), "it says what GitHub shares");
+});
+
+check("the login provider that came before is gone from every page a person sees", () => {
+  // The design library the tokens come from is also called raft-ui; that
+  // name lives in a TypeScript comment, never in the served markup, so the
+  // pages can be held to zero mentions of the word.
+  for (const [name, h] of [["login", loginPage()], ["refused", refusedPage("state")], ["key", keyPage()]] as const) {
+    must(!/raft/i.test(h), `${name} page still names the old provider`);
+  }
 });
 
 check("the sign-in page names neither the old door nor the secret one", () => {
@@ -49,7 +58,8 @@ check("every refusal says what happened, what to do, and leads back to /login", 
   }
   // Every reason index.ts's refuse() can redirect with (admit()'s three, plus
   // the three the routes name themselves) has words of its own.
-  for (const r of ["not-human", "no-email", "wrong-server", "state", "exchange", "unconfigured"]) must(r in REFUSALS, `reason "${r}" has a page`);
+  for (const r of ["not-invited", "state", "exchange", "unconfigured"]) must(r in REFUSALS, `reason "${r}" has a page`);
+  for (const r of ["not-human", "no-email", "wrong-server"]) must(!(r in REFUSALS), `reason "${r}" belonged to the old provider`);
 });
 
 check("the key page is a form to /login/key and nothing else; the error is ours, escaped; no link leads to it", () => {
@@ -79,7 +89,9 @@ check("a viewer with a name, email and picture gets a face, a card and a way out
   const b = viewerBadge("alex@example.com", { email: "alex@example.com", name: "Alex Chen", username: "alex", picture: 'https://img.example/a.png?x="1"&y=2' });
   must(/<details class="me">/.test(b), "a card behind the face");
   must(/<b>Alex Chen<\/b>/.test(b), "the name, first");
-  must(/<span class="sub">alex@example.com<\/span>/.test(b), "the email under it");
+  must(/<span class="sub">@alex<\/span>/.test(b), "the handle under it, ahead of the email");
+  const emailOnly = viewerBadge("alex@example.com", { email: "alex@example.com", name: "Alex Chen", picture: null });
+  must(/<span class="sub">alex@example.com<\/span>/.test(emailOnly), "without a handle, the email");
   must(/<img src="https:\/\/img.example\/a.png\?x=&quot;1&quot;&amp;y=2"/.test(b), "the picture, escaped");
   must(/title="Alex Chen">A/.test(b), "the initial sits under the picture as a fallback");
   must(/<form method="post" action="\/logout">/.test(b), "sign out posts to /logout");

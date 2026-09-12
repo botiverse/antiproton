@@ -7,11 +7,11 @@
  * request, so nothing here can be talked into rendering a caller-supplied
  * identity: the pages carry the brand, one button, and words.
  *
- * The button goes to `/login/raft`, which starts the OpenID flow against Raft.
- * The console signs in humans only (a Raft *agent* account is refused after
- * the exchange, see `REFUSALS`), and it keys everything a person owns on their
- * verified email, so the page says both up front rather than after the
- * round trip. The QA entrance (`/login/key`) is deliberately absent from the
+ * The button goes to `/login/github`, which starts the OAuth flow against
+ * GitHub. Only invited accounts get in (anyone else is refused after the
+ * exchange, see `REFUSALS`), and everything a person owns is keyed on their
+ * GitHub account rather than on an email, so the page says both up front
+ * rather than after the round trip. The QA entrance (`/login/key`) is deliberately absent from the
  * sign-in page: it is a secret, not a choice. Its own form is rendered here
  * too (`keyPage`), so the one person who does reach it sees the same product.
  */
@@ -68,9 +68,9 @@ border:1px solid var(--line);border-radius:6px;outline:0}
 @media(max-width:480px){body{padding:14px;align-items:start}.door{padding:22px 18px 18px}}
 `;
 
-// Raft's mark, drawn small for the button: four squares, the platform's tile.
-// Monochrome so it takes the button's ink in every theme.
-const RAFT_MARK = `<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><rect x="1" y="1" width="6" height="6" rx="1.2"/><rect x="9" y="1" width="6" height="6" rx="1.2"/><rect x="1" y="9" width="6" height="6" rx="1.2"/><rect x="9" y="9" width="6" height="6" rx="1.2"/></svg>`;
+// GitHub's mark, drawn small for the button (the Octicons "mark-github"
+// glyph, MIT). Monochrome so it takes the button's ink in every theme.
+const GITHUB_MARK = `<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>`;
 
 function shell(title: string, body: string): string {
   return `<!doctype html><html lang="en" data-theme="brutal"><head><meta charset="utf-8">
@@ -89,16 +89,16 @@ ${THEME_BOOT}
 
 /**
  * GET /login. One button. The words say what the console is and what signing
- * in gives away (name and email), because a person deciding whether to press
- * a button deserves to know both before the redirect, not on Raft's consent
- * screen.
+ * in gives away (username, name and avatar), because a person deciding
+ * whether to press a button deserves to know both before the redirect, not
+ * on GitHub's consent screen.
  */
 export function loginPage(): string {
   return shell("sign in",
     `<h1>Sign in to the console</h1>
   <p>This console drives a real agent against the operator's model account, so it needs to know who you are.</p>
-  <a class="btn" href="/login/raft" rel="nofollow">${RAFT_MARK}Login with Raft</a>
-  <p class="fine">Human accounts only. Raft shares your name and email with antiproton; everything you create here is keyed on that email.
+  <a class="btn" href="/login/github" rel="nofollow">${GITHUB_MARK}Sign in with GitHub</a>
+  <p class="fine">Invited GitHub accounts only. GitHub shares your username, name and avatar with antiproton; everything you create here is keyed on that account.
   New to this? <a href="https://report.antiproton.ai/" target="_blank" rel="noopener">Read what antiproton is</a> first.</p>`);
 }
 
@@ -108,20 +108,10 @@ export function loginPage(): string {
  * none of them names the mechanism, because the person cannot act on it.
  */
 export const REFUSALS: Record<string, { title: string; body: string; next: string }> = {
-  "not-human": {
-    title: "That is an agent account",
-    body: "The console signs in people only. An agent reaches its work through the runtime, not through this page.",
-    next: "Sign in with your own Raft account instead.",
-  },
-  "no-email": {
-    title: "Your account did not share an email",
-    body: "The console keys everything you own on a verified email, so it cannot sign you in without one.",
-    next: "Add and verify an email on your Raft profile, then try again.",
-  },
-  "wrong-server": {
-    title: "Wrong Raft server",
-    body: "You signed in with an account on a Raft server this console is not registered with.",
-    next: "Try again and pick the server antiproton lives on.",
+  "not-invited": {
+    title: "That account is not on the list",
+    body: "This console lets in the GitHub accounts its operator has invited, and yours is not one of them yet.",
+    next: "Ask the operator to add your GitHub username, then sign in again.",
   },
   state: {
     title: "The sign-in did not come back the way it left",
@@ -129,20 +119,20 @@ export const REFUSALS: Record<string, { title: string; body: string; next: strin
     next: "Start the sign-in again from here.",
   },
   exchange: {
-    title: "Raft did not accept the sign-in",
-    body: "The one-time code Raft sent back could not be traded for an identity. Codes expire within minutes and work once.",
+    title: "GitHub did not accept the sign-in",
+    body: "The one-time code GitHub sent back could not be traded for an identity. Codes expire within minutes and work once.",
     next: "Start the sign-in again from here.",
   },
   unconfigured: {
     title: "Sign-in is not set up on this deployment",
-    body: "The operator has not configured Login with Raft here, so nobody can sign in yet.",
+    body: "The operator has not configured sign-in with GitHub here, so nobody can sign in yet.",
     next: "Tell the operator. There is nothing to do on your side.",
   },
 };
 
 const GENERIC = {
   title: "Sign-in did not complete",
-  body: "Raft sent you back without a usable identity.",
+  body: "GitHub sent you back without a usable identity.",
   next: "Try again; if it keeps happening, tell the operator what the reason below says.",
 };
 
@@ -155,7 +145,7 @@ export function refusedPage(reason: string): string {
     `<h1>${esc(r.title)}</h1>
   <p>${esc(r.body)}</p>
   ${tag}<p class="why">${esc(r.next)}</p>
-  <a class="btn" href="/login">${RAFT_MARK}Back to sign in</a>
+  <a class="btn" href="/login">Back to sign in</a>
   <p class="fine">Nothing was created. You are not signed in.</p>`);
 }
 
@@ -168,7 +158,7 @@ export function refusedPage(reason: string): string {
 export function keyPage(error?: string): string {
   return shell("sign in with a key",
     `<h1>Sign in with a key</h1>
-  <p class="why">For testing this deployment with a browser. A person signs in with <a href="/login">Login with Raft</a> instead.</p>
+  <p class="why">For testing this deployment with a browser. A person signs in with <a href="/login">GitHub</a> instead.</p>
   <form method="post" action="/login/key" autocomplete="off">
     <label class="field"><span>key</span><input type="password" name="key" autocomplete="off" spellcheck="false" autofocus required></label>
     ${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
