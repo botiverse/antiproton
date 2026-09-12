@@ -25,6 +25,9 @@ export interface Viewer {
   /** The agent this person owns, when the sign-in resolved one through the
    *  identity table (GitHub). Absent for identities keyed on their email. */
   agentId?: string;
+  /** The tenant that agent lives in: each self-registered person is their
+   *  own (quota and data are per tenant); older identities are "demo". */
+  tenantId?: string;
 }
 
 /** What the session cookie carries. Sealed, never trusted unsealed. */
@@ -36,9 +39,10 @@ export interface SessionClaims {
   picture: string | null;
   sub: string;
   source: "qa" | "github";
-  /** Resolved at sign-in from the identity table; a session carries it so
-   *  no request has to look it up again. */
+  /** Resolved at sign-in from the identity table; a session carries them so
+   *  no request has to look them up again. */
   agentId?: string;
+  tenantId?: string;
   iat: number;
   exp: number;
 }
@@ -169,7 +173,7 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
         // A GitHub session without its agent is not an identity: the key is
         // the mapping, and a cookie that lost it names nobody.
         if (typeof s.agentId !== "string" || !s.agentId) return null;
-        return { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "github", agentId: s.agentId };
+        return { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "github", agentId: s.agentId, tenantId: typeof s.tenantId === "string" && s.tenantId ? s.tenantId : "demo" };
       }
       // Any other source (the Raft sessions that once existed) names nobody:
       // the holder signs in again.
@@ -191,6 +195,7 @@ export async function sessionCookieFor(secret: string, v: Viewer, sub: string, n
     v: 1, who: v.email, name: v.name, username: v.username, picture: v.picture, sub,
     source: v.source === "qa" ? "qa" : "github",
     ...(v.agentId ? { agentId: v.agentId } : {}),
+    ...(v.tenantId ? { tenantId: v.tenantId } : {}),
     iat: now, exp: now + SESSION_TTL_MS,
   };
   return cookieHeader(SESSION_COOKIE, await seal(secret, claims), SESSION_TTL_MS / 1000);
@@ -275,6 +280,12 @@ export function githubDefaultAgentId(profile: Pick<GithubProfile, "id">): string
   return `u-github_${profile.id}`;
 }
 
+/** The tenant a self-registered person gets: their own, so quota and data
+ *  are theirs alone (tygg, 2026-09-12: 每个 user 都应该是一个独立的 tenant). */
+export function githubDefaultTenantId(profile: Pick<GithubProfile, "id">): string {
+  return `t-github_${profile.id}`;
+}
+
 /** The key the identity table is looked up by: the numeric id, never the login. */
 export function githubIdentityKey(profile: Pick<GithubProfile, "id">): string {
   return `github:${profile.id}`;
@@ -285,7 +296,7 @@ export function githubIdentityKey(profile: Pick<GithubProfile, "id">): string {
  * only: the verified primary address when GitHub exposes one, otherwise a
  * name that can never be mistaken for one. The agent comes from the table.
  */
-export function githubViewer(profile: GithubProfile, emails: GithubEmail[], agentId: string): Viewer {
+export function githubViewer(profile: GithubProfile, emails: GithubEmail[], agentId: string, tenantId = "demo"): Viewer {
   const primary = emails.find((m) => m.primary && m.verified)?.email
     ?? emails.find((m) => m.verified)?.email
     ?? null;
@@ -296,5 +307,6 @@ export function githubViewer(profile: GithubProfile, emails: GithubEmail[], agen
     picture: profile.avatar_url ?? null,
     source: "github",
     agentId,
+    tenantId,
   };
 }

@@ -10,7 +10,7 @@
 import {
   seal, open, resolveViewer, sessionCookieFor, b64url, unb64url,
   readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
-  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId,
+  githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
   GITHUB_TOKEN, GITHUB_API,
 } from "../cf/src/auth.ts";
 
@@ -160,6 +160,8 @@ await check("github: the profile is fetched under the token with a User-Agent; e
 await check("github: the identity key is the numeric id; the viewer shows the verified primary email or a non-email name", async () => {
   assert(githubIdentityKey({ id: 1024025 }) === "github:1024025", "key must be github:<id>");
   assert(githubDefaultAgentId({ id: 1024025 }) === "u-github_1024025" && /^u-[A-Za-z0-9._-]{1,48}$/.test(githubDefaultAgentId({ id: 1024025 })), "a self-registered agent id names the numeric id and passes the admin route's shape");
+  assert(githubDefaultTenantId({ id: 1024025 }) === "t-github_1024025" && /^[A-Za-z0-9._-]{1,48}$/.test(githubDefaultTenantId({ id: 1024025 })), "a self-registered tenant names the numeric id and passes the admin route's shape");
+  assert(githubViewer({ id: 7, login: "x" }, [], "u-x").tenantId === "demo" && githubViewer({ id: 7, login: "x" }, [], "u-x", "t-github_7").tenantId === "t-github_7", "viewer tenant defaults to demo and carries the row's tenant");
   const v = githubViewer({ id: 1024025, login: "torvalds", name: "Linus", avatar_url: "https://a/x.png" },
     [{ email: "old@x.test", primary: false, verified: true }, { email: "linus@x.test", primary: true, verified: true }, { email: "un@x.test", primary: false, verified: false }], "u-linus_x.test");
   assert(v.email === "linus@x.test" && v.username === "torvalds" && v.picture === "https://a/x.png" && v.source === "github" && v.agentId === "u-linus_x.test", "viewer fields");
@@ -170,12 +172,16 @@ await check("github: the identity key is the numeric id; the viewer shows the ve
 });
 
 await check("github: a session carries the mapped agent and resolves with it; one that lost it names nobody", async () => {
-  const v = githubViewer({ id: 1024025, login: "torvalds" }, [], "u-tygg_example.test");
+  const v = githubViewer({ id: 1024025, login: "torvalds" }, [], "u-tygg_example.test", "t-github_1024025");
   const cookie = await sessionCookieFor(SECRET, v, "github:1024025", now);
   const r = await resolveViewer(req(cookie.split(";")[0]), { SESSION_SECRET: SECRET }, { now });
-  assert(r && r.source === "github" && r.agentId === "u-tygg_example.test" && r.username === "torvalds", "github session must resolve with its agent");
+  assert(r && r.source === "github" && r.agentId === "u-tygg_example.test" && r.tenantId === "t-github_1024025" && r.username === "torvalds", "github session must resolve with its agent and tenant");
   const claims = await open<any>(SECRET, cookie.split(";")[0].split("=")[1], now);
-  assert(claims.agentId === "u-tygg_example.test" && claims.source === "github", "claims carry agentId + source");
+  assert(claims.agentId === "u-tygg_example.test" && claims.tenantId === "t-github_1024025" && claims.source === "github", "claims carry agentId + tenantId + source");
+  // A session sealed before tenants were per person names no tenant: it is "demo".
+  const older = await seal(SECRET, { ...claims, tenantId: undefined });
+  const ro = await resolveViewer(req(`${SESSION_COOKIE}=${older}`), { SESSION_SECRET: SECRET }, { now });
+  assert(ro && ro.tenantId === "demo" && ro.agentId === "u-tygg_example.test", "a session without a tenant is the demo tenant, same agent");
   const lost = await seal(SECRET, { ...claims, agentId: undefined });
   assert(await resolveViewer(req(`${SESSION_COOKIE}=${lost}`), { SESSION_SECRET: SECRET }, { now }) === null, "a github session without an agent is nobody");
   // A session from the Raft login that once existed: well-formed, correctly
