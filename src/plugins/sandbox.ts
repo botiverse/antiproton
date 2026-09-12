@@ -547,20 +547,35 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       return { ok: false as const, kind: "rejected" as const, reason: "run9 needs both ak and sk; one of them is missing" };
     }
     try {
-      const res = await fetch(`${cfg.endpoint}/projects/${cfg.project}/workspace/boxes`, {
-        headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
-        signal: AbortSignal.timeout(cfg.timeoutMs),
-      });
+      // Asks about one box that cannot exist, rather than listing the project.
+      //
+      // Verifying a key by listing every box means the answer to "does this key
+      // work" arrives with everyone else's containers attached — under a shared
+      // account that is every other tenant's. Nothing here read that list, but
+      // the boundary was our filter rather than their refusal (cody, 2026-09-12),
+      // and a broker in front of run9 would refuse this call outright, so the
+      // narrow question is also the one that keeps working.
+      //
+      // Measured against the live API, like the statuses below, because the
+      // first version of this file guessed and was wrong:
+      //
+      //   keys good, box absent   400  {"error":"box not found"}      ← reached and authorised
+      //   keys bad                401  {"error":"invalid api key"}
+      //   project absent          400  {"error":"project not found"}
+      const res = await fetch(
+        `${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/b_credential_check_only`, {
+          headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
+          signal: AbortSignal.timeout(cfg.timeoutMs),
+        });
       if (res.ok) return { ok: true as const, account: cfg.project };
       const body = (await res.text()).slice(0, 200);
-      // Measured against the live API rather than assumed, because the first
-      // version of this guessed 404 for a missing project and run9 does not use
-      // it — every one of these is a 400, so the status alone cannot tell a bad
-      // key from a bad project name, and the body is what separates them:
-      //
-      //   bad keys            401  {"error":"invalid api key"}
-      //   project absent      400  {"error":"project not found"}
-      //   name not a name     400  {"error":"project_cid must match [a-z0-9_-]{3,20}"}
+      // The box is not there because nothing by that name ever is: reaching
+      // that answer means the keys were accepted and the project exists, which
+      // is the whole question.
+      if (/box not found/i.test(body)) return { ok: true as const, account: cfg.project };
+      // Status alone cannot separate a bad key from a bad project name — both
+      // arrive as 400 — so the body is what decides, and the name rule is
+      // quoted from run9's own message: project_cid must match [a-z0-9_-]{3,20}.
       if (res.status === 401 || res.status === 403) {
         return { ok: false as const, kind: "rejected" as const, reason: "run9 rejected these keys" };
       }
