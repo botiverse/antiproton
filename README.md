@@ -370,11 +370,11 @@ SWE-bench rows below say which environment produced them.
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
 | `pi-agent` | 8 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, and a run interrupted by eviction is reported open and finished |
 | `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
-| `pi-tools` | 11 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept |
+| `pi-tools` | 18 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
 | `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
 | `executor` · `http-plugin` | 20 | sandbox contract in-process (`executor` 10 runs the `spec/executor-spec` rows), fetch and HTML extraction (`http-plugin` 10) |
-| `state` | 12 | memory that survives a task, byte budgets, per-agent isolation |
+| `state` | 14 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, and every row `list` returns carrying the `ref` it is read back by |
 | `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
