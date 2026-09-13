@@ -178,4 +178,10 @@ check("each program's baseline speaks only for itself", () => {
 });
 
 console.log(`\n  ${"─".repeat(56)}\n  ${passed} passed, ${failed} failed\n`);
-process.exit(failed ? 1 : 0);
+// A suite that runs no cases must not report success. `failed ? 1 : 0` is the whole of
+// this file's verdict, and an empty run satisfies it — which is how a suite
+// dies without saying so: the gate runs every file (#245), but a file that
+// stopped asserting anything still exits 0. `cf/src/runtime.ts` records what
+// that cost once, when the one test guarding a version pin died the same day
+// the pin broke and nothing went red until the breakage reached production.
+process.exit(failed || passed === 0 ? 1 : 0);
