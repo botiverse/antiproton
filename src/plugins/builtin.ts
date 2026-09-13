@@ -19,7 +19,11 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
     tools: [
       { name: "search", summary: "Search available tools by keyword.", parameters: { type: "object", properties: { query: { type: "string" } } }, sideEffects: "read", idempotency: "native" },
       { name: "describe", summary: "Full schema for one tool.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] }, sideEffects: "read", idempotency: "native" },
-      { name: "mounts", summary: "List this agent's mounts and which account each is bound to.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" },
+      // "which account" was true of one seeded mount out of five. The others
+      // carry a label describing what the mount is — "open web", "agent
+      // memory", "container" — so the field promised an identity and delivered
+      // a description, and the model had no way to tell which it had.
+      { name: "mounts", summary: "List this agent's mounts and what each one is.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "native" },
     ],
     async invoke(tool, args, ctx) {
       const { tenantId, agentId } = ctx.caller;
@@ -35,7 +39,9 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
           parameters: t.parameters,
           plugin: m.plugin,
           version: m.toolVersion,
-          account: m.publicConfig.account ?? null,
+          // Named for what it holds: the operator's word for this mount,
+          // which is an account only when the operator made it one.
+          label: m.publicConfig.account ?? null,
           summary: t.summary,
           sideEffects: t.sideEffects,
         })),

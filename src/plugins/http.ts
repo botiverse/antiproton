@@ -389,8 +389,13 @@ export const httpPlugin: Plugin = {
           ? {
               body: formBody
                 ? new URLSearchParams(
+                    // A pair, said as a pair. `.map` widens `[k, String(v)]` to
+                    // `string[]`, and only one of the two runtimes' types accepts
+                    // that — which is why this was invisible until the programs
+                    // were split. The runtime value never changed; the type was
+                    // simply less specific than the thing it described.
                     Object.entries(a.body as Record<string, unknown>)
-                      .map(([k, v]) => [k, String(v)]),
+                      .map(([k, v]): [string, string] => [k, String(v)]),
                   ).toString()
                 : jsonBody ? JSON.stringify(a.body) : String(a.body),
             }

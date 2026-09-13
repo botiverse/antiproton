@@ -6,6 +6,7 @@
  * uses its default for ever and the symptom appears somewhere else entirely.
  */
 import { readFile } from "node:fs/promises";
+import { SqliteStore } from "../src/store/sqlite.ts";
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
@@ -15,8 +16,8 @@ import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf,
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
-import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
+import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
@@ -1236,6 +1237,49 @@ await check("an unreadable row reads as no container, and a usable one still rea
   const a = activityOf(asBoxState({ boxId: 7 } as any));
   if (a.live !== null) throw new Error("an unreadable row reported a running container");
   if (usageOf(asBoxState("nonsense" as any)).length !== 0) throw new Error("an unreadable row produced history");
+});
+
+/**
+ * What the catalogue calls a mount's label, and why it is not "account".
+ *
+ * The `mounts` tool used to say it listed "which account each is bound to",
+ * and hand the model `account: "open web"` — a description dressed as an
+ * identity. Four of the five seeded values are descriptions ("open web",
+ * "agent memory", "container", "builtin"); only GitHub's is an account. A
+ * field that is an identity for one mount and a description for four gives the
+ * model no way to know which it is holding.
+ */
+await check("the catalogue offers a mount's label, and does not call it an account", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "web", installationId: "i", connectionId: null,
+    plugin: "http", toolVersion: "1.0.0", publicConfig: { account: "open web" }, secretRef: null, policy: null,
+  } as any);
+  const tools = builtinToolsPlugin(store, () => [httpPlugin]);
+  const ctx: any = {
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "tools",
+    credential: null, publicConfig: {},
+    connection: { get: async () => null, set: async () => {} },
+    sibling: async () => null, record: async () => {},
+  };
+  // `search` answers from the catalogue, which is where the field lived.
+  const found: any = await tools.invoke("search", { query: "get" }, ctx);
+  const hit = (Array.isArray(found) ? found : found.matches ?? [])[0];
+  if (!hit) throw new Error(`nothing matched: ${JSON.stringify(found).slice(0, 200)}`);
+  if (hit.account !== undefined) throw new Error("the model is still told a description is an account");
+  if (hit.label !== "open web") throw new Error(`the label is missing: ${JSON.stringify(hit)}`);
+
+  const summary = tools.tools.find((t) => t.name === "mounts")!.summary;
+  if (/account/i.test(summary)) throw new Error(`the tool still promises accounts: ${summary}`);
+
+  // `mounts` hands back the configuration as it was written, where `account` is
+  // the operator's own key and means whatever they put in it. That is raw
+  // config, not the catalogue describing a mount, so it stays as it is.
+  const listed: any = await tools.invoke("mounts", {}, ctx);
+  const row = (listed.mounts ?? listed)[0];
+  if (row?.config?.account !== "open web") throw new Error(`the raw config stopped coming through: ${JSON.stringify(row)}`);
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
