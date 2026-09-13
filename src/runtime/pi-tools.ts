@@ -18,7 +18,7 @@
  * putting them in front of the model.
  */
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
-import { switchedOffMessage } from "./gateway.ts";
+import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
 import type { Json } from "../core/types.ts";
 
 /** What the model is offered, and the mount-qualified address behind it. */
@@ -287,10 +287,10 @@ export function runJsTool(
      *  different strings for one tool: `web__get` outside the sandbox, and the
      *  gateway's `web.get` inside it, with nothing saying which is which. */
     tools?: MountedTool[];
-    /** Aliases of mounts this agent has but has switched off. A script may still
-     *  name their tools (a session older than the switch), and the truthful
-     *  answer is "switched off", not "no such tool, try a neighbour". */
-    switchedOff?: string[];
+    /** Mounts this agent has but cannot be offered, with why. A script may still
+     *  name their tools (a session older than the change), and the truthful
+     *  answer is the reason, not "no such tool, try a neighbour". */
+    unoffered?: Array<{ alias: string; plugin: string; reason: "switched_off" | "plugin_unavailable" }>;
   } = {},
 ): AgentHarnessTool<undefined> {
   let seq = 0;
@@ -304,7 +304,7 @@ export function runJsTool(
     typeof name === "string" ? (byName.get(name) ?? name) : name;
   const offered = [...byName.keys()];
   // By the alias as it appears in a model-facing name (`gh` in gh__issues_list).
-  const switchedOff = new Map((opts.switchedOff ?? []).map((alias) => [modelName(alias), alias]));
+  const unoffered = new Map((opts.unoffered ?? []).map((u) => [modelName(u.alias), u]));
   return {
     name: "run_js",
     label: "run_js",
@@ -335,14 +335,16 @@ export function runJsTool(
           // broken (Piper, 2026-09-13). Dotted names still go on: the gateway
           // answers those as unknown_tool / not_mounted already.
           if (typeof call.tool === "string" && !call.tool.includes(".") && !byName.has(call.tool)) {
-            // A mount that exists but is switched off: say so, in the gateway's
+            // A mount that exists but cannot be offered: say why, in the gateway's
             // own words, rather than offer neighbours — the next move is a person
-            // turning it back on, not another tool (Piper, Dora, Rex, 2026-09-13).
-            const off = switchedOff.get(call.tool.split("__")[0]!);
-            if (off !== undefined) {
+            // or an operator, not another tool (Piper, Dora, Rex, 2026-09-13).
+            const u = unoffered.get(call.tool.split("__")[0]!);
+            if (u !== undefined) {
               return Promise.resolve({
                 status: "rejected" as const,
-                error: { code: "plugin_disabled", message: switchedOffMessage(off) },
+                error: u.reason === "switched_off"
+                  ? { code: "plugin_disabled", message: switchedOffMessage(u.alias) }
+                  : { code: "plugin_unavailable", message: pluginUnavailableMessage(u.alias, u.plugin) },
               });
             }
             // With nothing offered at all (every plugin switched off), "no tool

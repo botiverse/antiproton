@@ -19,6 +19,25 @@ export function switchedOffMessage(alias: string): string {
   return `the \`${alias}\` mount is switched off for this agent; someone has to turn it back on`;
 }
 
+/**
+ * A mount whose plugin is not installed here (never installed, or renamed).
+ * Said as a sentence the model can act on — it cannot call this mount at all,
+ * and fixing it is an operator's job — where the message used to be the bare
+ * plugin id (Piper, Dora, 2026-09-13).
+ */
+export function pluginUnavailableMessage(alias: string, plugin: string): string {
+  return `the \`${alias}\` mount uses the plugin "${plugin}", which is not installed here; none of its tools can be called until an operator fixes the mount`;
+}
+
+/**
+ * A mount that exists and is on, asked for a tool it does not have. Names the
+ * mount and the tool separately — never as one dispatch address, which the
+ * model is not shown — where the message used to be the bare tool name.
+ */
+export function unknownToolMessage(alias: string, tool: string): string {
+  return `the \`${alias}\` mount has no tool named "${tool}"`;
+}
+
 export interface SecretResolver {
   /** `scope` is the mount's owner. A reference is resolved for the agent whose
    *  mount names it, never for whoever wrote the string. */
@@ -403,7 +422,7 @@ export class ToolGateway {
 
     const plugin = this.#plugins.get(r.mount.plugin);
     if (!plugin) {
-      return { status: "rejected", error: { code: "plugin_unavailable", message: r.mount.plugin } };
+      return { status: "rejected", error: { code: "plugin_unavailable", message: pluginUnavailableMessage(r.mount.alias, r.mount.plugin) } };
     }
     // Withholding the tools is not the same as refusing the call, and only the
     // second one holds. A conversation opened before the plugin was switched
@@ -441,7 +460,7 @@ export class ToolGateway {
       };
     }
     if (!plugin.tools.some((t) => t.name === r.tool)) {
-      return { status: "rejected", error: { code: "unknown_tool", message: r.tool } };
+      return { status: "rejected", error: { code: "unknown_tool", message: unknownToolMessage(r.mount.alias, r.tool) } };
     }
 
     const schema = plugin.tools.find((t) => t.name === r.tool)!;

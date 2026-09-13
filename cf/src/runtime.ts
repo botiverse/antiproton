@@ -283,25 +283,27 @@ export function enabledMounts<T extends { plugin: string }>(
 }
 
 /**
- * The mounts this agent has but has switched off: installed plugin, answer
- * resolving to off. Not the complement of `enabledMounts` — a mount naming a
- * plugin nobody installed is neither on nor off, and telling a model "someone
- * has to turn it back on" about it would send a person to a switch that does
- * not exist.
+ * The mounts this agent has whose tools it cannot be offered, and why: the
+ * plugin is installed but switched off for this agent, or no plugin by that id
+ * is installed at all. The two need different sentences — a person can switch
+ * one back on; the other needs an operator — so the reason travels with them.
  *
- * run_js needs these by alias: a stale session still holds a switched-off
+ * run_js needs these by alias: a session older than the change still holds the
  * mount's tool names, and without them its refusal read as a typo with
- * unrelated neighbours (Piper, 2026-09-13).
+ * unrelated neighbours (Piper, Dora, Rex, 2026-09-13).
  */
-export function switchedOffMounts<T extends { plugin: string }>(
+export function unofferedMounts<T extends { plugin: string }>(
   mounts: T[],
   installed: Map<string, Pick<Plugin, "defaultForAllAgents">>,
   choices: Record<string, PluginChoice>,
-): T[] {
-  return mounts.filter((m) => {
+): Array<{ mount: T; reason: "switched_off" | "plugin_unavailable" }> {
+  const out: Array<{ mount: T; reason: "switched_off" | "plugin_unavailable" }> = [];
+  for (const m of mounts) {
     const plugin = installed.get(m.plugin);
-    return !!plugin && !pluginEnabled(plugin, choices[m.plugin]);
-  });
+    if (!plugin) out.push({ mount: m, reason: "plugin_unavailable" });
+    else if (!pluginEnabled(plugin, choices[m.plugin])) out.push({ mount: m, reason: "switched_off" });
+  }
+  return out;
 }
 
 /**
@@ -764,7 +766,8 @@ export class AgentRuntime {
     const records = enabledMounts(all, byId, choices);
     return {
       records,
-      switchedOff: switchedOffMounts(all, byId, choices).map((m) => m.alias),
+      unoffered: unofferedMounts(all, byId, choices)
+        .map(({ mount, reason }) => ({ alias: mount.alias, plugin: mount.plugin, reason })),
       mounts: records.map((m) => ({
         alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
       })),
@@ -802,7 +805,7 @@ export class AgentRuntime {
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
     await this.repinMounts(tenantId, agentId);
-    const { tools, records, switchedOff } = await this.#catalogueFor(tenantId, agentId);
+    const { tools, records, unoffered } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
     // The call context's task is the conversation, so held calls and audit
     // rows say which conversation asked. The first session's id is the same
@@ -824,8 +827,9 @@ export class AgentRuntime {
           onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
           // So a script names a tool the way the model's own list names it.
           tools: tools as MountedTool[],
-          // So a stale name for a switched-off mount is answered as switched off.
-          switchedOff,
+          // So a stale name for a mount that cannot be offered is answered with
+          // the reason, not as a typo.
+          unoffered,
         })]
       : [];
 

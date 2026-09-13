@@ -416,19 +416,32 @@ await check("关掉的挂载: run_js 里用它的名字,回'被关了、要人�
   const { switchedOffMessage } = await import("../src/runtime/gateway.ts");
   const seen: string[] = [];
   const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } };
-  const make = (tools: any[], switchedOff: string[]) => runJsTool(new QuickJsExecutor() as any, host as any, { tools, switchedOff }) as any;
+  const { pluginUnavailableMessage } = await import("../src/runtime/gateway.ts");
+  const make = (tools: any[], off: string[], unavailable: Array<[string, string]> = []) => runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools,
+    unoffered: [
+      ...off.map((alias) => ({ alias, plugin: "github", reason: "switched_off" as const })),
+      ...unavailable.map(([alias, plugin]) => ({ alias, plugin, reason: "plugin_unavailable" as const })),
+    ],
+  }) as any;
   const run = async (tool: any, name: string) => {
     seen.length = 0;
     const out = await tool.execute(`off-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.message ?? null, r.error?.candidates ?? null]);` });
     const [[status, code, message, candidates]] = JSON.parse(out.content[0].text);
     return { seen: [...seen], status, code, message, candidates };
   };
-  const withTools = make(qualifyMountedTools([named("get", "web.get")]), ["gh"]);
+  const withTools = make(qualifyMountedTools([named("get", "web.get")]), ["gh"], [["box", "run9"]]);
   const off = await run(withTools, "gh__issues_list");
   if (off.seen.length !== 0) throw new Error(`a switched-off mount's name reached the host: ${off.seen}`);
   if (off.code !== "plugin_disabled") throw new Error(`a switched-off mount was answered as ${off.code}: ${off.message}`);
   if (off.message !== switchedOffMessage("gh")) throw new Error(`the answer is not the gateway's sentence: ${off.message}`);
   if (off.candidates !== null) throw new Error(`a switched-off mount was offered neighbours: ${JSON.stringify(off.candidates)}`);
+  // A mount whose plugin is not installed (or was renamed): its own sentence,
+  // naming the plugin, not "switched off" and not neighbours.
+  const gone = await run(withTools, "box__run");
+  if (gone.code !== "plugin_unavailable") throw new Error(`an unavailable plugin's mount was answered as ${gone.code}: ${gone.message}`);
+  if (gone.message !== pluginUnavailableMessage("box", "run9")) throw new Error(`not the gateway's sentence: ${gone.message}`);
+  if (gone.candidates !== null) throw new Error(`an unavailable plugin's mount was offered neighbours: ${JSON.stringify(gone.candidates)}`);
   // A typo against an offered tool is still a typo.
   const typo = await run(withTools, "web__gte");
   if (typo.code !== "unknown_tool") throw new Error(`a typo stopped being unknown_tool: ${typo.code}`);
