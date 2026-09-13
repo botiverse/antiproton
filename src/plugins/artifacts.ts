@@ -90,18 +90,30 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       // and the next begins is a number the model was given, not a guess about
       // the structure.
       if (a.from !== undefined) {
-        const from = Math.max(0, Math.floor(Number(a.from)) || 0);
+        let from = Math.max(0, Math.floor(Number(a.from)) || 0);
+        // The note's `from` is always a whole-character boundary, but the model
+        // may compute its own; on the second half of a pair, start at the pair
+        // (Piper, 2026-09-13). The result's `from` says where it really began.
+        const first = raw.charCodeAt(from);
+        if (from > 0 && from < raw.length && first >= 0xdc00 && first <= 0xdfff
+          && (raw.charCodeAt(from - 1) & 0xfc00) === 0xd800) from--;
         let end = Math.min(from + READ_PAGE, raw.length);
-        // Half a surrogate pair is not a character; the next page starts with it.
+        // Half a surrogate pair is not a character; this page stops before it.
         const last = raw.charCodeAt(end - 1);
         if (end < raw.length && end - 1 > from && last >= 0xd800 && last <= 0xdbff) end--;
         const text = raw.slice(from, end);
         const to = from + text.length;
+        // `from` pages text; list arguments have nothing to act on here, and a
+        // dropped argument must not look like one that had nothing to do (#270).
+        const unused = (["fields", "offset", "limit"] as const).filter((k) => a[k] !== undefined);
+        const paging = to < raw.length
+          ? `showing characters ${from}-${to} of ${raw.length}; continue with read { ref, from: ${to} }`
+          : `end of result (${raw.length} characters)`;
         return {
           kind: "text", bytes: raw.length, from, to, text,
-          note: to < raw.length
-            ? `showing characters ${from}-${to} of ${raw.length}; continue with read { ref, from: ${to} }`
-            : `end of result (${raw.length} characters)`,
+          note: unused.length
+            ? `${paging}; ${unused.join(", ")} page a list and do not apply with from, so they were not used`
+            : paging,
         };
       }
       let parsed: unknown;

@@ -123,6 +123,23 @@ await check("a page never ends inside a character", async () => {
   if (!String(r.note).includes("from: 16383")) throw new Error(`next page must start at the emoji: ${r.note}`);
 });
 
+await check("from with list arguments says they were not used, rather than dropping them", async () => {
+  // Piper, 2026-09-13: fields came back silently ignored, the shape #270 removed.
+  const r = await reader(items)({ from: 0, fields: ["id"], limit: 5 });
+  if (r.kind !== "text") throw new Error(`from must page text: ${JSON.stringify(r).slice(0, 120)}`);
+  if (!/fields, limit .*not used/.test(String(r.note))) throw new Error(`the unused arguments are not named: ${r.note}`);
+  const plain = await reader(items)({ from: 0 });
+  if (/not used/.test(String(plain.note))) throw new Error(`nothing was given, so nothing is unused: ${plain.note}`);
+});
+
+await check("a from on the second half of a character starts at the whole character", async () => {
+  // Stored text is '"' + ten a's + an emoji + 'b"': 11 is its first half, 12 its second.
+  const r = await reader("a".repeat(10) + "\u{1F600}b")({ from: 12 });
+  if (r.from !== 11) throw new Error(`the page must start at the pair, and say so: from ${r.from}`);
+  const c = r.text.charCodeAt(0);
+  if (c >= 0xdc00 && c <= 0xdfff) throw new Error(`page starts with half a character: ${c.toString(16)}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
