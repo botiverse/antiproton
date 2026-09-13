@@ -11,6 +11,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { offloadLimit, tooLargeResult } from "../cf/src/runtime.ts";
+import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -117,6 +118,14 @@ await check("a 10 KB result is parked when it can be read back, and kept whole w
   must(10_000 > offloadLimit("files__read"), `with a reader, 10 KB must be parked (limit ${offloadLimit("files__read")})`);
   must(10_000 <= offloadLimit(null), `without a reader, 10 KB must not be cut (limit ${offloadLimit(null)})`);
   must(4 * 1024 <= offloadLimit("files__read"), "exactly 4 KiB still goes inline");
+});
+
+await check("the model is told the size at which its results are parked", async () => {
+  // A behaviour the model has to adapt to is stated where the model reads
+  // (tygg, 2026-09-13), and the number in that sentence is the one that parks.
+  const said = await artifactsPlugin(null as any, "b").promptContribution!({ alias: "artifacts" } as any);
+  must(String(said).includes(`over ${offloadLimit("artifacts__read") / 1024} KB`), `the prompt must state the parking size: ${said}`);
+  must(String(said).includes("over 4 KB"), `tygg's number is 4K: ${said}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

@@ -8,6 +8,14 @@ import type { R2Artifacts } from "../store/artifacts.ts";
  * Projection and slicing happen host-side on purpose — the point is to keep the
  * model's context small, so returning the whole blob would defeat the offload.
  */
+
+/**
+ * Past this size a tool result is parked, for an agent that has this plugin's
+ * `read` tool. It lives here because the sentence that tells the model the
+ * number is here too; the runtime reads the same constant.
+ */
+export const PARK_BYTES = 4 * 1024;
+
 export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
   return {
     id: "artifacts",
@@ -31,9 +39,9 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
      * and a sentence about "the artifacts tool" is wrong the moment they do.
      */
     async promptContribution(ctx) {
-      return "Large results may come back summarised with an artifact reference instead of the "
-        + `full payload; read them back with the \`read\` tool on \`${ctx.alias}\`, projecting only `
-        + "the fields you need.";
+      return `A tool result over ${PARK_BYTES / 1024} KB comes back as a short preview with an artifact `
+        + `reference instead of the full payload; read the rest with the \`read\` tool on \`${ctx.alias}\`, `
+        + "projecting only the fields you need.";
     },
 
     tools: [
