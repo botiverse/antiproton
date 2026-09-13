@@ -60,9 +60,17 @@ Reach for run_js only when it earns its cost — it is a whole extra round trip:
 For a single lookup, call the tool directly instead. Never wrap one plain call
 in run_js.
 
+Each run starts from nothing: globals, variables and anything you set on
+globalThis are gone by the next run, so carry what you need in your own output
+or in a tool that stores it.
+
 Inside run_js: every call returns { status, ... }. "succeeded" carries .result,
 "rejected" carries .error.code. There is no fetch, require, fs or process — the
-tool tag is the only way out. Nothing persists between runs.`;
+tool tag is the only way out. console.log is not returned; only output() is.
+The clock does not advance while code runs (it moves only when a tool call
+returns), so Date.now() and performance.now() cannot time a computation.
+What you output() comes back into this conversation as it is, up to 64 KiB, and
+is not turned into an artifact reference — output only what you need to read.`;
 
 /** Kept for tests and for anything that wants the unadorned text. */
 export const BASE_SYSTEM = CORE;
