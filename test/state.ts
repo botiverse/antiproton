@@ -233,6 +233,44 @@ await check("list 真的把键列出来,而不是只报个数", async () => {
   if (filtered.total?.keys !== 2) throw new Error("the total followed the filter instead of the store");
 });
 
+await check("remember 与 put 是同一个命名空间,而描述现在说了这件事", async () => {
+  // A fresh agent found this by experiment: it called `get` on the `journal`
+  // document and got found:true, so the two share a store — but no description
+  // said so, and it wrote that it had guessed (via Vera, 2026-09-13). The cost
+  // of guessing is not curiosity: a `put` to `journal` replaces what has been
+  // remembered, and nothing warns first.
+  const { plugin, ctx } = await fixture();
+  await plugin.invoke("remember", { key: "journal", text: "shipped the gate" }, ctx());
+  const got = await plugin.invoke("get", { key: "journal" }, ctx()) as Record<string, unknown>;
+  if (got.found !== true) throw new Error(`remember and get are not one namespace after all: ${JSON.stringify(got)}`);
+
+  await plugin.invoke("put", { key: "journal", value: "replaced" }, ctx());
+  const after = await plugin.invoke("get", { key: "journal" }, ctx()) as Record<string, unknown>;
+  if (after.value !== "replaced") throw new Error(`put did not replace the document: ${JSON.stringify(after.value)}`);
+
+  // The behaviour was always this; what was missing was saying it.
+  const tools = Object.fromEntries(plugin.tools.map((t) => [t.name, t.summary]));
+  if (!/same store|one store/.test(tools.remember!)) throw new Error(`remember does not say it shares a store: ${tools.remember}`);
+  if (!/one store|remember/.test(tools.put!)) throw new Error(`put does not say it shares a store: ${tools.put}`);
+});
+
+await check("list 每行带 ref,而描述现在说了它是什么", async () => {
+  // `list` returns `{key, bytes, ref, updatedAt}` per row and its summary named
+  // only the first, second and fourth. The agent reported `ref` as a field "no
+  // description mentions" — and it is the useful one: a parked value can be
+  // opened from the artifacts mount without a `get` first.
+  const { plugin, ctx } = await fixture();
+  await plugin.invoke("put", { key: "small", value: "inline" }, ctx());
+  const listed = await plugin.invoke("list", {}, ctx()) as { keys: Array<Record<string, unknown>> };
+  const row = listed.keys.find((r) => r.key === "small");
+  if (!row) throw new Error(`the key is not listed: ${JSON.stringify(listed)}`);
+  if (!("ref" in row)) throw new Error(`the row has no ref column: ${JSON.stringify(row)}`);
+  if (row.ref !== null) throw new Error(`an inline value should list ref: null, got ${JSON.stringify(row.ref)}`);
+
+  const summary = plugin.tools.find((t) => t.name === "list")!.summary;
+  if (!summary.includes("ref")) throw new Error(`the summary still does not name the ref column: ${summary}`);
+});
+
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

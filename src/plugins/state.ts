@@ -135,7 +135,9 @@ export function statePlugin(
           "having next time (a preference, a decision, a hard-won detail), `todo` for something " +
           "still open, `journal` for what happened. These three are shown to you automatically " +
           "when a task starts, so anything you put there you will see again without looking it " +
-          "up. Write the fact, not the story. Never write a credential.",
+          "up. Write the fact, not the story. Never write a credential. A document is a key in " +
+          "the same store `put`, `get`, `list` and `forget` use, so `get` on `journal` returns it " +
+          "and a `put` to that key replaces the whole document rather than appending to it.",
         parameters: {
           type: "object",
           properties: {
@@ -152,7 +154,9 @@ export function statePlugin(
         summary:
           "Store a value under a key, replacing whatever was there. For data rather than notes — " +
           "a result you will need later, a structure you do not want to rebuild. Large values are " +
-          "kept in object storage automatically and handed back as a reference.",
+          "kept in object storage automatically and handed back as a reference. Keys share one " +
+          "store with `remember`'s documents, so writing to `memory`, `todo` or `journal` here " +
+          "overwrites what you have been remembering.",
         parameters: {
           type: "object",
           properties: { key: { type: "string" }, value: {} },
@@ -176,7 +180,11 @@ export function statePlugin(
       },
       {
         name: "list",
-        summary: "What is stored, with sizes and when it changed. Values are not returned.",
+        summary:
+          "What is stored, with sizes and when it changed. Values are not returned. Each row also " +
+          "carries `ref`: the r2:// reference when that value was too large to keep inline, and " +
+          "null when it was not — so a large value can be opened from the artifacts mount without " +
+          "a `get` first.",
         parameters: {
           type: "object",
           properties: {
