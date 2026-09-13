@@ -15,7 +15,7 @@ async function check(name: string, fn: () => Promise<void> | void) {
 }
 const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); };
 const req = (version?: string) =>
-  new Request("https://example.test/ui/inbox", { headers: version ? { [VERSION_HEADER]: version } : {} });
+  new Request("https://example.test/ui/agents", { headers: version ? { [VERSION_HEADER]: version } : {} });
 
 await check("a first poll gets the fragment and its version", async () => {
   const r = await conditional(req(), "<p>one</p>");

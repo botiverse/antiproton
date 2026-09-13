@@ -1,12 +1,11 @@
 /**
  * The shell's polling schedule, checked as markup.
  *
- * Two rules the page keeps. Every poll stops while the tab is hidden: a
- * console left open in a background tab must not keep an object awake to
- * answer a page nobody is reading. And the inbox is fetched by exactly one
- * element, which feeds both the list and the rail badge: two elements on the
- * same route at different intervals made the badge lag the list it counted
- * (Vera, 2026-09-12) and doubled the request rate on the inbox view.
+ * There is no global poller: every one polls only while its view shows, and
+ * every poll stops while the tab is hidden, so a console left open in a
+ * background tab must not keep an object awake to answer a page nobody is
+ * reading. The inbox (which once polled in every view to feed a rail badge)
+ * is gone — the held calls were already beside the conversation.
  */
 import { page } from "../cf/src/ui.ts";
 
@@ -26,21 +25,18 @@ check("every poll pauses while the tab is hidden", () => {
   for (const t of polls) for (const clause of t.match(/every \d+s\[[^\]]*\]/g) ?? []) must(/every \d+s\[!document\.hidden( &&|\])/.test(clause), `poll without a visibility guard: ${clause}`);
 });
 
-check("the inbox is fetched by exactly one element", () => {
-  const els = [...html.matchAll(/<div[^>]*hx-get="\/ui\/inbox"[^>]*>/g)].map((m) => m[0]);
-  must(els.length === 1, `expected one inbox fetcher, found ${els.length}`);
-  const el = els[0];
-  must(/id="inbox"/.test(el), "the fetcher must be the visible inbox panel");
-  must(/hx-trigger="load, ap:show, every 5s\[!document\.hidden && document\.body\.dataset\.view==='inbox'\], every 30s\[!document\.hidden && document\.body\.dataset\.view!=='inbox'\]"/.test(el),
-    `the inbox polls in every view, fast while it is showing and slow elsewhere: ${el}`);
-  must(/hx-on::after-swap="ap\.count\(this\)"/.test(el), "the same swap must update the badge");
-  must(!/inbox-poll/.test(html), "the hidden conduit is gone");
+check("the inbox is gone — no view, rail badge, route or pollers named by it", () => {
+  // tygg (2026-09-13, #design): the page was useless — the same held calls
+  // render above the composer in the agents view. All of it goes, route
+  // included.
+  must(!/id="inbox"|data-view="inbox"|inbox-count|ui\/inbox/.test(html), "no inbox element, badge or route in the shell");
+  must(/<body[^>]*data-view="agents"/.test(html), "the shell lands on agents");
 });
 
 check("the page catches up when the tab is shown again", () => {
   must(/addEventListener\('visibilitychange'/.test(html), "no visibilitychange listener");
   must(/if \(document\.hidden\) return;/.test(html), "the listener must act only on becoming visible");
-  must(/'\.view\.on \[data-lazy\], \.side-view\.on \[data-lazy\], #inbox'/.test(html), "the shown panels and the inbox must be re-triggered");
+  must(/'\.view\.on \[data-lazy\], \.side-view\.on \[data-lazy\]'/.test(html), "the shown panels must be re-triggered — the old always-on inbox gone");
 });
 
   check("a panel's version lives on the panel, not in a map keyed by path", () => {
