@@ -3,7 +3,11 @@
 # commands on one line separated by `;`, which is how a red run reached
 # production on 2026-09-12: nothing was gating, only sequencing.
 set -euo pipefail
-cd ~/antiproton
+# The tree this script belongs to, not a fixed checkout. `cd ~/antiproton` made
+# every run test the shared checkout, so a run from a worktree tested master
+# instead of the change beside it, and read as a verdict on the wrong tree
+# (Rex, 2026-09-13).
+cd "$(dirname "$0")/../.."
 # Every suite, minus the ones named here with the reason they cannot run here.
 # It used to be a list of 17 that someone had to remember to extend: 20 of the
 # 37 suites were never gated, and the two of them that had gone red (confirm,
