@@ -88,6 +88,27 @@ export function baselineReasons(text) {
   return out;
 }
 
+/**
+ * The next baseline for one program, and what became of the reasons in it.
+ *
+ * A function so the carrying can fail a test. The loop below reads files and
+ * writes them; this decides what goes in them, which is the part with a rule in
+ * it. Per program on purpose: each baseline is its own file, so a signature
+ * that only occurs in the other program's output is `dropped` here and kept
+ * there, and neither file speaks for the other.
+ */
+export function rewriteBaseline(now, priorText) {
+  const kept = baselineReasons(priorText ?? "");
+  const carried = now.filter((s) => kept.has(s));
+  const dropped = [...kept].filter(([s]) => !now.includes(s));
+  return {
+    text: now.map((s) => (kept.has(s) ? `${s} # ${kept.get(s)}` : s)).join("\n") + "\n",
+    carried: carried.map((s) => [s, kept.get(s)]),
+    dropped,
+  };
+}
+
+
 /** tsc's output reduced to sorted, unique signatures: no line, no column. */
 export function signatures(output) {
   const sig = (l) => l.replace(/^([^(]+)\(\d+,\d+\): (error TS\d+: .*)$/, "$1: $2");
@@ -200,16 +221,16 @@ if (at >= 0) {
   }
   for (const r of results) {
     if (named.length && !named.includes(r.name)) continue;
-    const kept = existsSync(r.baseline) ? baselineReasons(readFileSync(r.baseline, "utf8")) : new Map();
-    const carried = r.now.filter((s) => kept.has(s));
-    writeFileSync(r.baseline, r.now.map((s) => (kept.has(s) ? `${s} # ${kept.get(s)}` : s)).join("\n") + "\n");
+    const prior = existsSync(r.baseline) ? readFileSync(r.baseline, "utf8") : "";
+    const { text, carried, dropped } = rewriteBaseline(r.now, prior);
+    writeFileSync(r.baseline, text);
     console.log(`baseline written (${r.name}, ${r.baseline}): ${r.now.length} signatures`);
     // Named, because the point of carrying a reason forward is that somebody
     // sees it again. A reason whose signature is gone is not carried, and that
     // is the one worth noticing: it was explaining something that no longer
     // happens — in this program; the other program's file is its own.
-    for (const s of carried) console.log(`  KEPT ${s} # ${kept.get(s)}`);
-    for (const [s, why] of kept) if (!r.now.includes(s)) console.log(`  DROPPED ${s} # ${why}`);
+    for (const [s, why] of carried) console.log(`  KEPT ${s} # ${why}`);
+    for (const [s, why] of dropped) console.log(`  DROPPED ${s} # ${why}`);
   }
   process.exit(0);
 }

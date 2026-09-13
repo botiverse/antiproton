@@ -6,6 +6,10 @@
  */
 export function baselineSignatures(text: string): string[];
 export function baselineReasons(text: string): Map<string, string>;
+export function rewriteBaseline(
+  now: string[],
+  priorText: string | undefined,
+): { text: string; carried: [string, string][]; dropped: [string, string][] };
 export function signatures(output: string): string[];
 export function compare(now: string[], baselineText: string): { base: Set<string>; fresh: string[]; gone: string[] };
 export function boundary(
