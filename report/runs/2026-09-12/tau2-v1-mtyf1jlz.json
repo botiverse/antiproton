@@ -1,0 +1,125 @@
+{
+ "bench": "tau2-retail",
+ "base": "https://antiproton.botiverse.workers.dev",
+ "build": "2fe3c94",
+ "driver": {
+  "commit": "2fe3c94",
+  "dirty": false
+ },
+ "object": "bench-v1",
+ "model": "deepseek-flash",
+ "wait": "push",
+ "tasks": [
+  "0"
+ ],
+ "trials": 1,
+ "startedAt": "2026-09-12T13:22:56.026Z",
+ "results": [
+  {
+   "id": "0",
+   "taskId": "t_0_mtyf0q6z",
+   "reward": 0,
+   "dbMatch": false,
+   "actionMatch": false,
+   "ended": "out-of-scope",
+   "turns": 2,
+   "simCalls": 3,
+   "usage": {
+    "prompt": 21193,
+    "completion": 2321,
+    "calls": 7
+   },
+   "kinds": {
+    "message": 2,
+    "model.response": 7,
+    "tool.result": 16
+   },
+   "byTool": {
+    "tools__search": 14,
+    "tools__mounts": 1,
+    "tools__describe": 1
+   },
+   "toolErrors": 0,
+   "seconds": 38,
+   "expectedWrites": [
+    "exchange_delivered_order_items"
+   ],
+   "performedWrites": [],
+   "expectedArgs": [
+    {
+     "name": "exchange_delivered_order_items",
+     "args": {
+      "order_id": "#W2378156",
+      "item_ids": [
+       "1151293680",
+       "4983901480"
+      ],
+      "new_item_ids": [
+       "7706410293",
+       "7747408585"
+      ],
+      "payment_method_id": "credit_card_9513926"
+     }
+    }
+   ],
+   "performedArgs": [],
+   "trial": 1
+  }
+ ],
+ "tools": {
+  "tools__search": 14,
+  "tools__mounts": 1,
+  "tools__describe": 1
+ },
+ "endings": {
+  "out-of-scope": 1
+ },
+ "activity": {
+  "activeMs": 1221,
+  "summedMs": 1221,
+  "pollMs": 0,
+  "invocations": 19,
+  "spanMs": 33814,
+  "byKind": [
+   {
+    "kind": "benchStart",
+    "n": 1,
+    "ms": 196
+   },
+   {
+    "kind": "benchSay",
+    "n": 2,
+    "ms": 0
+   },
+   {
+    "kind": "alarm",
+    "n": 9,
+    "ms": 1025
+   },
+   {
+    "kind": "offload_dispatch",
+    "n": 7,
+    "ms": 0
+   },
+   {
+    "kind": "offload_provider",
+    "n": 7,
+    "ms": 18500
+   },
+   {
+    "kind": "offload_rtt",
+    "n": 7,
+    "ms": 18500
+   },
+   {
+    "kind": "deliver",
+    "n": 7,
+    "ms": 0
+   }
+  ]
+ },
+ "written": {
+  "at": "2026-09-12T13:23:34.150Z",
+  "file": "report/runs/2026-09-12/tau2-v1-mtyf1jlz.json"
+ }
+}
