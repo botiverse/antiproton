@@ -31,6 +31,7 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  */
 const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
+import type { UsageRecorder } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
@@ -193,6 +194,12 @@ export interface RuntimeDeps {
    * for the whole completion instead of being billed for it. Omitted = inline.
    */
   offloadModel?: (job: ModelJob) => Promise<void>;
+  /**
+   * Where usage events go: the deployment's one ledger object. Absent means no
+   * ledger is configured, and every event is kept as lost in this agent's own
+   * store — visible, and replayable once there is somewhere to put it.
+   */
+  recorder?: UsageRecorder;
   /** Domain plugins beyond the built-ins (the benchmark mounts `retail` here). */
   extraPlugins?: Plugin[];
   maxTurns?: number;
@@ -379,7 +386,7 @@ export class AgentRuntime {
     this.#secrets = {
       resolve: async (ref, scope) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope),
     };
-    this.#gateway = new ToolGateway(this.store, plugins, this.#secrets);
+    this.#gateway = new ToolGateway(this.store, plugins, this.#secrets, deps.recorder);
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -497,6 +504,12 @@ export class AgentRuntime {
    * them. A plugin that keeps nothing answers "nothing", and that is correct
    * rather than a special case.
    */
+  /** Usage events the ledger refused for this agent, kept here (see ToolGateway#recordFor). */
+  async usageLost(tenantId: string, agentId: string) {
+    await this.ready();
+    return this.store.listUsageLost(tenantId, agentId);
+  }
+
   async renameMount(
     tenantId: string, agentId: string, from: string, to: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {

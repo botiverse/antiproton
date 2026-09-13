@@ -1,5 +1,6 @@
-import type { StorageAdapter, StateEntry } from "../core/store.ts";
-import type { PluginChoice } from "../plugins/types.ts";
+import type { StorageAdapter, StateEntry, LostUsage } from "../core/store.ts";
+import { lostUsageOf, USAGE_LOST_TABLE } from "./ledger.ts";
+import type { PluginChoice, UsageEvent } from "../plugins/types.ts";
 import type {
   AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
@@ -123,11 +124,13 @@ export class DurableObjectStore implements StorageAdapter {
 
   async init() {
     for (const stmt of SCHEMA) this.#sql.exec(stmt);
+    this.#sql.exec(USAGE_LOST_TABLE);
     // Columns added after a table already exists are invisible to
     // CREATE TABLE IF NOT EXISTS; each ALTER is idempotent by trial.
     for (const alter of [
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
+      "ALTER TABLE operations ADD COLUMN usage_lost INTEGER NOT NULL DEFAULT 0",
       // A secrets table created before the suffix column was dropped keeps a
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
@@ -393,13 +396,37 @@ export class DurableObjectStore implements StorageAdapter {
       this.#now(), commandId);
   }
 
-  async recordOperation(op: Omit<OperationRecord, "status" | "resultRef">) {
+  async recordOperation(op: Omit<OperationRecord, "status" | "resultRef" | "usageLost">) {
     this.#sql.exec(
       `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias, tool, tool_version,
          status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?)
        ON CONFLICT(operation_id) DO NOTHING`,
       op.operationId, op.tenantId, op.agentId, op.taskId, op.mountAlias, op.tool, op.toolVersion,
       this.#now(), this.#now());
+  }
+
+  async noteUsageLost(
+    at: { tenantId: string; agentId: string; alias: string; operationId: string | null },
+    event: UsageEvent,
+  ) {
+    // One transaction: a kept event and the flag on its call are one fact.
+    this.#tx(() => {
+      this.#sql.exec(
+        `INSERT INTO usage_lost(tenant_id, agent_id, alias, operation_id, kind, event, ref, quantity, unit, at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        at.tenantId, at.agentId, at.alias, at.operationId, event.kind, event.event, event.ref,
+        event.quantity ?? null, event.unit ?? null, this.#now());
+      if (at.operationId) {
+        this.#sql.exec("UPDATE operations SET usage_lost = usage_lost + 1 WHERE tenant_id=? AND operation_id=?",
+          at.tenantId, at.operationId);
+      }
+    });
+  }
+
+  async listUsageLost(tenantId: string, agentId: string): Promise<LostUsage[]> {
+    return this.#sql
+      .exec("SELECT * FROM usage_lost WHERE tenant_id=? AND agent_id=? ORDER BY seq", tenantId, agentId)
+      .toArray().map(lostUsageOf);
   }
 
   async getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null> {
@@ -409,6 +436,7 @@ export class DurableObjectStore implements StorageAdapter {
       operationId: r.operation_id, tenantId: r.tenant_id, agentId: r.agent_id, taskId: r.task_id,
       mountAlias: r.mount_alias, tool: r.tool, toolVersion: r.tool_version, status: r.status,
       resultRef: r.result_ref,
+      usageLost: Number(r.usage_lost ?? 0),
     };
   }
 

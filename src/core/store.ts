@@ -16,7 +16,10 @@ import type {
 // The vocabulary belongs to the plugin contract; the store persists it rather
 // than defining a second copy of the same three words. Type-only, and
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
-import type { PluginChoice } from "../plugins/types.ts";
+import type { PluginChoice, UsageEvent } from "../plugins/types.ts";
+
+/** A usage event the ledger did not take, as kept in the agent's own store. */
+export type LostUsage = UsageEvent & { alias: string; operationId: string | null; at: number };
 
 /** A stored value: inline when small, a reference to object storage when not. */
 export interface StateEntry {
@@ -110,7 +113,7 @@ export interface StorageAdapter {
   claimOutbox(limit: number, tenantId?: string): Promise<Array<{ commandId: string; taskId: string; kind: string; payload: Json }>>;
   markDispatched(commandId: string): Promise<void>;
 
-  recordOperation(op: Omit<OperationRecord, "status" | "resultRef">): Promise<void>;
+  recordOperation(op: Omit<OperationRecord, "status" | "resultRef" | "usageLost">): Promise<void>;
   getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null>;
   completeOperation(
     tenantId: string,
@@ -121,6 +124,23 @@ export interface StorageAdapter {
      *  execution that started it still has to deliver what it produced. */
     result?: Json,
   ): Promise<void>;
+
+  /**
+   * Keep a usage event the ledger refused, and flag the call it came from.
+   *
+   * The gateway promises plugins that `record` never throws, so a failed ledger
+   * write is swallowed — and a swallow must leave a trace, or an audit with
+   * holes reads exactly like a quiet week. The event itself is kept rather than
+   * a tally: it is still true, and it can be replayed into the ledger later.
+   * `operationId` is null on paths with no call in flight (a release at
+   * settle, the idle pass), and then only the event is kept.
+   */
+  noteUsageLost(
+    at: { tenantId: string; agentId: string; alias: string; operationId: string | null },
+    event: UsageEvent,
+  ): Promise<void>;
+  /** This agent's kept events, oldest first. Their count is the counter. */
+  listUsageLost(tenantId: string, agentId: string): Promise<LostUsage[]>;
 
   /** Registers a wait, resolving it immediately if the operation already finished. */
   registerWait(

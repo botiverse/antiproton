@@ -100,6 +100,12 @@ export interface OperationRecord {
   toolVersion: string;
   status: OperationStatus;
   resultRef: string | null;
+  /**
+   * Usage events this call produced that the ledger did not take. Zero on
+   * almost every row; anything else means the audit has a hole here, and the
+   * events themselves are kept beside it (`StorageAdapter.listUsageLost`).
+   */
+  usageLost: number;
 }
 
 /**

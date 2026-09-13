@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import type { StorageAdapter, StateEntry } from "../core/store.ts";
-import type { PluginChoice } from "../plugins/types.ts";
+import type { StorageAdapter, StateEntry, LostUsage } from "../core/store.ts";
+import type { PluginChoice, UsageEvent } from "../plugins/types.ts";
+import { lostUsageOf, USAGE_LOST_TABLE } from "./ledger.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -169,11 +170,13 @@ export class SqliteStore implements StorageAdapter {
 
   async init() {
     this.#db.exec(SCHEMA);
+    this.#db.exec(USAGE_LOST_TABLE);
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
     for (const alter of [
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
+      "ALTER TABLE operations ADD COLUMN usage_lost INTEGER NOT NULL DEFAULT 0",
       // A secrets table created before the suffix column was dropped keeps a
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
@@ -587,7 +590,7 @@ export class SqliteStore implements StorageAdapter {
       .run(now(), commandId);
   }
 
-  async recordOperation(op: Omit<OperationRecord, "status" | "resultRef">) {
+  async recordOperation(op: Omit<OperationRecord, "status" | "resultRef" | "usageLost">) {
     this.#db
       .prepare(
         `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias,
@@ -608,6 +611,28 @@ export class SqliteStore implements StorageAdapter {
       );
   }
 
+  async noteUsageLost(
+    at: { tenantId: string; agentId: string; alias: string; operationId: string | null },
+    event: UsageEvent,
+  ) {
+    this.#db
+      .prepare(`INSERT INTO usage_lost(tenant_id, agent_id, alias, operation_id, kind, event, ref, quantity, unit, at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(at.tenantId, at.agentId, at.alias, at.operationId, event.kind, event.event, event.ref,
+        event.quantity ?? null, event.unit ?? null, Date.now());
+    if (at.operationId) {
+      this.#db
+        .prepare("UPDATE operations SET usage_lost = usage_lost + 1 WHERE tenant_id=? AND operation_id=?")
+        .run(at.tenantId, at.operationId);
+    }
+  }
+
+  async listUsageLost(tenantId: string, agentId: string): Promise<LostUsage[]> {
+    return (this.#db
+      .prepare("SELECT * FROM usage_lost WHERE tenant_id=? AND agent_id=? ORDER BY seq")
+      .all(tenantId, agentId) as any[]).map(lostUsageOf);
+  }
+
   async getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null> {
     const r = this.#db
       .prepare("SELECT * FROM operations WHERE tenant_id=? AND operation_id=?")
@@ -623,6 +648,7 @@ export class SqliteStore implements StorageAdapter {
       toolVersion: r.tool_version,
       status: r.status,
       resultRef: r.result_ref,
+      usageLost: Number(r.usage_lost ?? 0),
     };
   }
 

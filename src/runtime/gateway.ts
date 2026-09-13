@@ -24,21 +24,21 @@ export interface UsageRecorder {
 }
 
 /**
- * The recorder in place until events are stored somewhere: it keeps nothing and
- * **counts what it did not keep**.
+ * The recorder when no ledger is configured: it refuses every event.
  *
  * A silent no-op would be the shape we spent a day removing — a write that
- * vanishes, indistinguishable from a week when nobody used anything. A counter
- * is not a ledger, but it answers "are we losing events, and how many", which
- * is the question a silent default cannot.
+ * vanishes, indistinguishable from a week when nobody used anything. Refusing
+ * sends each event down the same path as a ledger that is down: kept in the
+ * agent's own store and counted there. The first version counted in a module
+ * variable (Piper), which proved the swallow did something but reset whenever
+ * the object was evicted and was shared by every agent in the isolate, so
+ * nobody could read it back afterwards — and reading it back is the point.
  */
-export const countingRecorder: UsageRecorder & { dropped: number } = {
-  dropped: 0,
-  async write() { countingRecorder.dropped++; },
+export const noLedger: UsageRecorder = {
+  async write() { throw new Error("no ledger is configured"); },
 };
 
 export const envSecrets: SecretResolver = {
-
   async resolve(ref) {
     return process.env[ref.replace(/^env:/, "")] ?? null;
   },
@@ -108,7 +108,7 @@ export class ToolGateway {
     store: StorageAdapter,
     plugins: Plugin[],
     secrets: SecretResolver = envSecrets,
-    recorder: UsageRecorder = countingRecorder,
+    recorder: UsageRecorder = noLedger,
   ) {
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
@@ -121,17 +121,29 @@ export class ToolGateway {
    *
    * The contract tells plugins this never throws, and this is where that is
    * made true — a plugin calls it beside its work, and a row that could not be
-   * written must not fail the thing it was describing. The loss is the
-   * recorder's to report; swallowing it here without one would be the silence
-   * the counter exists to break.
+   * written must not fail the thing it was describing.
+   *
+   * But a swallow must leave a trace, or an audit with holes reads exactly like
+   * a quiet week. So a refused event is kept in this agent's own store — the
+   * event itself, not a tally, because it is still true and can be replayed
+   * into the ledger later — and when a tool call was in flight, that call's
+   * operation row is flagged too. `operationId` is null on the paths that have
+   * no call: a release at settle, the idle pass, a credential check.
    */
-  #recordFor(at: { tenantId: string; agentId: string }, alias: string) {
+  #recordFor(at: { tenantId: string; agentId: string }, alias: string, operationId: string | null = null) {
     return async (event: UsageEvent) => {
+      const where = { tenantId: at.tenantId, agentId: at.agentId, alias };
       try {
-        await this.#recorder.write({ tenantId: at.tenantId, agentId: at.agentId, alias }, event);
-      } catch {
-        // Reported by whoever owns the writer, counted by the default one.
-        await countingRecorder.write({ tenantId: at.tenantId, agentId: at.agentId, alias }, event);
+        await this.#recorder.write(where, event);
+      } catch (lost) {
+        try {
+          await this.#store.noteUsageLost({ ...where, operationId }, event);
+        } catch (alsoLost) {
+          // Neither store took it. The log is the last place it can be seen,
+          // and it still must not reach the plugin.
+          console.error(`usage event lost twice: ${JSON.stringify({ ...where, operationId, event })}: ` +
+            `${String((lost as Error)?.message ?? lost)}; ${String((alsoLost as Error)?.message ?? alsoLost)}`);
+        }
       }
     };
   }
@@ -587,7 +599,7 @@ export class ToolGateway {
             connection: connectionFor(other.alias),
           };
         },
-        record: this.#recordFor(ctx, mount.alias),
+        record: this.#recordFor(ctx, mount.alias, operationId),
       });
       await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null);
       return { status: "succeeded", operationId, result };

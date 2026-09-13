@@ -4,7 +4,7 @@
 # production on 2026-09-12: nothing was gating, only sequencing.
 set -euo pipefail
 cd ~/antiproton
-for t in exclusive mount-config mount-reports plugin-enable rename-mount release \
+for t in ledger usage-record exclusive mount-config mount-reports plugin-enable rename-mount release \
          pi-tools pi-offload pi-agent pi-sessions console-storage console-plugins \
          console-choice console-version state auth prompt-contributions; do
   printf "%-22s" "$t"
