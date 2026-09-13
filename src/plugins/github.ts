@@ -293,9 +293,21 @@ export const githubPlugin: Plugin = {
     const a = (args ?? {}) as Record<string, any>;
     switch (name) {
       case "auth_status": {
-        requireAccount(ctx, "auth_status");
+        // The one tool whose subject is the identity itself, so having none is
+        // an answer rather than a failure — `gh auth status`, which this names,
+        // prints "not logged in" instead of refusing. Under `requireAccount` an
+        // agent asking "who am I here?" was told its question was invalid, and
+        // could not tell that apart from a call it had got wrong (a fresh agent
+        // via Vera, 2026-09-13).
+        if (!ctx.credential) {
+          return {
+            authenticated: false,
+            account: null,
+            note: "no account is attached to this mount, so it reads public data only; a person attaches one",
+          };
+        }
         const u = await call("GET", "/user", ctx);
-        return { login: u.login, name: u.name, type: u.type, id: u.id };
+        return { authenticated: true, login: u.login, name: u.name, type: u.type, id: u.id };
       }
 
       case "repo_view":
