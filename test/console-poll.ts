@@ -64,6 +64,19 @@ check("the held cards ride with the chat, in one fragment under one version", ()
   must(/\.held:has\(>\.empty\)\{display:none\}/.test(html), "with nothing waiting the block must not draw; the hint under the composer already says where a held call shows");
 });
 
+check("the inspector holds only the merged tabs: events, memory, runtime", () => {
+  // tygg (2026-09-13, #design): some tabs can be merged. trajectory was
+  // entirely covered by events (waterfall over the timeline strip, raw
+  // records over the list), and storage/sandbox/runtime were three slices
+  // of one uiStorage answer. Three tabs, one question each.
+  const tabs = [...html.matchAll(/role="tab" data-insp="([^"]+)"/g)].map((m) => m[1]);
+  must(tabs.join(",") === "events,memory,runtime", `expected the merged set, found ${tabs.join(",")}`);
+  must(/id="insp"[^>]*hx-get="\/ui\/events"/.test(html), "the panel must open on events, not the removed trajectory");
+  must(/paths = \{ events: '\/ui\/events', memory: '\/ui\/memory', runtime: '\/ui\/runtime\?stack=1' \}/.test(html),
+    "the runtime tab must ask for the stacked fragment (all three cost panels in one answer)");
+  must(/if \(!paths\[name\]\) name = 'events';/.test(html), "a stale deep link, e.g. insp=trajectory, must land on events");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);

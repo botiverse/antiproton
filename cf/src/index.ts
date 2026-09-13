@@ -2871,8 +2871,14 @@ export default {
           if (v.unchanged) return v.unchanged;
           const d = await stub.uiStorage(gate.tenantId, agentId, taskId);
           return html(url.pathname === "/ui/storage" ? storage(d)
+            // The inspector's runtime tab asks with stack=1: the three cost
+            // panels stacked into one fragment, object first, then the
+            // container, then everything the object is holding. The rail's
+            // runtime screen still polls each panel alone.
             : url.pathname === "/ui/memory" ? memoryPanel(d)
             : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
+            : url.searchParams.get("stack") === "1"
+              ? `<h3>the object</h3>${runtimePanel(d)}<h3>containers</h3>${sandboxPanel(d)}<h3>storage</h3>${storage(d)}`
             : runtimePanel(d), v.etag);
         }
         // Data routes for the console shell, rendered by the shell's own
