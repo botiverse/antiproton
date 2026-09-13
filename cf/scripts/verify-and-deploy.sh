@@ -24,10 +24,17 @@ if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # (Rex, 2026-09-13). A new suite is gated by being written.
 #
 # A suite passes when it exits 0 AND reports at least one pass: an emptied suite
-# exits 0 too. And the set of suites must match test/suites.txt, so a deleted
-# one is refused instead of skipped (Piper, 2026-09-13; cf/scripts/suite-verdict.sh).
+# exits 0 too. And every suite in the commit production runs now must still be
+# here, unless test/removed-suites.txt names it, so a deleted one is refused
+# instead of skipped (Piper, Rex, 2026-09-13; cf/scripts/suite-verdict.sh).
 . cf/scripts/suite-verdict.sh
-problems=$(suite_list_problems test/suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+live=$(curl -fsS -m 20 https://antiproton.ai/ui/whoami 2>/dev/null | sed -n 's/.*"build":"\([0-9a-f]\{7,40\}\)".*/\1/p' || true)
+if [ -z "$live" ] || ! git cat-file -e "${live}^{commit}" 2>/dev/null; then
+  echo "refusing: cannot tell which commit production runs (${live:-no answer}), so a deleted suite could go unnoticed."
+  exit 1
+fi
+git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > /tmp/suites-in-production.txt
+problems=$(suite_removals /tmp/suites-in-production.txt test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
 if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
 NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
 run_suite() {  # name, command...

@@ -5,10 +5,12 @@
 #    "0 passed, 0 failed" and exits 0 — the verdict every file computed was
 #    "nothing failed", which an empty run satisfies (Piper, 2026-09-13). So the
 #    gate also requires the last reported pass count to be above zero.
-# 2. Is every suite still there? The loop walks test/*.ts, so a deleted file is
-#    simply not visited. test/suites.txt names every suite; a file missing from
-#    the tree, or present but unlisted, fails the gate until the list is changed
-#    in the same commit — a deliberate removal says so, an accidental one is loud.
+# 2. Is every suite that guards production still there? The loop walks
+#    test/*.ts, so a deleted file is simply not visited. The gate compares the
+#    suites in the commit production is running now with the ones present, and
+#    refuses a missing one unless test/removed-suites.txt names it. There is no
+#    list of suites to keep: a new suite costs nothing (the loop already runs
+#    it), and only a deletion has to say "I meant this" (Piper, Rex, 2026-09-13).
 
 # suite_passed_count: reads a suite's output on stdin, prints the last reported
 # pass count ("58 passed, 0 failed" or "5/5 passed"), or nothing if it reported none.
@@ -16,16 +18,16 @@ suite_passed_count() {
   sed 's/\x1b\[[0-9;]*m//g' | grep -oE '[0-9]+(/[0-9]+)? passed' | tail -1 | grep -oE '^[0-9]+' || true
 }
 
-# suite_list_problems LISTED_FILE ACTUAL_NAMES...: prints one line per mismatch
-# between the committed list and the suites present, nothing when they agree.
-suite_list_problems() {
-  local listed="$1"; shift
+# suite_removals PREVIOUS_NAMES_FILE ACKNOWLEDGED_FILE CURRENT_NAMES...
+# prints one line per suite in PREVIOUS that is not in CURRENT and not
+# acknowledged, nothing otherwise. Blank lines and "#" comments are ignored.
+suite_removals() {
+  local previous="$1" acknowledged="$2"; shift 2
   local name
   while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    case " $* " in *" $name "*) ;; *) echo "suite removed: $name (delete it from test/suites.txt in the same change if that was meant)";; esac
-  done < "$listed"
-  for name in "$@"; do
-    grep -qxF "$name" "$listed" || echo "suite not listed: $name (add it to test/suites.txt)"
-  done
+    case "$name" in ""|\#*) continue;; esac
+    case " $* " in *" $name "*) continue;; esac
+    if [ -f "$acknowledged" ] && grep -v '^#' "$acknowledged" | grep -qxF "$name"; then continue; fi
+    echo "suite removed: $name (it guards what production runs now; name it in test/removed-suites.txt if that was meant)"
+  done < "$previous"
 }

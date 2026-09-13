@@ -45,14 +45,33 @@ check("the last count wins, so an earlier summary cannot mask the verdict", () =
   if (count("  3 passed, 0 failed\n...\n  0 passed, 0 failed\n") !== "0") throw new Error("an earlier count was used");
 });
 
-check("a removed suite and an unlisted one are both named", () => {
+check("a suite production is guarded by and that has gone is refused, by name", () => {
   const dir = mkdtempSync(join(tmpdir(), "suites-"));
-  const listed = join(dir, "suites.txt");
-  writeFileSync(listed, "alpha\nbeta\n");
-  const problems = sh('suite_list_problems "$@"', "", listed, "alpha", "gamma");
-  if (!problems.includes("suite removed: beta")) throw new Error(`a removal went unnamed: ${problems}`);
-  if (!problems.includes("suite not listed: gamma")) throw new Error(`an unlisted suite went unnamed: ${problems}`);
-  if (sh('suite_list_problems "$@"', "", listed, "alpha", "beta") !== "") throw new Error("an agreeing list reported problems");
+  const previous = join(dir, "previous.txt");
+  writeFileSync(previous, "alpha\nbeta\n");
+  const problems = sh('suite_removals "$@"', "", previous, join(dir, "none.txt"), "alpha");
+  if (!problems.includes("suite removed: beta")) throw new Error(`a removal went unnamed: ${JSON.stringify(problems)}`);
+  if (problems.includes("alpha")) throw new Error("a suite still present was reported");
+});
+
+check("a removal named in the acknowledged list passes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "suites-"));
+  const previous = join(dir, "previous.txt");
+  const acknowledged = join(dir, "removed.txt");
+  writeFileSync(previous, "alpha\nbeta\n");
+  writeFileSync(acknowledged, "# why it went\nbeta\n");
+  const problems = sh('suite_removals "$@"', "", previous, acknowledged, "alpha");
+  if (problems !== "") throw new Error(`an acknowledged removal was refused: ${problems}`);
+});
+
+check("a new suite costs nothing: only disappearance is refused", () => {
+  // The loop already runs every test/*.ts, so refusing an unlisted new suite
+  // would protect nothing and tax every new file (Piper).
+  const dir = mkdtempSync(join(tmpdir(), "suites-"));
+  const previous = join(dir, "previous.txt");
+  writeFileSync(previous, "alpha\n");
+  const problems = sh('suite_removals "$@"', "", previous, join(dir, "none.txt"), "alpha", "gamma");
+  if (problems !== "") throw new Error(`a new suite was refused: ${problems}`);
 });
 
 console.log(`\n  Suite verdict\n  ${"─".repeat(56)}`);
