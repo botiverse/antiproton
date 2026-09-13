@@ -608,9 +608,9 @@ ${HEAD_ASSETS}
 <aside class="inspector" id="inspector">
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
   <div class="tabs" role="tablist" aria-label="inspector">
-    ${inspTab("trajectory")}${inspTab("events")}${inspTab("storage")}${inspTab("memory")}${inspTab("sandbox")}${inspTab("runtime")}
+    ${inspTab("events")}${inspTab("memory")}${inspTab("runtime")}
   </div>
-  <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/transcript" hx-swap="innerHTML"
+  <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/events" hx-swap="innerHTML"
        hx-trigger="ap:show, every 3s[${awake} && document.body.dataset.view==='agents']">loading…</div>
   <div class="hint" style="padding:8px 0 0">Every tab re-reads the store while it is showing; nothing is cached client-side.</div>
 </aside>
@@ -716,8 +716,10 @@ ${HEAD_ASSETS}
     // The inspector's tabs: one panel, re-pointed at the chosen fragment. The
     // choice lives on the URL, so a reload and a deep link land on the same tab.
     insp(name) {
-      const paths = { trajectory: '/ui/transcript', events: '/ui/events', storage: '/ui/storage', memory: '/ui/memory', sandbox: '/ui/sandbox', runtime: '/ui/runtime' };
-      if (!paths[name]) name = 'trajectory';
+      // Three tabs, one question each: what it did (events), what it believes
+      // (memory), what it is billed for and holding (runtime, stacked).
+      const paths = { events: '/ui/events', memory: '/ui/memory', runtime: '/ui/runtime?stack=1' };
+      if (!paths[name]) name = 'events';
       document.querySelectorAll('.inspector [role=tab]').forEach(b => { const on = b.dataset.insp === name; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
       const panel = document.getElementById('insp');
       panel.setAttribute('hx-get', paths[name]); delete panel.dataset.ver;
@@ -1394,7 +1396,7 @@ export function runtimePanel(d: any): string {
 ${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]))}
 
 <div class="hint" style="padding:10px 0 0">Container time is billed separately and by the
-  second — see the <b>sandbox</b> tab.</div>`;
+  second — see the <b>containers</b> section below.</div>`;
 }
 
 
