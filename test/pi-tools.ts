@@ -243,10 +243,14 @@ await check("扣住的工具不会被提供,其余原样", async () => {
   if (withholdTools(cat, []).length !== 3) throw new Error("withholding nothing removed something");
 });
 
-await check("沙箱里用的是模型看到的名字,地址也仍然接受", async () => {
-  // The prompt tells the model the sandbox reaches "the same tools", so the
-  // string that works outside has to work inside. Before this, outside was the
-  // registered name and inside was the gateway's address, and nothing said so.
+await check("runJsTool 的换名表: 模型看到的名字查到地址,地址原样通过", async () => {
+  // What this proves is narrow: the table in runJsTool maps an offered name to
+  // its address and passes an address through. The sandbox here is a stub that
+  // calls invoke directly, so it never meets the parser both executors run
+  // first — and on 2026-09-13 that parser refused every offered name before
+  // this table could see it, while this case stayed green under a title that
+  // claimed the sandbox accepted them (Piper, Rex, Dora). The claim that a
+  // script can use the offered names is made by the real-executor case below.
   const calls: any[] = [];
   const host = { async invoke(call: any) { calls.push(call.tool); return { status: "succeeded" }; } };
   const sandbox = {
