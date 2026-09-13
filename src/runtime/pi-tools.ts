@@ -305,6 +305,20 @@ export function runJsTool(
   const offered = [...byName.keys()];
   // By the alias as it appears in a model-facing name (`gh` in gh__issues_list).
   const unoffered = new Map((opts.unoffered ?? []).map((u) => [modelName(u.alias), u]));
+  // Every alias as it appears in a model-facing name, offered or not: a name is
+  // attributed to the LONGEST alias it starts with. Not by splitting at the
+  // first "__" — an alias may itself contain "__" (renameMount does not forbid
+  // it), which is the same inversion #255 refused for truncated names (Piper).
+  // Offered aliases take part so a typo on an offered mount (gh__eu) is not
+  // mistaken for a switched-off mount whose alias is a shorter prefix (gh).
+  const offeredAliases = new Set((opts.tools ?? []).map((t) => modelName(t.address.split(".")[0]!)));
+  const aliasOf = (typed: string): string | null => {
+    let best: string | null = null;
+    for (const a of [...offeredAliases, ...unoffered.keys()]) {
+      if (typed.startsWith(`${a}__`) && (best === null || a.length > best.length)) best = a;
+    }
+    return best;
+  };
   return {
     name: "run_js",
     label: "run_js",
@@ -338,7 +352,8 @@ export function runJsTool(
             // A mount that exists but cannot be offered: say why, in the gateway's
             // own words, rather than offer neighbours — the next move is a person
             // or an operator, not another tool (Piper, Dora, Rex, 2026-09-13).
-            const u = unoffered.get(call.tool.split("__")[0]!);
+            const owner = aliasOf(call.tool);
+            const u = owner === null || offeredAliases.has(owner) ? undefined : unoffered.get(owner);
             if (u !== undefined) {
               return Promise.resolve({
                 status: "rejected" as const,

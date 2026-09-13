@@ -453,6 +453,40 @@ await check("关掉的挂载: run_js 里用它的名字,回'被关了、要人�
   if (emptyOther.code !== "no_tools") throw new Error(`with an empty list an unrelated name got ${emptyOther.code}`);
 });
 
+await check("提供不出来的挂载按【最长别名前缀】正向匹配: 别名里带 __ 也认得", async () => {
+  // Splitting at the first "__" gave my__gh__issues_list to an alias "my", so
+  // a switched-off mount renamed to my__gh got the typo answer again (Piper,
+  // 2026-09-13). And a typo on an offered mount whose alias is longer than a
+  // switched-off one must stay a typo.
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const { switchedOffMessage } = await import("../src/runtime/gateway.ts");
+  const host = { async invoke() { return { status: "succeeded", operationId: "op", result: {} }; } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools: qualifyMountedTools([named("list", "gh__eu.list")]),
+    unoffered: [
+      { alias: "my__gh", plugin: "github", reason: "switched_off" },
+      { alias: "gh", plugin: "github", reason: "switched_off" },
+    ],
+  });
+  const run = async (name: string) => {
+    const out = await tool.execute(`pfx-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.message ?? null]);` });
+    const [[status, code, message]] = JSON.parse(out.content[0].text);
+    return { status, code, message };
+  };
+  const nested = await run("my__gh__issues_list");
+  if (nested.code !== "plugin_disabled" || nested.message !== switchedOffMessage("my__gh")) {
+    throw new Error(`an alias containing __ was not recognised as switched off: ${nested.code} ${nested.message}`);
+  }
+  const typoOnOffered = await run("gh__eu__lst");
+  if (typoOnOffered.code !== "unknown_tool") {
+    throw new Error(`a typo on the offered gh__eu mount was attributed to the switched-off gh: ${typoOnOffered.code} ${typoOnOffered.message}`);
+  }
+  const plain = await run("gh__issues_list");
+  if (plain.code !== "plugin_disabled" || plain.message !== switchedOffMessage("gh")) {
+    throw new Error(`the plain switched-off alias stopped matching: ${plain.code} ${plain.message}`);
+  }
+});
+
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
 await check("a plugin's presence is asked by plugin and answered from the offered tools", async () => {
   const tool = (alias: string) => [{ name: "put", description: "", parameters: {}, address: `${alias}.put` }] as MountedTool[];
