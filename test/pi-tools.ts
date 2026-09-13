@@ -365,6 +365,23 @@ await check("run_js 里写错模型自己那套名字,答'没有这个工具'并
   if (dotted.seen.join() !== "state.gett") throw new Error(`a dotted name was intercepted: ${JSON.stringify(dotted)}`);
 });
 
+await check("工具列表为空时,run_js 说'列表是空的',而不是暗示拼错了", async () => {
+  // Every plugin switched off still leaves a working run_js with nothing to
+  // call. "No tool named X" would read as a typo and invite another name, which
+  // fails again; the refusal must not be satisfiable by trying a different name.
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const seen: string[] = [];
+  const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, { tools: [] });
+  const out = await tool.execute("empty-1", { source: "const r = await tool`state__get ${{}}`; output([r.status, r.error?.code ?? null, r.error?.message ?? null]);" });
+  const [[status, code, message]] = JSON.parse(out.content[0].text);
+  if (seen.length !== 0) throw new Error(`a call reached the host with no tools offered: ${seen}`);
+  if (status !== "rejected" || code !== "no_tools") throw new Error(`an empty list was answered with ${status}/${code}`);
+  if (!String(message).includes("empty") || String(message).includes("state__get")) {
+    throw new Error(`the refusal does not say the list is empty, or still reads as a typo: ${message}`);
+  }
+});
+
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
 await check("a plugin's presence is asked by plugin and answered from the offered tools", async () => {
   const tool = (alias: string) => [{ name: "put", description: "", parameters: {}, address: `${alias}.put` }] as MountedTool[];
