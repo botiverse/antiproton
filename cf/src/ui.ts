@@ -592,7 +592,7 @@ ${HEAD_ASSETS}
   </section>
   <section class="view" data-view="plugins">
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
-    <div class="body" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
+    <div class="body plugins-root" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
          hx-trigger="ap:show, every 3s[${awake} && ${inView} && !ap.editing('#plugins')]">loading…</div>
   </section>
   <section class="view" data-view="runtime">
@@ -608,10 +608,10 @@ ${HEAD_ASSETS}
 <aside class="inspector" id="inspector">
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
   <div class="tabs" role="tablist" aria-label="inspector">
-    ${inspTab("events")}${inspTab("memory")}${inspTab("runtime")}
+    ${inspTab("events")}${inspTab("plugins")}${inspTab("memory")}${inspTab("runtime")}
   </div>
-  <div class="body" id="insp" role="tabpanel" data-lazy hx-get="/ui/events" hx-swap="innerHTML"
-       hx-trigger="ap:show, every 3s[${awake} && document.body.dataset.view==='agents']">loading…</div>
+  <div class="body plugins-root" id="insp" role="tabpanel" data-lazy hx-get="/ui/events" hx-swap="innerHTML"
+       hx-trigger="ap:show, every 3s[${awake} && document.body.dataset.view==='agents' && !ap.editing('#insp')]">loading…</div>
   <div class="hint" style="padding:8px 0 0">Every tab re-reads the store while it is showing; nothing is cached client-side.</div>
 </aside>
 <script>
@@ -716,9 +716,11 @@ ${HEAD_ASSETS}
     // The inspector's tabs: one panel, re-pointed at the chosen fragment. The
     // choice lives on the URL, so a reload and a deep link land on the same tab.
     insp(name) {
-      // Three tabs, one question each: what it did (events), what it believes
-      // (memory), what it is billed for and holding (runtime, stacked).
-      const paths = { events: '/ui/events', memory: '/ui/memory', runtime: '/ui/runtime?stack=1' };
+      // Three tabs, one question each: what it did (events), what it may do
+      // (plugins: the same fragment the rail's plugins view shows), what it
+      // believes (memory), what it is billed for and holding (runtime,
+      // stacked).
+      const paths = { events: '/ui/events', plugins: '/ui/plugins', memory: '/ui/memory', runtime: '/ui/runtime?stack=1' };
       if (!paths[name]) name = 'events';
       document.querySelectorAll('.inspector [role=tab]').forEach(b => { const on = b.dataset.insp === name; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
       const panel = document.getElementById('insp');
@@ -1829,9 +1831,12 @@ export function catalogue(d: any): string {
           ? `<span class="tag ${p.credential.required ? "bad" : ""}">${
               p.credential.required ? "account required" : "account optional"}</span>`
           : ""}</summary>
+      // The catalogue is shown twice: in the rail's plugins view and in the
+      // inspector's plugins tab. The select must repaint whichever panel is
+      // showing it, not a fixed id that is half-hidden in the other view.
       <form class="plug-choice">
         <input type="hidden" name="plugin" value="${esc(p.id)}">
-        <select name="choice" hx-post="/ui/plugin/choice" hx-target="#plugins" hx-swap="innerHTML" hx-trigger="change">
+        <select name="choice" hx-post="/ui/plugin/choice" hx-target="closest .plugins-root" hx-swap="innerHTML" hx-trigger="change">
           ${["inherit", "enable", "disable"].map((c) =>
             `<option value="${c}"${(p.choice ?? "inherit") === c ? " selected" : ""}>${c}</option>`).join("")}
         </select>
