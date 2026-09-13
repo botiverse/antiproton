@@ -3,8 +3,8 @@
 | file | what it is | authoritative? |
 |---|---|---|
 | [`pi-upstream.md`](pi-upstream.md) | how to stay in sync with pi — the seams, the copied source, the contracts no type expresses, the deliberate divergences, and the upgrade checklist | yes, for anything pi-related |
-| [`服务端Antiproton-完整计划书.md`](服务端Antiproton-完整计划书.md) | the original server-side (Cloudflare) design doc, v1.1 | **no — frozen history** |
-| [`本地自托管Antiproton-计划书.md`](本地自托管Antiproton-计划书.md) | the companion design doc for the local, self-hosted deployment, v1.0 | **no — frozen history** |
+| [`server-plan-archive.md`](server-plan-archive.md) | the original server-side (Cloudflare) pre-implementation plan doc, v1.1 | **no — frozen history** |
+| [`self-hosted-plan-archive.md`](self-hosted-plan-archive.md) | the companion design doc for the local, self-hosted deployment, v1.0 | **no — frozen history** |
 
 [`../README.md`](../README.md) describes the system as it is, and is the only
 document kept in step with the code.

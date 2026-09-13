@@ -18,6 +18,74 @@ at once:
 - **The agent never holds a credential.** It acts on your systems, and its
   context never contains your keys.
 
+## Getting Started
+
+### Prerequisites
+
+- **Node.js**: >= 24 (Node 24+ native TypeScript support with `--experimental-strip-types` / strip-only TS is used; no build step required for Node scripts).
+- **Package manager**: `npm`.
+- **Cloudflare account** (optional, for edge deployment): Wrangler CLI and a Cloudflare account with Workers and Durable Objects enabled.
+- **Model API key**: e.g. OpenRouter, Anthropic, or OpenAI key.
+
+### Installation
+
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/botiverse/antiproton.git
+cd antiproton
+npm install
+```
+
+### Running Tests
+
+The test suite covers in-process storage conformance, agent loop semantics, tool isolation, compaction, and sandbox contracts:
+
+```bash
+# Run individual unit or conformance test suites (Node 24+ native TS strip)
+node test/pi-storage.ts
+node test/pi-agent.ts
+node test/state.ts
+
+# Or run predefined npm scripts for key suites
+npm run pi-storage
+npm run pi-agent
+npm run pi-tools
+
+# Run type checks (Node scripts and Cloudflare Worker checked independently)
+npm run typecheck
+```
+
+Three integration tests require live external credentials and are skipped in standard unit runs:
+- `test/live-e2e.ts`: Live end-to-end multi-turn agent test (`RUN_LIVE_TESTS=1`).
+- `test/live-github.ts`: Real GitHub tool operations against a test repository (`GITHUB_TOKEN=...`).
+- `test/appworld.ts`: AppWorld benchmark evaluation against an active AppWorld environment.
+
+### Local Development & Edge Deployment
+
+Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
+
+1. **Configure credentials:**
+   Copy the example environment or configure credentials in `cf/wrangler.jsonc` (or via Cloudflare Secrets):
+   ```bash
+   npx wrangler secret put ANTHROPIC_API_KEY
+   # or OPENROUTER_API_KEY, etc.
+   ```
+
+2. **Run locally with Wrangler:**
+   ```bash
+   cd cf
+   npx wrangler dev
+   ```
+
+3. **Deploy to Cloudflare Workers:**
+   ```bash
+   ./deploy.sh
+   ```
+   The deployment script executes verification gates before uploading the Worker and running smoke checks.
+
+---
+
 ## Costing nothing while idle
 
 Scale-to-zero is easy to claim and easy to lose one careless `await` at a time,
@@ -370,11 +438,11 @@ SWE-bench rows below say which environment produced them.
 | `pi-storage` | 21 | pi's own storage conformance, unchanged, on node:sqlite (`npm run pi-storage`) and on Durable Object storage (`npm run pi-storage:do`, a worker that is never deployed): mixed-write atomicity, rollback across every store, value and list ordering within a transaction, branch stops before filters and cursors before limits, admission order under concurrent commits, close that seals admission but drains what it admitted |
 | `pi-agent` | 8 | the object-side loop: a message is a pure write, a pass suspends rather than waits, a tool turn goes model → gateway → model, a duplicated pass does not grow the transcript, a run is not dispatched twice, the alarm does not poll, and a run interrupted by eviction is reported open and finished |
 | `pi-offload` | 3 | the object never waits for the model: drive suspends, the answer resumes the same operation, and a suspension survives eviction |
-| `pi-tools` | 11 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept |
+| `pi-tools` | 18 | mounts as tools: the gateway is still the only way out, a refusal reaches the model as a refusal, replay policy, and names the provider will accept. The `run_js` half runs against the real executors: a script reaches a tool by the name the model was offered, a mistyped name is answered with the nearest names rather than "not a tool name", an empty tool list says so, a switched-off mount says why, and a name is attributed to the longest alias it starts with — because an alias may itself contain `__` |
 | `pi-loop` | 3 | pi's harness on our storage, and a rebuilt harness finding the transcript again |
 | `pi-bridge` | 5 | pi's request shape against our provider client, both ways |
 | `executor` · `http-plugin` | 20 | sandbox contract in-process (`executor` 10 runs the `spec/executor-spec` rows), fetch and HTML extraction (`http-plugin` 10) |
-| `state` | 12 | memory that survives a task, byte budgets, per-agent isolation |
+| `state` | 14 | memory that survives a task, byte budgets, per-agent isolation, `remember` and `put` sharing one namespace, and every row `list` returns carrying the `ref` it is read back by |
 | `markdown` | 7 | the console renders the agent's markdown and never its HTML |
 | `model-binding` | 6 | whose key an agent spends |
 
@@ -450,6 +518,17 @@ A single instance is a coin flip: `astropy-12907` passed alone, failed in a
 slice, and passed again on another model, all with the same code. Three
 instances measure that the loop runs, not how good it is.
 
+## Contributing
+
+We welcome contributions from the community. To keep antiproton reliable and maintainable:
+
+- **Plugins (`src/plugins/`):** Open for direct pull requests! If you want to add integrations, tool bindings, or data connectors, feel free to submit a PR with tests in `test/`.
+- **Core Runtime & Durable Objects (`src/kernel/`, `src/store/`, `cf/`):** Please **open an issue first** to discuss architecture, invariants, and design before writing code.
+- **Evidence-based verification:** Every PR must include tests that verify the exact mechanism or boundary introduced. We verify mechanism by callable entry points, not by assertions of absence.
+- **Documentation:** Documentation must be kept in sync with code reality. All documentation is in English.
+
+---
+
 ## What was taken from elsewhere
 
 The harness is the commodity part of this, and the parts of it that are good
@@ -524,16 +603,15 @@ them:
   eventually exhaust one object's 10 GB.
 - **Plugin lifecycle.** A mount's config and policy are reconciled on every
   visit, so drift self-heals, and a seed mount is validated on the first agent
-  it reaches. Disabling and revoking one is still missing, as is any notion of
-  installing a plugin at runtime. Revoking would have to respect one property
-  that the prompt now depends on: a paragraph telling the model to call a tool
-  names the mount and the tool — "kept by the `state` mount, correct one with
-  its `remember` tool" — rather than the address the harness dispatches to,
-  because that address is not what the model is offered. Both halves are
-  resolved at prompt time and the sentence is dropped when no mount is there,
-  so revoking a mount has to keep the resolution rather than the wording.
-  Nothing can revoke today, which is why this is a property to preserve rather
-  than a fault to fix.
+  it reaches. Mounts can be switched on, switched off, or set to inherit via the
+  console (with switched-off mounts keeping their row marked closed rather than
+  vanishing), and mounts can be renamed. Full revocation and dynamic installation
+  of arbitrary plugins at runtime are not supported: plugins are registered at
+  build time in `src/plugins/index.ts`. Revoking or removing a mount must preserve
+  prompt resolution integrity: the system prompt names the mount and tool
+  (e.g. "kept by the `state` mount, correct one with its `remember` tool") rather
+  than the underlying dispatch address, and drops the instruction when the mount
+  is absent.
 - **OAuth mounts.** An operator configures a credential by pasting it — a token,
   a username and password, an access key and a secret key. Those are two of the
   three shapes a credential can have: a bare token, an object with named fields,
@@ -563,9 +641,9 @@ them:
   used to seed this and they had drifted — a run gave three, the console seven —
   which is why the sentence is here rather than left to the code. The older
   threading layer is also still unused — `events.thread_id` is a column nothing
-  reads, and the `threads`/`task_threads` tables with the `POST
-  /agents/:id/threads` routes sit on `SqliteStore` in a file nothing calls, so
-  there are two vocabularies for one idea and only the console's is live.
+  reads, and the historical `threads`/`task_threads` tables in `SqliteStore`
+  remain unreferenced by the Worker runtime, so there are two vocabularies for
+  one idea and only the console's unified conversation model is live.
 - **External events.** Nothing can wake an agent from the outside yet — no
   webhooks. An agent now remembers across tasks, but it still cannot be woken
   by the world; that is the remaining half of "long-running".
