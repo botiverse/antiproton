@@ -28,7 +28,10 @@ if bash test/pi-storage-do.sh >/dev/null 2>&1; then echo ok; else echo FAIL; exi
 # reopens that file with truncation: every suite line above was erased and the
 # log read as one typecheck line followed by NUL bytes, so a deploy's own record
 # could not show which suites had run (2026-09-13).
-tc=$(npm run typecheck 2>&1 | tail -1)
+# `|| true`: typecheck exits non-zero exactly when it has something to say, and
+# under `set -e` a failing assignment would stop the script here, silently —
+# the verdict belongs to the `case` below, after the line has been printed.
+tc=$(npm run typecheck 2>&1 | tail -1) || true
 echo "$tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
 echo "--- all green; deploying ---"
