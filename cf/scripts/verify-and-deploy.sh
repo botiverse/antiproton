@@ -28,14 +28,29 @@ if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # here, unless test/removed-suites.txt names it, so a deleted one is refused
 # instead of skipped (Piper, Rex, 2026-09-13; cf/scripts/suite-verdict.sh).
 . cf/scripts/suite-verdict.sh
-live=$(curl -fsS -m 20 https://antiproton.ai/ui/whoami 2>/dev/null | sed -n 's/.*"build":"\([0-9a-f]\{7,40\}\)".*/\1/p' || true)
-if [ -z "$live" ] || ! git cat-file -e "${live}^{commit}" 2>/dev/null; then
-  echo "refusing: cannot tell which commit production runs (${live:-no answer}), so a deleted suite could go unnoticed."
-  exit 1
-fi
-git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > /tmp/suites-in-production.txt
-problems=$(suite_removals /tmp/suites-in-production.txt test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
-if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
+# Which commit production runs is asked of production — so, left alone, a
+# production that is down could not be redeployed, including by the fix for
+# it (Rex). ANTIPROTON_LIVE_BUILD=<sha> states it instead: one explicit line,
+# still checked against the repo. A preview deploy skips the check entirely,
+# like the master-only guard above, and never depends on production being up.
+case " $* " in
+  *wrangler.preview.jsonc*) ;;
+  *)
+    if [ -n "${ANTIPROTON_LIVE_BUILD:-}" ]; then
+      live="$ANTIPROTON_LIVE_BUILD"
+    else
+      live=$(curl -fsS -m 20 https://antiproton.ai/ui/whoami 2>/dev/null | sed -n 's/.*"build":"\([0-9a-f]\{7,40\}\)".*/\1/p' || true)
+    fi
+    if [ -z "$live" ] || ! git cat-file -e "${live}^{commit}" 2>/dev/null; then
+      echo "refusing: cannot tell which commit production runs (${live:-no answer}), so a deleted suite could go unnoticed."
+      echo "If production is down, state it: ANTIPROTON_LIVE_BUILD=<the sha it last ran> $0 $*"
+      exit 1
+    fi
+    git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > /tmp/suites-in-production.txt
+    problems=$(suite_removals /tmp/suites-in-production.txt test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+    if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
+    ;;
+esac
 NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
 run_suite() {  # name, command...
   local name="$1"; shift
