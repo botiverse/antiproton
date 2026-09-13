@@ -24,6 +24,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import type { MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
+import type { Plugin } from "../../src/plugins/types.ts";
 import { retailPlugin, applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { nodeWorker, runToRest } from "../node-worker.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
@@ -75,7 +76,10 @@ async function runTask(task: any, verbose: boolean) {
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent(T, AGENT);
-  const plugins = [retailPlugin(db, performed), builtinToolsPlugin(store, () => plugins)];
+  // Annotated because the tools plugin reads this list back through a closure:
+  // a self-referencing initializer has no type to infer, so without this it is
+  // `any`, and every use below was unchecked (six baseline entries, one cause).
+  const plugins: Plugin[] = [retailPlugin(db, performed), builtinToolsPlugin(store, () => plugins)];
   for (const alias of ["retail", "tools"] as const) {
     await store.addMount({
       tenantId: T, agentId: AGENT, alias, plugin: alias, installationId: `inst-${alias}`,
