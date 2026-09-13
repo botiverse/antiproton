@@ -407,6 +407,52 @@ await check("closestNames 直接测: 同别名优先 · 最长共同前缀排前
   if (closestNames("anything", []).length !== 0) throw new Error("names were invented from an empty list");
 });
 
+await check("关掉的挂载: run_js 里用它的名字,回'被关了、要人去开',不给无关候选", async () => {
+  // A session older than the switch still holds gh__issues_list. Before, that
+  // name missed the offered table and got "no tool named …; closest: web__get",
+  // so the model tried an unrelated tool. The gateway already had the true
+  // sentence, reachable only by a dispatch address (Piper, 2026-09-13).
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const { switchedOffMessage } = await import("../src/runtime/gateway.ts");
+  const seen: string[] = [];
+  const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } };
+  const { pluginUnavailableMessage } = await import("../src/runtime/gateway.ts");
+  const make = (tools: any[], off: string[], unavailable: Array<[string, string]> = []) => runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools,
+    unoffered: [
+      ...off.map((alias) => ({ alias, plugin: "github", reason: "switched_off" as const })),
+      ...unavailable.map(([alias, plugin]) => ({ alias, plugin, reason: "plugin_unavailable" as const })),
+    ],
+  }) as any;
+  const run = async (tool: any, name: string) => {
+    seen.length = 0;
+    const out = await tool.execute(`off-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.message ?? null, r.error?.candidates ?? null]);` });
+    const [[status, code, message, candidates]] = JSON.parse(out.content[0].text);
+    return { seen: [...seen], status, code, message, candidates };
+  };
+  const withTools = make(qualifyMountedTools([named("get", "web.get")]), ["gh"], [["box", "run9"]]);
+  const off = await run(withTools, "gh__issues_list");
+  if (off.seen.length !== 0) throw new Error(`a switched-off mount's name reached the host: ${off.seen}`);
+  if (off.code !== "plugin_disabled") throw new Error(`a switched-off mount was answered as ${off.code}: ${off.message}`);
+  if (off.message !== switchedOffMessage("gh")) throw new Error(`the answer is not the gateway's sentence: ${off.message}`);
+  if (off.candidates !== null) throw new Error(`a switched-off mount was offered neighbours: ${JSON.stringify(off.candidates)}`);
+  // A mount whose plugin is not installed (or was renamed): its own sentence,
+  // naming the plugin, not "switched off" and not neighbours.
+  const gone = await run(withTools, "box__run");
+  if (gone.code !== "plugin_unavailable") throw new Error(`an unavailable plugin's mount was answered as ${gone.code}: ${gone.message}`);
+  if (gone.message !== pluginUnavailableMessage("box", "run9")) throw new Error(`not the gateway's sentence: ${gone.message}`);
+  if (gone.candidates !== null) throw new Error(`an unavailable plugin's mount was offered neighbours: ${JSON.stringify(gone.candidates)}`);
+  // A typo against an offered tool is still a typo.
+  const typo = await run(withTools, "web__gte");
+  if (typo.code !== "unknown_tool") throw new Error(`a typo stopped being unknown_tool: ${typo.code}`);
+  // Nothing offered at all, but that one mount is off: say it is off, not that the list is empty.
+  const empty = make([], ["gh"]);
+  const emptyOff = await run(empty, "gh__issues_list");
+  if (emptyOff.code !== "plugin_disabled") throw new Error(`with an empty list a switched-off name got ${emptyOff.code}`);
+  const emptyOther = await run(empty, "zz__x");
+  if (emptyOther.code !== "no_tools") throw new Error(`with an empty list an unrelated name got ${emptyOther.code}`);
+});
+
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
 await check("a plugin's presence is asked by plugin and answered from the offered tools", async () => {
   const tool = (alias: string) => [{ name: "put", description: "", parameters: {}, address: `${alias}.put` }] as MountedTool[];

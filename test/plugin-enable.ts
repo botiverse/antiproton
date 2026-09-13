@@ -21,7 +21,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { AgentRuntime, enabledMounts, parsePluginChoice } from "../cf/src/runtime.ts";
+import { AgentRuntime, enabledMounts, parsePluginChoice, unofferedMounts } from "../cf/src/runtime.ts";
 import { pluginEnabled, credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -205,6 +205,29 @@ await check("种子只包含【用户什么都不用给就能用】的插件", a
     if (personal) {
       throw new Error(`seed ${seed.alias} needs a credential the user has not given yet, so a new agent gets a mount that fails on its first call`);
     }
+  }
+});
+
+await check("unofferedMounts: 关了的算 switched_off · 没装的算 plugin_unavailable · 其余都提供", async () => {
+  // run_js answers a stale name with the reason in this list. The two reasons
+  // need different sentences — a person can switch one back on, the other needs
+  // an operator — so a mount must never land in the wrong one.
+  const installed = new Map<string, { defaultForAllAgents?: boolean }>([
+    ["github", { defaultForAllAgents: false }],
+    ["http", { defaultForAllAgents: true }],
+  ]);
+  const mounts = [{ alias: "gh", plugin: "github" }, { alias: "web", plugin: "http" }, { alias: "ghost", plugin: "nope" }];
+  const read = (choices: Record<string, any>) =>
+    unofferedMounts(mounts, installed as any, choices).map((u) => `${u.mount.alias}:${u.reason}`).sort().join();
+  const byDefault = read({});
+  if (byDefault !== "gh:switched_off,ghost:plugin_unavailable") throw new Error(`with no answers read ${byDefault}`);
+  const flipped = read({ github: "enable", http: "disable" });
+  if (flipped !== "ghost:plugin_unavailable,web:switched_off") throw new Error(`after flipping both answers read ${flipped}`);
+  // Offered and unoffered partition every mount: nothing in both, nothing in neither.
+  const offered = mounts.filter((m) => installed.has(m.plugin) && enabledMounts([m], installed as any, {}).length).map((m) => m.alias);
+  const not = unofferedMounts(mounts, installed as any, {}).map((u) => u.mount.alias);
+  if (offered.some((a) => not.includes(a)) || offered.length + not.length !== mounts.length) {
+    throw new Error(`offered ${JSON.stringify(offered)} and unoffered ${JSON.stringify(not)} do not partition the mounts`);
   }
 });
 
