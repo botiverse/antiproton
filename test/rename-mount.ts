@@ -13,7 +13,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { agentRef } from "../src/runtime/secrets.ts";
+import { agentRef, secretRefKind } from "../src/runtime/secrets.ts";
 import { renameSafety } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
@@ -174,6 +174,32 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
   const quiet = new ToolGateway(store, [{ id: "run9", version: "1.0.0", tools: [], async invoke() { return {}; } }], { async resolve() { return null; } });
   if ((await quiet.mountActivity(ctx, "node")).live) throw new Error("a plugin with no activity() was read as busy");
   if ((await gw.mountActivity(ctx, "ghost")).live) throw new Error("a mount that does not exist was read as busy");
+});
+
+/**
+ * What /admin/diagnose reports about a renamed mount, read the way it reads it.
+ *
+ * A rename in production can only be checked from outside, and the outside
+ * sees two things per mount: whose credential it names (`secretRefKind`) and
+ * whether state is kept under the alias. So those two readings must come out
+ * right after a real rename — including the case where the credential is the
+ * deployment's and must not have moved — or the check would pass a half move.
+ */
+await check("diagnose 的两格读数:凭证类别与连接状态跟着别名走", async () => {
+  const own = await fixture();
+  await own.renameMount("t", "a", "node", "sandbox", { newRef: agentRef("sandbox") });
+  const moved = await own.getMountByAlias("t", "a", "sandbox");
+  if (secretRefKind(moved?.secretRef) !== "agent") throw new Error(`agent credential reads as ${secretRefKind(moved?.secretRef)}`);
+  if ((await own.getConnection("t", "a", "sandbox")) == null) throw new Error("no state under the new alias");
+  if ((await own.getConnection("t", "a", "node")) != null) throw new Error("state left under the old alias");
+
+  const op = await fixture({ operatorRef: true });
+  await op.renameMount("t", "a", "node", "sandbox", null);
+  const kept = await op.getMountByAlias("t", "a", "sandbox");
+  if (kept?.secretRef !== "operator:run9" || secretRefKind(kept.secretRef) !== "operator") {
+    throw new Error(`an operator reference changed: ${kept?.secretRef}`);
+  }
+  if (secretRefKind(null) !== "none" || secretRefKind("env:X") !== "env") throw new Error("the other kinds misread");
 });
 
 console.log(`\n  Renaming a mount\n  ${"─".repeat(56)}`);

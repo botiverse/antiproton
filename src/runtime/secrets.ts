@@ -28,6 +28,22 @@ export function isAgentRef(ref: string | null | undefined): boolean {
   return typeof ref === "string" && ref.startsWith(AGENT_REF);
 }
 
+/**
+ * Whose credential a reference names, never what it is.
+ *
+ * For an operator reading a mount from outside: after a rename, an `agent`
+ * reference should have moved with the mount and an `operator` one should
+ * not have, and telling those apart must not require reading either value.
+ * Only the prefix is inspected, and nothing after it is returned.
+ */
+export function secretRefKind(ref: string | null | undefined): "none" | "agent" | "operator" | "env" | "other" {
+  if (!ref) return "none";
+  if (isAgentRef(ref)) return "agent";
+  if (ref.startsWith("operator:")) return "operator";
+  if (ref.startsWith("env:")) return "env";
+  return "other";
+}
+
 export interface Sealed { ciphertext: string; iv: string }
 
 const enc = new TextEncoder();
