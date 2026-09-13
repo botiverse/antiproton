@@ -8,6 +8,17 @@ import { pluginEnabled } from "../plugins/types.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
+/**
+ * What the model is told when it reaches a mount that exists but is switched off
+ * for this agent: the mount is still there, and a person, not the agent, turns
+ * it back on. One sentence for both places that can say it — the gateway, for
+ * a dispatch address, and run_js, for a name in the model's own form — so the
+ * two cannot drift apart.
+ */
+export function switchedOffMessage(alias: string): string {
+  return `the \`${alias}\` mount is switched off for this agent; someone has to turn it back on`;
+}
+
 export interface SecretResolver {
   /** `scope` is the mount's owner. A reference is resolved for the agent whose
    *  mount names it, never for whoever wrote the string. */
@@ -414,7 +425,7 @@ export class ToolGateway {
         // the mount still exists and that a person, not the agent, reopens it.
         error: {
           code: "plugin_disabled",
-          message: `the \`${r.mount.alias}\` mount is switched off for this agent; someone has to turn it back on`,
+          message: switchedOffMessage(r.mount.alias),
         },
       };
     }
