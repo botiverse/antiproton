@@ -190,6 +190,37 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
   return null;
 }
 
+/**
+ * Who may use the programmatic routes, `/agent/*` and `/bench/*`.
+ *
+ * They took the tenant and agent from the query string and asked nobody:
+ * `GET /agent/state?tenantId=…&agentId=…` returned any agent's answer and
+ * events to a caller with no session and no token, and `/bench/purge` or
+ * `/bench/basedb` changed shared state for the same caller (task #15,
+ * 2026-09-13). Addressing an object is not permission to read it.
+ *
+ * `/bench/*` exists for the benchmark runners, which carry the automation
+ * token; nobody signs in to use it. `/agent/*` is the same automation door plus
+ * a signed-in person reaching their own agents: their tenant, and an agent
+ * that is theirs — `owns` is the caller's answer from the directory, asked only
+ * when the agent is not the one the identity names. Anything else is
+ * `not-found`, so "not yours" and "does not exist" look the same from outside,
+ * as they do on the console routes.
+ */
+export function programmaticAccess(
+  v: Viewer | null,
+  route: "agent" | "bench",
+  target: { tenantId: string; agentId: string },
+  owns?: boolean,
+): "allow" | "unauthorized" | "not-found" {
+  if (!v || v.source === "anonymous") return "unauthorized";
+  if (v.source === "automation") return "allow";
+  if (route === "bench") return "unauthorized";
+  if ((v.tenantId ?? "demo") !== target.tenantId) return "not-found";
+  if (v.agentId === target.agentId || owns === true) return "allow";
+  return "not-found";
+}
+
 export async function sessionCookieFor(secret: string, v: Viewer, sub: string, now = Date.now()): Promise<string> {
   const claims: SessionClaims = {
     v: 1, who: v.email, name: v.name, username: v.username, picture: v.picture, sub,

@@ -11,7 +11,7 @@ import {
   seal, open, resolveViewer, sessionCookieFor, b64url, unb64url,
   readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
-  GITHUB_TOKEN, GITHUB_API,
+  GITHUB_TOKEN, GITHUB_API, programmaticAccess, type Viewer,
 } from "../cf/src/auth.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -188,6 +188,36 @@ await check("github: a session carries the mapped agent and resolves with it; on
   // signed, and nobody — its holder signs in with GitHub instead.
   const legacy = await seal(SECRET, { v: 1, who: "a@b.test", name: null, username: null, picture: null, sub: "sub", source: "raft", iat: now, exp: now + 3600_000 });
   assert(await resolveViewer(req(`${SESSION_COOKIE}=${legacy}`), { SESSION_SECRET: SECRET }, { now }) === null, "a Raft-era session must resolve to nobody");
+});
+
+await check("programmatic routes: nobody, anonymous and QA are refused; automation reaches anything", async () => {
+  // task #15: /agent/state answered any tenant's agent to a caller with no
+  // session and no token, and /bench/purge changed shared state the same way.
+  const target = { tenantId: "t-other", agentId: "u-someone" };
+  const anon: Viewer = { email: "anonymous (UNPROTECTED)", name: null, username: null, picture: null, source: "anonymous" };
+  const auto: Viewer = { email: "automation", name: "automation", username: null, picture: null, source: "automation" };
+  assert(programmaticAccess(null, "agent", target) === "unauthorized", "no viewer reached an agent");
+  assert(programmaticAccess(anon, "agent", target) === "unauthorized", "the anonymous viewer reached an agent");
+  assert(programmaticAccess(null, "bench", target) === "unauthorized", "no viewer reached the benchmark routes");
+  assert(programmaticAccess(QA_VIEWER, "bench", target) === "unauthorized", "a QA session reached the benchmark routes");
+  assert(programmaticAccess(auto, "agent", target) === "allow", "automation was refused an agent");
+  assert(programmaticAccess(auto, "bench", target) === "allow", "automation was refused the benchmark routes");
+});
+
+await check("programmatic routes: a signed-in person reaches their own agents, in their own tenant, and nothing else", async () => {
+  const me: Viewer = { email: "me@x", name: null, username: "me", picture: null, source: "github", agentId: "u-me", tenantId: "t-me" };
+  assert(programmaticAccess(me, "agent", { tenantId: "t-me", agentId: "u-me" }) === "allow", "refused the agent the identity names");
+  assert(programmaticAccess(me, "agent", { tenantId: "t-me", agentId: "u-mine-2" }, true) === "allow", "refused an agent the directory says is theirs");
+  assert(programmaticAccess(me, "agent", { tenantId: "t-me", agentId: "u-not-mine" }, false) === "not-found", "reached an agent in their tenant that is not theirs");
+  assert(programmaticAccess(me, "agent", { tenantId: "t-me", agentId: "u-not-mine" }) === "not-found", "an unasked directory counted as ownership");
+  // Another tenant is refused even with a matching agent id or a stray "owns":
+  // ownership is looked up in the caller's own tenant, never across.
+  assert(programmaticAccess(me, "agent", { tenantId: "t-other", agentId: "u-me" }) === "not-found", "reached another tenant's agent that shares an id");
+  assert(programmaticAccess(me, "agent", { tenantId: "t-other", agentId: "u-x" }, true) === "not-found", "reached another tenant through owns");
+  assert(programmaticAccess(me, "bench", { tenantId: "bench", agentId: "" }) === "unauthorized", "a signed-in person reached the benchmark routes");
+  // An older identity without a tenant lives in "demo", as tenantOf says.
+  const old: Viewer = { email: "old@x", name: null, username: null, picture: null, source: "github", agentId: "u-old" };
+  assert(programmaticAccess(old, "agent", { tenantId: "demo", agentId: "u-old" }) === "allow", "an identity without a tenant is not in demo");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
