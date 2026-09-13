@@ -1288,4 +1288,10 @@ for (const r of results) {
 }
 const pass = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${pass} passed, ${results.length - pass} failed\n`);
-process.exit(pass === results.length ? 0 : 1);
+// A suite that runs no cases must not report success. `pass === results.length` is the whole of
+// this file's verdict, and an empty run satisfies it — which is how a suite
+// dies without saying so: the gate runs every file (#245), but a file that
+// stopped asserting anything still exits 0. `cf/src/runtime.ts` records what
+// that cost once, when the one test guarding a version pin died the same day
+// the pin broke and nothing went red until the breakage reached production.
+process.exit(results.length > 0 && pass === results.length ? 0 : 1);
