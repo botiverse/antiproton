@@ -3,7 +3,7 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, MountActivity, MountUsage } from "../plugins/types.ts";
+import type { Plugin, MountActivity, MountUsage, UsageEvent } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
@@ -14,7 +14,31 @@ export interface SecretResolver {
   resolve(ref: string, scope?: { tenantId: string; agentId: string }): Promise<string | null>;
 }
 
+/**
+ * Where usage events go. Injected, because what stores them is not what
+ * produces them — and because the contract promises a plugin that `record`
+ * never throws, which only the side holding the writer can guarantee.
+ */
+export interface UsageRecorder {
+  write(at: { tenantId: string; agentId: string; alias: string }, event: UsageEvent): Promise<void>;
+}
+
+/**
+ * The recorder in place until events are stored somewhere: it keeps nothing and
+ * **counts what it did not keep**.
+ *
+ * A silent no-op would be the shape we spent a day removing — a write that
+ * vanishes, indistinguishable from a week when nobody used anything. A counter
+ * is not a ledger, but it answers "are we losing events, and how many", which
+ * is the question a silent default cannot.
+ */
+export const countingRecorder: UsageRecorder & { dropped: number } = {
+  dropped: 0,
+  async write() { countingRecorder.dropped++; },
+};
+
 export const envSecrets: SecretResolver = {
+
   async resolve(ref) {
     return process.env[ref.replace(/^env:/, "")] ?? null;
   },
@@ -51,6 +75,7 @@ export class ToolGateway {
   #store: StorageAdapter;
   #plugins: Map<string, Plugin>;
   #secrets: SecretResolver;
+  #recorder: UsageRecorder;
   /**
    * One queue per mount that declared it cannot overlap, keyed
    * `tenant/agent/alias`.
@@ -79,10 +104,36 @@ export class ToolGateway {
    */
   #queues = new Map<string, Promise<unknown>>();
 
-  constructor(store: StorageAdapter, plugins: Plugin[], secrets: SecretResolver = envSecrets) {
+  constructor(
+    store: StorageAdapter,
+    plugins: Plugin[],
+    secrets: SecretResolver = envSecrets,
+    recorder: UsageRecorder = countingRecorder,
+  ) {
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
+    this.#recorder = recorder;
+  }
+
+  /**
+   * The `record` a plugin is handed: it resolves whatever the writer does.
+   *
+   * The contract tells plugins this never throws, and this is where that is
+   * made true — a plugin calls it beside its work, and a row that could not be
+   * written must not fail the thing it was describing. The loss is the
+   * recorder's to report; swallowing it here without one would be the silence
+   * the counter exists to break.
+   */
+  #recordFor(at: { tenantId: string; agentId: string }, alias: string) {
+    return async (event: UsageEvent) => {
+      try {
+        await this.#recorder.write({ tenantId: at.tenantId, agentId: at.agentId, alias }, event);
+      } catch {
+        // Reported by whoever owns the writer, counted by the default one.
+        await countingRecorder.write({ tenantId: at.tenantId, agentId: at.agentId, alias }, event);
+      }
+    };
   }
 
   /** alias.tool  →  exact mount.  plugin.tool  →  only if unambiguous. */
@@ -208,6 +259,7 @@ export class ToolGateway {
                 this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
             },
             async sibling() { return null; },
+            record: this.#recordFor(ctx, mount.alias),
           });
         } catch (e: any) {
           // A plugin that cannot describe itself must not stop the agent from
@@ -254,6 +306,7 @@ export class ToolGateway {
           this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
       },
       async sibling() { return null; },
+      record: this.#recordFor(ctx, mount.alias),
     });
   }
 
@@ -289,6 +342,7 @@ export class ToolGateway {
           this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
       },
       async sibling() { return null; },
+      record: this.#recordFor(ctx, mount.alias),
     });
   }
 
@@ -320,6 +374,7 @@ export class ToolGateway {
               this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
           },
           async sibling() { return null; },
+          record: this.#recordFor(ctx, mount.alias),
         });
         // Only report what was actually holding something: a release log that
         // names every mount tells you nothing about what was costing anything.
@@ -532,6 +587,7 @@ export class ToolGateway {
             connection: connectionFor(other.alias),
           };
         },
+        record: this.#recordFor(ctx, mount.alias),
       });
       await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null);
       return { status: "succeeded", operationId, result };
@@ -569,6 +625,7 @@ export class ToolGateway {
         alias,
         credential, publicConfig: mount.publicConfig, connection: connectionFor(alias),
         async sibling() { return null; },
+        record: this.#recordFor({ tenantId, agentId }, alias),
       });
     } catch (e) {
       // A check that threw gave no verdict on the key: the provider was not

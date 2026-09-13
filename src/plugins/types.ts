@@ -9,6 +9,33 @@ export interface ToolSchema {
   idempotency: "native" | "key" | "none";
 }
 
+/**
+ * One thing that happened and will be paid for, as it happens.
+ *
+ * **Events, not amounts.** A duration can only be written when something ends,
+ * and the end is exactly what is missing in the cases worth recording: a
+ * container that leaked, a call that threw, a worker recycled mid-flight. So a
+ * resource that lasts is two events and the reader subtracts, which makes an
+ * unreturned container an interval with no end rather than a row that never
+ * arrived. `quantity` and `unit` are for what is over in one call — a request,
+ * a token count — where there is nothing to wait for.
+ *
+ * This is not the meter. `activity` and `usage` answer what a mount is holding
+ * and has held, from a bounded window it keeps for the console; this is written
+ * where the thing happens, to somewhere nothing can go around, because "what
+ * did this tenant use" cannot be reconstructed from a window that forgets.
+ */
+export interface UsageEvent {
+  /** What kind of resource: "container" today. */
+  kind: string;
+  event: "opened" | "closed";
+  /** The resource's own id, so the two events can be paired. */
+  ref: string;
+  /** For something finished in one call. Omitted for `opened`/`closed` pairs. */
+  quantity?: number;
+  unit?: string;
+}
+
 /** Where a plugin keeps what it derived from a credential. Scoped to one mount,
  *  so two mounts of the same plugin never share a session. */
 export interface ConnectionState {
@@ -44,6 +71,20 @@ export interface PluginContext {
    * so it grants nothing the agent was not already configured to use.
    */
   sibling(alias: string): Promise<{ credential: string | null; connection: ConnectionState } | null>;
+
+  /**
+   * Write down something that will be paid for.
+   *
+   * **It must not throw.** A plugin calls this beside the work, not instead of
+   * it: failing a container start because a row could not be written punishes
+   * the thing that worked for the thing that did not. The caller is entitled to
+   * ignore the result.
+   *
+   * **And a swallowed write must leave a trace** — the gateway records the loss
+   * and counts it, because an audit with silent holes is indistinguishable from
+   * a quiet week, and telling those apart is the whole reason the record exists.
+   */
+  record(event: UsageEvent): Promise<void>;
 }
 
 /**

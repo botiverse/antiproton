@@ -1238,6 +1238,60 @@ await check("an unreadable row reads as no container, and a usable one still rea
   if (usageOf(asBoxState("nonsense" as any)).length !== 0) throw new Error("an unreadable row produced history");
 });
 
+/**
+ * The ledger is written where the thing happens, and it cannot break it.
+ *
+ * Two events, not a duration: the length of a container's life is only known
+ * when it ends, and the cases worth recording are the ones that never reach an
+ * end — a leak, a throw, a worker recycled mid-call. So an unreturned container
+ * has to look like an interval with no close, not like a row that never
+ * arrived.
+ *
+ * And a recorder that fails must not take the call with it. The asymmetry is
+ * not close: a lost line costs the audit a line, while a throw would abandon a
+ * container that already exists — running, billed, and no longer written where
+ * the release path can find it, which is precisely what the ledger exists to
+ * make visible.
+ */
+await check("stopping a box records a close, and a recorder that throws does not break it", async () => {
+  const events: Array<{ event: string; ref: string; kind: string }> = [];
+  let live: any = { boxId: "b-77", createdAt: 1_000, lastUsedAt: 2_000, execs: 2, saved: [] };
+  const ctx = (record: (e: any) => Promise<void>): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: JSON.stringify({ ak: "a", sk: "b" }),
+    publicConfig: { endpoint: "https://sandbox.invalid" },
+    connection: { get: async () => live, set: async (v: any) => { live = v; } },
+    sibling: async () => null,
+    record,
+  });
+
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
+  try {
+    // A working recorder: one close, naming the box that was stopped.
+    const r = await (run9 as any).invoke("release", {}, ctx(async (e: any) => { events.push(e); }));
+    if (!r) throw new Error("release returned nothing");
+    const closed = events.filter((e) => e.event === "closed");
+    if (closed.length !== 1) throw new Error(`${closed.length} close events, not 1: ${JSON.stringify(events)}`);
+    if (closed[0]!.ref !== "b-77" || closed[0]!.kind !== "container") {
+      throw new Error(`the close does not name the container: ${JSON.stringify(closed[0])}`);
+    }
+    // No quantity on a lasting resource: the reader subtracts two instants.
+    if ("quantity" in closed[0]!) throw new Error("a container reported an amount instead of an interval");
+
+    // A recorder that throws: the release still happens and still answers.
+    live = { boxId: "b-88", createdAt: 1_000, lastUsedAt: 2_000, execs: 0, saved: [] };
+    const still: any = await (run9 as any).invoke("release", {},
+      ctx(async () => { throw new Error("ledger down"); }));
+    if (!still || still.released !== true) {
+      throw new Error(`a failing recorder changed the outcome: ${JSON.stringify(still)}`);
+    }
+    if (live.boxId !== "") throw new Error("the box record was not cleared, so the next call reuses a dead box");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
