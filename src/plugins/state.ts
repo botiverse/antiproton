@@ -1,5 +1,5 @@
 import type { Plugin, PluginContext } from "./types.ts";
-import { READ_WHOLE_MAX } from "./artifacts.ts";
+import { READ_WHOLE_MAX, readableKey } from "./artifacts.ts";
 import type { StorageAdapter } from "../core/store.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import type { Json } from "../core/types.ts";
@@ -249,6 +249,24 @@ export function statePlugin(
         case "get": {
           const got = await store.getState(tenantId, agentId, key);
           if (!got) return { key, found: false };
+          if (got.ref && !readableKey(got.ref.replace(/^r2:\/\/[^/]+\//, ""))) {
+            // A row written before the reader refused these segments: the value
+            // is there and cannot be fetched. Offering the read call anyway
+            // hands the model an instruction that fails, and nothing in the
+            // answer says the value is unreachable — it looks like a value it
+            // simply has not opened yet (Vera on 2d3de80). So no call is
+            // offered, and the one move that helps is: it is `forget`.
+            //
+            // The reference itself is left out. Its only use here would be the
+            // call that cannot work, and `list` still reports `ref` per row,
+            // so it stays where it is diagnostic and goes where it would be an
+            // instruction.
+            return {
+              key, found: true, bytes: got.bytes, readable: false,
+              note: `this value was stored under a key that is no longer valid, so it cannot be read back; `
+                + `remove it with forget { key: "${key}" }`,
+            };
+          }
           if (got.ref) {
             // The note is the call, with the reference already in it: a model
             // that has to assemble one from a shape guesses the argument names,

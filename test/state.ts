@@ -318,6 +318,30 @@ await check("键是名字不是路径: 含 `..` 段的键写不进去,而 `a/b` 
   }
 });
 
+await check("旧行的 ref 读不回来时,get 不再递给模型一个打不通的调用", async () => {
+  // A row written before the reader refused these segments: the value is there
+  // and cannot be fetched. Handing back the read call anyway gives the model an
+  // instruction that fails, and nothing in the answer says the value is
+  // unreachable — it reads like one it merely has not opened yet (Vera on
+  // 2d3de80). The one move that helps is `forget`, so that is the call given.
+  const { store, plugin, ctx } = await fixture();
+  (store as any).getState = async () => ({
+    bytes: 99_999, updatedAt: 1, value: null,
+    ref: "r2://b/t/t/a/state/aa/../../../other/pwn.json",
+  });
+  const r = await plugin.invoke("get", { key: "k" }, ctx()) as Record<string, unknown>;
+  const note = String(r.note ?? "");
+  if (/read \{/.test(note)) throw new Error(`a call that the reader refuses was offered anyway: ${note}`);
+  if (!/forget \{ key: "k" \}/.test(note)) throw new Error(`the one call that helps is not given: ${note}`);
+  if (r.found !== true) throw new Error("the row is there; saying otherwise hides what forget has to remove");
+  if (r.ref !== undefined) throw new Error(`the unusable reference was handed back anyway: ${JSON.stringify(r.ref)}`);
+
+  // and a readable ref is untouched
+  (store as any).getState = async () => ({ bytes: 99_999, updatedAt: 1, value: null, ref: "r2://b/t/t/a/state/ok.json" });
+  const good = await plugin.invoke("get", { key: "k" }, ctx()) as Record<string, unknown>;
+  if (!/read \{ ref:/.test(String(good.note))) throw new Error(`a readable value stopped offering its call: ${good.note}`);
+});
+
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

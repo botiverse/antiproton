@@ -33,6 +33,19 @@ export const READ_PAGE = 16 * 1024;
  */
 export const READ_WHOLE_MAX = 32 * 1024;
 
+/**
+ * Whether a reference's key can be read back at all.
+ *
+ * The reader refuses `.`, `..` and empty segments, so anything that offers a
+ * `read` call has to ask the same question or it offers one that cannot work.
+ * One predicate with two callers rather than two checks that agree today:
+ * `state.get` handed back a call for a key the reader would refuse, and the
+ * model had no way to tell the value was unreachable (Vera on 2d3de80).
+ */
+export function readableKey(key: string): boolean {
+  return !key.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
+}
+
 export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
   return {
     id: "artifacts",
@@ -101,7 +114,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       // anywhere, which makes it a dependency this guard cannot see. Refusing
       // the segments costs one pass and ends the delegation — and it is the
       // segments, not the characters: `notes..old` is a name, `..` is a move.
-      if (key.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) {
+      if (!readableKey(key)) {
         throw new Error(`reference is not readable by this agent: ${a.ref.slice(0, 80)}`);
       }
       const raw = new TextDecoder().decode(await artifacts.get(key));
