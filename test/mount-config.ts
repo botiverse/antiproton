@@ -12,7 +12,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -1280,6 +1280,30 @@ await check("the catalogue offers a mount's label, and does not call it an accou
   const listed: any = await tools.invoke("mounts", {}, ctx);
   const row = (listed.mounts ?? listed)[0];
   if (row?.config?.account !== "open web") throw new Error(`the raw config stopped coming through: ${JSON.stringify(row)}`);
+});
+
+await check("从盒子里存出来的文件,名字是【解析过的路径】,不是原样拼进去", async () => {
+  // The key sanitised characters and kept segments, so a saved file could be
+  // named `work/../etc/x` — which the reader refuses (#289), leaving a file an
+  // agent saved and could never open again (cody, 2026-09-13). The name is now
+  // what the box itself would call the file.
+  const cases: Array<[string, string]> = [
+    ["/work/out.txt", "work/out.txt"],
+    ["/work/./out.txt", "work/out.txt"],
+    ["/work//out.txt", "work/out.txt"],
+    ["/work/../etc/x", "etc/x"],
+    ["/../../escape", "escape"],          // `..` at the root stays at the root
+  ];
+  for (const [path, want] of cases) {
+    const got = segmentsOf(path).join("/");
+    if (got !== want) throw new Error(`${path} became ${JSON.stringify(got)}, not ${JSON.stringify(want)}`);
+  }
+  // and the property that matters: no segment the reader would refuse
+  for (const [path] of cases) {
+    if (segmentsOf(path).some((seg) => seg === "" || seg === "." || seg === "..")) {
+      throw new Error(`${path} still carries a segment that makes its reference unreadable`);
+    }
+  }
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
