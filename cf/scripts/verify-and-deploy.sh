@@ -23,7 +23,14 @@ done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
 printf "%-22s" "pi-storage-do"
 if bash test/pi-storage-do.sh >/dev/null 2>&1; then echo ok; else echo FAIL; exit 1; fi
-npm run typecheck 2>&1 | tail -1 | tee /dev/stderr | grep -q ", 0 new" || { echo "typecheck: new errors"; exit 1; }
+# Captured, then printed, then tested. It used to be piped through
+# \`tee /dev/stderr\`, and when the run is redirected to a log file, /dev/stderr
+# reopens that file with truncation: every suite line above was erased and the
+# log read as one typecheck line followed by NUL bytes, so a deploy's own record
+# could not show which suites had run (2026-09-13).
+tc=$(npm run typecheck 2>&1 | tail -1)
+echo "$tc"
+case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
 echo "--- all green; deploying ---"
 set -a; . ~/.secrets/antiproton.env; set +a
 bash cf/scripts/deploy.sh "$@"
