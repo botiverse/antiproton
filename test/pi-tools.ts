@@ -405,6 +405,12 @@ await check("closestNames 直接测: 同别名优先 · 最长共同前缀排前
   if (!alias[0]!.startsWith("state__")) throw new Error(`a mistyped alias did not fall back to the nearest names: ${JSON.stringify(alias)}`);
   if (closestNames("state__gte", names, 2).length !== 2) throw new Error("the limit was not applied");
   if (closestNames("anything", []).length !== 0) throw new Error("names were invented from an empty list");
+  // An alias containing "__": the group is found by comparison, not by the
+  // part before the first "__" (which would be "my" and match nothing).
+  const nested = closestNames("my__gh__issue", ["my__gh__issues", "my__gh__pulls", "gh__issues", "web__get"]);
+  if (nested[0] !== "my__gh__issues" || nested.some((n) => !n.startsWith("my__gh__"))) {
+    throw new Error(`a typo under the alias my__gh was offered other mounts' names: ${JSON.stringify(nested)}`);
+  }
 });
 
 await check("关掉的挂载: run_js 里用它的名字,回'被关了、要人去开',不给无关候选", async () => {
