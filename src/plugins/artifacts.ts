@@ -80,15 +80,49 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       } catch {
         return { kind: "text", bytes: raw.length, text: raw.slice(a.offset ?? 0, (a.offset ?? 0) + (a.limit ?? 4000)) };
       }
-      if (!Array.isArray(parsed)) return { kind: "value", value: parsed };
+      // `fields`, `offset` and `limit` page a list, and this tool's summary
+      // promises them without conditions — as does `state.get`, which tells the
+      // model to open its reference here. But a parked result is often an
+      // envelope around the list rather than the list itself: `state.get` parks
+      // `{key, found, bytes, updatedAt, value}`. Reading only the top level
+      // dropped all three arguments without a word, so an agent that asked for
+      // five items projected to one field received three hundred whole, larger
+      // than what it had stored (Vera's fresh agent, 2026-09-13).
+      //
+      // So the page comes from the one array inside, when there is exactly one,
+      // and `at` names it. Exactly one, because two would be a guess; with none
+      // or several the value is returned whole and the result says the
+      // arguments did not apply, which is the part that was missing — a dropped
+      // argument is indistinguishable from one that did nothing.
+      const pageOf = (items: unknown[]) => {
+        const offset = a.offset ?? 0;
+        const limit = Math.min(a.limit ?? 50, 200);
+        const page = items.slice(offset, offset + limit).map((item) => {
+          if (!a.fields?.length || item === null || typeof item !== "object") return item;
+          return Object.fromEntries(a.fields.map((f) => [f, (item as any)[f]]));
+        });
+        return { total: items.length, offset, returned: page.length, items: page };
+      };
 
-      const offset = a.offset ?? 0;
-      const limit = Math.min(a.limit ?? 50, 200);
-      const page = parsed.slice(offset, offset + limit).map((item) => {
-        if (!a.fields?.length || item === null || typeof item !== "object") return item;
-        return Object.fromEntries(a.fields.map((f) => [f, (item as any)[f]]));
-      });
-      return { kind: "array", total: parsed.length, offset, returned: page.length, items: page };
+      if (Array.isArray(parsed)) return { kind: "array", ...pageOf(parsed) };
+
+      const inner = parsed && typeof parsed === "object"
+        ? Object.entries(parsed as Record<string, unknown>).filter(([, v]) => Array.isArray(v))
+        : [];
+      if (inner.length === 1) {
+        const [at, items] = inner[0] as [string, unknown[]];
+        return { kind: "array", at, ...pageOf(items) };
+      }
+      if (!a.fields?.length && a.offset === undefined && a.limit === undefined) {
+        return { kind: "value", value: parsed };
+      }
+      return {
+        kind: "value",
+        value: parsed,
+        note: inner.length === 0
+          ? "fields, offset and limit page an array; this artifact holds none, so it came back whole"
+          : `fields, offset and limit page one array; this artifact holds ${inner.length} (${inner.map(([k]) => k).join(", ")}), so it came back whole`,
+      };
     },
   };
 }
