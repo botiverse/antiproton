@@ -273,9 +273,11 @@ await check("runJsTool 的换名表: 模型看到的名字查到地址,地址原
   if (calls.join(",") !== "web.get,web.get") {
     throw new Error(`the sandbox did not reach the same tool both ways: ${calls.join(",")}`);
   }
-  // An unknown name is the gateway's to refuse, with its own message.
-  await (tool as any).execute("c2", { source: "nonsense" });
-  if (calls[2] !== "nonsense") throw new Error(`a lookup swallowed an unknown name: ${calls[2]}`);
+  // An unknown dotted name is the gateway's to refuse, with its own message.
+  // (An unknown name in the model's own form is refused by runJsTool itself,
+  // with candidates — the real-executor case below covers that.)
+  await (tool as any).execute("c2", { source: "nonsense.tool" });
+  if (calls[2] !== "nonsense.tool") throw new Error(`a lookup swallowed an unknown dotted name: ${calls[2]}`);
 });
 
 await check("run_js 里写模型看到的名字,在真实执行器里也能调到工具", async () => {
@@ -327,6 +329,40 @@ await check("Worker 执行器把脚本写的名字原样交给 host", async () =
   } finally {
     executions.delete("exec-names");
   }
+});
+
+await check("run_js 里写错模型自己那套名字,答'没有这个工具'并给出候选,而不是'名字不合法'", async () => {
+  // #255 made `alias__tool` the shape a script uses; a typo in it then reached
+  // the gateway and came back as "not a tool name", contradicting that rule
+  // (Piper, 2026-09-13). Through the real executor, as the model hits it.
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const seen: string[] = [];
+  const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools: qualifyMountedTools([named("get", "state.get"), named("put", "state.put"), named("get", "web.get")]),
+  });
+  const run = async (name: string) => {
+    seen.length = 0;
+    const out = await tool.execute(`u-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.candidates ?? null, r.error?.message ?? null]);` });
+    const [[status, code, candidates, message]] = JSON.parse(out.content[0].text);
+    return { seen: [...seen], status, code, candidates, message };
+  };
+  // "gte", not "gett": a typo that already contains the right name would pass a
+  // check on the message whether or not the message named anything.
+  const typo = await run("state__gte");
+  if (typo.seen.length !== 0) throw new Error(`an unknown offered-form name reached the host: ${typo.seen}`);
+  if (typo.code !== "unknown_tool") throw new Error(`a typo was answered with ${typo.code}, not unknown_tool`);
+  if (typo.candidates?.[0] !== "state__get") throw new Error(`the likely name was not offered first: ${JSON.stringify(typo.candidates)}`);
+  // The message itself names it, since that is what reaches the model even when
+  // a script does not print the candidates field.
+  if (!String(typo.message).includes("state__get")) throw new Error(`the message does not name the likely tool: ${typo.message}`);
+  const alias = await run("stat__get");
+  if (alias.code !== "unknown_tool" || !String(alias.candidates?.[0]).startsWith("state__")) {
+    throw new Error(`a mistyped alias did not point at the near names: ${JSON.stringify(alias)}`);
+  }
+  // A dotted name is still the gateway's to answer, in its own words.
+  const dotted = await run("state.gett");
+  if (dotted.seen.join() !== "state.gett") throw new Error(`a dotted name was intercepted: ${JSON.stringify(dotted)}`);
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);

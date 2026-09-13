@@ -297,6 +297,7 @@ export function runJsTool(
   const byAddress = new Map((opts.tools ?? []).map((t) => [t.address, t]));
   const address = (name: unknown) =>
     typeof name === "string" ? (byName.get(name) ?? name) : name;
+  const offered = [...byName.keys()];
   return {
     name: "run_js",
     label: "run_js",
@@ -319,6 +320,28 @@ export function runJsTool(
         // A stable key per call inside one execution, so a repeat reaches the
         // same operation rather than minting a new one.
         invoke: (call: any) => {
+          // A name in the model's own form (no dot) that is not in its list is
+          // answered here, where that list is known. Passed on, the gateway —
+          // which only speaks addresses — called it "not a tool name", though
+          // the shape is exactly the one the model was told to use; so a one-
+          // character slip in a long, truncated name read as a rule it had
+          // broken (Piper, 2026-09-13). Dotted names still go on: the gateway
+          // answers those as unknown_tool / not_mounted already.
+          if (typeof call.tool === "string" && !call.tool.includes(".") && !byName.has(call.tool)) {
+            // The likely names go into the message as well as `candidates`: the
+            // message is what reaches the model on every path, while the field
+            // is only seen if the script prints it (Dora).
+            const candidates = closestNames(call.tool, offered);
+            return Promise.resolve({
+              status: "rejected" as const,
+              error: {
+                code: "unknown_tool",
+                message: `no tool named ${JSON.stringify(call.tool)} in your tool list` +
+                  (candidates.length ? `; closest: ${candidates.slice(0, 5).join(", ")}` : ""),
+                candidates,
+              },
+            });
+          }
           const addr = address(call.tool);
           const target = typeof addr === "string" ? byAddress.get(addr) : undefined;
           const lifted = target && declaresConfirm(target.parameters) ? { args: call.args, confirm: false } : liftConfirm(call.args);
@@ -343,6 +366,22 @@ export function runJsTool(
       };
     },
   } as AgentHarnessTool<undefined>;
+}
+
+/**
+ * The offered names a mistyped one most likely meant, best first, at most ten.
+ *
+ * Names under the same alias (the part before `__`) come first, since a slip
+ * in the tool part is the usual one; failing that, every name is ranked by how
+ * much of the typed name it shares from the start. Exported so the ranking can
+ * be tested without an executor.
+ */
+export function closestNames(typed: string, names: string[], limit = 10): string[] {
+  const shared = (a: string, b: string) => { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++; return i; };
+  const alias = typed.split("__")[0]!;
+  const sameAlias = names.filter((n) => n.split("__")[0] === alias);
+  const pool = sameAlias.length ? sameAlias : names;
+  return [...pool].sort((a, b) => shared(typed, b) - shared(typed, a) || a.localeCompare(b)).slice(0, limit);
 }
 
 /**

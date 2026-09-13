@@ -16,7 +16,8 @@ export type ToolResult =
 export interface ToolError {
   code: string;
   message: string;
-  /** For ambiguous mount references: the aliases the agent could have meant. */
+  /** What the agent could have meant: aliases for an ambiguous mount reference,
+   *  or offered tool names for one run_js did not recognise. */
   candidates?: string[];
   /** For unauthorized/unmounted plugins: a link a human can act on. */
   authorizationUrl?: string;
