@@ -1,20 +1,12 @@
-bench/swebench/cf.ts: error TS2339: Property 'onerror' does not exist on type 'WebSocket'.
-bench/swebench/cf.ts: error TS2339: Property 'onmessage' does not exist on type 'WebSocket'.
-bench/swebench/cf.ts: error TS2551: Property 'onclose' does not exist on type 'WebSocket'. Did you mean 'close'?
 bench/swebench/run.ts: error TS2345: Argument of type 'number | null' is not assignable to parameter of type 'number'.
-bench/tau2/cf.ts: error TS2339: Property 'onerror' does not exist on type 'WebSocket'.
-bench/tau2/cf.ts: error TS2339: Property 'onmessage' does not exist on type 'WebSocket'.
-bench/tau2/cf.ts: error TS2551: Property 'onclose' does not exist on type 'WebSocket'. Did you mean 'close'?
 bench/tau2/run.ts: error TS2339: Property 'exclusive' does not exist on type '{}'.
 bench/tau2/run.ts: error TS2339: Property 'tools' does not exist on type '{}'.
 bench/tau2/run.ts: error TS7006: Parameter 'pl' implicitly has an 'any' type.
 bench/tau2/run.ts: error TS7006: Parameter 't' implicitly has an 'any' type.
 bench/tau2/run.ts: error TS7022: 'plugins' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer.
 bench/tau2/run.ts: error TS7024: Function implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.
-cf/src/index.ts: error TS2339: Property 'ToolBinding' does not exist on type 'Exports'.
-cf/src/index.ts: error TS2345: Argument of type '{ name: string; address: string; }[]' is not assignable to parameter of type 'MountedTool[]'.
-cf/src/runtime.ts: error TS2322: Type '{ account: string | undefined; } | {}' is not assignable to type 'Record<string, unknown>'.
-src/store/artifacts.ts: error TS2554: Expected 0 arguments, but got 1. # not a code error: one tsc program carries both runtimes' globals, so whichever lib loads second wins — cody diagnosed it 2026-09-12; a real fix is two programs
+src/plugins/http.ts: error TS2345: Argument of type 'string[][]' is not assignable to parameter of type 'string | Iterable<[string, string]> | readonly [string, string][] | Record<string, string | readonly string[]> | URLSearchParams | undefined'. # surfaced by the two-program split, not new code: line 392 hands URLSearchParams a string[][], which the worker types accept and node types do not, and the one program checked it against the worker types only; unread as a debt (cody, 2026-09-12)
+src/runtime/secrets.ts: error TS2304: Cannot find name 'CryptoKey'. # surfaced by the two-program split, not new code: @types/node 22.20 declares no global CryptoKey though engines is node >=24, where it is one; the worker program resolves it, so only node reports it (cody, 2026-09-12)
 test/pi-agent.ts: error TS2367: This comparison appears to be unintentional because the types '1' and '2' have no overlap. # correct comparison of two literal types; fixing it would weaken the test (Rex, 2026-09-12)
 test/secrets.ts: error TS7006: Parameter '_args' implicitly has an 'any' type.
 test/secrets.ts: error TS7006: Parameter '_tool' implicitly has an 'any' type.

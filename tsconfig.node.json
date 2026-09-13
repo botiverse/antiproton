@@ -1,0 +1,46 @@
+// The node program: everything that runs under node, with node's globals only.
+//
+// It used to share one program with cf/src and both runtimes' type packages,
+// and whichever loaded second decided what `WebSocket`, `Headers` or `Buffer`
+// meant everywhere — so bench drivers were told node's WebSocket had no
+// `onmessage`, and node code was checked against worker types that accepted
+// what node's reject.
+//
+// The tests that import cf/src are excluded here and compiled in the worker
+// program instead: importing cf/src pulls it into whichever program the test
+// is in, and cf/src checked without worker globals is a wall of
+// `Cannot find name 'R2Bucket'` about the build, not the code. The ratchet
+// fails if a cf/src file turns up in this program, so a new test that imports
+// cf/src and is not moved says so. report/ has no .ts to check.
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "lib": ["es2022"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "bench/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "test/auth.ts",
+    "test/confirm.ts",
+    "test/console-assets.ts",
+    "test/console-chat.ts",
+    "test/console-choice.ts",
+    "test/console-events.ts",
+    "test/console-login.ts",
+    "test/console-plugins.ts",
+    "test/console-poll.ts",
+    "test/console-storage.ts",
+    "test/console-version.ts",
+    "test/markdown.ts",
+    "test/mount-config.ts",
+    "test/plugin-enable.ts",
+    "test/prompt-contributions.ts"
+  ]
+}

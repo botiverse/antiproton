@@ -27,7 +27,10 @@ measures real bytes on binary via `byteLength`.
 **`npm run typecheck` first**, before the suites. It is a ratchet rather than a
 gate: the tree carries type errors that predate any check, so `tsc` on its own
 never passes, and `scripts/typecheck.mjs` fails only on a signature that is not in
-`typecheck-baseline.txt`. **An entry in that baseline is a finding still owed a
+its program's baseline. There are two programs, because node and the worker have
+different globals: `tsconfig.node.json` against `typecheck-baseline.node.txt`, and
+`tsconfig.worker.json` (cf/src, the src/** it imports, and the tests that import
+cf/src) against `typecheck-baseline.worker.txt`. **An entry in that baseline is a finding still owed a
 reading, not one agreed to be harmless** — the first one read turned out to be a
 tool that had never once done what its own summary promised — so the file shrinks
 by somebody understanding an entry, and `--update` means understood, never
