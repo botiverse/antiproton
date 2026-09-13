@@ -10,7 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { offloadLimit, tooLargeResult } from "../cf/src/runtime.ts";
+import { limitForCall, offloadLimit, tooLargeResult } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -118,6 +118,15 @@ await check("a 10 KB result is parked when it can be read back, and kept whole w
   must(10_000 > offloadLimit("files__read"), `with a reader, 10 KB must be parked (limit ${offloadLimit("files__read")})`);
   must(10_000 <= offloadLimit(null), `without a reader, 10 KB must not be cut (limit ${offloadLimit(null)})`);
   must(4 * 1024 <= offloadLimit("files__read"), "exactly 4 KiB still goes inline");
+});
+
+await check("a page read back from a parked result is not parked again at 4 KB", async () => {
+  // The host sees addresses, not offered names, so the reader is matched by its
+  // address; a 10 KB page must come back whole, while any other 10 KB result
+  // from the same agent is still parked.
+  const reader = { name: "artifacts__read", address: "artifacts.read" };
+  must(10_000 <= limitForCall("artifacts.read", reader), `a 10 KB page read back must arrive whole (limit ${limitForCall("artifacts.read", reader)})`);
+  must(10_000 > limitForCall("http.get", reader), `any other 10 KB result is still parked (limit ${limitForCall("http.get", reader)})`);
 });
 
 await check("the model is told the size at which its results are parked", async () => {
