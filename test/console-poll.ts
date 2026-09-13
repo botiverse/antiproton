@@ -64,17 +64,22 @@ check("the held cards ride with the chat, in one fragment under one version", ()
   must(/\.held:has\(>\.empty\)\{display:none\}/.test(html), "with nothing waiting the block must not draw; the hint under the composer already says where a held call shows");
 });
 
-check("the inspector holds only the merged tabs: events, memory, runtime", () => {
+check("the inspector holds the merged tabs: events, plugins, memory, runtime", () => {
   // tygg (2026-09-13, #design): some tabs can be merged. trajectory was
   // entirely covered by events (waterfall over the timeline strip, raw
   // records over the list), and storage/sandbox/runtime were three slices
-  // of one uiStorage answer. Three tabs, one question each.
+  // of one uiStorage answer — so the merge made room for the plugins tab
+  // this agent asks for next.
   const tabs = [...html.matchAll(/role="tab" data-insp="([^"]+)"/g)].map((m) => m[1]);
-  must(tabs.join(",") === "events,memory,runtime", `expected the merged set, found ${tabs.join(",")}`);
+  must(tabs.join(",") === "events,plugins,memory,runtime", `expected the merged set, found ${tabs.join(",")}`);
   must(/id="insp"[^>]*hx-get="\/ui\/events"/.test(html), "the panel must open on events, not the removed trajectory");
-  must(/paths = \{ events: '\/ui\/events', memory: '\/ui\/memory', runtime: '\/ui\/runtime\?stack=1' \}/.test(html),
-    "the runtime tab must ask for the stacked fragment (all three cost panels in one answer)");
+  must(/paths = \{ events: '\/ui\/events', plugins: '\/ui\/plugins', memory: '\/ui\/memory', runtime: '\/ui\/runtime\?stack=1' \}/.test(html),
+    "each tab must name its fragment (runtime is stacked, the rest are plain routes)");
   must(/if \(!paths\[name\]\) name = 'events';/.test(html), "a stale deep link, e.g. insp=trajectory, must land on events");
+  must(/id="insp"[\s\S]*?hx-trigger="ap:show, every 3s\[[\s\S]*?!ap\.editing\('#insp'\)\]"/.test(html),
+    "the whole panel must pause while a form in it is being edited, or the plugins tab empties a credential form like the rail once did");
+  must(/class="body plugins-root" id="insp"/.test(html) && /class="body plugins-root" id="plugins"/.test(html),
+    "both panels that host the catalogue must let the enable/disable select find their root");
 });
 
 const failed = results.filter((r) => !r.ok);

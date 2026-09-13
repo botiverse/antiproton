@@ -43,7 +43,7 @@ check("the control posts plugin/choice and rounds back to the panel", () => {
   const html = catalogue({ installed: [plugin("demo", true, "inherit", true)] });
   must(html.includes('hx-post="/ui/plugin/choice"'), "no route");
   must(html.includes('name="plugin" value="demo"'), "no plugin id");
-  must(html.includes('hx-target="#plugins"'), "the swap would leave the panel half-old");
+  must(html.includes('hx-target="closest .plugins-root"'), "the swap must repaint whichever panel shows the catalogue — the rail's plugins view or the inspector tab, not a hard-coded id");
 });
 
 const d: any = {

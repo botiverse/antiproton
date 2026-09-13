@@ -271,7 +271,7 @@ check("an unknown mount alias is said back, escaped", () => {
 // attribute on the shell; this keeps a later edit to that attribute honest.
 check("the plugins panel's poll waits while a person is typing in it", () => {
   const html = page("t_u-x", "someone", "u-x");
-  const panel = html.match(/<div class="body" id="plugins"[^>]*>/)?.[0] ?? "";
+  const panel = html.match(/<div class="body plugins-root" id="plugins"[^>]*>/)?.[0] ?? "";
   must(panel, "the plugins panel is in the shell");
   must(/hx-trigger="[^"]*every \d+s\[[^\]]*!ap\.editing\('#plugins'\)/.test(panel), "the every-Ns trigger is gated on ap.editing('#plugins')");
   const fn = html.match(/editing\(sel\) \{[\s\S]*?\n    \},/)?.[0] ?? "";
