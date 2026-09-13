@@ -365,13 +365,13 @@ check("the composer keeps a refused message and says why", () => {
   must(/if \(ev\.detail\.successful\) \{ form\.reset\(\)/.test(html) && /err\.textContent = 'not sent: '/.test(html), "reset only on success; otherwise the reason is shown");
 });
 
-// Held calls must not swallow the conversation: the panel is capped and
-// scrolls, and a card's argument block wraps rather than running off the edge.
-check("the held-approvals panel is capped and card arguments wrap", () => {
+// Held calls append like ordinary flow — a long argument must wrap rather
+// than run the card off the edge. The old sticky-strip cap itself is gone.
+check("card argument blocks wrap in the held flow", () => {
   const html = page("t_u-x", "someone", "u-x");
   const css = html.slice(html.indexOf("<style>"), html.indexOf("</style>"));
-  must(/\.held\{[^}]*max-height:[^}]*overflow:auto/.test(css), "the held panel has a max height and scrolls");
   must(/\.card pre\{[^}]*white-space:pre-wrap/.test(css), "card argument blocks wrap");
+  must(!/\.held\{[^}]*max-height|\.held\{position:sticky/.test(css), "the old strip's cap and stick are gone — the flow is plain");
 });
 
 // An agent-raised hold (confirm: true, recorded as heldBy "agent") reads as

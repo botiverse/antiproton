@@ -48,16 +48,17 @@ check("the page catches up when the tab is shown again", () => {
     for (const m of reassigned) must(/delete panel\.dataset\.ver;/.test(m[1]), `a reassigned URL must forget the old version: ${m[0].slice(0, 80)}`);
   });
 
-check("the held cards ride with the chat, in one fragment under one version", () => {
+check("the held cards append as plain flow, in the same fragment under the same version", () => {
   must(!/hx-get="\/ui\/approvals"/.test(html), "no element may poll /ui/approvals on its own");
-  // Scope: after this change the element is not in the shell at all. It is
-  // in the chat fragment (chat.ts); test/console-chat.ts holds what it may
-  // be there. Looking for it on /ui and not finding it is the intended state.
-  must(!/id="approvals"/.test(html), "the wrapper the decide buttons target arrives inside the chat fragment, not in the shell");
+  // Scope: they are in the chat fragment (chat.ts); test/console-chat.ts
+  // holds what it may be there. Looking for them on /ui and not finding them
+  // is the intended state. The strip was deleted (tygg, 2026-09-13 #design,
+  // task #6): cards follow the turns as ordinary flow, and mobile loses its
+  // one region-duplicating panel.
+  must(!/\.held\{position:sticky/.test(html), "the sticky strip is gone: the cards append after the turns");
   must(/id="transcript"[^>]*\s+hx-get="\/ui\/chat\?held=1"/.test(html), "the transcript must ask for the held cards");
   must(/hx-post="\/ui\/message"[^>]*hx-vals='\{"held":"1"\}'/.test(html), "a sent message must redraw the transcript with the held cards too");
-  must(/\.held\{position:sticky;bottom:-13px;/.test(html), "inside the scrolling body the block must stick above the composer, as the old strip always showed");
-  must(/\.held:has\(>\.empty\)\{display:none\}/.test(html), "with nothing waiting the block must not draw; the hint under the composer already says where a held call shows");
+  must(/\.held:has\(>\.empty\)\{display:none\}/.test(html), "with nothing waiting the wrapper must not draw; the hint under the composer already says a held call shows next to it");
 });
 
 check("the inspector holds the merged tabs: events, plugins, memory, runtime", () => {
