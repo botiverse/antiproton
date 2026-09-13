@@ -65,8 +65,10 @@ globalThis are gone by the next run, so carry what you need in your own output
 or in a tool that stores it.
 
 Inside run_js: every call returns { status, ... }. "succeeded" carries .result,
-"rejected" carries .error.code. There is no fetch, require, fs or process — the
-tool tag is the only way out. console.log is not returned; only output() is.
+"rejected" carries .error.code. run_js code has no fetch, require, fs or process —
+the tool tag is its only way out. That is true of run_js alone: a container or
+shell that one of your tools runs commands in is a different machine, with its
+own runtime and network. console.log is not returned; only output() is.
 The clock does not advance while code runs (it moves only when a tool call
 returns), so Date.now() and performance.now() cannot time a computation.
 What you output() comes back into this conversation as it is, up to 64 KiB, and
