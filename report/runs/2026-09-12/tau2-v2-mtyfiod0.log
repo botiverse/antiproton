@@ -1,0 +1,116 @@
+
+  τ²-bench retail — 8 task(s) × 3 trial(s), model deepseek-flash, waiting by push
+  on https://antiproton.botiverse.workers.dev object bench-v2
+  ────────────────────────────────────────────────────────────────────────────────────
+  [31m✗[0m task 0    db=NO act=NO  transfer      2 turns / 7 calls / 21122 tok / 32s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["1151293680","4983901480"],"new_item_ids":["7706410293","7747408585"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 1    db=NO act=NO  out-of-scope  2 turns / 9 calls / 30199 tok / 44s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["4983901480"],"new_item_ids":["7747408585"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 2    db=NO act=NO  out-of-scope  2 turns / 6 calls / 18061 tok / 28s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["4202497723","4602305039","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                     performed (nothing by that name)
+  [31m✗[0m task 3    db=NO act=NO  out-of-scope  2 turns / 7 calls / 22982 tok / 36s
+      expected: [modify_pending_order_items]  performed: []
+        modify_pending_order_items expected {"item_ids":["8349118980"],"new_item_ids":["9647292434"],"order_id":"#W4776164","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+  [31m✗[0m task 4    db=NO act=NO  out-of-scope  2 turns / 5 calls / 14962 tok / 23s
+      expected: [modify_pending_order_items, modify_pending_order_items]  performed: []
+        modify_pending_order_items expected {"item_ids":["3799046073"],"new_item_ids":["9647292434"],"order_id":"#W6247578","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+        modify_pending_order_items expected {"item_ids":["8349118980"],"new_item_ids":["9647292434"],"order_id":"#W4776164","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+  [31m✗[0m task 5    db=NO act=NO  out-of-scope  4 turns / 12 calls / 37475 tok / 54s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["8538875209"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                     performed (nothing by that name)
+  [31m✗[0m task 6    db=NO act=NO  out-of-scope  2 turns / 7 calls / 20394 tok / 32s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["8384507844"],"new_item_ids":["7453605304"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 7    db=NO act=NO  out-of-scope  2 turns / 7 calls / 19932 tok / 33s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["8384507844"],"new_item_ids":["1569765161"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 0    db=NO act=NO  out-of-scope  2 turns / 7 calls / 19938 tok / 28s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["1151293680","4983901480"],"new_item_ids":["7706410293","7747408585"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 1    db=NO act=NO  out-of-scope  3 turns / 8 calls / 22569 tok / 44s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["4983901480"],"new_item_ids":["7747408585"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 2    db=NO act=NO  out-of-scope  2 turns / 8 calls / 25344 tok / 31s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["4202497723","4602305039","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                     performed (nothing by that name)
+  [31m✗[0m task 3    db=NO act=NO  out-of-scope  1 turns / 4 calls / 10407 tok / 25s
+      expected: [modify_pending_order_items]  performed: []
+        modify_pending_order_items expected {"item_ids":["8349118980"],"new_item_ids":["9647292434"],"order_id":"#W4776164","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+  [31m✗[0m task 4    db=NO act=NO  out-of-scope  2 turns / 8 calls / 27589 tok / 42s
+      expected: [modify_pending_order_items, modify_pending_order_items]  performed: []
+        modify_pending_order_items expected {"item_ids":["3799046073"],"new_item_ids":["9647292434"],"order_id":"#W6247578","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+        modify_pending_order_items expected {"item_ids":["8349118980"],"new_item_ids":["9647292434"],"order_id":"#W4776164","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+  [31m✗[0m task 5    db=NO act=NO  out-of-scope  2 turns / 8 calls / 25871 tok / 33s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["8538875209"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                     performed (nothing by that name)
+  [31m✗[0m task 6    db=NO act=NO  out-of-scope  2 turns / 6 calls / 15599 tok / 20s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["8384507844"],"new_item_ids":["7453605304"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 7    db=NO act=NO  out-of-scope  1 turns / 5 calls / 14398 tok / 15s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["8384507844"],"new_item_ids":["1569765161"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 0    db=NO act=NO  out-of-scope  2 turns / 6 calls / 16174 tok / 23s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["1151293680","4983901480"],"new_item_ids":["7706410293","7747408585"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 1    db=NO act=NO  out-of-scope  1 turns / 5 calls / 15088 tok / 30s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["4983901480"],"new_item_ids":["7747408585"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 2    db=NO act=NO  out-of-scope  1 turns / 5 calls / 12967 tok / 26s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["4202497723","4602305039","9408160950"],"order_id":"#W2378156","payment_method_id":"credit_card_9513926"}
+                                     performed (nothing by that name)
+  [31m✗[0m task 3    db=NO act=NO  out-of-scope  1 turns / 5 calls / 14355 tok / 24s
+      expected: [modify_pending_order_items]  performed: []
+        modify_pending_order_items expected {"item_ids":["8349118980"],"new_item_ids":["9647292434"],"order_id":"#W4776164","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+  [31m✗[0m task 4    db=NO act=NO  out-of-scope  2 turns / 7 calls / 18511 tok / 30s
+      expected: [modify_pending_order_items, modify_pending_order_items]  performed: []
+        modify_pending_order_items expected {"item_ids":["3799046073"],"new_item_ids":["9647292434"],"order_id":"#W6247578","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+        modify_pending_order_items expected {"item_ids":["8349118980"],"new_item_ids":["9647292434"],"order_id":"#W4776164","payment_method_id":"credit_card_9513926"}
+                                   performed (nothing by that name)
+  [31m✗[0m task 5    db=NO act=NO  out-of-scope  2 turns / 7 calls / 20951 tok / 34s
+      expected: [return_delivered_order_items]  performed: []
+        return_delivered_order_items expected {"item_ids":["8538875209"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                     performed (nothing by that name)
+  [31m✗[0m task 6    db=NO act=NO  out-of-scope  2 turns / 6 calls / 17906 tok / 33s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["8384507844"],"new_item_ids":["7453605304"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                       performed (nothing by that name)
+  [31m✗[0m task 7    db=NO act=NO  out-of-scope  2 turns / 7 calls / 18258 tok / 26s
+      expected: [exchange_delivered_order_items]  performed: []
+        exchange_delivered_order_items expected {"item_ids":["8384507844"],"new_item_ids":["1569765161"],"order_id":"#W6390527","payment_method_id":"paypal_7644869"}
+                                       performed (nothing by that name)
+  ────────────────────────────────────────────────────────────────────────────────────
+  pass^1 = 0/8 = 0.0%
+  pass^2 = 0/8 = 0.0%
+  pass^3 = 0/8 = 0.0%
+  pass^1 = 0/24 = 0.0%   746s wall
+  tools: tools__search×258  tools__describe×56  tools__mounts×25
+  failures by ending: out-of-scope×23  transfer×1
+  object billed 17.6s of 746s wall (2%)
+  recorded report/runs/2026-09-12/tau2-v2-mtyfiod0.json
+
