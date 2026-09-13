@@ -30,12 +30,14 @@ export function pluginUnavailableMessage(alias: string, plugin: string): string 
 }
 
 /**
- * A mount that exists and is on, asked for a tool it does not have. Names the
- * mount and the tool separately — never as one dispatch address, which the
- * model is not shown — where the message used to be the bare tool name.
+ * A mount that exists and is on, asked for a tool it does not have. Says what
+ * follows — another tool on the same mount — rather than echoing the name back,
+ * as `already_attempted` states its consequence (Dora, Rex). Names the mount and
+ * the tool separately, never as one dispatch address, which the model is not
+ * shown; the message used to be the bare tool name.
  */
 export function unknownToolMessage(alias: string, tool: string): string {
-  return `the \`${alias}\` mount has no tool named "${tool}"`;
+  return `the \`${alias}\` mount has no tool named "${tool}"; call one of the tools it does offer`;
 }
 
 export interface SecretResolver {

@@ -40,6 +40,8 @@ await check("插件没装的挂载: 说出挂载和插件,并说明要运维来�
   if (r.status !== "rejected" || r.error?.code !== "plugin_unavailable") throw new Error(`got ${JSON.stringify(r)}`);
   if (r.error.message !== pluginUnavailableMessage("work", "run9")) throw new Error(`not the sentence: ${r.error.message}`);
   if (r.error.message === "run9") throw new Error("the message is still the bare plugin id");
+  // The next move: nothing the model can do; an operator has to fix the mount.
+  if (!/an operator fixes the mount/.test(r.error.message)) throw new Error(`the refusal does not say who fixes it: ${r.error.message}`);
   if (r.error.message.includes("work.run")) throw new Error(`the refusal names a dispatch address: ${r.error.message}`);
 });
 
@@ -49,6 +51,8 @@ await check("挂载在、工具不存在: 说出挂载和工具名,不带派发�
   if (r.status !== "rejected" || r.error?.code !== "unknown_tool") throw new Error(`got ${JSON.stringify(r)}`);
   if (r.error.message !== unknownToolMessage("work", "walk")) throw new Error(`not the sentence: ${r.error.message}`);
   if (r.error.message === "walk") throw new Error("the message is still the bare tool name");
+  // The next move, not just the fact: another tool on the same mount.
+  if (!/call one of the tools it does offer/.test(r.error.message)) throw new Error(`the refusal does not say what to do next: ${r.error.message}`);
   if (r.error.message.includes("work.walk")) throw new Error(`the refusal names a dispatch address: ${r.error.message}`);
 });
 
