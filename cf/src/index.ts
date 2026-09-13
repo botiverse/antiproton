@@ -52,6 +52,7 @@ import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import {
   resolveViewer,
+  programmaticAccess,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
@@ -2456,7 +2457,13 @@ export default {
     let name: string;
     let uiSelected: { who: string; home: string; agentId: string; tenantId: string } | null = null;
     if (url.pathname.startsWith("/conformance")) name = "conformance-v2";
-    else if (url.pathname.startsWith("/bench")) name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
+    else if (url.pathname.startsWith("/bench")) {
+      // The benchmark runners' door, and only theirs (see programmaticAccess).
+      if (programmaticAccess(await viewer(request, env), "bench", { tenantId: "bench", agentId: "" }) !== "allow") {
+        return Response.json({ error: "NOT_AUTHORIZED", hint: "the benchmark routes need x-harness-token" }, { status: 401 });
+      }
+      name = `bench-${url.searchParams.get("obj") ?? "v1"}`;
+    }
     else if (url.pathname.startsWith("/ui")) {
       // One demo agent per signed-in person, so two people trying it at once
       // do not share a conversation — and so the isolation is real, not a demo
@@ -2501,6 +2508,22 @@ export default {
         name = agentObjectName(tenantId, agentId);
       } catch (e: any) {
         return Response.json({ error: String(e?.message ?? e) }, { status: 400 });
+      }
+      // Addressed by identity from the query, so the caller must be allowed to
+      // reach that identity: automation, or a signed-in owner (task #15).
+      const v = await viewer(request, env);
+      let access = programmaticAccess(v, "agent", { tenantId, agentId });
+      if (access === "not-found" && v && tenantOf(v) === tenantId) {
+        const home = agentOf(v);
+        const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, home)));
+        access = programmaticAccess(v, "agent", { tenantId, agentId },
+          await homeStub.uiOwnsAgent(tenantId, home, agentId));
+      }
+      if (access === "unauthorized") {
+        return Response.json({ error: "NOT_SIGNED_IN", hint: "sign in at /login, or present x-harness-token" }, { status: 401 });
+      }
+      if (access === "not-found") {
+        return Response.json({ error: `no such agent: ${agentId} (not this viewer's, or never created)` }, { status: 404 });
       }
     } else name = "p0";
     const stub = env.AGENT.get(env.AGENT.idFromName(name));
