@@ -347,7 +347,9 @@ await check("run_js 里写错模型自己那套名字,答'没有这个工具'并
     const [[status, code, candidates, message]] = JSON.parse(out.content[0].text);
     return { seen: [...seen], status, code, candidates, message };
   };
-  const typo = await run("state__gett");
+  // "gte", not "gett": a typo that already contains the right name would pass a
+  // check on the message whether or not the message named anything.
+  const typo = await run("state__gte");
   if (typo.seen.length !== 0) throw new Error(`an unknown offered-form name reached the host: ${typo.seen}`);
   if (typo.code !== "unknown_tool") throw new Error(`a typo was answered with ${typo.code}, not unknown_tool`);
   if (typo.candidates?.[0] !== "state__get") throw new Error(`the likely name was not offered first: ${JSON.stringify(typo.candidates)}`);
