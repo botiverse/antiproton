@@ -9,23 +9,14 @@ set -euo pipefail
 # (Rex, 2026-09-13).
 cd "$(dirname "$0")/../.."
 
-# Production deploys merged code only. Once this script tests the tree it lives
-# in, running it from a worktree would otherwise also deploy that worktree —
-# and on 2026-09-13 a verification run of an unmerged branch did exactly that:
-# green suites, then a production deploy stamped with a head master did not
-# have. A preview deploy (--config wrangler.preview.jsonc) may ship a branch.
-# Checked first, so a refusal costs nothing.
-case " $* " in
-  *wrangler.preview.jsonc*) ;;
-  *)
-    git fetch -q origin master
-    if ! git merge-base --is-ancestor HEAD origin/master; then
-      echo "refusing to deploy: HEAD $(git rev-parse --short HEAD) is not on origin/master."
-      echo "Production ships merged code only; use --config wrangler.preview.jsonc for a branch."
-      exit 1
-    fi
-    ;;
-esac
+# Production ships the current master and nothing else (cf/scripts/deploy-guard.sh
+# says why). Checked first, so a refusal costs nothing. On 2026-09-13 a
+# verification run of an unmerged branch reached production; the first version
+# of this check then allowed any merged commit, including an older one (Piper).
+. cf/scripts/deploy-guard.sh
+git fetch -q origin master
+refusal=$(deploy_refusal "$(git rev-parse HEAD)" "$(git rev-parse origin/master)" "$@")
+if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # Every suite, minus the ones named here with the reason they cannot run here.
 # It used to be a list of 17 that someone had to remember to extend: 20 of the
 # 37 suites were never gated, and the two of them that had gone red (confirm,
