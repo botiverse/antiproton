@@ -9,6 +9,8 @@
 > ⚠️ 特别地，本文 §13 的 P1 路线与 §14 验收矩阵仍以租约（lease）、fencing token、
 > generation、事务 outbox 为交付项；这些机制在采用 pi 的循环后已被删除（见 `README.md`
 > 与 [`pi-upstream.md`](pi-upstream.md)）。保留原样是为了记录它们曾被如何论证，不是因为它们还在。
+> ⚠️ 同样地，正文 §16 的状态表仍把 `src/api/server.ts` 列为 ✅；该文件与其 node 侧 HTTP 服务已在
+> Worker 实现取代后被删除（#276，2026-09-13）。保留原样是为了记录它曾被如何论证，不是因为它还在。
 >
 > 姊妹文档：[`本地自托管Antiproton-计划书.md`](本地自托管Antiproton-计划书.md)（第二种部署形态）。
 
