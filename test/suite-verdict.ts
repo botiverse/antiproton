@@ -37,6 +37,14 @@ check("both count forms read, coloured or not", () => {
   }
 });
 
+check("a count inside a case's text is not the suite's verdict", () => {
+  // A suite with no summary line whose case says "3 passed attempts" asserted
+  // nothing; an unanchored match read it as three passes (Piper).
+  if (count("  \x1b[32m✓\x1b[0m the retry path stops after 3 passed attempts\n") !== "") {
+    throw new Error("a case's text was read as a pass count");
+  }
+});
+
 check("a suite that reports no count reads as nothing, not as a pass", () => {
   if (count("all good\n") !== "") throw new Error("a missing count was read as a number");
 });

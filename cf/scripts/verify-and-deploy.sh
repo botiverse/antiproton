@@ -46,8 +46,11 @@ case " $* " in
       echo "If production is down, state it: ANTIPROTON_LIVE_BUILD=<the sha it last ran> $0 $*"
       exit 1
     fi
-    git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > /tmp/suites-in-production.txt
-    problems=$(suite_removals /tmp/suites-in-production.txt test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+    # A file of its own: several trees may run this gate at once (Piper).
+    in_production=$(mktemp)
+    git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > "$in_production"
+    problems=$(suite_removals "$in_production" test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+    rm -f "$in_production"
     if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
     ;;
 esac

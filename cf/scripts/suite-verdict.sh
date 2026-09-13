@@ -13,9 +13,13 @@
 #    it), and only a deletion has to say "I meant this" (Piper, Rex, 2026-09-13).
 
 # suite_passed_count: reads a suite's output on stdin, prints the last reported
-# pass count ("58 passed, 0 failed" or "5/5 passed"), or nothing if it reported none.
+# pass count from a line beginning with it ("58 passed, 0 failed" or "5/5 passed"),
+# or nothing if it reported none.
 suite_passed_count() {
-  sed 's/\x1b\[[0-9;]*m//g' | grep -oE '[0-9]+(/[0-9]+)? passed' | tail -1 | grep -oE '^[0-9]+' || true
+  # Anchored to the start of a line (after colour codes): the summary is a line
+  # of its own, and a case's text can contain "3 passed" mid-sentence, which an
+  # unanchored match read as a pass count (Piper, 2026-09-13).
+  sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^[[:space:]]*[0-9]+(/[0-9]+)? passed' | tail -1 | grep -oE '[0-9]+' | head -1 || true
 }
 
 # suite_removals PREVIOUS_NAMES_FILE ACKNOWLEDGED_FILE CURRENT_NAMES...
