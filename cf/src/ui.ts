@@ -184,13 +184,11 @@ section.view[data-view=agents].on{height:100%}
 .conv{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;
 flex:1;min-height:0}
 .conv .body{flex:1;min-height:0;max-height:none;overflow:auto}
-/* Held calls sit between the transcript and the composer. Capped and
-   scrolling, so nine waiting calls cannot swallow the conversation and push
-   the composer out of the box (tygg, 2026-09-11). */
-.held{position:sticky;bottom:-13px;margin:14px -13px -13px;padding:0 13px 3px;background:var(--panel);border-top:1px solid var(--line);max-height:min(40%,320px);overflow:auto}
+/* Held calls append as plain flow next to the turns, at most a card taller
+   than a long argument block (tygg, 2026-09-13: the strip nobody used is gone).
+   A card's argument block wraps rather than running off the edge. */
 .held:has(>.empty){display:none}
 .held:empty{display:none}
-.held .card{margin:10px 0}
 .card pre{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
 .inspector{grid-area:insp;overflow:auto;background:var(--panel);border-left:1px solid var(--line);padding:12px;min-width:0}
 /* the inspector's tabs, on rUI's Tabs recipe: Elegant is an underline strip
