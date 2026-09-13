@@ -1,0 +1,50 @@
+// The worker program: cf/src and the src/** it imports, with the worker's
+// globals plus node's (the worker runs with nodejs_compat, and node's types
+// arrive anyway through undici-types' `/// <reference types="node" />`).
+//
+// `@cloudflare/workers-types/experimental`, not the package root, and the
+// order in `types` does not matter — both were measured. The root entry
+// declares `declare const Buffer: any;`, which breaks node's `Buffer` wherever
+// both are loaded: `createHmac(...).digest().toString("hex")` becomes
+// "Expected 0 arguments, but got 1" (src/store/artifacts.ts) in either order,
+// and with the worker types alone. The experimental entry omits that line; its
+// cost is that it also declares APIs behind flags this worker does not enable.
+// `wrangler types` output for this compatibility date and nodejs_compat gave
+// the identical error list on this tree, and would be a 590 KB generated file
+// to keep in step.
+//
+// The tests listed below run under node but import cf/src, so they are checked
+// here, where cf/src has its globals; tsconfig.node.json excludes the same
+// list, and the ratchet fails if a file ends up in neither or in both.
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node", "@cloudflare/workers-types/experimental"],
+    "lib": ["es2022"]
+  },
+  "include": [
+    "cf/src/**/*.ts",
+    "test/auth.ts",
+    "test/confirm.ts",
+    "test/console-assets.ts",
+    "test/console-chat.ts",
+    "test/console-choice.ts",
+    "test/console-events.ts",
+    "test/console-login.ts",
+    "test/console-plugins.ts",
+    "test/console-poll.ts",
+    "test/console-storage.ts",
+    "test/console-version.ts",
+    "test/markdown.ts",
+    "test/mount-config.ts",
+    "test/plugin-enable.ts",
+    "test/prompt-contributions.ts"
+  ],
+  "exclude": ["node_modules"]
+}

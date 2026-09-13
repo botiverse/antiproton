@@ -6,3 +6,10 @@
  */
 export function baselineSignatures(text: string): string[];
 export function baselineReasons(text: string): Map<string, string>;
+export function signatures(output: string): string[];
+export function compare(now: string[], baselineText: string): { base: Set<string>; fresh: string[]; gone: string[] };
+export function boundary(
+  programs: Record<string, { files: Set<string>; roots: Set<string> }>,
+  sources: string[],
+): string[];
+export const PROGRAMS: { name: string; config: string; baseline: string }[];
