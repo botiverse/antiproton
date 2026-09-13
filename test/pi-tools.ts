@@ -14,7 +14,7 @@ import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
-import { bridgeTools, offersPlugin, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
+import { bridgeTools, offersPlugin, replayPolicy, qualifyMountedTools, withholdTools, runJsTool, type MountedTool, closestNames } from "../src/runtime/pi-tools.ts";
 import { offloadedProvider, type OffloadPort } from "../src/model/pi-offloaded.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -391,6 +391,20 @@ await check("工具列表为空时,run_js 说'列表是空的',而不是暗示�
   if (!String(message).includes("empty") || String(message).includes("state__get")) {
     throw new Error(`the refusal does not say the list is empty, or still reads as a typo: ${message}`);
   }
+});
+
+await check("closestNames 直接测: 同别名优先 · 最长共同前缀排前 · 至多 limit 个", async () => {
+  // Exported so the ranking can be tested without an executor, and until now no
+  // test imported it: its contract was covered only inside executor cases, where
+  // an earlier assertion can throw first and skip it (Dora, 2026-09-13).
+  const names = ["state__get", "state__put", "state__list", "web__get", "web__post"];
+  const first = closestNames("state__gte", names);
+  if (first[0] !== "state__get") throw new Error(`closestNames ranked ${JSON.stringify(first)} for state__gte`);
+  if (first.some((n) => !n.startsWith("state__"))) throw new Error(`a same-alias typo was offered another alias: ${JSON.stringify(first)}`);
+  const alias = closestNames("stat__get", names);
+  if (!alias[0]!.startsWith("state__")) throw new Error(`a mistyped alias did not fall back to the nearest names: ${JSON.stringify(alias)}`);
+  if (closestNames("state__gte", names, 2).length !== 2) throw new Error("the limit was not applied");
+  if (closestNames("anything", []).length !== 0) throw new Error("names were invented from an empty list");
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
