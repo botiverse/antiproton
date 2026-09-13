@@ -22,6 +22,15 @@ what it bounds is a string, which is everywhere except binary payloads. They are
 coherent because they all count the same unit, and `src/store/artifacts.ts`
 measures real bytes on binary via `byteLength`.
 
+## Contribution Guidelines
+
+To keep the repository sound, maintainable, and aligned with core principles:
+
+- **Open for direct pull requests:** Plugins located under `src/plugins/`. Community contributions adding new external tool connectors, data adapters, or plugin integrations are warmly welcomed with accompanying tests in `test/`.
+- **Require an issue first:** Core runtime, state management, and Durable Objects under `src/kernel/`, `src/store/`, and `cf/`. Please open an issue to discuss invariants and architecture before writing code.
+- **Evidence over assertion:** Benchmarks, measurable telemetry, and positive control tests decide proposals. Every PR should verify its claims through testable entry points.
+- **Documentation standards:** All public documentation is in English, focused on external readability and factual fidelity. When code changes public behavior, keep `README.md` and related docs updated in the same PR.
+
 ## Running the tests
 
 **`npm run typecheck` first**, before the suites. It is a ratchet rather than a
@@ -101,10 +110,9 @@ and it is the only doc kept in step with the code. Everything else is history or
 reference:
 
 - [`docs/pi-upstream.md`](docs/pi-upstream.md) — how to stay in sync with pi.
-- [`docs/服务端Antiproton-完整计划书.md`](docs/服务端Antiproton-完整计划书.md) and
-  [`docs/本地自托管Antiproton-计划书.md`](docs/本地自托管Antiproton-计划书.md) —
-  the pre-implementation design docs, **frozen on purpose**. They record the
-  reasoning and the evidence of their moment, including mechanisms since
-  deleted (the self-built kernel's leases, fencing and outbox). Do not read them
-  as the current design, and do not update them to match: their value is that
-  they were written before the code, and current facts belong in the README.
+- [`docs/server-plan-archive.md`](docs/server-plan-archive.md) and
+  [`docs/self-hosted-plan-archive.md`](docs/self-hosted-plan-archive.md) —
+  the pre-implementation design docs (historical archives, frozen on purpose).
+  They record early architectural reasoning and benchmark evidence (including mechanisms
+  since replaced by pi's loop). Do not read them as the active design; active reality
+  belongs exclusively in [`README.md`](README.md).

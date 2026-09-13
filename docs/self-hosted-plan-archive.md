@@ -3,12 +3,12 @@
 > **归档说明（2026-09-10，入库时补写）**
 >
 > 本文是**设计文档，正文不改**，归档以保留当时的设计论证（与姊妹文档
-> [`服务端Antiproton-完整计划书.md`](服务端Antiproton-完整计划书.md) 的处理一致）。
+> [`server-plan-archive.md`](server-plan-archive.md) 的处理一致）。
 >
 > **现状以 [`README.md`](../README.md) 为准。** 本文写作之后，内核、Harness 与存储层的实现已发生大幅变动
 > （例如循环改用 pi 的，删除了自建内核的租约 / fencing / outbox）——其中共享部分的描述同样已过时。
 
-> 与 `服务端Antiproton-完整计划书.md`（SaaS / Cloudflare 版，v1.1）并列的第二个部署形态。
+> 与 `server-plan-archive.md`（SaaS / Cloudflare 版，v1.1）并列的第二个部署形态。
 > 内核、Harness、Gateway、插件协议完全共用；不同的只是**存储后端、执行后端、归属与迁移机制**。
 > 本文只写这一版特有的东西，共用部分标注「见 SaaS 版 §x」。
 

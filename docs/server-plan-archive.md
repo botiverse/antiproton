@@ -12,7 +12,7 @@
 > ⚠️ 同样地，正文 §16 的状态表仍把 `src/api/server.ts` 列为 ✅；该文件与其 node 侧 HTTP 服务已在
 > Worker 实现取代后被删除（#276，2026-09-13）。保留原样是为了记录它曾被如何论证，不是因为它还在。
 >
-> 姊妹文档：[`本地自托管Antiproton-计划书.md`](本地自托管Antiproton-计划书.md)（第二种部署形态）。
+> 姊妹文档：[`self-hosted-plan-archive.md`](self-hosted-plan-archive.md)（第二种部署形态）。
 
 > **状态说明（2026-09-09）**
 >
