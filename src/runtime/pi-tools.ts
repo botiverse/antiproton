@@ -418,13 +418,15 @@ export function runJsTool(
 /**
  * The offered names a mistyped one most likely meant, best first, at most ten.
  *
- * Names under the same alias come first, since a slip in the tool part is the
- * usual one; failing that, every name is ranked by how much of the typed name
- * it shares from the start. "The same alias" is found by comparison, never by
- * splitting the typed name at its first `__`: an alias may itself contain `__`
- * (my__gh), so the group is the names sharing the longest prefix with the typed
- * name that ends in `__` (Dora, 2026-09-13 — the twin of #261's lookup). Exported so the ranking can
- * be tested without an executor.
+ * The names sharing the longest prefix with the typed name that ends in `__`
+ * come first, since a slip in the tool part is the usual one; failing that,
+ * every name is a candidate. Within the group, names rank by how much of the
+ * typed name they share from the start. The group is found by comparison, never
+ * by splitting the typed name at its first `__`: an alias may itself contain
+ * `__` (my__gh). It approximates "the same alias" without knowing the aliases,
+ * so a sibling mount can fall in it: for `a__fo`, `a__b__run` shares `a__` just
+ * as `a__foo` does, and only the ranking puts it last. Exported so the ranking
+ * can be tested without an executor.
  */
 export function closestNames(typed: string, names: string[], limit = 10): string[] {
   const shared = (a: string, b: string) => { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++; return i; };
