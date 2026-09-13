@@ -16,6 +16,13 @@ import type { R2Artifacts } from "../store/artifacts.ts";
  */
 export const PARK_BYTES = 4 * 1024;
 
+/**
+ * How much of a stored result one `read { from }` returns. Well under the line
+ * at which the reader's own answer would be parked again (cf/src/runtime.ts
+ * limitForCall), with room for the escaping a string inside JSON costs.
+ */
+export const READ_PAGE = 16 * 1024;
+
 export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
   return {
     id: "artifacts",
@@ -39,20 +46,22 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
      * and a sentence about "the artifacts tool" is wrong the moment they do.
      */
     async promptContribution(ctx) {
-      return `A tool result over ${PARK_BYTES / 1024} KB comes back as a short preview with an artifact `
-        + `reference instead of the full payload; read the rest with the \`read\` tool on \`${ctx.alias}\`, `
-        + "projecting only the fields you need.";
+      return `A tool result over ${PARK_BYTES / 1024} KB comes back as a summary (\`preview\`) with a \`note\` `
+        + `giving the exact \`read\` call on \`${ctx.alias}\` that returns all of it; `
+        + "for a large list, project only the fields you need.";
     },
 
     tools: [
       {
         name: "read",
         summary:
-          "Read back a parked result by its r2:// reference. Use fields to project, offset/limit to page.",
+          "Read back a parked result by its r2:// reference: whole, fields/offset/limit for part of a list, "
+          + "or from to page through one too large to return at once.",
         parameters: {
           type: "object",
           properties: {
             ref: { type: "string" },
+            from: { type: "integer", description: "character to read from, a page at a time, as the note says" },
             fields: { type: "array", items: { type: "string" }, description: "keys to keep from each array item" },
             offset: { type: "integer" },
             limit: { type: "integer" },
@@ -65,7 +74,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
     ],
     async invoke(tool, args, ctx) {
       if (tool !== "read") throw new Error(`unknown tool: ${tool}`);
-      const a = args as { ref: string; fields?: string[]; offset?: number; limit?: number };
+      const a = args as { ref: string; from?: number; fields?: string[]; offset?: number; limit?: number };
       const prefix = `r2://${bucket}/t/${ctx.caller.tenantId}/${ctx.caller.agentId}/`;
       // Tenant isolation is enforced on the reference itself, not on a guess
       // about who parked it.
@@ -74,6 +83,27 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       }
       const key = a.ref.slice(`r2://${bucket}/`.length);
       const raw = new TextDecoder().decode(await artifacts.get(key));
+      // The continuation a cut result points at: the stored text as-is, a page
+      // at a time, each page ending with the call that reads the next — the way
+      // pi's own read tool continues a file (pi-coding-agent 0.83.0, dist/core/tools/read.js).
+      // It reads text rather than a parsed value so that where one page ends
+      // and the next begins is a number the model was given, not a guess about
+      // the structure.
+      if (a.from !== undefined) {
+        const from = Math.max(0, Math.floor(Number(a.from)) || 0);
+        let end = Math.min(from + READ_PAGE, raw.length);
+        // Half a surrogate pair is not a character; the next page starts with it.
+        const last = raw.charCodeAt(end - 1);
+        if (end < raw.length && end - 1 > from && last >= 0xd800 && last <= 0xdbff) end--;
+        const text = raw.slice(from, end);
+        const to = from + text.length;
+        return {
+          kind: "text", bytes: raw.length, from, to, text,
+          note: to < raw.length
+            ? `showing characters ${from}-${to} of ${raw.length}; continue with read { ref, from: ${to} }`
+            : `end of result (${raw.length} characters)`,
+        };
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);

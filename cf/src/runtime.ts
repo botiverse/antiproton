@@ -115,23 +115,63 @@ export function limitForCall(tool: string, reader: { name: string; address: stri
 /**
  * What the model gets instead of a result too big to put in the conversation.
  *
- * Two branches, and each says something true. Parked: here is a reference and
- * the tool that opens it, named the way the model was offered it, because this
- * is an instruction to call something now rather than a description. Not
- * parked: the rest is gone, in the same words run9 uses when it truncates —
- * because a reference nobody can open reads as though the content is still
- * somewhere, and an agent will go looking for a tool it does not have.
+ * A summary of the value (tygg, 2026-09-13: it clearly helps), and — from pi's
+ * design (pi-coding-agent 0.83.0, dist/core/tools/read.js) — a note that is
+ * the exact next call, not a direction. The note used to list the reader's
+ * arguments, and only two tools' descriptions said a result could come back
+ * this way, so a fresh agent took a GitHub read's summary for a tool that had
+ * returned no data (Vera, 2026-09-13).
+ *
+ * The call depends on size, because a whole read is itself held to the
+ * reader's line: under it, `{ ref }` returns everything; over it, a whole read
+ * would be parked again, so the call is `{ ref, from: 0 }`, which pages the
+ * text and says on each page where the next begins.
+ *
+ * Every cut result has this one shape, whichever tool produced it. Not parked:
+ * no reference, and the loss stated, because a reference nobody can open reads
+ * as though the content is still somewhere.
  */
 export function tooLargeResult(
-  preview: Json,
-  bytes: number,
+  value: unknown,
+  body: string,
   parked: { ref: string; readBack: string } | null,
 ): Record<string, Json> {
-  return parked
-    ? { ref: parked.ref, bytes, preview, note: `parked because it is large; read the rest with ${parked.readBack} { ref, fields, offset, limit }` }
-    : { bytes, preview, note: "too large for the conversation; the rest was discarded, not stored, because nothing is mounted that could read a parked result back" };
+  const preview = summarise(value);
+  const what = `a summary of a ${body.length}-character result`;
+  if (!parked) {
+    return { preview, bytes: body.length,
+      note: `${what}; the rest was discarded, not stored, because nothing is mounted that could read a parked result back` };
+  }
+  const call = body.length <= offloadLimit(null)
+    ? `${parked.readBack} { ref: "${parked.ref}" }`
+    : `${parked.readBack} { ref: "${parked.ref}", from: 0 }, which returns it in pages`;
+  return { preview, bytes: body.length, ref: parked.ref,
+    note: `${what}; all of it is stored: read it with ${call} (or fields/offset/limit for part of a list)` };
 }
 
+/**
+ * The limit, said in every tool's own description.
+ *
+ * pi states its limit in each tool's description, in the same sentence as
+ * what to do when it is reached (read.js: "truncated to 2000 lines or 50KB …
+ * continue with offset"). Here the cut happens for every mounted call, so a
+ * sentence in two plugins' descriptions described a global behaviour locally,
+ * and a model using any other tool was never told. Added here, where the
+ * reader and the line are both known, so no plugin has to repeat a number it
+ * does not own. The reader's own description is left alone: its pages are
+ * held to a different line and its summary already says how to continue.
+ */
+export function withLimitNote<T extends { description: string; address: string }>(
+  tools: T[],
+  reader: { name: string; address: string } | null,
+): T[] {
+  const kb = offloadLimit(reader?.name ?? null) / 1024;
+  const sentence = reader
+    ? ` A result over ${kb} KB comes back as a summary (preview) and a note with the ${reader.name} call that reads all of it.`
+    : ` A result over ${kb} KB comes back as a summary (preview); the rest is discarded.`;
+  return tools.map((t) =>
+    reader && t.address === reader.address ? t : { ...t, description: `${t.description ?? ""}${sentence}` });
+}
 
 /**
  * What the agent is told about a result too big to hand it whole.
@@ -629,12 +669,13 @@ export class AgentRuntime {
         const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
-        if (body.length <= limitForCall(call.tool, reader)) return res;
+        const limit = limitForCall(call.tool, reader);
+        if (body.length <= limit) return res;
         if (!readBack) {
           return {
             status: "succeeded",
             operationId: res.operationId,
-            result: tooLargeResult(summarise(res.result), body.length, null),
+            result: tooLargeResult(res.result, body, null),
           };
         }
         const key = `t/${ctx.tenantId}/${ctx.agentId}/${res.operationId}.json`;
@@ -643,7 +684,7 @@ export class AgentRuntime {
         return {
           status: "succeeded",
           operationId: res.operationId,
-          result: tooLargeResult(summarise(res.result), stored.bytes, { ref: stored.ref, readBack }),
+          result: tooLargeResult(res.result, body, { ref: stored.ref, readBack }),
         };
       },
     };
@@ -846,6 +887,7 @@ export class AgentRuntime {
     const readTool = (tools as MountedTool[]).find((t) =>
       offersPlugin(records, [t], "artifacts") && t.address.endsWith(".read"));
     const reader = readTool ? { name: readTool.name, address: readTool.address } : null;
+    const offered = withLimitNote(tools as MountedTool[], reader);
     const host = this.#host(
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader);
     const store = this.store;
@@ -858,7 +900,7 @@ export class AgentRuntime {
       ? [runJsTool(this.#executor as any, host, {
           onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
           // So a script names a tool the way the model's own list names it.
-          tools: tools as MountedTool[],
+          tools: offered,
           // So a stale name for a mount that cannot be offered is answered with
           // the reason, not as a typo.
           unoffered,
@@ -894,7 +936,7 @@ export class AgentRuntime {
         id: binding.model,
         contextWindow: this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW,
       },
-      tools: tools as MountedTool[],
+      tools: offered,
       extraTools: extraTools as any,
       toolHost: host,
       dispatch: async (jobId) => {

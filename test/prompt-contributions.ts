@@ -10,7 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { limitForCall, offloadLimit, tooLargeResult } from "../cf/src/runtime.ts";
+import { limitForCall, offloadLimit, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 
@@ -98,19 +98,63 @@ await check("no credential is resolved to write a paragraph", async () => {
   must(sawCredential === null, `the plugin must see no credential, saw ${JSON.stringify(sawCredential)}`);
 });
 
-await check("a result too large to send says something true in both cases", async () => {
-  // With a reader: a reference, and the tool named as the model was offered it
-  // — this sentence is an instruction to call something, so it must be a name
-  // the model can copy rather than the gateway's `artifacts.read` address.
-  const parked = tooLargeResult({ head: "…" } as any, 40_000, { ref: "r2://x", readBack: "files__read" });
-  must(parked.ref === "r2://x" && String(parked.note).includes("files__read"), `parked note: ${JSON.stringify(parked)}`);
+await check("a parked result keeps its summary and gives the exact call that reads all of it", async () => {
+  // Summary kept (tygg, 2026-09-13); the note is the next call, pi-style, named
+  // as the model was offered it. A whole read fits under the reader's line.
+  const value = { full_name: "cloudflare/workerd", stargazers_count: 7000, description: "x".repeat(9_000) };
+  const body = JSON.stringify(value);
+  const parked = tooLargeResult(value, body, { ref: "r2://x", readBack: "files__read" });
+  must((parked.preview as any)?.full_name === "cloudflare/workerd", `the summary is kept: ${JSON.stringify(parked.preview).slice(0, 80)}`);
+  must(String(parked.note).includes('files__read { ref: "r2://x" }'), `the note must be the call: ${parked.note}`);
+  must(!String(parked.note).includes("from:"), `a result that fits one read is not paged: ${parked.note}`);
   must(!String(parked.note).includes("artifacts.read"), "the note must not name a dispatch address");
-  // Without one: no reference at all, and the loss stated. A reference nobody
-  // can open reads as though the content is still somewhere.
-  const gone = tooLargeResult({ head: "…" } as any, 40_000, null);
-  must(!("ref" in gone), `nothing to read it back with, so no reference: ${JSON.stringify(gone)}`);
+  must(parked.ref === "r2://x" && parked.bytes === body.length, `ref and size: ${JSON.stringify(parked).slice(0, 120)}`);
+  // Over the reader's own line a whole read would be parked again, so the call pages.
+  const big = { description: "x".repeat(offloadLimit(null) + 1) };
+  const paged = tooLargeResult(big, JSON.stringify(big), { ref: "r2://y", readBack: "files__read" });
+  must(String(paged.note).includes('files__read { ref: "r2://y", from: 0 }'), `a result over the reader's line must be paged: ${paged.note}`);
+  // Without a reader: no reference, the loss stated, the same shape otherwise.
+  const gone = tooLargeResult(value, body, null);
+  must(!("ref" in gone), `nothing to read it back with, so no reference: ${JSON.stringify(gone).slice(0, 120)}`);
   must(/discarded, not stored/.test(String(gone.note)), `the loss must be stated: ${gone.note}`);
-  must(gone.bytes === 40_000 && "preview" in gone, "how much there was, and what the start of it looked like");
+  must(Object.keys(gone).join() === "preview,bytes,note" && Object.keys(parked).join() === "preview,bytes,ref,note",
+    `one shape: ${Object.keys(parked)} / ${Object.keys(gone)}`);
+});
+
+await check("following the note of a result too big for one read returns the exact result", async () => {
+  // The seam between the runtime's note and the reader's pages.
+  const value = Array.from({ length: 4000 }, (_, i) => ({ id: i, t: `\u00e9\u{1F600}${i}` }));
+  const body = JSON.stringify(value);
+  const bytes = new TextEncoder().encode(body);
+  const plugin = artifactsPlugin({ async get() { return bytes; } } as any, "b");
+  const ctx = { caller: { tenantId: "t", agentId: "a" }, alias: "artifacts" } as any;
+  const ref = "r2://b/t/t/a/op.json";
+  let note = String(tooLargeResult(value, body, { ref, readBack: "artifacts__read" }).note);
+  let joined = "", pages = 0;
+  for (let m = /from: (\d+)/.exec(note); m; m = /from: (\d+)/.exec(note)) {
+    const page: any = await plugin.invoke("read", { ref, from: Number(m[1]) }, ctx);
+    joined += page.text; note = String(page.note);
+    if (++pages > 50) throw new Error("the notes never reach the end");
+  }
+  must(pages >= 3, `expected several pages for ${body.length} characters, got ${pages}`);
+  must(joined === body, `pages != result (${joined.length} vs ${body.length})`);
+});
+
+await check("every offered tool's own description states the limit and what to do at it", async () => {
+  // pi puts the limit in each tool's description. A sentence in two plugins'
+  // descriptions described a behaviour every mounted call has.
+  const reader = { name: "artifacts__read", address: "artifacts.read" };
+  const tools = [
+    { name: "gh__api_get", address: "gh.api_get", description: "Read any GitHub REST endpoint." },
+    { name: "artifacts__read", address: "artifacts.read", description: "Read back a parked result." },
+  ];
+  const withReader = withLimitNote(tools, reader);
+  must(withReader[0]!.description.includes(`over ${offloadLimit("artifacts__read") / 1024} KB`) && withReader[0]!.description.includes("artifacts__read"),
+    `with a reader: ${withReader[0]!.description}`);
+  must(withReader[1]!.description === "Read back a parked result.", `the reader's own description is left alone: ${withReader[1]!.description}`);
+  const without = withLimitNote([tools[0]!], null);
+  must(without[0]!.description.includes(`over ${offloadLimit(null) / 1024} KB`) && /discarded/.test(without[0]!.description),
+    `without a reader: ${without[0]!.description}`);
 });
 
 await check("a 10 KB result is parked when it can be read back, and kept whole when it cannot", async () => {
