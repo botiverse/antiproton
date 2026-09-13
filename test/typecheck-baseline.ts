@@ -18,7 +18,7 @@
  * file checked by neither or counted by both — are functions here too.
  */
 import { readFileSync } from "node:fs";
-import { baselineSignatures, baselineReasons, signatures, compare, boundary, PROGRAMS } from "../scripts/typecheck.mjs";
+import { baselineSignatures, baselineReasons, rewriteBaseline, signatures, compare, boundary, PROGRAMS } from "../scripts/typecheck.mjs";
 
 let passed = 0, failed = 0;
 const check = (name: string, fn: () => void) => {
@@ -148,6 +148,33 @@ check("a program with no roots is a broken boundary, not a clean run", () => {
   // tsc failing to start produces no errors, and no errors reads as clean.
   const problems = boundary({ node: program([]), worker: program(["cf/src/index.ts"]) }, ["cf/src/index.ts"]);
   if (!problems.some((p) => p.startsWith("node: no root files"))) throw new Error(problems.join(" | ") || "no problem reported");
+});
+
+check("a rewrite carries the reasons of signatures that remain", () => {
+  const prior = [
+    "a.ts: error TS1: x # a decision, not a debt",
+    "b.ts: error TS2: y # diagnosed, still unfixed",
+  ].join("\n") + "\n";
+  const { text, carried, dropped } = rewriteBaseline(["a.ts: error TS1: x", "c.ts: error TS3: z"], prior);
+  if (!text.includes("a.ts: error TS1: x # a decision, not a debt")) throw new Error(`the surviving reason was dropped:\n${text}`);
+  if (text.includes("b.ts")) throw new Error("a signature that no longer occurs was kept");
+  if (!/^c\.ts: error TS3: z$/m.test(text)) throw new Error("a new signature arrived with something attached");
+  if (carried.length !== 1 || carried[0]![0] !== "a.ts: error TS1: x") throw new Error(`carried: ${JSON.stringify(carried)}`);
+  // The one worth seeing: its reason explained something that has stopped
+  // happening, so somebody has to decide whether the explanation still matters.
+  if (dropped.length !== 1 || dropped[0]![1] !== "diagnosed, still unfixed") throw new Error(`dropped: ${JSON.stringify(dropped)}`);
+});
+
+check("each program's baseline speaks only for itself", () => {
+  // Two programs, two files. A signature occurring only in the other program's
+  // output is `dropped` here and carried there; if a rewrite ever consulted
+  // both files, a reason would follow the wrong signature — and the split
+  // exists precisely because the two runtimes disagree.
+  const nodePrior = "src/x.ts: error TS1: only in node # node-only lib gap\n";
+  const { text, carried, dropped } = rewriteBaseline(["src/x.ts: error TS2: only in worker"], nodePrior);
+  if (carried.length !== 0) throw new Error("a reason crossed from one program's baseline into the other's");
+  if (dropped.length !== 1) throw new Error("the node-only reason was not reported as dropped here");
+  if (text.includes("node-only lib gap")) throw new Error("the other program's reason was written into this file");
 });
 
 console.log(`\n  ${"─".repeat(56)}\n  ${passed} passed, ${failed} failed\n`);
