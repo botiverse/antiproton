@@ -59,7 +59,7 @@ import { httpPlugin } from "../../src/plugins/http.ts";
 import { statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
-import { artifactsPlugin, PARK_BYTES } from "../../src/plugins/artifacts.ts";
+import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -95,7 +95,7 @@ export interface ModelJob {
  * the conversation. Whether that should park too has not been decided.
  */
 export function offloadLimit(readBack: string | null): number {
-  return readBack ? PARK_BYTES : 32 * 1024;
+  return readBack ? PARK_BYTES : READ_WHOLE_MAX;
 }
 
 /**

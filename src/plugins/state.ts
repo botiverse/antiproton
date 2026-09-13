@@ -1,4 +1,5 @@
 import type { Plugin, PluginContext } from "./types.ts";
+import { READ_WHOLE_MAX } from "./artifacts.ts";
 import type { StorageAdapter } from "../core/store.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import type { Json } from "../core/types.ts";
@@ -249,9 +250,20 @@ export function statePlugin(
           const got = await store.getState(tenantId, agentId, key);
           if (!got) return { key, found: false };
           if (got.ref) {
+            // The note is the call, with the reference already in it: a model
+            // that has to assemble one from a shape guesses the argument names,
+            // and a value over the read-back line has to be paged rather than
+            // read whole — which the old note never said, so a 60 KB value's
+            // only documented route parked again and stopped there (Vera's
+            // fresh agent on f0a3bcc, 2026-09-13).
+            const whole = got.bytes <= READ_WHOLE_MAX;
             return {
               key, found: true, bytes: got.bytes, ref: got.ref,
-              note: "too large to return here; the artifacts mount reads it back: `read { ref, fields, offset, limit }`",
+              note: whole
+                ? `too large to return here; read it from the artifacts mount: `
+                  + `read { ref: "${got.ref}" }`
+                : `too large to return here, and too large to read back in one call; page it from `
+                  + `the artifacts mount: read { ref: "${got.ref}", from: 0 } — each page's note gives the next`,
             };
           }
           return { key, found: true, bytes: got.bytes, updatedAt: got.updatedAt, value: got.value };

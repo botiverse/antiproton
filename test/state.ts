@@ -9,6 +9,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { statePlugin, workingSet, WORKING_SET } from "../src/plugins/state.ts";
+import { READ_WHOLE_MAX } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 import type { PluginContext } from "../src/plugins/types.ts";
 
@@ -269,6 +270,31 @@ await check("list 每行带 ref,而描述现在说了它是什么", async () => 
 
   const summary = plugin.tools.find((t) => t.name === "list")!.summary;
   if (!summary.includes("ref")) throw new Error(`the summary still does not name the ref column: ${summary}`);
+});
+
+await check("转存值的 note 就是那次调用本身,而且按大小给对形式", async () => {
+  // The old note gave a shape — `read { ref, fields, offset, limit }` — with no
+  // reference in it and no mention of `from`. So a 60 KB value's only
+  // documented route was a whole read, which the reader parks again: the model
+  // followed the instructions and stopped (Vera's fresh agent, 2026-09-13).
+  const { store, plugin, ctx } = await fixture();
+  const ref = "r2://b/t/t/a/big.json";
+
+  const small = { bytes: READ_WHOLE_MAX - 1, ref, updatedAt: 1, value: null };
+  const big = { bytes: READ_WHOLE_MAX + 1, ref, updatedAt: 1, value: null };
+  const noteFor = async (row: typeof small) => {
+    (store as any).getState = async () => row;
+    const r = await plugin.invoke("get", { key: "k" }, ctx()) as Record<string, unknown>;
+    return String(r.note ?? "");
+  };
+
+  const under = await noteFor(small);
+  if (!under.includes(ref)) throw new Error(`the note does not carry the reference: ${under}`);
+  if (/from:/.test(under)) throw new Error(`a value that reads back whole should not be told to page: ${under}`);
+
+  const over = await noteFor(big);
+  if (!over.includes(ref)) throw new Error(`the note does not carry the reference: ${over}`);
+  if (!/from: 0/.test(over)) throw new Error(`a value past the read-back line must be paged, and the note must say so: ${over}`);
 });
 
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
