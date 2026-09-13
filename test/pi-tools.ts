@@ -273,9 +273,11 @@ await check("runJsTool 的换名表: 模型看到的名字查到地址,地址原
   if (calls.join(",") !== "web.get,web.get") {
     throw new Error(`the sandbox did not reach the same tool both ways: ${calls.join(",")}`);
   }
-  // An unknown name is the gateway's to refuse, with its own message.
-  await (tool as any).execute("c2", { source: "nonsense" });
-  if (calls[2] !== "nonsense") throw new Error(`a lookup swallowed an unknown name: ${calls[2]}`);
+  // An unknown dotted name is the gateway's to refuse, with its own message.
+  // (An unknown name in the model's own form is refused by runJsTool itself,
+  // with candidates — the real-executor case below covers that.)
+  await (tool as any).execute("c2", { source: "nonsense.tool" });
+  if (calls[2] !== "nonsense.tool") throw new Error(`a lookup swallowed an unknown dotted name: ${calls[2]}`);
 });
 
 await check("run_js 里写模型看到的名字,在真实执行器里也能调到工具", async () => {
