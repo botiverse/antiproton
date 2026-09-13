@@ -12,6 +12,7 @@ import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { limitForCall, offloadLimit, tooLargeResult } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
+import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -127,6 +128,15 @@ await check("a page read back from a parked result is not parked again at 4 KB",
   const reader = { name: "artifacts__read", address: "artifacts.read" };
   must(10_000 <= limitForCall("artifacts.read", reader), `a 10 KB page read back must arrive whole (limit ${limitForCall("artifacts.read", reader)})`);
   must(10_000 > limitForCall("http.get", reader), `any other 10 KB result is still parked (limit ${limitForCall("http.get", reader)})`);
+});
+
+await check("run_js' missing fetch is stated as run_js' own, not as true of every place code runs", async () => {
+  // A fresh agent read "There is no fetch" and then found fetch in the sandbox
+  // container it had just used (Vera's fresh agent, 2026-09-13). The sentence
+  // was about run_js; unscoped, it read as a claim about everywhere.
+  const p = systemPrompt({ sandbox: true });
+  must(!/(^|[.\n] ?)There is no fetch/.test(p), "an unscoped 'There is no fetch' is back in the prompt");
+  must(/run_js code has no fetch/.test(p) && /true of run_js alone/.test(p), "the prompt must say whose fetch is missing");
 });
 
 await check("the model is told the size at which its results are parked", async () => {
