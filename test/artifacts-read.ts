@@ -72,6 +72,27 @@ await check("asking for nothing gets the value whole, with no note about argumen
   if (r.kind !== "value" || r.note !== undefined) throw new Error(`an unasked-for note appeared: ${JSON.stringify(r)}`);
 });
 
+await check("asking for nothing keeps the whole envelope, not its list alone", async () => {
+  // The case the one above did not reach: its value held no array, so it never
+  // exercised the descent. With an array inside, descending unasked returned
+  // fifty items and dropped `key`, `bytes` and `updatedAt` (cody, 2026-09-13).
+  // Descending is an inference about intent, and the arguments are its only
+  // signal — so with none, nothing is inferred.
+  const r = await reader({ key: "k", found: true, bytes: 19_093, updatedAt: 1, value: items })({});
+  if (r.kind !== "value") throw new Error(`an envelope was paged without being asked: ${JSON.stringify(r).slice(0, 120)}`);
+  for (const k of ["key", "bytes", "updatedAt"]) {
+    if (!(k in (r.value as Record<string, unknown>))) throw new Error(`the envelope lost \`${k}\`: ${JSON.stringify(r.value).slice(0, 120)}`);
+  }
+  if ((r.value as any).value.length !== 300) throw new Error(`the list was truncated unasked: ${(r.value as any).value.length}`);
+});
+
+await check("a bare list still pages by default, as it always has", async () => {
+  // The asymmetry is deliberate: a top-level array has nothing else in it to
+  // lose, so its long-standing default paging is not a silent truncation.
+  const r = await reader(items)({});
+  if (r.kind !== "array" || r.returned !== 50) throw new Error(`the default page changed: ${JSON.stringify(r).slice(0, 120)}`);
+});
+
 console.log(`\n  What \`read\` does with fields, offset and limit\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

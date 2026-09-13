@@ -106,15 +106,22 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
 
       if (Array.isArray(parsed)) return { kind: "array", ...pageOf(parsed) };
 
+      // Only descend when the caller asked to page or project. Descending is an
+      // inference about what they meant, and the arguments are the only signal
+      // of it; without them, returning the array alone would drop the rest of
+      // the envelope — a `state.get` reference read with no arguments came back
+      // as fifty items with its `key`, `bytes` and `updatedAt` gone (cody,
+      // 2026-09-13). A top-level array still pages by default, as it always
+      // has: there is nothing else in it to lose.
+      const asked = !!a.fields?.length || a.offset !== undefined || a.limit !== undefined;
+      if (!asked) return { kind: "value", value: parsed };
+
       const inner = parsed && typeof parsed === "object"
         ? Object.entries(parsed as Record<string, unknown>).filter(([, v]) => Array.isArray(v))
         : [];
       if (inner.length === 1) {
         const [at, items] = inner[0] as [string, unknown[]];
         return { kind: "array", at, ...pageOf(items) };
-      }
-      if (!a.fields?.length && a.offset === undefined && a.limit === undefined) {
-        return { kind: "value", value: parsed };
       }
       return {
         kind: "value",
