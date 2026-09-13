@@ -328,12 +328,17 @@ export function runJsTool(
           // broken (Piper, 2026-09-13). Dotted names still go on: the gateway
           // answers those as unknown_tool / not_mounted already.
           if (typeof call.tool === "string" && !call.tool.includes(".") && !byName.has(call.tool)) {
+            // The likely names go into the message as well as `candidates`: the
+            // message is what reaches the model on every path, while the field
+            // is only seen if the script prints it (Dora).
+            const candidates = closestNames(call.tool, offered);
             return Promise.resolve({
               status: "rejected" as const,
               error: {
                 code: "unknown_tool",
-                message: `no tool named ${JSON.stringify(call.tool)} in your tool list`,
-                candidates: closestNames(call.tool, offered),
+                message: `no tool named ${JSON.stringify(call.tool)} in your tool list` +
+                  (candidates.length ? `; closest: ${candidates.slice(0, 5).join(", ")}` : ""),
+                candidates,
               },
             });
           }

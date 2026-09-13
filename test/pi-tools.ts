@@ -343,14 +343,17 @@ await check("run_js 里写错模型自己那套名字,答'没有这个工具'并
   });
   const run = async (name: string) => {
     seen.length = 0;
-    const out = await tool.execute(`u-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.candidates ?? null]);` });
-    const [[status, code, candidates]] = JSON.parse(out.content[0].text);
-    return { seen: [...seen], status, code, candidates };
+    const out = await tool.execute(`u-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.candidates ?? null, r.error?.message ?? null]);` });
+    const [[status, code, candidates, message]] = JSON.parse(out.content[0].text);
+    return { seen: [...seen], status, code, candidates, message };
   };
   const typo = await run("state__gett");
   if (typo.seen.length !== 0) throw new Error(`an unknown offered-form name reached the host: ${typo.seen}`);
   if (typo.code !== "unknown_tool") throw new Error(`a typo was answered with ${typo.code}, not unknown_tool`);
   if (typo.candidates?.[0] !== "state__get") throw new Error(`the likely name was not offered first: ${JSON.stringify(typo.candidates)}`);
+  // The message itself names it, since that is what reaches the model even when
+  // a script does not print the candidates field.
+  if (!String(typo.message).includes("state__get")) throw new Error(`the message does not name the likely tool: ${typo.message}`);
   const alias = await run("stat__get");
   if (alias.code !== "unknown_tool" || !String(alias.candidates?.[0]).startsWith("state__")) {
     throw new Error(`a mistyped alias did not point at the near names: ${JSON.stringify(alias)}`);
