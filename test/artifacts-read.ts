@@ -93,6 +93,30 @@ await check("a bare list still pages by default, as it always has", async () => 
   if (r.kind !== "array" || r.returned !== 50) throw new Error(`the default page changed: ${JSON.stringify(r).slice(0, 120)}`);
 });
 
+await check("以自己的前缀开头,不等于停在里面", async () => {
+  // A reference may begin inside this agent's prefix and still move out of it:
+  // the prefix test reads the front of the string, and nothing read the rest.
+  // What kept it from escaping was R2 treating a key as opaque — true, and
+  // written down nowhere, so the guard could not see the dependency it had
+  // (Vera, 2026-09-13). Refused here now, so it no longer rests on the store.
+  const r = reader({ any: "thing" });
+  const escapes = `r2://${BUCKET}/t/t/a/state/aa/../../../../othertenant/u-else/state/pwn.json`;
+  let refused = false;
+  try { await r({ ref: escapes }); } catch (e) { refused = /not readable by this agent/.test(String((e as Error).message)); }
+  if (!refused) throw new Error("a reference that starts inside the prefix and then leaves it was accepted");
+});
+
+await check("被拒的是路径段,不是字符: `notes..old` 仍是一个名字", async () => {
+  // The refusal must be about a segment that means "up", not about two dots
+  // appearing in a name. A guard that cannot tell them apart takes away a
+  // legal key to stop an illegal move.
+  const body = new TextEncoder().encode(JSON.stringify({ ok: true }));
+  const plugin = artifactsPlugin({ async get() { return body; } } as any, BUCKET);
+  const ctx = { caller: { tenantId: "t", agentId: "a" }, alias: "artifacts" } as any;
+  const out = await plugin.invoke("read", { ref: `r2://${BUCKET}/t/t/a/state/notes..old.json` } as any, ctx) as any;
+  if (out.kind !== "value") throw new Error(`a name containing two dots was refused: ${JSON.stringify(out)}`);
+});
+
 console.log(`\n  What \`read\` does with fields, offset and limit\n  ${"─".repeat(56)}`);
 await check("from continues a cut result page by page, and the pages join back into the exact text", async () => {
   // Following the notes is the whole contract: each page says where the next

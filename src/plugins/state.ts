@@ -279,6 +279,21 @@ export function statePlugin(
           }
           // Checked before writing, not after: the point is to refuse, not to
           // notice afterwards that the object is full.
+          // A key becomes part of the object's path once a value is large
+          // enough to be parked, so a key that moves through the path names
+          // somewhere else: one written this way produced a reference that left
+          // this agent's subtree while still beginning with it (Vera,
+          // 2026-09-13). `/` stays legal — `list { prefix }` exists so keys can
+          // be hierarchical — but a segment that is `.` or `..` is a move
+          // rather than a name.
+          //
+          // Judged here, before the size does, because the alternative is a key
+          // that works while the value is small and fails the day it grows.
+          // That is the worse failure: it arrives later, to someone who did not
+          // write the key, and looks like the value's fault.
+          if (key.split("/").some((seg) => seg === "." || seg === "..")) {
+            throw new Error(`a key names a value, not a path: \`${key}\` moves through it`);
+          }
           const usage = await store.stateUsage(tenantId, agentId);
           const prior = (await store.getState(tenantId, agentId, key))?.bytes ?? 0;
           if (usage.bytes - prior + body.length > cfg.maxTotalBytes) {

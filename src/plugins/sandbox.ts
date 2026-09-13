@@ -210,6 +210,22 @@ export function boxReminder(alias: string): string {
  * that the two clocks are numbers. A checker that insisted on the whole record
  * would reject rows this code can in fact use.
  */
+/**
+ * A box path as path segments, resolved: empty and `.` segments drop out and
+ * `..` climbs, never past the root. The result is what the file's own machine
+ * would call it, which is the only name under which finding it again makes
+ * sense — and it carries no segment that would make the reference unreadable.
+ */
+export function segmentsOf(path: string): string[] {
+  const out: string[] = [];
+  for (const seg of String(path).split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") { out.pop(); continue; }
+    out.push(seg);
+  }
+  return out;
+}
+
 export function asBoxState(v: Json): BoxState | null {
   if (!v || typeof v !== "object") return null;
   const o = v as Record<string, unknown>;
@@ -947,7 +963,15 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
         throw new Error(`could not read ${path}: ${res.status} ${(await res.text()).slice(0, 160)}`);
       }
       const body = new Uint8Array(await res.arrayBuffer());
-      const name = path.replace(/^\//, "").replace(/[^A-Za-z0-9._/-]/g, "_") + (archive ? ".tar" : "");
+      // The name is where the file was, resolved the way the box itself
+      // resolved it: `/work/../etc/x` is `/etc/x` on that machine, and the
+      // artifact should be named for the file it is. Sanitising the characters
+      // and stopping there kept `.`, `..` and empty segments in the key, which
+      // the reader now refuses (#289) — so the box could save a file out and
+      // then never open it again (cody, 2026-09-13). `..` at the root stays at
+      // the root, as it does in a filesystem.
+      const name = segmentsOf(path).map((seg) => seg.replace(/[^A-Za-z0-9._-]/g, "_")).join("/")
+        + (archive ? ".tar" : "");
       const stored = await artifacts.put(
         `t/${ctx.caller.tenantId}/${ctx.caller.agentId}/sandbox/${state!.boxId}/${name}`,
         body, archive ? "application/x-tar" : "application/octet-stream");

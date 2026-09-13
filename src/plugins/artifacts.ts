@@ -92,6 +92,18 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
         throw new Error(`reference is not readable by this agent: ${String(a.ref).slice(0, 80)}`);
       }
       const key = a.ref.slice(`r2://${bucket}/`.length);
+      // Starting inside this agent's prefix is not the same as staying there.
+      // A reference may carry `..` and still pass the test above, because the
+      // test reads the front of the string and nothing reads the rest: the
+      // whole of "it does not escape" then rests on R2 treating a key as
+      // opaque and never resolving a segment (Vera wrote one and read it back
+      // unchanged, 2026-09-13). That is true of R2 and it is not written down
+      // anywhere, which makes it a dependency this guard cannot see. Refusing
+      // the segments costs one pass and ends the delegation — and it is the
+      // segments, not the characters: `notes..old` is a name, `..` is a move.
+      if (key.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) {
+        throw new Error(`reference is not readable by this agent: ${a.ref.slice(0, 80)}`);
+      }
       const raw = new TextDecoder().decode(await artifacts.get(key));
       // The continuation a cut result points at: the stored text as-is, a page
       // at a time, each page ending with the call that reads the next — the way

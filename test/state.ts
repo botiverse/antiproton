@@ -297,6 +297,27 @@ await check("转存值的 note 就是那次调用本身,而且按大小给对形
   if (!/from: 0/.test(over)) throw new Error(`a value past the read-back line must be paged, and the note must say so: ${over}`);
 });
 
+await check("键是名字不是路径: 含 `..` 段的键写不进去,而 `a/b` 与 `notes..old` 照旧", async () => {
+  // A key becomes part of the object's path, so a key that moves through the
+  // path names somewhere else: one written this way produced a reference that
+  // left the agent's own subtree while still beginning with it (Vera). `/`
+  // stays legal — `list { prefix }` exists so keys can be hierarchical — and
+  // two dots inside a name are a name.
+  const { plugin, ctx } = await fixture();
+  const big = "z".repeat(200_000);
+
+  let refused = "";
+  try { await plugin.invoke("put", { key: "aa/../../../../othertenant/u/pwn", value: big }, ctx()); }
+  catch (e) { refused = String((e as Error).message); }
+  if (!/names a value, not a path/.test(refused)) throw new Error(`a key that moves through the path was accepted: ${refused || "(no error)"}`);
+
+  // and the two shapes that must stay legal
+  for (const key of ["notes/2026/march", "notes..old"]) {
+    const r = await plugin.invoke("put", { key, value: "small" }, ctx()) as Record<string, unknown>;
+    if (r.key !== key) throw new Error(`a legal key was refused: ${key}`);
+  }
+});
+
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
