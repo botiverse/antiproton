@@ -328,6 +328,19 @@ export function runJsTool(
           // broken (Piper, 2026-09-13). Dotted names still go on: the gateway
           // answers those as unknown_tool / not_mounted already.
           if (typeof call.tool === "string" && !call.tool.includes(".") && !byName.has(call.tool)) {
+            // With nothing offered at all (every plugin switched off), "no tool
+            // named X" reads as a typo and invites another name, which fails the
+            // same way turn after turn. Say the list is empty, so the next move
+            // is to do the work in the script (Piper, Dora, 2026-09-13).
+            if (offered.length === 0) {
+              return Promise.resolve({
+                status: "rejected" as const,
+                error: {
+                  code: "no_tools",
+                  message: "your tool list is empty, so no tool can be called from run_js; do the work in the script itself",
+                },
+              });
+            }
             // The likely names go into the message as well as `candidates`: the
             // message is what reaches the model on every path, while the field
             // is only seen if the script prints it (Dora).
