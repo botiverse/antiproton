@@ -4,6 +4,10 @@
 set -euo pipefail
 PORT="${PORT:-8791}"
 cd "$(dirname "$0")/../cf"
+# Removed first: a build that fails never writes this file, and the reader below
+# once printed a result from two days earlier as "21 passed" while the worker
+# had not compiled at all.
+rm -f /tmp/antiproton-conformance.json
 npx wrangler dev --config wrangler.conformance.jsonc --local \
   --port "$PORT" --inspector-port 0 >/tmp/antiproton-conformance.log 2>&1 &
 for _ in $(seq 1 60); do
@@ -11,6 +15,11 @@ for _ in $(seq 1 60); do
   if curl -sf -m 300 "http://127.0.0.1:$PORT/" -o /tmp/antiproton-conformance.json; then break; fi
 done
 for p in $(lsof -ti "tcp:$PORT" 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
+if [ ! -s /tmp/antiproton-conformance.json ]; then
+  echo "conformance worker produced no result; see /tmp/antiproton-conformance.log" >&2
+  tail -20 /tmp/antiproton-conformance.log >&2
+  exit 1
+fi
 node -e '
 const r = JSON.parse(require("fs").readFileSync("/tmp/antiproton-conformance.json", "utf8"));
 console.log(`\n  pi Storage conformance — ${r.backend}\n  ${"─".repeat(56)}`);

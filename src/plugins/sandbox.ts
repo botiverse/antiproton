@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
+import type { Plugin, PluginContext, MountActivity, MountUsage, UsageEvent } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 
 /**
@@ -262,6 +262,19 @@ const DEFAULTS = {
 };
 
 /**
+ * Tell the ledger, and never let that be the reason a call fails.
+ *
+ * The contract says `record` does not throw; this catch is here because the
+ * asymmetry is not close. A lost row costs an audit one line. A throw here
+ * would abandon a container that already exists — running, billed, and no
+ * longer written down anywhere the release path can find — which is the exact
+ * outcome the ledger was added to make visible.
+ */
+async function noted(ctx: PluginContext, event: UsageEvent): Promise<void> {
+  try { await ctx.record(event); } catch { /* the recorder's to report, not ours to raise */ }
+}
+
+/**
  * Hand the box back for real.
  *
  * `stop` is not release: it returns 200, halts the runtime, and leaves the box
@@ -298,6 +311,10 @@ async function stopBox(
   // there — but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
   const session = sessionOf(state, Date.now());
+  // Written even when the delete failed. "We tried to stop it" is the honest
+  // record: the alternative leaves an interval that never closes, which reads
+  // as a container still running.
+  await noted(ctx, { kind: "container", event: "closed", ref: state.boxId });
   await ctx.connection.set({
     boxId: "", createdAt: 0, lastUsedAt: 0,
     sessions: keepSessions(state.sessions, session),
@@ -929,6 +946,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
         ...(Object.keys(placeholders).length ? { placeholders } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
+      // After the write, so anything in the ledger is a box this mount will
+      // find again; before any work, so a box that is used once and then leaks
+      // still has its beginning written down.
+      await noted(ctx, { kind: "container", event: "opened", ref: boxId });
     }
 
     /**

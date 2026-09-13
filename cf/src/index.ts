@@ -29,7 +29,9 @@ import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { pluginEnabled } from "../../src/plugins/types.ts";
-import type { MountActivity, MountUsage } from "../../src/plugins/types.ts";
+import type { MountActivity, MountUsage, UsageEvent } from "../../src/plugins/types.ts";
+import { Ledger, intervals, usage as ledgerUsage } from "../../src/store/ledger.ts";
+import type { UsageRecorder } from "../../src/runtime/gateway.ts";
 
 /**
  * What the plugins page is handed about each mount that has something to say.
@@ -388,6 +390,7 @@ export class AgentDO extends DurableObject<Env> {
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       secretKek: this.env.SECRET_KEK,
+      recorder: ledgerRecorder(this.env),
       // Native tool calling by default. The alternative asks the model to
       // reply in a convention invented here, and a model under any pressure
       // falls back to the one it was trained on — four different markups
@@ -786,6 +789,7 @@ export class AgentDO extends DurableObject<Env> {
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       secretKek: this.env.SECRET_KEK,
+      recorder: ledgerRecorder(this.env),
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
       // the runtime already has.
       extraPlugins: swe ? [] : [this.#benchState().plugin()],
@@ -1264,6 +1268,25 @@ export class AgentDO extends DurableObject<Env> {
       .map((r: any) => ({ key: String(r.provider_key), agentId: String(r.agent_id), tenantId: String(r.tenant_id), addedBy: String(r.added_by), createdAt: Number(r.created_at) }));
   }
 
+  // ---- the ledger ------------------------------------------------------------
+  // One object for the deployment, named "ledger": what every tenant used, as
+  // it happened (src/store/ledger.ts). Every agent's gateway writes to it; only
+  // the operator reads it, because it is the one view that crosses tenants.
+  #usageLedger?: Ledger;
+  #ledger() { return (this.#usageLedger ??= new Ledger(this.sql)); }
+
+  async ledgerAppend(at: { tenantId: string; agentId: string; alias: string }, event: UsageEvent) {
+    this.#ledger().append(at, event);
+    return { ok: true as const };
+  }
+
+  /** Quantities per tenant, and the intervals still open — never money. */
+  async ledgerRead(since: number) {
+    const rows = this.#ledger().since(since);
+    const now = Date.now();
+    return { since, now, usage: ledgerUsage(rows, now), open: intervals(rows).filter((i) => i.closedAt === null) };
+  }
+
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
@@ -1601,6 +1624,12 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Rename one mount. Refused while it is holding something; see the runtime. */
+  async uiUsageLost(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    const lost = await this.runtime().usageLost(tenantId, agentId);
+    return { count: lost.length, lost };
+  }
+
   async uiRenameMount(tenantId: string, agentId: string, from: string, to: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiRenameMount", () => this.runtime().renameMount(tenantId, agentId, from, to));
@@ -2091,6 +2120,19 @@ function githubConfig(env: Env): GithubConfig | null {
 /** The one object that holds the identity table (see AgentDO.identityLookup). */
 function identities(env: Env) {
   return env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", "identities")));
+}
+
+/**
+ * The one object that holds the ledger (see AgentDO.ledgerAppend). Named
+ * outside the `a/<tenant>/<agent>` space, so no agent id can ever be given it.
+ */
+function ledger(env: Env) {
+  return env.AGENT.get(env.AGENT.idFromName("ledger"));
+}
+
+/** Every agent's gateway writes its usage events to that one object. */
+function ledgerRecorder(env: Env): UsageRecorder {
+  return { async write(at, event) { await ledger(env).ledgerAppend(at, event); } };
 }
 
 /** A refusal the browser sees as a page and a CLI sees as typed JSON. */
@@ -2701,6 +2743,29 @@ export default {
           const k = url.searchParams.get("taskId") ?? `t_${a}`;
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.uiCompact(t, a, k));
+        }
+        case "/admin/usage": {
+          // What every tenant has used, from the ledger: quantities and the
+          // intervals still open, never money. Operator-only, because it is
+          // the one view that crosses tenants.
+          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const since = Number(url.searchParams.get("since") ?? 0);
+          return Response.json(await ledger(env).ledgerRead(Number.isFinite(since) ? since : 0));
+        }
+        case "/admin/usage-lost": {
+          // The other half of the audit: events one agent produced that the
+          // ledger refused, kept in that agent's own object. A non-zero count
+          // is a hole in /admin/usage, and these rows are what fills it.
+          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId") ?? "");
+          if (!a) return Response.json({ error: "agentId is required" }, { status: 400 });
+          const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          return Response.json(await s4.uiUsageLost(t, a));
         }
         case "/admin/rename-mount": {
           // Renaming a mount is an operator act, not something an agent or a
