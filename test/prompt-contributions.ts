@@ -10,7 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { tooLargeResult } from "../cf/src/runtime.ts";
+import { offloadLimit, tooLargeResult } from "../cf/src/runtime.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -109,6 +109,14 @@ await check("a result too large to send says something true in both cases", asyn
   must(!("ref" in gone), `nothing to read it back with, so no reference: ${JSON.stringify(gone)}`);
   must(/discarded, not stored/.test(String(gone.note)), `the loss must be stated: ${gone.note}`);
   must(gone.bytes === 40_000 && "preview" in gone, "how much there was, and what the start of it looked like");
+});
+
+await check("a 10 KB result is parked when it can be read back, and kept whole when it cannot", async () => {
+  // The line is low only where parking loses nothing; where the rest would be
+  // discarded, a 10 KB result still arrives whole.
+  must(10_000 > offloadLimit("files__read"), `with a reader, 10 KB must be parked (limit ${offloadLimit("files__read")})`);
+  must(10_000 <= offloadLimit(null), `without a reader, 10 KB must not be cut (limit ${offloadLimit(null)})`);
+  must(4 * 1024 <= offloadLimit("files__read"), "exactly 4 KiB still goes inline");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

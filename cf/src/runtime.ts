@@ -80,7 +80,18 @@ export interface ModelJob {
   payload: Json;
 }
 
-const OFFLOAD_BYTES = 32 * 1024;
+/**
+ * How big a tool result may be before the model gets a preview instead.
+ *
+ * Two numbers, because the two branches lose different things. With a reader
+ * mounted, a larger result is parked and nothing is lost, so the line is low
+ * and the conversation stays small (tygg, 2026-09-13: 4K). Without one, the
+ * rest is discarded, so lowering the line there would only throw more away;
+ * it stays where it was.
+ */
+export function offloadLimit(readBack: string | null): number {
+  return readBack ? 4 * 1024 : 32 * 1024;
+}
 
 /**
  * What the model gets instead of a result too big to put in the conversation.
@@ -598,7 +609,7 @@ export class AgentRuntime {
         const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
-        if (body.length <= OFFLOAD_BYTES) return res;
+        if (body.length <= offloadLimit(readBack)) return res;
         if (!readBack) {
           return {
             status: "succeeded",
