@@ -84,6 +84,14 @@ If you report a branch as green, **name the set you ran**. The suites nearest a
 change answer "is this change sound"; only the full fifteen answer "is this
 branch sound", and the two are different questions.
 
+**A change a test is meant to certify needs two readings, and they are separate.**
+First, a reading that the change *moved the behaviour under test* — without it a
+green cannot be told from a change that did nothing at all. Second, when the guard
+is deliberately broken, a reading that the failure *names the assertion you meant*,
+not one that happened to run first. A green or a red can both be true for a
+reason unrelated to the claim being made, so the reading is part of the claim: what
+shows this changed the behaviour, and which assertion reddens if the guard breaks.
+
 ## Which document is authoritative
 
 [`README.md`](README.md) describes the system as it is; its numbers are measured
