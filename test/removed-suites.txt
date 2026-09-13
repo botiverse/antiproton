@@ -1,0 +1,3 @@
+# Suites deliberately deleted. The deploy gate refuses a suite that production
+# is currently guarded by and that has disappeared, unless it is named here.
+# One name per line (file name without .ts), with a line saying why.

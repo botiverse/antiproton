@@ -21,17 +21,56 @@ if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # It used to be a list of 17 that someone had to remember to extend: 20 of the
 # 37 suites were never gated, and the two of them that had gone red (confirm,
 # secrets — their fixtures predated the plugin switch) stayed red unnoticed
-# (Rex, 2026-09-13). A new suite is now gated by being written.
+# (Rex, 2026-09-13). A new suite is gated by being written.
+#
+# A suite passes when it exits 0 AND reports at least one pass: an emptied suite
+# exits 0 too. And every suite in the commit production runs now must still be
+# here, unless test/removed-suites.txt names it, so a deleted one is refused
+# instead of skipped (Piper, Rex, 2026-09-13; cf/scripts/suite-verdict.sh).
+. cf/scripts/suite-verdict.sh
+# Which commit production runs is asked of production — so, left alone, a
+# production that is down could not be redeployed, including by the fix for
+# it (Rex). ANTIPROTON_LIVE_BUILD=<sha> states it instead: one explicit line,
+# still checked against the repo. A preview deploy skips the check entirely,
+# like the master-only guard above, and never depends on production being up.
+case " $* " in
+  *wrangler.preview.jsonc*) ;;
+  *)
+    if [ -n "${ANTIPROTON_LIVE_BUILD:-}" ]; then
+      live="$ANTIPROTON_LIVE_BUILD"
+    else
+      live=$(curl -fsS -m 20 https://antiproton.ai/ui/whoami 2>/dev/null | sed -n 's/.*"build":"\([0-9a-f]\{7,40\}\)".*/\1/p' || true)
+    fi
+    if [ -z "$live" ] || ! git cat-file -e "${live}^{commit}" 2>/dev/null; then
+      echo "refusing: cannot tell which commit production runs (${live:-no answer}), so a deleted suite could go unnoticed."
+      echo "If production is down, state it: ANTIPROTON_LIVE_BUILD=<the sha it last ran> $0 $*"
+      exit 1
+    fi
+    # A file of its own: several trees may run this gate at once (Piper).
+    in_production=$(mktemp)
+    git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > "$in_production"
+    problems=$(suite_removals "$in_production" test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+    rm -f "$in_production"
+    if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
+    ;;
+esac
 NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
+run_suite() {  # name, command...
+  local name="$1"; shift
+  printf "%-22s" "$name"
+  local out n
+  if ! out=$("$@" 2>&1); then echo FAIL; exit 1; fi
+  n=$(printf '%s\n' "$out" | suite_passed_count)
+  if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing: ${n:-no pass count})"; exit 1; fi
+  echo "ok ($n)"
+}
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
   case "$NEEDS_SERVICE" in *" $t "*) printf "%-22sskipped (needs a live service)\n" "$t"; continue;; esac
-  printf "%-22s" "$t"
-  if node "$f" >/dev/null 2>&1; then echo ok; else echo FAIL; exit 1; fi
+  run_suite "$t" node "$f"
 done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
-printf "%-22s" "pi-storage-do"
-if bash test/pi-storage-do.sh >/dev/null 2>&1; then echo ok; else echo FAIL; exit 1; fi
+run_suite pi-storage-do bash test/pi-storage-do.sh
 # Captured, then printed, then tested. It used to be piped through
 # \`tee /dev/stderr\`, and when the run is redirected to a log file, /dev/stderr
 # reopens that file with truncation: every suite line above was erased and the
