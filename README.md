@@ -1,210 +1,32 @@
 # antiproton
 
-A durable, multi-tenant runtime for agents that act on real systems, on
-infrastructure that costs nothing while nobody is asking it anything.
+> A durable, multi-tenant runtime for AI agents that interact with real-world systems, built on serverless infrastructure that costs nothing while idle.
 
-The agent loop itself is commodity — bring your own, or use the reference one.
-What this provides is everything underneath it, and it is built for four things
-at once:
+The agent loop itself is commodity — bring your own, or use the reference harness. Antiproton provides the durable execution substrate underneath it, designed around four core architectural guarantees:
 
-- **Multi-tenant, structurally.** Two tenants are two Durable Objects with two
-  SQLite databases. Cross-tenant data is not in the database being queried, so
-  isolation does not depend on remembering a `WHERE` clause.
-- **Server-side.** No laptop, no `.agent` directory, no process to keep alive.
-  An agent survives a crash, an eviction and a deploy, and resumes.
-- **Scale to zero, pay as you go.** An idle agent runs nothing: no process, no
-  poller, no armed timer, no container. It costs storage and nothing else, and
-  the next message rebuilds it from its log.
-- **The agent never holds a credential.** It acts on your systems, and its
-  context never contains your keys.
-
-## Getting Started
-
-### Prerequisites
-
-- **Node.js**: >= 24 (Node 24+ native TypeScript support with `--experimental-strip-types` / strip-only TS is used; no build step required for Node scripts).
-- **Package manager**: `npm`.
-- **Cloudflare account** (optional, for edge deployment): Wrangler CLI and a Cloudflare account with Workers and Durable Objects enabled.
-- **Model API key**: e.g. OpenRouter, Anthropic, or OpenAI key.
-
-### Installation
-
-Clone the repository and install dependencies:
-
-```bash
-git clone https://github.com/botiverse/antiproton.git
-cd antiproton
-npm install
-```
-
-### Running Tests
-
-The test suite covers in-process storage conformance, agent loop semantics, tool isolation, compaction, and sandbox contracts:
-
-```bash
-# Run individual unit or conformance test suites (Node 24+ native TS strip)
-node test/pi-storage.ts
-node test/pi-agent.ts
-node test/state.ts
-
-# Or run predefined npm scripts for key suites
-npm run pi-storage
-npm run pi-agent
-npm run pi-tools
-
-# Run type checks (Node scripts and Cloudflare Worker checked independently)
-npm run typecheck
-```
-
-Three integration tests require live external credentials and are skipped in standard unit runs:
-- `test/live-e2e.ts`: Live end-to-end multi-turn agent test (`RUN_LIVE_TESTS=1`).
-- `test/live-github.ts`: Real GitHub tool operations against a test repository (`GITHUB_TOKEN=...`).
-- `test/appworld.ts`: AppWorld benchmark evaluation against an active AppWorld environment.
-
-### Local Development & Edge Deployment
-
-Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
-
-1. **Configure credentials:**
-   Copy the example environment or configure credentials in `cf/wrangler.jsonc` (or via Cloudflare Secrets):
-   ```bash
-   npx wrangler secret put ANTHROPIC_API_KEY
-   # or OPENROUTER_API_KEY, etc.
-   ```
-
-2. **Run locally with Wrangler:**
-   ```bash
-   cd cf
-   npx wrangler dev
-   ```
-
-3. **Deploy to Cloudflare Workers:**
-   ```bash
-   ./deploy.sh
-   ```
-   The deployment script executes verification gates before uploading the Worker and running smoke checks.
+- **Structural multi-tenancy:** Distinct tenants execute in discrete Durable Objects backed by dedicated SQLite databases. Cross-tenant data is physically absent from the querying database rather than filtered by application `WHERE` clauses.
+- **Serverless durability:** Runs in the cloud without long-lived background daemons, local laptop requirements, or state directories. Agents survive crashes, process evictions, and code deployments, resuming execution transparently.
+- **True scale-to-zero:** Idle agents consume zero compute: no active processes, no background polling, no armed timers, and no active containers. Inactive state costs storage only; incoming requests reconstruct the agent from its event log.
+- **Zero-trust credential isolation:** Agents act on external APIs and systems without credentials ever entering model context prompts, tool outputs, or execution logs.
 
 ---
 
-## Costing nothing while idle
+## Table of Contents
 
-Scale-to-zero is easy to claim and easy to lose one careless `await` at a time,
-so the numbers below are measured on the deployment rather than reasoned about.
+- [Architecture](#architecture)
+- [Getting Started](#getting-started)
+- [Core Invariants](#core-invariants)
+  - [Zero Cost While Idle](#zero-cost-while-idle)
+  - [Zero-Trust Security & Credential Isolation](#zero-trust-security--credential-isolation)
+  - [Context Window Bounding & Compaction](#context-window-bounding--compaction)
+  - [Persistent Memory](#persistent-memory)
+  - [Storage Substrate](#storage-substrate)
+- [Verification & Benchmarks](#verification--benchmarks)
+- [Contributing](#contributing)
+- [What Was Taken From Elsewhere](#what-was-taken-from-elsewhere)
+- [What Is Not Done](#what-is-not-done)
 
-Durable Objects bill **wall-clock duration while the object is active**; Workers
-bill **CPU**, and time spent waiting on I/O is free. A model call is five to
-sixty seconds of pure waiting. Awaiting it inside the object means paying for
-the wait; that one distinction drives most of the design.
-
-| | Measured |
-|---|---|
-| Model call awaited inside the object | 128.2s of billed object time |
-| The same work, awaited off it | **0.7s** |
-| One agent, 79 model calls | 40.8s billed inside vs **709.2s waited outside** (582.5s of it the provider) |
-| Idle agent | no invocations, no armed alarm, no container |
-
-Three things had to be true for the last row, and each was a bug first:
-
-- **The alarm stands down.** It used to re-arm every 30 seconds for the life of
-  the object. An idle object now deletes its alarm and wakes only when something
-  arrives.
-- **Nothing polls.** Work in flight belongs to a queue, which redelivers until
-  acked and gives up into a dead-letter queue. The object does not stay awake to
-  supervise it. (It used to: the sweeper, the give-up timer and the re-dispatch
-  loop were a hand-rolled reimplementation of one line of a queue's contract.)
-- **The sandbox is handed back.** A container is destroyed when the agent has
-  nothing open, not stopped — `stop` returns 200, leaves the box and its storage
-  in place, and keeps billing. Thirteen boxes were live before that was noticed.
-  The release is scoped to the agent and covers every mount it holds, so it fires
-  when the *agent* has nothing open rather than when a particular task ends. The
-  condition is per pass, not per conversation: a wake that settles a turn and
-  opens no new one releases, so a container is handed back between turns of the
-  same conversation rather than only at its end. A mount whose plugin keeps
-  something across calls should therefore expect to be released and re-entered
-  rather than held — `run9` preserves the environments named in `envs` for that
-  reason, and anything a container accumulates that is not named there is gone.
-
-The other half of cost is tokens, and the number that decides it is prompt-cache
-hit rate. Measured here: editing the system message drops it from **84.9% to
-0.0%** — 6.6x the uncached tokens — while editing the tool block costs 1.1x. So
-the agent's memory is injected once when the harness opens rather than before
-every turn, which is where a local harness would put it. The injection is built
-from tenant and agent rather than from anything per conversation, so the harness
-opening decides how often it is paid. The console draws the cache
-hit per call, so losing it is visible rather than merely expensive.
-
-The cache is not the whole story, though: on a long investigation it sits above
-99% and the bill still climbs, because each fetched page is re-sent on every
-subsequent turn. That is what compaction is for, below.
-
-## The security claim
-
-> **The agent acts on your systems, and its context never contains your keys.**
-
-Most agent setups put credentials in the model's context — an API key in the
-prompt, an OAuth token in a tool result, or a tool that fetches one. That makes
-prompt injection a credential-exfiltration path, puts tokens through the model
-provider and the logs, and leaves no clean answer to "who did this, under whose
-authority".
-
-The benchmark that demonstrates the alternative is [AppWorld][appworld]: 9 apps,
-457 APIs, **362 of them (79%) behind an access token**. AppWorld's own interface
-expects the agent to read the supervisor's passwords, call each app's `login`,
-and carry the token itself. Here the nine apps are nine ordinary mounts:
-
-| | AppWorld's native interface | This runtime |
-|---|---|---|
-| Where credentials live | the agent's context | `secret_ref`, dereferenced server-side |
-| Who logs in | the agent | the gateway |
-| Where the token is kept | the agent's context | the mount's connection state |
-| What the model sees | passwords, tokens, Python | `spotify.show_song({song_id})` |
-
-Nine end-to-end cases assert it against the live servers: no schema mentions
-`access_token`, the credential-reading tool is not mounted, an authenticated
-call succeeds without the agent ever logging in, and the token never appears in
-a tool result.
-
-An operator attaches a credential for a mount from the console. It is stored in
-the agent's own object — **per agent, so a token attached under one agent is not
-there under the next**, which is the same boundary the mount scope comes from
-rather than a limitation of the page — sealed with AES-GCM under a Worker-held
-key: the row
-holds ciphertext and an IV, and no fragment of the value. The reference
-takes the form `agent:<name>` beside `env:NAME`, and resolves only against the
-(tenant, agent) that owns the mount naming it — the resolver takes its scope from
-the mount, not from the reference, so no reference one agent can write reaches
-another's store. Nothing returns the value: not the console, not a tool result,
-not a transcript entry. A plugin that can check a credential reports the account
-it authenticated as, which is also the only credential-derived string the page
-shows.
-
-Dereferencing server-side decides who may *use* a credential. It does not by
-itself decide where one may be *sent*, and for most plugins the host is fixed by
-the plugin rather than chosen by the agent — so the question does not arise. The
-`http` mount is the exception: the agent supplies the URL, so a credential on it
-would go wherever the agent points it, and a setting (`allowedHosts`) is the only
-thing bounding that. A mount carrying a credential therefore **must bound where
-that credential may be sent**, and the bound is declared by the field the plugin
-requires — for `http`, `allowedHosts`. The check reads *this mount's*
-`secret_ref` rather than what the plugin is able to carry, because a mount can
-hold a key before its plugin ever declares one and the hazard does not wait for
-the declaration. It runs twice: when the mount is provisioned, and again when a
-credential is later attached to it, so that attaching afterwards is not a way
-around a refusal the seed path would have made. A mount carrying no credential
-may leave the list unset, and then any public host is reachable.
-
-  **How a person gets in.** The console authenticates through a GitHub OAuth
-  app; there is no per-person password and no session the deployment keeps.
-  (An operator also has a long shared key a deployment can enable for
-  testing, which is an identity of its own and not a person's account.) A
-  sign-in that resolves to a row in the identity table lands on that row's
-  agent. The table is the whole of the admission rule: an account not on it
-  is refused, and a deployment can instead run open sign-up, in which a
-  first sign-in writes its own row and gets a new agent — seven seeded
-  mounts, an empty memory, and a **tenant of its own**, so one person's
-  quota and storage are not another's.
-
-[appworld]: https://github.com/StonyBrookNLP/appworld
+---
 
 ## Architecture
 
@@ -345,7 +167,199 @@ The invented convention is gone with the harness that used it: pi's loop calls
 tools through the provider's channel and nothing else, so there is no regex left
 to teach.
 
-## Keeping the context small enough to think in
+---
+
+## Getting Started
+
+### Prerequisites
+
+- **Node.js**: >= 24 (Node 24+ native TypeScript support with `--experimental-strip-types` / strip-only TS is used; no build step required for Node scripts).
+- **Package manager**: `npm`.
+- **Cloudflare account** (optional, for edge deployment): Wrangler CLI and a Cloudflare account with Workers and Durable Objects enabled.
+- **Model API key**: e.g. OpenRouter, Anthropic, or OpenAI key.
+
+### Installation
+
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/botiverse/antiproton.git
+cd antiproton
+npm install
+```
+
+### Running Tests
+
+The test suite covers in-process storage conformance, agent loop semantics, tool isolation, compaction, and sandbox contracts:
+
+```bash
+# Run individual unit or conformance test suites (Node 24+ native TS strip)
+node test/pi-storage.ts
+node test/pi-agent.ts
+node test/state.ts
+
+# Or run predefined npm scripts for key suites
+npm run pi-storage
+npm run pi-agent
+npm run pi-tools
+
+# Run type checks (Node scripts and Cloudflare Worker checked independently)
+npm run typecheck
+```
+
+Three integration tests require live external credentials and are skipped in standard unit runs:
+- `test/live-e2e.ts`: Live end-to-end multi-turn agent test (`RUN_LIVE_TESTS=1`).
+- `test/live-github.ts`: Real GitHub tool operations against a test repository (`GITHUB_TOKEN=...`).
+- `test/appworld.ts`: AppWorld benchmark evaluation against an active AppWorld environment.
+
+### Local Development & Edge Deployment
+
+Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
+
+1. **Configure credentials:**
+   Copy the example environment or configure credentials in `cf/wrangler.jsonc` (or via Cloudflare Secrets):
+   ```bash
+   npx wrangler secret put ANTHROPIC_API_KEY
+   # or OPENROUTER_API_KEY, etc.
+   ```
+
+2. **Run locally with Wrangler:**
+   ```bash
+   cd cf
+   npx wrangler dev
+   ```
+
+3. **Deploy to Cloudflare Workers:**
+   ```bash
+   ./deploy.sh
+   ```
+   The deployment script executes verification gates before uploading the Worker and running smoke checks.
+
+---
+
+## Core Invariants
+
+### Zero Cost While Idle
+
+Scale-to-zero is easy to claim and easy to lose one careless `await` at a time,
+so the numbers below are measured on the deployment rather than reasoned about.
+
+Durable Objects bill **wall-clock duration while the object is active**; Workers
+bill **CPU**, and time spent waiting on I/O is free. A model call is five to
+sixty seconds of pure waiting. Awaiting it inside the object means paying for
+the wait; that one distinction drives most of the design.
+
+| | Measured |
+|---|---|
+| Model call awaited inside the object | 128.2s of billed object time |
+| The same work, awaited off it | **0.7s** |
+| One agent, 79 model calls | 40.8s billed inside vs **709.2s waited outside** (582.5s of it the provider) |
+| Idle agent | no invocations, no armed alarm, no container |
+
+Three things had to be true for the last row, and each was a bug first:
+
+- **The alarm stands down.** It used to re-arm every 30 seconds for the life of
+  the object. An idle object now deletes its alarm and wakes only when something
+  arrives.
+- **Nothing polls.** Work in flight belongs to a queue, which redelivers until
+  acked and gives up into a dead-letter queue. The object does not stay awake to
+  supervise it. (It used to: the sweeper, the give-up timer and the re-dispatch
+  loop were a hand-rolled reimplementation of one line of a queue's contract.)
+- **The sandbox is handed back.** A container is destroyed when the agent has
+  nothing open, not stopped — `stop` returns 200, leaves the box and its storage
+  in place, and keeps billing. Thirteen boxes were live before that was noticed.
+  The release is scoped to the agent and covers every mount it holds, so it fires
+  when the *agent* has nothing open rather than when a particular task ends. The
+  condition is per pass, not per conversation: a wake that settles a turn and
+  opens no new one releases, so a container is handed back between turns of the
+  same conversation rather than only at its end. A mount whose plugin keeps
+  something across calls should therefore expect to be released and re-entered
+  rather than held — `run9` preserves the environments named in `envs` for that
+  reason, and anything a container accumulates that is not named there is gone.
+
+The other half of cost is tokens, and the number that decides it is prompt-cache
+hit rate. Measured here: editing the system message drops it from **84.9% to
+0.0%** — 6.6x the uncached tokens — while editing the tool block costs 1.1x. So
+the agent's memory is injected once when the harness opens rather than before
+every turn, which is where a local harness would put it. The injection is built
+from tenant and agent rather than from anything per conversation, so the harness
+opening decides how often it is paid. The console draws the cache
+hit per call, so losing it is visible rather than merely expensive.
+
+The cache is not the whole story, though: on a long investigation it sits above
+99% and the bill still climbs, because each fetched page is re-sent on every
+subsequent turn. That is what compaction is for, below.
+
+### Zero-Trust Security & Credential Isolation
+
+> **The agent acts on your systems, and its context never contains your keys.**
+
+Most agent setups put credentials in the model's context — an API key in the
+prompt, an OAuth token in a tool result, or a tool that fetches one. That makes
+prompt injection a credential-exfiltration path, puts tokens through the model
+provider and the logs, and leaves no clean answer to "who did this, under whose
+authority".
+
+The benchmark that demonstrates the alternative is [AppWorld][appworld]: 9 apps,
+457 APIs, **362 of them (79%) behind an access token**. AppWorld's own interface
+expects the agent to read the supervisor's passwords, call each app's `login`,
+and carry the token itself. Here the nine apps are nine ordinary mounts:
+
+| | AppWorld's native interface | This runtime |
+|---|---|---|
+| Where credentials live | the agent's context | `secret_ref`, dereferenced server-side |
+| Who logs in | the agent | the gateway |
+| Where the token is kept | the agent's context | the mount's connection state |
+| What the model sees | passwords, tokens, Python | `spotify.show_song({song_id})` |
+
+Nine end-to-end cases assert it against the live servers: no schema mentions
+`access_token`, the credential-reading tool is not mounted, an authenticated
+call succeeds without the agent ever logging in, and the token never appears in
+a tool result.
+
+An operator attaches a credential for a mount from the console. It is stored in
+the agent's own object — **per agent, so a token attached under one agent is not
+there under the next**, which is the same boundary the mount scope comes from
+rather than a limitation of the page — sealed with AES-GCM under a Worker-held
+key: the row
+holds ciphertext and an IV, and no fragment of the value. The reference
+takes the form `agent:<name>` beside `env:NAME`, and resolves only against the
+(tenant, agent) that owns the mount naming it — the resolver takes its scope from
+the mount, not from the reference, so no reference one agent can write reaches
+another's store. Nothing returns the value: not the console, not a tool result,
+not a transcript entry. A plugin that can check a credential reports the account
+it authenticated as, which is also the only credential-derived string the page
+shows.
+
+Dereferencing server-side decides who may *use* a credential. It does not by
+itself decide where one may be *sent*, and for most plugins the host is fixed by
+the plugin rather than chosen by the agent — so the question does not arise. The
+`http` mount is the exception: the agent supplies the URL, so a credential on it
+would go wherever the agent points it, and a setting (`allowedHosts`) is the only
+thing bounding that. A mount carrying a credential therefore **must bound where
+that credential may be sent**, and the bound is declared by the field the plugin
+requires — for `http`, `allowedHosts`. The check reads *this mount's*
+`secret_ref` rather than what the plugin is able to carry, because a mount can
+hold a key before its plugin ever declares one and the hazard does not wait for
+the declaration. It runs twice: when the mount is provisioned, and again when a
+credential is later attached to it, so that attaching afterwards is not a way
+around a refusal the seed path would have made. A mount carrying no credential
+may leave the list unset, and then any public host is reachable.
+
+  **How a person gets in.** The console authenticates through a GitHub OAuth
+  app; there is no per-person password and no session the deployment keeps.
+  (An operator also has a long shared key a deployment can enable for
+  testing, which is an identity of its own and not a person's account.) A
+  sign-in that resolves to a row in the identity table lands on that row's
+  agent. The table is the whole of the admission rule: an account not on it
+  is refused, and a deployment can instead run open sign-up, in which a
+  first sign-in writes its own row and gets a new agent — seven seeded
+  mounts, an empty memory, and a **tenant of its own**, so one person's
+  quota and storage are not another's.
+
+[appworld]: https://github.com/StonyBrookNLP/appworld
+
+### Context Window Bounding & Compaction
 
 A long investigation outgrows any context window, and what it has learned is
 the part worth keeping. Dropping old turns keeps the task alive and throws the
@@ -379,7 +393,7 @@ the goal and per-page progress intact, and the agent then answered two questions
 whose answers had been fetched *before* the compaction, without going back to
 re-read anything.
 
-## Remembering
+### Persistent Memory
 
 An agent that cannot write anything down re-derives everything on every task,
 and it knows it: asked to keep a note, this one used to answer that it had
@@ -407,7 +421,7 @@ unprompted, and formatted the reply the way it had been asked to.
 
 [pim]: https://github.com/jayzeng/pi-memory
 
-## Storage
+### Storage Substrate
 
 One contract, two implementations, no third:
 
@@ -420,6 +434,9 @@ A db9/Postgres backend also passed, and was removed: 61,219 ms against sqlite's
 162 ms, no `SERIALIZABLE`, and `40001` on plain concurrent inserts. A backend
 that passes but is never run is a liability, not an asset — it has to be updated
 on every seam change while nobody exercises it.
+
+
+---
 
 ## What is verified
 
@@ -518,6 +535,8 @@ A single instance is a coin flip: `astropy-12907` passed alone, failed in a
 slice, and passed again on another model, all with the same code. Three
 instances measure that the loop runs, not how good it is.
 
+---
+
 ## Contributing
 
 We welcome contributions from the community. To keep antiproton reliable and maintainable:
@@ -590,6 +609,8 @@ followed, and both are pi's now.
 
 [pi]: https://github.com/badlogic/pi-mono
 [codex]: https://developers.openai.com/codex
+
+---
 
 ## What is not done
 
