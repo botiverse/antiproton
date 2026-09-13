@@ -73,7 +73,9 @@ await check("the gateway hands the value to the plugin's call context and to not
   await store.putSecret("t", "a", "gh", { ...(await seal(k, VALUE)) });
   let seen: string | null = null;
   const plugin: Plugin = {
-    id: "echo", version: "1", tools: [{ name: "ping", summary: "ping", sideEffects: "read", idempotency: "idempotent", schema: { type: "object", properties: {} } } as any],
+    // On for every agent: since the three-state switch (#216) a plugin that does
+    // not say so is off, and the gateway would refuse before any credential moved.
+    id: "echo", version: "1", defaultForAllAgents: true, tools: [{ name: "ping", summary: "ping", sideEffects: "read", idempotency: "idempotent", schema: { type: "object", properties: {} } } as any],
     async invoke(_tool, _args, ctx) { seen = ctx.credential; return { pong: true }; },
   } as any;
   await store.addMount({ tenantId: "t", agentId: "a", alias: "gh", plugin: "echo", installationId: "i",

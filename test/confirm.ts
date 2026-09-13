@@ -23,7 +23,10 @@ const must = (c: unknown, why: string) => { if (!c) throw new Error(why); };
 async function fixture() {
   const seen: unknown[] = [];
   const plugin: Plugin = {
-    id: "p", version: "1.0.0",
+    // `defaultForAllAgents` because since the three-state switch (#216) a plugin
+    // that does not say so is off for every agent, and the gateway refuses the
+    // call before confirm is ever read. This file is about confirm.
+    id: "p", version: "1.0.0", defaultForAllAgents: true,
     tools: [{ name: "zap", description: "", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" } as any],
     async invoke(_tool, args) { seen.push(args); return { zapped: true }; },
   };
