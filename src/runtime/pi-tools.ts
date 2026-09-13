@@ -418,16 +418,24 @@ export function runJsTool(
 /**
  * The offered names a mistyped one most likely meant, best first, at most ten.
  *
- * Names under the same alias (the part before `__`) come first, since a slip
- * in the tool part is the usual one; failing that, every name is ranked by how
- * much of the typed name it shares from the start. Exported so the ranking can
+ * Names under the same alias come first, since a slip in the tool part is the
+ * usual one; failing that, every name is ranked by how much of the typed name
+ * it shares from the start. "The same alias" is found by comparison, never by
+ * splitting the typed name at its first `__`: an alias may itself contain `__`
+ * (my__gh), so the group is the names sharing the longest prefix with the typed
+ * name that ends in `__` (Dora, 2026-09-13 — the twin of #261's lookup). Exported so the ranking can
  * be tested without an executor.
  */
 export function closestNames(typed: string, names: string[], limit = 10): string[] {
   const shared = (a: string, b: string) => { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++; return i; };
-  const alias = typed.split("__")[0]!;
-  const sameAlias = names.filter((n) => n.split("__")[0] === alias);
-  const pool = sameAlias.length ? sameAlias : names;
+  // The end of the longest common prefix that closes on "__", or 0 when the two
+  // share no whole alias segment.
+  const boundary = (a: string, b: string) => {
+    const cut = a.slice(0, shared(a, b)).lastIndexOf("__");
+    return cut < 0 ? 0 : cut + 2;
+  };
+  const best = names.reduce((m, n) => Math.max(m, boundary(typed, n)), 0);
+  const pool = best > 0 ? names.filter((n) => boundary(typed, n) === best) : names;
   return [...pool].sort((a, b) => shared(typed, b) - shared(typed, a) || a.localeCompare(b)).slice(0, limit);
 }
 
