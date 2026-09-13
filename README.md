@@ -42,14 +42,18 @@ npm install
 The test suite covers in-process storage conformance, agent loop semantics, tool isolation, compaction, and sandbox contracts:
 
 ```bash
-# Run unit and conformance tests (40+ test files)
-npm test
+# Run individual unit or conformance test suites (Node 24+ native TS strip)
+node test/pi-storage.ts
+node test/pi-agent.ts
+node test/state.ts
+
+# Or run predefined npm scripts for key suites
+npm run pi-storage
+npm run pi-agent
+npm run pi-tools
 
 # Run type checks (Node scripts and Cloudflare Worker checked independently)
 npm run typecheck
-
-# Check README suite counts against the suites
-npm run suite-table
 ```
 
 Three integration tests require live external credentials and are skipped in standard unit runs:
