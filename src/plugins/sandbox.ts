@@ -262,18 +262,6 @@ const DEFAULTS = {
 };
 
 /**
- * Hand the box back for real.
- *
- * `stop` is not release: it returns 200, halts the runtime, and leaves the box
- * and its storage in place — the state stays `ready` and storage keeps being
- * billed, which is the largest component of the quota. Only `DELETE` actually
- * frees it. Stopping first is a courtesy so nothing is killed mid-write.
- *
- * Failures are reported rather than swallowed. An earlier version buried them
- * on the theory that "the box stops itself eventually"; the result was thirteen
- * live boxes and a release path that had been announcing success the whole time.
- */
-/**
  * Tell the ledger, and never let that be the reason a call fails.
  *
  * The contract says `record` does not throw; this catch is here because the
@@ -286,6 +274,18 @@ async function noted(ctx: PluginContext, event: UsageEvent): Promise<void> {
   try { await ctx.record(event); } catch { /* the recorder's to report, not ours to raise */ }
 }
 
+/**
+ * Hand the box back for real.
+ *
+ * `stop` is not release: it returns 200, halts the runtime, and leaves the box
+ * and its storage in place — the state stays `ready` and storage keeps being
+ * billed, which is the largest component of the quota. Only `DELETE` actually
+ * frees it. Stopping first is a courtesy so nothing is killed mid-write.
+ *
+ * Failures are reported rather than swallowed. An earlier version buried them
+ * on the theory that "the box stops itself eventually"; the result was thirteen
+ * live boxes and a release path that had been announcing success the whole time.
+ */
 async function stopBox(
   ctx: PluginContext,
 ): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number } | null> {
