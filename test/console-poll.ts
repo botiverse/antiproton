@@ -78,6 +78,16 @@ check("the inspector holds the merged tabs: events, plugins, memory, runtime", (
     "both panels that host the catalogue must let the enable/disable select find their root");
 });
 
+check("the compact button marks its flight: label flips for the request, flips back on any answer", () => {
+  // tygg (2026-09-13, #design): clicking compact said nothing — no in-flight
+  // state, and a transcript that looked unchanged. The form now asks the
+  // shell to mark the button busy before the request and to free it after,
+  // pending or refused either way.
+  must(/hx-post="\/ui\/compact"[^>]*hx-on::before-request="ap\.busy\(this, true\)"/.test(html), "the compact form must mark the button before the request");
+  must(/hx-post="\/ui\/compact"[^>]*hx-on::after-request="ap\.busy\(this, false\)"/.test(html), "and free it on any answer, refused included");
+  must(/busy\(form, on\) \{[\s\S]*?b\.disabled = true[\s\S]*?b\.disabled = false/.test(html), "busy() disables and re-enables; label round-trips through data-label");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);

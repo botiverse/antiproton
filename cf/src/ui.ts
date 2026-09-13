@@ -539,7 +539,8 @@ ${HEAD_ASSETS}
       <span class="spacer"></span>
       <button type="button" class="pane-btn" onclick="ap.pane('side')">${ICONS.tasks}agents</button>
       <button type="button" class="pane-btn" onclick="ap.pane('insp')">${ICONS.inspector}inspector</button>
-      <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
+      <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML"
+            hx-on::before-request="ap.busy(this, true)" hx-on::after-request="ap.busy(this, false)" style="padding:0;border:0">
         <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
       </form></div>
     <div class="conv">
@@ -616,6 +617,16 @@ ${HEAD_ASSETS}
       const xhr = ev.detail.xhr, body = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 200) : '';
       err.textContent = 'not sent: ' + (xhr ? xhr.status + ' ' : '') + (body || (xhr && xhr.status ? '' : 'could not reach the server'));
       err.hidden = false;
+    },
+    // A one-shot action like compact must say on the button itself that the
+    // request went out; tygg (2026-09-13 #design): the compact button answered
+    // with nothing. Its label flips for the flight and flips back on any
+    // answer — an empty-looking click was what made it feel unresponsive.
+    busy(form, on) {
+      const b = form.querySelector('button[title]');
+      if (!b) return;
+      if (on) { b.dataset.label = b.textContent; b.textContent = '…'; b.disabled = true; }
+      else { b.disabled = false; if (b.dataset.label) b.textContent = b.dataset.label; }
     },
     // Switching agents: the agent id goes on the URL and every panel
     // request carries it from there (the configRequest hook below).
