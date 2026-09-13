@@ -62,7 +62,7 @@ import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment, inbox, mountList, catalogue, agentList } from "./ui.ts";
+  runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -1721,31 +1721,6 @@ export class AgentDO extends DurableObject<Env> {
       total, shown: events.length, events, byOp, busy };
   }
 
-  /**
-   * The inbox: every call held for a decision across this agent's tasks,
-   * oldest first, plus how many tasks there are and how many are still open.
-   * The same store method the per-task panel reads, without the task filter.
-   */
-  async uiInbox(tenantId: string, agentId: string) {
-    const rt = this.runtime();
-    await rt.ready();
-    const pending = (await rt.store.listApprovals(tenantId, "pending"))
-      .filter((a) => a.agentId === agentId)
-      .sort((x, y) => x.createdAt - y.createdAt)
-      .map((a) => ({
-        operationId: a.operationId, taskId: a.taskId, agentId: a.agentId,
-        tool: `${a.mountAlias}.${a.tool}`,
-        // The gateway holds the request as { tool, args }; the tool is already
-        // named above, so the card gets the arguments themselves.
-        args: (a.request as any)?.args ?? a.request,
-        requestedAt: new Date(a.createdAt).toISOString(),
-        heldBy: (a.request as any)?.heldBy === "agent" ? "the agent" : `${a.mountAlias} policy`,
-      }));
-    const tasks = await rt.store.listTasks(tenantId, agentId);
-    const running = tasks.filter((t) => t.status !== "completed" && t.status !== "failed").length;
-    return { pending, tasks: { total: tasks.length, running } };
-  }
-
   #ownerAgent(): string | null {
     const row = this.sql.exec("SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     return row ? String(row.agent_id) : null;
@@ -2915,12 +2890,6 @@ export default {
             .map((a) => ({ ...a, current: a.agentId === (uiSelected?.agentId ?? home) }));
           // The page swaps the rendered list in; anything else gets the data.
           return request.headers.get("hx-request") ? conditional(request, agentList({ agents })) : Response.json({ agents });
-        }
-        case "/ui/inbox": {
-          const gate = await requireViewer(request, env);
-          if (gate instanceof Response) return gate;
-          const d = await stub.uiInbox(gate.tenantId, uiSelected?.agentId ?? gate.agentId);
-          return conditional(request, inbox({ viewer: gate.who, ...d }));
         }
         case "/ui/approvals": {
           const gate = await requireViewer(request, env);

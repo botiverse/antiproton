@@ -9,7 +9,7 @@
  * the store produces its metadata, and no value the read block might carry
  * ever reaches the markup.
  */
-import { page, plugins, mountFragment, mountBlockId, inbox, mountList, bareTool, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
+import { page, plugins, mountFragment, mountBlockId, mountList, bareTool, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -213,28 +213,8 @@ check("a hostile alias or summary cannot break out of the markup", () => {
   must(!/alias" value="x" onmouseover/.test(html), "alias must be escaped in attributes");
 });
 
-
-// ---- the shell's inbox and task list ----------------------------------------
-check("the inbox renders each held call with the request verbatim, escaped, and its own count", () => {
-  const html = inbox({ viewer: "someone", pending: [
-    { operationId: "op-1", taskId: "t_a", agentId: "u-x", tool: "gh.issues.create", args: { title: `<img src=x onerror=1>` }, requestedAt: new Date(Date.now() - 120000).toISOString(), heldBy: "gh policy" },
-    { operationId: "op-2", taskId: "t_b", agentId: "u-x", tool: "node.exec", args: { cmd: "ls" }, requestedAt: new Date().toISOString(), heldBy: "node policy" },
-  ], tasks: { total: 3, running: 2 } });
-  must(/data-pending="2"/.test(html), "the root must carry the pending count");
-  must(/gh\.issues\.create/.test(html) && /node\.exec/.test(html), "both calls render");
-  must(!html.includes("<img src=x"), "arguments must be escaped");
-  must(html.includes("&lt;img src=x onerror=1&gt;"), "the escaped text must still be shown verbatim");
-  must(/waiting 2 min/.test(html), "how long it has waited");
-  must(/held by gh policy/.test(html), "who is holding it");
-  must(/hx-post="\/ui\/decide"[^>]*hx-target="#inbox"/.test(html.replace(/\n/g, " ")), "decisions re-render the inbox");
-  must(/open the agent/.test(html) && /agentId=u-x/.test(html) && !/open the conversation/.test(html), "each card opens its agent (one agent, one conversation)");
-});
-
-check("an empty inbox says nothing needs you and what is running", () => {
-  const html = inbox({ viewer: "someone", pending: [], tasks: { total: 3, running: 1 } });
-  must(/data-pending="0"/.test(html), "count is zero");
-  must(/Nothing is waiting on you\. 1 of 3 tasks running\./.test(html), "the empty state names the running count");
-});
+// The inbox was a second copy of the held calls: the conversation's panel
+// (below) is the one that decides them, so the page is gone (tygg, 2026-09-13).
 
 
 
@@ -316,7 +296,7 @@ check("the shell carries the current agent and sends it with every panel request
   must(/<body[^>]*data-agent="u-x_k3"/.test(html), "the body names the agent");
   must(/id="agents" data-lazy hx-get="\/ui\/agents"/.test(html), "the sidebar loads the agent list");
   must(/e\.detail\.parameters\.agentId = document\.body\.dataset\.agent/.test(html), "the configRequest hook adds agentId");
-  must(/href="\/ui\?view=inbox&agentId=u-x_k3"/.test(html), "rail links carry the agent and nothing else");
+  must(/href="\/ui\?view=agents&agentId=u-x_k3"/.test(html), "rail links carry the agent and nothing else");
   must(/<form class="new-agent-form" id="new-agent" hidden/.test(html) && /name="name" maxlength="60" required/.test(html) && /name="description" maxlength="2000"/.test(html), "the create form has name and description within the limits");
   must(/fetch\('\/ui\/agent', \{ method: 'POST'/.test(html), "create posts to /ui/agent");
   must(/Nothing is copied from another agent/.test(html), "the form says credentials and memory are per agent");
@@ -391,19 +371,13 @@ check("the held-approvals panel is capped and card arguments wrap", () => {
   const html = page("t_u-x", "someone", "u-x");
   const css = html.slice(html.indexOf("<style>"), html.indexOf("</style>"));
   must(/\.held\{[^}]*max-height:[^}]*overflow:auto/.test(css), "the held panel has a max height and scrolls");
-  must(/\.card pre,\.inbox-card pre\{[^}]*white-space:pre-wrap/.test(css), "card argument blocks wrap");
+  must(/\.card pre\{[^}]*white-space:pre-wrap/.test(css), "card argument blocks wrap");
 });
 
 // An agent-raised hold (confirm: true, recorded as heldBy "agent") reads as
-// the agent asking, not as a policy stopping it, on the inbox card and the
-// conversation's approvals card alike.
+// the agent asking, not as a policy stopping it, on the conversation's
+// approvals card (the inbox, which also said it, is gone).
 check("an agent-raised hold says the agent asked, a policy hold says held by", () => {
-  const inb = inbox({ viewer: "someone", pending: [
-    { operationId: "op-a", taskId: "t", agentId: "u-x", tool: "gh.issue_create", args: { title: "x" }, requestedAt: new Date().toISOString(), heldBy: "the agent" },
-    { operationId: "op-p", taskId: "t", agentId: "u-x", tool: "node.exec", args: { cmd: "ls" }, requestedAt: new Date().toISOString(), heldBy: "node policy" },
-  ], tasks: { total: 1, running: 1 } });
-  must(/the agent asked you to confirm/.test(inb) && !/held by the agent/.test(inb), "the agent-raised card says the agent asked");
-  must(/held by node policy/.test(inb), "a policy hold still says held by the policy");
   const rows: any[] = [
     { operationId: "op-a", mountAlias: "gh", tool: "issue_create", state: "pending", request: { args: { title: "x" }, heldBy: "agent" } },
     { operationId: "op-p", mountAlias: "node", tool: "exec", state: "pending", request: { args: { cmd: "ls" } } },

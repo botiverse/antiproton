@@ -79,11 +79,11 @@ body{margin:0;background:var(--bg);color:var(--ink);
 font:14px/1.55 var(--mono-font)}
 /* --- the shell: rail · sidebar · main · inspector ------------------------
    rUI's AppShell, as CSS. Slots own placement only; the panels inside own
-   their surfaces. Which columns exist depends on the section: the inbox is
-   one wide column, a conversation has all four. */
+   their surfaces. Which columns exist depends on the section: a conversation
+   has all four, while plugins and runtime leave the inspector and sidebar out. */
 body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
-body.shell[data-view=inbox],body.shell[data-view=runtime]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=runtime]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 @media(max-width:1100px){body.shell[data-view=agents]{grid-template-columns:56px 0 minmax(0,1fr) 0}}
 
@@ -181,28 +181,17 @@ section.view[data-view=agents].on{height:100%}
 .view-head h2{border:0;padding:0;font-size:15px;color:var(--ink);text-transform:none;letter-spacing:0;font-weight:600}
 .view-head .sub{color:var(--dim);font-size:11px}
 .view-head .spacer{flex:1}
-.banner{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--accent);border-radius:8px;
-background:var(--sunk);color:var(--accent);font-size:12px}
-.banner[hidden]{display:none}
-.banner .dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
-.banner .text{flex:1}
-.banner a{color:var(--accent);font-weight:600}
-.inbox-card .inbox-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
-.inbox-card .meta{color:var(--dim);font-size:11px}
-.inbox-card .row{align-items:center}
-.inbox-card .open{margin-left:auto;color:var(--dim);font-size:12px}
 .conv{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;
 flex:1;min-height:0}
 .conv .body{flex:1;min-height:0;max-height:none;overflow:auto}
 /* Held calls sit between the transcript and the composer. Capped and
    scrolling, so nine waiting calls cannot swallow the conversation and push
-   the composer out of the box (tygg, 2026-09-11); the inbox is the place to
-   read them all. */
+   the composer out of the box (tygg, 2026-09-11). */
 .held{position:sticky;bottom:-13px;margin:14px -13px -13px;padding:0 13px 3px;background:var(--panel);border-top:1px solid var(--line);max-height:min(40%,320px);overflow:auto}
 .held:has(>.empty){display:none}
 .held:empty{display:none}
 .held .card{margin:10px 0}
-.card pre,.inbox-card pre{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+.card pre{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
 .inspector{grid-area:insp;overflow:auto;background:var(--panel);border-left:1px solid var(--line);padding:12px;min-width:0}
 /* the inspector's tabs, on rUI's Tabs recipe: Elegant is an underline strip
    over a hairline, Brutal a bordered bar with dividers and the active tab
@@ -387,14 +376,14 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,
 [data-theme="brutal"] .view>.body,[data-theme="brutal"] .task,[data-theme="brutal"] .mount-link,
 [data-theme="brutal"] .banner,[data-theme="brutal"] .rail-item,[data-theme="brutal"] .mode,[data-theme="brutal"] pre,
-[data-theme="brutal"] .badge,[data-theme="brutal"] .tag,[data-theme="brutal"] .inbox-card{border-radius:0}
+[data-theme="brutal"] .badge,[data-theme="brutal"] .tag{border-radius:0}
 [data-theme="brutal"] button{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-sm)}
 [data-theme="brutal"] button:hover{box-shadow:var(--theme-shadow-md)}
 [data-theme="brutal"] button.ghost{border-color:var(--line-strong);box-shadow:none}
 [data-theme="brutal"] button:disabled{box-shadow:none}
 [data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password]{border:2px solid var(--line-strong);background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
 [data-theme="brutal"] input[type=text]:focus,[data-theme="brutal"] input[type=password]:focus{box-shadow:var(--theme-shadow-md)}
-[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body,[data-theme="brutal"] .banner{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
 [data-theme="brutal"] .card{border-left-width:2px}
 [data-theme="brutal"] .task,[data-theme="brutal"] .mount-link{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .task.on,[data-theme="brutal"] .mount-link.on{background:var(--primary-soft)}
@@ -429,13 +418,10 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
   body[data-pane=side] main.main,body[data-pane=insp] main.main{display:none}
   main.main{padding:12px}
   .pane-btn{display:inline-flex}
-  button,.inbox-card .row button{min-height:40px;padding:9px 14px;font-size:13px}
+  button{min-height:40px;padding:9px 14px;font-size:13px}
   input[type=text],input[type=password]{min-height:40px;font-size:15px}
-  .inbox-card .row{flex-wrap:wrap;gap:8px}
-  .inbox-card .open{margin-left:0;width:100%;padding-top:4px}
   .view-head h2{font-size:14px}
   .conv .body{max-height:none}
-  .banner{font-size:12px;padding:8px 10px}
 }
 @media(max-width:760px){.sidebar .pane-close,.inspector .pane-close{display:inline-flex;margin:10px 12px 0}}
 `;
@@ -443,13 +429,11 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 /**
  * The console, as a product rather than a debugging page.
  *
- * Four sections on a rail. The inbox is home: every call the gateway is
- * holding for this viewer, the request verbatim, and the two buttons that
- * settle it — that flow is what antiproton is, so it is the first thing seen.
- * A conversation shows the transcript with any held call above the composer;
- * beside it the inspector opens what is hard to see from outside — the
- * trajectory, the raw events, what the object is holding, where the time
- * went — one section at a time. Plugins and runtime are their own sections.
+ * Three sections on a rail. A conversation shows the transcript with any
+ * held call above the composer — approve or refuse it right there; beside
+ * it the inspector opens what is hard to see from outside — the events,
+ * the plugins, what the agent believes, where the time went — one tab at a
+ * time. Plugins and runtime are their own sections.
  * Every panel is still a plain GET that renders the store directly; the
  * shell keeps only which section is showing and which mode the viewer chose.
  */
@@ -491,11 +475,6 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   // costs nothing, and neither does a tab nobody is looking at: every poll
   // on the page starts with `awake`, and the visibilitychange listener at
   // the bottom catches the panels up the moment the tab is shown again.
-  // The inbox is the one panel that polls in every view, because the rail
-  // badge it feeds is in every view; it does so at two speeds, every 5s
-  // while the inbox is showing and every 30s elsewhere, since a 304 still
-  // wakes the object and a badge may lag half a minute (Vera, 2026-09-12:
-  // 720 wakes an hour per idle tab at one speed, 120 at two).
   const awake = "!document.hidden";
   const lazy = (id: string, path: string, every: string, cond: string) =>
     `<div class="body" id="${id}" data-lazy hx-get="${path}" hx-swap="innerHTML"
@@ -511,10 +490,9 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 ${HEAD_ASSETS}
-<style>${FONT_CSS}${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="inbox" data-agent="${esc(agentId)}">
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="agents" data-agent="${esc(agentId)}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
-  ${rail("inbox", "inbox").replace('</span><span>inbox', '</span><b class="count" id="inbox-count" hidden></b><span>inbox')}
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
   ${rail("runtime", "runtime")}
@@ -556,12 +534,6 @@ ${HEAD_ASSETS}
   </div>
 </aside>
 <main class="main" id="main">
-  <section class="view" data-view="inbox">
-    <div class="view-head"><h2>Inbox</h2><span class="sub">calls held by the gateway, waiting for your signature</span></div>
-    <div class="body" id="inbox" data-lazy hx-get="/ui/inbox" hx-swap="innerHTML"
-         hx-trigger="load, ap:show, every 5s[${awake} && document.body.dataset.view==='inbox'], every 30s[${awake} && document.body.dataset.view!=='inbox']"
-         hx-on::after-swap="ap.count(this)">loading…</div>
-  </section>
   <section class="view" data-view="agents">
     <div class="view-head"><span class="avatar lg" id="agent-avatar" hidden></span><h2 id="agent-name">${esc(agentId)}</h2>
       <span class="spacer"></span>
@@ -570,8 +542,6 @@ ${HEAD_ASSETS}
       <form hx-post="/ui/compact" hx-target="#transcript" hx-swap="innerHTML" style="padding:0;border:0">
         <button type="submit" class="ghost" title="Summarise the older part of this conversation now, keeping the recent part">compact</button>
       </form></div>
-    <div class="banner" id="banner" hidden><span class="dot"></span><span class="text"></span>
-      <a href="/ui?view=inbox" onclick="ap.show('inbox');return false">review</a></div>
     <div class="conv">
       <div class="body" id="transcript" data-lazy
            hx-get="/ui/chat?held=1" hx-swap="innerHTML"
@@ -636,17 +606,6 @@ ${HEAD_ASSETS}
       document.querySelectorAll('.side-view').forEach(v => v.classList.toggle('on', v.dataset.for === view));
       const u = new URL(location.href); u.searchParams.set('view', view); history.replaceState(null, '', u);
       document.querySelectorAll('.view.on [data-lazy], .side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
-    },
-    count(el) {
-      const list = el.querySelector('.inbox-list');
-      const n = list ? Number(list.dataset.pending || 0) : el.querySelectorAll('.card').length;
-      const b = document.getElementById('inbox-count'); b.textContent = String(n); b.hidden = n === 0;
-      const banner = document.getElementById('banner');
-      const first = el.querySelector('.inbox-card .tool');
-      banner.hidden = n === 0;
-      banner.querySelector('.text').textContent = n === 1
-        ? '1 call is waiting for you: ' + (first ? first.textContent : '')
-        : n + ' calls are waiting for you';
     },
     // A send that the server refused must not vanish: htmx swaps nothing on
     // a non-2xx, and a form that resets regardless would eat the text and say
@@ -756,7 +715,7 @@ ${HEAD_ASSETS}
       panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver;
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
-    ap.show(['inbox', 'agents', 'plugins', 'runtime'].includes(v) ? v : 'inbox');
+    ap.show(['agents', 'plugins', 'runtime'].includes(v) ? v : 'agents');
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
@@ -786,11 +745,11 @@ ${HEAD_ASSETS}
     if (v) e.detail.elt.dataset.ver = v;
   });
   // Polling stops while the tab is hidden (every trigger tests document.hidden);
-  // on return, the shown panels and the inbox refresh at once rather than
-  // waiting out the rest of their interval.
+  // on return, the shown panels refresh at once rather than waiting out the
+  // rest of their interval.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) return;
-    document.querySelectorAll('.view.on [data-lazy], .side-view.on [data-lazy], #inbox').forEach(el => htmx.trigger(el, 'ap:show'));
+    document.querySelectorAll('.view.on [data-lazy], .side-view.on [data-lazy]').forEach(el => htmx.trigger(el, 'ap:show'));
   });
 </script>
 </body></html>`;
@@ -1507,46 +1466,6 @@ ${allSaved.length
  * Mounts come first because they are the answer to "why did that happen".
  * Nothing here shows a credential; only whether one is attached.
  */
-/**
- * The inbox: every call the gateway is holding for this viewer, across tasks.
- *
- * This is the product's moment — the agent asked, the gateway held, a person
- * reads the request verbatim and signs — so it is the home section. Oldest
- * first, because the one that has waited longest is the one to look at. The
- * root carries the pending count so the rail badge can read it without a
- * second request. The empty state says what is running, so an empty inbox
- * reads as "nothing needs you" rather than "nothing is happening".
- */
-export function inbox(d: any): string {
-  const pending: any[] = d?.pending ?? [];
-  const tasks = d?.tasks ?? { total: 0, running: 0 };
-  const ago = (iso: string) => {
-    const t = Date.parse(iso); if (Number.isNaN(t)) return "";
-    const m = Math.max(0, Math.round((Date.now() - t) / 60000));
-    return m < 1 ? "just now" : m < 60 ? `${m} min` : m < 1440 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} d`;
-  };
-  const card = (a: any) => {
-    const req = a.args ?? {};
-    return `<div class="card inbox-card">
-  <div class="inbox-head"><span class="tool">${esc(a.tool)}</span>
-    <span class="meta">${esc(a.agentId ?? "")}${a.heldBy === "the agent" ? " · the agent asked you to confirm" : a.heldBy ? ` · held by ${esc(a.heldBy)}` : ""}${a.requestedAt ? ` · waiting ${esc(ago(a.requestedAt))}` : ""}</span></div>
-  <div class="k">the request, verbatim</div>
-  <pre>${esc(JSON.stringify(req, null, 2))}</pre>
-  <div class="row">
-    <button hx-post="/ui/decide" hx-target="#inbox" hx-swap="innerHTML"
-      hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "approved" }))}'>approve</button>
-    <button class="bad" hx-post="/ui/decide" hx-target="#inbox" hx-swap="innerHTML"
-      hx-vals='${esc(JSON.stringify({ operationId: a.operationId, decision: "denied" }))}'>deny</button>
-    <a class="open" href="/ui?view=agents&agentId=${encodeURIComponent(a.agentId ?? "")}" onclick="ap.agent('${esc(a.agentId ?? "")}');return false">open the agent →</a>
-  </div>
-</div>`;
-  };
-  const body = pending.length
-    ? pending.map(card).join("")
-    : `<div class="empty">Nothing is waiting on you. ${tasks.running} of ${tasks.total} task${tasks.total === 1 ? "" : "s"} running.</div>`;
-  return `<div class="inbox-list" data-pending="${pending.length}">${body}</div>`;
-}
-
 
 /**
  * An agent's avatar, drawn from its seed.
