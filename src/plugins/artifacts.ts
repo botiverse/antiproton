@@ -23,6 +23,16 @@ export const PARK_BYTES = 4 * 1024;
  */
 export const READ_PAGE = 16 * 1024;
 
+/**
+ * The most a read-back may return in one call. A page the reader hands back is
+ * itself a mounted call, so it meets a line of its own (cf/src/runtime.ts
+ * limitForCall): this is that line, and it is the same one a call meets when no
+ * reader is mounted at all. Here rather than in the runtime because it is a
+ * fact about reading back, and because the note that tells a model which call
+ * to make has to know it (state.ts).
+ */
+export const READ_WHOLE_MAX = 32 * 1024;
+
 export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
   return {
     id: "artifacts",
