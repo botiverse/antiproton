@@ -99,6 +99,20 @@ export function offloadLimit(readBack: string | null): number {
 }
 
 /**
+ * The line for one call. Reading a parked result back is itself a mounted
+ * call, so at the parking line the page it returned was parked again and the
+ * model never got past a preview (Vera, 2026-09-13). The reader's own answer
+ * is held to the line where nothing parks instead; a page bigger than that is
+ * still parked, and fewer fields or a smaller limit reads it.
+ *
+ * Compared by address, because that is what reaches the host: both the
+ * bridge and run_js resolve the offered name before they invoke.
+ */
+export function limitForCall(tool: string, reader: { name: string; address: string } | null): number {
+  return reader && tool === reader.address ? offloadLimit(null) : offloadLimit(reader?.name ?? null);
+}
+
+/**
  * What the model gets instead of a result too big to put in the conversation.
  *
  * Two branches, and each says something true. Parked: here is a reference and
@@ -603,9 +617,10 @@ export class AgentRuntime {
    */
   #host(
     ctx: { tenantId: string; agentId: string; taskId: string },
-    /** The reader, as the model would name it, or null when it has none. */
-    readBack: string | null,
+    /** The reader — offered name and address — or null when it has none. */
+    reader: { name: string; address: string } | null,
   ) {
+    const readBack = reader?.name ?? null;
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
@@ -614,7 +629,7 @@ export class AgentRuntime {
         const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
-        if (body.length <= offloadLimit(readBack)) return res;
+        if (body.length <= limitForCall(call.tool, reader)) return res;
         if (!readBack) {
           return {
             status: "succeeded",
@@ -828,8 +843,9 @@ export class AgentRuntime {
     // string the single-conversation object always used.
     // Which tool, if any, can read a parked result back — by plugin, and named
     // the way the model was offered it.
-    const reader = (tools as MountedTool[]).find((t) =>
-      offersPlugin(records, [t], "artifacts") && t.address.endsWith(".read"))?.name ?? null;
+    const readTool = (tools as MountedTool[]).find((t) =>
+      offersPlugin(records, [t], "artifacts") && t.address.endsWith(".read"));
+    const reader = readTool ? { name: readTool.name, address: readTool.address } : null;
     const host = this.#host(
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader);
     const store = this.store;
