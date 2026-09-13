@@ -329,6 +329,35 @@ await check("Worker 执行器把脚本写的名字原样交给 host", async () =
   }
 });
 
+await check("run_js 里写错模型自己那套名字,答'没有这个工具'并给出候选,而不是'名字不合法'", async () => {
+  // #255 made `alias__tool` the shape a script uses; a typo in it then reached
+  // the gateway and came back as "not a tool name", contradicting that rule
+  // (Piper, 2026-09-13). Through the real executor, as the model hits it.
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const seen: string[] = [];
+  const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools: qualifyMountedTools([named("get", "state.get"), named("put", "state.put"), named("get", "web.get")]),
+  });
+  const run = async (name: string) => {
+    seen.length = 0;
+    const out = await tool.execute(`u-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null, r.error?.candidates ?? null]);` });
+    const [[status, code, candidates]] = JSON.parse(out.content[0].text);
+    return { seen: [...seen], status, code, candidates };
+  };
+  const typo = await run("state__gett");
+  if (typo.seen.length !== 0) throw new Error(`an unknown offered-form name reached the host: ${typo.seen}`);
+  if (typo.code !== "unknown_tool") throw new Error(`a typo was answered with ${typo.code}, not unknown_tool`);
+  if (typo.candidates?.[0] !== "state__get") throw new Error(`the likely name was not offered first: ${JSON.stringify(typo.candidates)}`);
+  const alias = await run("stat__get");
+  if (alias.code !== "unknown_tool" || !String(alias.candidates?.[0]).startsWith("state__")) {
+    throw new Error(`a mistyped alias did not point at the near names: ${JSON.stringify(alias)}`);
+  }
+  // A dotted name is still the gateway's to answer, in its own words.
+  const dotted = await run("state.gett");
+  if (dotted.seen.join() !== "state.gett") throw new Error(`a dotted name was intercepted: ${JSON.stringify(dotted)}`);
+});
+
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);
 await check("a plugin's presence is asked by plugin and answered from the offered tools", async () => {
   const tool = (alias: string) => [{ name: "put", description: "", parameters: {}, address: `${alias}.put` }] as MountedTool[];
