@@ -138,12 +138,12 @@ await check("会话里旧的工具表和 run_js 都不能绕过这个开关", as
 
   await store.setPluginChoice("t", "a", "offered", "disable");
   const after = await gw.invoke(ctx, "offered.ping", {});
-  if (after.status !== "rejected" || (after.error as any)?.code !== "plugin_disabled") {
+  if (after.status !== "rejected" || after.error?.code !== "plugin_disabled") {
     throw new Error(`a switched-off mount answered a call by address: ${JSON.stringify(after)}`);
   }
   // The refusal is addressed to a model that must now do something else, so it
   // says a person reopens it — and it does not hand back a dispatch address.
-  const message = String((after.error as any)?.message ?? "");
+  const message = String(after.error?.message ?? "");
   if (message.includes("offered.ping")) throw new Error(`the refusal names a dispatch address: ${message}`);
 });
 

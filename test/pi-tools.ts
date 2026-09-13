@@ -356,6 +356,14 @@ await check("run_js 里写错模型自己那套名字,答'没有这个工具'并
   // The message itself names it, since that is what reaches the model even when
   // a script does not print the candidates field.
   if (!String(typo.message).includes("state__get")) throw new Error(`the message does not name the likely tool: ${typo.message}`);
+  // Names offered to the model only, never a dispatch address: candidates come
+  // from the offered-name table, and that is the whole reason this message may
+  // name tools at all (the refusal rule pinned in test/plugin-enable.ts). A
+  // refactor that ranked the address table instead would leak `state.get` here.
+  if ((typo.candidates ?? []).some((c: string) => c.includes("."))) {
+    throw new Error(`a candidate is a dispatch address: ${JSON.stringify(typo.candidates)}`);
+  }
+  if (/state\.(get|put)/.test(String(typo.message))) throw new Error(`the message names a dispatch address: ${typo.message}`);
   const alias = await run("stat__get");
   if (alias.code !== "unknown_tool" || !String(alias.candidates?.[0]).startsWith("state__")) {
     throw new Error(`a mistyped alias did not point at the near names: ${JSON.stringify(alias)}`);
