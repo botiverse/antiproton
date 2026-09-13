@@ -15,6 +15,7 @@ import { html, conditional, holds, notModified } from "./version.ts";
 import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
+import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
@@ -640,12 +641,24 @@ export class AgentDO extends DurableObject<Env> {
         current: execution.current, lastOperationId: execution.lastOperationId,
       },
       modelBinding: await rt.store.getModelBinding(tenantId, agentId),
-      mounts: (await rt.store.listMounts(tenantId, agentId)).map((m) => ({
+      mounts: await Promise.all((await rt.store.listMounts(tenantId, agentId)).map(async (m) => ({
         alias: m.alias, plugin: m.plugin, policy: m.policy,
         // A mount created before a config field existed keeps the old config
         // for ever, and the symptom shows up somewhere else entirely.
         config: m.publicConfig,
-      })),
+        // Whose credential this is, never what it is: an operator moving or
+        // renaming a mount has to be able to see which references moved with
+        // it (the agent's own) and which must not have (the deployment's).
+        secret: secretRefKind(m.secretRef),
+        // Whether state is kept under this alias. A rename moves it in the
+        // same transaction as the mount; this is how that is checked from
+        // outside, since the state itself is the plugin's and stays private.
+        connection: (await rt.store.getConnection(tenantId, agentId, m.alias)) != null,
+      }))),
+      // What each mount says it is holding and has held — the sandbox panel's
+      // data, which was otherwise reachable only from a signed-in person's own
+      // page. Activity and history only; no credential, no plugin state.
+      mountReports: await this.#mountReports(rt, tenantId, agentId, taskId),
       eventKinds: kinds,
       lastEvents: events.slice(-6).map((e) => ({
         seq: e.sequence, kind: e.kind,
