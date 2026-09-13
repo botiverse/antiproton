@@ -476,8 +476,6 @@ ten-instance run below is the one measured under SWE-bench's own condition.
 
 | | model | resolved | wall clock | prompt tokens | measured in |
 |---|---|---|---|---|---|
-| the previous harness | deepseek-v4-pro | 1/3 | 699 s | 307 k | Node process, in-memory SQLite |
-| pi's loop | deepseek-v4-pro | 2/3 | 1,044 s | 1,647 k | Node process, in-memory SQLite |
 | pi's loop | deepseek-flash | 3/3 | 690 s | 550 k (94% cached) | Node process, in-memory SQLite |
 | pi's loop | **deepseek-flash** *(deployed model)* | **3/3** | 692 s | 446 k (93% cached) | **Durable Object** `bench-swe1`, 2026-09-10, `swe-on-object` |
 
@@ -495,9 +493,8 @@ anything. The three misses ran out of the fifteen-minute budget; every solve
 landed in one file. The object was billed for 4,419 s of the 6,059 s wall clock
 (73 %), 527 s of it the runner grading.
 
-The first two rows of the slice table compare loops; the last two change the model as well, and
-are here because it is the model the deployment runs. Only the last row meets
-the standard: it was driven through the deployed Worker (`bench/swebench/cf.ts`),
+The table compares the loop in-process against the deployed environment for the deployed model (`deepseek-flash`). Only the on-object row meets
+the full measurement standard: it was driven through the deployed Worker (`bench/swebench/cf.ts`),
 the agent ran inside the object with the instance's image mounted as its
 machine, the model calls went through the production queue, and the grader ran
 in the same container before the runner released it. Same score and wall clock
@@ -526,10 +523,6 @@ sandbox is not yet shown to pay on this substrate.
 Two runs of the same commit on the same model scored 3/3 both times and differed
 by a third in cost — 1,071 s / 813 k against 690 s / 550 k. That is the size of
 the noise, and it is worth knowing before reading any single figure as a trend.
-
-The score is not the interesting number. Both instances the old loop failed
-ended after **one model call** — it was not the model failing the task, it was
-the loop stopping. The new one works them for eleven to fifty-nine turns.
 
 A single instance is a coin flip: `astropy-12907` passed alone, failed in a
 slice, and passed again on another model, all with the same code. Three
