@@ -21,17 +21,31 @@ if [ -n "$refusal" ]; then echo "$refusal"; exit 1; fi
 # It used to be a list of 17 that someone had to remember to extend: 20 of the
 # 37 suites were never gated, and the two of them that had gone red (confirm,
 # secrets — their fixtures predated the plugin switch) stayed red unnoticed
-# (Rex, 2026-09-13). A new suite is now gated by being written.
+# (Rex, 2026-09-13). A new suite is gated by being written.
+#
+# A suite passes when it exits 0 AND reports at least one pass: an emptied suite
+# exits 0 too. And the set of suites must match test/suites.txt, so a deleted
+# one is refused instead of skipped (Piper, 2026-09-13; cf/scripts/suite-verdict.sh).
+. cf/scripts/suite-verdict.sh
+problems=$(suite_list_problems test/suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
 NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
+run_suite() {  # name, command...
+  local name="$1"; shift
+  printf "%-22s" "$name"
+  local out n
+  if ! out=$("$@" 2>&1); then echo FAIL; exit 1; fi
+  n=$(printf '%s\n' "$out" | suite_passed_count)
+  if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing: ${n:-no pass count})"; exit 1; fi
+  echo "ok ($n)"
+}
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
   case "$NEEDS_SERVICE" in *" $t "*) printf "%-22sskipped (needs a live service)\n" "$t"; continue;; esac
-  printf "%-22s" "$t"
-  if node "$f" >/dev/null 2>&1; then echo ok; else echo FAIL; exit 1; fi
+  run_suite "$t" node "$f"
 done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
-printf "%-22s" "pi-storage-do"
-if bash test/pi-storage-do.sh >/dev/null 2>&1; then echo ok; else echo FAIL; exit 1; fi
+run_suite pi-storage-do bash test/pi-storage-do.sh
 # Captured, then printed, then tested. It used to be piped through
 # \`tee /dev/stderr\`, and when the run is redirected to a log file, /dev/stderr
 # reopens that file with truncation: every suite line above was erased and the
