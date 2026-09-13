@@ -366,7 +366,7 @@ footer a{color:var(--accent)}
       <tr><td>&hellip; the contaminated condition, on purpose</td><td class="k">NETWORK=open N=10 OBJ=x node bench/swebench/cf.ts</td></tr>
       <tr><td>&tau;&sup2;, inside the deployed object</td><td class="k">OBJ=do1 N=8 TRIALS=3 node bench/tau2/cf.ts</td></tr>
       <tr><td>&hellip; waiting by polling instead of push</td><td class="k">WAIT=poll node bench/tau2/cf.ts</td></tr>
-      <tr><td>&hellip; a finished task&rsquo;s transcript, after the fact</td><td class="k">curl &quot;$BASE/bench/trajectory?obj=do1&amp;taskId=&hellip;&quot;</td></tr>
+      <tr><td>&hellip; a finished task&rsquo;s transcript, after the fact</td><td class="k">curl -H &quot;x-harness-token: $HARNESS_AUTOMATION_TOKEN&quot; &quot;$BASE/bench/trajectory?obj=do1&amp;taskId=&hellip;&quot;</td></tr>
       <tr><td>Storage contract, in process</td><td class="k">npm run pi-storage</td></tr>
       <tr><td>&hellip; on real Durable Object storage</td><td class="k">npm run pi-storage:do</td></tr>
     </tbody>
