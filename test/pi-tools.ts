@@ -243,10 +243,14 @@ await check("扣住的工具不会被提供,其余原样", async () => {
   if (withholdTools(cat, []).length !== 3) throw new Error("withholding nothing removed something");
 });
 
-await check("沙箱里用的是模型看到的名字,地址也仍然接受", async () => {
-  // The prompt tells the model the sandbox reaches "the same tools", so the
-  // string that works outside has to work inside. Before this, outside was the
-  // registered name and inside was the gateway's address, and nothing said so.
+await check("runJsTool 的换名表: 模型看到的名字查到地址,地址原样通过", async () => {
+  // What this proves is narrow: the table in runJsTool maps an offered name to
+  // its address and passes an address through. The sandbox here is a stub that
+  // calls invoke directly, so it never meets the parser both executors run
+  // first — and on 2026-09-13 that parser refused every offered name before
+  // this table could see it, while this case stayed green under a title that
+  // claimed the sandbox accepted them (Piper, Rex, Dora). The claim that a
+  // script can use the offered names is made by the real-executor case below.
   const calls: any[] = [];
   const host = { async invoke(call: any) { calls.push(call.tool); return { status: "succeeded" }; } };
   const sandbox = {
@@ -272,6 +276,57 @@ await check("沙箱里用的是模型看到的名字,地址也仍然接受", asy
   // An unknown name is the gateway's to refuse, with its own message.
   await (tool as any).execute("c2", { source: "nonsense" });
   if (calls[2] !== "nonsense") throw new Error(`a lookup swallowed an unknown name: ${calls[2]}`);
+});
+
+await check("run_js 里写模型看到的名字,在真实执行器里也能调到工具", async () => {
+  // The case above hands names straight to invoke through a fake sandbox, so it
+  // never met the parser both executors run first — which only accepted dotted
+  // addresses and refused `web__get` before the mapping could see it. This goes
+  // through the real in-process executor: the template tag, the parser, the
+  // mapping, the host (tygg's agent, 2026-09-13).
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const seen: string[] = [];
+  const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: { ok: true } }; } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools: qualifyMountedTools([named("get", "web.get")]),
+  });
+  const run = async (name: string) => {
+    seen.length = 0;
+    const out = await tool.execute(`c-${name}`, { source: `const r = await tool\`${name} \${{}}\`; output([r.status, r.error?.code ?? null]);` });
+    // output() takes one value; the script reports [status, error code].
+    const [[status, code]] = JSON.parse(out.content[0].text);
+    return { seen: [...seen], status, code };
+  };
+  const offered = await run("web__get");
+  if (offered.seen.join() !== "web.get" || offered.status !== "succeeded") {
+    throw new Error(`the offered name did not reach the tool: ${JSON.stringify(offered)}`);
+  }
+  const address = await run("web.get");
+  if (address.seen.join() !== "web.get") throw new Error(`the address stopped working: ${JSON.stringify(address)}`);
+  const bad = await run("web get!");
+  if (bad.seen.length !== 0 || bad.code !== "bad_tool_name") {
+    throw new Error(`a malformed name was not refused before the host: ${JSON.stringify(bad)}`);
+  }
+});
+
+await check("Worker 执行器把脚本写的名字原样交给 host", async () => {
+  // Production runs run_js in a Dynamic Worker; its calls land in
+  // handleSandboxCall, which used to rebuild the name from a parsed address.
+  const { executions, handleSandboxCall } = await import("../src/runtime/dynamic-worker-executor.ts");
+  const { DEFAULT_LIMITS } = await import("../src/core/execution.ts");
+  const seen: string[] = [];
+  executions.set("exec-names", {
+    host: { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } },
+    limits: DEFAULT_LIMITS, hostCalls: 0, inFlight: 0, accepted: [], aborted: false, pending: new Set(),
+  } as any);
+  try {
+    const r = await handleSandboxCall("exec-names", ["web__get ", ""], [{}]);
+    if (r.status !== "succeeded" || seen.join() !== "web__get") {
+      throw new Error(`the Worker path did not pass the offered name on: ${JSON.stringify({ r, seen })}`);
+    }
+  } finally {
+    executions.delete("exec-names");
+  }
 });
 
 console.log(`\n  Mounts as pi tools\n  ${"─".repeat(56)}`);

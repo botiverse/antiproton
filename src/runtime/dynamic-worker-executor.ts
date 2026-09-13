@@ -68,7 +68,7 @@ export async function handleSandboxCall(
 
   state.hostCalls++;
   state.inFlight++;
-  const name = `${parsed.ref.head}.${parsed.ref.tool}`;
+  const name = parsed.name;
   const p = state.host
     .invoke({ tool: name, args: parsed.args, opts: parsed.opts as Record<string, Json> })
     .then(

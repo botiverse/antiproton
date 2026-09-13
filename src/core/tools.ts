@@ -29,6 +29,9 @@ export interface ToolRef {
   tool: string;
 }
 
+/** A literal tool name as a script may write it: an offered name or a dotted address. */
+const TOOL_NAME = /^[a-z0-9_]+(\.[a-z0-9_]+)*$/i;
+
 export function parseToolRef(raw: string): ToolRef | null {
   const trimmed = raw.trim();
   if (!/^[a-z0-9_]+(\.[a-z0-9_]+)+$/i.test(trimmed)) return null;
@@ -43,7 +46,16 @@ export function parseToolRef(raw: string): ToolRef | null {
  * stays 100% plugin schema (no reserved-word collisions).
  */
 export interface ParsedCall {
-  ref: ToolRef;
+  /**
+   * The tool as the script named it, unchanged: the name the model was offered
+   * (`web__get`) or a dispatch address (`web.get`). Resolving it is not this
+   * parser's job — run_js maps offered names to addresses right after, and the
+   * gateway refuses what is still unknown with its own message. Parsing it into
+   * an address here rejected every offered name before that mapping could run,
+   * so no tool was reachable from run_js by the names the model had (tygg's
+   * agent, 2026-09-13).
+   */
+  name: string;
   args: Json;
   opts: { idempotencyKey?: string; timeoutMs?: number };
 }
@@ -53,8 +65,7 @@ export function parseTemplateCall(
   values: readonly unknown[],
 ): ParsedCall | { error: ToolError } {
   const name = strings[0]?.trim() ?? "";
-  const ref = parseToolRef(name);
-  if (!ref) return { error: { code: "bad_tool_name", message: `not a tool name: ${JSON.stringify(name)}` } };
+  if (!TOOL_NAME.test(name)) return { error: { code: "bad_tool_name", message: `not a tool name: ${JSON.stringify(name)}` } };
   for (let i = 1; i < strings.length; i++) {
     if (strings[i]!.trim() !== "") {
       return { error: { code: "unexpected_text", message: "only interpolated values may follow the tool name" } };
@@ -77,5 +88,5 @@ export function parseTemplateCall(
       },
     };
   }
-  return { ref, args: args as Json, opts: (opts as ParsedCall["opts"]) ?? {} };
+  return { name, args: args as Json, opts: (opts as ParsedCall["opts"]) ?? {} };
 }
