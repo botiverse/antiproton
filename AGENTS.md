@@ -81,8 +81,10 @@ rather than at the setup:
   itself.
 
 If you report a branch as green, **name the set you ran**. The suites nearest a
-change answer "is this change sound"; only the full fifteen answer "is this
-branch sound", and the two are different questions.
+change answer "is this change sound"; only the whole set — every file in `test/`
+except the ones that need a live service — answers "is this branch sound", and the
+two are different questions. Name the second one without a count, for the reason
+two paragraphs up.
 
 **A change a test is meant to certify needs two readings, and they are separate.**
 First, a reading that the change *moved the behaviour under test* — without it a
