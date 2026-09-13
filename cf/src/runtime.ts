@@ -59,7 +59,7 @@ import { httpPlugin } from "../../src/plugins/http.ts";
 import { statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
-import { artifactsPlugin } from "../../src/plugins/artifacts.ts";
+import { artifactsPlugin, PARK_BYTES } from "../../src/plugins/artifacts.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -80,7 +80,23 @@ export interface ModelJob {
   payload: Json;
 }
 
-const OFFLOAD_BYTES = 32 * 1024;
+/**
+ * How big a tool result may be before the model gets a preview instead.
+ *
+ * Two numbers, because the two branches lose different things. With a reader
+ * mounted, a larger result is parked and nothing is lost, so the line is low
+ * and the conversation stays small (tygg, 2026-09-13: 4K). Without one, the
+ * rest is discarded, so lowering the line there would only throw more away;
+ * it stays where it was.
+ *
+ * This is the line for mounted tool calls only. What a run_js script returns
+ * with output() is never parked; it comes back as-is up to its own 64 KiB cap
+ * (src/core/execution.ts), so a script can still bring a larger result into
+ * the conversation. Whether that should park too has not been decided.
+ */
+export function offloadLimit(readBack: string | null): number {
+  return readBack ? PARK_BYTES : 32 * 1024;
+}
 
 /**
  * What the model gets instead of a result too big to put in the conversation.
@@ -598,7 +614,7 @@ export class AgentRuntime {
         const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
-        if (body.length <= OFFLOAD_BYTES) return res;
+        if (body.length <= offloadLimit(readBack)) return res;
         if (!readBack) {
           return {
             status: "succeeded",

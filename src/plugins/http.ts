@@ -178,8 +178,8 @@ export const httpPlugin: Plugin = {
     // rename would refuse every mount already carrying the old key.
     //
     // Quoted rather than paraphrased, so the citation can be grepped:
-    //     cf/src/runtime.ts:366   const body = JSON.stringify(res.result);
-    //     cf/src/runtime.ts:367   if (body.length <= OFFLOAD_BYTES) return res;
+    //     cf/src/runtime.ts   const body = JSON.stringify(res.result);
+    //     cf/src/runtime.ts   if (body.length <= offloadLimit(readBack)) return res;
     { name: "maxBytes", type: "number", default: DEFAULT_MAX_BYTES,
       summary: "How much of a response body is returned. The rest is cut and discarded, not kept anywhere; `bytes` reports the full size, so a truncated result says how much went." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "How long one request may take." },
