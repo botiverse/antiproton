@@ -70,7 +70,45 @@ Antiproton enforces a **Zero-Trust Credential Gate**:
 
 ---
 
-## 4. Context Compaction as a Lossless Function
+## 4. Extensibility, Marketplaces, & Programmable Structured Tools
+
+In conventional agent frameworks, plugins are treated as unconstrained callback scripts or arbitrary Python functions. Installing a tool requires absolute trust in the third-party author: a rogue tool can inspect process memory, exfiltrate environment variables, or scan local network sockets.
+
+Antiproton inverts this dynamic. We designed plugins under `src/plugins/` to be open for community contribution—and structurally architected for an eventual third-party marketplace—because the runtime structure renders them **safe by default**.
+
+### A Mount Is an Authority Boundary, Not a Callback
+A plugin declares schemas and implementations, but it never grants ambient authority. Authority belongs strictly to the **mount**:
+- **Independent Policies:** A mount carries an explicit policy (`allow`, `deny`, or `approval` across read, write, and individual tools). Mounting the same plugin twice under two distinct aliases creates two distinct authorities (e.g., a read-only production database mount beside a read-write staging mount).
+- **The Danger of Ungated Neighbors:** As formulated in our invariants (`README.md:108-112`), an ungated mount of a plugin sitting beside a gated mount is a door beside the gate. Security requires evaluating an agent's entire mount set, not inspecting one mount in isolation.
+- **Human-in-the-Loop Parking:** When an operation requires `approval`, execution does not abort. The task *parks* cleanly, awaiting human authorization. In production testing, answering a held call with an error caused the agent to abort after 75s; pausing execution with an explicit parking status converted the exact same task into a **17.2s success** (`README.md:118-122`).
+
+### The Marketplace Foundation: Decoupling Provider from Consumer
+The underlying storage schema was built from day one to support an open ecosystem marketplace (`src/store/durable-object.ts:80`):
+- The `mounts` schema physically isolates `installation_id`, `tool_version` pins, `secret_ref`, and `policy` per `(tenant, agent, alias)`.
+- Capabilities are decoupled: capability providers publish plugins, while operators configure separate policies and credentials per alias.
+- What remains unbuilt is dynamic runtime installation: plugins are currently registered at build time in `cf/src/runtime.ts` (`README.md:622-626`). We state this limitation explicitly rather than pretending dynamic runtime loading exists.
+
+### Programmable Structured Tools: Moving Logic into the Sandbox (`run_js`)
+Standard tool calling forces an LLM into an inefficient conversational loop: call an API, wait 5 seconds, receive raw JSON into context, decide the next call, and repeat. For data filtering, pagination, or multi-step calculations, this turns routine computation into exorbitant token and wall-clock expense.
+
+Antiproton introduces **Programmable Structured Tools** via **`run_js`**:
+- **Hermetic Execution:** `run_js` evaluates JavaScript inside an isolated sandbox (QuickJS or Cloudflare Dynamic Workers) with zero ambient network access (`globalOutbound: null`), no filesystem, and no ambient `process` or `fetch`.
+- **The Tool Bridge as Sole Egress:** Sandboxed code reaches the world exclusively by invoking registered tools through an injected host bridge. Those calls re-enter the `ToolGateway`, where they are subjected to the exact same mount policies, authorization gates, and audit trails as direct model tool calls.
+- **Code-as-Orchestrator:** Rather than consuming 10 separate model turns to fetch, paginate, and filter a 500-item list, the model can generate a concise script that loops, joins, and aggregates data directly inside the sandbox, returning only the compact, structured answer.
+
+### The Measure of Honesty: When a Feature Does Not Yet Pay
+Most technical manifestos present their capabilities as unmitigated triumphs. Antiproton's documentation takes the opposite stance: **we measure whether a feature actually earns its place, and state plainly when it does not.**
+
+On paper, `run_js` is an elegant capability. In our production benchmark measurements, however:
+- Across all three SWE-bench Verified instances (53 tool calls in-process, 49 on-object), `run_js` was used **zero times** (`README.md:516-522`).
+- On τ²-bench retail, it went unused across **24 trials**.
+- As recorded in `README.md:519`: *"This task is shell work inside a container, and the sandbox earns its place by replacing several calls with one; neither benchmark is the shape that tests it, and the sandbox is not yet shown to pay on this substrate."*
+
+An architectural capability that does not yet pay under real benchmarks is reported as unproven, not celebrated as a breakthrough. That discipline is the difference between marketing and engineering.
+
+---
+
+## 5. Context Compaction as a Lossless Function
 
 Long-running investigations inevitably exceed context windows. Naive architectures truncate old messages, throwing away hard-earned discoveries and forcing the agent to repeat work.
 
@@ -83,7 +121,7 @@ When context budgets approach thresholds:
 
 ---
 
-## 5. Our Engineering Methodology: Four Hard-Earned Invariants
+## 6. Our Engineering Methodology: Four Hard-Earned Invariants
 
 The technical architecture is only half the story. The way Antiproton was built and verified reflects a disciplined philosophy regarding evidence, truth, and software verification. Over intensive engineering cycles, we established four non-negotiable principles:
 
