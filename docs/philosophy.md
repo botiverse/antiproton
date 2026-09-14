@@ -88,13 +88,18 @@ The underlying storage schema was built from day one to support an open ecosyste
 - Capabilities are decoupled: capability providers publish plugins, while operators configure separate policies and credentials per alias.
 - What remains unbuilt is dynamic runtime installation: plugins are currently registered at build time in `cf/src/runtime.ts` (`README.md:622-626`). We state this limitation explicitly rather than pretending dynamic runtime loading exists.
 
-### Programmable Structured Tools: Moving Logic into the Sandbox (`run_js`)
-Standard tool calling forces an LLM into an inefficient conversational loop: call an API, wait 5 seconds, receive raw JSON into context, decide the next call, and repeat. For data filtering, pagination, or multi-step calculations, this turns routine computation into exorbitant token and wall-clock expense.
+### Programmable Structured Tools: Why Agents Don't Like Bash
 
-Antiproton introduces **Programmable Structured Tools** via **`run_js`**:
-- **Hermetic Execution:** `run_js` evaluates JavaScript inside an isolated sandbox (QuickJS or Cloudflare Dynamic Workers) with zero ambient network access (`globalOutbound: null`), no filesystem, and no ambient `process` or `fetch`.
-- **The Tool Bridge as Sole Egress:** Sandboxed code reaches the world exclusively by invoking registered tools through an injected host bridge. Those calls re-enter the `ToolGateway`, where they are subjected to the exact same mount policies, authorization gates, and audit trails as direct model tool calls.
-- **Code-as-Orchestrator:** Rather than consuming 10 separate model turns to fetch, paginate, and filter a 500-item list, the model can generate a concise script that loops, joins, and aggregates data directly inside the sandbox, returning only the compact, structured answer.
+Most agent architectures default to handing the model an unconstrained bash terminal over a POSIX filesystem. The industry rationalizes this by arguing that bash is universal. But the truth is simpler: **agents don't like bash, just like human developers don't like writing complex bash.**
+
+Bash's primary historic virtue was physical keyboard ergonomics for human typists: spaces are easier to strike than parentheses, and single-line commands chain piping primitives with minimal typing. But non-trivial, multi-line bash scripts are notoriously difficult to write, reason about, and debug. While post-training and RL fine-tuning often inject synthetic multi-line bash scripts to force CLI competence, this fights the model's natural strengths. LLMs are trained on vastly richer, cleaner, and more expressive corpora in modern structured languages—overwhelmingly **JavaScript and TypeScript**.
+
+This explains why Antiproton explicitly rejected architectures based on "just a bash shell over a POSIX filesystem on top of shared storage":
+
+1. **Structured Types Over Brittle Text Streams:** When an agent composes tools, paginates endpoints, transforms nested objects, or catches errors, it writes structured JavaScript. It manipulates real data structures (arrays, objects, maps, JSON) and benefits from standard control flow and typed exception handling, rather than brittle string munging with `grep`, `awk`, `sed`, subshells, and escaping-heavy shell interpolations.
+2. **Preserving the Sandboxing Invariant:** A shared POSIX filesystem with bash requires granting the sandbox ambient filesystem and network access—the exact two capabilities Antiproton strictly eliminates (`README.md:89`). Antiproton's architectural stance is uncompromising: *"A container is a mount, not a loophole. Work that genuinely needs a real machine gets one... rather than by loosening the sandbox"* (`README.md:98`).
+3. **Hermetic Execution with a Single Exit:** `run_js` evaluates JavaScript inside an isolated sandbox (QuickJS or Cloudflare Dynamic Workers) with zero ambient network access (`globalOutbound: null`), no filesystem, and no ambient `process` or `fetch`. Code in the sandbox interacts with external systems exclusively through an injected host tool bridge. Those calls re-enter the `ToolGateway`, where they are subjected to the exact same mount policies, authorization gates, and audit trails as direct model tool calls.
+4. **Code-as-Orchestrator:** Rather than consuming 10 separate conversational round trips across the network—or struggling with fragile shell scripts—the model writes a concise, idiomatic JavaScript snippet that orchestrates tools locally in the sandbox, returning only the compact, structured answer.
 
 ### The Measure of Honesty: When a Feature Does Not Yet Pay
 Most technical manifestos present their capabilities as unmitigated triumphs. Antiproton's documentation takes the opposite stance: **we measure whether a feature actually earns its place, and state plainly when it does not.**
