@@ -63,13 +63,22 @@ export function keyForRef(ref: string, caller: RefOwner): string | null {
 }
 
 /**
- * Text as its owner may be shown it: every raw reference into that owner's
- * scope rewritten to the shown form. For what was written before references
- * changed shape — a transcript's stored tool results, an answer that quoted
- * one — and is read back to a person or a model now.
+ * Text as its owner may be shown it: every reference into that owner's scope
+ * rewritten to the shown form. For what was written before references changed
+ * shape — a transcript's stored tool results, an answer that quoted one — and
+ * is read back to a person or a model now.
+ *
+ * Both spellings are rewritten: the raw reference, and the bare key an older
+ * "no such artifact: t/<tenant>/<agent>/…" error echoed, which the model then
+ * quoted in its answers (64c275a probe, 2026-09-14: 7 such keys on one agent,
+ * every raw reference already masked). The key must start where a path can
+ * start, so `…/t/<tenant>/<agent>/` inside some longer path is not taken for
+ * one, and the trailing slash keeps agent `u-me` from matching `u-me2`.
  */
 export function maskRawRefs(text: string, owner: RefOwner): string {
   const esc = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`r2://[A-Za-z0-9._-]+/t/${esc(owner.tenantId)}/${esc(owner.agentId)}/`, "g");
-  return String(text).replace(re, AGENT_REF);
+  const scope = `t/${esc(owner.tenantId)}/${esc(owner.agentId)}/`;
+  const raw = new RegExp(`r2://[A-Za-z0-9._-]+/${scope}`, "g");
+  const bare = new RegExp(`(^|[^A-Za-z0-9._/-])${scope}`, "g");
+  return String(text).replace(raw, AGENT_REF).replace(bare, `$1${AGENT_REF}`);
 }
