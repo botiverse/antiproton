@@ -69,7 +69,7 @@ Consider the standard approach to sandbox networking: an environment is granted 
 
 Antiproton starts from **absolute zero and builds through addition**:
 - The execution sandbox (QuickJS or Cloudflare Dynamic Workers) initializes with `globalOutbound: null`—no sockets, no DNS resolver, no HTTP stack, and no access to the open Internet. There are no firewall filters to bypass because network capability does not exist in the isolate.
-- Capability is added explicitly via mounts: to reach external endpoints, the developer mounts an audited plugin (such as `http` with an explicit `allowedHosts` whitelist). Egress is not "permitted despite a block"; it is an explicit, typed, and auditable tool bridge synthesized from scratch.
+- Capability is added explicitly via mounts: to reach external endpoints, the developer mounts an audited plugin. Through `http`, the operator configures `allowedHosts` explicitly—omit it and public hosts are reachable; set it (even to an empty list) and only those specific hosts are permitted, with no wildcard allowances (`src/plugins/http.ts:16`, `requiredWithCredential: true`). Egress is not "permitted despite a block"; it is an explicit, typed, and auditable tool bridge synthesized from scratch.
 
 ### The Zero-Trust Credential Gate
 Most agent systems inject API keys, database passwords, and OAuth tokens directly into prompt strings or tool result payloads. This turns every prompt injection attack into an exfiltration vector. If a model can read a token, a malicious instruction can trick the model into leaking it.
