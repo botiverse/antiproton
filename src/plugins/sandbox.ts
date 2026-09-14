@@ -687,9 +687,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     {
       name: "start_from",
       summary:
-        "Begin from an environment kept earlier instead of a bare image. Releases the current " +
-        "container if there is one; the next run or shell starts from the snapshot. Call with no " +
-        "name to see what has been kept. Setting up a machine is usually the slowest and most " +
+        "Begin from an environment kept earlier instead of a bare image. Naming one releases the " +
+        "current container if there is one; the next run or shell starts from the snapshot. Call " +
+        "with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most " +
         "expensive part of using one, and this is how you stop paying for it twice.",
       parameters: {
         type: "object",
@@ -895,9 +895,17 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       const envs = prior?.envs ?? [];
       const want = String((args as any)?.name ?? "");
       if (!want) {
+        // `released: false` because the summary promised a release and this
+        // call is the one that does not perform it — a model reading
+        // `{kept: [], note}` alone cannot tell whether its container was just
+        // taken away (Vera, 2026-09-14). Every ending of this tool now says so
+        // outright rather than leaving it to be inferred from what is missing.
         return {
           kept: envs.map((e) => ({ name: e.name, note: e.note, savedAt: e.savedAt })),
-          note: envs.length ? "pass one of these as name" : "nothing kept yet; `keep` saves one",
+          released: false,
+          note: envs.length
+            ? "this only lists; pass one of these as name to start from it"
+            : "this only lists; nothing kept yet, and `keep` saves one",
         };
       }
       const env = envs.find((e) => e.name === want);
@@ -910,6 +918,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
         startFrom: env.snapId } as unknown as Json);
       return {
         startingFrom: env.name, note: "the next run or shell starts from this environment",
+        released: !!released,
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
@@ -1156,8 +1165,26 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       throw new Error(`unknown tool: ${tool}`);
     }
 
+    // Started on run9's *background* route, not the plain one, because that is
+    // the only kind of execution run9 will kill: `POST /execs/{id}/kill` on an
+    // execution created here answers 400 `exec is not background mode`, and the
+    // command runs to completion regardless. Measured on a box of our own
+    // (Piper, 2026-09-14): a foreground `sleep 45 && echo … > /tmp/fg-probe`
+    // was killed, answered 400, finished `succeeded` and wrote its file; the
+    // same command started here was killed with 200, went to `cancelled
+    // (explicit_cancel)`, and its file never appeared. That is the whole of the
+    // defect Vera reproduced — a job refused by the cap kept running, unlisted
+    // and uncancellable — and it also means the pre-#16 "exceeded timeoutMs and
+    // was killed" path never killed anything.
+    //
+    // `background` here is run9's word for "the caller is not attached", not
+    // ours: the mount hands *every* command to this route, and whether the
+    // agent waits for it is decided below by the grace window. The record comes
+    // back in the same shape either way — state, exit_code, output_summary —
+    // which is what lets `finished` stay one function (checked live: exit 3 and
+    // both streams came back identically).
     const started = await api(
-      "POST", `/projects/${cfg.project}/workspace/boxes/${state.boxId}/execs`,
+      "POST", `/projects/${cfg.project}/workspace/boxes/${state.boxId}/background-execs`,
       { command: execArgv(cfg, command) },
     );
     const execId = started.exec_id as string;
@@ -1207,13 +1234,50 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     return { done: true, result: finished(rec, cfg, state, ctx.alias) as Json };
   },
 
-  /** Stop it and stop paying for it. */
+  /**
+   * Stop it and stop paying for it — and say so when it did not stop.
+   *
+   * The `.catch(() => {})` that used to be here decided, inside the plugin,
+   * that a failed kill did not matter. It did: with three jobs running, a
+   * refused fourth was cancelled through this path, the kill did not take, and
+   * the command ran to completion in the container — with no job id, so
+   * nothing could list it or cancel it (Vera, 2026-09-14). Both layers
+   * swallowed the failure, so our ledger and the container were free to differ
+   * with nobody able to notice.
+   *
+   * So: kill, then *confirm*. "I sent a kill" is our record; "the process is
+   * gone" is the fact, and the bill follows the fact. Returning means the
+   * execution is in a state that will not change again; anything else throws,
+   * and the caller — which owns the ledger — decides what to record and
+   * whether to ask again (cody, 2026-09-14: no retry loop here, because the
+   * runtime is what keeps a refused job tracked and calls back at its ceiling).
+   */
   async cancelBackground(handle, ctx) {
     const cfg = cfgOf(ctx);
     const h = handle as { execId?: string };
     if (!h?.execId) return;
     const api = apiFor(cfg, ctx);
-    await api("POST", `/projects/${cfg.project}/workspace/execs/${h.execId}/kill`).catch(() => {});
+    const path = `/projects/${cfg.project}/workspace/execs/${h.execId}`;
+    let why: string;
+    try {
+      await api("POST", `${path}/kill`);
+      why = "kill accepted but the execution kept running";
+    } catch (e) {
+      why = e instanceof Error ? e.message : String(e);
+    }
+    // The kill's own answer is not the evidence either way: a refusal may mean
+    // only that the execution had already ended, and an acceptance does not
+    // make it stop. Its state is the single authority, so it is asked whether
+    // the kill succeeded or failed.
+    let state: string | null = null;
+    try {
+      state = String((await api("GET", path)).state);
+    } catch (e) {
+      why += `; state unreadable: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    if (state !== null && TERMINAL.includes(state)) return;
+    if (state !== null) why += `; state ${state}`;
+    throw new Error(`exec ${h.execId} did not stop: ${why}`);
   },
 
   };
