@@ -2423,6 +2423,7 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   }
   const deps: AgentsApiDeps = {
     now: () => Date.now(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     mintAgentId: () => mintAgentId(ownerAgentId),
     mintSessionId,
     index: {

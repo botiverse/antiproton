@@ -11,11 +11,15 @@ import {
   toOpenAIAgent, toOpenAISession, type StoredAgent, type StoredSession,
 } from "./shapes.ts";
 import { sessionTranscript } from "./transcript.ts";
+import { pumpSessionEvents, type Snapshot } from "./events.ts";
 
 export type SessionStatus = "idle" | "in_progress" | "requires_action" | "failed";
 
 export interface AgentsApiDeps {
   now(): number;
+  sleep(ms: number): Promise<void>;
+  /** How long one event stream may stay open (events.ts STREAM_MAX_MS when unset). */
+  streamMaxMs?: number;
   mintAgentId(): string;
   mintSessionId(): string;
   index: {
@@ -75,6 +79,36 @@ async function sessionObject(deps: AgentsApiDeps, s: StoredSession) {
 }
 
 /**
+ * An SSE response for the session's events from now on. The Worker holds it and
+ * reads the agent's object in short calls (events.ts); `thenStart` runs after the
+ * baseline is read, so a turn it starts is streamed rather than counted as history.
+ */
+async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: () => Promise<void>): Promise<Response> {
+  const agent = await deps.index.getAgent(s.agentId);
+  if (!agent) return notFound("agent", s.agentId);
+  const read = async (): Promise<Snapshot> => {
+    const t = await deps.agents.transcript(s.agentId, s.id);
+    return { ...sessionTranscript(t, { sessionId: s.id, agentId: s.agentId }), status: t.running ? "in_progress" : "idle" };
+  };
+  const baseline = await read();
+  if (thenStart) await thenStart();
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const prefix = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+  let n = 0;
+  void pumpSessionEvents({
+    baseline, read, sessionId: s.id, sleep: deps.sleep, now: deps.now, maxMs: deps.streamMaxMs,
+    write: (text) => writer.write(encoder.encode(text)),
+    sessionWith: (status) => toOpenAISession(s, agent, { status }) as unknown as Record<string, unknown>,
+    eventId: () => `evt_${prefix}_${++n}`,
+  }).finally(() => writer.close().catch(() => {}));
+  return new Response(readable, {
+    headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-accel-buffering": "no" },
+  });
+}
+
+/**
  * One request under `/v1`. `path` is what follows `/v1` (e.g. `/agents/sessions/sess_1`).
  * Returns null for a path this API does not own, so the caller can fall through.
  */
@@ -89,7 +123,6 @@ export async function handleAgentsApi(
   if (seg[1] === "sessions") {
     if (seg.length === 2 && method === "POST") {
       if (!isObj(body)) return openAIError(400, "the request body must be a JSON object", { param: "body", code: "invalid_value" });
-      if (body.stream === true) return openAIError(400, "stream: streaming session events is not supported by this deployment yet", { param: "stream", code: "unsupported_parameter" });
       if (Array.isArray(body.vault_ids) && body.vault_ids.length) return openAIError(400, "vault_ids: vaults are not supported by this deployment", { param: "vault_ids", code: "unsupported_parameter" });
       const env = parseEnvironment(body.environment);
       if (!env.ok) return refuse(env);
@@ -117,7 +150,11 @@ export async function handleAgentsApi(
       };
       await deps.agents.openSession(agentId, session.id);
       await deps.index.putSession(session);
-      if (text.text) await deps.agents.postInput(agentId, session.id, text.text);
+      const input = text.text;
+      if (body.stream === true) {
+        return eventStream(deps, session, input ? () => deps.agents.postInput(agentId, session.id, input) : undefined);
+      }
+      if (input) await deps.agents.postInput(agentId, session.id, input);
       return ok(await sessionObject(deps, session));
     }
     if (seg.length === 2 && method === "GET") {
@@ -127,6 +164,30 @@ export async function handleAgentsApi(
       const data = [];
       for (const s of page.page.data) { const o = await sessionObject(deps, s); if (o) data.push(o); }
       return ok({ ...page.page, data });
+    }
+    if (seg[3] === "events" && seg.length === 4) {
+      const s = await deps.index.getSession(seg[2]!);
+      if (!s) return notFound("session", seg[2]!);
+      if (method === "GET") return eventStream(deps, s);
+      if (method === "POST") {
+        if (!isObj(body) || !Array.isArray(body.events) || !body.events.length) {
+          return openAIError(400, "events must be a non-empty array", { param: "events", code: "invalid_value" });
+        }
+        // Every event is checked before any is acted on, so a refused batch changes nothing.
+        const texts: string[] = [];
+        for (const [i, e] of body.events.entries()) {
+          if (!isObj(e)) return openAIError(400, "each event must be an object", { param: `events[${i}]`, code: "invalid_value" });
+          if (e.type !== "agent.session.input.message") {
+            return openAIError(400, `events[${i}].type: ${JSON.stringify(e.type)} is not supported by this deployment yet`, { param: `events[${i}].type`, code: "unsupported_parameter" });
+          }
+          const t = inputText(e.input);
+          if (!t.ok) return refuse({ ...t, param: `events[${i}].${t.param}` });
+          if (!t.text) return openAIError(400, "input must not be empty", { param: `events[${i}].input`, code: "invalid_value" });
+          texts.push(t.text);
+        }
+        for (const text of texts) await deps.agents.postInput(s.agentId, s.id, text);
+        return new Response(null, { status: 204 });
+      }
     }
     if ((seg[3] === "items" || seg[3] === "turns") && method === "GET") {
       const s = await deps.index.getSession(seg[2]!);

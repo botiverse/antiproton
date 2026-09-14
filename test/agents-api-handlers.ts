@@ -18,6 +18,9 @@ function fakeDeps() {
   const log = { adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
   const deps: AgentsApiDeps = {
     now: () => (t += 1000),
+    // A macrotask, so input posted by another request lands between two reads of the stream.
+    sleep: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    streamMaxMs: 60_000,
     mintAgentId: () => `agent_${++n}`,
     mintSessionId: () => `sess_${++n}`,
     index: {
@@ -96,7 +99,6 @@ await check("what is not supported yet is refused by name, and unknown or not-ow
   const { deps } = fakeDeps();
   await call(deps, "POST", "/agents", { model: "m" });
   const cases: Array<[unknown, string]> = [
-    [{ agent_id: "agent_1", environment: { type: "openai_hosted" }, stream: true }, "stream"],
     [{ agent_id: "agent_1", environment: { type: "openai_hosted" }, vault_ids: ["v1"] }, "vault_ids"],
     [{ agent_id: "agent_1", environment: { type: "openai_hosted", packages: { npm: ["zod"] } } }, "environment.packages"],
     [{ agent_id: "agent_1", environment: { type: "openai_hosted" }, input: [{ role: "user", content: [{ type: "input_image", image_url: "x" }] }] }, "input[0].content[0].type"],
@@ -118,6 +120,51 @@ await check("input text: strings and input_text parts joined; other parts refuse
   const t: any = inputText([{ role: "user", content: [{ type: "input_text", text: "a" }, { type: "input_text", text: "b" }] }, { role: "user", content: "c" }]);
   assert(t.ok && t.text === "a\n\nb\n\nc", `joined: ${JSON.stringify(t)}`);
   assert((inputText(undefined) as any).text === null, "absent input is not empty");
+});
+
+/** The event types in an SSE body, keepalives skipped. */
+const frames = (text: string) => text.split("\n\n").filter((f) => f.startsWith("event: ")).map((f) => JSON.parse(f.split("\n")[1]!.slice("data: ".length)));
+
+await check("events: GET streams from now on; POST input starts a turn it reports through idle; create with stream does both", async () => {
+  const { deps, log } = fakeDeps();
+  let entries: unknown[] = [
+    { type: "message", seq: 1, timestamp: 1_000, message: { role: "user", content: "old" } },
+    { type: "message", seq: 2, timestamp: 2_000, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "old answer" }] } },
+  ];
+  deps.agents.transcript = async () => ({ entries, running: false });
+  deps.agents.postInput = async (_a, s, text) => {
+    log.inputs.push({ session: s, text });
+    const seq = entries.length;
+    entries = [...entries,
+      { type: "message", seq: seq + 1, timestamp: 3_000, message: { role: "user", content: text } },
+      { type: "message", seq: seq + 2, timestamp: 4_000, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `re: ${text}` }] } }];
+  };
+  await call(deps, "POST", "/agents", { model: "m", name: "a" });
+  const sess = (await call(deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" } })).body;
+
+  const stream = (await handleAgentsApi("GET", `/agents/sessions/${sess.id}/events`, new URLSearchParams(), undefined, deps))!;
+  assert(stream.status === 200 && /^text\/event-stream/.test(stream.headers.get("content-type") ?? ""), `stream: ${stream.status} ${stream.headers.get("content-type")}`);
+  const posted = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
+    { events: [{ type: "agent.session.input.message", input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }] }] }, deps))!;
+  assert(posted.status === 204 && log.inputs.at(-1)?.text === "hello", `post: ${posted.status} ${JSON.stringify(log.inputs)}`);
+  const got = frames(await stream.text());
+  const types = got.map((e) => e.type);
+  assert(!got.some((e) => JSON.stringify(e).includes("old answer")), "history was replayed");
+  assert(types.includes("agent.session.turn.created") && types.includes("agent.session.turn.completed") && types.at(-1) === "agent.session.idle",
+    `types: ${types}`);
+  assert(got.find((e) => e.type === "agent.session.turn.output_text.done")?.text === "re: hello", "the answer text");
+
+  const refused = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
+    { events: [{ type: "agent.session.input.message", input: "a" }, { type: "agent.session.input.cancel" }] }, deps))!;
+  const body = await refused.json() as any;
+  assert(refused.status === 400 && body.error.param === "events[1].type" && log.inputs.length === 1, `a refused batch: ${refused.status} ${JSON.stringify(body)} inputs ${log.inputs.length}`);
+
+  const created = (await handleAgentsApi("POST", "/agents/sessions", new URLSearchParams(),
+    { agent_id: "agent_1", environment: { type: "none" }, input: "again", stream: true }, deps))!;
+  assert(/^text\/event-stream/.test(created.headers.get("content-type") ?? ""), "create with stream did not stream");
+  const createdTypes = frames(await created.text()).map((e) => e.type);
+  assert(log.inputs.at(-1)?.text === "again" && createdTypes.includes("agent.session.turn.completed") && createdTypes.at(-1) === "agent.session.idle",
+    `create stream: ${createdTypes}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
