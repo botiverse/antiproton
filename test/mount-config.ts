@@ -739,6 +739,58 @@ await check("an accepted quiet request records when to ask again, and leaves the
 });
 
 /**
+ * Every ending of `start_from` says whether the container was released.
+ *
+ * The tool's summary used to promise a release without conditions, while the
+ * call that only lists what is kept performs none — so a model reading
+ * `{kept: [], note}` could not tell whether its container had just been taken
+ * away (Vera, 2026-09-14). The field exists precisely so that nobody has to
+ * infer it, which is a property worth a case of its own: removed, the plugin
+ * still passes everything else (Vera checked, and it did).
+ */
+await check("start_from 的每一个结局都直说【释放了没有】,而且只列出的那次什么也不释放", async () => {
+  const calls: string[] = [];
+  const kept = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    calls.push(`${init?.method ?? "GET"} ${String(url)}`);
+    return new Response("{}");
+  }) as any;
+  let saved: any = null;
+  const ctx = (state: unknown): any => ({
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
+    credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
+    connection: { get: async () => state, set: async (v: unknown) => { saved = v; } },
+    sibling: async () => null,
+  });
+  const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 1,
+    envs: [{ name: "ready", snapId: "s-1", savedAt: 5 }] };
+  try {
+    const listed: any = await run9.invoke("start_from", {} as any, ctx(live));
+    if (listed.released !== false) {
+      throw new Error(`listing what is kept did not say it released nothing: ${JSON.stringify(listed)}`);
+    }
+    if (calls.length) throw new Error(`listing what is kept called run9: ${JSON.stringify(calls)}`);
+    if (saved) throw new Error("listing what is kept wrote connection state");
+
+    const chosen: any = await run9.invoke("start_from", { name: "ready" } as any, ctx(live));
+    if (chosen.released !== true || chosen.releasedPrevious !== "b-1") {
+      throw new Error(`naming one released the old container without saying so: ${JSON.stringify(chosen)}`);
+    }
+    // Nothing was running, so nothing was let go — and that ending has to say
+    // so too, or `released` would only ever appear when it is true, which is
+    // the inference the field exists to remove.
+    saved = null;
+    const empty: any = await run9.invoke("start_from", { name: "ready" } as any,
+      ctx({ boxId: "", createdAt: 0, lastUsedAt: 0, envs: live.envs }));
+    if (empty.released !== false) {
+      throw new Error(`choosing an environment with no container running answered ${JSON.stringify(empty)}`);
+    }
+  } finally {
+    globalThis.fetch = kept;
+  }
+});
+
+/**
  * The three places that tell the model how the box ends must end it the same way.
  *
  * `run` and `shell` describe the container before it exists; the per-execution
