@@ -4,7 +4,7 @@
  */
 import {
   admitBackground, BACKGROUND_CAP, BACKGROUND_MAX_MS, completionMessage, dueBackgroundJobs, finishBackgroundJob, markPolled,
-  mountsWithRunningJobs, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runningBackgroundJobs, startedResult,
+  jobsTool, mountsWithRunningJobs, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
 } from "../src/runtime/background-jobs.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -16,7 +16,7 @@ async function check(name: string, fn: () => Promise<void>) {
 function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 
 const now = 1_800_000_000_000;
-const job = (id: string, secs = 10) => ({ id, mount: "node", tool: "shell", createdAt: now - secs * 1000 });
+const job = (id: string, secs = 10) => ({ id, mount: "node", tool: "node__shell", createdAt: now - secs * 1000 });
 const me = { tenantId: "t-me", agentId: "u-me" };
 
 await check("up to the cap is admitted; the next is refused and told what is running", async () => {
@@ -47,7 +47,8 @@ await check("the agent is told at once that it may keep working, and how to see 
 
 await check("the completion message names the job and carries the result or the error", async () => {
   const done = completionMessage(job("j1", 130), { state: "done", result: { exitCode: 0, output: "ok" } }, now);
-  assert(done.includes("j1") && done.includes("node.shell") && done.includes("130s"), `header incomplete: ${done}`);
+  assert(done.includes("j1") && done.includes("node__shell") && done.includes("130s"), `header incomplete: ${done}`);
+  assert(!done.includes("node.shell"), `the message names a dispatch address: ${done}`);
   assert(done.includes('"exitCode":0'), `result missing: ${done}`);
   const failed = completionMessage(job("j2"), { state: "failed", error: "box gone" }, now);
   assert(failed.includes("failed") && failed.includes("box gone"), `error missing: ${failed}`);
@@ -113,6 +114,75 @@ await check("a job past the ceiling is overdue; one inside it is not", async () 
   assert(BACKGROUND_MAX_MS === 30 * 60_000, `ceiling ${BACKGROUND_MAX_MS}`);
   assert(!overdueBackground({ createdAt: now - BACKGROUND_MAX_MS }, now), "exactly at the ceiling counted as overdue");
   assert(overdueBackground({ createdAt: now - BACKGROUND_MAX_MS - 1 }, now), "past the ceiling did not count as overdue");
+});
+
+function fakes() {
+  const log = { completed: [] as string[], delivered: [] as Array<{ session: string; text: string }>, cancelled: [] as string[] };
+  return {
+    log,
+    completeOperation: async (id: string, status: string) => { log.completed.push(`${id}:${status}`); },
+    deliver: async (session: string, text: string) => { log.delivered.push({ session, text }); },
+    cancel: async (j: { id: string }) => { log.cancelled.push(j.id); },
+  };
+}
+
+await check("a pass finishes a done job: operation succeeded, result delivered to its session, nothing left to wake for", async () => {
+  const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
+  try {
+    recordBackgroundJob(sql, me, { id: "op1", session: "s2", mount: "node", tool: "node__shell", handle: { execId: "e1" } }, now);
+    const r = await runBackgroundPass({ sql, owner: me, now: now + 2_000, ...f,
+      poll: async () => ({ done: true as const, result: { exitCode: 0, output: "all green" } }) });
+    assert(r.finished.join() === "op1", `finished: ${r.finished}`);
+    assert(f.log.completed.join() === "op1:succeeded", `operation: ${f.log.completed}`);
+    assert(f.log.delivered.length === 1 && f.log.delivered[0]!.session === "s2", `delivered to ${JSON.stringify(f.log.delivered)}`);
+    assert(f.log.delivered[0]!.text.includes("all green"), `the result is not in the message: ${f.log.delivered[0]!.text}`);
+    assert(runningBackgroundJobs(sql, me).length === 0 && r.wakeInMs === null, "a finished job still runs or wakes");
+  } finally { host.dispose(); }
+});
+
+await check("a pass leaves an unfinished or unreachable job running and checks it later", async () => {
+  const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
+  try {
+    recordBackgroundJob(sql, me, { id: "op1", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
+    recordBackgroundJob(sql, me, { id: "op2", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
+    const r = await runBackgroundPass({ sql, owner: me, now: now + 2_000, ...f,
+      poll: async (j) => { if (j.id === "op2") throw new Error("run9 502"); return { done: false as const }; } });
+    assert(r.checked === 2 && r.finished.length === 0, `checked ${r.checked}, finished ${r.finished}`);
+    assert(f.log.delivered.length === 0 && f.log.completed.length === 0, "an unfinished job was delivered or completed");
+    assert(runningBackgroundJobs(sql, me).length === 2, "a job stopped running without an answer");
+    assert(r.wakeInMs === nextPollDelay(1), `next wake ${r.wakeInMs}, expected ${nextPollDelay(1)}`);
+  } finally { host.dispose(); }
+});
+
+await check("a job past the ceiling is cancelled and failed, even when the plugin cannot stop it", async () => {
+  const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
+  try {
+    recordBackgroundJob(sql, me, { id: "op1", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
+    const later = now + BACKGROUND_MAX_MS + 60_000;
+    const r = await runBackgroundPass({ sql, owner: me, now: later, ...f,
+      poll: async () => ({ done: false as const }),
+      cancel: async () => { f.log.cancelled.push("tried"); throw new Error("box gone"); } });
+    assert(f.log.cancelled.join() === "tried", "the plugin was not asked to stop the job");
+    assert(r.finished.join() === "op1" && f.log.completed.join() === "op1:failed", `finished ${r.finished}, op ${f.log.completed}`);
+    assert(/longer than 30 minutes/.test(f.log.delivered[0]?.text ?? ""), `the agent was not told why: ${f.log.delivered[0]?.text}`);
+  } finally { host.dispose(); }
+});
+
+await check("the jobs tool lists running work by offered name, and cancels one by id", async () => {
+  const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
+  try {
+    recordBackgroundJob(sql, me, { id: "op1", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
+    const t = jobsTool({ sql, owner: me, cancel: f.cancel, completeOperation: f.completeOperation, now: () => now + 42_000 });
+    const listed = JSON.parse((await t.execute("c1", { action: "list" })).content[0]!.text);
+    assert(listed.running[0]?.job === "op1" && listed.running[0]?.tool === "node__shell" && listed.running[0]?.runningSeconds === 42,
+      `list: ${JSON.stringify(listed)}`);
+    let msg = "";
+    try { await t.execute("c2", { action: "cancel", job: "nope" }); } catch (e) { msg = String((e as Error).message); }
+    assert(/no running job/.test(msg), `cancelling an unknown job did not say so: ${msg}`);
+    await t.execute("c3", { action: "cancel", job: "op1" });
+    assert(f.log.cancelled.join() === "op1" && f.log.completed.join() === "op1:cancelled", `cancel: ${JSON.stringify(f.log)}`);
+    assert(runningBackgroundJobs(sql, me).length === 0, "a cancelled job still runs");
+  } finally { host.dispose(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
