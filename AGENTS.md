@@ -106,8 +106,10 @@ shows this changed the behaviour, and which assertion reddens if the guard break
 ## Which document is authoritative
 
 [`README.md`](README.md) describes the system as it is; its numbers are measured
-and it is the only doc kept in step with the code. Everything else is history or
+and it is kept in step with the code. Everything else is history or
 reference:
+
+- The live `build` (`curl -s https://antiproton.ai/ui/whoami | jq .build`) answers *what is running*; the `master` HEAD answers *where the code is*. They are expected to differ. Read **what the commits between them changed**, not the numbers: a delta containing only `*.md` needs no deployment, and using a live build to check a code feature reads a deployed feature as absent when a doc commit has moved the head.
 
 - [`docs/philosophy.md`](docs/philosophy.md) — the engineering philosophy, architectural rationale, and verification principles.
 - [`docs/pi-upstream.md`](docs/pi-upstream.md) — how to stay in sync with pi.
