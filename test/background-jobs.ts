@@ -3,8 +3,8 @@
  * how often they are checked, and what the agent is told at start and end.
  */
 import {
-  admitBackground, BACKGROUND_CAP, BACKGROUND_MAX_MS, completionMessage, dueBackgroundJobs, finishBackgroundJob, markPolled,
-  jobsTool, mountsWithRunningJobs, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
+  admitBackground, BACKGROUND_CAP, BACKGROUND_MAX_MS, BACKGROUND_STOP_GRACE_MS, completionMessage, dueBackgroundJobs, finishBackgroundJob, markPolled,
+  jobsTool, mountsWithRunningJobs, refuseOverCap, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
 } from "../src/runtime/background-jobs.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -154,17 +154,35 @@ await check("a pass leaves an unfinished or unreachable job running and checks i
   } finally { host.dispose(); }
 });
 
-await check("a job past the ceiling is cancelled and failed, even when the plugin cannot stop it", async () => {
+await check("a job past the ceiling that cannot be stopped stays tracked and is retried, then is failed as possibly still running", async () => {
   const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
   try {
     recordBackgroundJob(sql, me, { id: "op1", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
-    const later = now + BACKGROUND_MAX_MS + 60_000;
-    const r = await runBackgroundPass({ sql, owner: me, now: later, ...f,
+    const deps = { sql, owner: me, ...f,
       poll: async () => ({ done: false as const }),
-      cancel: async () => { f.log.cancelled.push("tried"); throw new Error("box gone"); } });
-    assert(f.log.cancelled.join() === "tried", "the plugin was not asked to stop the job");
+      cancel: async () => { f.log.cancelled.push("tried"); throw new Error("exec e1 did not stop: state running"); } };
+    const first = await runBackgroundPass({ ...deps, now: now + BACKGROUND_MAX_MS + 60_000 });
+    assert(f.log.cancelled.length === 1, "the plugin was not asked to stop the job");
+    assert(first.finished.length === 0 && f.log.completed.length === 0 && f.log.delivered.length === 0,
+      `a job that could not be stopped was dropped: finished ${first.finished}, op ${f.log.completed}`);
+    assert(runningBackgroundJobs(sql, me).some((j) => j.id === "op1"), "a job that could not be stopped is no longer tracked");
+    const last = await runBackgroundPass({ ...deps, now: now + BACKGROUND_MAX_MS + BACKGROUND_STOP_GRACE_MS + 60_000 });
+    assert(f.log.cancelled.length === 2, `the cancel was not asked again: ${f.log.cancelled.length}`);
+    assert(last.finished.join() === "op1" && f.log.completed.join() === "op1:failed", `finished ${last.finished}, op ${f.log.completed}`);
+    const text = f.log.delivered[0]?.text ?? "";
+    assert(/longer than 30 minutes/.test(text) && /could not be stopped/.test(text) && /may still be running/.test(text),
+      `the agent was not told the job may still be running: ${text}`);
+  } finally { host.dispose(); }
+});
+
+await check("a job past the ceiling that stops is failed as cancelled", async () => {
+  const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
+  try {
+    recordBackgroundJob(sql, me, { id: "op1", session: "main", mount: "node", tool: "node__shell", handle: {} }, now);
+    const r = await runBackgroundPass({ sql, owner: me, now: now + BACKGROUND_MAX_MS + 60_000, ...f,
+      poll: async () => ({ done: false as const }) });
     assert(r.finished.join() === "op1" && f.log.completed.join() === "op1:failed", `finished ${r.finished}, op ${f.log.completed}`);
-    assert(/longer than 30 minutes/.test(f.log.delivered[0]?.text ?? ""), `the agent was not told why: ${f.log.delivered[0]?.text}`);
+    assert(/and was cancelled/.test(f.log.delivered[0]?.text ?? ""), `message: ${f.log.delivered[0]?.text}`);
   } finally { host.dispose(); }
 });
 
@@ -182,6 +200,32 @@ await check("the jobs tool lists running work by offered name, and cancels one b
     await t.execute("c3", { action: "cancel", job: "op1" });
     assert(f.log.cancelled.join() === "op1" && f.log.completed.join() === "op1:cancelled", `cancel: ${JSON.stringify(f.log)}`);
     assert(runningBackgroundJobs(sql, me).length === 0, "a cancelled job still runs");
+  } finally { host.dispose(); }
+});
+
+await check("a call over the cap is recorded before it is stopped, so it can never run unseen", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    for (const id of ["j1", "j2", "j3"]) recordBackgroundJob(sql, me, { id, session: "main", mount: "sandbox", tool: "sandbox__shell", handle: {} }, now);
+    const running = runningBackgroundJobs(sql, me);
+    let cancelled = false;
+    const r = await refuseOverCap({ sql, owner: me, running, now, cancel: async () => { cancelled = true; },
+      job: { id: "j4", session: "main", mount: "sandbox", tool: "sandbox__shell", handle: { execId: "e4" } } });
+    assert(cancelled && r.stopRequested, "the plugin was not asked to stop the job");
+    assert(runningBackgroundJobs(sql, me).some((j) => j.id === "j4"), "the refused job is not tracked until it has ended");
+    assert(r.message.includes("j4") && /being stopped/.test(r.message) && r.message.includes("j1"), `message: ${r.message}`);
+  } finally { host.dispose(); }
+});
+
+await check("when stopping fails, the refused call is still tracked and the agent is told it is still running", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    const r = await refuseOverCap({ sql, owner: me, running: [job("a"), job("b"), job("c")], now,
+      cancel: async () => { throw new Error("run9 POST kill -> 409"); },
+      job: { id: "j4", session: "main", mount: "sandbox", tool: "sandbox__shell", handle: {} } });
+    assert(!r.stopRequested, "a failed stop was reported as requested");
+    assert(runningBackgroundJobs(sql, me).some((j) => j.id === "j4"), "a job that could not be stopped was dropped");
+    assert(/still running as background job j4/.test(r.message) && r.message.includes("409"), `the failure is not told: ${r.message}`);
   } finally { host.dispose(); }
 });
 
