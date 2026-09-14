@@ -12,6 +12,7 @@
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
 import { html, conditional, holds, notModified } from "./version.ts";
+import { maskRawRefs } from "../../src/store/refs.ts";
 import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
@@ -1701,8 +1702,12 @@ export class AgentDO extends DurableObject<Env> {
     }));
     const all = [...entries, ...failed].sort((a, b) => a.sequence - b.sequence);
     const total = all.length;
+    // Shown to a person: a stored tool result written before references
+    // changed shape still names the bucket, tenant and agent (tygg, 2026-09-14).
+    const owner = { tenantId, agentId };
     const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
-      sequence: e.sequence, kind: e.kind, payload: e.payload,
+      sequence: e.sequence, kind: e.kind,
+      payload: JSON.parse(maskRawRefs(JSON.stringify(e.payload), owner)) as typeof e.payload,
       createdAt: Number((e.payload as any)?.at ?? 0),
     }));
     const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
@@ -1791,7 +1796,9 @@ export class AgentDO extends DurableObject<Env> {
       .find((e) => e.kind === "model.response" && !(e.payload as any).toolCalls);
     return {
       status: running ? "running" : "idle",
-      answer: running ? null : ((last?.payload as any)?.text ?? null),
+      // An answer can quote a reference it was given before they changed shape.
+      answer: running ? null : (((last?.payload as any)?.text ?? null) === null
+        ? null : maskRawRefs(String((last!.payload as any).text), { tenantId, agentId })),
       events: events.map((e) => ({
         sequence: e.sequence, kind: e.kind,
         usage: (e.payload as any)?.usage ?? undefined,
@@ -1845,7 +1852,8 @@ export class AgentDO extends DurableObject<Env> {
     const events = entriesToEvents(
       await this.#entries(cur.tenantId, cur.agentId, cur.after + 1)).slice(0, 200);
     for (const e of events) {
-      ws.send(JSON.stringify({ id: e.sequence, kind: e.kind, payload: e.payload }));
+      ws.send(maskRawRefs(JSON.stringify({ id: e.sequence, kind: e.kind, payload: e.payload }),
+        { tenantId: cur.tenantId, agentId: cur.agentId }));
     }
     if (events.length) {
       (ws as any).serializeAttachment({ ...cur, after: events.at(-1)!.sequence });
