@@ -49,7 +49,7 @@ export interface StoredAgent {
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
-function metadataOf(v: unknown): Record<string, string> | Invalid {
+export function metadataOf(v: unknown): Record<string, string> | Invalid {
   if (v === undefined || v === null) return {};
   if (!isObj(v)) return invalid("metadata", "metadata must be an object of strings");
   const entries = Object.entries(v);
@@ -155,6 +155,7 @@ export function toOpenAIAgent(id: string, a: StoredAgent) {
 }
 
 export const agentDeleted = (id: string) => ({ id, deleted: true, object: "agent.deleted" as const });
+export const sessionDeleted = (id: string) => ({ id, deleted: true, object: "agent.session.deleted" as const });
 
 // ---- environments ---------------------------------------------------------
 
