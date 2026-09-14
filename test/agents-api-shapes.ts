@@ -90,6 +90,13 @@ await check("a cursor page the SDK can walk to the end, and cannot loop on", asy
     assert(pages < 10, "the pages never end");
   }
   assert(pages === 3 && seen.length === 45 && new Set(seen).size === 45 && seen[0] === "x0" && seen[44] === "x44", `walked ${pages} pages, ${seen.length} items`);
+  // The boundary the loose rule gets wrong: a list that is an exact multiple of the page size must say it ended
+  // on its last full page, not send the SDK after one more (45 items could not tell `<` from `<=`).
+  const exact = Array.from({ length: 40 }, (_, i) => ({ id: `y${i}` }));
+  const p1: any = cursorPage(exact, { limit: 20, order: "asc" });
+  const p2: any = cursorPage(exact, { after: "y19", limit: 20, order: "asc" });
+  assert(p1.page.has_more === true && p2.page.data.length === 20, `exact-multiple pages: ${JSON.stringify([p1.page.has_more, p2.page.data.length])}`);
+  assert(p2.page.has_more === false, "the last full page of an exact multiple still claims there is more");
   const desc: any = cursorPage(items, { limit: 2 });
   assert(desc.page.data[0].id === "x44", "default order is not newest first");
   assert(!(cursorPage(items, { after: "nope" }) as any).ok, "an unknown after restarted the list");
