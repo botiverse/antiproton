@@ -1265,6 +1265,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
    * and the caller — which owns the ledger — decides what to record and
    * whether to ask again (cody, 2026-09-14: no retry loop here, because the
    * runtime is what keeps a refused job tracked and calls back at its ceiling).
+   *
+   * **A terminal state is run9's record, not the process.** That the two agree
+   * — that `cancelled` means the shell is gone — is something we measured (a
+   * `sleep && echo … > file` whose file never appeared: cody three times, Piper
+   * once) and not something the API defines, so it can change without telling
+   * us. Whoever edits this path or the one that starts an execution owes that
+   * reading again; every cheaper check in the suites reads a record, and a
+   * record is what was wrong the first time.
    */
   async cancelBackground(handle, ctx) {
     const cfg = cfgOf(ctx);
