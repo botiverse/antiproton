@@ -380,6 +380,19 @@ export interface Plugin {
    * release, billed by the second for as long as they exist.
    *
    * Fifteen of them accumulated before the meter made it visible.
+   *
+   * **It costs the whole turn, not this mount.** pi serialises every tool call
+   * in a turn when *any* of them asks for it — `hasSequentialToolCall` in
+   * `agent-loop.js`, `toolCalls.some(...)` — so declaring this also stops
+   * unrelated mounts from running alongside. The sentence above says what the
+   * flag is for; this says what it costs, and the two were far enough apart
+   * that the cost read as "one mount waits" (cody measured it on SWE-bench:
+   * three quarters of billed Worker time is spent waiting on a container,
+   * against 3% for a task that uses none).
+   *
+   * So it is worth declaring only where overlapping really does break
+   * something, and it is a reason to want a call that can be left and returned
+   * to rather than waited on.
    */
   exclusive?: boolean;
   /**
