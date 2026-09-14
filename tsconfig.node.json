@@ -28,6 +28,7 @@
   "exclude": [
     "node_modules",
     "test/auth.ts",
+    "test/agents-api-keys.ts",
     "test/confirm.ts",
     "test/console-assets.ts",
     "test/console-chat.ts",
