@@ -38,6 +38,8 @@ export const BACKGROUND_CAP = 3;
  * runs (Piper, 2026-09-14).
  */
 export const BACKGROUND_MAX_MS = 30 * 60_000;
+/** How long past the ceiling a job that could not be stopped is still retried before it is given up. */
+export const BACKGROUND_STOP_GRACE_MS = 10 * 60_000;
 
 export interface JobOwner {
   tenantId: string;
@@ -204,9 +206,12 @@ export interface BackgroundPassDeps {
  * the ceiling, finish and deliver what ended, and say when to come back.
  *
  * A poll that throws is not a result: the job is checked again later, and the
- * ceiling is what keeps "later" from being forever. A cancel that throws past
- * the ceiling still fails the job — the slot and the bill are what the
- * ceiling protects, and a plugin that cannot stop its work cannot change that.
+ * ceiling is what keeps "later" from being forever. Past the ceiling the job is
+ * cancelled; if the plugin says it could not stop it, the job stays tracked and
+ * the cancel is asked again on later passes, because dropping it would leave
+ * work running that nothing can list or stop (Vera, 2026-09-14). After
+ * BACKGROUND_STOP_GRACE_MS more the job is failed anyway, so a slot cannot be
+ * held forever, and the agent is told it may still be running.
  */
 export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checked: number; finished: string[]; wakeInMs: number | null }> {
   const now = d.now ?? Date.now();
@@ -215,8 +220,16 @@ export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checke
   const due = dueBackgroundJobs(d.sql, d.owner, now);
   for (const job of due) {
     if (overdueBackground(job, now, maxMs)) {
-      try { await d.cancel(job); } catch { /* failed either way; see above */ }
-      const outcome = { state: "failed" as const, error: `ran longer than ${Math.round(maxMs / 60_000)} minutes and was cancelled` };
+      let stopError: string | null = null;
+      try { await d.cancel(job); } catch (e) { stopError = (e as Error)?.message ?? String(e); }
+      if (stopError !== null && !overdueBackground(job, now, maxMs + BACKGROUND_STOP_GRACE_MS)) {
+        markPolled(d.sql, d.owner, job.id, now);
+        continue;
+      }
+      const minutes = Math.round(maxMs / 60_000);
+      const outcome = { state: "failed" as const, error: stopError === null
+        ? `ran longer than ${minutes} minutes and was cancelled`
+        : `ran longer than ${minutes} minutes and could not be stopped (${stopError}); it may still be running in its container` };
       if (finishBackgroundJob(d.sql, d.owner, job.id, outcome, now)) {
         await d.completeOperation(job.id, "failed");
         await d.deliver(job.session, completionMessage(job, outcome, now));
@@ -320,7 +333,7 @@ export async function refuseOverCap(d: {
     return {
       stopRequested: false,
       message: `${over} This call was over the limit, but stopping it failed (${(e as Error)?.message ?? e}); ` +
-        `it is still running as background job ${d.job.id}. jobs.cancel can try again, and it is cancelled at the ceiling.`,
+        `it is still running as background job ${d.job.id}. jobs.cancel can try again; past the ceiling it is cancelled again on every check.`,
     };
   }
 }
