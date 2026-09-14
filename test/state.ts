@@ -288,12 +288,19 @@ await check("转存值的 note 就是那次调用本身,而且按大小给对形
     return String(r.note ?? "");
   };
 
+  // The reference the note carries is the one the agent may be shown:
+  // `artifact://<path>`, with no bucket, tenant or agent in it (tygg,
+  // 2026-09-14). Asserting the raw form is absent is the half that matters —
+  // carrying the right string and also leaking the old one would pass a test
+  // that only looked for the right one.
+  const shown = "artifact://big.json";
+  for (const [what, note] of [["under", await noteFor(small)], ["over", await noteFor(big)]] as const) {
+    if (!note.includes(shown)) throw new Error(`the ${what} note does not carry the shown reference: ${note}`);
+    if (note.includes("r2://") || note.includes("/t/")) throw new Error(`the ${what} note leaks the raw key: ${note}`);
+  }
   const under = await noteFor(small);
-  if (!under.includes(ref)) throw new Error(`the note does not carry the reference: ${under}`);
   if (/from:/.test(under)) throw new Error(`a value that reads back whole should not be told to page: ${under}`);
-
   const over = await noteFor(big);
-  if (!over.includes(ref)) throw new Error(`the note does not carry the reference: ${over}`);
   if (!/from: 0/.test(over)) throw new Error(`a value past the read-back line must be paged, and the note must say so: ${over}`);
 });
 
