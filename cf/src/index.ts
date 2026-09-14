@@ -1359,7 +1359,14 @@ export class AgentDO extends DurableObject<Env> {
 
   async apiSessionStatus(tenantId: string, agentId: string, sessionId: string): Promise<"idle" | "in_progress"> {
     this.#claim(tenantId, agentId);
-    const agent = await this.runtime().agent(tenantId, agentId, sessionId);
+    const rt = this.runtime();
+    await rt.ready();
+    // An agent is bound to a model when its first turn starts (apiPostInput), and
+    // the harness cannot be built without one — so an agent that has never run is
+    // idle by construction, and asking the harness would only throw (preview probe,
+    // 2026-09-14: "no model binding" on a fresh session).
+    if (!(await rt.store.getModelBinding(tenantId, agentId))) return "idle";
+    const agent = await rt.agent(tenantId, agentId, sessionId);
     return (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null ? "in_progress" : "idle";
   }
 
