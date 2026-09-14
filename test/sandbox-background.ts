@@ -32,7 +32,7 @@ function run9(states: string[], extra: Record<string, unknown> = {}) {
   globalThis.fetch = (async (url: string, init?: any) => {
     const path = String(url);
     calls.push(`${init?.method ?? "GET"} ${path.replace("https://sandbox.example", "")}`);
-    if (/\/execs$/.test(path)) return new Response(JSON.stringify({ exec_id: "e1" }));
+    if (/execs$/.test(path)) return new Response(JSON.stringify({ exec_id: "e1" }));
     if (/\/kill$/.test(path)) return new Response("{}");
     const state = states[Math.min(i++, states.length - 1)]!;
     return new Response(JSON.stringify({ state, exit_code: state === "succeeded" ? 0 : null, output_summary: "hello" }));
@@ -68,6 +68,21 @@ await check("跑不完的命令交回一个句柄,而不是把这一轮占住", 
   }
 });
 
+
+await check("命令起在 run9 的【background 路由】上 —— 否则根本杀不掉", async () => {
+  // `POST /execs/{id}/kill` answers 400 `exec is not background mode` for an
+  // execution started on the plain route, and the command runs to completion
+  // no matter what our ledger says (measured on our own box, 2026-09-14). So
+  // which route starts it is not a detail of plumbing: it is the difference
+  // between a cancel that works and one that only looks like it did.
+  const { ctx, calls } = run9(["running"]);
+  await plugin.invoke("shell", { command: "sleep 600" }, ctx);
+  const started = calls.filter((c) => c.startsWith("POST") && c.includes("/boxes/"));
+  if (!started.some((c) => c.endsWith("/background-execs"))) {
+    throw new Error(`the command was started on a route run9 will not kill: ${JSON.stringify(started)}`);
+  }
+});
+
 await check("两种结局给出【同一个结果】—— 这是这组用例真正守的东西", async () => {
   // The same command, finished in the call and finished through the poll. If
   // these ever differ, the model's result depends on how long its command
@@ -94,12 +109,111 @@ await check("还在跑时 poll 说没完,而且【一个字节都不写连接状
   if (written() !== null) throw new Error(`poll wrote connection state: ${JSON.stringify(written())}`);
 });
 
-await check("取消就是去把它杀掉", async () => {
-  const { ctx, calls } = run9(["running"]);
+/**
+ * run9 for the cancelling cases: the kill's answers and the states the
+ * execution reports afterwards are given separately, because the whole point
+ * of these cases is that those two can disagree.
+ */
+function killing(kills: number[], states: string[]) {
+  const calls: string[] = [];
+  let k = 0, s = 0;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const path = String(url).replace("https://sandbox.example", "");
+    calls.push(`${init?.method ?? "GET"} ${path}`);
+    if (/\/kill$/.test(path)) {
+      const status = kills[Math.min(k++, kills.length - 1)]!;
+      return new Response(status === 200 ? "{}" : "no such exec", { status });
+    }
+    const state = states[Math.min(s++, states.length - 1)]!;
+    return new Response(JSON.stringify({ state, exit_code: null, output_summary: "" }));
+  }) as any;
+  const ctx: any = {
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: JSON.stringify({ ak: "a", sk: "b" }),
+    publicConfig: { endpoint: "https://sandbox.example", graceMs: 0 },
+    connection: { get: async () => BOX, set: async () => {} },
+    sibling: async () => null,
+  };
+  return { ctx, calls };
+}
+
+await check("取消就是去把它杀掉,而且要【确认它真的停了】", async () => {
+  const { ctx, calls } = killing([200], ["killed"]);
   await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx);
   if (!calls.some((c) => c === "POST /projects/default/workspace/execs/e1/kill")) {
     throw new Error(`cancelling did not kill the execution: ${JSON.stringify(calls)}`);
   }
+  if (!calls.some((c) => c === "GET /projects/default/workspace/execs/e1")) {
+    throw new Error(`cancelling never checked that it had stopped: ${JSON.stringify(calls)}`);
+  }
+});
+
+await check("杀不掉就【说出来】,不能咽下去", async () => {
+  // The defect this case exists for: with three jobs running, a refused fourth
+  // was cancelled through this path, the kill did not take, and the command
+  // ran to completion in the container — with no job id, so nothing could list
+  // it or cancel it (Vera, 2026-09-14). A swallowed failure is a cancellation
+  // that did not happen, still billing, with nothing left that can name it.
+  const { ctx } = killing([404], ["running"]);
+  let threw: string | null = null;
+  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx)
+    .catch((e) => { threw = String((e as Error).message); });
+  if (threw === null) throw new Error("a kill that never took was reported as a successful cancel");
+  if (!String(threw).includes("e1")) throw new Error(`the failure does not say which execution: ${threw}`);
+});
+
+await check("两种失败【说的不是一回事】,调用方要能分开它们", async () => {
+  // The caller reports this to the agent, so the words are part of the
+  // contract. A refused kill is a statement about the process — nothing
+  // stopped it. An accepted kill whose state has not settled is not: claiming
+  // "it kept running" there would pass on a claim we never made (Vera).
+  // Built one at a time: `killing` installs its stub on the spot, so two
+  // fixtures made up front would both answer with the second one's rules.
+  const said = async (kills: number[]) => {
+    const { ctx } = killing(kills, ["running"]);
+    let msg = "";
+    await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch((e) => { msg = String((e as Error).message); });
+    return msg;
+  };
+  const a = await said([400]);
+  const b = await said([200]);
+  for (const m of [a, b]) {
+    if (!/could not confirm/i.test(m)) throw new Error(`a cancel that proved nothing claimed more than it knew: ${m}`);
+  }
+  // run9's own answer is what tells the runtime the kill was refused, and the
+  // status code is the part of it that is actionable.
+  if (!a.includes("400")) throw new Error(`a refused kill does not carry run9's answer: ${a}`);
+  if (!/kill accepted/.test(b) || b.includes("400")) {
+    throw new Error(`an accepted kill is not told apart from a refused one: ${b}`);
+  }
+});
+
+await check("杀请求成功、但进程还在跑 —— 这也是【没停】", async () => {
+  // "The kill returned 200" is our record; "the process is gone" is the fact,
+  // and the bill follows the fact.
+  const { ctx } = killing([200], ["running"]);
+  let threw = false;
+  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch(() => { threw = true; });
+  if (!threw) throw new Error("an execution still running after an accepted kill was reported as stopped");
+});
+
+await check("杀请求被拒、但它其实早就结束了 —— 不算失败", async () => {
+  // A kill refused for an execution that has already ended is not a failure to
+  // report: the state, not the kill's answer, is what is asked.
+  const { ctx } = killing([404], ["succeeded"]);
+  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx);
+});
+
+await check("只杀一次、只确认一次 —— 重试归运行时,不在插件里绕圈", async () => {
+  // The kill most likely to be refused is the one sent the instant an exec
+  // starts, which is when the cap fires. Retrying here would look like the fix
+  // and would instead hide the state the runtime needs: it is what keeps a
+  // refused job tracked and asks again at its ceiling (cody, 2026-09-14).
+  const { ctx, calls } = killing([409], ["running"]);
+  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch(() => {});
+  const kills = calls.filter((c) => c.endsWith("/kill")).length;
+  const gets = calls.filter((c) => !c.endsWith("/kill")).length;
+  if (kills !== 1 || gets !== 1) throw new Error(`one kill and one check, not ${kills} and ${gets}: ${JSON.stringify(calls)}`);
 });
 
 globalThis.fetch = original;

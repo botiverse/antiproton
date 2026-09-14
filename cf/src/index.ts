@@ -35,6 +35,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
+import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
 import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
@@ -675,6 +676,10 @@ export class AgentDO extends DurableObject<Env> {
         detail: JSON.stringify(e.payload).slice(0, 220),
       })),
       pendingWork: execution.current ? 1 : 0,
+      // How recent background jobs ended (task #16): running, done, failed or
+      // cancelled, with when and why — the only record of whether a job refused
+      // at the cap, or past its ceiling, actually stopped.
+      backgroundJobs: recentBackgroundJobs(this.sql, { tenantId, agentId }, 10),
       alarm: await this.ctx.storage.getAlarm(),
       // What the agent believes, in the operator's own view. The tools tell the
       // agent this is readable by the person running it; that has to be true,

@@ -38,6 +38,8 @@ export const BACKGROUND_CAP = 3;
  * runs (Piper, 2026-09-14).
  */
 export const BACKGROUND_MAX_MS = 30 * 60_000;
+/** How long past the ceiling a job that could not be stopped is still retried before it is given up. */
+export const BACKGROUND_STOP_GRACE_MS = 10 * 60_000;
 
 export interface JobOwner {
   tenantId: string;
@@ -146,6 +148,29 @@ export function runningBackgroundJobs(sql: Sql, owner: JobOwner): BackgroundJob[
 }
 
 /** Mounts with work still running: idle reclaim must not release their boxes (Piper, 2026-09-14). */
+/**
+ * The owner's most recent jobs, newest first, as an operator reads them: how
+ * each one ended, not only which are still running. Without this, whether a
+ * refused or finished job really stopped could only be inferred from the last
+ * few transcript events, which scroll away (Vera, 2026-09-14). The handle is
+ * left out; the outcome is cut short.
+ */
+export function recentBackgroundJobs(sql: Sql, owner: JobOwner, limit = 10) {
+  ensureBackgroundTable(sql);
+  const cut = (v: unknown) => (v === null || v === undefined ? null : (typeof v === "string" ? v : JSON.stringify(v)).slice(0, 300));
+  return (sql.exec(
+    "SELECT * FROM background_jobs WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+    owner.tenantId, owner.agentId, limit).toArray() as any[]).map((r) => {
+    let outcome: { result?: unknown; error?: unknown } = {};
+    try { outcome = r.outcome ? JSON.parse(String(r.outcome)) : {}; } catch { outcome = { error: String(r.outcome) }; }
+    return {
+      id: String(r.id), session: String(r.session), mount: String(r.mount), tool: String(r.tool), state: String(r.state),
+      createdAt: Number(r.created_at), finishedAt: r.finished_at === null || r.finished_at === undefined ? null : Number(r.finished_at),
+      polls: Number(r.polls), error: cut(outcome.error), result: cut(outcome.result),
+    };
+  });
+}
+
 export function mountsWithRunningJobs(sql: Sql, owner: JobOwner): Set<string> {
   return new Set(runningBackgroundJobs(sql, owner).map((j) => j.mount));
 }
@@ -204,9 +229,12 @@ export interface BackgroundPassDeps {
  * the ceiling, finish and deliver what ended, and say when to come back.
  *
  * A poll that throws is not a result: the job is checked again later, and the
- * ceiling is what keeps "later" from being forever. A cancel that throws past
- * the ceiling still fails the job — the slot and the bill are what the
- * ceiling protects, and a plugin that cannot stop its work cannot change that.
+ * ceiling is what keeps "later" from being forever. Past the ceiling the job is
+ * cancelled; if the plugin says it could not stop it, the job stays tracked and
+ * the cancel is asked again on later passes, because dropping it would leave
+ * work running that nothing can list or stop (Vera, 2026-09-14). After
+ * BACKGROUND_STOP_GRACE_MS more the job is failed anyway, so a slot cannot be
+ * held forever, and the agent is told it may still be running.
  */
 export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checked: number; finished: string[]; wakeInMs: number | null }> {
   const now = d.now ?? Date.now();
@@ -215,8 +243,16 @@ export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checke
   const due = dueBackgroundJobs(d.sql, d.owner, now);
   for (const job of due) {
     if (overdueBackground(job, now, maxMs)) {
-      try { await d.cancel(job); } catch { /* failed either way; see above */ }
-      const outcome = { state: "failed" as const, error: `ran longer than ${Math.round(maxMs / 60_000)} minutes and was cancelled` };
+      let stopError: string | null = null;
+      try { await d.cancel(job); } catch (e) { stopError = (e as Error)?.message ?? String(e); }
+      if (stopError !== null && !overdueBackground(job, now, maxMs + BACKGROUND_STOP_GRACE_MS)) {
+        markPolled(d.sql, d.owner, job.id, now);
+        continue;
+      }
+      const minutes = Math.round(maxMs / 60_000);
+      const outcome = { state: "failed" as const, error: stopError === null
+        ? `ran longer than ${minutes} minutes and was cancelled`
+        : `ran longer than ${minutes} minutes and could not be stopped (${stopError}); it may still be running in its container` };
       if (finishBackgroundJob(d.sql, d.owner, job.id, outcome, now)) {
         await d.completeOperation(job.id, "failed");
         await d.deliver(job.session, completionMessage(job, outcome, now));
@@ -308,4 +344,44 @@ export function jobsTool(d: {
       });
     },
   };
+}
+
+/**
+ * A call that came back running while the agent is already at the cap.
+ *
+ * It has started — the plugin only returns a handle once the work is under way
+ * — so refusing the call does not stop the work. It used to be cancelled in
+ * a fire-and-forget request whose failure was swallowed and then forgotten: the
+ * refused command ran to completion, billed, with no job id, invisible to
+ * `jobs` and beyond the ceiling's reach (Vera, 2026-09-14). So the job is
+ * recorded first, then asked to stop, and it stays tracked until a poll shows
+ * the work really ended. The agent is told the truth: refused, being stopped,
+ * and under which id.
+ */
+export async function refuseOverCap(d: {
+  sql: Sql;
+  owner: JobOwner;
+  job: { id: string; session: string; mount: string; tool: string; handle: unknown };
+  running: Array<Pick<BackgroundJob, "id" | "mount" | "tool" | "createdAt">>;
+  cancel(): Promise<void>;
+  now?: number;
+}): Promise<{ message: string; stopRequested: boolean }> {
+  const now = d.now ?? Date.now();
+  const admit = admitBackground(d.running, BACKGROUND_CAP, now);
+  const over = admit.ok ? "" : admit.message;
+  recordBackgroundJob(d.sql, d.owner, d.job, now);
+  try {
+    await d.cancel();
+    return {
+      stopRequested: true,
+      message: `${over} This call was over the limit and is being stopped as background job ${d.job.id}; ` +
+        "it counts toward the limit until it has actually ended.",
+    };
+  } catch (e) {
+    return {
+      stopRequested: false,
+      message: `${over} This call was over the limit, but stopping it failed (${(e as Error)?.message ?? e}); ` +
+        `it is still running as background job ${d.job.id}. jobs.cancel can try again; past the ceiling it is cancelled again on every check.`,
+    };
+  }
 }
