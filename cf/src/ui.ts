@@ -381,7 +381,11 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] button:disabled{box-shadow:none}
 [data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password]{border:2px solid var(--line-strong);background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
 [data-theme="brutal"] input[type=text]:focus,[data-theme="brutal"] input[type=password]:focus{box-shadow:var(--theme-shadow-md)}
-[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug{border:1px solid var(--line-strong);margin:8px 0;box-shadow:none}
+/* A card inside a framed panel keeps a hairline, not the offset shadow:
+   stacked 2px borders + shadows read as black boxes overlapping each other
+   (tygg, 2026-09-13). */
 [data-theme="brutal"] .card{border-left-width:2px}
 [data-theme="brutal"] .task,[data-theme="brutal"] .mount-link{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .task.on,[data-theme="brutal"] .mount-link.on{background:var(--primary-soft)}
