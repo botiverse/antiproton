@@ -52,6 +52,18 @@ await check("a path that moves or has an empty segment resolves to nothing", asy
   assert(keyForRef("state/notes.json", me) === null, "a bare path with no scheme resolved");
 });
 
+await check("each of the three kinds round-trips, and a shown reference is never raw", async () => {
+  // The kind is where the object was written, so it survives the round trip
+  // without being named anywhere (Vera, 2026-09-14).
+  for (const path of ["op_7f3a.json", "state/huge2.json", "sandbox/box-1/work/sub/out.txt"]) {
+    const rawRef = `r2://antiproton-artifacts/t/t-me/u-me/${path}`;
+    const shown = toAgentRef(rawRef, me);
+    assert(shown === `${AGENT_REF}${path}`, `${path} was shown as ${shown}`);
+    assert(!String(shown).startsWith("r2://"), `a raw reference was produced: ${shown}`);
+    assert(keyForRef(shown!, me) === `t/t-me/u-me/${path}`, `${path} did not resolve back to its own key`);
+  }
+});
+
 await check("text written before the change is shown with the owner's raw references rewritten", async () => {
   // A stored tool result, serialised: the JSON escaping around the reference must not stop the rewrite.
   const stored = JSON.stringify({ ref: raw, note: `read it with artifacts__read { ref: "${raw}" }` });
