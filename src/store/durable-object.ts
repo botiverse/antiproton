@@ -179,6 +179,13 @@ export class DurableObjectStore implements StorageAdapter {
       tenantId, agentId) as any;
     return r ? { agentId: String(r.agent_id), config: JSON.parse(String(r.config ?? "{}")) as Json, createdAt: Number(r.created_at) } : null;
   }
+  async updateAgentConfig(tenantId: string, agentId: string, config: Json = {}) {
+    const before = this.#one("SELECT 1 AS x FROM agents WHERE tenant_id=? AND agent_id=?", tenantId, agentId);
+    if (!before) return false;
+    this.#sql.exec("UPDATE agents SET config=? WHERE tenant_id=? AND agent_id=?", j(config), tenantId, agentId);
+    return true;
+  }
+
 
   async createTask(
     tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion = 0,

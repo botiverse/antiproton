@@ -41,6 +41,8 @@ export interface StorageAdapter {
   createAgent(tenantId: string, agentId: string, config?: Json): Promise<void>;
   /** The agent's record as created: its config is where a name and a description live. */
   loadAgent(tenantId: string, agentId: string): Promise<{ agentId: string; config: Json; createdAt: number } | null>;
+  /** Replace an agent's config; false when there is no such agent. The persona the harness reads lives here. */
+  updateAgentConfig(tenantId: string, agentId: string, config: Json): Promise<boolean>;
   /**
    * Snapshots and the raw task log.
    *

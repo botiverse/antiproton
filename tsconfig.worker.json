@@ -33,6 +33,7 @@
     "test/auth.ts",
     "test/agents-api-keys.ts",
     "test/agents-api-shapes.ts",
+    "test/agents-api-store.ts",
     "test/confirm.ts",
     "test/console-assets.ts",
     "test/console-chat.ts",
