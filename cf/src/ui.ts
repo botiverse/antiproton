@@ -420,6 +420,9 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
   input[type=text],input[type=password]{min-height:40px;font-size:15px}
   .view-head h2{font-size:14px}
   .conv .body{max-height:none}
+  /* The composer hint explains steer/after; on a phone that legend costs the
+     conversation real space it already is short of (tygg, 2026-09-13). */
+  .send-hint{display:none}
 }
 @media(max-width:760px){.sidebar .pane-close,.inspector .pane-close{display:inline-flex;margin:10px 12px 0}}
 `;
@@ -556,8 +559,8 @@ ${HEAD_ASSETS}
       </form>
       <div class="err send-err" id="send-err" hidden></div>
     </div>
-    <div class="hint" style="padding:0">Sending while it works steers it: the message reaches the model before its next call.
-      <b>after</b> holds the message until it has finished. A held call shows above the composer until you sign it.</div>
+    <div class="hint send-hint" style="padding:0"><b>send</b> steers it mid-flight; <b>after</b> holds until it finishes.
+      A held call shows in the flow until you sign it.</div>
   </section>
   <section class="view" data-view="plugins">
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
