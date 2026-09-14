@@ -182,16 +182,28 @@ interface BoxState {
  * two with nothing failing, which is how "persists between calls" outlived the
  * behaviour it described.
  *
- * **It says what is true of the deployment it is running in.** The lease in this
- * PR is off until someone sets the two numbers, and while it is off the box
- * really does wait for the agent — so the sentence waits too. The three-clause
- * version ("you are asked when it goes quiet, and taken if nobody answers")
- * lands in the same change that sets `RUN9_IDLE_MINUTES` and
- * `RUN9_MAX_IDLE_MINUTES`, because a promise the mechanism is not keeping is
- * the defect this file has already carried twice.
+ * **It says what is true of the deployment it is running in**, and for a long
+ * while it did not. It read "this container persists between calls", on the
+ * premise that with the idle lease off a box waits for its agent. The opposite
+ * is what the runtime does: with no lease configured — which is production —
+ * a settled turn hands its containers back, so the box lives for one turn and
+ * the next call starts a new one. Both `cf/src/runtime.ts` (`idle`) and
+ * `src/runtime/idle-lease.ts` say so in as many words; I read neither, and
+ * wrote the sentence from the half of the lifetime I had in mind. Measured by
+ * Vera's probe: nine containers for one agent, `uses: 1` each, 3.3–9.5 s
+ * apiece, and the model quoted this line back while watching the box id change
+ * under it.
+ *
+ * So the lifetime it states is the one the agent can actually use — every call
+ * in this turn — and it names what outlives the turn instead, which is a kept
+ * filesystem. When a deployment turns the lease on, this sentence stops being
+ * true in the other direction, so the runtime should hand the plugin that fact
+ * rather than have it remembered here (cody has offered `idle`); until then
+ * there is no deployment where the lease is on.
  */
 export function boxReminder(alias: string): string {
-  return `this container persists between calls; the \`release\` tool on \`${alias}\` destroys it`;
+  return `every call in this turn uses this same container, and it is handed back when the turn ends`
+    + `; \`keep\` on \`${alias}\` saves its filesystem for a later turn, and \`release\` destroys it now`;
 }
 
 /**
@@ -607,10 +619,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
         "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
         "starts a container that is billed for every second it exists, and it cannot call your other " +
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
-        "few seconds of compute. The container is NOT the per-execution sandbox: it persists between " +
-        "calls until you release it, so installs and files survive from one call to the next — do not " +
-        "reinstall. Work in as few calls as you can, save what matters with `save`, and release it. " +
-        "Everything inside is destroyed when it is released.",
+        "few seconds of compute. The container is NOT the per-execution sandbox: every call in this " +
+        "turn uses the same one, so installs and files survive from one call to the next — do not " +
+        "reinstall. It is handed back when the turn ends, so a later turn starts a new container " +
+        "unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save " +
+        "what matters with `save`, and release it. Everything inside is destroyed when it is released.",
       parameters: {
         type: "object",
         properties: {
@@ -630,8 +643,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     {
       name: "shell",
       summary:
-        "Shell in the same billed-by-the-second container as `run`, and the same one across calls " +
-        "— state, installed packages and files carry over. Only for what needs a real " +
+        "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
+        "in this turn — state, installed packages and files carry over from one call to the next, and " +
+        "the container is handed back when the turn ends. Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
