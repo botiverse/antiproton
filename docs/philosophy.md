@@ -90,6 +90,8 @@ Antiproton replaces the bash-over-shared-storage paradigm with **Programmable St
 - **Preserving the Sandboxing Invariant:** A shared POSIX filesystem with bash requires granting the sandbox ambient filesystem and network access—the exact two capabilities Antiproton strictly eliminates. Our architectural stance is uncompromising: *"A container is a mount, not a loophole. Work that genuinely needs a real machine gets one... rather than by loosening the sandbox."*
 - **Code-as-Orchestrator:** Rather than consuming 10 separate conversational round trips across the network—or struggling with fragile shell scripts—the model writes a concise, idiomatic JavaScript snippet that orchestrates tools locally in the sandbox, returning only the compact, structured answer.
 
+Yet even an elegant capability must submit to empirical reality: in our production benchmarks, `run_js` went completely unused across every trial (0 calls across three SWE-bench Verified instances and 24 τ² trials). The sandbox is not yet shown to pay on this substrate—and we state that plainly rather than declaring premature victory.
+
 ---
 
 ## 4. Context as State: Lossless Compaction & Long-Term Memory
