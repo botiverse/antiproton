@@ -1435,7 +1435,12 @@ export class AgentDO extends DurableObject<Env> {
       // second it exists" is true of a container and false of an API key, and
       // only the plugin knows which it is. A console composing that line would
       // have to know too.
-      mountReports: await this.#mountReports(rt, tenantId, agentId, taskId),
+      // A sandbox mount lists the files its boxes kept, and entries saved
+      // before references changed shape still name the bucket, tenant and agent
+      // (6 objects across 4 agents). This panel is shown to a person; the
+      // operator's diagnose keeps raw references on purpose.
+      mountReports: JSON.parse(maskRawRefs(
+        JSON.stringify(await this.#mountReports(rt, tenantId, agentId, taskId)), { tenantId, agentId })),
       modelBinding: rows("SELECT * FROM model_bindings WHERE tenant_id=? AND agent_id=?", tenantId, agentId)[0] ?? null,
       quotas: rows("SELECT * FROM quotas WHERE tenant_id=?", tenantId),
       // The agent's own memory, whole rather than sampled: seeing what it
