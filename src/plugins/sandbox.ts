@@ -1261,7 +1261,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     let why: string;
     try {
       await api("POST", `${path}/kill`);
-      why = "kill accepted but the execution kept running";
+      why = "kill accepted";
     } catch (e) {
       why = e instanceof Error ? e.message : String(e);
     }
@@ -1277,7 +1277,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     }
     if (state !== null && TERMINAL.includes(state)) return;
     if (state !== null) why += `; state ${state}`;
-    throw new Error(`exec ${h.execId} did not stop: ${why}`);
+    // "Could not confirm", not "did not stop". Only one of the two ways to get
+    // here is a statement about the process: a refused kill leaves it running,
+    // while an accepted kill with a state that has not settled says nothing
+    // about it either way — and the caller, which reports this to the agent,
+    // would be passing on a claim we did not make (Vera, 2026-09-14). The two
+    // are told apart by what follows the colon: run9's own answer, or `kill
+    // accepted`.
+    throw new Error(`could not confirm exec ${h.execId} stopped: ${why}`);
   },
 
   };

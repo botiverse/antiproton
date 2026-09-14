@@ -162,6 +162,32 @@ await check("杀不掉就【说出来】,不能咽下去", async () => {
   if (!String(threw).includes("e1")) throw new Error(`the failure does not say which execution: ${threw}`);
 });
 
+await check("两种失败【说的不是一回事】,调用方要能分开它们", async () => {
+  // The caller reports this to the agent, so the words are part of the
+  // contract. A refused kill is a statement about the process — nothing
+  // stopped it. An accepted kill whose state has not settled is not: claiming
+  // "it kept running" there would pass on a claim we never made (Vera).
+  // Built one at a time: `killing` installs its stub on the spot, so two
+  // fixtures made up front would both answer with the second one's rules.
+  const said = async (kills: number[]) => {
+    const { ctx } = killing(kills, ["running"]);
+    let msg = "";
+    await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch((e) => { msg = String((e as Error).message); });
+    return msg;
+  };
+  const a = await said([400]);
+  const b = await said([200]);
+  for (const m of [a, b]) {
+    if (!/could not confirm/i.test(m)) throw new Error(`a cancel that proved nothing claimed more than it knew: ${m}`);
+  }
+  // run9's own answer is what tells the runtime the kill was refused, and the
+  // status code is the part of it that is actionable.
+  if (!a.includes("400")) throw new Error(`a refused kill does not carry run9's answer: ${a}`);
+  if (!/kill accepted/.test(b) || b.includes("400")) {
+    throw new Error(`an accepted kill is not told apart from a refused one: ${b}`);
+  }
+});
+
 await check("杀请求成功、但进程还在跑 —— 这也是【没停】", async () => {
   // "The kill returned 200" is our record; "the process is gone" is the fact,
   // and the bill follows the fact.
