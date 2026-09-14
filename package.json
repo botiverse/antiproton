@@ -16,6 +16,7 @@
     "release": "node test/release.ts",
     "auth": "node test/auth.ts",
     "typecheck": "node scripts/typecheck.mjs",
+    "suite-table": "node scripts/suite-table.mjs",
     "typecheck-baseline": "node test/typecheck-baseline.ts"
   },
   "dependencies": {
