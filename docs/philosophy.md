@@ -157,21 +157,29 @@ In contrast, when we deployed an automated, naive agent with **no prior timeline
 
 ## 7. Addition, Not Subtraction: Agents as Citizens of the New World
 
-Underlying all these architectural decisions is a foundational worldview: **AI agents are not downgraded human simulators running in crippled legacy environments; they are the new citizens of a new digital world.**
+Underlying every line of Antiproton's design is a foundational worldview: **AI agents are the new citizens of a new digital world. In building infrastructure for them, we must use addition (加法), not subtraction (减法).**
 
-In software engineering, when developers try to fit agents into existing paradigms, they almost always use **subtraction (减法)**:
-- Take a traditional Linux OS, and strip down permissions until it barely works.
-- Take an interactive human shell (bash), strip away interactivity, and hack together timeouts.
-- Take a standard human authentication flow (OAuth / browser passwords), and try to make the agent pretend to be a human sitting at a screen typing credentials.
+When legacy software engineering attempts to accommodate autonomous agents, it almost universally resorts to **subtraction**:
+- Take a monolithic Linux OS, and strip down capabilities until it barely runs.
+- Take an interactive human shell (bash), strip away terminals, and hack fragile timeouts around text streams.
+- Take a standard human security policy, and respond with runtime bans, errors, and task cancellations whenever an action looks uncertain.
 
-Subtraction treats the agent as a liability—a clumsy, dangerous pseudo-human that must be restricted and contained within systems designed decades ago for keyboards and monitors.
+Subtraction treats the agent as a liability—a clumsy, dangerous pseudo-human that must be restricted and contained within legacy environments designed decades ago for human fingers and physical keyboards.
 
-Antiproton builds infrastructure through **addition (加法)**:
-- **First-Class Digital Citizens:** Instead of forcing an agent to pretend to be a POSIX process, we grant it native digital citizenship: an edge-resident actor with durable memory, its own isolated database, deterministic lifecycle states, and verified wait-offloading.
-- **Purpose-Built Ergonomics:** We give the agent what natively amplifies its intelligence—structured, typed JavaScript execution, cryptographic credential gates, and lossless event folding—rather than human keyboard artifacts.
-- **Constructive Capability:** We construct a runtime where safety is not an exhausting list of runtime bans, but a structural foundation upon which rich ecosystems, third-party marketplaces, and autonomous collaborations can be built without fear.
+Antiproton designs infrastructure through **addition**:
 
----
+### Structure Instead of Bans (32 Instances of "Rather Than")
+Across Antiproton's codebase and architecture, this principle is reflected not as an abstract slogan, but as a recurring structural discipline (appearing 32 times in our foundational specifications):
+- **Physical Absence Over Runtime Filtering:** Multi-tenancy is not an instruction to "remember the `WHERE` clause"; data is physically absent from the querying database *rather than* filtered.
+- **Dedicated Egress Over Network Bans:** The sandbox does not play a game of whack-a-mole with blocked ports; it gives the agent a single, auditable tool bridge *rather than* loosening the isolate.
+- **Asynchronous Waiting Over Blocking:** The runtime issues an I/O pass that returns `waiting` *rather than* blocking or polling.
+
+### The Power of Addition: Human-in-the-Loop Parking
+The clearest operational proof of "addition over subtraction" is **approval parking** (`src/runtime/gateway.ts:507-527`):
+- **The Subtraction Approach:** When a tool call requires human authorization, fail the call with an error or security exception. In our benchmark evaluations, answering a held call with an error caused the agent to conclude it was blocked and terminate the task in failure after 75s.
+- **The Addition Approach:** Do not reject the call. Preserve the agent's intent by returning `status: "pending"` with `heldBy: "policy"`. The task *parks* cleanly, the human inspects and signs the exact request, and execution resumes seamlessly.
+
+Told that it was paused rather than refused, the exact same task transformed from a **75s failure into a 17.2s success** (`README.md:118-122`). That is the measurable dividend of addition: safety is achieved by providing structure to preserve capability, not by stripping capability away.
 
 ## Conclusion: Building for Reality
 
