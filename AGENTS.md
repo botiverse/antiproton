@@ -27,7 +27,7 @@ measures real bytes on binary via `byteLength`.
 To keep the repository sound, maintainable, and aligned with core principles:
 
 - **Open for direct pull requests:** Plugins located under `src/plugins/`. Community contributions adding new external tool connectors, data adapters, or plugin integrations are warmly welcomed with accompanying tests in `test/`.
-- **Require an issue first:** Core runtime, state management, and Durable Objects under `src/kernel/`, `src/store/`, and `cf/`. Please open an issue to discuss invariants and architecture before writing code.
+- **Require an issue first:** Core runtime, state management, and Durable Objects under `src/runtime/`, `src/core/`, `src/store/`, and `cf/`. Please open an issue to discuss invariants and architecture before writing code.
 - **Evidence over assertion:** Benchmarks, measurable telemetry, and positive control tests decide proposals. Every PR should verify its claims through testable entry points.
 - **Documentation standards:** All public documentation is in English, focused on external readability and factual fidelity. When code changes public behavior, keep `README.md` and related docs updated in the same PR.
 

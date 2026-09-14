@@ -536,7 +536,7 @@ instances measure that the loop runs, not how good it is.
 We welcome contributions from the community. To keep antiproton reliable and maintainable:
 
 - **Plugins (`src/plugins/`):** Open for direct pull requests! If you want to add integrations, tool bindings, or data connectors, feel free to submit a PR with tests in `test/`.
-- **Core Runtime & Durable Objects (`src/kernel/`, `src/store/`, `cf/`):** Please **open an issue first** to discuss architecture, invariants, and design before writing code.
+- **Core Runtime & Durable Objects (`src/runtime/`, `src/core/`, `src/store/`, `cf/`):** Please **open an issue first** to discuss architecture, invariants, and design before writing code.
 - **Evidence-based verification:** Every PR must include tests that verify the exact mechanism or boundary introduced. We verify mechanism by callable entry points, not by assertions of absence.
 - **Documentation:** Documentation must be kept in sync with code reality. All documentation is in English.
 
@@ -622,7 +622,7 @@ them:
   console (with switched-off mounts keeping their row marked closed rather than
   vanishing), and mounts can be renamed. Full revocation and dynamic installation
   of arbitrary plugins at runtime are not supported: plugins are registered at
-  build time in `src/plugins/index.ts`. Revoking or removing a mount must preserve
+  build time in `cf/src/runtime.ts`. Revoking or removing a mount must preserve
   prompt resolution integrity: the system prompt names the mount and tool
   (e.g. "kept by the `state` mount, correct one with its `remember` tool") rather
   than the underlying dispatch address, and drops the instruction when the mount
