@@ -797,28 +797,49 @@ await check("start_from 的每一个结局都直说【释放了没有】,而且�
  * reminder describes it while it does. An agent reads whichever it happens to
  * be looking at, and it cannot tell which is stale — so a promise mended in one
  * and left in another is worse than the original wrong sentence: it is wrong
- * only sometimes. This is the test that failed to exist while "persists between
- * calls until you release it" outlived the behaviour it described.
+ * only sometimes.
+ *
+ * **Consistency was all this case checked, so it held three copies of a false
+ * sentence green.** "Persists between calls" was never true of a deployment
+ * with no idle lease — which is production: a settled turn hands its containers
+ * back. Vera's probe found nine containers for one agent, `uses: 1` each, while
+ * the model quoted the line (cody, 2026-09-14). So the assertions now name the
+ * lifetime the runtime actually gives — this turn — and refuse the promise that
+ * outlived it. Three agreeing statements are worth nothing if all three are
+ * wrong, and only the wording can be checked here; what makes it true is
+ * `cf/src/runtime.ts` releasing on a settled turn while `idle` is unset.
  */
 await check("run, shell and the per-execution reminder end the container the same way", async () => {
   const run = run9.tools.find((t) => t.name === "run")!.summary;
   const shell = run9.tools.find((t) => t.name === "shell")!.summary;
   const reminder = boxReminder("box");
   for (const [where, text] of [["run", run], ["shell", shell], ["the reminder", reminder]] as const) {
-    // Each says the box survives calls…
-    if (!/persists between calls|across calls/.test(text)) {
-      throw new Error(`${where} no longer says the container survives calls: ${text.slice(0, 120)}`);
+    // Each says how far the container reaches: every call in this turn, which
+    // is the part an agent can plan against.
+    if (!/every call in this turn|same one for every call in this turn|this turn uses the same one/.test(text)) {
+      throw new Error(`${where} no longer says the container is the same one for every call in this turn: ${text.slice(0, 160)}`);
     }
-    // …and each says the same thing about how it ends. Today that is "when you
-    // release it", because the lease is off until the two numbers are set; the
-    // day they are, all three gain the idle clause together and this assertion
-    // changes with them. What must never differ is the three of them.
-    if (!/release/.test(text)) {
-      throw new Error(`${where} says the box survives calls without saying what ends it: ${text.slice(0, 160)}`);
+    // …and each says the same thing about where it stops. An agent that reads
+    // only one of the three must not come away planning a second turn in a
+    // container that will not be there.
+    if (!/handed back when the turn ends/.test(text)) {
+      throw new Error(`${where} says the box survives calls without saying the turn ends it: ${text.slice(0, 160)}`);
+    }
+    // The sentence that was wrong for as long as it existed. It is refused by
+    // name, because "persists between calls" is exactly what someone tidying
+    // this wording would write again.
+    if (/persists between calls|persists across calls|until you release it/.test(text)) {
+      throw new Error(`${where} promises the container outlives the turn, which no deployment does: ${text.slice(0, 160)}`);
     }
     if (/goes idle|idle long enough/.test(text)) {
       throw new Error(`${where} promises the idle question while the lease is off: ${text.slice(0, 160)}`);
     }
+  }
+  // What outlives a turn is a kept filesystem, and the reminder is the one an
+  // agent is holding at the moment it matters — when its container is about to
+  // go and it has not saved anything.
+  if (!/\bkeep\b/.test(reminder)) {
+    throw new Error(`the reminder ends the container without naming what survives it: ${reminder}`);
   }
   // When the lease is switched on, the reminder is also the one that has to say
   // silence has a consequence — the other two describe a box that may not exist
