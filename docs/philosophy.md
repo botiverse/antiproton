@@ -19,7 +19,7 @@ Yet, when applied to autonomous, stateful AI agents, the fundamental abstraction
 On traditional Linux abstractions:
 - **State is tied to machines and processes:** To preserve working memory, an agent must reside in-process within a persistent VM or container. Moving or scaling that process online requires distributed coordinators, socket migration, and disk remounting.
 - **Cold starts fight statefulness:** If an idle container is killed to save money, waking it incurs hundreds of milliseconds to seconds of runtime initialization, image pulls, and state deserialization.
-- **The Waiting Dilemma:** Empirical profiling reveals that **model inference latency accounts for ~94% of an agent's total wall-clock time**. In a multi-turn task, the CPU executes logic for mere seconds; the rest is pure network idle time. Keeping a Linux process resident burns compute for waiting; killing it destroys execution continuity.
+- **The Waiting Dilemma:** Empirical profiling reveals that **model inference latency accounts for ~94% of an agent's total wall-clock time** (a completion is ~94% waiting, `docs/pi-upstream.md:75`). In a multi-turn task, the CPU executes logic for mere seconds; the rest is pure network idle time. Keeping a Linux process resident burns compute for waiting; killing it destroys execution continuity.
 
 The answer is not to fight the Linux scheduler to make process migration seamless. The answer is to **change the level of abstraction: the agent's identity does not live on a Linux process interface.**
 
@@ -66,7 +66,7 @@ Antiproton enforces a **Zero-Trust Credential Gate**:
 - **Models address abstract tool aliases (`alias__tool`), never endpoints or keys.**
 - Credentials reside in sealed, encrypted server-side stores and resolve dynamically via `secret_ref`. They never enter model context prompts, execution sandboxes, or audit logs.
 - For outbound HTTP capabilities, credentials must be bound to an explicit whitelist of allowed hosts (`allowedHosts`). The model decides *what* to fetch, but the gateway enforces *where* the credential is authenticated.
-- In evaluations across AppWorld (9 applications, 457 APIs, 79% token-authenticated), the agent completed authentications without ever receiving or logging a single credential token.
+- By construction, the model never receives the token. In our AppWorld benchmark setup (9 applications, 457 APIs, 362 of them [79%] requiring access tokens), the agent operates through gateway-resolved aliases rather than handling bearer credentials; the refusal paths and secret isolation are asserted in `test/gateway-refusals.ts` and `test/secrets.ts`.
 
 ---
 
