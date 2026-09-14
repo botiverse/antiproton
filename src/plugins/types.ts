@@ -494,6 +494,14 @@ export interface Plugin {
    * Called when a person or the agent cancels, and when the runtime's ceiling
    * runs out — a job that cannot end would otherwise hold one of the agent's
    * few concurrent slots and keep billing for as long as it exists.
+   *
+   * **Returning means the work has actually stopped, not that a stop was
+   * requested.** If the plugin cannot confirm that, it rejects, and the
+   * caller — which owns the ledger — decides what to record and whether to
+   * try again. A plugin that swallows the failure here reports a cancellation
+   * that did not happen, and the work keeps running with nothing left that can
+   * name it: that is how a job refused by the cap ran to completion, unlisted
+   * and uncancellable (Vera, 2026-09-14).
    */
   cancelBackground?(handle: Json, ctx: PluginContext): Promise<void>;
   /**
