@@ -4,6 +4,7 @@ import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/typ
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage } from "../plugins/types.ts";
+import { Backgrounded } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
@@ -537,34 +538,21 @@ export class ToolGateway {
       ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
       : null;
     try {
-      const store = this.#store;
-      const secrets = this.#secrets;
-      const mount = r.mount;
-      const connectionFor = (alias: string) => ({
-        get: () => store.getConnection(ctx.tenantId, ctx.agentId, alias),
-        set: (state: Json, expiresAt?: number | null) =>
-          store.putConnection(ctx.tenantId, ctx.agentId, alias, state, expiresAt ?? null),
-      });
-      const result = await plugin.invoke(r.tool, args, {
-        caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
-        alias: mount.alias,
-        credential,
-        publicConfig: mount.publicConfig,
-        // Scoped to the mount, not the plugin: two accounts of the same service
-        // must never see each other's session.
-        connection: connectionFor(mount.alias),
-        async sibling(alias: string) {
-          // Only this agent's own mounts: never a lookup by tenant or by plugin.
-          const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
-          if (!other) return null;
-          return {
-            credential: other.secretRef
-              ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
-              : null,
-            connection: connectionFor(other.alias),
-          };
-        },
-      });
+      const result = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
+      // Checked on the value the plugin returned, before anything serialises
+      // it: the signal is the class, and a copy that went through JSON is data
+      // (Piper, 2026-09-14). The work has started and outlives this call; the
+      // runtime records the job and the operation stays running until it ends.
+      if (result instanceof Backgrounded) {
+        await this.#store.completeOperation(ctx.tenantId, operationId, "running", null);
+        return {
+          status: "running", operationId,
+          background: {
+            alias: r.mount.alias, tool: r.tool, handle: result.handle,
+            ...(result.note !== undefined ? { note: result.note } : {}),
+          },
+        };
+      }
       await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null);
       return { status: "succeeded", operationId, result };
     } catch (err) {
@@ -574,6 +562,68 @@ export class ToolGateway {
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
       return { status, operationId, error: { code: "tool_error", message: e.message } };
     }
+  }
+
+  /**
+   * What a plugin is handed for one of this agent's mounts. One construction
+   * for the call and for everything that comes back to the same work later —
+   * a poll or a cancel sees exactly the context the call saw, credential
+   * included, and nothing about a background job has to travel with it.
+   */
+  #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null) {
+    const store = this.#store;
+    const secrets = this.#secrets;
+    const connectionFor = (alias: string) => ({
+      get: () => store.getConnection(ctx.tenantId, ctx.agentId, alias),
+      set: (state: Json, expiresAt?: number | null) =>
+        store.putConnection(ctx.tenantId, ctx.agentId, alias, state, expiresAt ?? null),
+    });
+    return {
+      caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
+      alias: mount.alias,
+      credential,
+      publicConfig: mount.publicConfig,
+      // Scoped to the mount, not the plugin: two accounts of the same service
+      // must never see each other's session.
+      connection: connectionFor(mount.alias),
+      async sibling(alias: string) {
+        // Only this agent's own mounts: never a lookup by tenant or by plugin.
+        const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+        if (!other) return null;
+        return {
+          credential: other.secretRef
+            ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
+            : null,
+          connection: connectionFor(other.alias),
+        };
+      },
+    };
+  }
+
+  /** The mount, its plugin and a fresh context, for coming back to backgrounded work. */
+  async #backgroundTarget(ctx: CallContext, alias: string) {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    if (!mount) throw new Error(`background work on ${alias}: that mount no longer exists`);
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin) throw new Error(`background work on ${alias}: its plugin is not installed on this deployment`);
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+      : null;
+    return { plugin, context: this.#contextFor(ctx, mount, credential) };
+  }
+
+  /** Has backgrounded work on this mount finished? Asked with the context the call had. */
+  async pollBackground(ctx: CallContext, alias: string, handle: Json) {
+    const { plugin, context } = await this.#backgroundTarget(ctx, alias);
+    if (!plugin.pollBackground) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot report on it`);
+    return plugin.pollBackground(handle, context);
+  }
+
+  /** Stop backgrounded work on this mount. */
+  async cancelBackground(ctx: CallContext, alias: string, handle: Json) {
+    const { plugin, context } = await this.#backgroundTarget(ctx, alias);
+    if (!plugin.cancelBackground) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot stop it`);
+    await plugin.cancelBackground(handle, context);
   }
 
   /**

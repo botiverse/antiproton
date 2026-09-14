@@ -15,6 +15,9 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
 import {
+  admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
+} from "../../src/runtime/background-jobs.ts";
+import {
   bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
@@ -662,14 +665,40 @@ export class AgentRuntime {
     ctx: { tenantId: string; agentId: string; taskId: string },
     /** The reader — offered name and address — or null when it has none. */
     reader: { name: string; address: string } | null,
+    /** What the model was offered, so a job is named the way the model can name it back. */
+    offered: MountedTool[] = [],
   ) {
     const readBack = reader?.name ?? null;
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
+    const sql = this.#deps.ctx.storage.sql;
     return {
       async invoke(call: { tool: string; args: any; opts?: any }): Promise<ToolResult> {
         const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
+        // Work that has started and outlives this call (task #16). The model is
+        // told at once that it may keep going; the job is checked on the alarm
+        // and its result comes back as a message.
+        if (res.status === "running" && res.background) {
+          const owner = { tenantId: ctx.tenantId, agentId: ctx.agentId };
+          const bg = res.background;
+          const shown = offered.find((t) => t.address === call.tool)?.name ?? call.tool;
+          const admit = admitBackground(runningBackgroundJobs(sql, owner));
+          if (!admit.ok) {
+            // Only the plugin knows which calls go to the background, and it
+            // knows when it returns, so the cap is applied then: the job over it
+            // is stopped at once rather than left running unattended.
+            await gw.cancelBackground(ctx, bg.alias, bg.handle).catch(() => {});
+            await store.completeOperation(ctx.tenantId, res.operationId, "cancelled", null);
+            return { status: "rejected", error: { code: "background_limit", message: admit.message } };
+          }
+          const session = ctx.taskId === LEGACY_TASK ? MAIN_SESSION : ctx.taskId;
+          recordBackgroundJob(sql, owner, { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle });
+          return {
+            status: "succeeded", operationId: res.operationId,
+            result: startedResult({ id: res.operationId, mount: bg.alias, tool: shown }, bg.note) as unknown as Json,
+          };
+        }
         if (res.status !== "succeeded") return res;
         const body = JSON.stringify(res.result);
         const limit = limitForCall(call.tool, reader);
@@ -896,23 +925,36 @@ export class AgentRuntime {
     const reader = readTool ? { name: readTool.name, address: readTool.address } : null;
     const offered = withLimitNote(tools as MountedTool[], reader);
     const host = this.#host(
-      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader);
+      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered);
     const store = this.store;
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
     // plugin — so it is built here and handed to open beside the mounts. It
     // has to be in that list: open reconciles the names a session remembers
     // against it, and a tool added afterwards was removed on every reopen.
-    const extraTools = sandbox
-      ? [runJsTool(this.#executor as any, host, {
-          onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
-          // So a script names a tool the way the model's own list names it.
-          tools: offered,
-          // So a stale name for a mount that cannot be offered is answered with
-          // the reason, not as a typo.
-          unoffered,
-        })]
-      : [];
+    // An agent's background work is its own to see and to stop (task #16), and
+    // like run_js this tool's body is this object, not a plugin.
+    const jobs = jobsTool({
+      sql: this.#deps.ctx.storage.sql,
+      owner: { tenantId, agentId },
+      cancel: (job) => this.#gateway.cancelBackground(
+        { tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session },
+        job.mount, job.handle as Json),
+      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+    });
+    const extraTools = [
+      ...(sandbox
+        ? [runJsTool(this.#executor as any, host, {
+            onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+            // So a script names a tool the way the model's own list names it.
+            tools: offered,
+            // So a stale name for a mount that cannot be offered is answered with
+            // the reason, not as a typo.
+            unoffered,
+          })]
+        : []),
+      jobs,
+    ];
 
     const agent = await PiAgent.open({
       host: this.#deps.ctx.storage,
@@ -998,9 +1040,22 @@ export class AgentRuntime {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
     ensureAgentTables(sql);
+    // Background work first (task #16). A job that ended is delivered as a
+    // message, which marks its session as having work, so the loop below steps
+    // it in this same pass; the rest say when they want checking again.
+    const owner = { tenantId, agentId };
+    const jobCtx = (job: { session: string }) =>
+      ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
+    const bg = await runBackgroundPass({
+      sql, owner,
+      poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json),
+      cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json),
+      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+      deliver: async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); },
+    });
     const sessions = sessionsWithWork(sql);
     if (!sessions.length) sessions.push(MAIN_SESSION);
-    let open = 0, wakeInMs: number | null = null;
+    let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
     for (const session of sessions) {
       const agent = await this.agent(tenantId, agentId, session);
@@ -1014,7 +1069,11 @@ export class AgentRuntime {
     // by handing it back at once, or, where the deployment leases them, by
     // asking the agent first and taking it at the ceiling.
     let releaseFailed: Array<{ alias: string; error: string }> = [];
-    if (this.#deps.autoRelease !== false && open === 0) {
+    // A turn that settled while background work runs has not finished using
+    // its containers: releasing now would take the machine out from under the
+    // job, which is the normal case, since the model keeps working (task #16).
+    const backgroundRunning = runningBackgroundJobs(sql, owner).length > 0;
+    if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning) {
       if (!this.#deps.idle) {
         if (settled.length) {
           const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
@@ -1058,7 +1117,12 @@ export class AgentRuntime {
     const offeredName = (alias: string, tool: string) =>
       (tools as MountedTool[]).find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
 
+    // A background exec does not touch lastUsedAt, so a box running one looks
+    // idle for as long as the command runs; reclaim would take the machine out
+    // from under it (Piper, 2026-09-14). The job table knows; the box does not.
+    const busy = mountsWithRunningJobs(sql, { tenantId, agentId });
     for (const mount of await this.store.listMounts(tenantId, agentId)) {
+      if (busy.has(mount.alias)) continue;
       const state = (await this.store.getConnection(tenantId, agentId, mount.alias)) as any;
       const boxId = typeof state?.boxId === "string" ? state.boxId : "";
       const lastUsedAt = Number(state?.lastUsedAt) || 0;

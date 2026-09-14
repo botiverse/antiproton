@@ -9,7 +9,9 @@ import type { Json } from "./types.ts";
  */
 export type ToolResult =
   | { status: "succeeded"; operationId: string; result: Json }
-  | { status: "pending" | "running"; operationId: string }
+  | { status: "pending"; operationId: string }
+  /** `background`: the work has started and outlives the call (see Backgrounded). */
+  | { status: "running"; operationId: string; background?: { alias: string; tool: string; handle: Json; note?: string } }
   | { status: "failed" | "cancelled" | "unknown"; operationId: string; error?: ToolError }
   | { status: "rejected"; error: ToolError };
 

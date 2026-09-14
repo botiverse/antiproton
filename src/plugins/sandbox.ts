@@ -1,5 +1,6 @@
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
+import { backgrounded } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
 
@@ -30,6 +31,7 @@ export interface SandboxConfig {
   image?: string;
   project?: string;
   timeoutMs?: number;
+  graceMs?: number;
   maxOutputBytes?: number;
   /** Who verifies the credential: the provider's API, or the endpoint itself. */
   verifyWith?: "provider" | "endpoint";
@@ -227,6 +229,87 @@ export function segmentsOf(path: string): string[] {
   return out;
 }
 
+/** The states run9 reports for an execution that will not change again. */
+const TERMINAL = ["succeeded", "failed", "killed", "cancelled", "timeout"];
+
+/** This mount's settings, defaults filled in. */
+function cfgOf(ctx: PluginContext) {
+  // No written return type: the spread of a partial over the defaults is the
+  // truth here, and an annotation beside it would be a second statement of the
+  // same thing, free to disagree with it.
+  return { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
+}
+
+/**
+ * A caller for run9's API under this mount's credential.
+ *
+ * Lifted out of `invoke` because polling and cancelling happen outside a call
+ * and need the same door — with the same credential resolution, so there is
+ * one place that knows how to talk to run9 rather than three that agree.
+ */
+function apiFor(cfg: ReturnType<typeof cfgOf>, ctx: PluginContext) {
+  if (!ctx.credential) throw new Error("run9 mount has no credential");
+  const cred = JSON.parse(ctx.credential) as Run9Credential;
+  const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
+  return async (method: string, path: string, body?: unknown) => {
+    const res = await fetch(cfg.endpoint + path, {
+      method,
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(cfg.timeoutMs),
+    });
+    const text = await res.text();
+    let parsed: any = text;
+    try { parsed = JSON.parse(text); } catch { /* plain text error */ }
+    if (!res.ok) throw new Error(`run9 ${method} ${path} -> ${res.status}: ${String(text).slice(0, 200)}`);
+    return parsed;
+  };
+}
+
+/**
+ * What an execution looks like once it will not change again.
+ *
+ * One function, because the call may finish the work itself or hand it over
+ * and have it finished elsewhere, and the two must produce the same thing.
+ * Built in both places instead, they would be two rules about one shape, and
+ * the pair would drift the first time either was edited (#291).
+ */
+export function finished(
+  rec: any,
+  cfg: ReturnType<typeof cfgOf>,
+  state: BoxState | null,
+  alias: string,
+): Record<string, unknown> {
+  const out = String(rec.output_summary ?? "");
+  return {
+    state: rec.state,
+    exitCode: rec.exit_code ?? null,
+    // "container", never "sandbox": the harness already calls the per-execution
+    // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
+    // nothing between executions" concluded this box was volatile too — which
+    // would have it reinstalling packages on every call.
+    reminder: boxReminder(alias),
+    ...execOutput(out, cfg.maxOutputBytes),
+    box: state?.boxId ?? null,
+    // So the agent learns the environment from a result it already has,
+    // instead of spending turns probing for an interpreter.
+    image: cfg.image,
+    ...(state?.envs?.length ? { kept: state.envs.map((e) => e.name) } : {}),
+    ...(state?.placeholders && Object.keys(state.placeholders).length
+      ? {
+          credentials: Object.entries(state.placeholders).map(([name, ph]) => ({
+            name, writeThis: ph,
+            toHosts: (cfg.secrets ?? []).find((d) => d.name === name)?.hosts ?? [],
+            header: (cfg.secrets ?? []).find((d) => d.name === name)?.header,
+          })),
+          note: "write the placeholder where the credential would go; it is substituted " +
+            "on the way out, only for those hosts. You cannot read the value, and neither " +
+            "can anything running in this container.",
+        }
+      : {}),
+  };
+}
+
 export function asBoxState(v: Json): BoxState | null {
   if (!v || typeof v !== "object") return null;
   const o = v as Record<string, unknown>;
@@ -274,6 +357,7 @@ const DEFAULTS = {
   image: "public.ecr.aws/docker/library/node:22-alpine",
   project: "default",
   timeoutMs: 120_000,
+  graceMs: 5_000,
   maxOutputBytes: 24_000,
   maxQuietMinutes: 60,
 };
@@ -496,7 +580,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     { name: "shellPrefix", type: "string", summary: "Prepended to every shell command — for images whose toolchain lives in an environment a plain shell never enters." },
     { name: "network", type: "string", choices: ["open", "none"], default: "open",
       summary: "\"open\" or \"none\". With none every command runs in an empty network namespace: no route out, not even DNS." },
-    { name: "timeoutMs", type: "number", summary: "How long one call may take.", default: 120000 },
+    { name: "timeoutMs", type: "number", summary: "How long one request to the provider may take.", default: 120000 },
+    { name: "graceMs", type: "number", default: 5000,
+      summary: "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on." },
     { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
     { name: "secrets", type: "string[]", references: "credential",
       summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
@@ -1076,51 +1162,59 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     );
     const execId = started.exec_id as string;
 
-    const deadline = Date.now() + cfg.timeoutMs;
+    // The work has begun. From here the call may finish it or hand it over,
+    // and both have to produce the same thing — `finished` is that thing, in
+    // one place, because a result built twice is two rules about one shape
+    // and they drift (the lesson of #291).
+    await ctx.connection.set({
+      ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1,
+    } as unknown as Json);
+
+    const grace = Date.now() + cfg.graceMs;
     for (;;) {
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${execId}`);
-      if (["succeeded", "failed", "killed", "cancelled", "timeout"].includes(rec.state)) {
-        const out = String(rec.output_summary ?? "");
-        await ctx.connection.set({
-          ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1,
-        } as unknown as Json);
-        return {
-          state: rec.state,
-          exitCode: rec.exit_code ?? null,
-          // "container", never "sandbox": the harness already calls the per-execution
-          // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
-          // nothing between executions" concluded this box was volatile too — which
-          // would have it reinstalling packages on every call.
-          reminder: boxReminder(ctx.alias),
-          ...execOutput(out, cfg.maxOutputBytes),
-          box: state.boxId,
-          // So the agent learns the environment from a result it already has,
-          // instead of spending turns probing for an interpreter.
-          image: cfg.image,
-          ...(state.envs?.length
-            ? { kept: state.envs.map((e) => e.name) }
-            : {}),
-          ...(state.placeholders && Object.keys(state.placeholders).length
-            ? {
-                credentials: Object.entries(state.placeholders).map(([name, ph]) => ({
-                  name, writeThis: ph,
-                  toHosts: (cfg.secrets ?? []).find((d) => d.name === name)?.hosts ?? [],
-                  header: (cfg.secrets ?? []).find((d) => d.name === name)?.header,
-                })),
-                note: "write the placeholder where the credential would go; it is substituted " +
-                  "on the way out, only for those hosts. You cannot read the value, and neither " +
-                  "can anything running in this container.",
-              }
-            : {}),
-        };
-      }
-      if (Date.now() > deadline) {
-        // Leaving it running would burn the tenant's quota unattended.
-        await api("POST", `/projects/${cfg.project}/workspace/execs/${execId}/kill`).catch(() => {});
-        throw new Error(`run9 exec ${execId} exceeded ${cfg.timeoutMs}ms and was killed`);
+      if (TERMINAL.includes(rec.state)) return finished(rec, cfg, state, ctx.alias);
+      if (Date.now() > grace) {
+        // Handed over rather than waited on: the turn is serialised while this
+        // call is open (`exclusive`), so waiting here costs the agent every
+        // other tool it might have run and every thought it might have had
+        // (cody measured three quarters of billed Worker time on SWE-bench).
+        // The ceiling that used to live here is the runtime's now, and so is
+        // the cancelling — `timeoutMs` no longer means "how long the Worker
+        // holds".
+        return backgrounded(
+          { boxId: state.boxId, execId },
+          `running in the container; its result arrives on its own, and \`jobs\` lists what is running`,
+        );
       }
       await new Promise((r) => setTimeout(r, 1200));
     }
   },
+
+  /** One look at the execution, with no waiting and nothing written. */
+  async pollBackground(handle, ctx) {
+    const cfg = cfgOf(ctx);
+    const h = handle as { boxId?: string; execId?: string };
+    if (!h?.execId) throw new Error("not an execution handle");
+    const api = apiFor(cfg, ctx);
+    const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${h.execId}`);
+    if (!TERMINAL.includes(rec.state)) return { done: false, progress: { state: rec.state } };
+    // The box as it was when the work started: this runs outside the call, and
+    // writing connection state from here would race a second job finishing at
+    // the same moment — the read-modify-write `exclusive` exists to prevent,
+    // in a new place (Piper, 2026-09-14).
+    const state = asBoxState(await ctx.connection.get());
+    return { done: true, result: finished(rec, cfg, state, ctx.alias) as Json };
+  },
+
+  /** Stop it and stop paying for it. */
+  async cancelBackground(handle, ctx) {
+    const cfg = cfgOf(ctx);
+    const h = handle as { execId?: string };
+    if (!h?.execId) return;
+    const api = apiFor(cfg, ctx);
+    await api("POST", `/projects/${cfg.project}/workspace/execs/${h.execId}/kill`).catch(() => {});
+  },
+
   };
 }
