@@ -30,6 +30,24 @@ export interface BackgroundJob {
 export const BACKGROUND_CAP = 3;
 
 /**
+ * How long a background call may run before it is cancelled. Not because long
+ * work is wrong — that is what backgrounding is for — but because a job that
+ * never ends holds one of the agent's slots and is billed for as long as it
+ * runs (Piper, 2026-09-14).
+ */
+export const BACKGROUND_MAX_MS = 30 * 60_000;
+
+export interface JobOwner {
+  tenantId: string;
+  agentId: string;
+}
+
+/** Past the ceiling: the poller cancels it through the plugin and finishes it as failed. */
+export function overdueBackground(job: Pick<BackgroundJob, "createdAt">, now: number = Date.now(), maxMs: number = BACKGROUND_MAX_MS): boolean {
+  return now - job.createdAt > maxMs;
+}
+
+/**
  * Whether one more background job may start. The refusal names what is
  * running, because the useful next step is to wait for one or cancel one, and
  * the agent cannot do either without the ids.
@@ -87,10 +105,17 @@ type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): unknown[]
  * One row per background call, in the agent's own object. `next_poll_at` is
  * what the alarm reads: the object sleeps until the soonest one, and a job
  * that is not due costs nothing.
+ *
+ * The table is already this agent's alone (one object per agent, claimed on
+ * first use), and every read still names the owner: a handle goes back to a
+ * plugin to be polled or cancelled, and a query that forgot whose it was would
+ * send another agent's work there (Piper, 2026-09-14; the same lesson as the
+ * artifact references).
  */
 export function ensureBackgroundTable(sql: Sql) {
   sql.exec(`CREATE TABLE IF NOT EXISTS background_jobs (
-    id TEXT PRIMARY KEY, session TEXT NOT NULL, mount TEXT NOT NULL, tool TEXT NOT NULL,
+    id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+    session TEXT NOT NULL, mount TEXT NOT NULL, tool TEXT NOT NULL,
     handle TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
     finished_at INTEGER, polls INTEGER NOT NULL DEFAULT 0, next_poll_at INTEGER NOT NULL,
     outcome TEXT)`);
@@ -104,49 +129,58 @@ const rowToJob = (r: any): BackgroundJob => ({
 });
 
 export function recordBackgroundJob(
-  sql: Sql, job: { id: string; session: string; mount: string; tool: string; handle: unknown }, now: number = Date.now(),
+  sql: Sql, owner: JobOwner, job: { id: string; session: string; mount: string; tool: string; handle: unknown }, now: number = Date.now(),
 ) {
   ensureBackgroundTable(sql);
   sql.exec(
-    "INSERT INTO background_jobs(id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES (?,?,?,?,?,'running',?,0,?)",
-    job.id, job.session, job.mount, job.tool, JSON.stringify(job.handle ?? null), now, now + nextPollDelay(0));
+    "INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES (?,?,?,?,?,?,?,'running',?,0,?)",
+    job.id, owner.tenantId, owner.agentId, job.session, job.mount, job.tool, JSON.stringify(job.handle ?? null), now, now + nextPollDelay(0));
 }
 
-export function runningBackgroundJobs(sql: Sql): BackgroundJob[] {
+export function runningBackgroundJobs(sql: Sql, owner: JobOwner): BackgroundJob[] {
   ensureBackgroundTable(sql);
-  return sql.exec("SELECT * FROM background_jobs WHERE state = 'running' ORDER BY created_at ASC").toArray().map(rowToJob);
+  return sql.exec("SELECT * FROM background_jobs WHERE tenant_id = ? AND agent_id = ? AND state = 'running' ORDER BY created_at ASC",
+    owner.tenantId, owner.agentId).toArray().map(rowToJob);
 }
 
-export function dueBackgroundJobs(sql: Sql, now: number = Date.now()): BackgroundJob[] {
+/** Mounts with work still running: idle reclaim must not release their boxes (Piper, 2026-09-14). */
+export function mountsWithRunningJobs(sql: Sql, owner: JobOwner): Set<string> {
+  return new Set(runningBackgroundJobs(sql, owner).map((j) => j.mount));
+}
+
+export function dueBackgroundJobs(sql: Sql, owner: JobOwner, now: number = Date.now()): BackgroundJob[] {
   ensureBackgroundTable(sql);
-  return sql.exec("SELECT * FROM background_jobs WHERE state = 'running' AND next_poll_at <= ? ORDER BY next_poll_at ASC", now)
-    .toArray().map(rowToJob);
+  return sql.exec("SELECT * FROM background_jobs WHERE tenant_id = ? AND agent_id = ? AND state = 'running' AND next_poll_at <= ? ORDER BY next_poll_at ASC",
+    owner.tenantId, owner.agentId, now).toArray().map(rowToJob);
 }
 
 /** A check that found the job still running: count it and schedule the next. */
-export function markPolled(sql: Sql, id: string, now: number = Date.now()) {
-  const row = sql.exec("SELECT polls FROM background_jobs WHERE id = ?", id).toArray()[0] as any;
+export function markPolled(sql: Sql, owner: JobOwner, id: string, now: number = Date.now()) {
+  const row = sql.exec("SELECT polls FROM background_jobs WHERE id = ? AND tenant_id = ? AND agent_id = ?",
+    id, owner.tenantId, owner.agentId).toArray()[0] as any;
   if (!row) return;
   const polls = Number(row.polls) + 1;
-  sql.exec("UPDATE background_jobs SET polls = ?, next_poll_at = ? WHERE id = ? AND state = 'running'",
-    polls, now + nextPollDelay(polls), id);
+  sql.exec("UPDATE background_jobs SET polls = ?, next_poll_at = ? WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'",
+    polls, now + nextPollDelay(polls), id, owner.tenantId, owner.agentId);
 }
 
 /** Only a running job finishes, so a late answer cannot overwrite a cancel. Returns whether it did. */
 export function finishBackgroundJob(
-  sql: Sql, id: string, outcome: { state: "done" | "failed" | "cancelled"; result?: unknown; error?: string }, now: number = Date.now(),
+  sql: Sql, owner: JobOwner, id: string, outcome: { state: "done" | "failed" | "cancelled"; result?: unknown; error?: string }, now: number = Date.now(),
 ): boolean {
-  const before = sql.exec("SELECT state FROM background_jobs WHERE id = ?", id).toArray()[0] as any;
+  const before = sql.exec("SELECT state FROM background_jobs WHERE id = ? AND tenant_id = ? AND agent_id = ?",
+    id, owner.tenantId, owner.agentId).toArray()[0] as any;
   if (!before || before.state !== "running") return false;
-  sql.exec("UPDATE background_jobs SET state = ?, finished_at = ?, outcome = ? WHERE id = ? AND state = 'running'",
-    outcome.state, now, JSON.stringify({ result: outcome.result ?? null, error: outcome.error ?? null }), id);
+  sql.exec("UPDATE background_jobs SET state = ?, finished_at = ?, outcome = ? WHERE id = ? AND tenant_id = ? AND agent_id = ? AND state = 'running'",
+    outcome.state, now, JSON.stringify({ result: outcome.result ?? null, error: outcome.error ?? null }), id, owner.tenantId, owner.agentId);
   return true;
 }
 
 /** Milliseconds until the soonest check, or null when nothing is running: the alarm stands down. */
-export function nextBackgroundWake(sql: Sql, now: number = Date.now()): number | null {
+export function nextBackgroundWake(sql: Sql, owner: JobOwner, now: number = Date.now()): number | null {
   ensureBackgroundTable(sql);
-  const row = sql.exec("SELECT MIN(next_poll_at) AS at FROM background_jobs WHERE state = 'running'").toArray()[0] as any;
+  const row = sql.exec("SELECT MIN(next_poll_at) AS at FROM background_jobs WHERE tenant_id = ? AND agent_id = ? AND state = 'running'",
+    owner.tenantId, owner.agentId).toArray()[0] as any;
   if (!row || row.at === null || row.at === undefined) return null;
   return Math.max(0, Number(row.at) - now);
 }
