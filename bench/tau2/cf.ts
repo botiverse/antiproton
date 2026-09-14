@@ -161,8 +161,11 @@ async function pushForAnswer(taskId: string): Promise<string | null> {
 }
 
 function oneSocket(taskId: string, deadline: number): Promise<string | null> {
-  const ws = new WebSocket(BASE.replace(/^http/, "ws") + withObj(
-    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`));
+  // The token goes on the upgrade too: /bench/* is gated (task #15), and a
+  // refused upgrade reaches a WebSocket client only as close 1006 with no body,
+  // which this runner then scored as a stalled agent (Vera, 2026-09-14).
+  const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
+    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
   return new Promise<string | null>((resolve) => {
     const stop = (v: string | null) => {
       clearInterval(keepalive); clearTimeout(timer);
