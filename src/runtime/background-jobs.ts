@@ -148,6 +148,29 @@ export function runningBackgroundJobs(sql: Sql, owner: JobOwner): BackgroundJob[
 }
 
 /** Mounts with work still running: idle reclaim must not release their boxes (Piper, 2026-09-14). */
+/**
+ * The owner's most recent jobs, newest first, as an operator reads them: how
+ * each one ended, not only which are still running. Without this, whether a
+ * refused or finished job really stopped could only be inferred from the last
+ * few transcript events, which scroll away (Vera, 2026-09-14). The handle is
+ * left out; the outcome is cut short.
+ */
+export function recentBackgroundJobs(sql: Sql, owner: JobOwner, limit = 10) {
+  ensureBackgroundTable(sql);
+  const cut = (v: unknown) => (v === null || v === undefined ? null : (typeof v === "string" ? v : JSON.stringify(v)).slice(0, 300));
+  return (sql.exec(
+    "SELECT * FROM background_jobs WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+    owner.tenantId, owner.agentId, limit).toArray() as any[]).map((r) => {
+    let outcome: { result?: unknown; error?: unknown } = {};
+    try { outcome = r.outcome ? JSON.parse(String(r.outcome)) : {}; } catch { outcome = { error: String(r.outcome) }; }
+    return {
+      id: String(r.id), session: String(r.session), mount: String(r.mount), tool: String(r.tool), state: String(r.state),
+      createdAt: Number(r.created_at), finishedAt: r.finished_at === null || r.finished_at === undefined ? null : Number(r.finished_at),
+      polls: Number(r.polls), error: cut(outcome.error), result: cut(outcome.result),
+    };
+  });
+}
+
 export function mountsWithRunningJobs(sql: Sql, owner: JobOwner): Set<string> {
   return new Set(runningBackgroundJobs(sql, owner).map((j) => j.mount));
 }

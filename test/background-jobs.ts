@@ -4,7 +4,7 @@
  */
 import {
   admitBackground, BACKGROUND_CAP, BACKGROUND_MAX_MS, BACKGROUND_STOP_GRACE_MS, completionMessage, dueBackgroundJobs, finishBackgroundJob, markPolled,
-  jobsTool, mountsWithRunningJobs, refuseOverCap, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
+  jobsTool, recentBackgroundJobs, mountsWithRunningJobs, refuseOverCap, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
 } from "../src/runtime/background-jobs.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -226,6 +226,22 @@ await check("when stopping fails, the refused call is still tracked and the agen
     assert(!r.stopRequested, "a failed stop was reported as requested");
     assert(runningBackgroundJobs(sql, me).some((j) => j.id === "j4"), "a job that could not be stopped was dropped");
     assert(/still running as background job j4/.test(r.message) && r.message.includes("409"), `the failure is not told: ${r.message}`);
+  } finally { host.dispose(); }
+});
+
+await check("recent jobs for the operator: this owner's only, newest first, with how each ended, cut short", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    recordBackgroundJob(sql, me, { id: "old", session: "main", mount: "sandbox", tool: "sandbox__shell", handle: { execId: "e1" } }, now);
+    recordBackgroundJob(sql, me, { id: "new", session: "main", mount: "sandbox", tool: "sandbox__shell", handle: { execId: "e2" } }, now + 1000);
+    recordBackgroundJob(sql, { tenantId: me.tenantId, agentId: "someone-else" }, { id: "theirs", session: "main", mount: "sandbox", tool: "x", handle: {} }, now + 2000);
+    finishBackgroundJob(sql, me, "old", { state: "failed", error: "x".repeat(1000) }, now + 5000);
+    const rows = recentBackgroundJobs(sql, me, 10);
+    assert(rows.map((r) => r.id).join() === "new,old", `rows ${rows.map((r) => r.id)}`);
+    assert(rows[0]!.state === "running" && rows[0]!.finishedAt === null, `running row ${JSON.stringify(rows[0])}`);
+    assert(rows[1]!.state === "failed" && rows[1]!.finishedAt === now + 5000 && rows[1]!.error?.length === 300, `finished row ${JSON.stringify(rows[1]).slice(0, 200)}`);
+    assert(!JSON.stringify(rows).includes("execId"), "the handle was included");
+    assert(recentBackgroundJobs(sql, me, 1).length === 1, "the limit was not applied");
   } finally { host.dispose(); }
 });
 
