@@ -1,5 +1,6 @@
 import type { Plugin, PluginContext } from "./types.ts";
-import { READ_WHOLE_MAX, readableKey } from "./artifacts.ts";
+import { READ_WHOLE_MAX } from "./artifacts.ts";
+import { toAgentRef } from "../store/refs.ts";
 import type { StorageAdapter } from "../core/store.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import type { Json } from "../core/types.ts";
@@ -225,7 +226,11 @@ export function statePlugin(
         // having, so they keep their own name rather than the listing's, and
         // they are the whole store while `keys` is what the prefix and the
         // limit selected.
-        return { keys: rows, total: { keys: usage.keys, bytes: usage.bytes } };
+        // Each row's reference as this agent may be shown it; null where the
+        // stored key names nothing of its own, which is the same answer `get`
+        // gives for that row.
+        const shownRows = rows.map((r: any) => ({ ...r, ref: r.ref ? toAgentRef(r.ref, ctx.caller) : null }));
+        return { keys: shownRows, total: { keys: usage.keys, bytes: usage.bytes } };
       }
 
       const key = String(a.key ?? "");
@@ -249,7 +254,13 @@ export function statePlugin(
         case "get": {
           const got = await store.getState(tenantId, agentId, key);
           if (!got) return { key, found: false };
-          if (got.ref && !readableKey(got.ref.replace(/^r2:\/\/[^/]+\//, ""))) {
+          // What this agent may be shown, and whether it may be shown anything:
+          // `toAgentRef` is null exactly when the stored key names nothing of
+          // this agent's — a legacy row whose key moves through the path. The
+          // same call answers "can it be read" and "what do we hand over", so
+          // the two cannot disagree.
+          const shown = got.ref ? toAgentRef(got.ref, ctx.caller) : null;
+          if (got.ref && shown === null) {
             // A row written before the reader refused these segments: the value
             // is there and cannot be fetched. Offering the read call anyway
             // hands the model an instruction that fails, and nothing in the
@@ -276,12 +287,12 @@ export function statePlugin(
             // fresh agent on f0a3bcc, 2026-09-13).
             const whole = got.bytes <= READ_WHOLE_MAX;
             return {
-              key, found: true, bytes: got.bytes, ref: got.ref,
+              key, found: true, bytes: got.bytes, ref: shown,
               note: whole
                 ? `too large to return here; read it from the artifacts mount: `
-                  + `read { ref: "${got.ref}" }`
+                  + `read { ref: "${shown}" }`
                 : `too large to return here, and too large to read back in one call; page it from `
-                  + `the artifacts mount: read { ref: "${got.ref}", from: 0 } — each page's note gives the next`,
+                  + `the artifacts mount: read { ref: "${shown}", from: 0 } — each page's note gives the next`,
             };
           }
           return { key, found: true, bytes: got.bytes, updatedAt: got.updatedAt, value: got.value };
@@ -331,7 +342,7 @@ export function statePlugin(
           await store.putState(tenantId, agentId, key, {
             value: null, ref: stored.ref, bytes: body.length,
           });
-          return { key, bytes: body.length, stored: "object-storage", ref: stored.ref };
+          return { key, bytes: body.length, stored: "object-storage", ref: toAgentRef(stored.ref, ctx.caller) };
         }
       }
       throw new Error(`unknown tool: ${tool}`);
