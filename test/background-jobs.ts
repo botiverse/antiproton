@@ -2,7 +2,11 @@
  * The rules a background tool call is held to (task #16): how many may run,
  * how often they are checked, and what the agent is told at start and end.
  */
-import { admitBackground, BACKGROUND_CAP, completionMessage, nextPollDelay, startedResult } from "../src/runtime/background-jobs.ts";
+import {
+  admitBackground, BACKGROUND_CAP, completionMessage, dueBackgroundJobs, finishBackgroundJob, markPolled,
+  nextBackgroundWake, nextPollDelay, recordBackgroundJob, runningBackgroundJobs, startedResult,
+} from "../src/runtime/background-jobs.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -46,6 +50,36 @@ await check("the completion message names the job and carries the result or the 
   assert(done.includes('"exitCode":0'), `result missing: ${done}`);
   const failed = completionMessage(job("j2"), { state: "failed", error: "box gone" }, now);
   assert(failed.includes("failed") && failed.includes("box gone"), `error missing: ${failed}`);
+});
+
+await check("the job table: recorded, due on schedule, polled forward, and the soonest wake", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    assert(nextBackgroundWake(sql, now) === null, "nothing running, yet the alarm was asked to wake");
+    recordBackgroundJob(sql, { id: "j1", session: "main", mount: "node", tool: "shell", handle: { boxId: "b", execId: "e1" } }, now);
+    recordBackgroundJob(sql, { id: "j2", session: "s2", mount: "node", tool: "run", handle: { execId: "e2" } }, now + 1_000);
+    const running = runningBackgroundJobs(sql);
+    assert(running.length === 2 && running[0]!.id === "j1", `running: ${JSON.stringify(running.map((j) => j.id))}`);
+    assert((running[0]!.handle as any).execId === "e1", "the handle did not survive the round trip");
+    assert(nextBackgroundWake(sql, now) === 2_000, `first wake ${nextBackgroundWake(sql, now)}`);
+    assert(dueBackgroundJobs(sql, now + 1_999).length === 0, "a job was due before its first check");
+    assert(dueBackgroundJobs(sql, now + 2_000).map((j) => j.id).join() === "j1", "j1 was not due at 2 s");
+    markPolled(sql, "j1", now + 2_000);
+    assert(dueBackgroundJobs(sql, now + 2_001).map((j) => j.id).join() === "", "a polled job stayed due");
+    assert(nextBackgroundWake(sql, now + 2_000) === 1_000, `wake after polling j1: ${nextBackgroundWake(sql, now + 2_000)}`);
+  } finally { host.dispose(); }
+});
+
+await check("a finished or cancelled job stays finished: a late answer cannot overwrite it", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    recordBackgroundJob(sql, { id: "j1", session: "main", mount: "node", tool: "shell", handle: {} }, now);
+    assert(finishBackgroundJob(sql, "j1", { state: "cancelled" }, now + 5_000), "a running job could not be cancelled");
+    assert(!finishBackgroundJob(sql, "j1", { state: "done", result: { exitCode: 0 } }, now + 9_000), "a late result overwrote the cancel");
+    assert(runningBackgroundJobs(sql).length === 0, "a cancelled job still counts as running");
+    assert(nextBackgroundWake(sql, now) === null, "a finished job still asks the alarm to wake");
+    assert(!finishBackgroundJob(sql, "nope", { state: "done" }, now), "an unknown job was finished");
+  } finally { host.dispose(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

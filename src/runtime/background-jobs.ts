@@ -79,3 +79,74 @@ export function completionMessage(
   if (outcome.state === "failed") return `${head}\n${outcome.error ?? "failed without a message"}`;
   return head;
 }
+
+/** The two methods of a Durable Object's SQL a job table needs; node:sqlite provides the same pair in tests. */
+type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): unknown[] } };
+
+/**
+ * One row per background call, in the agent's own object. `next_poll_at` is
+ * what the alarm reads: the object sleeps until the soonest one, and a job
+ * that is not due costs nothing.
+ */
+export function ensureBackgroundTable(sql: Sql) {
+  sql.exec(`CREATE TABLE IF NOT EXISTS background_jobs (
+    id TEXT PRIMARY KEY, session TEXT NOT NULL, mount TEXT NOT NULL, tool TEXT NOT NULL,
+    handle TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+    finished_at INTEGER, polls INTEGER NOT NULL DEFAULT 0, next_poll_at INTEGER NOT NULL,
+    outcome TEXT)`);
+}
+
+const rowToJob = (r: any): BackgroundJob => ({
+  id: String(r.id), session: String(r.session), mount: String(r.mount), tool: String(r.tool),
+  handle: JSON.parse(String(r.handle)), state: r.state, createdAt: Number(r.created_at),
+  finishedAt: r.finished_at === null || r.finished_at === undefined ? null : Number(r.finished_at),
+  polls: Number(r.polls),
+});
+
+export function recordBackgroundJob(
+  sql: Sql, job: { id: string; session: string; mount: string; tool: string; handle: unknown }, now: number = Date.now(),
+) {
+  ensureBackgroundTable(sql);
+  sql.exec(
+    "INSERT INTO background_jobs(id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES (?,?,?,?,?,'running',?,0,?)",
+    job.id, job.session, job.mount, job.tool, JSON.stringify(job.handle ?? null), now, now + nextPollDelay(0));
+}
+
+export function runningBackgroundJobs(sql: Sql): BackgroundJob[] {
+  ensureBackgroundTable(sql);
+  return sql.exec("SELECT * FROM background_jobs WHERE state = 'running' ORDER BY created_at ASC").toArray().map(rowToJob);
+}
+
+export function dueBackgroundJobs(sql: Sql, now: number = Date.now()): BackgroundJob[] {
+  ensureBackgroundTable(sql);
+  return sql.exec("SELECT * FROM background_jobs WHERE state = 'running' AND next_poll_at <= ? ORDER BY next_poll_at ASC", now)
+    .toArray().map(rowToJob);
+}
+
+/** A check that found the job still running: count it and schedule the next. */
+export function markPolled(sql: Sql, id: string, now: number = Date.now()) {
+  const row = sql.exec("SELECT polls FROM background_jobs WHERE id = ?", id).toArray()[0] as any;
+  if (!row) return;
+  const polls = Number(row.polls) + 1;
+  sql.exec("UPDATE background_jobs SET polls = ?, next_poll_at = ? WHERE id = ? AND state = 'running'",
+    polls, now + nextPollDelay(polls), id);
+}
+
+/** Only a running job finishes, so a late answer cannot overwrite a cancel. Returns whether it did. */
+export function finishBackgroundJob(
+  sql: Sql, id: string, outcome: { state: "done" | "failed" | "cancelled"; result?: unknown; error?: string }, now: number = Date.now(),
+): boolean {
+  const before = sql.exec("SELECT state FROM background_jobs WHERE id = ?", id).toArray()[0] as any;
+  if (!before || before.state !== "running") return false;
+  sql.exec("UPDATE background_jobs SET state = ?, finished_at = ?, outcome = ? WHERE id = ? AND state = 'running'",
+    outcome.state, now, JSON.stringify({ result: outcome.result ?? null, error: outcome.error ?? null }), id);
+  return true;
+}
+
+/** Milliseconds until the soonest check, or null when nothing is running: the alarm stands down. */
+export function nextBackgroundWake(sql: Sql, now: number = Date.now()): number | null {
+  ensureBackgroundTable(sql);
+  const row = sql.exec("SELECT MIN(next_poll_at) AS at FROM background_jobs WHERE state = 'running'").toArray()[0] as any;
+  if (!row || row.at === null || row.at === undefined) return null;
+  return Math.max(0, Number(row.at) - now);
+}
