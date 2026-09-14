@@ -15,7 +15,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
 import {
-  admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
+  admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult,
 } from "../../src/runtime/background-jobs.ts";
 import {
   bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
@@ -683,16 +683,21 @@ export class AgentRuntime {
           const owner = { tenantId: ctx.tenantId, agentId: ctx.agentId };
           const bg = res.background;
           const shown = offered.find((t) => t.address === call.tool)?.name ?? call.tool;
-          const admit = admitBackground(runningBackgroundJobs(sql, owner));
-          if (!admit.ok) {
-            // Only the plugin knows which calls go to the background, and it
-            // knows when it returns, so the cap is applied then: the job over it
-            // is stopped at once rather than left running unattended.
-            await gw.cancelBackground(ctx, bg.alias, bg.handle).catch(() => {});
-            await store.completeOperation(ctx.tenantId, res.operationId, "cancelled", null);
-            return { status: "rejected", error: { code: "background_limit", message: admit.message } };
-          }
           const session = ctx.taskId === LEGACY_TASK ? MAIN_SESSION : ctx.taskId;
+          const running = runningBackgroundJobs(sql, owner);
+          if (!admitBackground(running).ok) {
+            // Only the plugin knows which calls go to the background, and it
+            // knows when it returns, so the cap is applied then. The work has
+            // already started: it is recorded, asked to stop, and tracked until a
+            // poll shows it ended — never dropped on a request whose failure went
+            // unseen (refuseOverCap). The operation stays running until then.
+            const refused = await refuseOverCap({
+              sql, owner, running,
+              job: { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle },
+              cancel: () => gw.cancelBackground(ctx, bg.alias, bg.handle),
+            });
+            return { status: "rejected", error: { code: "background_limit", message: refused.message } };
+          }
           recordBackgroundJob(sql, owner, { id: res.operationId, session, mount: bg.alias, tool: shown, handle: bg.handle });
           return {
             status: "succeeded", operationId: res.operationId,

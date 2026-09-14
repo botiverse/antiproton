@@ -284,3 +284,43 @@ export function jobsTool(d: {
     },
   };
 }
+
+/**
+ * A call that came back running while the agent is already at the cap.
+ *
+ * It has started — the plugin only returns a handle once the work is under way
+ * — so refusing the call does not stop the work. It used to be cancelled in
+ * a fire-and-forget request whose failure was swallowed and then forgotten: the
+ * refused command ran to completion, billed, with no job id, invisible to
+ * `jobs` and beyond the ceiling's reach (Vera, 2026-09-14). So the job is
+ * recorded first, then asked to stop, and it stays tracked until a poll shows
+ * the work really ended. The agent is told the truth: refused, being stopped,
+ * and under which id.
+ */
+export async function refuseOverCap(d: {
+  sql: Sql;
+  owner: JobOwner;
+  job: { id: string; session: string; mount: string; tool: string; handle: unknown };
+  running: Array<Pick<BackgroundJob, "id" | "mount" | "tool" | "createdAt">>;
+  cancel(): Promise<void>;
+  now?: number;
+}): Promise<{ message: string; stopRequested: boolean }> {
+  const now = d.now ?? Date.now();
+  const admit = admitBackground(d.running, BACKGROUND_CAP, now);
+  const over = admit.ok ? "" : admit.message;
+  recordBackgroundJob(d.sql, d.owner, d.job, now);
+  try {
+    await d.cancel();
+    return {
+      stopRequested: true,
+      message: `${over} This call was over the limit and is being stopped as background job ${d.job.id}; ` +
+        "it counts toward the limit until it has actually ended.",
+    };
+  } catch (e) {
+    return {
+      stopRequested: false,
+      message: `${over} This call was over the limit, but stopping it failed (${(e as Error)?.message ?? e}); ` +
+        `it is still running as background job ${d.job.id}. jobs.cancel can try again, and it is cancelled at the ceiling.`,
+    };
+  }
+}
