@@ -14,6 +14,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
+import { mountsWithRunningJobs } from "../../src/runtime/background-jobs.ts";
 import {
   bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
@@ -1058,7 +1059,12 @@ export class AgentRuntime {
     const offeredName = (alias: string, tool: string) =>
       (tools as MountedTool[]).find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
 
+    // A background exec does not touch lastUsedAt, so a box running one looks
+    // idle for as long as the command runs; reclaim would take the machine out
+    // from under it (Piper, 2026-09-14). The job table knows; the box does not.
+    const busy = mountsWithRunningJobs(sql, { tenantId, agentId });
     for (const mount of await this.store.listMounts(tenantId, agentId)) {
+      if (busy.has(mount.alias)) continue;
       const state = (await this.store.getConnection(tenantId, agentId, mount.alias)) as any;
       const boxId = typeof state?.boxId === "string" ? state.boxId : "";
       const lastUsedAt = Number(state?.lastUsedAt) || 0;

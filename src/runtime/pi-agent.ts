@@ -19,6 +19,7 @@
  * memory actually is, and it removes a whole identifier from the system.
  */
 import { createModels } from "@earendil-works/pi-ai";
+import { ensureBackgroundTable } from "./background-jobs.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { LaneBusy } from "@earendil-works/pi-agent-core";
@@ -114,9 +115,13 @@ export function failedRuns(sql: SqlHost["sql"], session: string = MAIN_SESSION):
 }
 
 export function sessionsWithWork(sql: SqlHost["sql"]): string[] {
+  // A background tool call is work too: its session has to be stepped so the
+  // job is checked and its result delivered, even when the lane itself is idle.
+  ensureBackgroundTable(sql as any);
   const rows = sql.exec(
     `SELECT session FROM pi_sessions WHERE active = 1
-     UNION SELECT session FROM pi_model_jobs WHERE answer IS NULL`).toArray() as any[];
+     UNION SELECT session FROM pi_model_jobs WHERE answer IS NULL
+     UNION SELECT session FROM background_jobs WHERE state = 'running'`).toArray() as any[];
   return rows.map((r) => String(r.session));
 }
 
