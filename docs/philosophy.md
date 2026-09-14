@@ -52,7 +52,7 @@ Security in multi-tenant systems is usually an afterthought implemented as a dat
 In Antiproton, **multi-tenancy is structural, not an application check**:
 - **Two tenants are two separate Durable Objects with two completely separate SQLite database files.**
 - Tenant A's data is physically absent from Tenant B's storage engine. A query in Tenant B cannot leak Tenant A's data even under catastrophic application-level logic errors, because the data does not exist in that database.
-- File storage and artifact references are scoped by cryptographically enforced prefixes: `r2://bucket/t/<tenant>/<agent>/...`. The tool gateway validates caller boundaries at the edge; cross-tenant path traversal is structurally unparseable.
+- File storage is scoped by the caller's identity, not by the reference: a model or person only ever sees `artifact://<path>`, with no bucket, tenant or agent in it, and the server resolves it by prepending the caller's own `t/<tenant>/<agent>/` (`src/store/refs.ts`, `keyForRef`). A reference therefore cannot name another agent's object at all, and paths with `.`, `..` or empty segments resolve to nothing (`test/agent-refs.ts`). The programmatic routes (`/agent/*`, `/bench/*`) strictly require the automation token or a signed-in owner (`cf/src/auth.ts`, `programmaticAccess`, `test/auth.ts`).
 
 ---
 
