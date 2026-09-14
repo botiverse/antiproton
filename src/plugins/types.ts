@@ -365,6 +365,40 @@ export function credentialForm(credential: CredentialSpec | undefined | null): C
   return { kind: "signIn", signIn: shape.signIn, accountRequired: required };
 }
 
+/**
+ * What a tool returns when the work has started and will not finish inside
+ * this call: the handle the plugin needs to find it again, and a line for the
+ * model about what is now running.
+ *
+ * A class rather than a shape, because a tool's result is arbitrary `Json`
+ * and any agreed key can occur in real data — a result that happened to
+ * contain `background` would be read as a job that does not exist, silently
+ * and rarely. `instanceof` cannot be produced by data, so the signal and the
+ * data cannot be confused no matter what a tool returns (Piper, cody,
+ * 2026-09-14).
+ *
+ * The handle is the plugin's own business and is stored as given: for a
+ * container it is the box and the execution. It must never carry a
+ * credential — polling happens inside the agent's object with the same
+ * `PluginContext` the call had, so the secret is already there and does not
+ * need to travel in the handle.
+ */
+export class Backgrounded {
+  // Written out rather than declared in the constructor: Node runs this as
+  // strip-only TypeScript, where a parameter property is a syntax error.
+  readonly handle: Json;
+  readonly note?: string;
+  constructor(handle: Json, note?: string) {
+    this.handle = handle;
+    if (note !== undefined) this.note = note;
+  }
+}
+
+/** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
+export function backgrounded(handle: Json, note?: string): Backgrounded {
+  return new Backgrounded(handle, note);
+}
+
 export interface Plugin {
   id: string;
   version: string;
@@ -432,7 +466,36 @@ export interface Plugin {
    * which say nothing about whether it is the right key.
    */
   checkCredential?(ctx: PluginContext): Promise<CredentialCheck>;
-  invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json>;
+  /**
+   * Do the thing. Returning {@link Backgrounded} means it has started and the
+   * caller should be given a job rather than a result — every other return is
+   * the result itself.
+   */
+  invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json | Backgrounded>;
+
+  /**
+   * Has the backgrounded work finished, and what did it produce?
+   *
+   * Asked with the same `PluginContext` the call had, inside the agent's own
+   * object, so a credential never travels to a queue. `progress` is for the
+   * model to see while it waits; `result` is what the tool would have returned
+   * had it finished in the call, so nothing downstream needs to know which of
+   * the two paths a result came by.
+   *
+   * A plugin that never backgrounds anything does not implement this.
+   */
+  pollBackground?(handle: Json, ctx: PluginContext): Promise<
+    { done: false; progress?: Json } | { done: true; result: Json }
+  >;
+
+  /**
+   * Stop it, and let go of whatever it was holding.
+   *
+   * Called when a person or the agent cancels, and when the runtime's ceiling
+   * runs out — a job that cannot end would otherwise hold one of the agent's
+   * few concurrent slots and keep billing for as long as it exists.
+   */
+  cancelBackground?(handle: Json, ctx: PluginContext): Promise<void>;
   /**
    * Let go of anything this mount is holding, once the agent has nothing left
    * open.
