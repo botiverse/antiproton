@@ -109,6 +109,7 @@ shows this changed the behaviour, and which assertion reddens if the guard break
 and it is the only doc kept in step with the code. Everything else is history or
 reference:
 
+- [`docs/philosophy.md`](docs/philosophy.md) — the engineering philosophy, architectural rationale, and verification principles.
 - [`docs/pi-upstream.md`](docs/pi-upstream.md) — how to stay in sync with pi.
 - [`docs/server-plan-archive.md`](docs/server-plan-archive.md) and
   [`docs/self-hosted-plan-archive.md`](docs/self-hosted-plan-archive.md) —
