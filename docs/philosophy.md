@@ -168,6 +168,15 @@ Subtraction treats the agent as a liability—a clumsy, dangerous pseudo-human t
 
 Antiproton designs infrastructure through **addition**:
 
+### Zero Ambient Capability: Why We Don't Restrict Full Network Access
+Consider how traditional sandboxes handle network security: they take an execution environment with **full ambient network capacity**, and then attempt to restrict it through subtraction—DNS filters, iptables rules, egress firewalls, and URL blacklists. This is an unending game of cat-and-mouse where a single misconfiguration leaks private subnets.
+
+Why start with full capacity and try to restrict it, when you can **start from absolute zero and build through addition?**
+
+In Antiproton:
+- **Zero Ambient Network by Default:** The sandbox isolate starts with `globalOutbound: null`—no sockets, no DNS resolver, no HTTP stack, and no network card. There are no firewall filters to bypass because the network capability does not exist in the environment.
+- **Additive Capability via Mounts:** To reach external systems, the environment explicitly adds audited capabilities (such as the `http` plugin with a declared `allowedHosts` whitelist, or authenticated SaaS plugins). Egress is not "permitted despite a block"; it is an explicit, typed, and audited tool bridge created from scratch.
+
 ### Structure Instead of Bans (32 Instances of "Rather Than")
 Across Antiproton's codebase and architecture, this principle is reflected not as an abstract slogan, but as a recurring structural discipline (appearing 32 times in our foundational specifications):
 - **Physical Absence Over Runtime Filtering:** Multi-tenancy is not an instruction to "remember the `WHERE` clause"; data is physically absent from the querying database *rather than* filtered.
