@@ -4,7 +4,7 @@
 
 Most AI agent frameworks are demonstrations of optimism. They show a model executing a tool in a single happy-path turn on a developer's laptop, treating the real engineering challenges—durability across evictions, multi-tenant isolation, long-running cost, and execution safety—as downstream deployment details to be patched on later.
 
-When developers attempt to take these prototypes into production, they almost universally resort to **subtraction (减法)**:
+When developers attempt to take these prototypes into production, they almost universally resort to **subtraction**:
 - They take a legacy, monolithic Linux OS, and strip down permissions until it barely boots.
 - They take an interactive terminal shell (bash), strip away human interactivity, and wrap brittle timeouts around unbuffered streams.
 - They grant full ambient network capacity, and then struggle to patch leaks with egress firewalls and IP blacklists.
@@ -12,7 +12,7 @@ When developers attempt to take these prototypes into production, they almost un
 
 Subtraction treats the agent as a liability—a clumsy, dangerous pseudo-human that must be chained inside systems designed decades ago for physical keyboards and desktop monitors.
 
-**Antiproton is built on addition (加法).** 
+**Antiproton is built on addition.** 
 
 We do not force agents to masquerade as crippled Linux processes. We treat them as first-class digital citizens, providing purpose-built distributed infrastructure where safety is not an exhausting list of runtime bans, but a structural foundation upon which capability, autonomy, and open ecosystems can be constructed without compromise.
 
