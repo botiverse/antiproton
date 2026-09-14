@@ -112,7 +112,32 @@ In contrast, when we deployed an automated, naive agent with **no prior timeline
 
 ---
 
+## 7. Addition, Not Subtraction: Agents as Citizens of the New World
+
+Underlying all these architectural decisions is a foundational worldview: **AI agents are not downgraded human simulators running in crippled legacy environments; they are the new citizens of a new digital world.**
+
+In software engineering, when developers try to fit agents into existing paradigms, they almost always use **subtraction (减法)**:
+- Take a traditional Linux OS, and strip down permissions until it barely works.
+- Take an interactive human shell (bash), strip away interactivity, and hack together timeouts.
+- Take a standard human authentication flow (OAuth / browser passwords), and try to make the agent pretend to be a human sitting at a screen typing credentials.
+
+Subtraction treats the agent as a liability—a clumsy, dangerous pseudo-human that must be restricted and contained within systems designed decades ago for keyboards and monitors.
+
+Antiproton builds infrastructure through **addition (加法)**:
+- **First-Class Digital Citizens:** Instead of forcing an agent to pretend to be a POSIX process, we grant it native digital citizenship: an edge-resident actor with durable memory, its own isolated database, deterministic lifecycle states, and verified wait-offloading.
+- **Purpose-Built Ergonomics:** We give the agent what natively amplifies its intelligence—structured, typed JavaScript execution, cryptographic credential gates, and lossless event folding—rather than human keyboard artifacts.
+- **Constructive Capability:** We construct a runtime where safety is not an exhausting list of runtime bans, but a structural foundation upon which rich ecosystems, third-party marketplaces, and autonomous collaborations can be built without fear.
+
+---
+
 ## Conclusion: Building for Reality
+
+AI agents will not achieve enterprise reliability through ever-longer prompts, naive subtraction, or hand-waving abstractions. They require the same rigor that distributed database systems and secure operating systems demand:
+- **Addition over subtraction:** Treating agents as first-class citizens with purpose-built infrastructure rather than crippled legacy processes.
+- **Physics over promises:** Structural isolation, true scale-to-zero compute, and zero-trust credential barriers.
+- **Evidence over assertion:** Verifiable numbers, destructive testing, and epistemological humility in evaluation.
+
+Antiproton is built for developers who believe that if an agent is going to act on real systems, every single guarantee underneath it must be verifiable.
 
 AI agents will not achieve enterprise reliability through ever-longer prompts or hand-waving abstractions. They require the same rigor that distributed database systems and secure operating systems demand:
 - **Physics over promises:** Structural isolation, true scale-to-zero compute, and zero-trust credential barriers.
