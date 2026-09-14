@@ -15,7 +15,7 @@ function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 function fakeDeps() {
   let t = 1_800_000_000_000, n = 0;
   const agents = new Map<string, StoredAgent>(), sessions = new Map<string, StoredSession>();
-  const log = { adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
+  const log = { cancelled: [] as string[], adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
   const deps: AgentsApiDeps = {
     now: () => (t += 1000),
     // A macrotask, so input posted by another request lands between two reads of the stream.
@@ -39,6 +39,7 @@ function fakeDeps() {
       openSession: async (_a, s) => { log.opened.push(s); },
       postInput: async (_a, s, text) => { log.inputs.push({ session: s, text }); },
       status: async () => "idle",
+      cancel: async (_a, s) => { log.cancelled.push(s); },
       transcript: async () => ({ entries: [], running: false }),
     },
   };
@@ -155,9 +156,18 @@ await check("events: GET streams from now on; POST input starts a turn it report
   assert(got.find((e) => e.type === "agent.session.turn.output_text.done")?.text === "re: hello", "the answer text");
 
   const refused = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
-    { events: [{ type: "agent.session.input.message", input: "a" }, { type: "agent.session.input.cancel" }] }, deps))!;
+    { events: [{ type: "agent.session.input.message", input: "a" }, { type: "agent.session.input.tool_result", turn_id: "t", call_id: "c", success: true }] }, deps))!;
   const body = await refused.json() as any;
   assert(refused.status === 400 && body.error.param === "events[1].type" && log.inputs.length === 1, `a refused batch: ${refused.status} ${JSON.stringify(body)} inputs ${log.inputs.length}`);
+
+  const order: string[] = [];
+  deps.agents.cancel = async () => { order.push("cancel"); };
+  const prior = deps.agents.postInput;
+  deps.agents.postInput = async (a, s2, text) => { order.push(`message:${text}`); await prior(a, s2, text); };
+  const both = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
+    { events: [{ type: "agent.session.input.cancel" }, { type: "agent.session.input.message", input: "instead" }] }, deps))!;
+  assert(both.status === 204 && order.join() === "cancel,message:instead", `cancel then message: ${both.status} ${order}`);
+  deps.agents.postInput = prior;
 
   const created = (await handleAgentsApi("POST", "/agents/sessions", new URLSearchParams(),
     { agent_id: "agent_1", environment: { type: "none" }, input: "again", stream: true }, deps))!;

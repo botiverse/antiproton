@@ -411,6 +411,21 @@ export class PiAgent {
     return started;
   }
 
+  /**
+   * Cancel the run in flight. pi's abort ends it and drops its outstanding
+   * model call, so a late answer is never applied, but it appends nothing —
+   * so a `marker` custom entry naming the run is written, for whoever needs to
+   * tell a cancelled turn from one not yet started. Custom entries are not in
+   * the model's context. Null when nothing was running.
+   */
+  async cancel(marker: string): Promise<string | null> {
+    const aborted: any = await this.#lane.abort(CTX);
+    if (!aborted?.ok) return null;
+    const operationId = String(aborted.value.operationId);
+    await this.#lane.appendCustomEntry(marker, { operationId }, CTX);
+    return operationId;
+  }
+
   async compact() {
     return this.#lane.accept({ kind: "compaction" }, CTX);
   }

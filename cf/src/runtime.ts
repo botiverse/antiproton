@@ -15,7 +15,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
 import {
-  admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
+  admitBackground, jobsTool, mountsWithRunningJobs, stopSessionJobs, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
 } from "../../src/runtime/background-jobs.ts";
 import {
   bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
@@ -24,6 +24,7 @@ import {
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
+import { TURN_CANCELLED } from "./agents-api/transcript.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 
@@ -1028,6 +1029,27 @@ export class AgentRuntime {
     // carries an operation id, a queued message carries an entry id.
     const landed = res?.value?.operationId ? "prompt" : mode === "followUp" ? "followUp" : "steer";
     return { mode: landed, queued: landed !== "prompt", result: res };
+  }
+
+  /**
+   * Stop a session's turn and the background work it started (Agents API
+   * input.cancel, task #17). pi's abort ends the run and drops its model call
+   * but records nothing (measured 2026-09-14), so a marker entry says the turn
+   * was cancelled. A background job whose stop cannot be confirmed stays
+   * tracked, and the ceiling asks again. Nothing running is not an error.
+   */
+  async cancelSession(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
+    const agent = await this.agent(tenantId, agentId, session);
+    const cancelledTurn = await agent.cancel(TURN_CANCELLED);
+    const sql = this.#deps.ctx.storage.sql;
+    ensureAgentTables(sql);
+    const jobs = await stopSessionJobs({
+      sql, owner: { tenantId, agentId }, session,
+      cancel: (job) => this.#gateway.cancelBackground(
+        { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json),
+      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+    });
+    return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
   }
 
   /**

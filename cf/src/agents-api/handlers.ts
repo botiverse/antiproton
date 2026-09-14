@@ -42,6 +42,8 @@ export interface AgentsApiDeps {
     /** Deliver text to the session: starts a turn when idle. */
     postInput(agentId: string, sessionId: string, text: string): Promise<void>;
     status(agentId: string, sessionId: string): Promise<SessionStatus>;
+    /** Cancel the session's running turn and its background work. Nothing running is not an error. */
+    cancel(agentId: string, sessionId: string): Promise<void>;
     /** The session's pi entries, oldest first, and whether its lane is running now. */
     transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean }>;
   };
@@ -173,19 +175,24 @@ export async function handleAgentsApi(
         if (!isObj(body) || !Array.isArray(body.events) || !body.events.length) {
           return openAIError(400, "events must be a non-empty array", { param: "events", code: "invalid_value" });
         }
-        // Every event is checked before any is acted on, so a refused batch changes nothing.
-        const texts: string[] = [];
+        // Every event is checked before any is acted on, so a refused batch changes nothing;
+        // then they are applied in the order given.
+        const actions: Array<{ kind: "message"; text: string } | { kind: "cancel" }> = [];
         for (const [i, e] of body.events.entries()) {
           if (!isObj(e)) return openAIError(400, "each event must be an object", { param: `events[${i}]`, code: "invalid_value" });
+          if (e.type === "agent.session.input.cancel") { actions.push({ kind: "cancel" }); continue; }
           if (e.type !== "agent.session.input.message") {
             return openAIError(400, `events[${i}].type: ${JSON.stringify(e.type)} is not supported by this deployment yet`, { param: `events[${i}].type`, code: "unsupported_parameter" });
           }
           const t = inputText(e.input);
           if (!t.ok) return refuse({ ...t, param: `events[${i}].${t.param}` });
           if (!t.text) return openAIError(400, "input must not be empty", { param: `events[${i}].input`, code: "invalid_value" });
-          texts.push(t.text);
+          actions.push({ kind: "message", text: t.text });
         }
-        for (const text of texts) await deps.agents.postInput(s.agentId, s.id, text);
+        for (const a of actions) {
+          if (a.kind === "cancel") await deps.agents.cancel(s.agentId, s.id);
+          else await deps.agents.postInput(s.agentId, s.id, a.text);
+        }
         return new Response(null, { status: 204 });
       }
     }

@@ -1357,6 +1357,22 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /** Cancel a session's running turn and its background work (Agents API input.cancel). */
+  async apiCancelSession(tenantId: string, agentId: string, sessionId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiCancelSession", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      // Never bound means never run: there is nothing to cancel (see apiSessionStatus).
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) {
+        return { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] };
+      }
+      const out = await rt.cancelSession(tenantId, agentId, sessionId);
+      await this.ctx.storage.setAlarm(Date.now());
+      return out;
+    });
+  }
+
   /** The session's entries and whether its lane runs now, as JSON text (see apiGetAgent on RPC types). */
   async apiTranscript(tenantId: string, agentId: string, sessionId: string): Promise<string> {
     this.#claim(tenantId, agentId);
@@ -2450,6 +2466,7 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       openSession: async (agentId, sessionId) => { await agentStub(agentId).apiOpenSession(tenantId, agentId, sessionId); },
       postInput: async (agentId, sessionId, text) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text); },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
+      cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
       transcript: async (agentId, sessionId) =>
         JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as { entries: unknown[]; running: boolean },
     },

@@ -2,7 +2,7 @@
  * A session's pi entries as Agents API items and turns (task #17): turn
  * boundaries, statuses, usage, and item shapes the SDK reads.
  */
-import { sessionTranscript } from "../cf/src/agents-api/transcript.ts";
+import { sessionTranscript, TURN_CANCELLED } from "../cf/src/agents-api/transcript.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -94,6 +94,23 @@ await check("a failed tool result is reported as an error, not as output", () =>
   ], running: true }, ids);
   const out = items.find((i) => i.type === "function_call_output")!;
   assert(out.status === "failed" && out.output === null && out.error === "denied", `output ${JSON.stringify(out)}`);
+});
+
+await check("a turn with the cancel marker is cancelled, its open call incomplete, and the marker is not an item", () => {
+  // What pi leaves after an abort (measured): the user message, deferred placeholders, and nothing else.
+  const { items, turns } = sessionTranscript({ entries: [
+    user("go", 0),
+    entry({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "c7", name: "x", arguments: {} }] }, 1_000),
+    entry({ role: "assistant", stopReason: "deferred", content: [] }, 1_500),
+    { type: "custom", customType: TURN_CANCELLED, id: "m", parentId: null, seq: ++seq, timestamp: T0 + 2_000, data: { operationId: "op" } },
+    user("next", 3_000),
+  ], running: true }, ids);
+  assert(turns[0]!.status === "cancelled" && turns[0]!.completed_at === Math.floor((T0 + 2_000) / 1000), `turn ${JSON.stringify(turns[0])}`);
+  assert(turns[1]!.status === "in_progress", `the next turn ${turns[1]!.status}`);
+  assert(items.find((i) => i.type === "function_call")!.status === "incomplete", "the open call still reads in progress");
+  assert(items.length === 3, `items ${items.map((i) => i.type)}`);
+  const bare = sessionTranscript({ entries: [user("go", 0), { type: "custom", customType: TURN_CANCELLED, id: "m2", parentId: null, seq: ++seq, timestamp: T0 + 500 }], running: false }, ids);
+  assert(bare.turns[0]!.status === "cancelled", `a turn cancelled before any reply: ${bare.turns[0]!.status}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

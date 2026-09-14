@@ -10,6 +10,14 @@
  */
 
 type Json = Record<string, unknown>;
+
+/**
+ * The custom entry written right after a turn is cancelled. pi's abort ends the
+ * run and drops its model call but appends nothing (measured 2026-09-14), so
+ * without this a cancelled turn reads as a prompt never picked up. Custom
+ * entries are not projected into the model's context.
+ */
+export const TURN_CANCELLED = "agents_api.turn_cancelled";
 type TurnStatus = "queued" | "in_progress" | "completed" | "failed" | "cancelled";
 
 export interface ApiTurn {
@@ -38,9 +46,10 @@ export function sessionTranscript(
   source: { entries: unknown[]; running: boolean },
   ids: { sessionId: string; agentId: string },
 ): { items: ApiItem[]; turns: ApiTurn[] } {
+  // A cancel marker rides along as a pseudo-message so it lands in the turn it ends.
   const messages = source.entries
-    .filter((e: any) => e?.type === "message" && e.message)
-    .map((e: any) => ({ seq: Number(e.seq), at: Number(e.timestamp), m: e.message as any }));
+    .filter((e: any) => (e?.type === "message" && e.message) || (e?.type === "custom" && e.customType === TURN_CANCELLED))
+    .map((e: any) => ({ seq: Number(e.seq), at: Number(e.timestamp), m: (e.type === "custom" ? { role: "cancelled" } : e.message) as any }));
 
   // Group into turns at each user message; anything before the first is not a turn.
   const groups: Array<typeof messages> = [];
@@ -59,10 +68,12 @@ export function sessionTranscript(
     const last = gi === groups.length - 1;
     const replies = group.filter((x) => x.m.role === "assistant" && x.m.stopReason !== "deferred");
     const final = replies[replies.length - 1];
-    const ended = !!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running);
+    const cancelled = group.some((x) => x.m.role === "cancelled");
+    const ended = cancelled || (!!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running));
 
     let status: TurnStatus;
-    if (ended) status = final!.m.stopReason === "error" ? "failed" : final!.m.stopReason === "aborted" ? "cancelled" : "completed";
+    if (cancelled || final?.m.stopReason === "aborted") status = "cancelled";
+    else if (ended) status = final!.m.stopReason === "error" ? "failed" : "completed";
     else status = source.running || replies.length ? "in_progress" : "queued";
 
     let input = 0, output = 0, cached = 0, reasoning = 0;

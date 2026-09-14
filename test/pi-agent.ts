@@ -231,6 +231,26 @@ await check("对象被驱逐:重新 open 后接着跑完", async () => {
 });
 
 console.log(`\n  The object-side loop\n  ${"─".repeat(56)}`);
+await check("取消一轮:模型调用被丢掉,留下一条点名这一轮的标记;空闲时取消什么也不报;之后还能再说话", async () => {
+  const f = await fixture();
+  await f.agent.say("hello");
+  await f.agent.step();
+  if (f.w.pending(f.host).length !== 1) throw new Error("no model call to cancel");
+  const cancelled = await f.agent.cancel("test.turn_cancelled");
+  if (!cancelled) throw new Error("a running turn was not cancelled");
+  if ((await f.agent.lane.inspectExecution(CTX)).current !== null) throw new Error("the run is still current after cancel");
+  const jobs = f.host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0] as any;
+  if (Number(jobs.n) !== 0) throw new Error("the model call was left out, so its answer could still land");
+  const entries = await f.agent.storage.scanEntries({ order: "asc" }, CTX) as any[];
+  const marker = entries.find((e) => e.type === "custom" && e.customType === "test.turn_cancelled");
+  if (!marker || marker.data?.operationId !== cancelled) throw new Error(`no marker naming the run: ${JSON.stringify(marker)}`);
+  if ((await f.agent.cancel("test.turn_cancelled")) !== null) throw new Error("cancelling an idle lane reported a cancellation");
+  await f.agent.say("again");
+  await f.agent.step();
+  if (f.w.pending(f.host).length !== 1) throw new Error("the lane took no new prompt after the cancel");
+  await f.agent.close();
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
