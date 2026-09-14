@@ -11,7 +11,7 @@ import {
   toOpenAIAgent, toOpenAISession, type StoredAgent, type StoredSession,
 } from "./shapes.ts";
 import { sessionTranscript } from "./transcript.ts";
-import { pumpSessionEvents, type Snapshot } from "./events.ts";
+import { pumpSessionEvents, type PendingCall, type Snapshot } from "./events.ts";
 
 export type SessionStatus = "idle" | "in_progress" | "requires_action" | "failed";
 
@@ -41,11 +41,17 @@ export interface AgentsApiDeps {
     openSession(agentId: string, sessionId: string): Promise<void>;
     /** Deliver text to the session: starts a turn when idle. */
     postInput(agentId: string, sessionId: string, text: string): Promise<void>;
-    status(agentId: string, sessionId: string): Promise<SessionStatus>;
+    /** The session's status and the function calls it waits on the caller for. */
+    status(agentId: string, sessionId: string): Promise<{ status: SessionStatus; pending: PendingCall[] }>;
+    /**
+     * The caller's results. Every call is checked before any is kept: an id this
+     * session never made in that turn comes back in `unknown` and nothing is kept.
+     */
+    toolResults(agentId: string, sessionId: string, results: Array<{ turnId: string; callId: string; output: string; isError: boolean }>): Promise<{ unknown: string[] }>;
     /** Cancel the session's running turn and its background work. Nothing running is not an error. */
     cancel(agentId: string, sessionId: string): Promise<void>;
     /** The session's pi entries, oldest first, and whether its lane is running now. */
-    transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean }>;
+    transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean; pending: PendingCall[] }>;
   };
 }
 
@@ -77,7 +83,8 @@ export function inputText(input: unknown): { ok: true; text: string | null } | R
 async function sessionObject(deps: AgentsApiDeps, s: StoredSession) {
   const agent = await deps.index.getAgent(s.agentId);
   if (!agent) return null;
-  return toOpenAISession(s, agent, { status: await deps.agents.status(s.agentId, s.id) });
+  const live = await deps.agents.status(s.agentId, s.id);
+  return toOpenAISession(s, agent, { status: live.status, pending: live.pending });
 }
 
 /**
@@ -90,7 +97,11 @@ async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: ()
   if (!agent) return notFound("agent", s.agentId);
   const read = async (): Promise<Snapshot> => {
     const t = await deps.agents.transcript(s.agentId, s.id);
-    return { ...sessionTranscript(t, { sessionId: s.id, agentId: s.agentId }), status: t.running ? "in_progress" : "idle" };
+    const pending = t.running ? [] : t.pending;
+    return {
+      ...sessionTranscript({ ...t, pending }, { sessionId: s.id, agentId: s.agentId }),
+      status: t.running ? "in_progress" : pending.length ? "requires_action" : "idle", pending,
+    };
   };
   const baseline = await read();
   if (thenStart) await thenStart();
@@ -102,7 +113,7 @@ async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: ()
   void pumpSessionEvents({
     baseline, read, sessionId: s.id, sleep: deps.sleep, now: deps.now, maxMs: deps.streamMaxMs,
     write: (text) => writer.write(encoder.encode(text)),
-    sessionWith: (status) => toOpenAISession(s, agent, { status }) as unknown as Record<string, unknown>,
+    sessionWith: (status, pending) => toOpenAISession(s, agent, { status, pending }) as unknown as Record<string, unknown>,
     eventId: () => `evt_${prefix}_${++n}`,
   }).finally(() => writer.close().catch(() => {}));
   return new Response(readable, {
@@ -178,9 +189,34 @@ export async function handleAgentsApi(
         // Every event is checked before any is acted on, so a refused batch changes nothing;
         // then they are applied in the order given.
         const actions: Array<{ kind: "message"; text: string } | { kind: "cancel" }> = [];
+        const results: Array<{ turnId: string; callId: string; output: string; isError: boolean }> = [];
+        const at: number[] = [];
         for (const [i, e] of body.events.entries()) {
           if (!isObj(e)) return openAIError(400, "each event must be an object", { param: `events[${i}]`, code: "invalid_value" });
           if (e.type === "agent.session.input.cancel") { actions.push({ kind: "cancel" }); continue; }
+          if (e.type === "agent.session.input.tool_result") {
+            for (const f of ["turn_id", "call_id"] as const) {
+              if (typeof e[f] !== "string" || !e[f]) return openAIError(400, `${f} is required`, { param: `events[${i}].${f}`, code: "invalid_value" });
+            }
+            if (typeof e.success !== "boolean") return openAIError(400, "success must be a boolean", { param: `events[${i}].success`, code: "invalid_value" });
+            let output = "";
+            if (e.success) {
+              if (typeof e.output === "string") output = e.output;
+              else if (Array.isArray(e.output)) {
+                const texts: string[] = [];
+                for (const [j, c] of e.output.entries()) {
+                  if (isObj(c) && c.type === "input_text" && typeof c.text === "string") { texts.push(c.text); continue; }
+                  return openAIError(400, `events[${i}].output[${j}]: the part type ${JSON.stringify(isObj(c) ? c.type : c)} is not supported by this deployment`, { param: `events[${i}].output[${j}].type`, code: "unsupported_parameter" });
+                }
+                output = texts.join("\n\n");
+              } else if (e.output !== undefined && e.output !== null) {
+                return openAIError(400, "output must be a string or input_text parts", { param: `events[${i}].output`, code: "invalid_value" });
+              }
+            } else output = typeof e.error === "string" && e.error ? e.error : "the function failed";
+            results.push({ turnId: e.turn_id as string, callId: e.call_id as string, output, isError: !e.success });
+            at.push(i);
+            continue;
+          }
           if (e.type !== "agent.session.input.message") {
             return openAIError(400, `events[${i}].type: ${JSON.stringify(e.type)} is not supported by this deployment yet`, { param: `events[${i}].type`, code: "unsupported_parameter" });
           }
@@ -188,6 +224,16 @@ export async function handleAgentsApi(
           if (!t.ok) return refuse({ ...t, param: `events[${i}].${t.param}` });
           if (!t.text) return openAIError(400, "input must not be empty", { param: `events[${i}].input`, code: "invalid_value" });
           actions.push({ kind: "message", text: t.text });
+        }
+        if (results.length) {
+          // Kept together or not at all, so they are not mixed with input that acts at once.
+          if (actions.length) return openAIError(400, "send tool results in their own request", { param: `events[${at[0]}].type`, code: "invalid_value" });
+          const kept = await deps.agents.toolResults(s.agentId, s.id, results);
+          if (kept.unknown.length) {
+            const i = at[results.findIndex((r) => r.callId === kept.unknown[0])] ?? at[0];
+            return openAIError(400, `no function call ${JSON.stringify(kept.unknown[0])} in that turn of this session`, { param: `events[${i}].call_id`, code: "invalid_value" });
+          }
+          return new Response(null, { status: 204 });
         }
         for (const a of actions) {
           if (a.kind === "cancel") await deps.agents.cancel(s.agentId, s.id);
@@ -199,7 +245,8 @@ export async function handleAgentsApi(
     if ((seg[3] === "items" || seg[3] === "turns") && method === "GET") {
       const s = await deps.index.getSession(seg[2]!);
       if (!s) return notFound("session", seg[2]!);
-      const t = sessionTranscript(await deps.agents.transcript(s.agentId, s.id), { sessionId: s.id, agentId: s.agentId });
+      const read = await deps.agents.transcript(s.agentId, s.id);
+      const t = sessionTranscript({ ...read, pending: read.running ? [] : read.pending }, { sessionId: s.id, agentId: s.agentId });
       if (seg.length === 4) {
         const page = seg[3] === "items" ? cursorPage(t.items, q) : cursorPage(t.turns, q);
         return page.ok ? ok(page.page) : refuse(page);

@@ -18,7 +18,7 @@ type Json = Record<string, unknown>;
  * entries are not projected into the model's context.
  */
 export const TURN_CANCELLED = "agents_api.turn_cancelled";
-type TurnStatus = "queued" | "in_progress" | "completed" | "failed" | "cancelled";
+type TurnStatus = "queued" | "in_progress" | "waiting" | "completed" | "failed" | "cancelled";
 
 export interface ApiTurn {
   id: string; object: "agent.session.turn"; agent_id: string; session_id: string; subagent_id: null;
@@ -43,7 +43,7 @@ const textOf = (content: unknown): string => {
 const FINAL = new Set(["stop", "length", "error", "aborted"]);
 
 export function sessionTranscript(
-  source: { entries: unknown[]; running: boolean },
+  source: { entries: unknown[]; running: boolean; pending?: Array<{ call_id: string }> },
   ids: { sessionId: string; agentId: string },
 ): { items: ApiItem[]; turns: ApiTurn[] } {
   // A cancel marker rides along as a pseudo-message so it lands in the turn it ends.
@@ -61,6 +61,8 @@ export function sessionTranscript(
   const items: ApiItem[] = [];
   const turns: ApiTurn[] = [];
   const answered = new Set(messages.filter((x) => x.m.role === "toolResult").map((x) => String(x.m.toolCallId)));
+  // Calls the caller is running: their placeholder result is not an item, and their turn waits.
+  const waiting = new Set((source.pending ?? []).map((p) => String(p.call_id)));
 
   groups.forEach((group, gi) => {
     const first = group[0]!;
@@ -71,9 +73,13 @@ export function sessionTranscript(
     const cancelled = group.some((x) => x.m.role === "cancelled");
     const ended = cancelled || (!!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running));
 
+    const waits = group.some((x) => x.m.role === "assistant"
+      && (Array.isArray(x.m.content) ? x.m.content : []).some((c: any) => c?.type === "toolCall" && waiting.has(String(c.id))));
+
     let status: TurnStatus;
     if (cancelled || final?.m.stopReason === "aborted") status = "cancelled";
     else if (ended) status = final!.m.stopReason === "error" ? "failed" : "completed";
+    else if (waits && !(last && source.running)) status = "waiting";
     else status = source.running || replies.length ? "in_progress" : "queued";
 
     let input = 0, output = 0, cached = 0, reasoning = 0;
@@ -105,6 +111,7 @@ export function sessionTranscript(
         continue;
       }
       if (m.role === "toolResult") {
+        if (waiting.has(String(m.toolCallId))) continue;
         const text = textOf(m.content);
         items.push({ id: `item_${seq}`, type: "function_call_output", call_id: String(m.toolCallId), turn_id: turnId,
           status: m.isError ? "failed" : "completed", output: m.isError ? null : text, error: m.isError ? text : null });
@@ -127,10 +134,23 @@ export function sessionTranscript(
         const callId = String(c.id);
         items.push({ id: `item_${seq}_c${i}`, type: "function_call", call_id: callId, name: String(c.name), turn_id: turnId,
           arguments: JSON.stringify(c.arguments ?? {}),
-          status: answered.has(callId) ? "completed" : ended ? "incomplete" : "in_progress" });
+          status: waiting.has(callId) ? "in_progress" : answered.has(callId) ? "completed" : ended ? "incomplete" : "in_progress" });
       });
     }
   });
 
   return { items, turns };
+}
+
+/** The turn each function call belongs to, by the same rule as the turns: the user message before it. */
+export function callTurns(entries: unknown[]): Map<string, string> {
+  const out = new Map<string, string>();
+  let turn: string | null = null;
+  for (const e of entries as any[]) {
+    if (e?.type !== "message" || !e.message) continue;
+    if (e.message.role === "user") { turn = `turn_${Number(e.seq)}`; continue; }
+    if (e.message.role !== "assistant" || !turn || !Array.isArray(e.message.content)) continue;
+    for (const c of e.message.content) if (c?.type === "toolCall") out.set(String(c.id), turn);
+  }
+  return out;
 }

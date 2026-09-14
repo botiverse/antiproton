@@ -109,6 +109,31 @@ await check("a client that goes away ends the pump", async () => {
   assert(outcome === "closed", `outcome ${outcome}`);
 });
 
+await check("a call for the caller: the call is shown, then requires_action; its result continues the turn through idle, where the SDK stops", () => {
+  const base = snap(history, false);
+  const callMsg = entry({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "cw", name: "get_weather", arguments: { city: "Oslo" } }] });
+  const asked = user("weather?");
+  const placeholder = entry({ role: "toolResult", toolCallId: "cw", toolName: "get_weather", isError: true, content: [{ type: "text", text: "waiting" }] });
+  const waitingEntries = [...history, asked, callMsg, placeholder];
+  const pending = [{ call_id: "cw", name: "get_weather", arguments: "{\"city\":\"Oslo\"}", turn_id: `turn_${asked.seq}` }];
+  const waiting: Snapshot = { ...sessionTranscript({ entries: waitingEntries, running: false, pending }, ids), status: "requires_action", pending };
+  const first = eventsBetween(base, waiting, ids, sessionWith, eventId);
+  const types = first.map((e) => e.type.replace("agent.session.", ""));
+  assert(types.at(-1) === "requires_action" && types.includes("turn.item.added"), `events: ${types}`);
+  assert(!first.some((e) => (e as any).item?.type === "function_call_output"), "the placeholder was sent as the call's output");
+  assert(sdkStopsAt(first) === -1, "the SDK would stop while its function is still to run");
+  // After the result: the branch no longer has the placeholder.
+  const done = [...history, asked, callMsg,
+    entry({ role: "toolResult", toolCallId: "cw", toolName: "get_weather", isError: false, content: [{ type: "text", text: "sunny" }] }),
+    entry({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Sunny in Oslo." }] })];
+  const second = eventsBetween(waiting, snap(done, false), ids, sessionWith, eventId);
+  const all = [...first, ...second];
+  const doneTypes = second.map((e) => e.type.replace("agent.session.", ""));
+  assert(doneTypes.includes("turn.item.done") && doneTypes.includes("turn.completed") && doneTypes.at(-1) === "idle", `after: ${doneTypes}`);
+  assert(second.some((e) => (e as any).item?.type === "function_call_output" && (e as any).item.output === "sunny"), "the real output was not sent");
+  assert(sdkStopsAt(all) === all.length - 1, `the SDK would stop at ${sdkStopsAt(all)} of ${all.length}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

@@ -2,7 +2,7 @@
  * A session's pi entries as Agents API items and turns (task #17): turn
  * boundaries, statuses, usage, and item shapes the SDK reads.
  */
-import { sessionTranscript, TURN_CANCELLED } from "../cf/src/agents-api/transcript.ts";
+import { callTurns, sessionTranscript, TURN_CANCELLED } from "../cf/src/agents-api/transcript.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -111,6 +111,19 @@ await check("a turn with the cancel marker is cancelled, its open call incomplet
   assert(items.length === 3, `items ${items.map((i) => i.type)}`);
   const bare = sessionTranscript({ entries: [user("go", 0), { type: "custom", customType: TURN_CANCELLED, id: "m2", parentId: null, seq: ++seq, timestamp: T0 + 500 }], running: false }, ids);
   assert(bare.turns[0]!.status === "cancelled", `a turn cancelled before any reply: ${bare.turns[0]!.status}`);
+});
+
+await check("a turn waiting on the caller: status waiting, its call in progress, the placeholder result hidden; calls map to their turn", () => {
+  const waitingEntries = [
+    user("weather?", 0),
+    entry({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "c5", name: "get_weather", arguments: { city: "Oslo" } }] }, 1_000),
+    entry({ role: "toolResult", toolCallId: "c5", toolName: "get_weather", isError: true, content: [{ type: "text", text: "waiting for the caller to run this function" }] }, 1_100),
+  ];
+  const { items, turns } = sessionTranscript({ entries: waitingEntries, running: false, pending: [{ call_id: "c5" }] }, ids);
+  assert(turns[0]!.status === "waiting" && turns[0]!.completed_at === null, `turn ${JSON.stringify(turns[0])}`);
+  assert(items.map((i) => i.type).join() === "message,function_call" && items[1]!.status === "in_progress", `items ${JSON.stringify(items)}`);
+  const turnId = turns[0]!.id;
+  assert(callTurns(waitingEntries).get("c5") === turnId, `call turn ${callTurns(waitingEntries).get("c5")} vs ${turnId}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

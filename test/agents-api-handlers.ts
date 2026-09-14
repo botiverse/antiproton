@@ -15,7 +15,7 @@ function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 function fakeDeps() {
   let t = 1_800_000_000_000, n = 0;
   const agents = new Map<string, StoredAgent>(), sessions = new Map<string, StoredSession>();
-  const log = { cancelled: [] as string[], adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
+  const log = { toolResults: [] as Array<{ session: string; results: Array<{ turnId: string; callId: string; output: string; isError: boolean }> }>, cancelled: [] as string[], adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
   const deps: AgentsApiDeps = {
     now: () => (t += 1000),
     // A macrotask, so input posted by another request lands between two reads of the stream.
@@ -38,9 +38,10 @@ function fakeDeps() {
       updatePersona: async (id, a) => { log.persona.push({ id, instructions: a.instructions }); },
       openSession: async (_a, s) => { log.opened.push(s); },
       postInput: async (_a, s, text) => { log.inputs.push({ session: s, text }); },
-      status: async () => "idle",
+      status: async () => ({ status: "idle" as const, pending: [] }),
+      toolResults: async (_a, s, results) => { log.toolResults.push({ session: s, results }); return { unknown: results.filter((r) => r.callId.startsWith("unknown")).map((r) => r.callId) }; },
       cancel: async (_a, s) => { log.cancelled.push(s); },
-      transcript: async () => ({ entries: [], running: false }),
+      transcript: async () => ({ entries: [], running: false, pending: [] }),
     },
   };
   return { deps, log, agents, sessions };
@@ -132,7 +133,7 @@ await check("events: GET streams from now on; POST input starts a turn it report
     { type: "message", seq: 1, timestamp: 1_000, message: { role: "user", content: "old" } },
     { type: "message", seq: 2, timestamp: 2_000, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "old answer" }] } },
   ];
-  deps.agents.transcript = async () => ({ entries, running: false });
+  deps.agents.transcript = async () => ({ entries, running: false, pending: [] });
   deps.agents.postInput = async (_a, s, text) => {
     log.inputs.push({ session: s, text });
     const seq = entries.length;
@@ -158,7 +159,33 @@ await check("events: GET streams from now on; POST input starts a turn it report
   const refused = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
     { events: [{ type: "agent.session.input.message", input: "a" }, { type: "agent.session.input.tool_result", turn_id: "t", call_id: "c", success: true }] }, deps))!;
   const body = await refused.json() as any;
-  assert(refused.status === 400 && body.error.param === "events[1].type" && log.inputs.length === 1, `a refused batch: ${refused.status} ${JSON.stringify(body)} inputs ${log.inputs.length}`);
+  assert(refused.status === 400 && body.error.param === "events[1].type" && log.inputs.length === 1 && log.toolResults.length === 0,
+    `a mixed batch: ${refused.status} ${JSON.stringify(body)} inputs ${log.inputs.length}`);
+
+  const post = async (events: unknown[]) => {
+    const r = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(), { events }, deps))!;
+    return { status: r.status, body: r.status === 204 ? null : await r.json() as any };
+  };
+  const good = await post([
+    { type: "agent.session.input.tool_result", turn_id: "turn_1", call_id: "call_1", success: true, output: [{ type: "input_text", text: "sunny" }] },
+    { type: "agent.session.input.tool_result", turn_id: "turn_1", call_id: "call_2", success: false, error: "no such city" },
+  ]);
+  const kept = log.toolResults.at(-1)?.results ?? [];
+  assert(good.status === 204 && kept.length === 2 && kept[0]!.output === "sunny" && !kept[0]!.isError && kept[1]!.output === "no such city" && kept[1]!.isError,
+    `tool results: ${good.status} ${JSON.stringify(kept)}`);
+  const unknown = await post([
+    { type: "agent.session.input.tool_result", turn_id: "turn_1", call_id: "call_9", success: true, output: "x" },
+    { type: "agent.session.input.tool_result", turn_id: "turn_1", call_id: "unknown_1", success: true, output: "x" },
+  ]);
+  assert(unknown.status === 400 && unknown.body.error.param === "events[1].call_id", `an unknown call: ${JSON.stringify(unknown)}`);
+  const noSuccess = await post([{ type: "agent.session.input.tool_result", turn_id: "turn_1", call_id: "call_1", output: "x" }]);
+  assert(noSuccess.status === 400 && noSuccess.body.error.param === "events[0].success", `success missing: ${JSON.stringify(noSuccess)}`);
+
+  deps.agents.status = async () => ({ status: "requires_action" as const, pending: [{ call_id: "call_1", name: "get_weather", arguments: "{}", turn_id: "turn_1" }] });
+  const waitingSession = (await call(deps, "GET", `/agents/sessions/${sess.id}`)).body;
+  assert(waitingSession.status === "requires_action" && waitingSession.required_actions[0]?.type === "function_call"
+    && waitingSession.required_actions[0]?.call_id === "call_1" && waitingSession.required_actions[0]?.turn_id === "turn_1", `session: ${JSON.stringify(waitingSession)}`);
+  deps.agents.status = async () => ({ status: "idle" as const, pending: [] });
 
   const order: string[] = [];
   deps.agents.cancel = async () => { order.push("cancel"); };

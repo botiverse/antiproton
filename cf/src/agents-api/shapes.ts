@@ -206,7 +206,10 @@ export interface StoredSession {
 
 export function toOpenAISession(
   s: StoredSession, agent: StoredAgent,
-  live: { status: "idle" | "in_progress" | "requires_action" | "failed"; error?: string | null } = { status: "idle" },
+  live: {
+    status: "idle" | "in_progress" | "requires_action" | "failed"; error?: string | null;
+    pending?: Array<{ call_id: string; name: string; arguments: string; turn_id: string }>;
+  } = { status: "idle" },
 ) {
   return {
     id: s.id,
@@ -217,7 +220,7 @@ export function toOpenAISession(
     last_active_at: seconds(s.lastActiveAt),
     metadata: s.metadata,
     object: "agent.session" as const,
-    required_actions: [],
+    required_actions: (live.pending ?? []).map((p) => ({ type: "function_call" as const, call_id: p.call_id, name: p.name, arguments: p.arguments, turn_id: p.turn_id })),
     status: live.status,
     usage: null,
     vault_ids: [],

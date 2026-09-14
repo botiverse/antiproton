@@ -24,7 +24,10 @@ import {
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
-import { TURN_CANCELLED } from "./agents-api/transcript.ts";
+import { callTurns, TURN_CANCELLED } from "./agents-api/transcript.ts";
+import {
+  answerClientCall, clientTools, dropClientCalls, pendingClientCalls, resumeClientCalls,
+} from "../../src/runtime/client-calls.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 
@@ -943,6 +946,19 @@ export class AgentRuntime {
         job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
+    // Function tools an API caller runs itself (Agents API, task #17): offered to
+    // the model like any tool; calling one pauses the turn for the caller's
+    // result (client-calls.ts). A name the model is already offered is skipped.
+    const agentRef: { current: PiAgent | null } = { current: null };
+    const apiTools = ((await store.loadAgent(tenantId, agentId))?.config as any)?.openai?.tools;
+    const taken = new Set([...offered.map((t) => t.name), "run_js", "jobs"]);
+    const callerTools = Array.isArray(apiTools)
+      ? clientTools(
+          apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
+            name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
+          })),
+          { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane })
+      : [];
     const extraTools = [
       ...(sandbox
         ? [runJsTool(this.#executor as any, host, {
@@ -955,6 +971,7 @@ export class AgentRuntime {
           })]
         : []),
       jobs,
+      ...callerTools,
     ];
 
     const agent = await PiAgent.open({
@@ -995,6 +1012,7 @@ export class AgentRuntime {
         await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
       },
     });
+    agentRef.current = agent;
     this.#agents.set(cacheKey, agent);
     return agent;
   }
@@ -1043,6 +1061,10 @@ export class AgentRuntime {
     const cancelledTurn = await agent.cancel(TURN_CANCELLED);
     const sql = this.#deps.ctx.storage.sql;
     ensureAgentTables(sql);
+    // A turn waiting for the caller has no run to abort; it still ends, and says so.
+    if (dropClientCalls(sql, session) > 0 && !cancelledTurn) {
+      await agent.lane.appendCustomEntry(TURN_CANCELLED, { operationId: null }, BACKGROUND_CONTEXT);
+    }
     const jobs = await stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(
@@ -1050,6 +1072,40 @@ export class AgentRuntime {
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
     return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
+  }
+
+  /** The session's branch, oldest first: what the model's context is built from. */
+  async branchEntries(tenantId: string, agentId: string, session: string) {
+    const agent = await this.agent(tenantId, agentId, session);
+    const tip = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).tipId;
+    return tip ? agent.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) : [];
+  }
+
+  /** Function calls this session waits on its API caller for, with the turn each belongs to. */
+  async waitingClientCalls(tenantId: string, agentId: string, session: string) {
+    const rows = pendingClientCalls(this.#deps.ctx.storage.sql, session);
+    if (!rows.length) return [];
+    const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
+    return rows.map((r) => ({ ...r, turn_id: turns.get(r.call_id) ?? "" }));
+  }
+
+  /**
+   * An API caller's function results (task #17). Each must name a call the
+   * model made in that turn of this session; if any does not, none is kept.
+   * The turn continues on the next pass once every paused call has its result.
+   */
+  async submitToolResults(
+    tenantId: string, agentId: string, session: string,
+    results: Array<{ turnId: string; callId: string; output: string; isError: boolean }>,
+  ): Promise<{ unknown: string[] }> {
+    const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
+    const unknown = results.filter((r) => turns.get(r.callId) !== r.turnId).map((r) => r.callId);
+    if (unknown.length) return { unknown };
+    const sql = this.#deps.ctx.storage.sql;
+    ensureAgentTables(sql);
+    for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
+    markSession(sql, session, true);
+    return { unknown: [] };
   }
 
   /**
@@ -1082,10 +1138,17 @@ export class AgentRuntime {
     for (const session of sessions) {
       const agent = await this.agent(tenantId, agentId, session);
       const out = await agent.step();
-      open += out.open;
+      // A turn paused for an API caller's function results continues once they
+      // have all arrived; the next pass drives the run this starts.
+      const resumed = out.open === 0 && await resumeClientCalls({
+        sql, session, lane: agent.lane as any,
+        branch: (tip) => agent.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any,
+      });
+      open += out.open + (resumed ? 1 : 0);
       settled.push(...out.settled);
-      if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
-      markSession(sql, session, out.open > 0 || out.wakeInMs !== null);
+      const wake = resumed ? 0 : out.wakeInMs;
+      if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
+      markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
     }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by

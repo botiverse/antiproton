@@ -13,7 +13,10 @@
  */
 import type { ApiItem, ApiTurn } from "./transcript.ts";
 
-export interface Snapshot { items: ApiItem[]; turns: ApiTurn[]; status: "idle" | "in_progress" | "failed" }
+export interface PendingCall { call_id: string; name: string; arguments: string; turn_id: string }
+export interface Snapshot {
+  items: ApiItem[]; turns: ApiTurn[]; status: "idle" | "in_progress" | "requires_action" | "failed"; pending?: PendingCall[];
+}
 export type SessionEvent = { type: string; event_id: string } & Record<string, unknown>;
 
 const TERMINAL_TURN = new Set(["completed", "failed", "cancelled"]);
@@ -25,7 +28,7 @@ const isOutput = (i: ApiItem) =>
 
 export function eventsBetween(
   prev: Snapshot, next: Snapshot, ids: { sessionId: string },
-  sessionWith: (status: Snapshot["status"]) => Record<string, unknown>, eventId: () => string,
+  sessionWith: (status: Snapshot["status"], pending?: PendingCall[]) => Record<string, unknown>, eventId: () => string,
 ): SessionEvent[] {
   const out: SessionEvent[] = [];
   const push = (e: Record<string, unknown> & { type: string }) => out.push({ ...e, event_id: eventId() });
@@ -34,7 +37,7 @@ export function eventsBetween(
   const prevItems = new Map(prev.items.map((i) => [i.id, i]));
 
   if (next.status === "in_progress" && prev.status !== "in_progress") {
-    push({ type: "agent.session.in_progress", session: sessionWith(next.status) });
+    push({ type: "agent.session.in_progress", session: sessionWith(next.status, next.pending) });
   }
   for (const t of next.turns) {
     const was = prevTurns.get(t.id);
@@ -74,17 +77,24 @@ export function eventsBetween(
   // be queued and finished between two reads, and the SDK only stops on a turn's
   // end followed by idle.
   if (next.status === "idle" && (prev.status !== "idle" || ended)) {
-    push({ type: "agent.session.idle", session: sessionWith(next.status) });
+    push({ type: "agent.session.idle", session: sessionWith(next.status, next.pending) });
+  }
+  // After the items, so the function call the caller is asked to run has already been shown.
+  const asked = (s: Snapshot) => (s.pending ?? []).map((p) => p.call_id).sort().join();
+  if (next.status === "requires_action" && (prev.status !== "requires_action" || asked(prev) !== asked(next))) {
+    push({ type: "agent.session.requires_action", session: sessionWith(next.status, next.pending) });
   }
   if (next.status === "failed" && prev.status !== "failed") {
-    push({ type: "agent.session.failed", session: sessionWith(next.status) });
+    push({ type: "agent.session.failed", session: sessionWith(next.status, next.pending) });
   }
   return out;
 }
 
 export const sse = (e: SessionEvent) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
 
-const isActive = (s: Snapshot) => s.status === "in_progress" || s.turns.some((t) => t.status === "queued" || t.status === "in_progress");
+// A session waiting on its caller is read quickly too: the SDK answers as soon as it sees the call.
+const isActive = (s: Snapshot) => s.status === "in_progress" || s.status === "requires_action"
+  || s.turns.some((t) => t.status === "queued" || t.status === "in_progress");
 
 /** How long the Worker waits before reading again: quickly while work runs, backing off while idle. */
 export function nextReadDelay(next: Snapshot, idleReads: number): number {
@@ -106,7 +116,7 @@ export async function pumpSessionEvents(o: {
   sleep(ms: number): Promise<void>;
   now(): number;
   sessionId: string;
-  sessionWith(status: Snapshot["status"]): Record<string, unknown>;
+  sessionWith(status: Snapshot["status"], pending?: PendingCall[]): Record<string, unknown>;
   eventId(): string;
   maxMs?: number;
 }): Promise<"closed" | "ceiling"> {

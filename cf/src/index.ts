@@ -1378,14 +1378,19 @@ export class AgentDO extends DurableObject<Env> {
     this.#claim(tenantId, agentId);
     const rt = this.runtime();
     await rt.ready();
-    if (!(await rt.store.getModelBinding(tenantId, agentId))) return JSON.stringify({ entries: [], running: false });
+    if (!(await rt.store.getModelBinding(tenantId, agentId))) return JSON.stringify({ entries: [], running: false, pending: [] });
     const agent = await rt.agent(tenantId, agentId, sessionId);
-    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+    // The branch, not every entry: resuming a paused call leaves its placeholder result on the branch it left.
+    const entries = await rt.branchEntries(tenantId, agentId, sessionId);
     const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
-    return JSON.stringify({ entries, running });
+    const pending = running ? [] : await rt.waitingClientCalls(tenantId, agentId, sessionId);
+    return JSON.stringify({ entries, running, pending });
   }
 
-  async apiSessionStatus(tenantId: string, agentId: string, sessionId: string): Promise<"idle" | "in_progress"> {
+  async apiSessionStatus(tenantId: string, agentId: string, sessionId: string): Promise<{
+    status: "idle" | "in_progress" | "requires_action";
+    pending: Array<{ call_id: string; name: string; arguments: string; turn_id: string }>;
+  }> {
     this.#claim(tenantId, agentId);
     const rt = this.runtime();
     await rt.ready();
@@ -1393,9 +1398,27 @@ export class AgentDO extends DurableObject<Env> {
     // the harness cannot be built without one — so an agent that has never run is
     // idle by construction, and asking the harness would only throw (preview probe,
     // 2026-09-14: "no model binding" on a fresh session).
-    if (!(await rt.store.getModelBinding(tenantId, agentId))) return "idle";
+    if (!(await rt.store.getModelBinding(tenantId, agentId))) return { status: "idle", pending: [] };
     const agent = await rt.agent(tenantId, agentId, sessionId);
-    return (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null ? "in_progress" : "idle";
+    if ((await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null) return { status: "in_progress", pending: [] };
+    const pending = await rt.waitingClientCalls(tenantId, agentId, sessionId);
+    return { status: pending.length ? "requires_action" : "idle", pending };
+  }
+
+  /** An API caller's function results; the turn continues on the alarm this sets (runtime.submitToolResults). */
+  async apiToolResults(
+    tenantId: string, agentId: string, sessionId: string,
+    results: Array<{ turnId: string; callId: string; output: string; isError: boolean }>,
+  ): Promise<{ unknown: string[] }> {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiToolResults", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) return { unknown: results.map((r) => r.callId) };
+      const out = await rt.submitToolResults(tenantId, agentId, sessionId, results);
+      if (!out.unknown.length) await this.ctx.storage.setAlarm(Date.now());
+      return out;
+    });
   }
 
   async uiListAgents(tenantId: string, ownerAgentId: string) {
@@ -2467,8 +2490,11 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       postInput: async (agentId, sessionId, text) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text); },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
+      toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
       transcript: async (agentId, sessionId) =>
-        JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as { entries: unknown[]; running: boolean },
+        JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as {
+          entries: unknown[]; running: boolean; pending: Array<{ call_id: string; name: string; arguments: string; turn_id: string }>;
+        },
     },
   };
   try {
