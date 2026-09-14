@@ -103,6 +103,10 @@ not one that happened to run first. A green or a red can both be true for a
 reason unrelated to the claim being made, so the reading is part of the claim: what
 shows this changed the behaviour, and which assertion reddens if the guard breaks.
 
+## Deployment & Build Verification
+
+- **`master` HEAD vs. Live Build:** It is normal for `master` HEAD to differ from the live build reported by `/ui/whoami`. When the commits between the live build and `master` contain only documentation changes (`*.md`, `docs/*`), a production deployment is not required. When verifying code behavior, always verify against the commit SHA reported by the live environment rather than assuming `master` HEAD is deployed.
+
 ## Which document is authoritative
 
 [`README.md`](README.md) describes the system as it is; its numbers are measured
