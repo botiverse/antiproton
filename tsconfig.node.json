@@ -32,6 +32,7 @@
     "test/agents-api-shapes.ts",
     "test/agents-api-store.ts",
     "test/agents-api-handlers.ts",
+    "test/agents-api-transcript.ts",
     "test/confirm.ts",
     "test/console-assets.ts",
     "test/console-chat.ts",

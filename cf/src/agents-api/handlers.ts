@@ -10,6 +10,7 @@ import {
   agentDeleted, cursorPage, metadataOf, openAIError, parseAgentParams, parseEnvironment, sessionDeleted,
   toOpenAIAgent, toOpenAISession, type StoredAgent, type StoredSession,
 } from "./shapes.ts";
+import { sessionTranscript } from "./transcript.ts";
 
 export type SessionStatus = "idle" | "in_progress" | "requires_action" | "failed";
 
@@ -37,6 +38,8 @@ export interface AgentsApiDeps {
     /** Deliver text to the session: starts a turn when idle. */
     postInput(agentId: string, sessionId: string, text: string): Promise<void>;
     status(agentId: string, sessionId: string): Promise<SessionStatus>;
+    /** The session's pi entries, oldest first, and whether its lane is running now. */
+    transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean }>;
   };
 }
 
@@ -124,6 +127,19 @@ export async function handleAgentsApi(
       const data = [];
       for (const s of page.page.data) { const o = await sessionObject(deps, s); if (o) data.push(o); }
       return ok({ ...page.page, data });
+    }
+    if ((seg[3] === "items" || seg[3] === "turns") && method === "GET") {
+      const s = await deps.index.getSession(seg[2]!);
+      if (!s) return notFound("session", seg[2]!);
+      const t = sessionTranscript(await deps.agents.transcript(s.agentId, s.id), { sessionId: s.id, agentId: s.agentId });
+      if (seg.length === 4) {
+        const page = seg[3] === "items" ? cursorPage(t.items, q) : cursorPage(t.turns, q);
+        return page.ok ? ok(page.page) : refuse(page);
+      }
+      if (seg[3] === "turns" && seg.length === 5) {
+        const turn = t.turns.find((x) => x.id === seg[4]);
+        return turn ? ok(turn) : notFound("turn", seg[4]!);
+      }
     }
     if (seg.length === 3) {
       const id = seg[2]!;

@@ -1357,6 +1357,18 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /** The session's entries and whether its lane runs now, as JSON text (see apiGetAgent on RPC types). */
+  async apiTranscript(tenantId: string, agentId: string, sessionId: string): Promise<string> {
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    if (!(await rt.store.getModelBinding(tenantId, agentId))) return JSON.stringify({ entries: [], running: false });
+    const agent = await rt.agent(tenantId, agentId, sessionId);
+    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    return JSON.stringify({ entries, running });
+  }
+
   async apiSessionStatus(tenantId: string, agentId: string, sessionId: string): Promise<"idle" | "in_progress"> {
     this.#claim(tenantId, agentId);
     const rt = this.runtime();
@@ -2437,6 +2449,8 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       openSession: async (agentId, sessionId) => { await agentStub(agentId).apiOpenSession(tenantId, agentId, sessionId); },
       postInput: async (agentId, sessionId, text) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text); },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
+      transcript: async (agentId, sessionId) =>
+        JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as { entries: unknown[]; running: boolean },
     },
   };
   try {

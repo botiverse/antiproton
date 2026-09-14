@@ -36,6 +36,7 @@ function fakeDeps() {
       openSession: async (_a, s) => { log.opened.push(s); },
       postInput: async (_a, s, text) => { log.inputs.push({ session: s, text }); },
       status: async () => "idle",
+      transcript: async () => ({ entries: [], running: false }),
     },
   };
   return { deps, log, agents, sessions };
