@@ -81,6 +81,21 @@ await check("text written before the change is shown with the owner's raw refere
   assert(maskRawRefs("r2://b/t/tXme/u-me/x", { tenantId: "t.me", agentId: "u-me" }) === "r2://b/t/tXme/u-me/x", "a dot in an id matched any character");
 });
 
+await check("a bare key an older error echoed is masked too, and only the owner's", async () => {
+  // "no such artifact: <key>" put the bare key in tool results, and answers quoted it.
+  const said = "artifacts__read: no such artifact: t/t-me/u-me/../../other/u-x/state/s.json";
+  const shown = maskRawRefs(said, me);
+  assert(!shown.includes("t/t-me/u-me/"), `the bare key survived: ${shown}`);
+  assert(shown.includes(`${AGENT_REF}../../other/u-x/state/s.json`), `not rewritten to the shown form: ${shown}`);
+  // Inside JSON and at the very start of the text.
+  assert(maskRawRefs(JSON.stringify({ e: "t/t-me/u-me/op_1.json" }), me) === JSON.stringify({ e: `${AGENT_REF}op_1.json` }), "a bare key inside JSON survived");
+  assert(maskRawRefs("t/t-me/u-me/x", me) === `${AGENT_REF}x`, "a bare key at the start of the text survived");
+  // Not a neighbour, not another tenant, not a longer path that merely contains the scope.
+  assert(maskRawRefs("t/t-me/u-me2/x", me) === "t/t-me/u-me2/x", "a neighbouring agent's bare key was rewritten");
+  assert(maskRawRefs("t/t-other/u-me/x", me) === "t/t-other/u-me/x", "another tenant's bare key was rewritten");
+  assert(maskRawRefs("backup/t/t-me/u-me/x", me) === "backup/t/t-me/u-me/x", "a longer path containing the scope was rewritten");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);
