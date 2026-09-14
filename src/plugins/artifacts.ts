@@ -1,4 +1,5 @@
 import type { Plugin } from "./types.ts";
+import { keyForRef } from "../store/refs.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 
 /**
@@ -33,18 +34,6 @@ export const READ_PAGE = 16 * 1024;
  */
 export const READ_WHOLE_MAX = 32 * 1024;
 
-/**
- * Whether a reference's key can be read back at all.
- *
- * The reader refuses `.`, `..` and empty segments, so anything that offers a
- * `read` call has to ask the same question or it offers one that cannot work.
- * One predicate with two callers rather than two checks that agree today:
- * `state.get` handed back a call for a key the reader would refuse, and the
- * model had no way to tell the value was unreachable (Vera on 2d3de80).
- */
-export function readableKey(key: string): boolean {
-  return !key.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
-}
 
 export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
   return {
@@ -98,24 +87,14 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
     async invoke(tool, args, ctx) {
       if (tool !== "read") throw new Error(`unknown tool: ${tool}`);
       const a = args as { ref: string; from?: number; fields?: string[]; offset?: number; limit?: number };
-      const prefix = `r2://${bucket}/t/${ctx.caller.tenantId}/${ctx.caller.agentId}/`;
-      // Tenant isolation is enforced on the reference itself, not on a guess
-      // about who parked it.
-      if (typeof a.ref !== "string" || !a.ref.startsWith(prefix)) {
+      // One question, asked by the contract that owns it: does this reference
+      // name something of the agent holding it? `keyForRef` answers for both
+      // forms — the shown `artifact://<path>` and a legacy raw reference still
+      // sitting in an old transcript — and it is the same function the runtime
+      // and the other plugins use, so the answer cannot drift between them.
+      const key = keyForRef(String(a.ref), ctx.caller);
+      if (key === null) {
         throw new Error(`reference is not readable by this agent: ${String(a.ref).slice(0, 80)}`);
-      }
-      const key = a.ref.slice(`r2://${bucket}/`.length);
-      // Starting inside this agent's prefix is not the same as staying there.
-      // A reference may carry `..` and still pass the test above, because the
-      // test reads the front of the string and nothing reads the rest: the
-      // whole of "it does not escape" then rests on R2 treating a key as
-      // opaque and never resolving a segment (Vera wrote one and read it back
-      // unchanged, 2026-09-13). That is true of R2 and it is not written down
-      // anywhere, which makes it a dependency this guard cannot see. Refusing
-      // the segments costs one pass and ends the delegation — and it is the
-      // segments, not the characters: `notes..old` is a name, `..` is a move.
-      if (!readableKey(key)) {
-        throw new Error(`reference is not readable by this agent: ${a.ref.slice(0, 80)}`);
       }
       const raw = new TextDecoder().decode(await artifacts.get(key));
       // The continuation a cut result points at: the stored text as-is, a page

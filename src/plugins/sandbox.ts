@@ -1,6 +1,7 @@
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
+import { toAgentRef } from "../store/refs.ts";
 
 /**
  * A real Node runtime, as a mount.
@@ -975,9 +976,15 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
       const stored = await artifacts.put(
         `t/${ctx.caller.tenantId}/${ctx.caller.agentId}/sandbox/${state!.boxId}/${name}`,
         body, archive ? "application/x-tar" : "application/octet-stream");
-      state = { ...state!, saved: [...(state!.saved ?? []), stored.ref], lastUsedAt: Date.now() };
+      // Kept in the form the agent may be shown, because that is the only form
+      // it leaves here in: `release` hands this list back, and `sessionOf`
+      // reports it without a caller to convert it with. Storing the raw key
+      // would put a conversion somewhere that has no owner to convert for
+      // (tygg, 2026-09-14).
+      const shown = toAgentRef(stored.ref, ctx.caller) ?? stored.ref;
+      state = { ...state!, saved: [...(state!.saved ?? []), shown], lastUsedAt: Date.now() };
       await ctx.connection.set(state as unknown as Json);
-      return { path, ref: stored.ref, bytes: body.length };
+      return { path, ref: shown, bytes: body.length };
     };
 
     if (tool === "keep") {

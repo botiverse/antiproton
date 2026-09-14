@@ -117,6 +117,49 @@ await check("被拒的是路径段,不是字符: `notes..old` 仍是一个名字
   if (out.kind !== "value") throw new Error(`a name containing two dots was refused: ${JSON.stringify(out)}`);
 });
 
+await check("模型拿到的引用里没有桶名、租户名、agent 名", async () => {
+  // The whole point of the change: what a reference carries is the path under
+  // this agent's own scope, and nothing about where the agent lives (tygg,
+  // 2026-09-14). Asserting the shown form is present is not enough — a value
+  // that carried both would pass that.
+  const r = reader({ ok: true });
+  const out = await r({ ref: "artifact://state/huge2.json" });
+  if (out.kind !== "value") throw new Error(`the shown form was not readable: ${JSON.stringify(out)}`);
+  const text = JSON.stringify(out);
+  for (const leak of ["r2://", "/t/", BUCKET]) {
+    if (text.includes(leak)) throw new Error(`the answer carries ${leak}: ${text.slice(0, 140)}`);
+  }
+});
+
+await check("旧转录里的原始引用仍读得回来,但别人的仍然不行", async () => {
+  // Transcripts written before the change hold raw references, so refusing
+  // them outright would make old work unreadable — the failure we repaired
+  // twice this week. They are accepted only inside the caller's own scope.
+  const r = reader({ ok: true });
+  const mine = await r({ ref: `r2://${BUCKET}/t/t/a/state/huge2.json` });
+  if (mine.kind !== "value") throw new Error(`a legacy reference of this agent's was refused: ${JSON.stringify(mine)}`);
+
+  let refused = false;
+  try { await r({ ref: `r2://${BUCKET}/t/other/u-else/state/huge2.json` }); }
+  catch (e) { refused = /not readable by this agent/.test(String((e as Error).message)); }
+  if (!refused) throw new Error("a legacy reference belonging to another agent was accepted");
+});
+
+await check("说不出别人的东西: 新形式里根本没有能指向别人的那一段", async () => {
+  // Under the shown form the caller supplies only the path inside its own
+  // scope, so naming another agent's object is not refused — it cannot be
+  // expressed. The nearest attempt is a path, and it resolves under the
+  // caller's own prefix.
+  const seen: string[] = [];
+  const body = new TextEncoder().encode(JSON.stringify({ ok: true }));
+  const plugin = artifactsPlugin({ async get(key: string) { seen.push(key); return body; } } as any, BUCKET);
+  const ctx = { caller: { tenantId: "t", agentId: "a" }, alias: "artifacts" } as any;
+  await plugin.invoke("read", { ref: "artifact://t/other/u-else/state/huge2.json" } as any, ctx);
+  if (seen[0] !== "t/t/a/t/other/u-else/state/huge2.json") {
+    throw new Error(`an attempt to name another agent did not land under the caller's own scope: ${seen[0]}`);
+  }
+});
+
 console.log(`\n  What \`read\` does with fields, offset and limit\n  ${"─".repeat(56)}`);
 await check("from continues a cut result page by page, and the pages join back into the exact text", async () => {
   // Following the notes is the whole contract: each page says where the next

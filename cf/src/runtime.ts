@@ -60,6 +60,7 @@ import { statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
+import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -224,7 +225,9 @@ class BoundArtifacts {
   }
   async get(key: string): Promise<Uint8Array> {
     const obj = await this.#bucket.get(key);
-    if (!obj) throw new Error(`no such artifact: ${key}`);
+    // Not the key: it names the bucket, the tenant and the agent, and this
+    // message reaches the model through the reader's error.
+    if (!obj) throw new Error("no such artifact");
     return new Uint8Array(await obj.arrayBuffer());
   }
 }
@@ -684,7 +687,11 @@ export class AgentRuntime {
         return {
           status: "succeeded",
           operationId: res.operationId,
-          result: tooLargeResult(res.result, body, { ref: stored.ref, readBack }),
+          // The operations row keeps the raw reference; the model is shown the
+          // agent's own path and nothing about where that agent lives (tygg,
+          // 2026-09-14). The key was built from ctx two lines up, so it is
+          // always under this agent's scope.
+          result: tooLargeResult(res.result, body, { ref: toAgentRef(stored.ref, ctx)!, readBack }),
         };
       },
     };
