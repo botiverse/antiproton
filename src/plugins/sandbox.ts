@@ -360,6 +360,11 @@ export function finished(
     state: rec.state,
     exitCode: rec.exit_code ?? null,
     ...(cwd ? { cwd } : {}),
+    // Allowed, not refused: an agent may need to look in /tmp. But work left there is gone after an idle
+    // spell (tmpfs, measured 2026-09-15), so the result says so while the agent is still standing in it.
+    ...(cwd && (cwd === "/tmp" || cwd.startsWith("/tmp/"))
+      ? { cwdNote: "files under /tmp do not survive while the container sits idle; keep work in the working directory" }
+      : {}),
     ...(rec.state === "error" && rec.reason ? { error: String(rec.reason) } : {}),
     // "container", never "sandbox": the harness already calls the per-execution
     // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
@@ -725,6 +730,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       summary:
         shellLifetime + " Each call starts in the directory the previous call ended in, like one terminal " +
         "session, and its result says where that is (`cwd`); the first starts in the working directory. " +
+        "Pass `workdir` to run one command in another directory instead of starting it with `cd`. " +
         "Exported variables and aliases do not carry over, so set them in the command that needs them, " +
         "and a command handed over as a job does not move the directory. Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
@@ -733,7 +739,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "that instead of probing for it. Save anything worth keeping, then release.",
       parameters: {
         type: "object",
-        properties: { command: { type: "string" } },
+        properties: {
+          command: { type: "string" },
+          workdir: {
+            type: "string",
+            description: "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended",
+          },
+        },
         required: ["command"],
       },
       sideEffects: "write",
@@ -1233,7 +1245,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
 
     const wd = cfg.workdir;
-    const a = (args ?? {}) as { code?: string; install?: string[]; command?: string };
+    const a = (args ?? {}) as { code?: string; install?: string[]; command?: string; workdir?: string };
+    const askedDir = tool === "shell" && typeof a.workdir === "string" && a.workdir.trim()
+      ? (a.workdir.trim().startsWith("/")
+          ? a.workdir.trim()
+          : "/" + segmentsOf(`${state.cwd ?? wd}/${a.workdir.trim()}`).join("/"))
+      : null;
     let command: string;
     if (tool === "run") {
       if (!a.code) throw new Error("code is required");
@@ -1260,7 +1277,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // ended, passed as run9's `workdir` rather than a `cd` glued in front (run9's
       // own advice for "run this from that directory"). A new box has no such
       // directory yet, so its first command makes and enters the working one.
-      command = state.cwd ? withCwdTrailer(a.command) : withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`);
+      // An explicit `workdir` (tygg, 2026-09-15) runs this one command there; a
+      // relative one is taken from where the shell is now.
+      command = (askedDir ?? state.cwd) ? withCwdTrailer(a.command) : withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`);
     } else {
       throw new Error(`unknown tool: ${tool}`);
     }
@@ -1283,7 +1302,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // back in the same shape either way — state, exit_code, output_summary —
     // which is what lets `finished` stay one function (checked live: exit 3 and
     // both streams came back identically).
-    const startIn = tool === "shell" && state.cwd ? state.cwd : null;
+    const startIn = tool === "shell" ? (askedDir ?? state.cwd ?? null) : null;
     const start = async (argv: string[], workdir: string | null) => (await api(
       "POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/background-execs`,
       { command: argv, ...(workdir ? { workdir } : {}) },
@@ -1302,9 +1321,17 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     for (;;) {
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${execId}`);
       // run9 does not start an exec in a directory that is gone (it may have been
-      // removed, or lived under /tmp, which does not survive an idle box). Once:
-      // start again in the working directory, and say so.
-      if (rec.state === "error" && startIn && !movedFrom && /failed to start/i.test(String(rec.reason ?? ""))) {
+      // removed, or lived under /tmp, which does not survive an idle box).
+      // A directory the agent named is its own answer: say it does not exist
+      // rather than run the command somewhere it did not ask for.
+      if (rec.state === "error" && askedDir && /failed to start/i.test(String(rec.reason ?? ""))) {
+        return {
+          ...finished(rec, cfg, state, ctx.alias, lease),
+          note: `${askedDir} does not exist in the container; create it first, or leave workdir out`,
+        };
+      }
+      // A remembered one that vanished: once, start again in the working directory, and say so.
+      if (rec.state === "error" && startIn && !askedDir && !movedFrom && /failed to start/i.test(String(rec.reason ?? ""))) {
         movedFrom = startIn;
         execId = await start(execArgv(cfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`)), null);
         continue;

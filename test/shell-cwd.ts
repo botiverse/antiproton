@@ -117,6 +117,40 @@ await check("a directory that is gone: the command runs once more in the working
   assert(gone.writes.at(-1)?.cwd === "/work", `saved cwd: ${gone.writes.at(-1)?.cwd}`);
 });
 
+await check("an explicit workdir runs this command there, a relative one from the current directory, and the shell follows", async () => {
+  const abs = run9({ ...BOX, cwd: "/work" }, { e1: [{ state: "succeeded", exit_code: 0, output_summary: "x\n__AP_CWD__/srv/app\n" }] });
+  const r: any = await plugin.invoke("shell", { command: "git status", workdir: "/srv/app" }, abs.ctx);
+  assert(abs.posts[0]!.body.workdir === "/srv/app", `explicit workdir not sent: ${JSON.stringify(abs.posts[0]?.body)}`);
+  assert(!abs.posts[0]!.body.command.join(" ").includes("cd "), "an explicit workdir still glued a cd in front");
+  assert(r.cwd === "/srv/app" && abs.writes.at(-1)?.cwd === "/srv/app", `after an explicit workdir: ${r.cwd}, saved ${abs.writes.at(-1)?.cwd}`);
+
+  const rel = run9({ ...BOX, cwd: "/srv/app" }, { e1: [{ state: "succeeded", exit_code: 0, output_summary: "__AP_CWD__/srv/app/tests\n" }] });
+  await plugin.invoke("shell", { command: "ls", workdir: "tests/../tests" }, rel.ctx);
+  assert(rel.posts[0]!.body.workdir === "/srv/app/tests", `relative workdir resolved to ${rel.posts[0]?.body.workdir}`);
+
+  const fresh = run9({ ...BOX }, { e1: [{ state: "succeeded", exit_code: 0, output_summary: "__AP_CWD__/opt\n" }] });
+  await plugin.invoke("shell", { command: "ls", workdir: "/opt" }, fresh.ctx);
+  assert(fresh.posts[0]!.body.workdir === "/opt" && !fresh.posts[0]!.body.command.join(" ").includes("cd /work"),
+    `on a new box an explicit workdir must win over the bootstrap: ${JSON.stringify(fresh.posts[0]?.body)}`);
+});
+
+await check("an explicit workdir that does not exist is refused by name, never run somewhere else", async () => {
+  const missing = run9({ ...BOX, cwd: "/work" }, { e1: [{ state: "error", reason: "failed to start run9ch exec" }] });
+  const r: any = await plugin.invoke("shell", { command: "make", workdir: "/nope" }, missing.ctx);
+  assert(missing.posts.length === 1, `a named directory that is missing was retried elsewhere: ${missing.posts.length} starts`);
+  assert(r.state === "error" && /\/nope does not exist/.test(String(r.note)), `result: ${JSON.stringify(r).slice(0, 200)}`);
+  assert(!missing.writes.some((w: any) => w?.cwd && w.cwd !== "/work"), "the shell moved after a refused workdir");
+});
+
+await check("a command that ends under /tmp is told its files will not survive idle time; elsewhere nothing is said", async () => {
+  const inTmp = run9({ ...BOX, cwd: "/work" }, { e1: [{ state: "succeeded", exit_code: 0, output_summary: "__AP_CWD__/tmp/build\n" }] });
+  const r: any = await plugin.invoke("shell", { command: "cd /tmp/build" }, inTmp.ctx);
+  assert(/do not survive while the container sits idle/.test(String(r.cwdNote)), `no warning under /tmp: ${JSON.stringify(r).slice(0, 200)}`);
+  const inWork = run9({ ...BOX, cwd: "/work" }, { e1: [{ state: "succeeded", exit_code: 0, output_summary: "__AP_CWD__/work/tmp-like\n" }] });
+  const w: any = await plugin.invoke("shell", { command: "cd /work/tmp-like" }, inWork.ctx);
+  assert(w.cwdNote === undefined, `a warning outside /tmp: ${w.cwdNote}`);
+});
+
 await check("an exec run9 could not start is a finished result, not a job that never ends", async () => {
   const stuck = run9({ ...BOX }, { e1: [{ state: "error", reason: "failed to start run9ch exec" }] });
   const r: any = await plugin.invoke("shell", { command: "true" }, stuck.ctx);
