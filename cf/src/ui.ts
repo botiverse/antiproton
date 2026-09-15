@@ -157,6 +157,7 @@ border-radius:8px;padding:10px 12px;box-shadow:var(--theme-shadow-md);font-size:
 .new-agent-form label i{color:var(--faint);font-style:normal}
 .new-agent-form .pick,.new-agent-form .row{display:flex;align-items:center;gap:8px}
 .new-agent-form .err{font-size:11px;color:var(--bad)}
+.err.write-err{color:var(--bad);font-size:11px;margin-top:6px}
 .new-agent-form .err[hidden]{display:none}
 .new-agent-form .hint{padding:0;font-size:10.5px}
 textarea{background:var(--layer-panel);border:1px solid var(--line-field);border-radius:6px;color:var(--ink);font:inherit;font-size:12px;padding:6px 8px;resize:vertical;min-height:56px;width:100%}
@@ -771,6 +772,24 @@ ${HEAD_ASSETS}
   document.body.addEventListener('htmx:afterRequest', (e) => {
     const v = e.detail.xhr && e.detail.xhr.getResponseHeader('x-ap-version');
     if (v) e.detail.elt.dataset.ver = v;
+  });
+  // A write the server refused swaps nothing (htmx leaves the panel alone),
+  // so the failure must be spoken: one line under the form, the server's own
+  // reason. Without it a click is indistinguishable from "did not save" —
+  // the shape Vera and cody named on 2026-09-15. The composer owns its error
+  // (ap.sent), so it is excluded here.
+  document.body.addEventListener('htmx:afterRequest', (e) => {
+    const elt = e.target;
+    const f = elt && elt.closest ? elt.closest('form[hx-post]') : null;
+    if (!f || f.getAttribute('hx-post') === '/ui/message') return;
+    const xhr = e.detail.xhr;
+    let slot = f.querySelector('.write-err');
+    if (!slot) { slot = document.createElement('div'); slot.className = 'err write-err'; f.appendChild(slot); }
+    const ok = !!xhr && xhr.status < 400;
+    slot.hidden = ok;
+    if (ok) return;
+    const body = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 160) : '';
+    slot.textContent = 'not saved' + (xhr && xhr.status ? ' (' + xhr.status + ')' : '') + (body ? ': ' + body : '');
   });
   // Polling stops while the tab is hidden (every trigger tests document.hidden);
   // on return, the shown panels refresh at once rather than waiting out the
