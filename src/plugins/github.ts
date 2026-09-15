@@ -54,7 +54,29 @@ function repoOf(args: Record<string, any>): string {
   return repo;
 }
 
-async function call(method: string, path: string, ctx: PluginContext, body?: unknown): Promise<any> {
+/**
+ * What a mount with no account should say when GitHub's answer may be about the
+ * account rather than the request. The seeded mount has none, and without this
+ * an agent read a private repository's 404 as "the repository cannot be
+ * reached" and a shared anonymous limit's 403 as a dead end, and the person had
+ * to work out that an account was missing (trajectory read by cody, 2026-09-15).
+ */
+function noAccountHint(status: number): string {
+  if (status === 404) {
+    return " — this mount has no account, so a private repository answers exactly like a missing one;" +
+      " a person can attach a token to the mount";
+  }
+  if (status === 403) {
+    return " — this mount has no account, so it shares GitHub's low anonymous rate limit with everything" +
+      " else calling from this server; a person can attach a token to the mount to raise it";
+  }
+  return "";
+}
+
+async function call(
+  method: string, path: string, ctx: PluginContext, body?: unknown,
+  opts: { text?: boolean } = {},
+): Promise<any> {
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "x-github-api-version": "2022-11-28",
@@ -70,7 +92,15 @@ async function call(method: string, path: string, ctx: PluginContext, body?: unk
     signal: AbortSignal.timeout(30_000),
   });
   const text = await res.text();
-  const parsed = text ? JSON.parse(text) : null;
+  // Parsed only when it is JSON. Actions logs are plain text and an error page
+  // can be HTML; parsing those threw a SyntaxError that named neither the status
+  // nor the endpoint, and the agent went to curl with the token in the command.
+  const type = res.headers.get("content-type") ?? "";
+  const isJson = /json/i.test(type) || (!type && /^\s*[[{]/.test(text));
+  let parsed: any = null;
+  if (text && isJson) {
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+  }
   if (!res.ok) {
     const remaining = res.headers.get("x-ratelimit-remaining");
     const reset = res.headers.get("x-ratelimit-reset");
@@ -80,10 +110,20 @@ async function call(method: string, path: string, ctx: PluginContext, body?: unk
       ? ` — rate limit exhausted, resets ${new Date(Number(reset) * 1000).toISOString()}`
       : "";
     const err = new Error(
-      `github ${res.status}: ${parsed?.message ?? res.statusText}${rate}`,
+      `github ${res.status}: ${parsed?.message ?? res.statusText}${rate}${ctx.credential ? "" : noAccountHint(res.status)}`,
     ) as Error & { retryable?: boolean };
     err.retryable = res.status === 429 || (res.status === 403 && remaining === "0") || res.status >= 500;
     throw err;
+  }
+  if (text && !isJson) {
+    if (!opts.text) throw new Error(`github answered ${type || "an unlabelled body"} rather than JSON for ${path}`);
+    if (/zip|gzip|octet-stream|image\/|pdf/i.test(type) || text.includes(NUL)) {
+      throw new Error(
+        `github answered binary content (${type || "unlabelled"}) for ${path}, which this tool cannot return as text` +
+        (/\/actions\/runs\/\d+\/logs/.test(path) ? "; a run's logs are a zip, and each job's logs are text at /repos/{owner}/{repo}/actions/jobs/{job_id}/logs" : ""),
+      );
+    }
+    return { contentType: type, text };
   }
   return parsed;
 }
@@ -253,7 +293,7 @@ export const githubPlugin: Plugin = {
     // two, so reading a label through it was held for approval exactly as
     // deleting one was — which is a gate nobody wants and everybody learns to
     // wave through. Splitting them lets each declare what it actually is.
-    t("api_get", "Read any GitHub REST endpoint, the way `gh api` does — for what the read tools above do not cover. Path only, no host, no body. Works without an account on public data.", {
+    t("api_get", "Read any GitHub REST endpoint, the way `gh api` does — for what the read tools above do not cover. Path only, no host, no body. Works without an account on public data. A text answer, such as a job's logs, comes back as { contentType, text }.", {
       path: { type: "string", description: '"/repos/owner/name/labels" — leading slash, no host' },
     }, ["path"], "read"),
     t("api", "Write to any GitHub REST endpoint — POST, PATCH, PUT or DELETE, for what the write tools above do not cover. Path only, no host. Needs an account, is not idempotent, and a mount may hold it for a person. To read, use api_get.", {
@@ -449,7 +489,7 @@ export const githubPlugin: Plugin = {
       }
 
       case "api_get":
-        return (await call("GET", apiPath(a.path), ctx)) as Json;
+        return (await call("GET", apiPath(a.path), ctx, undefined, { text: true })) as Json;
 
       case "api": {
         const method = String(a.method ?? "").toUpperCase();
