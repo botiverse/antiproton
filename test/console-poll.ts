@@ -112,6 +112,18 @@ check("a refused write says so under the form; the composer owns its own error",
   must(/slot\.hidden = ok/.test(html), "on success the line hides again");
 });
 
+check("a 422 with secret:true names the mount and offers send-anyway as a second click", () => {
+  // cody (#350/#351, 2026-09-15): a credential-shaped message is refused
+  // before it enters history or reaches the model. The composer must say
+  // where it belongs (the plugin's mount when the server knows it) and offer
+  // an explicit override — never send it by default.
+  must(/id="composer" hx-post="\/ui\/message"/.test(html), "the composer needs an id so the override button can resubmit it");
+  must(/xhr\.status === 422[\s\S]*?d\.secret === true/.test(html), "ap.sent must recognise the credential intercept, not print it as a generic failure");
+  must(/d\.plugins\[0\][\s\S]*?mount on the plugins page/.test(html), "when the server names a plugin, the hint points at its mount");
+  must(/No mount here takes this kind/.test(html), "when nothing takes it, the hint says so instead of guessing");
+  must(/type="submit" form="composer" name="allowSecret" value="1"/.test(html), "send-anyway resubmits the same text with allowSecret=1 — an explicit second click");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);
