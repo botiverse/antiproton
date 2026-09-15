@@ -19,6 +19,7 @@ import OpenAIModule from "openai";
 import { readdirSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { renderReport } from "./report.mjs";
 
 const OpenAI = OpenAIModule.default ?? OpenAIModule;
 const here = dirname(fileURLToPath(import.meta.url));
@@ -74,5 +75,6 @@ mkdirSync(out, { recursive: true });
 const record = { kind: "agents-api-sdk-qa", started, finished: new Date().toISOString(), target: base, build, sdk: `openai ${sdkVersion}`, tier, only: only || null, passed: results.length - failed, total: results.length, results };
 const file = join(out, `qa-${started.replace(/[:.]/g, "-")}.json`);
 writeFileSync(file, JSON.stringify(record, null, 2));
-console.log(`  recorded ${file}`);
+writeFileSync(file.replace(/\.json$/, ".html"), renderReport([record]));
+console.log(`  recorded ${file} (and .html)`);
 process.exit(failed ? 1 : 0);

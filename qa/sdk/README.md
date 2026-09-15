@@ -17,8 +17,10 @@ QA_ONLY=cancel qa/sdk/run.sh all   # only scenarios whose name contains "cancel"
 - **Model tiers:** `run.sh` puts `DEEPSEEK_API_KEY` from `~/.secrets/antiproton.env` on the
   `antiproton-preview` Worker for the run and deletes it on exit. The key is never printed or stored elsewhere.
   Model scenarios spend real DeepSeek tokens.
-- **Record:** each run writes a JSON record to `qa/sdk/out/` (target, build, SDK version,
-  each scenario's result and time). It is not a published benchmark run, so it does not go in `report/runs/`.
+- **Record:** each run writes a JSON record and a self-contained HTML report to `qa/sdk/out/` (target, build,
+  SDK version, each scenario's result, note or error, and time). It is not a published benchmark run, so it does
+  not go in `report/runs/`. To combine several runs into one report:
+  `node qa/sdk/report.mjs qa/sdk/out/a.json qa/sdk/out/b.json -o report.html`
 
 ## Writing a scenario
 
