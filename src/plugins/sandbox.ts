@@ -667,7 +667,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     ? "The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later " +
       "ones, so installs and files survive from one call to the next — do not reinstall. It stays until you " +
       `release it; ${leaseTerms(lease)}. Work in as few calls as you can, save what matters with \`save\`, and ` +
-      "release it as soon as you no longer need the machine. Everything inside is destroyed when it is released."
+      "release it once the machine will not be needed again. Everything inside is destroyed when it is released."
     : "The container is NOT the per-execution sandbox: every call in this " +
       "turn uses the same one, so installs and files survive from one call to the next — do not " +
       "reinstall. It is handed back when the turn ends, so a later turn starts a new container " +
@@ -848,8 +848,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       name: "release",
       summary:
         "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-        "first, in the same call. Do this as soon as you no longer need the machine — not at the end " +
-        "of the task, at the end of the work that needed a machine.",
+        "first, in the same call. Release it when this machine will not be needed again. If you or the " +
+        "person you are working for will come back to it, leave it running: an idle container is released " +
+        "on its own after a while, you are told before that, and `quiet` keeps it longer. A kept " +
+        "environment or a saved file is for starting a fresh machine later, not a reason to destroy one " +
+        "you are about to use again.",
       parameters: {
         type: "object",
         properties: {

@@ -7,7 +7,16 @@ set -euo pipefail
 PORT="${PORT:-8792}"
 cd "$(dirname "$0")/../cf"
 state=$(mktemp -d)
+dev=""
+# The whole tree `npx wrangler dev` started, children first: killing only what listens on the port stopped
+# workerd and left npm and wrangler running, and every run left another orphan on the port (2026-09-15).
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill_tree "$child"; done
+  kill "$pid" 2>/dev/null || true
+}
 cleanup() {
+  [ -n "$dev" ] && kill_tree "$dev"
   for p in $(lsof -ti "tcp:$PORT" 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
   rm -rf "$state"
 }
@@ -22,6 +31,7 @@ if ! CI=1 npx wrangler d1 migrations apply CONTROL_DB --local --persist-to "$sta
 fi
 npx wrangler dev --config wrangler.conformance.jsonc --local --persist-to "$state/d1" \
   --port "$PORT" --inspector-port 0 >"$state/dev.log" 2>&1 &
+dev=$!
 answered=""
 for _ in $(seq 1 60); do
   sleep 1

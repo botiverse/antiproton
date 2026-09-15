@@ -1450,6 +1450,23 @@ await check("从盒子里存出来的文件,名字是【解析过的路径】,�
 });
 
 console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
+/**
+ * When to release, said so that "the user will come back" has an answer.
+ *
+ * Vera's blind-use run (2026-09-15): an agent told the user would return to the files kept a snapshot, saved an
+ * archive, then released the container "to stop billing", because `release` said to destroy it as soon as the
+ * work that needed it was done. Under the lease that is the wrong trade: the idle release bounds the cost, and the
+ * next visit pays for a new machine. So `release` says when not to release, and what the kept copies are for.
+ */
+await check("release says to leave a container someone will come back to, and what kept copies are for", async () => {
+  const release = run9.tools.find((t) => t.name === "release")!.summary;
+  if (!/will not be needed again/.test(release)) throw new Error(`release does not say when to release: ${release}`);
+  if (!/come back to it, leave it running/.test(release)) throw new Error(`release does not say to leave a box someone returns to: ${release}`);
+  if (!/`quiet` keeps it longer/.test(release)) throw new Error(`release does not point to quiet: ${release}`);
+  if (!/for starting a fresh machine later/.test(release)) throw new Error(`release does not say what keep and save are for: ${release}`);
+  if (/as soon as you no longer need the machine/.test(release)) throw new Error(`release still says to destroy the box as soon as the work is done: ${release}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
