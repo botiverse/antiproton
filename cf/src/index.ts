@@ -57,6 +57,8 @@ import {
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
+import { adminDiagnose } from "./admin-diagnose.ts";
+import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
@@ -603,107 +605,18 @@ export class AgentDO extends DurableObject<Env> {
    * else's object through it — which is right, and also means a stuck agent is
    * invisible without a way in. Reachable only with the automation secret.
    */
+  /**
+   * /admin/diagnose's report, read from this object's SQL and the store's plain readers only
+   * (cf/src/diagnose-read.ts). It used to open the agent and render through uiTranscript, which ran the
+   * store's migrations, re-pinned mounts, created the default conversation and tables (Ada and Vera, #336).
+   * Null for an agent or conversation this object does not hold.
+   */
   async diagnose(tenantId: string, agentId: string, taskId: string) {
-    const rt = this.#activeRuntime();
-    await rt.ready();
-    const agent = await rt.agent(tenantId, agentId);
-    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
-    const events = entriesToEvents(entries);
-    const kinds: Record<string, number> = {};
-    for (const e of events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
-    const execution = await agent.lane.inspectExecution(BACKGROUND_CONTEXT);
-    const compactions = entries.filter((e) => e.type === "compaction");
-    return {
-      owner: await this.owner(),
-      // There is no checkpoint any more — the log is the state, so the size a
-      // long conversation eventually runs into is the transcript itself.
-      entries: entries.length,
-      compaction: {
-        compactions: compactions.length,
-        messages: entries.filter((e) => e.type === "message").length,
-        summary: (compactions.at(-1) as any)?.summary?.slice(0, 1200) ?? null,
-      },
-      // What the lane is doing right now, asked of the lane rather than
-      // inferred from rows that might disagree with it.
-      execution: {
-        tip: execution.tipId, model: execution.configuredModel,
-        current: execution.current, lastOperationId: execution.lastOperationId,
-      },
-      modelBinding: await rt.store.getModelBinding(tenantId, agentId),
-      mounts: await Promise.all((await rt.store.listMounts(tenantId, agentId)).map(async (m) => ({
-        alias: m.alias, plugin: m.plugin, policy: m.policy,
-        // A mount created before a config field existed keeps the old config
-        // for ever, and the symptom shows up somewhere else entirely.
-        config: m.publicConfig,
-        // Whose credential this is, never what it is: an operator moving or
-        // renaming a mount has to be able to see which references moved with
-        // it (the agent's own) and which must not have (the deployment's).
-        secret: secretRefKind(m.secretRef),
-        // Whether state is kept under this alias. A rename moves it in the
-        // same transaction as the mount; this is how that is checked from
-        // outside, since the state itself is the plugin's and stays private.
-        connection: (await rt.store.getConnection(tenantId, agentId, m.alias)) != null,
-      }))),
-      // What each mount says it is holding and has held — the sandbox panel's
-      // data, which was otherwise reachable only from a signed-in person's own
-      // page. Activity and history only; no credential, no plugin state.
-      mountReports: await this.#mountReports(rt, tenantId, agentId, taskId),
-      eventKinds: kinds,
-      lastEvents: events.slice(-6).map((e) => ({
-        seq: e.sequence, kind: e.kind,
-        detail: JSON.stringify(e.payload).slice(0, 220),
-      })),
-      pendingWork: execution.current ? 1 : 0,
-      // How recent background jobs ended (task #16): running, done, failed or
-      // cancelled, with when and why — the only record of whether a job refused
-      // at the cap, or past its ceiling, actually stopped.
-      backgroundJobs: recentBackgroundJobs(this.sql, { tenantId, agentId }, 10),
-      alarm: await this.ctx.storage.getAlarm(),
-      // What the agent believes, in the operator's own view. The tools tell the
-      // agent this is readable by the person running it; that has to be true,
-      // or a wrong memory is only discoverable by watching it act on one.
-      state: await (async () => {
-        const rt2 = this.#activeRuntime();
-        const keys = await rt2.store.listState(tenantId, agentId, "", 20);
-        const docs: Record<string, unknown> = {};
-        for (const k of keys.slice(0, 5)) {
-          const got = await rt2.store.getState(tenantId, agentId, k.key);
-          docs[k.key] = got?.ref ?? (typeof got?.value === "string"
-            ? got.value.slice(0, 600) : got?.value);
-        }
-        return { ...(await rt2.store.stateUsage(tenantId, agentId)), docs };
-      })(),
-      alarmFailures: this.#alarmFailures(),
-      // What is still being billed because it could not be handed back.
-      releaseErrors: (this.sql.exec(
-        "CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)"),
-        [...this.sql.exec("SELECT at, alias, message FROM release_errors ORDER BY at DESC LIMIT 5")]
-          .map((r: any) => ({ at: r.at, alias: r.alias, message: r.message }))),
-      // The table exists only once an alarm has failed; diagnose must not be
-      // the thing that throws while explaining why something else did.
-      alarmErrors: (this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)"),
-        [...this.sql.exec(
-        "SELECT at, message FROM alarm_errors ORDER BY at DESC LIMIT 3")].map((r: any) => r.message)),
-      // Which model calls are still out. An agent that stops for no visible
-      // reason is nearly always a row here that nothing is watching.
-      modelJobs: [...this.sql.exec(
-        `SELECT id, created_at FROM pi_model_jobs
-          WHERE answer IS NULL ORDER BY created_at DESC LIMIT 10`)].map((r: any) => ({
-          id: r.id, ageMs: Date.now() - Number(r.created_at),
-        })),
-      // What the panel actually renders. "It is not replying" and "the reply is
-      // not being drawn" look identical from outside, so show the rendering.
-      rendered: await (async () => {
-        try {
-          const t = await this.uiTranscript(tenantId, agentId, taskId);
-          const out = trajectory(t.events, t.byOp, t.busy);
-          return { ok: true, bytes: out.length, steps: (out.match(/class="step /g) ?? []).length,
-                   tail: out.slice(-400) };
-        } catch (e: any) {
-          return { ok: false, error: String(e?.message ?? e).slice(0, 300) };
-        }
-      })(),
-    };
+    return readDiagnosis(this.sql, tenantId, agentId, taskId, {
+      store: new DurableObjectStore(this.ctx as any),
+      plugins: this.#activeRuntime().plugins(),
+      alarm: () => this.ctx.storage.getAlarm(),
+    });
   }
 
   /** The binding, credential-free, so an operator can see whose key is in use. */
@@ -2943,18 +2856,12 @@ export default {
           const s3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s3.uiRenameMount(t, a, from, to));
         }
-        case "/admin/diagnose": {
-          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          const t = url.searchParams.get("tenantId") ?? "demo";
-          const a = String(url.searchParams.get("agentId"));
-          const k = url.searchParams.get("taskId") ?? `t_${a}`;
-          const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          return Response.json(await s2.diagnose(t, a, k));
-        }
+        case "/admin/diagnose":
+          return await adminDiagnose(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/admin/transcript":
-          return adminTranscript(request, env.AUTOMATION_TOKEN,
+          // Awaited, so a failure reaches this route's catch and its log instead of the platform's 1101.
+          return await adminTranscript(request, env.AUTOMATION_TOKEN,
             (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/ui": {
           const gate = await requireViewer(request, env);
