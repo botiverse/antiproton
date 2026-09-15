@@ -562,7 +562,7 @@ ${HEAD_ASSETS}
            hx-on::after-swap="if(this.dataset.pin!=='0')this.scrollTop=this.scrollHeight"
            onscroll="this.dataset.pin=(this.scrollHeight-this.scrollTop-this.clientHeight<40)?'1':'0'"
            >loading…</div>
-      <form hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-vals='{"held":"1"}' hx-on::after-request="ap.sent(this, event)">
+      <form id="composer" hx-post="/ui/message" hx-target="#transcript" hx-swap="innerHTML" hx-vals='{"held":"1"}' hx-on::after-request="ap.sent(this, event)">
         <input type="text" name="text" placeholder="ask it something…" autocomplete="off" required>
         <button type="submit" name="mode" value="steer">send</button>
         <button type="submit" name="mode" value="followUp" class="ghost"
@@ -630,10 +630,36 @@ ${HEAD_ASSETS}
     // A send that the server refused must not vanish: htmx swaps nothing on
     // a non-2xx, and a form that resets regardless would eat the text and say
     // nothing. Keep what was typed and say why, under the composer.
+    // A 422 with secret:true is the credential intercept (cody, #350/#351):
+    // the message never entered history and never reached the model. The
+    // answer names the kind and, when the server knows it, the plugins that
+    // take it; "send anyway" is an explicit second click, not the default.
     sent(form, ev) {
       const err = document.getElementById('send-err');
       if (ev.detail.successful) { form.reset(); err.hidden = true; return; }
-      const xhr = ev.detail.xhr, body = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 200) : '';
+      const xhr = ev.detail.xhr;
+      if (xhr && xhr.status === 422) {
+        let d = null;
+        try { d = JSON.parse(xhr.responseText); } catch { d = null; }
+        if (d && d.secret === true) {
+          // textContent, not innerHTML: kind and plugins are server data, and
+          // this script has no esc() (that is a module-scope helper).
+          err.textContent = 'This looks like a credential (' + String(d.kind || 'secret') + ') — it was not sent, and it is not in the conversation. ' +
+            (Array.isArray(d.plugins) && d.plugins.length
+              ? 'Fill it under the ' + String(d.plugins[0]) + ' mount on the plugins page. '
+              : 'No mount here takes this kind — please do not paste it. ');
+          const btn = document.createElement('button');
+          btn.type = 'submit'; btn.setAttribute('form', 'composer'); btn.name = 'allowSecret'; btn.value = '1';
+          btn.className = 'ghost'; btn.textContent = 'send anyway';
+          err.appendChild(btn);
+          // The button was created after htmx wired the page; without this it
+          // submits natively and allowSecret never reaches the request.
+          htmx.process(err);
+          err.hidden = false;
+          return;
+        }
+      }
+      const body = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 200) : '';
       err.textContent = 'not sent: ' + (xhr ? xhr.status + ' ' : '') + (body || (xhr && xhr.status ? '' : 'could not reach the server'));
       err.hidden = false;
     },
