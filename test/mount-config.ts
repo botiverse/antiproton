@@ -1132,20 +1132,24 @@ await check("the container's wording and the lease switch say the same thing", a
     : null;
   const deployed = sandboxPlugin(null as any, "local", lease);
 
+  // `numbers`: the text states the lease's minutes. release and quiet deliberately do not (Piper, 2026-09-15),
+  // but they promise the idle release all the same, so they are held to the switch.
   const says = [
-    ["run", deployed.tools.find((t) => t.name === "run")!.summary],
-    ["shell", deployed.tools.find((t) => t.name === "shell")!.summary],
-    ["the reminder", boxReminder("box", lease)],
+    ["run", deployed.tools.find((t) => t.name === "run")!.summary, true],
+    ["shell", deployed.tools.find((t) => t.name === "shell")!.summary, true],
+    ["the reminder", boxReminder("box", lease), true],
+    ["release", deployed.tools.find((t) => t.name === "release")!.summary, false],
+    ["quiet", deployed.tools.find((t) => t.name === "quiet")!.summary, false],
   ] as const;
-  for (const [where, text] of says) {
-    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release/.test(text);
+  for (const [where, text, numbers] of says) {
+    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release|released on its own|Postpone the release/.test(text);
     if (leaseOn && !promises) {
       throw new Error(`the lease is configured but ${where} still describes a box that only you can end: ${text.slice(0, 140)}`);
     }
     if (!leaseOn && promises) {
       throw new Error(`${where} promises the idle question, and no lease is configured to ask it: ${text.slice(0, 140)}`);
     }
-    if (leaseOn && !text.includes(`after ${setting("RUN9_MAX_IDLE_MINUTES")} idle minutes`)) {
+    if (leaseOn && numbers && !text.includes(`after ${setting("RUN9_MAX_IDLE_MINUTES")} idle minutes`)) {
       throw new Error(`${where} does not state the configured ceiling (${setting("RUN9_MAX_IDLE_MINUTES")} minutes): ${text.slice(0, 200)}`);
     }
   }
@@ -1459,12 +1463,25 @@ console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
  * next visit pays for a new machine. So `release` says when not to release, and what the kept copies are for.
  */
 await check("release says to leave a container someone will come back to, and what kept copies are for", async () => {
-  const release = run9.tools.find((t) => t.name === "release")!.summary;
+  const leased = sandboxPlugin(null as any, "local", { warnMs: 5 * 60_000, maxMs: 30 * 60_000 });
+  const release = leased.tools.find((t) => t.name === "release")!.summary;
   if (!/will not be needed again/.test(release)) throw new Error(`release does not say when to release: ${release}`);
   if (!/come back to it, leave it running/.test(release)) throw new Error(`release does not say to leave a box someone returns to: ${release}`);
   if (!/`quiet` keeps it longer/.test(release)) throw new Error(`release does not point to quiet: ${release}`);
   if (!/for starting a fresh machine later/.test(release)) throw new Error(`release does not say what keep and save are for: ${release}`);
   if (/as soon as you no longer need the machine/.test(release)) throw new Error(`release still says to destroy the box as soon as the work is done: ${release}`);
+  if (/\d+ (idle )?minutes/.test(release)) throw new Error(`release states minutes of its own instead of leaving them to the lease: ${release}`);
+  // Without a lease (the SWE-bench runner, a Worker with no lease settings) none of that is true (Piper, 2026-09-15).
+  const turn = sandboxPlugin(null as any, "local", null);
+  const turnRelease = turn.tools.find((t) => t.name === "release")!.summary;
+  const turnQuiet = turn.tools.find((t) => t.name === "quiet")!.summary;
+  if (/leave it running|released on its own|keeps it longer/.test(turnRelease)) {
+    throw new Error(`without a lease release still promises an idle release: ${turnRelease}`);
+  }
+  if (!/handed back when the turn ends/.test(turnRelease)) throw new Error(`without a lease release does not say the turn ends the box: ${turnRelease}`);
+  if (/Postpone the release/.test(turnQuiet) || !/no idle release to postpone/.test(turnQuiet)) {
+    throw new Error(`without a lease quiet still offers to postpone a release: ${turnQuiet}`);
+  }
 });
 
 for (const r of results) {

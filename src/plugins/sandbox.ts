@@ -680,6 +680,28 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     : "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
       "in this turn — state, installed packages and files carry over from one call to the next, and " +
       "the container is handed back when the turn ends.";
+  // `release` and `quiet` follow the same switch (Piper, 2026-09-15): "leave it running, it is released on its
+  // own and you are told first" is true only under a lease. Without one (the SWE-bench runner, a Worker with no
+  // lease settings) the container goes back when the turn ends, and there is no release to postpone. No
+  // minutes here: those come from the lease, in `run`, `shell` and the reminder.
+  const releaseSummary = lease
+    ? "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+      "first, in the same call. Release it when this machine will not be needed again. If you or the " +
+      "person you are working for will come back to it, leave it running: an idle container is released " +
+      "on its own after a while, you are told before that, and `quiet` keeps it longer. A kept " +
+      "environment or a saved file is for starting a fresh machine later, not a reason to destroy one " +
+      "you are about to use again."
+    : "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+      "first, in the same call. It is handed back when the turn ends anyway, so release it earlier only " +
+      "when you are done with the machine before the turn is; `keep` and `save` are how work outlives the turn.";
+  const quietSummary = lease
+    ? "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
+      "you are not told about it again until shortly before then. Use it when you are coming back to " +
+      "the machine — a build you are waiting on, work you return to after reading something. It is " +
+      "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
+      "and it can save files out in the same call."
+    : "Has no effect in this deployment: the container is handed back when the turn ends, so there is " +
+      "no idle release to postpone. Use `keep` to carry an environment into a later turn.";
   return {
   id: "sandbox",
   // Seeded despite being the only metered mount: a container the agent cannot
@@ -846,13 +868,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
     {
       name: "release",
-      summary:
-        "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-        "first, in the same call. Release it when this machine will not be needed again. If you or the " +
-        "person you are working for will come back to it, leave it running: an idle container is released " +
-        "on its own after a while, you are told before that, and `quiet` keeps it longer. A kept " +
-        "environment or a saved file is for starting a fresh machine later, not a reason to destroy one " +
-        "you are about to use again.",
+      summary: releaseSummary,
       parameters: {
         type: "object",
         properties: {
@@ -873,12 +889,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
     {
       name: "quiet",
-      summary:
-        "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
-        "you are not told about it again until shortly before then. Use it when you are coming back to " +
-        "the machine — a build you are waiting on, work you return to after reading something. It is " +
-        "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
-        "and it can save files out in the same call.",
+      summary: quietSummary,
       parameters: {
         type: "object",
         properties: {
