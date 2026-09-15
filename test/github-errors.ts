@@ -79,6 +79,57 @@ await check("with an account, the same answers carry no hint about attaching one
   }
 });
 
+/**
+ * A job's logs are a redirect to signed storage, and storage refuses our token.
+ *
+ * Measured on real GitHub (2026-09-15): /actions/jobs/{id}/logs answers 302 to
+ * *.blob.core.windows.net, which returns the log with no headers and 401
+ * InvalidAuthenticationInfo when GitHub's Authorization is sent along. Node's
+ * fetch drops that header on a cross-origin redirect; whether a Worker's does
+ * was not measured, so the plugin follows the redirect itself instead of
+ * relying on either.
+ */
+function hops(...answers: Array<{ status: number; body?: string; headers?: Record<string, string> }>) {
+  const seen: Array<{ url: string; auth: string | null; redirect: string | undefined }> = [];
+  let i = 0;
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const h = new Headers(init?.headers ?? {});
+    seen.push({ url: String(url), auth: h.get("authorization"), redirect: init?.redirect });
+    const a = answers[Math.min(i++, answers.length - 1)]!;
+    return new Response(a.body ?? "", { status: a.status, headers: a.headers ?? {} });
+  }) as any;
+  return seen;
+}
+
+await check("a redirect to storage is followed without our token, and the log comes back", async () => {
+  const seen = hops(
+    { status: 302, headers: { location: "https://results.blob.example/logs/1.txt?sig=abc" } },
+    { status: 200, body: "step 1\nstep 2\n", headers: { "content-type": "text/plain" } },
+  );
+  const r = await githubPlugin.invoke("api_get", { path: "/repos/o/r/actions/jobs/1/logs" }, ctx("tok")) as any;
+  if (seen.length !== 2) throw new Error(`the redirect was not followed by the plugin: ${JSON.stringify(seen)}`);
+  if (seen[1]!.auth !== null) throw new Error("the token was sent to the storage host");
+  if (!String(r?.text).includes("step 2")) throw new Error(`got ${JSON.stringify(r)}`);
+});
+
+await check("a redirect within GitHub's API keeps the token", async () => {
+  const seen = hops(
+    { status: 301, headers: { location: "https://api.github.com/repositories/42" } },
+    { status: 200, body: JSON.stringify({ full_name: "o/renamed" }), headers: { "content-type": "application/json" } },
+  );
+  await githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok"));
+  if (seen.length !== 2 || seen[1]!.auth !== "Bearer tok") throw new Error(`same-origin hop: ${JSON.stringify(seen)}`);
+});
+
+await check("an error from the storage host names that host, not GitHub", async () => {
+  hops(
+    { status: 302, headers: { location: "https://results.blob.example/logs/1.txt?sig=abc" } },
+    { status: 404, body: "<Error><Message>The specified blob does not exist.</Message></Error>", headers: { "content-type": "application/xml" } },
+  );
+  const why = await failure(() => githubPlugin.invoke("api_get", { path: "/repos/o/r/actions/jobs/1/logs" }, ctx("tok")));
+  if (!/results\.blob\.example/.test(why) || /sig=/.test(why)) throw new Error(`said: ${why}`);
+});
+
 globalThis.fetch = original;
 console.log(`\n  github: non-JSON answers and a missing account\n  ${"─".repeat(56)}`);
 for (const r of results) {

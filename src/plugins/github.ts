@@ -86,11 +86,29 @@ async function call(
   if (ctx.credential) headers.authorization = `Bearer ${ctx.credential}`;
   if (body !== undefined) headers["content-type"] = "application/json";
 
-  const res = await fetch(API + path, {
+  // Redirects are followed here rather than by fetch. A job's logs answer 302
+  // to signed storage (*.blob.core.windows.net), and storage refuses a request
+  // carrying GitHub's Authorization with 401 (measured 2026-09-15). Node's fetch
+  // drops that header on a cross-origin hop; a Worker's was not measured. So a
+  // hop within the API keeps the headers (a renamed repository redirects there
+  // and needs them), and any other host gets none: its URL is its credential.
+  let url = new URL(API + path);
+  let res = await fetch(url, {
     method, headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(30_000), redirect: "manual",
   });
+  for (let hop = 0; hop < 3 && res.status >= 300 && res.status < 400 && res.headers.get("location"); hop++) {
+    url = new URL(res.headers.get("location")!, url);
+    const sameApi = url.origin === new URL(API).origin;
+    res = await fetch(url, {
+      ...(sameApi ? { method, headers, body: body === undefined ? undefined : JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(30_000), redirect: "manual",
+    });
+  }
+  // Who answered, for errors: GitHub, or the storage host it sent us to. The
+  // host only, never the signed query string.
+  const who = url.origin === new URL(API).origin ? "github" : `${url.host} (where github redirected)`;
   const text = await res.text();
   // Parsed only when it is JSON. Actions logs are plain text and an error page
   // can be HTML; parsing those threw a SyntaxError that named neither the status
@@ -110,7 +128,7 @@ async function call(
       ? ` — rate limit exhausted, resets ${new Date(Number(reset) * 1000).toISOString()}`
       : "";
     const err = new Error(
-      `github ${res.status}: ${parsed?.message ?? res.statusText}${rate}${ctx.credential ? "" : noAccountHint(res.status)}`,
+      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${ctx.credential ? "" : noAccountHint(res.status)}`,
     ) as Error & { retryable?: boolean };
     err.retryable = res.status === 429 || (res.status === 403 && remaining === "0") || res.status >= 500;
     throw err;
