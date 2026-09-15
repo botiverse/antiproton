@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1Identities } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Identities } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -11,7 +11,9 @@ function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new
 
 export function controlPlaneCases(db: D1Database): SpecCase[] {
   const dir = d1Identities(db);
-  const wipe = () => db.prepare("DELETE FROM identities").run();
+  let clock = 1_800_000_000_000;
+  const keys = d1ApiKeys(db, () => ++clock);
+  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -61,6 +63,34 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     const rows = await dir.list();
     assert(rows.map((r) => r.key).join(",") === "github:8,github:9", `order ${rows.map((r) => r.key)}`);
     assert(JSON.stringify(rows[0]) === JSON.stringify({ key: "github:8", agentId: "u-early", tenantId: "demo", addedBy: "automation", createdAt: 8000 }), `row ${JSON.stringify(rows[0])}`);
+  });
+
+  add("the api_keys migration made exactly the columns the key queries read", async () => {
+    const { results } = await db.prepare("PRAGMA table_info(api_keys)").all();
+    const names = (results as any[]).map((r) => String(r.name)).sort().join(",");
+    assert(names === "created_at,hash,label,owner_agent_id,revoked_at,tenant_id", `columns ${names}`);
+  });
+
+  add("a key resolves to its tenant and owner until it is revoked, and never after", async () => {
+    await keys.issue({ hash: "h1", tenantId: "t-me", ownerAgentId: "u-me", label: "ci" });
+    const r = await keys.lookup("h1");
+    assert(r?.tenantId === "t-me" && r.ownerAgentId === "u-me", `lookup ${JSON.stringify(r)}`);
+    assert((await keys.lookup("nope")) === null, "an unknown hash resolved");
+    assert((await keys.revoke("h1")) === true, "revoking a live key reported nothing");
+    assert((await keys.lookup("h1")) === null, "a revoked key still resolves");
+    assert((await keys.revoke("h1")) === false, "revoking twice reported a revoke");
+    const { results } = await db.prepare("SELECT label, created_at, revoked_at FROM api_keys WHERE hash = 'h1'").all();
+    const row = (results as any[])[0];
+    assert(row?.label === "ci" && Number(row.revoked_at) > Number(row.created_at), `the revoked row: ${JSON.stringify(row)}`);
+  });
+
+  add("a hash issued twice is refused, not silently re-pointed at another owner", async () => {
+    await keys.issue({ hash: "h2", tenantId: "t-a", ownerAgentId: "u-a", label: "one" });
+    let threw = false;
+    try { await keys.issue({ hash: "h2", tenantId: "t-b", ownerAgentId: "u-b", label: "two" }); } catch { threw = true; }
+    assert(threw, "a second issue of the same hash succeeded");
+    const r = await keys.lookup("h2");
+    assert(r?.tenantId === "t-a" && r.ownerAgentId === "u-a", `the first owner was replaced: ${JSON.stringify(r)}`);
   });
 
   return cases;

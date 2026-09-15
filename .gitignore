@@ -21,3 +21,6 @@ bench/tau2/data/db.json
 
 # agent CLI scratch state; never part of the tree
 .tmp/
+
+# Local QA run records (qa/sdk/README.md)
+qa/sdk/out/

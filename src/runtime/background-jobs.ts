@@ -279,6 +279,31 @@ export async function runBackgroundPass(d: BackgroundPassDeps): Promise<{ checke
  * one. A finished job needs no asking — its result arrives as a message — so
  * there is deliberately no "status" action for a model to spend turns on.
  */
+/**
+ * Stop the background work one session started, when its turn is cancelled
+ * (Agents API input.cancel, task #17). A job whose stop is confirmed is finished
+ * as cancelled; one whose stop fails stays tracked, so `jobs` still lists it and
+ * the ceiling asks again.
+ */
+export async function stopSessionJobs(d: {
+  sql: Sql;
+  owner: JobOwner;
+  session: string;
+  cancel(job: BackgroundJob): Promise<void>;
+  completeOperation(operationId: string, status: "cancelled"): Promise<void>;
+  now?: number;
+}): Promise<{ stopped: string[]; stillRunning: string[] }> {
+  const stopped: string[] = [], stillRunning: string[] = [];
+  for (const job of runningBackgroundJobs(d.sql, d.owner).filter((j) => j.session === d.session)) {
+    try { await d.cancel(job); } catch { stillRunning.push(job.id); continue; }
+    if (finishBackgroundJob(d.sql, d.owner, job.id, { state: "cancelled" }, d.now ?? Date.now())) {
+      await d.completeOperation(job.id, "cancelled");
+    }
+    stopped.push(job.id);
+  }
+  return { stopped, stillRunning };
+}
+
 export function jobsTool(d: {
   sql: Sql;
   owner: JobOwner;

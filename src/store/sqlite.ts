@@ -244,6 +244,13 @@ export class SqliteStore implements StorageAdapter {
       .get(tenantId, agentId) as any;
     return r ? { agentId: String(r.agent_id), config: JSON.parse(String(r.config ?? "{}")) as Json, createdAt: Number(r.created_at) } : null;
   }
+  async updateAgentConfig(tenantId: string, agentId: string, config: Json = {}) {
+    const r = this.#db
+      .prepare("UPDATE agents SET config=? WHERE tenant_id=? AND agent_id=?")
+      .run(j(config), tenantId, agentId) as { changes?: number | bigint };
+    return Number(r.changes ?? 0) > 0;
+  }
+
 
   async createTask(
     tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion = 0,

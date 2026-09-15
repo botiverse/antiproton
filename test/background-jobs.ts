@@ -4,7 +4,7 @@
  */
 import {
   admitBackground, BACKGROUND_CAP, BACKGROUND_MAX_MS, BACKGROUND_STOP_GRACE_MS, completionMessage, dueBackgroundJobs, finishBackgroundJob, markPolled,
-  jobsTool, recentBackgroundJobs, mountsWithRunningJobs, refuseOverCap, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
+  jobsTool, recentBackgroundJobs, stopSessionJobs, mountsWithRunningJobs, refuseOverCap, nextBackgroundWake, nextPollDelay, overdueBackground, recordBackgroundJob, runBackgroundPass, runningBackgroundJobs, startedResult,
 } from "../src/runtime/background-jobs.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -200,6 +200,23 @@ await check("the jobs tool lists running work by offered name, and cancels one b
     await t.execute("c3", { action: "cancel", job: "op1" });
     assert(f.log.cancelled.join() === "op1" && f.log.completed.join() === "op1:cancelled", `cancel: ${JSON.stringify(f.log)}`);
     assert(runningBackgroundJobs(sql, me).length === 0, "a cancelled job still runs");
+  } finally { host.dispose(); }
+});
+
+await check("cancelling a session stops only that session's jobs; one that will not stop stays tracked", async () => {
+  const host = sqliteHost(); const sql = host.sql as any; const f = fakes();
+  try {
+    for (const [id, session] of [["j1", "s1"], ["j2", "s1"], ["j3", "s2"]] as const) {
+      recordBackgroundJob(sql, me, { id, session, mount: "sandbox", tool: "sandbox__shell", handle: {} }, now);
+    }
+    const r = await stopSessionJobs({ sql, owner: me, session: "s1", now,
+      cancel: async (job) => { f.log.cancelled.push(job.id); if (job.id === "j2") throw new Error("could not confirm exec stopped"); },
+      completeOperation: f.completeOperation });
+    assert([...f.log.cancelled].sort().join() === "j1,j2", `asked to stop ${f.log.cancelled}`);
+    assert(r.stopped.join() === "j1" && r.stillRunning.join() === "j2", `result ${JSON.stringify(r)}`);
+    assert(f.log.completed.join() === "j1:cancelled", `operations ${f.log.completed}`);
+    const left = runningBackgroundJobs(sql, me).map((j) => j.id).sort().join();
+    assert(left === "j2,j3", `still tracked: ${left}`);
   } finally { host.dispose(); }
 });
 

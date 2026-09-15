@@ -12,6 +12,16 @@
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
 import { html, conditional, holds, notModified } from "./version.ts";
+import type { Json } from "../../src/core/types.ts";
+import { bearerKey, hashApiKey, newApiKey } from "./agents-api/keys.ts";
+import { handleAgentsApi, type AgentsApiDeps } from "./agents-api/handlers.ts";
+import { apiAgentSeeds } from "./agents-api/provisioning.ts";
+import { watchChanges } from "./agents-api/watch.ts";
+import { openAIError, type StoredAgent, type StoredSession } from "./agents-api/shapes.ts";
+import {
+  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  mintAgentId, mintSessionId, putApiAgent, putApiSession,
+} from "./agents-api/store.ts";
 import { maskRawRefs } from "../../src/store/refs.ts";
 import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
@@ -61,7 +71,7 @@ import {
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
-import { admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
+import { d1ApiKeys, admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -1249,6 +1259,138 @@ export class AgentDO extends DurableObject<Env> {
     return rec;
   }
 
+  // ---- OpenAI-compatible agents API (task #17) -------------------------------
+  // Keys are control-plane data and live in D1 (cf/src/control-plane.ts d1ApiKeys).
+
+  // The owner's object indexes the agents and sessions its key created.
+  // An agent's tools carry JSON Schema (recursive Json), which the RPC stub types
+  // expand without bound; agents therefore cross the object boundary as JSON text.
+  async apiPutAgent(tenantId: string, ownerAgentId: string, id: string, agentJson: string) { this.#claim(tenantId, ownerAgentId); putApiAgent(this.sql, id, JSON.parse(agentJson) as StoredAgent); }
+  async apiGetAgent(tenantId: string, ownerAgentId: string, id: string): Promise<string | null> { this.#claim(tenantId, ownerAgentId); const a = getApiAgent(this.sql, id); return a ? JSON.stringify(a) : null; }
+  async apiListAgents(tenantId: string, ownerAgentId: string): Promise<string> { this.#claim(tenantId, ownerAgentId); return JSON.stringify(listApiAgents(this.sql)); }
+  async apiDeleteAgent(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return deleteApiAgent(this.sql, id); }
+  async apiPutSession(tenantId: string, ownerAgentId: string, sess: StoredSession) { this.#claim(tenantId, ownerAgentId); putApiSession(this.sql, sess); }
+  async apiGetSession(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return getApiSession(this.sql, id); }
+  async apiListSessions(tenantId: string, ownerAgentId: string, agentId: string | null) { this.#claim(tenantId, ownerAgentId); return listApiSessions(this.sql, agentId); }
+  async apiDeleteSession(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return deleteApiSession(this.sql, id); }
+
+  /** The persona the harness reads: the API's name and instructions, with the full config kept beside them. */
+  #apiPersona(agentId: string, a: StoredAgent, avatar: string) {
+    return { name: a.name ?? nameFor(agentId), description: a.instructions ?? "", avatar, openai: a } as unknown as Json;
+  }
+
+  /** Run in the agent's own object: create it with its persona, or refresh the persona if it exists. */
+  async apiAdopt(tenantId: string, agentId: string, agentJson: string) {
+    const a = JSON.parse(agentJson) as StoredAgent;
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    const existing = await rt.store.loadAgent(tenantId, agentId);
+    const avatar = String((existing?.config as any)?.avatar ?? mintAvatar());
+    if (!existing) await rt.store.createAgent(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
+    else await rt.store.updateAgentConfig(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
+    return { name: a.name ?? nameFor(agentId), description: a.instructions ?? "", avatar };
+  }
+
+  async apiUpdatePersona(tenantId: string, agentId: string, agentJson: string) {
+    const a = JSON.parse(agentJson) as StoredAgent;
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    const existing = await rt.store.loadAgent(tenantId, agentId);
+    const avatar = String((existing?.config as any)?.avatar ?? mintAvatar());
+    await rt.store.updateAgentConfig(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
+  }
+
+  /** A session is a conversation in this agent's object; the task row is what #conversation accepts. */
+  async apiOpenSession(tenantId: string, agentId: string, sessionId: string) {
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    if (!(await rt.store.loadTask(tenantId, sessionId))) await rt.store.createTask(tenantId, agentId, sessionId, {});
+  }
+
+  /** Text into the session, the way startTask does it for the main conversation. */
+  async apiPostInput(tenantId: string, agentId: string, sessionId: string, text: string, environment: "none" | "container" = "none") {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiPostInput", async () => {
+      const rt = this.runtime();
+      // Not the console's default mounts: an API agent has what its caller declared (agents-api/provisioning.ts).
+      await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment));
+      await rt.bindOperatorModel(tenantId, agentId);
+      await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
+      await this.ctx.storage.setAlarm(Date.now());
+      // The turn is on record now: say so, rather than leaving it for the step that follows.
+      await this.broadcast();
+      return { ok: true as const };
+    });
+  }
+
+  /** Cancel a session's running turn and its background work (Agents API input.cancel). */
+  async apiCancelSession(tenantId: string, agentId: string, sessionId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiCancelSession", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      // Never bound means never run: there is nothing to cancel (see apiSessionStatus).
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) {
+        return { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] };
+      }
+      const out = await rt.cancelSession(tenantId, agentId, sessionId);
+      await this.ctx.storage.setAlarm(Date.now());
+      await this.broadcast();
+      return out;
+    });
+  }
+
+  /** The session's entries and whether its lane runs now, as JSON text (see apiGetAgent on RPC types). */
+  async apiTranscript(tenantId: string, agentId: string, sessionId: string): Promise<string> {
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    if (!(await rt.store.getModelBinding(tenantId, agentId))) return JSON.stringify({ entries: [], running: false, pending: [] });
+    const agent = await rt.agent(tenantId, agentId, sessionId);
+    // The branch, not every entry: resuming a paused call leaves its placeholder result on the branch it left.
+    const entries = await rt.branchEntries(tenantId, agentId, sessionId);
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const pending = running ? [] : await rt.waitingClientCalls(tenantId, agentId, sessionId);
+    return JSON.stringify({ entries, running, pending });
+  }
+
+  async apiSessionStatus(tenantId: string, agentId: string, sessionId: string): Promise<{
+    status: "idle" | "in_progress" | "requires_action";
+    pending: Array<{ call_id: string; name: string; arguments: string; turn_id: string }>;
+  }> {
+    this.#claim(tenantId, agentId);
+    const rt = this.runtime();
+    await rt.ready();
+    // An agent is bound to a model when its first turn starts (apiPostInput), and
+    // the harness cannot be built without one — so an agent that has never run is
+    // idle by construction, and asking the harness would only throw (preview probe,
+    // 2026-09-14: "no model binding" on a fresh session).
+    if (!(await rt.store.getModelBinding(tenantId, agentId))) return { status: "idle", pending: [] };
+    const agent = await rt.agent(tenantId, agentId, sessionId);
+    if ((await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null) return { status: "in_progress", pending: [] };
+    const pending = await rt.waitingClientCalls(tenantId, agentId, sessionId);
+    return { status: pending.length ? "requires_action" : "idle", pending };
+  }
+
+  /** An API caller's function results; the turn continues on the alarm this sets (runtime.submitToolResults). */
+  async apiToolResults(
+    tenantId: string, agentId: string, sessionId: string,
+    results: Array<{ turnId: string; callId: string; output: string; isError: boolean }>,
+  ): Promise<{ unknown: string[] }> {
+    this.#claim(tenantId, agentId);
+    return this.#busy("apiToolResults", async () => {
+      const rt = this.runtime();
+      await rt.ready();
+      if (!(await rt.store.getModelBinding(tenantId, agentId))) return { unknown: results.map((r) => r.callId) };
+      const out = await rt.submitToolResults(tenantId, agentId, sessionId, results);
+      if (!out.unknown.length) { await this.ctx.storage.setAlarm(Date.now()); await this.broadcast(); }
+      return out;
+    });
+  }
+
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
@@ -1796,6 +1938,12 @@ export class AgentDO extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server);
+    // A change notice socket for the agents API's event stream (agents-api/watch.ts): told only that something
+    // changed, never sent the transcript, so a push costs this object one small send.
+    if (url.searchParams.get("kind") === "notify") {
+      (server as any).serializeAttachment({ notify: true });
+      return new Response(null, { status: 101, webSocket: client });
+    }
     const cursor = {
       after: Number(url.searchParams.get("after") ?? 0),
       tenantId: url.searchParams.get("tenantId") ?? "tenant-a",
@@ -1816,6 +1964,7 @@ export class AgentDO extends DurableObject<Env> {
       | { after: number; tenantId: string; agentId: string }
       | null;
     if (!cur) return;
+    if ((cur as any).notify) { ws.send('{"kind":"changed"}'); return; }
     // The bench object has its own runtime; readying the tenant one would build
     // a second harness over the same store and push from the wrong catalogue.
     const rt = this.#activeRuntime();
@@ -2257,6 +2406,94 @@ const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/u
  * What a person may name an agent. Checked in the route before any object is
  * touched, so a refusal costs nothing and leaves nothing behind.
  */
+/**
+ * `/admin/api-keys` (automation token only): issue a key for an owner. The key
+ * is in this one response and nowhere else; the table keeps its hash.
+ */
+async function adminApiKeys(request: Request, env: Env): Promise<Response> {
+  if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+  const b = (await request.json().catch(() => null)) as any;
+  const tenantId = String(b?.tenantId ?? ""), ownerAgentId = String(b?.ownerAgentId ?? ""), label = String(b?.label ?? "");
+  try { agentObjectName(tenantId, ownerAgentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  const key = newApiKey();
+  await d1ApiKeys(env.CONTROL_DB).issue({ hash: await hashApiKey(key), tenantId, ownerAgentId, label });
+  return Response.json({ key, tenantId, ownerAgentId, label });
+}
+
+/** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
+async function v1(request: Request, env: Env, url: URL): Promise<Response> {
+  const key = bearerKey(request);
+  if (!key) return openAIError(401, "Missing or malformed API key. Send Authorization: Bearer <key>.", { code: "invalid_api_key" });
+  const row = await d1ApiKeys(env.CONTROL_DB).lookup(await hashApiKey(key));
+  if (!row) return openAIError(401, "Incorrect API key provided.", { code: "invalid_api_key" });
+  const { tenantId, ownerAgentId } = row;
+  const owner = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, ownerAgentId)));
+  const agentStub = (agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  let body: unknown = undefined;
+  if (request.method === "POST") {
+    const text = await request.text();
+    if (text) {
+      try { body = JSON.parse(text); }
+      catch { return openAIError(400, "We could not parse the JSON body of your request.", { code: "invalid_json" }); }
+    } else body = {};
+  }
+  const deps: AgentsApiDeps = {
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // The agent's object pushes after every change; the stream reads when it hears (agents-api/watch.ts).
+    watch: async (agentId) => {
+      try { agentObjectName(tenantId, agentId); } catch { return null; }
+      const res = await agentStub(agentId).fetch("https://agent.internal/events?kind=notify", { headers: { Upgrade: "websocket" } });
+      const ws = res.webSocket;
+      if (!ws) return null;
+      ws.accept();
+      return watchChanges(ws as any);
+    },
+    mintAgentId: () => mintAgentId(ownerAgentId),
+    mintSessionId,
+    index: {
+      putAgent: async (id, a) => { await owner.apiPutAgent(tenantId, ownerAgentId, id, JSON.stringify(a)); },
+      getAgent: async (id) => {
+        try { agentObjectName(tenantId, id); } catch { return null; }
+        const text = await owner.apiGetAgent(tenantId, ownerAgentId, id);
+        return text ? (JSON.parse(text) as StoredAgent) : null;
+      },
+      listAgents: async () => JSON.parse(await owner.apiListAgents(tenantId, ownerAgentId)) as Array<{ id: string; agent: StoredAgent }>,
+      deleteAgent: (id) => owner.apiDeleteAgent(tenantId, ownerAgentId, id),
+      putSession: async (sess) => { await owner.apiPutSession(tenantId, ownerAgentId, sess); },
+      getSession: (id) => owner.apiGetSession(tenantId, ownerAgentId, id),
+      listSessions: (agentId) => owner.apiListSessions(tenantId, ownerAgentId, agentId ?? null),
+      deleteSession: (id) => owner.apiDeleteSession(tenantId, ownerAgentId, id),
+    },
+    agents: {
+      adopt: async (agentId, a) => {
+        const made = await agentStub(agentId).apiAdopt(tenantId, agentId, JSON.stringify(a));
+        // Listed in the owner's directory too, so the console shows what the API made.
+        await owner.uiRecordAgent(tenantId, ownerAgentId, { agentId, ...made, createdAt: a.createdAt });
+      },
+      updatePersona: async (agentId, a) => { await agentStub(agentId).apiUpdatePersona(tenantId, agentId, JSON.stringify(a)); },
+      openSession: async (agentId, sessionId) => { await agentStub(agentId).apiOpenSession(tenantId, agentId, sessionId); },
+      postInput: async (agentId, sessionId, text, environment) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text, environment); },
+      status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
+      cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
+      toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
+      transcript: async (agentId, sessionId) =>
+        JSON.parse(await agentStub(agentId).apiTranscript(tenantId, agentId, sessionId)) as {
+          entries: unknown[]; running: boolean; pending: Array<{ call_id: string; name: string; arguments: string; turn_id: string }>;
+        },
+    },
+  };
+  try {
+    const res = await handleAgentsApi(request.method, url.pathname.slice("/v1".length), url.searchParams, body, deps);
+    return res ?? openAIError(404, `${request.method} ${url.pathname} is not supported by this deployment`, { code: "not_found" });
+  } catch (e: any) {
+    return openAIError(500, String(e?.message ?? e).slice(0, 300), { type: "server_error" });
+  }
+}
+
 function agentSpec(form: FormData, ownerAgentId: string): { agentId: string; name: string; description: string; avatar: string; createdAt: number } | string {
   const name = String(form.get("name") ?? "").trim();
   const description = String(form.get("description") ?? "").trim();
@@ -2432,6 +2669,10 @@ export default {
     if (asset) return asset;
     const login = await handleLogin(request, env, url);
     if (login) return login;
+    // The OpenAI-compatible agents API and its key issuance answer before any
+    // object is chosen: they authenticate differently and address by key.
+    if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
+    if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
     // Each benchmark arm gets its own object. Sharing one meant asynchronous

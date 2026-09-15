@@ -1,0 +1,12 @@
+{
+  "name": "antiproton-qa-sdk",
+  "private": true,
+  "type": "module",
+  "description": "Manually triggered QA for the OpenAI-compatible agents API, driven by the official OpenAI SDK. Not part of the deploy gate.",
+  "scripts": {
+    "qa": "node run.mjs"
+  },
+  "dependencies": {
+    "openai": "7.15.0"
+  }
+}

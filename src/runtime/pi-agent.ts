@@ -141,6 +141,11 @@ export interface ModelChoice {
 
 export interface PiAgentOptions {
   host: SqlHost;
+  /**
+   * Custom entries to show the model, by customType: pi projects each one into the context it builds
+   * (entryProjectors). Anything not named here stays out of the model's context.
+   */
+  entryProjectors?: Record<string, (entry: { timestamp: number; data?: unknown }) => unknown[] | undefined>;
   sessionId: string;
   /** Which of the agent's transcripts this is. Absent means the first one,
    *  which keeps the tables it has always had. */
@@ -238,6 +243,7 @@ export class PiAgent {
       tools: bridged as any,
       // There is no non-deferred path; this makes the intent explicit to pi.
       streamOptions: { deferred: true },
+      ...(opts.entryProjectors ? { entryProjectors: opts.entryProjectors as any } : {}),
     }, CTX);
 
     const lane = await harness.lane(LANE, CTX);
@@ -409,6 +415,24 @@ export class PiAgent {
     if (started?.ok !== false) return started;
     if (LaneBusy.is(started.error)) return this.#lane.steer(text, undefined, CTX);
     return started;
+  }
+
+  /**
+   * Cancel the run in flight. pi's abort ends it and drops its outstanding
+   * model call, so a late answer is never applied, but it appends nothing —
+   * so a `marker` custom entry naming the run is written, for whoever needs to
+   * tell a cancelled turn from one not yet started. The marker reaches the
+   * model only if `entryProjectors` names it. Null when nothing was running.
+   *
+   * Depends on: @earendil-works/pi-agent-core 0.85.1 — lane.abort ends the run, drops the offloaded job
+   *   and appends no entry (measured). When pi is upgraded, re-check with test/pi-agent.ts.
+   */
+  async cancel(marker: string): Promise<string | null> {
+    const aborted: any = await this.#lane.abort(CTX);
+    if (!aborted?.ok) return null;
+    const operationId = String(aborted.value.operationId);
+    await this.#lane.appendCustomEntry(marker, { operationId }, CTX);
+    return operationId;
   }
 
   async compact() {

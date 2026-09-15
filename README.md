@@ -13,6 +13,7 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 
 ## Table of Contents
 
+- [OpenAI Agents API Guide](docs/agents-api.md)
 - [Philosophy & Design Principles](docs/philosophy.md)
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)

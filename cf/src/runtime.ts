@@ -15,7 +15,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import {
-  admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult,
+  admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
   bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
@@ -24,6 +24,11 @@ import {
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
+import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
+import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
+import {
+  answerClientCall, clientTools, dropClientCalls, pendingClientCalls, resumeClientCalls,
+} from "../../src/runtime/client-calls.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 
@@ -949,8 +954,30 @@ export class AgentRuntime {
         job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
+    // Function tools an API caller runs itself (Agents API, task #17): offered to
+    // the model like any tool; calling one pauses the turn for the caller's
+    // result (client-calls.ts). A name the model is already offered is skipped.
+    const agentRef: { current: PiAgent | null } = { current: null };
+    const apiConfig = ((await store.loadAgent(tenantId, agentId))?.config as any)?.openai;
+    const apiTools = apiConfig?.tools;
+    // An agent made through the Agents API is offered only what its caller declared, plus a container when a
+    // session asked for one: no run_js, and jobs only where a sandbox can start background work
+    // (agents-api/provisioning.ts).
+    const extras = harnessExtras({
+      apiAgent: !!apiConfig, sandbox,
+      hasSandboxMount: (offered as MountedTool[]).some((t) => offersPlugin(records, [t], "sandbox")),
+    });
+    const taken = new Set([...offered.map((t) => t.name), "run_js", "jobs"]);
+    const callerTools = Array.isArray(apiTools)
+      ? clientTools(
+          apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
+            name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
+          })),
+          { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
+            branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
+      : [];
     const extraTools = [
-      ...(sandbox
+      ...(extras.runJs
         ? [runJsTool(this.#executor as any, host, {
             onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
             // So a script names a tool the way the model's own list names it.
@@ -960,10 +987,16 @@ export class AgentRuntime {
             unoffered,
           })]
         : []),
-      jobs,
+      ...(extras.jobs ? [jobs] : []),
+      ...callerTools,
     ];
 
     const agent = await PiAgent.open({
+      // A cancelled turn's request stays in the history, so the model is told it was cancelled; otherwise the
+      // next turn finishes it (QA, 2026-09-15).
+      entryProjectors: {
+        [TURN_CANCELLED]: (entry) => [{ role: "user", content: [{ type: "text", text: CANCELLED_NOTE }], timestamp: entry.timestamp }],
+      },
       host: this.#deps.ctx.storage,
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       session,
@@ -985,7 +1018,7 @@ export class AgentRuntime {
         // paragraph is now the artifacts mount's own contribution, so the
         // condition is "the mount is there" and nobody has to check it.
         // `sandbox` stays: run_js is the harness's, not a mount's.
-        sandbox,
+        sandbox: extras.runJs,
       }),
       model: {
         provider: binding.provider,
@@ -1001,6 +1034,7 @@ export class AgentRuntime {
         await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
       },
     });
+    agentRef.current = agent;
     this.#agents.set(cacheKey, agent);
     return agent;
   }
@@ -1038,6 +1072,65 @@ export class AgentRuntime {
   }
 
   /**
+   * Stop a session's turn and the background work it started (Agents API
+   * input.cancel, task #17). pi's abort ends the run and drops its model call
+   * but records nothing (measured 2026-09-14), so a marker entry says the turn
+   * was cancelled. A background job whose stop cannot be confirmed stays
+   * tracked, and the ceiling asks again. Nothing running is not an error.
+   */
+  async cancelSession(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
+    const agent = await this.agent(tenantId, agentId, session);
+    const cancelledTurn = await agent.cancel(TURN_CANCELLED);
+    const sql = this.#deps.ctx.storage.sql;
+    ensureAgentTables(sql);
+    // A turn waiting for the caller has no run to abort; it still ends, and says so.
+    if (dropClientCalls(sql, session) > 0 && !cancelledTurn) {
+      await agent.lane.appendCustomEntry(TURN_CANCELLED, { operationId: null }, BACKGROUND_CONTEXT);
+    }
+    const jobs = await stopSessionJobs({
+      sql, owner: { tenantId, agentId }, session,
+      cancel: (job) => this.#gateway.cancelBackground(
+        { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json),
+      completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
+    });
+    return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
+  }
+
+  /** The session's branch, oldest first: what the model's context is built from. */
+  async branchEntries(tenantId: string, agentId: string, session: string) {
+    const agent = await this.agent(tenantId, agentId, session);
+    const tip = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).tipId;
+    return tip ? agent.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) : [];
+  }
+
+  /** Function calls this session waits on its API caller for, with the turn each belongs to. */
+  async waitingClientCalls(tenantId: string, agentId: string, session: string) {
+    const rows = pendingClientCalls(this.#deps.ctx.storage.sql, session);
+    if (!rows.length) return [];
+    const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
+    return rows.map((r) => ({ ...r, turn_id: turns.get(r.call_id) ?? "" }));
+  }
+
+  /**
+   * An API caller's function results (task #17). Each must name a call the
+   * model made in that turn of this session; if any does not, none is kept.
+   * The turn continues on the next pass once every paused call has its result.
+   */
+  async submitToolResults(
+    tenantId: string, agentId: string, session: string,
+    results: Array<{ turnId: string; callId: string; output: string; isError: boolean }>,
+  ): Promise<{ unknown: string[] }> {
+    const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
+    const unknown = results.filter((r) => turns.get(r.callId) !== r.turnId).map((r) => r.callId);
+    if (unknown.length) return { unknown };
+    const sql = this.#deps.ctx.storage.sql;
+    ensureAgentTables(sql);
+    for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
+    markSession(sql, session, true);
+    return { unknown: [] };
+  }
+
+  /**
    * One pass over every session with work, which is all an alarm should ever
    * do. A session is stepped when its last step left something open or a
    * model call of its is still out; the rest stay closed and cost nothing.
@@ -1067,10 +1160,17 @@ export class AgentRuntime {
     for (const session of sessions) {
       const agent = await this.agent(tenantId, agentId, session);
       const out = await agent.step();
-      open += out.open;
+      // A turn paused for an API caller's function results continues once they
+      // have all arrived; the next pass drives the run this starts.
+      const resumed = out.open === 0 && await resumeClientCalls({
+        sql, session, lane: agent.lane as any,
+        branch: (tip) => agent.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any,
+      });
+      open += out.open + (resumed ? 1 : 0);
       settled.push(...out.settled);
-      if (out.wakeInMs !== null) wakeInMs = wakeInMs === null ? out.wakeInMs : Math.min(wakeInMs, out.wakeInMs);
-      markSession(sql, session, out.open > 0 || out.wakeInMs !== null);
+      const wake = resumed ? 0 : out.wakeInMs;
+      if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
+      markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
     }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
