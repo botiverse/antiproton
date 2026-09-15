@@ -199,15 +199,15 @@ interface BoxState {
  * filesystem.
  *
  * With the lease on (tygg, 2026-09-15: a container is destroyed by the agent's
- * own `release`, not by the end of a turn) the runtime hands the plugin the
- * lease and the sentence names that lifetime instead: the same box in later
- * turns until the agent releases it, a question when it goes idle, and the
- * operator's ceiling. The numbers come from the lease, never from here.
+ * own `release`, not by the end of a turn; the agent is told before an idle one
+ * is taken and may postpone that) the runtime hands the plugin the lease and
+ * the sentence names that lifetime instead. The numbers come from the lease,
+ * never from here.
  */
 export interface BoxLease {
-  /** Idle this long before the agent is first asked about the box. */
-  afterMs: number;
-  /** Idle this long and the box is released, whatever the agent said. */
+  /** How long before the release the agent is told. */
+  warnMs: number;
+  /** Idle this long and the box is released, unless the agent postponed it. */
   maxMs: number;
 }
 
@@ -215,8 +215,8 @@ const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 
 /** What happens to an idle box under a lease, said once for the reminder, `run` and `shell`. */
 export function leaseTerms(lease: BoxLease): string {
-  return `if it goes idle for ${leaseMinutes(lease.afterMs)} minutes you are asked whether to keep it, `
-    + `and at ${leaseMinutes(lease.maxMs)} minutes idle it is released whatever you answer`;
+  return `after ${leaseMinutes(lease.maxMs)} idle minutes it is released; ${leaseMinutes(lease.warnMs)} minutes `
+    + `before that you are told, and \`quiet\` postpones the release by as long as you choose, within the mount's limit`;
 }
 
 export function boxReminder(alias: string, lease: BoxLease | null = null): string {
@@ -641,7 +641,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "secrets", type: "string[]", references: "credential",
       summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
     { name: "maxQuietMinutes", type: "number", default: 60,
-      summary: "Longest a single quiet request may last. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
+      summary: "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
     { name: "endpoint", type: "string", summary: "API endpoint.", default: "https://api.run.sys9.ai" },
     // Who can say whether this mount's credential works, which stops being run9
@@ -775,22 +775,22 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     {
       name: "quiet",
       summary:
-        "Put off the next reminder about this container. Use it when you know you will come back to " +
-        "the machine — a long download, a build you are waiting on, work you are returning to after " +
-        "reading something. It does not extend anything: the container is billed for every second " +
-        "either way, and the operator's ceiling still ends it. If you are not coming back, `release` " +
-        "is the cheaper answer, and it can save files out in the same call.",
+        "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
+        "you are not told about it again until shortly before then. Use it when you are coming back to " +
+        "the machine — a build you are waiting on, work you return to after reading something. It is " +
+        "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
+        "and it can save files out in the same call.",
       parameters: {
         type: "object",
         properties: {
           minutes: {
             type: "number",
-            description: "how long to stay quiet; a request over the mount's ceiling is refused, not shortened",
+            description: "how many more minutes to keep the container, from now; a request over the mount's limit is refused, not shortened",
           },
         },
         required: ["minutes"],
       },
-      // A write: it changes when the box is asked about, which changes what the
+      // A write: it changes when the box is released, which changes what the
       // box costs. Not idempotent, because each call moves the instant.
       sideEffects: "write",
       idempotency: "none",
@@ -974,7 +974,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
     const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
 
-    // Before the credential check on purpose: putting off a reminder calls
+    // Before the credential check on purpose: postponing a release calls
     // nothing at run9, so a mount whose key was removed can still answer it.
     if (tool === "quiet") {
       const cap = cfg.maxQuietMinutes ?? DEFAULTS.maxQuietMinutes;
@@ -991,13 +991,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           `Ask for ${cap} or fewer, or release the container — it is billed for every second either way.`,
         );
       }
-      if (!prior?.boxId) return { quiet: false, note: "nothing is running, so nothing will be asked about" };
+      if (!prior?.boxId) return { quiet: false, note: "nothing is running, so there is no release to postpone" };
       const quietUntil = Date.now() + asked * 60_000;
-      // `lastUsedAt` is deliberately NOT touched, unlike every other handler
-      // here. It is what the absolute idle ceiling is measured from, so bumping
-      // it would let an agent hold a box forever by asking for quiet again and
-      // again — each request legal, each under the ceiling, and the ceiling
-      // never reached. Deferring the question is not using the machine.
+      // The postponement is its own instant, and `lastUsedAt` is deliberately
+      // NOT touched, unlike every other handler here: the idle pass keeps the box
+      // until the later of the two (idle-lease.ts `releaseAt`), and the page can
+      // still tell "used" from "kept by request". Postponing is not using the
+      // machine. There is no total cap: each postponement is a call the agent
+      // chose to make, within this mount's limit (tygg, 2026-09-15).
       await ctx.connection.set({ ...prior, quietUntil } as unknown as Json);
       return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
     }
