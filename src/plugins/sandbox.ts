@@ -196,12 +196,34 @@ interface BoxState {
  *
  * So the lifetime it states is the one the agent can actually use — every call
  * in this turn — and it names what outlives the turn instead, which is a kept
- * filesystem. When a deployment turns the lease on, this sentence stops being
- * true in the other direction, so the runtime should hand the plugin that fact
- * rather than have it remembered here (cody has offered `idle`); until then
- * there is no deployment where the lease is on.
+ * filesystem.
+ *
+ * With the lease on (tygg, 2026-09-15: a container is destroyed by the agent's
+ * own `release`, not by the end of a turn) the runtime hands the plugin the
+ * lease and the sentence names that lifetime instead: the same box in later
+ * turns until the agent releases it, a question when it goes idle, and the
+ * operator's ceiling. The numbers come from the lease, never from here.
  */
-export function boxReminder(alias: string): string {
+export interface BoxLease {
+  /** Idle this long before the agent is first asked about the box. */
+  afterMs: number;
+  /** Idle this long and the box is released, whatever the agent said. */
+  maxMs: number;
+}
+
+const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
+
+/** What happens to an idle box under a lease, said once for the reminder, `run` and `shell`. */
+export function leaseTerms(lease: BoxLease): string {
+  return `if it goes idle for ${leaseMinutes(lease.afterMs)} minutes you are asked whether to keep it, `
+    + `and at ${leaseMinutes(lease.maxMs)} minutes idle it is released whatever you answer`;
+}
+
+export function boxReminder(alias: string, lease: BoxLease | null = null): string {
+  if (lease) {
+    return `every call uses this same container, in this turn and later ones, until you release it; ${leaseTerms(lease)}`
+      + `; \`keep\` on \`${alias}\` saves its filesystem beyond that, and \`release\` destroys it now`;
+  }
   return `every call in this turn uses this same container, and it is handed back when the turn ends`
     + `; \`keep\` on \`${alias}\` saves its filesystem for a later turn, and \`release\` destroys it now`;
 }
@@ -291,6 +313,7 @@ export function finished(
   cfg: ReturnType<typeof cfgOf>,
   state: BoxState | null,
   alias: string,
+  lease: BoxLease | null = null,
 ): Record<string, unknown> {
   const out = String(rec.output_summary ?? "");
   return {
@@ -300,7 +323,7 @@ export function finished(
     // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
     // nothing between executions" concluded this box was volatile too — which
     // would have it reinstalling packages on every call.
-    reminder: boxReminder(alias),
+    reminder: boxReminder(alias, lease),
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
     // So the agent learns the environment from a result it already has,
@@ -551,7 +574,26 @@ export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "
   return open ? argv : ["unshare", "-n", "--", ...argv];
 }
 
-export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Plugin {
+export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
+  // `run`, `shell` and every result state the same lifetime (boxReminder): with a lease, the box stays until
+  // the agent releases it or the idle ceiling takes it; without one, a settled turn hands it back.
+  const runLifetime = lease
+    ? "The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later " +
+      "ones, so installs and files survive from one call to the next — do not reinstall. It stays until you " +
+      `release it; ${leaseTerms(lease)}. Work in as few calls as you can, save what matters with \`save\`, and ` +
+      "release it as soon as you no longer need the machine. Everything inside is destroyed when it is released."
+    : "The container is NOT the per-execution sandbox: every call in this " +
+      "turn uses the same one, so installs and files survive from one call to the next — do not " +
+      "reinstall. It is handed back when the turn ends, so a later turn starts a new container " +
+      "unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save " +
+      "what matters with `save`, and release it. Everything inside is destroyed when it is released.";
+  const shellLifetime = lease
+    ? "Shell in the same billed-by-the-second container as `run`, and the same one for every call, in this " +
+      "turn and later ones — state, installed packages and files carry over — until you release it; " +
+      `${leaseTerms(lease)}.`
+    : "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
+      "in this turn — state, installed packages and files carry over from one call to the next, and " +
+      "the container is handed back when the turn ends.";
   return {
   id: "sandbox",
   // Seeded despite being the only metered mount: a container the agent cannot
@@ -619,11 +661,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
         "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
         "starts a container that is billed for every second it exists, and it cannot call your other " +
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
-        "few seconds of compute. The container is NOT the per-execution sandbox: every call in this " +
-        "turn uses the same one, so installs and files survive from one call to the next — do not " +
-        "reinstall. It is handed back when the turn ends, so a later turn starts a new container " +
-        "unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save " +
-        "what matters with `save`, and release it. Everything inside is destroyed when it is released.",
+        "few seconds of compute. " + runLifetime,
       parameters: {
         type: "object",
         properties: {
@@ -643,9 +681,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     {
       name: "shell",
       summary:
-        "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
-        "in this turn — state, installed packages and files carry over from one call to the next, and " +
-        "the container is handed back when the turn ends. Only for what needs a real " +
+        shellLifetime + " Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
@@ -1214,7 +1250,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     const grace = Date.now() + cfg.graceMs;
     for (;;) {
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${execId}`);
-      if (TERMINAL.includes(rec.state)) return finished(rec, cfg, state, ctx.alias);
+      if (TERMINAL.includes(rec.state)) return finished(rec, cfg, state, ctx.alias, lease);
       if (Date.now() > grace) {
         // Handed over rather than waited on: the turn is serialised while this
         // call is open (`exclusive`), so waiting here costs the agent every
@@ -1245,7 +1281,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string): Pl
     // the same moment — the read-modify-write `exclusive` exists to prevent,
     // in a new place (Piper, 2026-09-14).
     const state = asBoxState(await ctx.connection.get());
-    return { done: true, result: finished(rec, cfg, state, ctx.alias) as Json };
+    return { done: true, result: finished(rec, cfg, state, ctx.alias, lease) as Json };
   },
 
   /**
