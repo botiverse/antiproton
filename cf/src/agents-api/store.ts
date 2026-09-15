@@ -72,12 +72,17 @@ export function deleteApiAgent(sql: Sql, agentId: string, now = Date.now()): boo
 }
 
 /**
- * The agents the API deleted, for the console's own directory (owned_agents), which lists every agent
- * the owner made: without this, an agent gone from the API stayed in the console.
+ * The agents the API made, live and deleted, for the console's own directory (owned_agents), which lists
+ * every agent the owner made: a deleted one is left out there too, and a live one is marked as made
+ * through the API. The api_agents row is the record of that, so the mark is read here, not stored twice.
  */
-export function deletedApiAgentIds(sql: Sql): Set<string> {
+export function apiAgentIds(sql: Sql): { live: Set<string>; deleted: Set<string> } {
   ensureApiTables(sql);
-  return new Set(sql.exec("SELECT agent_id FROM api_agents WHERE deleted_at IS NOT NULL").toArray().map((r: any) => String(r.agent_id)));
+  const live = new Set<string>(), deleted = new Set<string>();
+  for (const r of sql.exec("SELECT agent_id, deleted_at FROM api_agents").toArray() as any[]) {
+    (r.deleted_at === null ? live : deleted).add(String(r.agent_id));
+  }
+  return { live, deleted };
 }
 
 const rowToSession = (r: any): StoredSession => ({

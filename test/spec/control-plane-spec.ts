@@ -93,5 +93,53 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert(r?.tenantId === "t-a" && r.ownerAgentId === "u-a", `the first owner was replaced: ${JSON.stringify(r)}`);
   });
 
+  add("an owner's keys are listed newest first, revoked ones with their time, and nobody else's", async () => {
+    await keys.issue({ hash: "k1", tenantId: "t", ownerAgentId: "u-me", label: "first" });
+    await keys.issue({ hash: "k2", tenantId: "t", ownerAgentId: "u-me", label: "second" });
+    await keys.issue({ hash: "k3", tenantId: "t", ownerAgentId: "u-other", label: "theirs" });
+    await keys.issue({ hash: "k4", tenantId: "t-2", ownerAgentId: "u-me", label: "same owner id, other tenant" });
+    await keys.revoke("k1");
+    const rows = await keys.list({ tenantId: "t", ownerAgentId: "u-me" });
+    assert(rows.map((r) => r.hash).join() === "k2,k1", `listed ${rows.map((r) => r.hash)}`);
+    assert(rows[0]!.label === "second" && rows[0]!.revokedAt === null, `the live key: ${JSON.stringify(rows[0])}`);
+    assert(Number(rows[1]!.revokedAt) > rows[1]!.createdAt, `the revoked key: ${JSON.stringify(rows[1])}`);
+    assert((await keys.list({ tenantId: "t", ownerAgentId: "u-nobody" })).length === 0, "an owner with no keys listed some");
+  });
+
+  add("the live-key limit holds for requests at the same time, and a revoke makes room", async () => {
+    const me = { tenantId: "t", ownerAgentId: "u-me" };
+    await keys.issue({ hash: "theirs", tenantId: "t", ownerAgentId: "u-other", label: "not counted" });
+    const tries = await Promise.all(Array.from({ length: 5 }, (_, i) => keys.issueWithin({ ...me, hash: `c${i}`, label: `c${i}` }, 3)));
+    const live = (await keys.list(me)).filter((k) => k.revokedAt === null);
+    assert(tries.filter(Boolean).length === 3 && live.length === 3, `issued ${tries.filter(Boolean).length}, live ${live.length}`);
+    assert((await keys.issueWithin({ ...me, hash: "over", label: "over" }, 3)) === false && (await keys.lookup("over")) === null, "a key past the limit was issued");
+    await keys.revokeOwned(live[0]!.hash, me);
+    assert((await keys.issueWithin({ ...me, hash: "after", label: "after" }, 3)) === true, "a revoked key still counted against the limit");
+  });
+
+  add("revokes and creates at the same time never leave more live keys than the limit", async () => {
+    const me = { tenantId: "t", ownerAgentId: "u-me" };
+    for (let i = 0; i < 3; i++) await keys.issue({ ...me, hash: `r${i}`, label: `r${i}` });
+    // At the limit: one revoke and four creates race. Whatever order D1 runs them in, one create at most fits.
+    const [revoked, ...created] = await Promise.all([
+      keys.revokeOwned("r0", me),
+      ...Array.from({ length: 4 }, (_, i) => keys.issueWithin({ ...me, hash: `n${i}`, label: `n${i}` }, 3)),
+    ]);
+    const live = (await keys.list(me)).filter((k) => k.revokedAt === null).length;
+    assert(revoked === true, "the revoke did not happen");
+    assert(created.filter(Boolean).length <= 1 && live <= 3, `created ${created.filter(Boolean).length}, live ${live}`);
+    assert(live === 3 - 1 + created.filter(Boolean).length, `live ${live} does not match what was revoked and created`);
+  });
+
+  add("a person revokes only their own key", async () => {
+    await keys.issue({ hash: "k5", tenantId: "t", ownerAgentId: "u-other", label: "theirs" });
+    assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-me" })) === false, "revoked another owner's key");
+    assert((await keys.revokeOwned("k5", { tenantId: "t-2", ownerAgentId: "u-other" })) === false, "revoked it from another tenant");
+    assert((await keys.lookup("k5")) !== null, "a refused revoke still stopped the key");
+    assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-other" })) === true, "the owner could not revoke it");
+    assert((await keys.lookup("k5")) === null, "a revoked key still resolves");
+    assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-other" })) === false, "revoking twice reported a revoke");
+  });
+
   return cases;
 }
