@@ -8,6 +8,8 @@
 //   QA_TIER           contract | model | all   (default: contract)
 //   QA_ONLY           a substring to run matching scenarios only
 //   QA_OUT            where to write the JSON record (default: qa/sdk/out/)
+//   QA_REPEAT         run each chosen scenario this many times (default: 1), for behaviour
+//                     that depends on what the model happens to do
 //
 // Each scenario file in scenarios/ exports { name, tier, run }. `contract` needs no
 // model and holds on any deployment; `model` needs the deployment to reach a real
@@ -40,7 +42,9 @@ for (const file of readdirSync(join(here, "scenarios")).filter((f) => f.endsWith
   const mod = await import(join(here, "scenarios", file));
   for (const s of mod.default ?? []) scenarios.push({ ...s, file });
 }
-const chosen = scenarios.filter((s) => (tier === "all" || s.tier === tier) && s.name.includes(only));
+const repeat = Math.max(1, Number(process.env.QA_REPEAT ?? 1) || 1);
+const matched = scenarios.filter((s) => (tier === "all" || s.tier === tier) && s.name.includes(only));
+const chosen = matched.flatMap((s) => Array.from({ length: repeat }, (_, i) => (repeat > 1 ? { ...s, name: `${s.name} #${i + 1}` } : s)));
 
 function assert(cond, message) { if (!cond) throw new Error(message); }
 const TERMINAL = /^agent\.session\.turn\.(completed|failed|cancelled)$/;
@@ -72,7 +76,7 @@ console.log(`\n  ${results.length - failed}/${results.length} passed\n`);
 
 const out = process.env.QA_OUT ?? join(here, "out");
 mkdirSync(out, { recursive: true });
-const record = { kind: "agents-api-sdk-qa", started, finished: new Date().toISOString(), target: base, build, sdk: `openai ${sdkVersion}`, tier, only: only || null, passed: results.length - failed, total: results.length, results };
+const record = { kind: "agents-api-sdk-qa", started, finished: new Date().toISOString(), target: base, build, sdk: `openai ${sdkVersion}`, tier, only: only || null, repeat, passed: results.length - failed, total: results.length, results };
 const file = join(out, `qa-${started.replace(/[:.]/g, "-")}.json`);
 writeFileSync(file, JSON.stringify(record, null, 2));
 writeFileSync(file.replace(/\.json$/, ".html"), renderReport([record]));

@@ -8,6 +8,7 @@ qa/sdk/run.sh              # contract tier: no model needed
 qa/sdk/run.sh model        # real-model tier
 qa/sdk/run.sh all
 QA_ONLY=cancel qa/sdk/run.sh all   # only scenarios whose name contains "cancel"
+QA_REPEAT=5 QA_ONLY=cancel qa/sdk/run.sh model   # each 5 times: model behaviour is not the same every run
 ```
 
 - **Target:** the preview deployment (`https://preview.antiproton.ai/v1`), the only place `/v1` is deployed.
