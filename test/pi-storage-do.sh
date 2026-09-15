@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # Runs the same conformance suite against real Durable Object SQLite, in a
 # worker that is never deployed. See cf/src/conformance.ts for why it is separate.
+# The port and the server it starts are this run's own (test/local-worker.sh).
 set -euo pipefail
-PORT="${PORT:-8791}"
+. "$(dirname "$0")/local-worker.sh"
 cd "$(dirname "$0")/../cf"
-npx wrangler dev --config wrangler.conformance.jsonc --local \
-  --port "$PORT" --inspector-port 0 >/tmp/antiproton-conformance.log 2>&1 &
+state=$(mktemp -d)
+trap 'stop_worker; rm -rf "$state"' EXIT
+start_worker "$state/dev.log"
+answered=""
 for _ in $(seq 1 60); do
   sleep 1
-  if curl -sf -m 300 "http://127.0.0.1:$PORT/" -o /tmp/antiproton-conformance.json; then break; fi
+  if curl -sf -m 300 "http://127.0.0.1:$PORT/" -o "$state/result.json"; then answered=1; break; fi
 done
-for p in $(lsof -ti "tcp:$PORT" 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
+stop_worker
+if [ -z "$answered" ]; then
+  echo "the conformance worker did not answer on :$PORT"
+  tail -20 "$state/dev.log"
+  exit 1
+fi
 node -e '
-const r = JSON.parse(require("fs").readFileSync("/tmp/antiproton-conformance.json", "utf8"));
+const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 console.log(`\n  pi Storage conformance — ${r.backend}\n  ${"─".repeat(56)}`);
 let g = "";
 for (const c of r.results) {
@@ -22,4 +30,4 @@ for (const c of r.results) {
 }
 console.log(`  ${"─".repeat(56)}\n  ${r.passed} passed, ${r.failed} failed  (${r.ms} ms)\n`);
 process.exit(r.failed === 0 ? 0 : 1);
-'
+' "$state/result.json"
