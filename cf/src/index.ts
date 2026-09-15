@@ -58,6 +58,7 @@ import {
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
 import { agentObjectName } from "./object-name.ts";
+import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { d1ApiKeys, admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
 import { staticAsset } from "./static.ts";
@@ -1790,61 +1791,25 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0): Promise<UiTranscript> {
-    return this.#transcript(tenantId, agentId, await this.#conversation(tenantId, agentId, taskId), tail);
+    const session = await this.#conversation(tenantId, agentId, taskId);
+    const rt = this.runtime();
+    const agent = await rt.agent(tenantId, agentId, session);
+    const shown = transcriptEvents(
+      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT), this.sql, session, { tenantId, agentId }, tail);
+    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const pendingApproval = (await rt.store.listApprovals(tenantId, "pending")).length > 0;
+    const busy: UiTranscript["busy"] = pendingApproval ? "waiting-for-approval" : running ? "thinking" : null;
+    return { ...shown, byOp: approvalsByOp(await rt.store.listApprovals(tenantId)), busy };
   }
 
   /**
-   * uiTranscript for an operator (/admin/transcript), and read-only: null for an object that holds no such
-   * agent, and for a conversation the agent does not have. uiTranscript opens the owner's default conversation
-   * on first use, which is right for their own page and wrong for a GET that can name anyone (Ada, #336).
+   * uiTranscript for an operator (/admin/transcript), read straight from this object's SQLite and nothing
+   * else (cf/src/transcript-read.ts). Opening the agent re-pins its mounts and reconciles its session, and the
+   * store's init runs migrations; a GET that can name anyone must do neither (Ada, #336). Null for an agent or
+   * conversation this object does not hold.
    */
-  async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<UiTranscript | null> {
-    const owner = await this.owner();
-    if (!owner || owner.tenantId !== tenantId || owner.agentId !== agentId) return null;
-    const rt = this.runtime();
-    await rt.ready();
-    if (taskId === `t_${agentId}`) return this.#transcript(tenantId, agentId, MAIN_SESSION, 0);
-    const task = await rt.store.loadTask(tenantId, taskId);
-    if (!task || task.agentId !== agentId) return null;
-    return this.#transcript(tenantId, agentId, taskId, 0);
-  }
-
-  async #transcript(tenantId: string, agentId: string, session: string, tail: number): Promise<UiTranscript> {
-    const rt = this.runtime();
-    const agent = await rt.agent(tenantId, agentId, session);
-    const entries = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
-    // A run that failed before its first model call leaves no entry, only
-    // pi's outcome record; without this the page shows the message and then
-    // nothing, which is what an hour of today looked like.
-    const failed = failedRuns(this.sql, session).map((f) => ({
-      sequence: f.seq, kind: "model.failed",
-      payload: { error: `${f.code}: ${f.message}`, operationId: f.operationId, at: f.at } as Record<string, unknown>,
-    }));
-    const all = [...entries, ...failed].sort((a, b) => a.sequence - b.sequence);
-    const total = all.length;
-    // Shown to a person: a stored tool result written before references
-    // changed shape still names the bucket, tenant and agent (tygg, 2026-09-14).
-    const owner = { tenantId, agentId };
-    const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
-      sequence: e.sequence, kind: e.kind,
-      payload: JSON.parse(maskRawRefs(JSON.stringify(e.payload), owner)) as typeof e.payload,
-      createdAt: Number((e.payload as any)?.at ?? 0),
-    }));
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
-    const pendingApproval = (await rt.store.listApprovals(tenantId, "pending")).length > 0;
-    const busy: "thinking" | "waiting-for-approval" | null = pendingApproval
-      ? "waiting-for-approval"
-      : running ? "thinking" : null;
-    // Approvals are keyed by operation so the trajectory can show a held call
-    // where it happened, with who signed it, instead of in a separate panel.
-    const byOp: UiTranscript["byOp"] = {};
-    for (const a of await rt.store.listApprovals(tenantId)) {
-      byOp[a.operationId] = {
-        state: a.state, approver: a.approver ?? null, tool: `${a.mountAlias}.${a.tool}`, request: a.request,
-      };
-    }
-    return {
-      total, shown: events.length, events, byOp, busy };
+  async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<TranscriptEvents | null> {
+    return readTranscript(this.sql, tenantId, agentId, taskId);
   }
 
   #ownerAgent(): string | null {

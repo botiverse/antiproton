@@ -88,7 +88,7 @@ await check("the right token and a named agent: 200 with the object's transcript
     `asked ${o.asked.join(", ")} and ${named.asked.join(", ")}`);
 });
 
-await check("the object's half never creates: adminTranscript opens no conversation, claims nothing, creates no task", async () => {
+await check("the object's half only reads: adminTranscript opens no agent, runtime or store, and reads through readTranscript", async () => {
   // It runs inside the Durable Object, which this suite cannot start; uiTranscript, beside it, creates the
   // default conversation on first use (Ada, #336). So the body is read, and the read is checked to have found it.
   const { readFileSync } = await import("node:fs");
@@ -97,10 +97,11 @@ await check("the object's half never creates: adminTranscript opens no conversat
   const end = src.indexOf("\n  }\n", start);
   assert(start >= 0 && end > start, "adminTranscript was not found in cf/src/index.ts");
   const body = src.slice(start, end);
-  for (const call of ["#conversation(", "#claim(", "createTask(", "uiTranscript(", "uiEnsure("]) {
+  for (const call of ["#conversation(", "#claim(", "createTask(", "uiTranscript(", "uiEnsure(", "runtime(", ".agent(", "store.", "#transcript("]) {
     assert(!body.includes(call), `adminTranscript calls ${call}`);
   }
-  assert(body.includes("this.owner()") && body.includes("loadTask("), "adminTranscript no longer checks the owner and the conversation");
+  // The read itself, and that it changes nothing, is test/transcript-read.ts, on a real database.
+  assert(body.includes("return readTranscript(this.sql,"), "adminTranscript no longer reads through readTranscript");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
