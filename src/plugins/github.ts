@@ -248,6 +248,12 @@ export const githubPlugin: Plugin = {
     required: false,
     summary: "A GitHub personal access token, or a GitHub App installation token.",
     shape: "token",
+    // Classic tokens and the OAuth, user, server and refresh tokens share one
+    // prefix scheme; fine-grained tokens have their own. Bounded below so a
+    // prefix mentioned in prose is not a token.
+    looksLike: [
+      { kind: "github-token", pattern: "\\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\\b" },
+    ],
     grants: "private repositories, code search, and every write tool: opening issues, commenting, closing.",
     docs: "https://github.com/settings/tokens",
   },
