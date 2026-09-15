@@ -56,7 +56,7 @@ await check("an agent the object does not hold is 404; one it holds is 200 with 
   assert(((await r200.json()) as any).owner?.agentId === "u-a", "the report is not the object's answer");
 });
 
-await check("the object's half reads through readDiagnosis and opens no runtime, agent or conversation", async () => {
+await check("the object's half reads through readDiagnosis: it names the runtime's plugins, and never readies it, opens the agent, or writes SQL", async () => {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../cf/src/index.ts", import.meta.url), "utf8");
   const start = src.indexOf("  async diagnose(tenantId: string, agentId: string, taskId: string) {");
@@ -64,9 +64,12 @@ await check("the object's half reads through readDiagnosis and opens no runtime,
   assert(start >= 0 && end > start, "diagnose was not found in cf/src/index.ts");
   const body = src.slice(start, end);
   assert(body.includes("return readDiagnosis(this.sql,"), "diagnose no longer reads through readDiagnosis");
-  for (const call of [".agent(", "ready(", "uiTranscript(", "#conversation(", "#claim(", "CREATE TABLE"]) {
+  // Constructing the runtime to name its plugins is allowed: the constructors build objects in memory and
+  // run no SQL (checked for #347). Readying it, opening the agent, or writing is not.
+  for (const call of [".agent(", "ready(", ".init(", "uiTranscript(", "#conversation(", "#claim(", "CREATE TABLE", "INSERT", "UPDATE "]) {
     assert(!body.includes(call), `diagnose calls ${call}`);
   }
+  assert(body.includes(".plugins()"), "diagnose no longer takes the plugins from the runtime, so this check describes nothing");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

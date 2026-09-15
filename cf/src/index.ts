@@ -609,7 +609,8 @@ export class AgentDO extends DurableObject<Env> {
    * /admin/diagnose's report, read from this object's SQL and the store's plain readers only
    * (cf/src/diagnose-read.ts). It used to open the agent and render through uiTranscript, which ran the
    * store's migrations, re-pinned mounts, created the default conversation and tables (Ada and Vera, #336).
-   * Null for an agent or conversation this object does not hold.
+   * The runtime is constructed only to name its plugins: its constructor builds objects in memory and runs no
+   * SQL; it is never readied here (Ada, #347). Null for an agent or conversation this object does not hold.
    */
   async diagnose(tenantId: string, agentId: string, taskId: string) {
     return readDiagnosis(this.sql, tenantId, agentId, taskId, {
