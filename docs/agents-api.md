@@ -11,13 +11,17 @@ Antiproton provides an edge-native, multi-tenant implementation of the **OpenAI 
 
 ## 1. Quick Start
 
-### Installation
+### Installation & SDK Version Requirement
 
-Install the official OpenAI Node.js / TypeScript SDK:
+Install the official OpenAI Node.js / TypeScript SDK, pinned strictly to version **7.15.0**:
 
 ```bash
 npm install openai@7.15.0
 ```
+
+> ⚠️ **Important Versioning & Module Resolution Caveats:**
+> - **SDK Version Must Be >= 7.15.0 (Tested on 7.15.0):** Older versions (such as `openai` 6.x) do not include `client.beta.agents`. Attempting to call `client.beta.agents.create()` on older versions will fail client-side with `TypeError: Cannot read properties of undefined (reading 'create')`.
+> - **Node.js ESM Symlink Resolution:** Node.js resolves ESM imports using the real filesystem path of the executing script (`realpath`), walking up to find `node_modules`. If your project or repository root has an older version of `openai` installed (e.g. 6.40.0), a script executing across symlinks may inadvertently resolve the older `openai` package. Always ensure the resolved package directory carries `openai@7.15.0`.
 
 ### Configuration
 
@@ -350,7 +354,15 @@ Canceling an idle session is accepted as a no-op. If a turn is active, Antiproto
 
 ## 5. Unsupported Features & Error Behavior
 
-Antiproton enforces strict schema validation. When an unsupported parameter is provided, the API returns a standard `400 Bad Request` with `code: "unsupported_parameter"` (or `invalid_value`), naming the exact field in `param`:
+### API Surface Scope: `client.beta.agents` Only
+Antiproton's `/v1` endpoint is purpose-built to implement the **OpenAI Agents API (`client.beta.agents`)**. It does **not** provide general OpenAI endpoints:
+- `POST /v1/chat/completions` returns `404 Not Found` with `code: "not_found"` (*"is not supported by this deployment"*).
+- `POST /v1/responses`, `/v1/embeddings`, `/v1/audio/*`, and other standard endpoints are not supported.
+
+Client applications must target the `beta.agents` interface rather than attempting to route generic completion traffic to this endpoint.
+
+### Parameter Validation Refusals
+When an unsupported parameter or event is provided to a supported Agents API route, the API returns a standard `400 Bad Request` with `code: "unsupported_parameter"` (or `invalid_value`), naming the exact field in `param`:
 
 | Unsupported Parameter / Event | `param` |
 |---|---|
