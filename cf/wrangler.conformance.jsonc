@@ -10,5 +10,9 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["StorageProbe"] }],
   "durable_objects": {
     "bindings": [{ "name": "PROBE", "class_name": "StorageProbe" }]
-  }
+  },
+  // Local only (test/control-plane-d1.sh): the id names no real database.
+  "d1_databases": [
+    { "binding": "CONTROL_DB", "database_name": "antiproton-conformance-control", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }
+  ]
 }

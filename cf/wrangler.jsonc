@@ -15,6 +15,12 @@
   "durable_objects": {
     "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }]
   },
+  // The control plane (cf/src/control-plane.ts, task #18): who may sign in, and
+  // as which tenant and agent. Agent data stays in each agent's own object.
+  // cf/scripts/deploy.sh applies migrations_dir before the Worker ships.
+  "d1_databases": [
+    { "binding": "CONTROL_DB", "database_name": "antiproton-control", "database_id": "726e14d9-261f-4712-a7a5-b011db179598", "migrations_dir": "migrations" }
+  ],
   "worker_loaders": [{ "binding": "LOADER" }],
   "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "antiproton-artifacts" }],
   // The only construct on this platform that owns work across invocations.

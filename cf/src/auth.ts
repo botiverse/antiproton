@@ -145,7 +145,7 @@ export function clearCookieHeader(name: string, path = "/"): string {
 }
 
 /** Why a sign-in was turned away; the page names each. */
-export type RefusalReason = "not-invited" | "state" | "exchange" | "unconfigured";
+export type RefusalReason = "not-invited" | "state" | "exchange" | "unconfigured" | "unavailable";
 
 // ---- resolving the viewer of a request ---------------------------------------
 

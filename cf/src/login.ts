@@ -137,6 +137,11 @@ export const REFUSALS: Record<string, { title: string; body: string; next: strin
     body: "The operator has not configured sign-in with GitHub here, so nobody can sign in yet.",
     next: "Tell the operator. There is nothing to do on your side.",
   },
+  unavailable: {
+    title: "Sign-in could not be checked just now",
+    body: "The list of who may sign in did not answer, so nobody new can sign in for the moment. Anyone already signed in is not affected.",
+    next: "Try again in a minute; if it keeps happening, tell the operator.",
+  },
 };
 
 const GENERIC = {

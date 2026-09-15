@@ -12,10 +12,14 @@
  * So: `npm run pi-storage:do`. Same PiSqliteStorage class as production, same
  * `sql` and `transactionSync` the real object hands it — what differs is only
  * which worker is asking.
+ *
+ * /control-plane runs the control plane's queries against a real local D1
+ * database the same way (test/control-plane-d1.sh prepares it).
  */
 import { DurableObject } from "cloudflare:workers";
 import { createStorageConformance } from "@earendil-works/pi-agent-core/harness/session/testing";
 import { PiSqliteStorage } from "../../src/store/pi-storage.ts";
+import { controlPlaneCases } from "../../test/spec/control-plane-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
 
@@ -51,8 +55,25 @@ export class StorageProbe extends DurableObject {
   }
 }
 
+async function runControlPlaneSpec(db: D1Database) {
+  const t0 = Date.now();
+  const results: Array<{ group: string; name: string; ok: boolean; error?: string }> = [];
+  for (const c of controlPlaneCases(db)) {
+    try { await c.run(); results.push({ group: "control plane", name: c.name, ok: true }); }
+    catch (e: any) { results.push({ group: "control plane", name: c.name, ok: false, error: String(e?.message ?? e) }); }
+  }
+  return {
+    backend: "d1",
+    ms: Date.now() - t0,
+    passed: results.filter((r) => r.ok).length,
+    failed: results.filter((r) => !r.ok).length,
+    results,
+  };
+}
+
 export default {
-  async fetch(_request: Request, env: { PROBE: DurableObjectNamespace<StorageProbe> }) {
+  async fetch(request: Request, env: { PROBE: DurableObjectNamespace<StorageProbe>; CONTROL_DB: D1Database }) {
+    if (new URL(request.url).pathname === "/control-plane") return Response.json(await runControlPlaneSpec(env.CONTROL_DB));
     const stub = env.PROBE.get(env.PROBE.idFromName("pi-storage"));
     return Response.json(await stub.runPiStorageSpec());
   },
