@@ -101,8 +101,13 @@ async function call(
   for (let hop = 0; hop < 3 && res.status >= 300 && res.status < 400 && res.headers.get("location"); hop++) {
     url = new URL(res.headers.get("location")!, url);
     const sameApi = url.origin === new URL(API).origin;
+    // 303 means "go and GET this"; 307 and 308 repeat the request as it was.
+    const asGet = res.status === 303 || method === "GET";
     res = await fetch(url, {
-      ...(sameApi ? { method, headers, body: body === undefined ? undefined : JSON.stringify(body) } : {}),
+      ...(sameApi ? {
+        method: asGet ? "GET" : method, headers,
+        body: asGet || body === undefined ? undefined : JSON.stringify(body),
+      } : {}),
       signal: AbortSignal.timeout(30_000), redirect: "manual",
     });
   }

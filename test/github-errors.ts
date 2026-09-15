@@ -108,6 +108,9 @@ await check("a redirect to storage is followed without our token, and the log co
   );
   const r = await githubPlugin.invoke("api_get", { path: "/repos/o/r/actions/jobs/1/logs" }, ctx("tok")) as any;
   if (seen.length !== 2) throw new Error(`the redirect was not followed by the plugin: ${JSON.stringify(seen)}`);
+  // Every request says manual: a fetch left to follow redirects itself is the
+  // runtime dependency this removes, and the fake would not notice (cody).
+  if (seen.some((x) => x.redirect !== "manual")) throw new Error(`a request left redirects to fetch: ${JSON.stringify(seen)}`);
   if (seen[1]!.auth !== null) throw new Error("the token was sent to the storage host");
   if (!String(r?.text).includes("step 2")) throw new Error(`got ${JSON.stringify(r)}`);
 });
@@ -119,6 +122,22 @@ await check("a redirect within GitHub's API keeps the token", async () => {
   );
   await githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok"));
   if (seen.length !== 2 || seen[1]!.auth !== "Bearer tok") throw new Error(`same-origin hop: ${JSON.stringify(seen)}`);
+  if (seen.some((x) => x.redirect !== "manual")) throw new Error(`a request left redirects to fetch: ${JSON.stringify(seen)}`);
+});
+
+await check("a 303 within the API is followed as a GET without the body", async () => {
+  const calls: Array<{ method: string; body: unknown }> = [];
+  let i = 0;
+  globalThis.fetch = (async (_url: any, init?: any) => {
+    calls.push({ method: init?.method ?? "GET", body: init?.body });
+    return i++ === 0
+      ? new Response("", { status: 303, headers: { location: "https://api.github.com/repos/o/r/issues/7" } })
+      : new Response(JSON.stringify({ number: 7 }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as any;
+  await githubPlugin.invoke("api", { method: "POST", path: "/repos/o/r/issues", body: { title: "t" } }, ctx("tok"));
+  if (calls.length !== 2 || calls[1]!.method !== "GET" || calls[1]!.body !== undefined) {
+    throw new Error(`the 303 hop was ${JSON.stringify(calls[1])}`);
+  }
 });
 
 await check("an error from the storage host names that host, not GitHub", async () => {
