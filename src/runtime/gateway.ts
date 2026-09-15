@@ -595,6 +595,7 @@ export class ToolGateway {
             ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
             : null,
           connection: connectionFor(other.alias),
+          plugin: other.plugin,
         };
       },
     };

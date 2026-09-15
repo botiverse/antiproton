@@ -43,7 +43,16 @@ export interface PluginContext {
    * config-time binding exists to prevent. Scoped to this agent's own mounts,
    * so it grants nothing the agent was not already configured to use.
    */
-  sibling(alias: string): Promise<{ credential: string | null; connection: ConnectionState } | null>;
+  sibling(alias: string): Promise<{
+    credential: string | null;
+    connection: ConnectionState;
+    /**
+     * Which plugin that mount is. A credential is only meaningful to the service
+     * it was issued for, so a plugin that hands one to a particular host checks
+     * this rather than trusting that an alias still names what it used to.
+     */
+    plugin: string;
+  } | null>;
 }
 
 /**
