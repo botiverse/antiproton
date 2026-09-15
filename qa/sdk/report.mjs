@@ -13,7 +13,12 @@ export function renderReport(records) {
   const when = (iso) => iso ? iso.replace("T", " ").replace(/\.\d+Z$/, " UTC") : "";
   const all = records.flatMap((r) => r.results);
   const passed = all.filter((x) => x.ok).length;
-  const ok = passed === all.length;
+  // The verdict is each scenario's latest result, in the order the records were given; every earlier
+  // run stays below, failures included, so a fixed failure is visible rather than erased.
+  const latest = new Map();
+  for (const r of records) for (const x of r.results) latest.set(x.name, x);
+  const latestPassed = [...latest.values()].filter((x) => x.ok).length;
+  const ok = latestPassed === latest.size;
   const builds = [...new Set(records.map((r) => r.build ?? "unknown"))].join(", ");
   const sdks = [...new Set(records.map((r) => r.sdk))].join(", ");
   const targets = [...new Set(records.map((r) => r.target))].join(", ");
@@ -41,7 +46,7 @@ export function renderReport(records) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agents API QA · ${passed}/${all.length}</title>
+<title>Agents API QA · ${latestPassed}/${latest.size}</title>
 <style>
   :root { --fg:#1c1c1e; --muted:#6b6b70; --line:#e3e3e6; --pass:#1f7a3a; --pass-bg:#e8f5ec; --fail:#b3261e; --fail-bg:#fdecea; }
   * { box-sizing: border-box; }
@@ -73,7 +78,8 @@ export function renderReport(records) {
   <h1>Agents API QA report</h1>
   <p class="meta">OpenAI-compatible agents API, exercised with the official OpenAI SDK (qa/sdk).</p>
   <dl class="summary">
-    <dt>result</dt><dd><span class="verdict ${ok ? "pass" : "fail"}">${passed}/${all.length} passed</span></dd>
+    <dt>result</dt><dd><span class="verdict ${ok ? "pass" : "fail"}">${latestPassed}/${latest.size} scenarios pass</span>
+      <div class="note">latest run of each scenario${records.length > 1 ? ` · ${passed}/${all.length} scenario runs passed across all ${records.length} runs, earlier ones kept below` : ""}</div></dd>
     <dt>runs</dt><dd>${records.length} (${records.map((r) => `${esc(r.tier)} ${r.passed}/${r.total}`).join(" · ")})</dd>
     <dt>target</dt><dd><code>${esc(targets)}</code></dd>
     <dt>build</dt><dd><code>${esc(builds)}</code></dd>
