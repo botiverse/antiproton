@@ -65,33 +65,38 @@ export function approvalsByOp(approvals: ApprovalMark[]): TranscriptEvents["byOp
   return byOp;
 }
 
-function hasTable(sql: Sql, name: string): boolean {
+export function hasTable(sql: Sql, name: string): boolean {
   return sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name).toArray().length > 0;
 }
 
 /**
- * The conversation `taskId` of this object's agent, or null when the object holds
- * no such agent or the agent no such conversation. `t_<agentId>` is the agent's
- * main session, as the console's own lookup has it; any other id must be a task
- * of this agent.
+ * The session `taskId` names for this object's agent, or null when the object
+ * holds no such agent or the agent no such conversation. `t_<agentId>` is the
+ * agent's main session, as the console's own lookup has it; any other id must be
+ * a task of this agent.
  */
-export function readTranscript(sql: Sql, tenantId: string, agentId: string, taskId: string): TranscriptEvents | null {
+export function sessionFor(sql: Sql, tenantId: string, agentId: string, taskId: string): string | null {
   if (!hasTable(sql, "owner")) return null;
   const owner = sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
   if (!owner || owner.tenant_id !== tenantId || owner.agent_id !== agentId) return null;
-  let session = MAIN_SESSION;
-  if (taskId !== `t_${agentId}`) {
-    const task = hasTable(sql, "tasks")
-      ? sql.exec("SELECT agent_id FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId).toArray()[0] as any
-      : undefined;
-    if (!task || task.agent_id !== agentId) return null;
-    session = taskId;
-  }
+  if (taskId === `t_${agentId}`) return MAIN_SESSION;
+  const task = hasTable(sql, "tasks")
+    ? sql.exec("SELECT agent_id FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId).toArray()[0] as any
+    : undefined;
+  return task && task.agent_id === agentId ? taskId : null;
+}
+
+/** A session's entries, oldest first; none when its table was never made. */
+export function readEntries(sql: Sql, session: string): Entry[] {
   const t = piTables(session);
-  const entries = hasTable(sql, t.entries)
+  return hasTable(sql, t.entries)
     ? (sql.exec(`SELECT body FROM ${t.entries} ORDER BY seq ASC`).toArray() as any[]).map((r) => JSON.parse(String(r.body)) as Entry)
     : [];
-  const approvals: ApprovalMark[] = hasTable(sql, "approvals")
+}
+
+/** The tenant's approvals, oldest first. */
+export function readApprovals(sql: Sql, tenantId: string): ApprovalMark[] {
+  return hasTable(sql, "approvals")
     ? (sql.exec(
       "SELECT operation_id, state, approver, mount_alias, tool, request FROM approvals WHERE tenant_id=? ORDER BY created_at ASC",
       tenantId).toArray() as any[]).map((r) => ({
@@ -99,5 +104,14 @@ export function readTranscript(sql: Sql, tenantId: string, agentId: string, task
       mountAlias: String(r.mount_alias), tool: String(r.tool), request: JSON.parse(String(r.request)),
     }))
     : [];
-  return { ...transcriptEvents(entries, sql, session, { tenantId, agentId }, 0), byOp: approvalsByOp(approvals) };
+}
+
+/** The conversation `taskId` of this object's agent, as the console shows it; null as sessionFor. */
+export function readTranscript(sql: Sql, tenantId: string, agentId: string, taskId: string): TranscriptEvents | null {
+  const session = sessionFor(sql, tenantId, agentId, taskId);
+  if (session === null) return null;
+  return {
+    ...transcriptEvents(readEntries(sql, session), sql, session, { tenantId, agentId }, 0),
+    byOp: approvalsByOp(readApprovals(sql, tenantId)),
+  };
 }
