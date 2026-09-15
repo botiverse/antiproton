@@ -832,6 +832,11 @@ await check("run, shell and the per-execution reminder end the container the sam
     if (!/`quiet` postpones the release/.test(text)) {
       throw new Error(`${where} does not say the release can be postponed with quiet: ${text.slice(0, 240)}`);
     }
+    // /tmp is a tmpfs in a run9 box and was emptied while the box sat idle; the working directory was not
+    // (production, 2026-09-15). An agent told only "files survive" keeps its work where it will vanish.
+    if (!/files under \/tmp do not survive while it sits idle/.test(text) || !/keep your work in the working directory/.test(text)) {
+      throw new Error(`${where} does not say /tmp is lost while the box is idle, or where to keep work: ${text.slice(-240)}`);
+    }
     if (/handed back when the turn ends|every call in this turn uses/.test(text)) {
       throw new Error(`${where} still ends the container with the turn under a lease: ${text.slice(0, 200)}`);
     }

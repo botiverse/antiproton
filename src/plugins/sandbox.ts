@@ -213,10 +213,18 @@ export interface BoxLease {
 
 const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 
-/** What happens to an idle box under a lease, said once for the reminder, `run` and `shell`. */
+/**
+ * What happens to an idle box under a lease, said once for the reminder, `run` and `shell`.
+ *
+ * "Files survive" is true of the box's root disk, not of /tmp. In a run9 box /tmp is a tmpfs; measured on
+ * production on 2026-09-15, a marker in /tmp was gone after 18 idle minutes while one in /work (the default
+ * working directory) was still there, in the same box, with no reboot in between. An agent that writes its
+ * work to /tmp and comes back after a pause would find it missing, so the sentence says where to keep it.
+ */
 export function leaseTerms(lease: BoxLease): string {
   return `after ${leaseMinutes(lease.maxMs)} idle minutes it is released; ${leaseMinutes(lease.warnMs)} minutes `
-    + `before that you are told, and \`quiet\` postpones the release by as long as you choose, within the mount's limit`;
+    + `before that you are told, and \`quiet\` postpones the release by as long as you choose, within the mount's limit; `
+    + `files under /tmp do not survive while it sits idle, so keep your work in the working directory`;
 }
 
 export function boxReminder(alias: string, lease: BoxLease | null = null): string {
