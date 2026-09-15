@@ -50,7 +50,7 @@ import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import {
   resolveViewer,
-  programmaticAccess,
+  programmaticAccess, isOperator,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
@@ -2985,6 +2985,19 @@ export default {
           const k = url.searchParams.get("taskId") ?? `t_${a}`;
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.diagnose(t, a, k));
+        }
+        case "/admin/transcript": {
+          // The whole conversation, payloads included: what the console's trajectory tab shows its owner,
+          // for an operator asked to look at someone's agent. diagnose keeps six events at 220 characters.
+          // Refused when no token is configured, unlike diagnose: this is a person's conversation.
+          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          const t = url.searchParams.get("tenantId") ?? "demo";
+          const a = String(url.searchParams.get("agentId"));
+          const k = url.searchParams.get("taskId") ?? `t_${a}`;
+          const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
+          return Response.json(await s4.uiTranscript(t, a, k));
         }
         case "/ui": {
           const gate = await requireViewer(request, env);
