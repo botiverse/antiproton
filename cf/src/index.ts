@@ -19,7 +19,7 @@ import { apiAgentSeeds } from "./agents-api/provisioning.ts";
 import { watchChanges } from "./agents-api/watch.ts";
 import { openAIError, type StoredAgent, type StoredSession } from "./agents-api/shapes.ts";
 import {
-  deleteApiAgent, deleteApiSession, deletedApiAgentIds, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  apiAgentIds, deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
   mintAgentId, mintSessionId, putApiAgent, putApiSession,
 } from "./agents-api/store.ts";
 import { maskRawRefs } from "../../src/store/refs.ts";
@@ -76,7 +76,7 @@ import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
-  runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList } from "./ui.ts";
+  runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
@@ -1404,13 +1404,14 @@ export class AgentDO extends DurableObject<Env> {
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
-    // An agent deleted through the API is gone here too; its object is kept, as for every agent.
-    const deleted = deletedApiAgentIds(this.sql);
+    // An agent deleted through the API is gone here too (its object is kept, as for every agent);
+    // one the API made, with a key of this person's, is marked so the list can say so.
+    const api = apiAgentIds(this.sql);
     const rows = (this.sql.exec("SELECT * FROM owned_agents ORDER BY created_at DESC").toArray() as any[])
-      .filter((r) => !deleted.has(String(r.agent_id)));
+      .filter((r) => !api.deleted.has(String(r.agent_id)));
     const owned = rows.map((r) => ({
       agentId: String(r.agent_id), name: String(r.name), description: String(r.description),
-      avatar: String(r.avatar), createdAt: Number(r.created_at),
+      avatar: String(r.avatar), createdAt: Number(r.created_at), api: api.live.has(String(r.agent_id)),
     }));
     // The first agent is the person's own object, named before names existed;
     // it gets a name and a face the same way a new one would, drawn from its
@@ -1422,7 +1423,7 @@ export class AgentDO extends DurableObject<Env> {
     if (agentId === ownerAgentId) return true;
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
-    if (deletedApiAgentIds(this.sql).has(agentId)) return false;
+    if (apiAgentIds(this.sql).deleted.has(agentId)) return false;
     return this.sql.exec("SELECT 1 FROM owned_agents WHERE agent_id=?", agentId).toArray().length > 0;
   }
 
@@ -2414,7 +2415,7 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent"]);
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke"]);
 
 /**
  * What a person may name an agent. Checked in the route before any object is
@@ -3157,6 +3158,42 @@ export default {
           const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, home)));
           await homeStub.uiRecordAgent(gate.tenantId, home, made);
           return Response.json(made);
+        }
+        case "/ui/api-keys":
+        case "/ui/api-keys/new":
+        case "/ui/api-keys/revoke": {
+          // A person's own Agents API keys. The owner is whoever signed in (their first agent, their
+          // tenant), never a value from the request: a key speaks only for the person who made it, and
+          // the agents it makes are listed as theirs. /admin/api-keys stays for automation.
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const owner = { tenantId: gate.tenantId, ownerAgentId: gate.agentId };
+          const keys = d1ApiKeys(env.CONTROL_DB);
+          const max = 10;
+          let issued: { key: string; label: string } | null = null, error: string | null = null;
+          if (url.pathname !== "/ui/api-keys") {
+            if (request.method !== "POST") return new Response("POST", { status: 405 });
+            if (gate.who.startsWith("anonymous")) return new Response("read-only", { status: 403 });
+            const form = await formOf(request);
+            if (!form) return new Response("expected a form body", { status: 400 });
+            if (url.pathname === "/ui/api-keys/new") {
+              const label = String(form.get("label") ?? "").trim().slice(0, 60);
+              const live = (await keys.list(owner)).filter((k) => k.revokedAt === null).length;
+              if (!label) error = "a key needs a name";
+              else if (live >= max) error = `you have ${live} live keys, the most one person may hold; revoke one first`;
+              else {
+                const key = newApiKey();
+                await keys.issue({ hash: await hashApiKey(key), ...owner, label });
+                issued = { key, label };
+              }
+            } else if (!(await keys.revokeOwned(String(form.get("hash") ?? ""), owner))) {
+              error = "that key is not one of yours, or it is already revoked";
+            }
+          }
+          const res = html(apiKeysPanel({ keys: await keys.list(owner), issued, error, baseUrl: `${url.origin}/v1`, max }));
+          // A new key is in this one response and nowhere else, so nothing on the way may keep a copy.
+          res.headers.set("cache-control", "no-store");
+          return res;
         }
         case "/ui/agents": {
           const gate = await requireViewer(request, env);

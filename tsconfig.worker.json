@@ -41,6 +41,7 @@
     "test/agents-api-watch.ts",
     "test/confirm.ts",
     "test/console-assets.ts",
+    "test/console-api-keys.ts",
     "test/console-chat.ts",
     "test/console-choice.ts",
     "test/console-events.ts",

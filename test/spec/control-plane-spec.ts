@@ -93,5 +93,28 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert(r?.tenantId === "t-a" && r.ownerAgentId === "u-a", `the first owner was replaced: ${JSON.stringify(r)}`);
   });
 
+  add("an owner's keys are listed newest first, revoked ones with their time, and nobody else's", async () => {
+    await keys.issue({ hash: "k1", tenantId: "t", ownerAgentId: "u-me", label: "first" });
+    await keys.issue({ hash: "k2", tenantId: "t", ownerAgentId: "u-me", label: "second" });
+    await keys.issue({ hash: "k3", tenantId: "t", ownerAgentId: "u-other", label: "theirs" });
+    await keys.issue({ hash: "k4", tenantId: "t-2", ownerAgentId: "u-me", label: "same owner id, other tenant" });
+    await keys.revoke("k1");
+    const rows = await keys.list({ tenantId: "t", ownerAgentId: "u-me" });
+    assert(rows.map((r) => r.hash).join() === "k2,k1", `listed ${rows.map((r) => r.hash)}`);
+    assert(rows[0]!.label === "second" && rows[0]!.revokedAt === null, `the live key: ${JSON.stringify(rows[0])}`);
+    assert(Number(rows[1]!.revokedAt) > rows[1]!.createdAt, `the revoked key: ${JSON.stringify(rows[1])}`);
+    assert((await keys.list({ tenantId: "t", ownerAgentId: "u-nobody" })).length === 0, "an owner with no keys listed some");
+  });
+
+  add("a person revokes only their own key", async () => {
+    await keys.issue({ hash: "k5", tenantId: "t", ownerAgentId: "u-other", label: "theirs" });
+    assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-me" })) === false, "revoked another owner's key");
+    assert((await keys.revokeOwned("k5", { tenantId: "t-2", ownerAgentId: "u-other" })) === false, "revoked it from another tenant");
+    assert((await keys.lookup("k5")) !== null, "a refused revoke still stopped the key");
+    assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-other" })) === true, "the owner could not revoke it");
+    assert((await keys.lookup("k5")) === null, "a revoked key still resolves");
+    assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-other" })) === false, "revoking twice reported a revoke");
+  });
+
   return cases;
 }

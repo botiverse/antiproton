@@ -4,7 +4,7 @@
  * store's new way to update an agent's config.
  */
 import {
-  deleteApiAgent, deleteApiSession, deletedApiAgentIds, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  apiAgentIds, deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
   mintAgentId, mintSessionId, putApiAgent, putApiSession, touchApiSession,
 } from "../cf/src/agents-api/store.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -41,15 +41,27 @@ await check("agents: put, update in place, list oldest first, and a deleted agen
   } finally { host.dispose(); }
 });
 
-await check("the ids of deleted agents, and only those, are what the console hides", async () => {
+await check("the console hides the agents the API deleted and marks the ones it made, and nothing else", async () => {
   const host = sqliteHost(); const sql = host.sql as any;
   try {
-    assert(deletedApiAgentIds(sql).size === 0, "an empty index reported deleted agents");
+    const empty = apiAgentIds(sql);
+    assert(empty.live.size === 0 && empty.deleted.size === 0, "an empty index reported agents");
     putApiAgent(sql, "a1", agentCfg("one"));
     putApiAgent(sql, "a2", agentCfg("two"));
     deleteApiAgent(sql, "a1", now + 10);
-    assert([...deletedApiAgentIds(sql)].join() === "a1", `deleted: ${[...deletedApiAgentIds(sql)]}`);
+    const ids = apiAgentIds(sql);
+    assert([...ids.deleted].join() === "a1" && [...ids.live].join() === "a2", `live ${[...ids.live]}, deleted ${[...ids.deleted]}`);
   } finally { host.dispose(); }
+});
+
+await check("only the API's index route writes api_agents, so being in it means the API made the agent", async () => {
+  // The console's "API" mark reads that table (apiAgentIds). A second writer, such as the console's own
+  // create route, would mark agents the API never made; this fails first, and the mark then needs a field.
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../cf/src/index.ts", import.meta.url), "utf8");
+  const calls = [...src.matchAll(/putApiAgent\(/g)].length;
+  const inRoute = /async apiPutAgent\([^)]*\)\s*\{[^\n]*putApiAgent\(/.test(src);
+  assert(calls === 1 && inRoute, `putApiAgent is called ${calls} times in cf/src/index.ts; inside apiPutAgent: ${inRoute}`);
 });
 
 await check("sessions: filtered by agent, touched, and a deleted session is gone from the API", async () => {

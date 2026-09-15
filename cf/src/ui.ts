@@ -83,7 +83,7 @@ font:14px/1.55 var(--mono-font)}
    has all four, while plugins and runtime leave the inspector and sidebar out. */
 body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
-body.shell[data-view=runtime]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=runtime],body.shell[data-view=keys]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 @media(max-width:1100px){body.shell[data-view=agents]{grid-template-columns:56px 0 minmax(0,1fr) 0}}
 
@@ -345,6 +345,10 @@ details.raw{margin-top:14px;color:var(--dim)}details.raw>summary{cursor:pointer}
 [data-theme="brutal"] .wf,[data-theme="brutal"] .call{border-radius:0;border-width:2px;border-color:var(--line-strong)}
 [data-theme="brutal"] .call.js,[data-theme="brutal"] .call.tool{border-left-width:4px}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12px}
+.issued{border:1px solid var(--line-strong);padding:10px;margin:0 0 12px}.issued pre.key{user-select:all;overflow-x:auto;margin:8px 0}
+form.new-key{display:flex;gap:8px;align-items:end;padding:0;border:0}
+table.keys{width:100%;border-collapse:collapse;font-size:12px;margin-top:12px}table.keys th,table.keys td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)}
+table.keys form{padding:0;border:0}
 .kv div:nth-child(odd){color:var(--dim)}
 .doc{background:var(--sunk);border:1px solid var(--line);border-radius:6px;padding:8px;
 white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
@@ -501,6 +505,7 @@ ${HEAD_ASSETS}
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
   ${rail("runtime", "runtime")}
+  ${rail("keys", "api keys")}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
@@ -579,6 +584,11 @@ ${HEAD_ASSETS}
     ${lazy("sandbox", "/ui/sandbox", "3s", inView)}
     <h3>storage</h3>
     ${lazy("storage", "/ui/storage", "3s", inView)}
+  </section>
+  <section class="view" data-view="keys">
+    <div class="view-head"><h2>API keys</h2><span class="sub">for the OpenAI Agents SDK; the agents a key makes are yours</span></div>
+    <!-- Read when shown and not polled: a poll would take a new key off the page before it is copied. -->
+    <div class="body" id="api-keys" data-lazy hx-get="/ui/api-keys" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
   </section>
 </main>
 <aside class="inspector" id="inspector">
@@ -731,7 +741,7 @@ ${HEAD_ASSETS}
       panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver;
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
-    ap.show(['agents', 'plugins', 'runtime'].includes(v) ? v : 'agents');
+    ap.show(['agents', 'plugins', 'runtime', 'keys'].includes(v) ? v : 'agents');
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
@@ -1540,9 +1550,45 @@ export function agentList(d: any): string {
     const desc = line(ag.description);
     return `<a class="task agent${ag.current ? " on" : ""}" data-agent="${esc(id)}" data-name="${name}" href="/ui?view=agents&agentId=${encodeURIComponent(id)}" onclick="ap.agent('${esc(id)}');return false">
   <span class="avatar">${avatarSvg(String(ag.avatar ?? ""))}</span>
-  <span class="who"><span class="name">${name}</span><span class="desc${desc ? "" : " faint"}">${desc || "no description"}</span></span>
+  <span class="who"><span class="name">${name}${ag.api === true ? ` <span class="tag" title="made with one of your API keys">API</span>` : ""}</span><span class="desc${desc ? "" : " faint"}">${desc || "no description"}</span></span>
 </a>`;
   }).join("");
+}
+
+/**
+ * A person's Agents API keys (/ui/api-keys). `issued` is the key just made: it is on the page in that one
+ * response and never again, since only its hash is kept. The list names keys by label and the start of the
+ * hash, never by value. Revoking asks first: a program using the key stops at once and it cannot be undone.
+ */
+export function apiKeysPanel(d: {
+  keys: Array<{ hash: string; label: string; createdAt: number; revokedAt: number | null }>;
+  issued: { key: string; label: string } | null;
+  error: string | null;
+  baseUrl: string;
+  max: number;
+}): string {
+  const live = d.keys.filter((k) => k.revokedAt === null).length;
+  const issued = d.issued ? `<div class="issued" role="status">
+  <div><b>${esc(d.issued.label)}</b>: copy this key now. This is the only time it is shown.</div>
+  <pre class="key">${esc(d.issued.key)}</pre>
+  <div class="hint">In the OpenAI SDK, set the base URL to <code>${esc(d.baseUrl)}</code> and the API key to the value above.</div>
+</div>` : "";
+  const row = (k: (typeof d.keys)[number]) => `<tr>
+  <td>${esc(k.label)}</td><td><code>${esc(k.hash.slice(0, 8))}</code></td><td>${when(k.createdAt) ?? ""}</td>
+  <td>${k.revokedAt === null ? "live" : `revoked ${when(k.revokedAt) ?? ""}`}</td>
+  <td>${k.revokedAt === null ? `<form hx-post="/ui/api-keys/revoke" hx-target="#api-keys" hx-swap="innerHTML"
+        hx-confirm="Revoke ${esc(k.label)}? Programs using this key stop working at once, and this cannot be undone.">
+    <input type="hidden" name="hash" value="${esc(k.hash)}"><button type="submit" class="ghost">revoke</button></form>` : ""}</td>
+</tr>`;
+  return `${issued}${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
+<form class="new-key" hx-post="/ui/api-keys/new" hx-target="#api-keys" hx-swap="innerHTML">
+  <label><span>name</span><input type="text" name="label" maxlength="60" required autocomplete="off" spellcheck="false" placeholder="what this key is for"></label>
+  <button type="submit"${live >= d.max ? ` disabled title="${d.max} live keys is the most; revoke one first"` : ""}>create key</button>
+</form>
+<div class="hint">${live} of ${d.max} live keys. Agents made with your keys are listed under agents, marked API.</div>
+${d.keys.length
+    ? `<table class="keys"><thead><tr><th>name</th><th>id</th><th>created</th><th>status</th><th></th></tr></thead><tbody>${d.keys.map(row).join("")}</tbody></table>`
+    : `<div class="empty">no keys yet</div>`}`;
 }
 
 /** The element a credential route swaps: one mount, re-rendered. */
