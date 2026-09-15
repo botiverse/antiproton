@@ -98,6 +98,20 @@ check("the composer hint is one breath and steps aside on mobile", () => {
   must(/@media\(max-width:760px\)[\s\S]*?\.send-hint\{display:none\}/.test(css), "the hint is hidden at phone width");
 });
 
+check("a refused write says so under the form; the composer owns its own error", () => {
+  // cody/Vera (2026-09-15, #core): a write the server 500s on swaps nothing,
+  // so "clicked" and "not saved" looked the same. One shared handler now
+  // speaks the failure next to any htmx write form, except the composer,
+  // which already owns its #send-err line through ap.sent.
+  must(/htmx:afterRequest'[\s\S]*?closest\('form\[hx-post\]'\)[\s\S]*?write-err/.test(html),
+    "the listener, the form lookup and the slot must all be in the same handler");
+  must(/xhr\.status >= 200 && xhr\.status < 400/.test(html), "status 0 (network cut, aborted) must not pass for success");
+  must(/content-type'[\s\S]*?includes\('json'\)[\s\S]*?\.error/.test(html), "a JSON error answers only its .error field — never the stack");
+  must(/hx-post'\) === '\/ui\/message'\) return/.test(html), "the composer must stay owned by ap.sent, not get a second error slot");
+  must(/slot\.textContent = 'not saved'/.test(html), "the failure must be spoken, with the server's status");
+  must(/slot\.hidden = ok/.test(html), "on success the line hides again");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);
