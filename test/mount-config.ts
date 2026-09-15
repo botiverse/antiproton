@@ -1338,10 +1338,6 @@ await check("an unreadable row reads as no container, and a usable one still rea
     { boxId: 7, createdAt: 1, lastUsedAt: 1 },          // id of the wrong type
     { boxId: "b", createdAt: "1", lastUsedAt: 1 },      // a clock that is a string
     { boxId: "b", createdAt: 1 },                       // half the clocks
-    // Present but not an array: `usage` maps over `sessions` and `start_from`
-    // searches `envs`, so this is the shape that throws rather than misses.
-    { boxId: "b", createdAt: 1, lastUsedAt: 1, sessions: { 0: {} } },
-    { boxId: "b", createdAt: 1, lastUsedAt: 1, envs: "none" },
   ]) {
     if (asBoxState(bad as any) !== null) throw new Error(`accepted ${JSON.stringify(bad)} as a container record`);
   }
@@ -1352,6 +1348,38 @@ await check("an unreadable row reads as no container, and a usable one still rea
   const a = activityOf(asBoxState({ boxId: 7 } as any));
   if (a.live !== null) throw new Error("an unreadable row reported a running container");
   if (usageOf(asBoxState("nonsense" as any)).length !== 0) throw new Error("an unreadable row produced history");
+});
+
+/**
+ * A container whose history cannot be read is still a container.
+ *
+ * `asBoxState` used to check that `sessions` and `envs` were arrays and nothing
+ * about what was in them, so a `null` entry threw in `usageOf` and a half-written
+ * one reported `undefined` as a reading (Rex). Rejecting the row is not the cure:
+ * its id names a box that exists and is billed, and "nothing is running" would
+ * start a second one and orphan it. So an unreadable entry is dropped, a list
+ * that is not a list reads as absent, and the container is kept.
+ */
+await check("an unreadable session or environment is dropped, and the container it came with is kept", () => {
+  const box = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 };
+  const session = { boxId: "b-0", startedAt: 1, endedAt: 2, lastUsedAt: 2, execs: 1, saved: ["py"] };
+  const env = { name: "py", snapId: "s-1", savedAt: 3 };
+  const s = asBoxState({
+    ...box,
+    sessions: [null, session, { boxId: "b-9" }, 7, { ...session, saved: [1] }],
+    envs: [null, env, { name: "half" }, { ...env, note: 5 }],
+  } as any);
+  if (s?.boxId !== "b-1") throw new Error("an unreadable history entry lost a running container");
+  const usage = usageOf(s);
+  if (usage.length !== 1 || usage[0]!.id !== "b-0" || usage[0]!.kept?.[0] !== "py") {
+    throw new Error(`usage read ${JSON.stringify(usage)}`);
+  }
+  if (s.envs?.length !== 1 || s.envs[0]!.name !== "py") throw new Error(`envs read ${JSON.stringify(s.envs)}`);
+
+  // A list that is not a list: the container still reads, the list as absent.
+  const t = asBoxState({ ...box, sessions: { 0: {} }, envs: "none" } as any);
+  if (activityOf(t).live?.id !== "b-1") throw new Error("a malformed list lost a running container");
+  if (usageOf(t).length !== 0 || t?.envs !== undefined) throw new Error("a malformed list was read as entries");
 });
 
 /**
