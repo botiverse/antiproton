@@ -846,13 +846,22 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
     {
       name: "release",
-      summary:
-        "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-        "first, in the same call. Release it when this machine will not be needed again. If you or the " +
-        "person you are working for will come back to it, leave it running: an idle container is released " +
-        "on its own after a while, you are told before that, and `quiet` keeps it longer. A kept " +
-        "environment or a saved file is for starting a fresh machine later, not a reason to destroy one " +
-        "you are about to use again.",
+      // Which advice is true depends on the lease, as it does for `run` and
+      // `shell`: without one a box is handed back when the turn ends, so
+      // "leave it running" and "`quiet` keeps it longer" would be promises
+      // nothing keeps (the SWE-bench runner, or a Worker without the two
+      // settings). No number here: the minutes are said where they are read.
+      summary: lease
+        ? "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+          "first, in the same call. Release it when this machine will not be needed again. If you or the " +
+          "person you are working for will come back to it, leave it running: an idle container is released " +
+          "on its own after a while, you are told before that, and `quiet` keeps it longer. A kept " +
+          "environment or a saved file is for starting a fresh machine later, not a reason to destroy one " +
+          "you are about to use again."
+        : "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+          "first, in the same call. It is handed back when the turn ends anyway, so release it sooner once " +
+          "this machine will not be needed again in this turn. A later turn starts a fresh machine: what it " +
+          "needs has to be kept or saved before this turn ends.",
       parameters: {
         type: "object",
         properties: {
@@ -873,12 +882,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
     {
       name: "quiet",
-      summary:
-        "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
-        "you are not told about it again until shortly before then. Use it when you are coming back to " +
-        "the machine — a build you are waiting on, work you return to after reading something. It is " +
-        "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
-        "and it can save files out in the same call.",
+      summary: lease
+        ? "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
+          "you are not told about it again until shortly before then. Use it when you are coming back to " +
+          "the machine — a build you are waiting on, work you return to after reading something. It is " +
+          "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
+          "and it can save files out in the same call."
+        : "Has no effect here: this mount has no idle release to put off, and the container is handed " +
+          "back when the turn ends whatever you ask. To carry work into a later turn, keep or save it.",
       parameters: {
         type: "object",
         properties: {
@@ -1089,6 +1100,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           `\`${ctx.alias}\` allows a quiet request of at most ${cap} minutes and ${asked} was asked for. ` +
           `Ask for ${cap} or fewer, or release the container — it is billed for every second either way.`,
         );
+      }
+      // After the refusals, so a malformed request is refused the same everywhere; before the write, so a
+      // mount with no lease does not record a postponement nothing will read and answer as if it had one.
+      if (!lease) {
+        return {
+          quiet: false,
+          note: "this mount has no idle release to postpone: the container is handed back when the turn ends",
+        };
       }
       if (!prior?.boxId) return { quiet: false, note: "nothing is running, so there is no release to postpone" };
       const quietUntil = Date.now() + asked * 60_000;

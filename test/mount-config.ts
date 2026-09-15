@@ -716,8 +716,10 @@ await check("an accepted quiet request records when to ask again, and leaves the
     connection: { get: async () => state, set: async (v: unknown) => { saved = v; } },
     sibling: async () => null,
   });
+  // Under a lease: only there is a postponement something reads. The case after this one holds the other side.
+  const leasedBox = sandboxPlugin(null as any, "local", { warnMs: 5 * 60_000, maxMs: 30 * 60_000 });
   const before = Date.now();
-  const r: any = await run9.invoke("quiet", { minutes: 30 } as any,
+  const r: any = await leasedBox.invoke("quiet", { minutes: 30 } as any,
     ctx({ boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 4, envs: [] }));
   if (r.quiet !== true) throw new Error(`a request inside the ceiling was not accepted: ${JSON.stringify(r)}`);
   if (!saved?.quietUntil) throw new Error("nothing was recorded for the wake to read");
@@ -733,9 +735,30 @@ await check("an accepted quiet request records when to ask again, and leaves the
   // No box: nothing will be asked about, so there is nothing to put off. It
   // answers instead of throwing, the way `release` does on an empty mount.
   saved = null;
-  const none: any = await run9.invoke("quiet", { minutes: 5 } as any, ctx(null));
+  const none: any = await leasedBox.invoke("quiet", { minutes: 5 } as any, ctx(null));
   if (none.quiet !== false) throw new Error(`quiet on an empty mount answered ${JSON.stringify(none)}`);
   if (saved) throw new Error("quiet wrote state for a box that does not exist");
+});
+
+/**
+ * Without a lease, `quiet` says it did nothing, and does nothing.
+ *
+ * With no lease a box is handed back when the turn ends, and no idle wake reads
+ * `quietUntil`. Answering `quiet: true` with an instant would be a postponement
+ * nobody performs — the agent plans to come back to a machine that will be gone.
+ */
+await check("without a lease, quiet answers that there is nothing to postpone and records nothing", async () => {
+  let saved: any = null;
+  const ctx: any = {
+    caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
+    credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
+    connection: { get: async () => ({ boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 }), set: async (v: unknown) => { saved = v; } },
+    sibling: async () => null,
+  };
+  const r: any = await run9.invoke("quiet", { minutes: 30 } as any, ctx);
+  if (r.quiet !== false) throw new Error(`quiet without a lease answered ${JSON.stringify(r)}`);
+  if (!/turn ends/.test(String(r.note))) throw new Error(`the answer does not say why: ${JSON.stringify(r)}`);
+  if (saved) throw new Error("quiet without a lease recorded a postponement nothing will read");
 });
 
 /**
@@ -1132,21 +1155,31 @@ await check("the container's wording and the lease switch say the same thing", a
     : null;
   const deployed = sandboxPlugin(null as any, "local", lease);
 
+  // The third field: whether the text states the lease's minutes. `release` describes the lease without
+  // numbers, so it is held to the switch and not to the figures; it was left off this list when it began
+  // describing the lease, and said so unconditionally, with nothing here to go red (2026-09-15).
   const says = [
-    ["run", deployed.tools.find((t) => t.name === "run")!.summary],
-    ["shell", deployed.tools.find((t) => t.name === "shell")!.summary],
-    ["the reminder", boxReminder("box", lease)],
+    ["run", deployed.tools.find((t) => t.name === "run")!.summary, true],
+    ["shell", deployed.tools.find((t) => t.name === "shell")!.summary, true],
+    ["the reminder", boxReminder("box", lease), true],
+    ["release", deployed.tools.find((t) => t.name === "release")!.summary, false],
+    ["quiet", deployed.tools.find((t) => t.name === "quiet")!.summary, false],
   ] as const;
-  for (const [where, text] of says) {
-    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release/.test(text);
+  for (const [where, text, statesMinutes] of says) {
+    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release|released on its own|keeps it longer|Postpone the release/.test(text);
     if (leaseOn && !promises) {
       throw new Error(`the lease is configured but ${where} still describes a box that only you can end: ${text.slice(0, 140)}`);
     }
     if (!leaseOn && promises) {
       throw new Error(`${where} promises the idle question, and no lease is configured to ask it: ${text.slice(0, 140)}`);
     }
-    if (leaseOn && !text.includes(`after ${setting("RUN9_MAX_IDLE_MINUTES")} idle minutes`)) {
+    if (!leaseOn || !statesMinutes) continue;
+    if (!text.includes(`after ${setting("RUN9_MAX_IDLE_MINUTES")} idle minutes`)) {
       throw new Error(`${where} does not state the configured ceiling (${setting("RUN9_MAX_IDLE_MINUTES")} minutes): ${text.slice(0, 200)}`);
+    }
+    // The warning is the other number the lease is built from, and nothing held it (Vera).
+    if (!text.includes(`${setting("RUN9_WARN_MINUTES")} minutes before that you are told`)) {
+      throw new Error(`${where} does not state the configured warning (${setting("RUN9_WARN_MINUTES")} minutes): ${text.slice(0, 260)}`);
     }
   }
 });
@@ -1459,12 +1492,21 @@ console.log(`\n  Mount settings\n  ${"─".repeat(56)}`);
  * next visit pays for a new machine. So `release` says when not to release, and what the kept copies are for.
  */
 await check("release says to leave a container someone will come back to, and what kept copies are for", async () => {
-  const release = run9.tools.find((t) => t.name === "release")!.summary;
+  // Under a lease: without one there is nothing to leave running, and the case below holds that side.
+  const release = sandboxPlugin(null as any, "local", { warnMs: 5 * 60_000, maxMs: 30 * 60_000 })
+    .tools.find((t) => t.name === "release")!.summary;
   if (!/will not be needed again/.test(release)) throw new Error(`release does not say when to release: ${release}`);
   if (!/come back to it, leave it running/.test(release)) throw new Error(`release does not say to leave a box someone returns to: ${release}`);
   if (!/`quiet` keeps it longer/.test(release)) throw new Error(`release does not point to quiet: ${release}`);
   if (!/for starting a fresh machine later/.test(release)) throw new Error(`release does not say what keep and save are for: ${release}`);
   if (/as soon as you no longer need the machine/.test(release)) throw new Error(`release still says to destroy the box as soon as the work is done: ${release}`);
+});
+
+await check("without a lease, release promises nothing a lease would keep", async () => {
+  const release = run9.tools.find((t) => t.name === "release")!.summary;
+  if (/leave it running|released on its own|`quiet`/.test(release)) throw new Error(`release promises the lease with none configured: ${release}`);
+  if (!/handed back when the turn ends/.test(release)) throw new Error(`release does not say the box ends with the turn: ${release}`);
+  if (!/will not be needed again/.test(release)) throw new Error(`release does not say when to release: ${release}`);
 });
 
 for (const r of results) {
