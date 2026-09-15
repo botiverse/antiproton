@@ -125,7 +125,7 @@ await check("a storage failure while parking does not fail a call that succeeded
   // R2 answered a put with an internal error (10001) and the model was told its GitHub read had failed (task #19).
   const value = { full_name: "cloudflare/workerd", description: "x".repeat(9_000) };
   const body = JSON.stringify(value);
-  const run = async (failures: number) => {
+  const run = async (failures: number, completeFails = false) => {
     let puts = 0; const completed: string[] = [];
     const result = await parkResult(value, body, "t/t/a/op.json", "artifacts__read", {
       async put(key) {
@@ -133,7 +133,10 @@ await check("a storage failure while parking does not fail a call that succeeded
         if (puts <= failures) throw new Error(`We encountered an internal error. (10001) key ${key}`);
         return { ref: `r2://bucket/${key}` };
       },
-      async complete(ref) { completed.push(ref); },
+      async complete(ref) {
+        if (completeFails) throw new Error(`db unavailable key t/t/a/op.json`);
+        completed.push(ref);
+      },
       shownRef: (ref) => ref.replace("r2://bucket/t/t/a/", "artifact://"),
     });
     return { result, puts, completed };
@@ -148,8 +151,17 @@ await check("a storage failure while parking does not fail a call that succeeded
   must(lost.puts === 2, `a second failure is not retried again: ${lost.puts} puts`);
   must(!("ref" in lost.result) && lost.completed.length === 0, `nothing stored, so no reference and no record: ${JSON.stringify(lost).slice(0, 200)}`);
   must((lost.result.preview as any)?.full_name === "cloudflare/workerd", "the summary is still returned");
-  must(/not kept/.test(String(lost.result.note)) && /succeeded/.test(String(lost.result.note)), `the loss and the success are both said: ${lost.result.note}`);
+  must(/could not be confirmed/.test(String(lost.result.note)) && /succeeded/.test(String(lost.result.note)), `the unconfirmed store and the success are both said: ${lost.result.note}`);
+  // Two failed puts do not prove nothing landed (a 5xx may have), so the note must not claim it (Ada, #341).
+  must(!/not kept|nothing to read back|not stored/.test(String(lost.result.note)), `the note claims more than is known: ${lost.result.note}`);
   must(!/10001|t\/t\/a|bucket/.test(JSON.stringify(lost.result)), `the storage error's text and the key stay out of the result: ${lost.result.note}`);
+  // Stored, then recording the reference failed: the call and the copy both exist, so the copy is still offered.
+  let unrecorded: Awaited<ReturnType<typeof run>> | null = null;
+  const logged = console.error; console.error = () => {};
+  try { unrecorded = await run(0, true); } catch (e) { must(false, `a failure to record the reference failed the call: ${(e as Error).message}`); }
+  finally { console.error = logged; }
+  must(unrecorded!.result.ref === "artifact://op.json", `the stored copy is still offered: ${JSON.stringify(unrecorded!.result).slice(0, 200)}`);
+  must(!/db unavailable|t\/t\/a|bucket/.test(JSON.stringify(unrecorded!.result)), `the recording error's text stays out of the result: ${JSON.stringify(unrecorded!.result).slice(0, 200)}`);
 });
 
 await check("following the note of a result too big for one read returns the exact result", async () => {

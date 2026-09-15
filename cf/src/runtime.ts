@@ -150,8 +150,10 @@ export function tooLargeResult(
   const preview = summarise(value);
   const what = `a summary of a ${body.length}-character result`;
   if (!parked && storeFailed) {
+    // Not "not stored": a put that errors may still have landed (a 5xx, a dropped
+    // connection), so what is known is only that no stored copy can be vouched for (Ada, #341).
     return { preview, bytes: body.length,
-      note: `${what}; the rest is not kept: storing it failed twice, so there is nothing to read back. ` +
+      note: `${what}; storing the rest could not be confirmed, so there is no reference to offer. ` +
         "The call itself succeeded; ask again for a smaller part of it (fields/offset/limit) rather than repeating it whole" };
   }
   if (!parked) {
@@ -174,7 +176,9 @@ export function tooLargeResult(
  * (task #19, agent u-zty0826…, 2026-09-15). One retry, then the summary with the
  * loss stated. The storage error's own text stays out of the result: it can name
  * the key, which names where the agent lives. The operation row gets the
- * reference only once there is one.
+ * reference only once there is one; if recording it fails, the stored copy is
+ * still offered and the failure goes to the Worker's log, since the call and the
+ * copy both exist and only our bookkeeping is behind (Ada, #341).
  */
 export async function parkResult(
   value: unknown,
@@ -193,7 +197,11 @@ export async function parkResult(
     try { stored = await deps.put(key, body); } catch { /* retried once, then stated in the result */ }
   }
   if (!stored) return tooLargeResult(value, body, null, true);
-  await deps.complete(stored.ref);
+  try {
+    await deps.complete(stored.ref);
+  } catch (e) {
+    console.error("parked result stored but its operation reference was not recorded:", key, e);
+  }
   return tooLargeResult(value, body, { ref: deps.shownRef(stored.ref), readBack });
 }
 
