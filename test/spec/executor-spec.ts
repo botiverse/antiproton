@@ -54,6 +54,16 @@ export async function executorSpec(exec: JsExecutor): Promise<SpecResult[]> {
     eq(after.outputs[0], "still alive", "host still usable afterwards");
   });
 
+  test("语法错误", "a script that does not parse fails as the script's own error, not the host's", async () => {
+    // The Dynamic Worker reported "missing ) after argument list" as an interrupted host_failure, which tells
+    // the model the outcome is unknown; QuickJS already called it eval_error. It is the script's (task #19).
+    const r = await exec.execute(`output((1)`, host());
+    eq(r.status, "failed", "failed, not interrupted");
+    eq(r.error!.code, "eval_error", "the script's own error");
+    const after = await exec.execute(`output("still alive")`, host());
+    eq(after.outputs[0], "still alive", "host still usable afterwards");
+  });
+
   test("统一入口", "tool tag is the only route out, and it carries business args only", async () => {
     calls = [];
     const r = await exec.execute(

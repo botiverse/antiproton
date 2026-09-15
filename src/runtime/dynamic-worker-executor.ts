@@ -121,6 +121,19 @@ ${source}
 };`;
 
 /**
+ * Whether a load failed because the script itself does not parse: reported as
+ * the script's error, as QuickJS reports it (eval_error), and one the model can
+ * fix, where "interrupted" told it the outcome was unknown (task #19). By the
+ * error's name, or a message that starts as one; a message that only mentions
+ * the word is some other failure (Vera, #341).
+ */
+export function isCompileError(err: unknown): boolean {
+  const e = err as { name?: unknown; message?: unknown } | null | undefined;
+  if (e?.name === "SyntaxError") return true;
+  return /^(Uncaught )?SyntaxError\b/.test(String(e?.message ?? err));
+}
+
+/**
  * Cloudflare Dynamic Workers as the JS executor. Compared with the QuickJS
  * implementation the isolation and the budgets stop being things we implement
  * and become things the platform enforces: `globalOutbound: null` refuses the
@@ -182,7 +195,18 @@ export class DynamicWorkerExecutor implements JsExecutor {
         if (signal.aborted) res("aborted");
         else signal.addEventListener("abort", () => res("aborted"), { once: true });
       });
-      const settled = await Promise.race([running, aborted]);
+      let settled: Response | "aborted";
+      try {
+        settled = await Promise.race([running, aborted]);
+      } catch (err) {
+        // Only the load can fail because of the script: a module that does not
+        // parse is rejected here. Reading the answer below is ours, and a
+        // SyntaxError from parsing it is not the script's (Vera, #341).
+        if (isCompileError(err)) {
+          return finish({ status: "failed", outputs: [], error: { code: "eval_error", message: String((err as Error)?.message ?? err) } });
+        }
+        throw err;
+      }
 
       if (settled === "aborted") {
         state.aborted = true;
