@@ -48,7 +48,7 @@ const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): a
  * rather than trusted; one that cannot answer that way is left out, as one failing mount always was.
  */
 async function mountReports(
-  mounts: MountRecord[], plugins: Plugin[], owner: { tenantId: string; agentId: string }, taskId: string,
+  sql: Sql, mounts: MountRecord[], plugins: Plugin[], owner: { tenantId: string; agentId: string }, taskId: string,
   store: DiagnosisStore,
 ): Promise<MountReports> {
   const out: MountReports = {};
@@ -61,7 +61,7 @@ async function mountReports(
       credential: null,
       publicConfig: m.publicConfig,
       connection: {
-        get: () => store.getConnection(owner.tenantId, owner.agentId, m.alias),
+        get: async () => hasTable(sql, "connections") ? store.getConnection(owner.tenantId, owner.agentId, m.alias) : null,
         set: async () => { throw new Error("read-only: a diagnosis does not change a mount's state"); },
       },
       async sibling() { return null; },
@@ -92,8 +92,11 @@ export async function readDiagnosis(
   for (const e of transcript.events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
   const compactions = entries.filter((e) => e.type === "compaction");
   const lastSummary = (compactions.at(-1) as { summary?: unknown } | undefined)?.summary;
-  const mounts = await store.listMounts(tenantId, agentId);
-  const stateKeys = await store.listState(tenantId, agentId, "", 20);
+  // A claimed object whose store was never initialised (an agent the API only named) has none of the store's
+  // tables; each read is guarded instead of letting "no such table" become a 500 (Ada, #347).
+  const mounts = hasTable(sql, "mounts") ? await store.listMounts(tenantId, agentId) : [];
+  const hasState = hasTable(sql, "agent_state");
+  const stateKeys = hasState ? await store.listState(tenantId, agentId, "", 20) : [];
   const docs: Record<string, unknown> = {};
   for (const k of stateKeys.slice(0, 5)) {
     const got = await store.getState(tenantId, agentId, k.key);
@@ -112,22 +115,22 @@ export async function readDiagnosis(
       why: "the lane's current operation lives in the open harness, and opening the agent to ask would change it; " +
         "modelJobs and backgroundJobs are what is stored about work in flight",
     },
-    modelBinding: await store.getModelBinding(tenantId, agentId),
+    modelBinding: hasTable(sql, "model_bindings") ? await store.getModelBinding(tenantId, agentId) : null,
     mounts: await Promise.all(mounts.map(async (m) => ({
       alias: m.alias, plugin: m.plugin, policy: m.policy ?? null,
       config: m.publicConfig,
       // Whose credential this is, never what it is.
       secret: secretRefKind(m.secretRef),
-      connection: (await store.getConnection(tenantId, agentId, m.alias)) != null,
+      connection: hasTable(sql, "connections") && (await store.getConnection(tenantId, agentId, m.alias)) != null,
     }))),
-    mountReports: await mountReports(mounts, deps.plugins, owner, taskId, store),
+    mountReports: await mountReports(sql, mounts, deps.plugins, owner, taskId, store),
     eventKinds: kinds,
     lastEvents: transcript.events.slice(-6).map((e) => ({
       seq: e.sequence, kind: e.kind, detail: JSON.stringify(e.payload).slice(0, 220),
     })),
     backgroundJobs: hasTable(sql, "background_jobs") ? recentBackgroundJobs(sql, owner, 10) : [],
     alarm: await deps.alarm(),
-    state: { ...(await store.stateUsage(tenantId, agentId)), docs },
+    state: { ...(hasState ? await store.stateUsage(tenantId, agentId) : { keys: 0, bytes: 0 }), docs },
     alarmFailures: Number(rows(sql, "counters2", "SELECT v FROM counters2 WHERE k='alarmFailures'")[0]?.v ?? 0),
     releaseErrors: rows(sql, "release_errors", "SELECT at, alias, message FROM release_errors ORDER BY at DESC LIMIT 5")
       .map((r) => ({ at: r.at, alias: r.alias, message: r.message })),

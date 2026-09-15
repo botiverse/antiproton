@@ -96,6 +96,25 @@ await check("the report says what the old one said about mounts, events, jobs an
   host.dispose();
 });
 
+await check("a claimed object whose store was never initialised reads as a report, not a missing table", async () => {
+  // An agent the Agents API only named: the constructor's tables and an owner row, and none of the store's (Ada, #347).
+  const host = sqliteHost();
+  host.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
+  host.sql.exec("INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self','demo','u-a')");
+  await new PiSqliteStorage(host).commit([message("m1", null, "hello")], CTX);
+  const store = new DurableObjectStore({ storage: { sql: host.sql, transactionSync: host.transactionSync } } as any);
+  const before = dump(host);
+  assert(!before.includes('"mounts"'), "the store's tables exist, so this case checks nothing");
+  let report: any = null;
+  try { report = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)); }
+  catch (e) { assert(false, `a claimed, uninitialised object threw: ${(e as Error).message}`); }
+  assert(report !== null && report.entries === 1, `report: ${JSON.stringify(report).slice(0, 200)}`);
+  assert(Array.isArray(report.mounts) && report.mounts.length === 0 && report.modelBinding === null && report.state.keys === 0,
+    `empty readings: ${JSON.stringify({ mounts: report.mounts, binding: report.modelBinding, state: report.state })}`);
+  assert(dump(host) === before, "reading an uninitialised object changed it");
+  host.dispose();
+});
+
 await check("an agent or conversation the object does not hold is null, and an unclaimed object gains no table", async () => {
   const { host, store } = await agentObject();
   const before = dump(host);
