@@ -190,7 +190,7 @@ await check("events: GET streams from now on; POST input starts a turn it report
   const order: string[] = [];
   deps.agents.cancel = async () => { order.push("cancel"); };
   const prior = deps.agents.postInput;
-  deps.agents.postInput = async (a, s2, text) => { order.push(`message:${text}`); await prior(a, s2, text); };
+  deps.agents.postInput = async (a, s2, text, env) => { order.push(`message:${text}`); await prior(a, s2, text, env); };
   const both = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
     { events: [{ type: "agent.session.input.cancel" }, { type: "agent.session.input.message", input: "instead" }] }, deps))!;
   assert(both.status === 204 && order.join() === "cancel,message:instead", `cancel then message: ${both.status} ${order}`);

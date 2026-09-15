@@ -44,7 +44,7 @@ export interface AgentsApiDeps {
     /** Make the session a conversation the agent's object will run. */
     openSession(agentId: string, sessionId: string): Promise<void>;
     /** Deliver text to the session: starts a turn when idle. */
-    postInput(agentId: string, sessionId: string, text: string): Promise<void>;
+    postInput(agentId: string, sessionId: string, text: string, environment: "none" | "container"): Promise<void>;
     /** The session's status and the function calls it waits on the caller for. */
     status(agentId: string, sessionId: string): Promise<{ status: SessionStatus; pending: PendingCall[] }>;
     /**
@@ -169,9 +169,9 @@ export async function handleAgentsApi(
       await deps.index.putSession(session);
       const input = text.text;
       if (body.stream === true) {
-        return eventStream(deps, session, input ? () => deps.agents.postInput(agentId, session.id, input) : undefined);
+        return eventStream(deps, session, input ? () => deps.agents.postInput(agentId, session.id, input, session.environment) : undefined);
       }
-      if (input) await deps.agents.postInput(agentId, session.id, input);
+      if (input) await deps.agents.postInput(agentId, session.id, input, session.environment);
       return ok(await sessionObject(deps, session));
     }
     if (seg.length === 2 && method === "GET") {
@@ -241,7 +241,7 @@ export async function handleAgentsApi(
         }
         for (const a of actions) {
           if (a.kind === "cancel") await deps.agents.cancel(s.agentId, s.id);
-          else await deps.agents.postInput(s.agentId, s.id, a.text);
+          else await deps.agents.postInput(s.agentId, s.id, a.text, s.environment);
         }
         return new Response(null, { status: 204 });
       }

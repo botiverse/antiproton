@@ -25,6 +25,7 @@ import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
+import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
 import {
   answerClientCall, clientTools, dropClientCalls, pendingClientCalls, resumeClientCalls,
 } from "../../src/runtime/client-calls.ts";
@@ -955,7 +956,15 @@ export class AgentRuntime {
     // the model like any tool; calling one pauses the turn for the caller's
     // result (client-calls.ts). A name the model is already offered is skipped.
     const agentRef: { current: PiAgent | null } = { current: null };
-    const apiTools = ((await store.loadAgent(tenantId, agentId))?.config as any)?.openai?.tools;
+    const apiConfig = ((await store.loadAgent(tenantId, agentId))?.config as any)?.openai;
+    const apiTools = apiConfig?.tools;
+    // An agent made through the Agents API is offered only what its caller declared, plus a container when a
+    // session asked for one: no run_js, and jobs only where a sandbox can start background work
+    // (agents-api/provisioning.ts).
+    const extras = harnessExtras({
+      apiAgent: !!apiConfig, sandbox,
+      hasSandboxMount: (offered as MountedTool[]).some((t) => offersPlugin(records, [t], "sandbox")),
+    });
     const taken = new Set([...offered.map((t) => t.name), "run_js", "jobs"]);
     const callerTools = Array.isArray(apiTools)
       ? clientTools(
@@ -965,7 +974,7 @@ export class AgentRuntime {
           { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane })
       : [];
     const extraTools = [
-      ...(sandbox
+      ...(extras.runJs
         ? [runJsTool(this.#executor as any, host, {
             onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
             // So a script names a tool the way the model's own list names it.
@@ -975,7 +984,7 @@ export class AgentRuntime {
             unoffered,
           })]
         : []),
-      jobs,
+      ...(extras.jobs ? [jobs] : []),
       ...callerTools,
     ];
 
@@ -1006,7 +1015,7 @@ export class AgentRuntime {
         // paragraph is now the artifacts mount's own contribution, so the
         // condition is "the mount is there" and nobody has to check it.
         // `sandbox` stays: run_js is the harness's, not a mount's.
-        sandbox,
+        sandbox: extras.runJs,
       }),
       model: {
         provider: binding.provider,

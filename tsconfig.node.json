@@ -34,6 +34,7 @@
     "test/agents-api-handlers.ts",
     "test/agents-api-transcript.ts",
     "test/agents-api-events.ts",
+    "test/agents-api-provisioning.ts",
     "test/confirm.ts",
     "test/console-assets.ts",
     "test/console-chat.ts",

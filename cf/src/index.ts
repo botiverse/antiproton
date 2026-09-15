@@ -15,6 +15,7 @@ import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
 import { bearerKey, hashApiKey, newApiKey } from "./agents-api/keys.ts";
 import { handleAgentsApi, type AgentsApiDeps } from "./agents-api/handlers.ts";
+import { apiAgentSeeds } from "./agents-api/provisioning.ts";
 import { openAIError, type StoredAgent, type StoredSession } from "./agents-api/shapes.ts";
 import {
   deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, issueKeyRow, listApiAgents, listApiSessions,
@@ -1350,11 +1351,12 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Text into the session, the way startTask does it for the main conversation. */
-  async apiPostInput(tenantId: string, agentId: string, sessionId: string, text: string) {
+  async apiPostInput(tenantId: string, agentId: string, sessionId: string, text: string, environment: "none" | "container" = "none") {
     this.#claim(tenantId, agentId);
     return this.#busy("apiPostInput", async () => {
       const rt = this.runtime();
-      await rt.provision(tenantId, agentId);
+      // Not the console's default mounts: an API agent has what its caller declared (agents-api/provisioning.ts).
+      await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment));
       await rt.bindOperatorModel(tenantId, agentId);
       await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
       await this.ctx.storage.setAlarm(Date.now());
@@ -2492,7 +2494,7 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       },
       updatePersona: async (agentId, a) => { await agentStub(agentId).apiUpdatePersona(tenantId, agentId, JSON.stringify(a)); },
       openSession: async (agentId, sessionId) => { await agentStub(agentId).apiOpenSession(tenantId, agentId, sessionId); },
-      postInput: async (agentId, sessionId, text) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text); },
+      postInput: async (agentId, sessionId, text, environment) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text, environment); },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
       toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),
