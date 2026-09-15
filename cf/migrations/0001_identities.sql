@@ -1,7 +1,8 @@
 -- The control plane's first table: who may sign in with GitHub, and as which (tenant, agent).
 --
 -- It lived inside one agent object (tenant "demo", agent "identities") until task #18, and keeps the
--- columns it had there, so POST /admin/identity/import copies the object's rows as they are.
+-- columns it had there. Production's 17 rows were copied across once, on 2026-09-15; the object still
+-- holds its old copy, and nothing reads it.
 -- Depends on: nothing outside this repo. Read and written by cf/src/control-plane.ts: a column changed
 -- here is changed there, and test/control-plane-d1.sh runs both against real D1.
 CREATE TABLE IF NOT EXISTS identities (

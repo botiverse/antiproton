@@ -50,31 +50,13 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert((await dir.lookup("github:1")) === null && (await dir.list()).length === 0, "the row survived");
   });
 
-  add("import inserts what D1 lacks, replaces sign-up rows, keeps operator rows, and a second run changes nothing", async () => {
-    await dir.upsert("github:2", { agentId: "u-derived", tenantId: "t-derived" }, "self");
-    await dir.upsert("github:3", { agentId: "u-operator-new", tenantId: "t-op" }, "automation");
-    const objectRows = [
-      { key: "github:1", agentId: "u-one", tenantId: "t-one", addedBy: "self", createdAt: 1000 },
-      { key: "github:2", agentId: "u-old", tenantId: "demo", addedBy: "automation", createdAt: 2000 },
-      { key: "github:3", agentId: "u-operator-old", tenantId: "demo", addedBy: "automation", createdAt: 3000 },
-    ];
-    const report = await dir.importRows(objectRows);
-    assert(report.read === 3 && report.inserted === 1 && report.replacedSelf === 1 && report.kept === 1, `report ${JSON.stringify(report)}`);
-    const rows = Object.fromEntries((await dir.list()).map((r) => [r.key, r]));
-    assert(rows["github:1"]?.agentId === "u-one" && rows["github:1"].createdAt === 1000, `inserted ${JSON.stringify(rows["github:1"])}`);
-    assert(rows["github:2"]?.agentId === "u-old" && rows["github:2"].tenantId === "demo" && rows["github:2"].addedBy === "automation",
-      `the object's invitation did not replace the sign-up row: ${JSON.stringify(rows["github:2"])}`);
-    assert(rows["github:3"]?.agentId === "u-operator-new", `the operator's newer row was overwritten: ${JSON.stringify(rows["github:3"])}`);
-    const again = await dir.importRows(objectRows);
-    const after = JSON.stringify(await dir.list());
-    assert(again.inserted === 0 && after === JSON.stringify(Object.values(rows).sort((a, b) => a.createdAt - b.createdAt || a.key.localeCompare(b.key))),
-      `second run: ${JSON.stringify(again)} -> ${after}`);
-  });
-
   add("list returns every field, oldest first", async () => {
-    await dir.importRows([
-      { key: "github:9", agentId: "u-late", tenantId: "t-9", addedBy: "self", createdAt: 9000 },
-      { key: "github:8", agentId: "u-early", tenantId: "demo", addedBy: "automation", createdAt: 8000 },
+    // Written with fixed created_at values, so the order is the rule and not the clock.
+    await db.batch([
+      db.prepare("INSERT INTO identities(provider_key, agent_id, tenant_id, added_by, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind("github:9", "u-late", "t-9", "self", 9000),
+      db.prepare("INSERT INTO identities(provider_key, agent_id, tenant_id, added_by, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind("github:8", "u-early", "demo", "automation", 8000),
     ]);
     const rows = await dir.list();
     assert(rows.map((r) => r.key).join(",") === "github:8,github:9", `order ${rows.map((r) => r.key)}`);

@@ -1247,27 +1247,6 @@ export class AgentDO extends DurableObject<Env> {
     return rec;
   }
 
-  // ---- the identity table, before the control plane --------------------------
-  // Sign-in used to read a table in this object (tenant "demo", agent
-  // "identities"). The table is D1 now (cf/src/control-plane.ts, task #18), and
-  // what is left here is the read POST /admin/identity/import copies from.
-  // Nothing writes these rows any more. Remove this, and that route, once
-  // production has imported.
-  #identities() {
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS identities(
-      provider_key TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
-      added_by TEXT NOT NULL, created_at INTEGER NOT NULL)`);
-    // Rows written before tenants were per person live in "demo", and stay
-    // there: moving an agent between tenants is moving it to another object.
-    try { this.sql.exec("ALTER TABLE identities ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'demo'"); } catch { /* already there */ }
-  }
-
-  async identityList() {
-    this.#identities();
-    return this.sql.exec("SELECT provider_key, agent_id, tenant_id, added_by, created_at FROM identities ORDER BY created_at").toArray()
-      .map((r: any) => ({ key: String(r.provider_key), agentId: String(r.agent_id), tenantId: String(r.tenant_id), addedBy: String(r.added_by), createdAt: Number(r.created_at) }));
-  }
-
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
@@ -2084,11 +2063,6 @@ function identities(env: Env): IdentityDirectory {
   return d1Identities(env.CONTROL_DB);
 }
 
-/** The object the identity table lived in before D1; read by /admin/identity/import only. */
-function legacyIdentityObject(env: Env) {
-  return env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", "identities")));
-}
-
 /** A refusal the browser sees as a page and a CLI sees as typed JSON. */
 function refuse(request: Request, reason: RefusalReason, hint: string, status = 403): Response {
   const wantsHtml = (request.headers.get("accept") ?? "").includes("text/html");
@@ -2715,19 +2689,6 @@ export default {
             console.error("admin/identity: control plane unavailable", String(e?.message ?? e));
             return Response.json({ error: "CONTROL_PLANE_UNAVAILABLE", hint: String(e?.message ?? e) }, { status: 503 });
           }
-        }
-        case "/admin/identity/import": {
-          // Task #18 cutover, run once per deployment right after the deploy that
-          // moved the identity table to D1: copies the rows the old object kept.
-          // Which row wins where both have one is control-plane.ts importRows.
-          // Remove with AgentDO.identityList once production has imported.
-          if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          if (request.method !== "POST") return Response.json({ error: "METHOD_NOT_ALLOWED", hint: "POST" }, { status: 405 });
-          const fromObject = await legacyIdentityObject(env).identityList();
-          const report = await identities(env).importRows(fromObject);
-          return Response.json({ ok: true, ...report, inControlPlane: (await identities(env).list()).length });
         }
         case "/admin/compact": {
           // The operator's way in, alongside /admin/diagnose. The UI button
