@@ -1,4 +1,4 @@
-import type { Json } from "../core/types.ts";
+import type { Json, MountPolicy } from "../core/types.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
 import { backgrounded } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
@@ -155,6 +155,8 @@ interface BoxState {
   placeholders?: Placeholders;
   /** What GH_TOKEN is in this container, when GitHub is wired in; never the token. */
   githubPlaceholder?: string;
+  /** The GitHub mount whose token was not wired in because its policy holds or denies calls. */
+  githubWithheld?: string;
   execs?: number;
   saved?: string[];
   /**
@@ -435,6 +437,10 @@ export function finished(
         "kept before then); read /etc/os-release",
     }),
     ...(state?.envs?.length ? { kept: state.envs.map((e) => e.name) } : {}),
+    ...(state?.githubWithheld ? {
+      github: `GitHub is not signed in here: calls on the \`${state.githubWithheld}\` mount are held for approval or ` +
+        "denied, and a container cannot ask for either. Use that mount's tools for GitHub.",
+    } : {}),
     ...(state?.githubPlaceholder ? {
       github: "gh and git work here as this agent's GitHub account, on GitHub only. GH_TOKEN holds a " +
         "placeholder that is swapped for the token on the way out, so neither you nor anything in this " +
@@ -809,6 +815,21 @@ export function githubEnv(placeholder: string): Record<string, string> {
     GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
     GIT_CONFIG_VALUE_0: `!f() { echo username=x-access-token; echo password=${placeholder}; }; f`,
   };
+}
+
+/**
+ * Whether a container may act as a mount whose calls the gateway would police.
+ *
+ * Policy is enforced at the gateway, and a container holding the mount's token
+ * reaches GitHub without passing through it: `gh pr create` or `git push` in
+ * the box would skip the approval the same call through the gh tools waits for
+ * (cody, 2026-09-15). So the token goes in only when nothing on that mount is
+ * held or denied, reads included, since the box reads GitHub directly too.
+ */
+export function policyLetsContainerAct(policy: MountPolicy | null | undefined): boolean {
+  if (!policy) return true;
+  return [policy.read, policy.write, ...Object.values(policy.tools ?? {})]
+    .every((d) => d === undefined || d === "allow");
 }
 
 const envFor = (state: BoxState | null) => state?.githubPlaceholder ? githubEnv(state.githubPlaceholder) : {};
@@ -1318,7 +1339,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // else would send that mount's credential there. No network, no use for it.
       const open = cfg.network === undefined || cfg.network === "open";
       const gh = cfg.github && open ? await ctx.sibling(cfg.github) : null;
-      const github = gh?.plugin === "github" && gh.credential ? githubSecrets(gh.credential, boxId) : [];
+      const usable = gh?.plugin === "github" && gh.credential ? gh : null;
+      const withheld = !!usable && !policyLetsContainerAct(usable.policy);
+      const github = usable && !withheld ? githubSecrets(usable.credential!, boxId) : [];
       const declared = cfg.secrets ?? [];
       // Before the box exists, because after it exists a throw leaks it.
       //
@@ -1394,6 +1417,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...state,
         ...(Object.keys(placeholders).length ? { placeholders } : {}),
         ...(github.length ? { githubPlaceholder: github[0]!.placeholder } : {}),
+        ...(withheld ? { githubWithheld: String(cfg.github) } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
     }

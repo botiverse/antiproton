@@ -596,6 +596,7 @@ export class ToolGateway {
             : null,
           connection: connectionFor(other.alias),
           plugin: other.plugin,
+          policy: other.policy ?? null,
         };
       },
     };

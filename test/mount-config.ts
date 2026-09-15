@@ -1706,12 +1706,20 @@ await check("a container gets a GitHub mount's token only as a placeholder, and 
       ["no such mount", null, {}],
       ["a container with no network", { plugin: "github", credential: token, connection: null }, { network: "none" }],
       ["the setting turned off", { plugin: "github", credential: token, connection: null }, { github: "" }],
+      ["a GitHub mount whose writes need approval", { plugin: "github", credential: token, connection: null, policy: { write: "approval" } }, {}],
+      ["a GitHub mount with one tool denied", { plugin: "github", credential: token, connection: null, policy: { tools: { pr_create: "deny" } } }, {}],
     ] as const) {
       const r = await start(sibling, cfg);
       if (r.secrets.length || r.create?.network_mode === "managed" || r.stored?.githubPlaceholder
         || JSON.stringify(r.exec).includes("GH_TOKEN") || JSON.stringify(calls).includes(token)) {
         throw new Error(`${why}: something was registered or exported`);
       }
+    }
+
+    // Withheld because of policy: the agent is told why, and where GitHub still works.
+    const held = await start({ plugin: "github", credential: token, connection: null, policy: { write: "approval" } });
+    if (held.stored?.githubWithheld !== "gh" || !/approval or denied/.test(String(held.result.github))) {
+      throw new Error(`a policy-held mount did not say why GitHub is missing: ${JSON.stringify(held.result.github)}`);
     }
 
     // run9 refusing the registration: the box already exists and is billed, so
@@ -1754,24 +1762,44 @@ await check("the gateway's sibling names the plugin of the mount it found", asyn
   const probe: any = {
     id: "probe", version: "1.0.0", defaultForAllAgents: true,
     tools: [{ name: "peek", summary: "x", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "safe" }],
-    invoke: async (_t: string, _a: unknown, ctx: any) => ({ found: await ctx.sibling("gh"), missing: await ctx.sibling("nope") }),
+    invoke: async (_t: string, _a: unknown, ctx: any) => ({
+      found: await ctx.sibling("gh"), held: await ctx.sibling("held"), missing: await ctx.sibling("nope"),
+    }),
   };
   const github: any = { id: "github", version: "1.0.0", defaultForAllAgents: true, tools: [], invoke: async () => null };
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
   await store.createTask("t", "a", "k", {});
-  const mount = (alias: string, plugin: string, secretRef: string | null) => store.addMount({
+  const mount = (alias: string, plugin: string, secretRef: string | null, policy: unknown = null) => store.addMount({
     tenantId: "t", agentId: "a", alias, plugin, installationId: `i-${alias}`, connectionId: null,
-    toolVersion: "1.0.0", publicConfig: {}, secretRef, policy: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef, policy,
   } as any);
   await mount("p", "probe", null);
   await mount("gh", "github", "ref:gh");
+  await mount("held", "github", "ref:gh", { write: "approval" });
   const gw = new ToolGateway(store, [probe, github], { async resolve(ref: string) { return ref === "ref:gh" ? "tok" : null; } } as any);
   const r: any = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "p.peek", {});
   if (r.status !== "succeeded") throw new Error(`the probe did not run: ${JSON.stringify(r)}`);
   if (r.result.found?.plugin !== "github" || r.result.found.credential !== "tok") throw new Error(`sibling answered ${JSON.stringify(r.result.found)}`);
   if (r.result.missing !== null) throw new Error("a missing sibling was invented");
+  // And its policy, because a plugin acting for that mount outside the gateway must honour it.
+  if (r.result.found.policy !== null || r.result.held?.policy?.write !== "approval") {
+    throw new Error(`sibling did not pass the policy through: ${JSON.stringify(r.result)}`);
+  }
+});
+
+await check("a container acts as a mount only when nothing on that mount is held or denied", async () => {
+  const sb: any = await import("../src/plugins/sandbox.ts");
+  if (typeof sb.policyLetsContainerAct !== "function") throw new Error("policyLetsContainerAct is not exported");
+  const cases: Array<[unknown, boolean]> = [
+    [null, true], [{}, true], [{ read: "allow", write: "allow", tools: { pr_create: "allow" } }, true],
+    [{ write: "approval" }, false], [{ write: "deny" }, false], [{ read: "approval" }, false],
+    [{ tools: { issue_create: "deny" } }, false], [{ write: "allow", tools: { api: "approval" } }, false],
+  ];
+  for (const [policy, want] of cases) {
+    if (sb.policyLetsContainerAct(policy) !== want) throw new Error(`${JSON.stringify(policy)} should be ${want}`);
+  }
 });
 
 /**

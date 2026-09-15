@@ -1,4 +1,4 @@
-import type { Json } from "../core/types.ts";
+import type { Json, MountPolicy } from "../core/types.ts";
 
 export interface ToolSchema {
   name: string;
@@ -52,6 +52,12 @@ export interface PluginContext {
      * this rather than trusting that an alias still names what it used to.
      */
     plugin: string;
+    /**
+     * That mount's policy. The gateway enforces it on calls that pass through
+     * the gateway; a plugin that lets something act for that mount by another
+     * route has to honour it itself, or the route skips it.
+     */
+    policy: MountPolicy | null;
   } | null>;
 }
 
