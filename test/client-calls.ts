@@ -173,6 +173,30 @@ await check("in a batch, a call the caller answered early is not asked for again
   await f.agent.close();
 });
 
+await check("an early answer used before its batch pauses is not turned back into a call the caller is asked for", async () => {
+  // The order pi does not produce in the fixture above, forced: call_y runs first and uses its early answer, and only
+  // then does call_x pause and record its batch. Without the "used" state the answer row was gone, and the batch
+  // recorded call_y as waiting again: the caller would be asked for a call that had already run.
+  const host = sqliteHost();
+  const entry = { type: "message", message: { role: "assistant", content: [
+    { type: "toolCall", id: "call_x", name: "get_weather", arguments: { city: "Rome" } },
+    { type: "toolCall", id: "call_y", name: "get_weather", arguments: { city: "Oslo" } },
+  ] } };
+  const lane = { async inspectExecution() { return { current: { id: "op_1" }, tipId: "tip" }; }, async requestAbort() { return { ok: true }; } };
+  const [tool] = clientTools(
+    [{ name: "get_weather", description: "weather for a city", parameters: { type: "object", properties: {} } }],
+    { sql: host.sql as any, session: SESSION, lane: () => lane as any, branch: async () => [entry] });
+  const aborted = { abortSignal: AbortSignal.abort() };
+  answerClientCall(host.sql as any, SESSION, "call_y", { output: "sunny", isError: false });
+  const y = await tool!.execute("call_y", { city: "Oslo" }, undefined, undefined, undefined, aborted);
+  assert((y.content[0] as any).text === "sunny", `call_y did not use its early answer: ${JSON.stringify(y)}`);
+  const x = await tool!.execute("call_x", { city: "Rome" }, undefined, undefined, undefined, aborted).then(() => "returned", (e) => String(e?.message ?? e));
+  assert(x === CLIENT_PENDING, `call_x did not pause: ${x}`);
+  const waiting = pendingClientCalls(host.sql as any, SESSION).map((c) => c.call_id).join();
+  assert(waiting === "call_x", `waiting for ${waiting || "none"}; call_y already ran with the caller's answer`);
+  assert(!answerClientCall(host.sql as any, SESSION, "call_y", { output: "again", isError: false }), "call_y was open to a second answer");
+});
+
 await check("a failed caller function reaches the model as an error; dropping a session's calls forgets them", async () => {
   const f = await fixture();
   await f.agent.say("weather?");
