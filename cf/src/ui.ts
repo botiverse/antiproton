@@ -642,13 +642,17 @@ ${HEAD_ASSETS}
         let d = null;
         try { d = JSON.parse(xhr.responseText); } catch { d = null; }
         if (d && d.secret === true) {
-          const where = Array.isArray(d.plugins) && d.plugins.length
-            ? 'Fill it under the ' + esc(String(d.plugins[0])) + ' mount on the plugins page.'
-            : 'No mount here takes this kind — please do not paste it.';
-          err.innerHTML = 'This looks like a credential (' + esc(d.kind || 'secret') + ') — it was not sent, and it is not in the conversation. ' +
-            where + ' ' +
-            '<button type="submit" form="composer" name="allowSecret" value="1" class="ghost">send anyway</button>';
-          // The button was injected after htmx wired the page; without this it
+          // textContent, not innerHTML: kind and plugins are server data, and
+          // this script has no esc() (that is a module-scope helper).
+          err.textContent = 'This looks like a credential (' + String(d.kind || 'secret') + ') — it was not sent, and it is not in the conversation. ' +
+            (Array.isArray(d.plugins) && d.plugins.length
+              ? 'Fill it under the ' + String(d.plugins[0]) + ' mount on the plugins page. '
+              : 'No mount here takes this kind — please do not paste it. ');
+          const btn = document.createElement('button');
+          btn.type = 'submit'; btn.setAttribute('form', 'composer'); btn.name = 'allowSecret'; btn.value = '1';
+          btn.className = 'ghost'; btn.textContent = 'send anyway';
+          err.appendChild(btn);
+          // The button was created after htmx wired the page; without this it
           // submits natively and allowSecret never reaches the request.
           htmx.process(err);
           err.hidden = false;
