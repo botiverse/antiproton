@@ -57,6 +57,28 @@ const call = async (deps: AgentsApiDeps, method: string, path: string, body?: un
   return { status: r.status, body: (text ? JSON.parse(text) : null) as any };
 };
 
+await check("input that looks like a credential is refused before anything is made or sent, by kind and never by content", async () => {
+  // task #19: a pasted token reached the model and was repeated twelve times. Built from repeated characters,
+  // so nothing in this file is itself shaped like a real secret.
+  const token = "gh" + "p_" + "e".repeat(36);
+  const created = fakeDeps();
+  const r = await call(created.deps, "POST", "/agents/sessions", { agent: { model: "m", name: "n" }, environment: { type: "none" }, input: `my token is ${token}` });
+  assert(r.status === 400 && r.body?.error?.code === "secret_in_input" && r.body.error.param === "input", `create: ${r.status} ${JSON.stringify(r.body)}`);
+  assert(!JSON.stringify(r.body).includes("eeee"), "the refusal carries the text");
+  assert(created.agents.size === 0 && created.sessions.size === 0 && created.log.inputs.length === 0 && created.log.opened.length === 0,
+    `a refused create left something behind: agents ${created.agents.size} sessions ${created.sessions.size} inputs ${created.log.inputs.length}`);
+
+  const later = fakeDeps();
+  const s = await call(later.deps, "POST", "/agents/sessions", { agent: { model: "m", name: "n" }, environment: { type: "none" } });
+  assert(s.status === 200, `session: ${s.status} ${JSON.stringify(s.body)}`);
+  const sent = await call(later.deps, "POST", `/agents/sessions/${s.body.id}/events`, { events: [
+    { type: "agent.session.input.message", input: "an ordinary message" },
+    { type: "agent.session.input.message", input: `and ${token}` },
+  ] });
+  assert(sent.status === 400 && sent.body?.error?.code === "secret_in_input" && sent.body.error.param === "events[1].input", `events: ${sent.status} ${JSON.stringify(sent.body)}`);
+  assert(later.log.inputs.length === 0, `a refused batch still posted input: ${JSON.stringify(later.log.inputs)}`);
+});
+
 await check("agents: create, retrieve, list, update reaching the persona, delete making it unreachable", async () => {
   const { deps, log } = fakeDeps();
   const c = await call(deps, "POST", "/agents", { model: "gpt-6-astra", name: "coder", instructions: "Write clean code." });

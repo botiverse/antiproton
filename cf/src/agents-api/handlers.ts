@@ -10,6 +10,7 @@
  *   sessions/{sessions,events,items,turns}.js, and AgentSessionInputParam. When they change, re-check the
  *   routes and the list of refused parameters.
  */
+import { secretShape } from "../secret-shape.ts";
 import {
   agentDeleted, cursorPage, metadataOf, openAIError, parseAgentParams, parseEnvironment, sessionDeleted,
   toOpenAIAgent, toOpenAISession, type StoredAgent, type StoredSession,
@@ -145,6 +146,19 @@ async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: ()
  * One request under `/v1`. `path` is what follows `/v1` (e.g. `/agents/sessions/sess_1`).
  * Returns null for a path this API does not own, so the caller can fall through.
  */
+/**
+ * Input that looks like a credential is refused before it reaches the agent, by kind and never by content
+ * (task #19: a pasted token went to the model and was repeated twelve times). An API caller has no second
+ * "send anyway" press, so a false positive is answered by changing the text; a credential belongs in the
+ * agent's mount, where the model never sees it.
+ */
+function secretRefused(kind: string, param: string): Response {
+  return openAIError(400,
+    `${param} looks like a ${kind} and was not sent: a credential belongs in the agent's mount, where the model never sees it; ` +
+      "if no mount takes this kind, do not send it as input",
+    { param, code: "secret_in_input" });
+}
+
 export async function handleAgentsApi(
   method: string, path: string, query: URLSearchParams, body: unknown, deps: AgentsApiDeps,
 ): Promise<Response | null> {
@@ -163,6 +177,9 @@ export async function handleAgentsApi(
       if ("ok" in (metadata as object)) return refuse(metadata as unknown as Refusal);
       const text = inputText(body.input);
       if (!text.ok) return refuse(text);
+      // Refused before a session or an agent is made, so a refused request leaves nothing behind (secret-shape.ts).
+      const secret = text.text ? secretShape(text.text) : null;
+      if (secret) return secretRefused(secret, "input");
       let agentId: string, agent: StoredAgent;
       if (typeof body.agent_id === "string" && body.agent_id) {
         if (body.agent !== undefined && body.agent !== null) return openAIError(400, "give agent_id or agent, not both", { param: "agent", code: "invalid_value" });
@@ -244,6 +261,9 @@ export async function handleAgentsApi(
           const t = inputText(e.input);
           if (!t.ok) return refuse({ ...t, param: `events[${i}].${t.param}` });
           if (!t.text) return openAIError(400, "input must not be empty", { param: `events[${i}].input`, code: "invalid_value" });
+          // Checked with the rest of the batch, so a refused event means none of the batch was acted on.
+          const secret = secretShape(t.text);
+          if (secret) return secretRefused(secret, `events[${i}].input`);
           actions.push({ kind: "message", text: t.text });
         }
         // Input opens the agent's object from its index row, and an agent deleted there takes nothing more.
