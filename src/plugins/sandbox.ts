@@ -728,6 +728,8 @@ export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "
  */
 export const MEASURED_IMAGES: Record<string, {
   measured: string; os: string; present: string[]; missing: string[]; install: string;
+  /** What was run on the fresh box, so the next person can run it again and compare. */
+  command: string;
 }> = {
   // cody and Piper, separately, on fresh run9 boxes: Node v24.21.0, npm 11.19.0.
   "public.ecr.aws/docker/library/node:24-bookworm": {
@@ -735,6 +737,8 @@ export const MEASURED_IMAGES: Record<string, {
     present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash"],
     missing: ["pip", "jq", "rg", "gh"],
     install: "apt-get update && apt-get install -y <pkg>",
+    command: "for t in node npm git curl make gcc g++ python3 bash ssh apt-get pip3 jq rg gh; do " +
+      "command -v $t >/dev/null && echo \"present $t\" || echo \"missing $t\"; done",
   },
 };
 

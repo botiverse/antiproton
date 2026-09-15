@@ -1561,7 +1561,9 @@ await check("the default image has a dated measurement, and the description says
   const defaultImage = String(plugin.config!.find((f) => f.name === "image")!.default);
   const m = sb.MEASURED_IMAGES?.[defaultImage];
   if (!m) throw new Error(`${defaultImage} is the default and nobody has measured what is in it: add it to MEASURED_IMAGES after checking a fresh box`);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(m.measured) || !m.present.length) throw new Error(`the measurement is incomplete: ${JSON.stringify(m)}`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(m.measured) || !m.present.length || !/command -v/.test(m.command ?? "")) {
+    throw new Error(`the measurement is incomplete, or does not say how to take it again: ${JSON.stringify(m)}`);
+  }
   const summary = plugin.tools.find((t) => t.name === "shell")!.summary;
   if (!summary.includes(sb.defaultImageSentence(defaultImage))) throw new Error("the description is not built from the measurement");
   for (const tool of [...m.present, ...m.missing]) {
