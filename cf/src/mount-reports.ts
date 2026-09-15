@@ -29,10 +29,12 @@ function asActivity(v: unknown): MountActivity | null {
   }
   if (v.quietUntil !== undefined && v.quietUntil !== null && !isNum(v.quietUntil)) return null;
   if (v.billing !== undefined && typeof v.billing !== "string") return null;
+  if (v.unreadable !== undefined && !isNum(v.unreadable)) return null;
   return {
     live,
     ...(v.quietUntil !== undefined ? { quietUntil: v.quietUntil as number | null } : {}),
     ...(v.billing !== undefined ? { billing: v.billing as string } : {}),
+    ...(v.unreadable !== undefined ? { unreadable: v.unreadable as number } : {}),
   };
 }
 

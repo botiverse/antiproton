@@ -65,6 +65,16 @@ check("only declared fields reach the page", () => {
   must(!/boxSecret|credential|placeholder|connection/.test(text), `undeclared fields passed: ${text}`);
 });
 
+check("a count of unreadable entries reaches the page, and a mount whose count is not a number is not reported", () => {
+  // A field added to MountActivity is checked here (see the file header): the
+  // sandbox reports how many entries of its record it dropped, and a boundary
+  // that copies only the fields it knew would drop the count in silence too.
+  const r = asMountReports({ box: { activity: { live: null, unreadable: 3 }, usage: [] } });
+  must(r?.box?.activity.unreadable === 3, `the count was lost: ${JSON.stringify(r)}`);
+  const bad = asMountReports({ box: { activity: { live: null, unreadable: "3" }, usage: [] }, ok: { activity: { live: null }, usage: [] } });
+  must(Object.keys(bad ?? {}).join(",") === "ok", `a string count was accepted: ${JSON.stringify(bad)}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

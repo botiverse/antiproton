@@ -276,6 +276,12 @@ export interface MountActivity {
    * exists to end.
    */
   billing?: string;
+  /**
+   * Entries of this mount's record it could not read and ignored; absent when
+   * none. A record is read leniently so one bad entry cannot lose a running
+   * container, and this keeps that leniency from being silent.
+   */
+  unreadable?: number;
 }
 
 /** One finished stretch of whatever a mount keeps alive. */

@@ -101,7 +101,14 @@ interface InjectedSecret {
   hosts: string[];
 }
 /** A saved filesystem, under a name the agent chose rather than an id. */
-interface Env { name: string; snapId: string; savedAt: number; note?: string }
+interface Env {
+  name: string;
+  snapId: string;
+  savedAt: number;
+  note?: string;
+  /** The image the kept container started from; absent for one kept before that was recorded. */
+  image?: string;
+}
 
 /** Placeholders handed to the agent for this box, by credential name. */
 type Placeholders = Record<string, string>;
@@ -132,6 +139,12 @@ interface BoxState {
   boxId: string;
   createdAt: number;
   lastUsedAt: number;
+  /**
+   * The image this container started from: the setting when it was created, or
+   * the image of the kept environment it started from. Absent when that is not
+   * known, which results say rather than falling back to the setting.
+   */
+  image?: string;
   /** What the agent may write; never the values behind them. */
   placeholders?: Placeholders;
   execs?: number;
@@ -405,8 +418,14 @@ export function finished(
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
     // So the agent learns the environment from a result it already has,
-    // instead of spending turns probing for an interpreter.
-    image: cfg.image,
+    // instead of spending turns probing for an interpreter. The container's
+    // own image, not the setting: a box from before the default changed, or one
+    // started from an environment kept then, is still the old image.
+    image: state?.image ?? null,
+    ...(state?.image ? {} : {
+      imageNote: "not recorded for this container (it predates recording, or started from an environment " +
+        "kept before then); read /etc/os-release",
+    }),
     ...(state?.envs?.length ? { kept: state.envs.map((e) => e.name) } : {}),
     ...(state?.placeholders && Object.keys(state.placeholders).length
       ? {
@@ -463,7 +482,22 @@ function isEnv(v: unknown): v is Env {
   if (!v || typeof v !== "object") return false;
   const e = v as Record<string, unknown>;
   return typeof e.name === "string" && typeof e.snapId === "string"
-    && typeof e.savedAt === "number" && (e.note === undefined || typeof e.note === "string");
+    && typeof e.savedAt === "number" && (e.note === undefined || typeof e.note === "string")
+    && (e.image === undefined || typeof e.image === "string");
+}
+
+/**
+ * How many entries `asBoxState` will drop from this record: unreadable elements,
+ * and a list that is not a list counts as one. Reported through `activity` so
+ * leniency that keeps a billed container does not also hide a corrupt record
+ * (Rex, 2026-09-15).
+ */
+export function unreadableEntries(v: Json): number {
+  if (!v || typeof v !== "object") return 0;
+  const o = v as Record<string, unknown>;
+  const count = (list: unknown, readable: (x: unknown) => boolean) =>
+    list === undefined ? 0 : Array.isArray(list) ? list.filter((x) => !readable(x)).length : 1;
+  return count(o.sessions, isSession) + count(o.envs, isEnv);
 }
 
 const SESSIONS_KEPT = 20;
@@ -496,7 +530,7 @@ const DEFAULTS = {
   shellPrefix: "",
   network: "open" as const,
   endpoint: "https://api.run.sys9.ai",
-  image: "public.ecr.aws/docker/library/node:22-alpine",
+  image: "public.ecr.aws/docker/library/node:22-bookworm",
   project: "default",
   timeoutMs: 120_000,
   graceMs: 5_000,
@@ -586,9 +620,9 @@ async function stopBox(
  * places and the reason a mount could only be found by the alias `node`. The
  * adapter is four lines and it is the whole fix: callers ask, this answers.
  */
-export function activityOf(state: BoxState | null | undefined): MountActivity {
+export function activityOf(state: BoxState | null | undefined, unreadable = 0): MountActivity {
   const billing = "billed for every second it exists, not per call";
-  if (!state?.boxId) return { live: null, billing };
+  if (!state?.boxId) return { live: null, billing, ...(unreadable ? { unreadable } : {}) };
   return {
     live: {
       id: state.boxId,
@@ -598,6 +632,7 @@ export function activityOf(state: BoxState | null | undefined): MountActivity {
       lastUsedAt: state.lastUsedAt || state.createdAt,
     },
     quietUntil: state.quietUntil ?? null,
+    ...(unreadable ? { unreadable } : {}),
     billing,
   };
 }
@@ -734,7 +769,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "provider", type: "string", choices: ["run9"], default: "run9",
       summary: "Which sandbox provider runs the container. Only run9 today." },
     { name: "image", type: "string", summary: "Container image to start from.",
-      default: "public.ecr.aws/docker/library/node:22-alpine" },
+      default: DEFAULTS.image },
     { name: "workdir", type: "string", summary: "Where scripts run and npm installs land. They must match, or Node resolves modules from somewhere npm did not install to.", default: "/work" },
     { name: "shape", type: "string", summary: "Machine size, e.g. 2c4g. Larger costs more per second." },
     { name: "shell", type: "string", summary: "Shell the shell tool runs commands in.", default: "/bin/sh" },
@@ -793,10 +828,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Pass `workdir` to run one command in another directory instead of starting it with `cd`. " +
         "Exported variables and aliases do not carry over, so set them in the command that needs them, " +
         "and a command handed over as a job does not move the directory. Only for what needs a real " +
-        "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
-        "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
-        "have configured a different image; every result reports which one is running, so read " +
-        "that instead of probing for it. Save anything worth keeping, then release.",
+        "machine (builds, tests, git). The default image is node:22-bookworm (Debian): Node, npm, git, " +
+        "curl, make, gcc/g++, Python 3 and bash are present; pip, jq, rg and gh are NOT, and " +
+        "`apt-get update && apt-get install -y <pkg>` installs more. An operator may have configured a " +
+        "different image; every result reports which one this container started from, so read that " +
+        "instead of probing for it. Save anything worth keeping, then release.",
       parameters: {
         type: "object",
         properties: {
@@ -1056,7 +1092,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   /** What this mount is keeping alive, read from its own state and nothing
    *  else: no credential, no call to run9. */
   async activity(ctx: PluginContext): Promise<MountActivity> {
-    return activityOf(asBoxState(await ctx.connection.get()));
+    const raw = await ctx.connection.get();
+    return activityOf(asBoxState(raw), unreadableEntries(raw));
   },
 
   /** The window this mount still holds. Bounded on purpose, which is why it is
@@ -1163,8 +1200,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
     // One box per mount, remembered, so an install survives to the next call.
     let state = asBoxState(await ctx.connection.get());
-    // An emptied record keeps the session history but has no box.
+    // An emptied record keeps the session history and what was kept, but has no box.
     const history = state?.sessions ?? [];
+    const kept = state?.envs ?? [];
     if (state && !state.boxId) state = null;
     if (!state) {
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
@@ -1174,6 +1212,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // only come from the record read at the top of this call. `BoxState`
       // declares the field, so there is nothing here to cast around either.
       const from = prior?.startFrom;
+      // What every result will report this container as: the setting, or the
+      // image the kept environment itself started from. Unknown stays unknown.
+      const image = from ? kept.find((e) => e.snapId === from)?.image : cfg.image;
       const declared = cfg.secrets ?? [];
       // Before the box exists, because after it exists a throw leaks it.
       //
@@ -1229,6 +1270,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
         sessions: history,
+        // Release carries these over because a snapshot outlives its box; a new
+        // record written without them erased the list on the next container's
+        // first command, stranding the snapshots in run9 with nothing naming them.
+        ...(image ? { image } : {}),
+        ...(kept.length ? { envs: kept } : {}),
         ...(Object.keys(placeholders).length ? { placeholders } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
@@ -1295,6 +1341,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (!snapId) throw new Error(`fork returned no snapshot: ${JSON.stringify(forked).slice(0, 160)}`);
       const env: Env = {
         name, snapId, savedAt: Date.now(),
+        ...(state!.image ? { image: state!.image } : {}),
         ...(typeof (args as any)?.note === "string" ? { note: String((args as any).note).slice(0, 200) } : {}),
       };
       const envs = [env, ...(state!.envs ?? []).filter((e) => e.name !== name)].slice(0, 20);
