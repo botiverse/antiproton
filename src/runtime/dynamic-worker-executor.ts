@@ -120,10 +120,17 @@ ${source}
   }
 };`;
 
-/** Whether a load failed because the script itself does not parse. */
+/**
+ * Whether a load failed because the script itself does not parse: reported as
+ * the script's error, as QuickJS reports it (eval_error), and one the model can
+ * fix, where "interrupted" told it the outcome was unknown (task #19). By the
+ * error's name, or a message that starts as one; a message that only mentions
+ * the word is some other failure (Vera, #341).
+ */
 export function isCompileError(err: unknown): boolean {
   const e = err as { name?: unknown; message?: unknown } | null | undefined;
-  return e?.name === "SyntaxError" || /\bSyntaxError\b/.test(String(e?.message ?? err));
+  if (e?.name === "SyntaxError") return true;
+  return /^(Uncaught )?SyntaxError\b/.test(String(e?.message ?? err));
 }
 
 /**
@@ -188,7 +195,18 @@ export class DynamicWorkerExecutor implements JsExecutor {
         if (signal.aborted) res("aborted");
         else signal.addEventListener("abort", () => res("aborted"), { once: true });
       });
-      const settled = await Promise.race([running, aborted]);
+      let settled: Response | "aborted";
+      try {
+        settled = await Promise.race([running, aborted]);
+      } catch (err) {
+        // Only the load can fail because of the script: a module that does not
+        // parse is rejected here. Reading the answer below is ours, and a
+        // SyntaxError from parsing it is not the script's (Vera, #341).
+        if (isCompileError(err)) {
+          return finish({ status: "failed", outputs: [], error: { code: "eval_error", message: String((err as Error)?.message ?? err) } });
+        }
+        throw err;
+      }
 
       if (settled === "aborted") {
         state.aborted = true;
@@ -211,13 +229,6 @@ export class DynamicWorkerExecutor implements JsExecutor {
       // A CPU or subrequest kill is not catchable inside the sandbox: it lands
       // here, in the supervisor. Unwrapped, it takes down the whole request.
       const message = String((err as Error)?.message ?? err);
-      // A script that does not parse never ran: its module failed to compile and
-      // the load rejected here, beside the kills. That is the script's error, as
-      // QuickJS reports it, and one the model can fix; "interrupted" told it the
-      // outcome was unknown (task #19).
-      if (isCompileError(err)) {
-        return finish({ status: "failed", outputs: [], error: { code: "eval_error", message } });
-      }
       const code = /CPU/i.test(message)
         ? "wall_time_exceeded"
         : /subrequest/i.test(message)
