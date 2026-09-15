@@ -159,7 +159,10 @@ export default [
       }
       assert(types.includes("agent.session.turn.cancelled") && types.at(-1) === "agent.session.idle", `events: ${types}`);
       const next = await runTurn(client, session.id, { input: "Reply with just the word OK." });
-      assert(next.ended?.type === "agent.session.turn.completed" && /ok/i.test(next.text), `next turn: ${next.ended?.type} ${JSON.stringify(next.text)}`);
+      // Just OK: the first live run passed on /ok/i while the model wrote the cancelled story anyway ("I can't do
+      // both ... here's the story you asked for"), because the cancelled request was still in its context.
+      assert(next.ended?.type === "agent.session.turn.completed" && /^\W*ok\W*$/i.test(next.text.trim()),
+        `the next turn did not just answer OK (the cancelled request may still be in the model's context): ${next.ended?.type} ${JSON.stringify(next.text.slice(0, 200))}`);
       return `cancelled, then ${JSON.stringify(next.text)}`;
     },
   },
