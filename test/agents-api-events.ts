@@ -143,9 +143,11 @@ await check("with change notices the pump waits for them instead of sleeping, an
   const started = snap([...history, user("go")], true);
   const outcome = await pumpSessionEvents({
     baseline: snap(history, false), sessionId: "sess_1", sessionWith, eventId, maxMs: 30_000,
-    read: async () => { reads.push(clock); return started; },
+    // The fake clock moves on every read and sleep too, so a pump that ignores notices reaches its ceiling and
+    // fails the assertions below instead of spinning for ever.
+    read: async () => { reads.push(clock); clock += 10; return started; },
     write: async () => {},
-    sleep: async () => { sleeps++; },
+    sleep: async (ms) => { sleeps++; clock += ms; },
     wait: async (ms) => { waits.push(ms); clock += 1_000; return "changed"; },
     now: () => clock,
   });
