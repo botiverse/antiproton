@@ -785,11 +785,20 @@ ${HEAD_ASSETS}
     const xhr = e.detail.xhr;
     let slot = f.querySelector('.write-err');
     if (!slot) { slot = document.createElement('div'); slot.className = 'err write-err'; f.appendChild(slot); }
-    const ok = !!xhr && xhr.status < 400;
+    // status 0 is "it never left": a network cut or an aborted request is the
+    // most ordinary not-saved there is, so it must not pass for success.
+    const ok = !!xhr && xhr.status >= 200 && xhr.status < 400;
     slot.hidden = ok;
     if (ok) return;
-    const body = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 160) : '';
-    slot.textContent = 'not saved' + (xhr && xhr.status ? ' (' + xhr.status + ')' : '') + (body ? ': ' + body : '');
+    // The outer catch answers JSON with an error and a stack: show the error,
+    // never the stack. A plain-text reason keeps its own words.
+    let reason = '';
+    if (xhr && xhr.responseText) {
+      const ct = String(xhr.getResponseHeader('content-type') || '');
+      if (ct.includes('json')) { try { reason = String((JSON.parse(xhr.responseText) ?? {}).error ?? ''); } catch { reason = ''; } }
+      if (!reason) reason = String(xhr.responseText).replace(/<[^>]*>/g, '').trim().slice(0, 160);
+    }
+    slot.textContent = 'not saved' + (xhr && xhr.status ? ' (' + xhr.status + ')' : '') + (reason ? ': ' + reason : '');
   });
   // Polling stops while the tab is hidden (every trigger tests document.hidden);
   // on return, the shown panels refresh at once rather than waiting out the
