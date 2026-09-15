@@ -15,6 +15,7 @@ import { FAVICON_DATA_URI, LOCKUP_SVG, MARK_OUTLINED_SVG } from "./brand.ts";
 import { RUI_TOKENS } from "./rui-tokens.ts";
 import { ICONS } from "./icons.ts";
 import { md } from "./md.ts";
+import { asMountReports, type MountReports } from "./mount-reports.ts";
 import { FONT_CSS, HEAD_ASSETS } from "./static.ts";
 
 const esc = (s: unknown) =>
@@ -1406,16 +1407,15 @@ export function sandboxPanel(d: any): string {
   const aliases = new Set(
     (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
   const name = [...aliases][0] ?? "sandbox";
-  // Typed loosely on purpose, like the rest of this file's `d`: the payload is
-  // built by the Durable Object and the page is handed it as JSON, so a precise
-  // type here would be a second declaration of a shape nothing checks against.
-  const reports: Record<string, any> = (d.mountReports ?? {}) as Record<string, any>;
+  // Checked on the way in (mount-reports.ts): the payload crossed a Durable Object boundary as JSON, so it is
+  // parsed into the contract types once, here, and what does not read is left out rather than drawn wrong.
+  const reports: MountReports = asMountReports(d.mountReports) ?? {};
   const alias = [...aliases].find((a) => reports[a as string]);
   const rep = alias ? reports[alias as string] : null;
-  const live: any = rep?.activity?.live ?? null;
-  const quietUntil = rep?.activity?.quietUntil ?? null;
-  const billing = rep?.activity?.billing ?? null;
-  const sessions: any[] = rep?.usage ?? [];
+  const live = rep?.activity.live ?? null;
+  const quietUntil = rep?.activity.quietUntil ?? null;
+  const billing = rep?.activity.billing ?? null;
+  const sessions = rep?.usage ?? [];
 
   if (!live && !sessions.length) {
     return `<div class="empty">no container has ever been started for this agent</div>

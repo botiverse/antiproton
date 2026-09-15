@@ -86,6 +86,23 @@ check("the quiet-until notice shows when the agent postponed, and artifacts unio
   must(html.includes("3 artifact(s)"), "kept was not unioned across sessions");
 });
 
+check("a report that does not read draws less, never NaN or undefined", () => {
+  // The payload crosses a Durable Object boundary as JSON; a bad row is dropped on the way in (mount-reports.ts).
+  const html = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mountReports: { box: {
+      activity: { live: null, billing: "billed" },
+      usage: [
+        null,
+        { id: "b0", startedAt: "yesterday", endedAt: 2, lastUsedAt: 2 },
+        { id: "b1", startedAt: 1000, endedAt: 61_000, lastUsedAt: 60_000, uses: 2, kept: ["r2://x/sandbox/b1/work/out.txt"] },
+      ],
+    } },
+  });
+  must(!/NaN|undefined/.test(html), `a malformed row reached the page: ${html.match(/.{0,60}(NaN|undefined).{0,60}/)?.[0]}`);
+  must(html.includes("1 artifact(s)"), "the readable row was dropped along with the bad ones");
+});
+
 let failures = 0;
 for (const r of results) {
   if (r.ok) console.log(`✓ ${r.name}`);
