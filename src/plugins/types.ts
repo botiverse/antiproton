@@ -206,6 +206,16 @@ export interface CredentialSpec {
   grants?: string;
   /** Where to get one. */
   docs?: string;
+  /**
+   * What this credential looks like when someone pastes it where it does not
+   * belong, so a message carrying one can be stopped before an agent reads it
+   * and the person sent to this plugin's form instead (task #19). Patterns are
+   * strings because the declaration travels to the console as JSON. Declare
+   * only shapes that are recognisable: a bare run of letters and digits matches
+   * every hash, and a guess that fires on ordinary text teaches people to
+   * click past it.
+   */
+  looksLike?: Array<{ kind: string; pattern: string }>;
 }
 
 /**
@@ -365,6 +375,28 @@ export function pluginEnabled(
   if (choice === "enable") return true;
   if (choice === "disable") return false;
   return plugin.defaultForAllAgents === true;
+}
+
+/**
+ * Which plugins' credentials a piece of text appears to contain.
+ *
+ * Answers with the plugin and the kind, never the text that matched: whatever
+ * reports this is about to refuse a message, and repeating the credential in
+ * the refusal would put it exactly where the refusal keeps it out of. A match
+ * is a guess, which is why the caller offers to send anyway.
+ */
+export function recogniseCredentials(
+  text: string, plugins: Array<{ id: string; credential?: CredentialSpec | null }>,
+): Array<{ plugin: string; kind: string }> {
+  const found: Array<{ plugin: string; kind: string }> = [];
+  for (const p of plugins) {
+    for (const s of p.credential?.looksLike ?? []) {
+      if (new RegExp(s.pattern).test(text) && !found.some((f) => f.plugin === p.id && f.kind === s.kind)) {
+        found.push({ plugin: p.id, kind: s.kind });
+      }
+    }
+  }
+  return found;
 }
 
 export function credentialForm(credential: CredentialSpec | undefined | null): CredentialForm {
