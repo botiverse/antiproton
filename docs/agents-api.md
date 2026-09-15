@@ -4,8 +4,8 @@ Antiproton provides an edge-native, multi-tenant implementation of the **OpenAI 
 
 > **Status & Target Environment:**
 > - Available on the **preview deployment**: `https://preview.antiproton.ai/v1`
-> - Validated against the official OpenAI SDK: `openai >= 7.15.0`
-> - Production deployment (`antiproton.ai/v1`) is scheduled following preview stabilization.
+> - Validated against the official OpenAI SDK: `openai 7.15.0` (pinned in `qa/sdk/package.json`)
+> - The agents API lives on a separate branch and runs strictly in the preview environment.
 
 ---
 
@@ -16,7 +16,7 @@ Antiproton provides an edge-native, multi-tenant implementation of the **OpenAI 
 Install the official OpenAI Node.js / TypeScript SDK:
 
 ```bash
-npm install openai
+npm install openai@7.15.0
 ```
 
 ### Configuration
@@ -64,11 +64,11 @@ All requests to `/v1/*` require an `Authorization: Bearer ap-...` header.
 - **Scoping:** Each API key is bound to a specific `(tenantId, ownerAgentId)`. All agents, sessions, and data created by that key live strictly within that tenant's physical boundary.
 
 ### Operator Key Issuance
-Issuing API keys is an administrative operation (not self-service for end-users). It requires an automation token:
+Issuing API keys is an administrative operation (not self-service for end-users). It requires an automation token passed in the `x-harness-token` header:
 
 ```bash
 curl -X POST https://preview.antiproton.ai/admin/api-keys \
-  -H "Authorization: Bearer <AUTOMATION_TOKEN>" \
+  -H "x-harness-token: <AUTOMATION_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{
     "tenantId": "org_enterprise",
@@ -81,9 +81,9 @@ Response:
 ```json
 {
   "key": "ap-abc123xyz...",
-  "prefix": "ap-abc123",
-  "label": "production-service-key",
-  "createdAt": "2026-09-15T06:00:00Z"
+  "tenantId": "org_enterprise",
+  "ownerAgentId": "agent_primary",
+  "label": "production-service-key"
 }
 ```
 
@@ -124,7 +124,10 @@ await client.beta.agents.delete(agent.id);
 
 ### 3.2 Managing Sessions
 
-Sessions represent ongoing stateful conversations backed by Antiproton's durable storage:
+Sessions represent ongoing stateful conversations backed by Antiproton's durable storage. Note that `environment` is required upon session creation:
+- `environment: { type: "none" }`
+- `environment: { type: "openai_hosted" }` (spawns a sandbox container; configuring custom packages/files/network is refused by parameter name)
+- `self_hosted` is refused.
 
 ```typescript
 // Create a session
@@ -143,8 +146,8 @@ await client.beta.agents.sessions.update(session.id, {
   metadata: { project: "customer-support" },
 });
 
-// List sessions for an agent
-for await (const s of client.beta.agents.sessions.list({ agent_id: agent.id })) {
+// List sessions for an agent (default order is "desc")
+for await (const s of client.beta.agents.sessions.list({ agent_id: agent.id, order: "asc" })) {
   console.log("Session:", s.id);
 }
 
@@ -154,7 +157,7 @@ await client.beta.agents.sessions.delete(session.id);
 
 ### 3.3 Running Conversational Turns (`sessions.stream`)
 
-In the OpenAI SDK, turns are executed via `sessions.stream`:
+In the OpenAI SDK, turns are initiated when input arrives. There is no `turns.create` endpoint. You run a turn via `sessions.stream`:
 
 ```typescript
 const stream = client.beta.agents.sessions.stream(session.id, {
@@ -162,18 +165,20 @@ const stream = client.beta.agents.sessions.stream(session.id, {
 });
 
 for await (const event of stream) {
-  if (event.type === "agent.session.turn.output_text.delta") {
+  if (event.type === "agent.session.turn.created") {
+    console.log("Turn started:", event.turn_id);
+  } else if (event.type === "agent.session.turn.output_text.delta") {
     process.stdout.write(event.delta ?? "");
   } else if (event.type === "agent.session.turn.output_text.done") {
     console.log("
-Final answer text:", event.text);
+Full output:", event.text);
   } else if (event.type === "agent.session.turn.completed") {
-    console.log("Turn completed. Turn ID:", event.turn_id);
+    console.log("Turn completed. Usage:", event.usage);
   }
 }
 ```
 
-You can also start the first turn immediately when creating a session by passing `stream: true`:
+You can also start the first turn immediately when creating a session by setting `stream: true`:
 
 ```typescript
 const stream = await client.beta.agents.sessions.create({
@@ -184,7 +189,7 @@ const stream = await client.beta.agents.sessions.create({
 });
 
 for await (const event of stream) {
-  // Handle events...
+  // Handle stream events...
 }
 ```
 
@@ -212,7 +217,9 @@ console.log("Usage:", turn.usage?.input_tokens, turn.usage?.output_tokens);
 
 ### 3.5 Client Function Tools
 
-When an agent needs to invoke client-side functions, Antiproton supports two execution paths:
+Tools are defined with a flat structure (`type: "function"`, with `name`, `description`, and `parameters` directly on the object; nested `function: { ... }` wrappers are refused).
+
+When an agent invokes client-side functions, Antiproton supports two execution paths:
 
 #### Path A: SDK Automatic Function Handling (`toolHandlers`)
 
@@ -241,9 +248,9 @@ const agent = await client.beta.agents.create({
 const stream = client.beta.agents.sessions.stream(session.id, {
   input: "What's the weather in Oslo right now?",
   toolHandlers: {
-    get_weather: async (args) => {
-      console.log("Called with city:", args.city);
-      return { city: args.city, forecast: "light rain", temperature_c: 13 };
+    get_weather: async ({ city }) => {
+      console.log("Fetching weather for:", city);
+      return { city, forecast: "light rain", temperature_c: 13 };
     },
   },
 });
@@ -257,15 +264,15 @@ for await (const event of stream) {
 
 #### Path B: Explicit Turn Suspension (`requires_action` & `input.tool_result`)
 
-If your application polls or manages WebSocket/SSE events manually:
-1. When the model requests a function, the stream emits an `agent.session.requires_action` event.
-2. Inspect `event.session.required_actions[0]`.
+If your application manages events manually via SSE streams:
+1. When the model requests a function call, the session status becomes `requires_action`, and the stream emits an `agent.session.requires_action` event carrying `session.required_actions`.
+2. Inspect `action.call_id`, `action.turn_id`, `action.name`, and `action.arguments`.
 3. Submit the result via `events.create` with `type: "agent.session.input.tool_result"`:
 
 ```typescript
 const stream = await client.beta.agents.sessions.events.stream(session.id);
 
-// Post a message event
+// Post an initial user message
 await client.beta.agents.sessions.events.create(session.id, {
   events: [
     {
@@ -284,7 +291,7 @@ for await (const event of stream) {
   if (event.type === "agent.session.requires_action") {
     const action = event.session.required_actions[0];
     
-    // Submit tool result
+    // Submit tool result back to the session
     await client.beta.agents.sessions.events.create(session.id, {
       events: [
         {
@@ -303,7 +310,7 @@ for await (const event of stream) {
 }
 ```
 
-The model resumes execution on a clean branch, ensuring the history contains only actual results without placeholder pollution.
+To report a tool error, send `success: false, error: "error description"`. Note that timing determines whether the turn pauses for the caller (`requires_action`) or resumes immediately if results arrive before the tool call turn executes.
 
 ### 3.6 Canceling an In-Flight Turn
 
@@ -315,7 +322,7 @@ await client.beta.agents.sessions.events.create(session.id, {
 });
 ```
 
-Antiproton cleanly interrupts execution and records a cancellation marker in the transcript so subsequent turns know the request was canceled.
+Canceling an idle session is accepted as a no-op. If a turn is active, Antiproton interrupts background execution and records a cancellation marker in the transcript so subsequent turns know the request was canceled.
 
 ---
 
@@ -324,40 +331,41 @@ Antiproton cleanly interrupts execution and records a cancellation marker in the
 | Resource | Method | Path | Description |
 |---|---|---|---|
 | **Agents** | `POST` | `/v1/agents` | Create an agent |
-| | `GET` | `/v1/agents` | List agents (paginated by `limit` / `after`) |
+| | `GET` | `/v1/agents` | List agents (paginated by `limit`, `after`, `order`) |
 | | `GET` | `/v1/agents/{id}` | Retrieve agent details |
 | | `POST` | `/v1/agents/{id}` | Update agent (name, instructions, tools) |
 | | `DELETE` | `/v1/agents/{id}` | Delete an agent |
-| **Sessions** | `POST` | `/v1/sessions` | Create a session (supports `stream: true`) |
-| | `GET` | `/v1/sessions` | List sessions (`agent_id`, `limit`, `after`) |
-| | `GET` | `/v1/sessions/{id}` | Retrieve a session |
-| | `POST` | `/v1/sessions/{id}` | Update session metadata |
-| | `DELETE` | `/v1/sessions/{id}` | Delete a session and its persistent state |
-| **Items & Turns** | `GET` | `/v1/sessions/{id}/items` | List transcript items (order `asc` / `desc`) |
-| | `GET` | `/v1/sessions/{id}/turns` | List turns for a session |
-| | `GET` | `/v1/sessions/{id}/turns/{turn_id}` | Retrieve details of a specific turn (includes usage) |
-| **Events** | `POST` | `/v1/sessions/{id}/events` | Submit events (`input.message`, `input.tool_result`, `input.cancel`) |
-| | `GET` | `/v1/sessions/{id}/events` | SSE event stream |
+| **Sessions** | `POST` | `/v1/agents/sessions` | Create a session (supports `stream: true`) |
+| | `GET` | `/v1/agents/sessions` | List sessions (`agent_id`, `limit`, `after`, `order`) |
+| | `GET` | `/v1/agents/sessions/{id}` | Retrieve a session |
+| | `POST` | `/v1/agents/sessions/{id}` | Update session metadata |
+| | `DELETE` | `/v1/agents/sessions/{id}` | Delete a session and its persistent state |
+| **Items & Turns** | `GET` | `/v1/agents/sessions/{id}/items` | List transcript items (order `asc` / `desc`) |
+| | `GET` | `/v1/agents/sessions/{id}/turns` | List turns for a session |
+| | `GET` | `/v1/agents/sessions/{id}/turns/{turn_id}` | Retrieve details of a specific turn (includes usage) |
+| **Events** | `POST` | `/v1/agents/sessions/{id}/events` | Submit input events (`agent.session.input.*`) |
+| | `GET` | `/v1/agents/sessions/{id}/events` | Open SSE event stream |
 
 ---
 
 ## 5. Unsupported Features & Error Behavior
 
-Antiproton enforces strict validation. When an unsupported parameter is provided, the API returns a standard `400 Bad Request` naming the exact parameter:
+Antiproton enforces strict schema validation. When an unsupported parameter is provided, the API returns a standard `400 Bad Request` with `code: "unsupported_parameter"` (or `invalid_value`), naming the exact field in `param`:
 
-| Unsupported Parameter / Event | Behavior |
+| Unsupported Parameter / Event | `param` |
 |---|---|
-| Non-function tools (e.g. `mcp`, `file_search`) | Returns `400 (unsupported_parameter: tools)` naming the unsupported tool type. |
-| `vault_ids` | Encrypted vault attachments are not supported; returns `400 (unsupported_parameter: vault_ids)`. |
-| `defer_loading` | Deferred agent tool schemas are not supported; returns `400 (unsupported_parameter: defer_loading)`. |
-| `environment.packages` | Package managers on environments return `400 (unsupported_parameter: environment.packages)`. |
-| Non-text input | Multimodal / binary message inputs return `400 (unsupported_parameter: content)`. |
-| `environment_connection` events | Environment socket pairing events return `400 (unsupported_event_type)`. |
+| Non-function tools (e.g. `mcp`) | `tools[i].type` |
+| `defer_loading: true` | `tools[i].defer_loading` |
+| `vault_ids` | `vault_ids` |
+| Configuring `openai_hosted` environment (packages, files, network, …) | `environment.<field>` |
+| `self_hosted` environment | `environment.type` |
+| Non-text message content parts | `input[i].content[j].type` |
+| Unsupported event types (e.g. `agent.session.input.environment_connection`) | `events[i].type` |
 
 ---
 
 ## 6. Known Behavioral Differences & Limits
 
-1. **Model Parameter:** The `model` parameter is accepted and preserved on the agent entity. However, actual inference execution routes through the deployment's configured model provider (e.g. `deepseek-flash` on the preview cluster).
-2. **Container Lease Lifecycles:** If a client tool call pauses execution for an extended period, the agent's underlying sandbox container (if mounted) may sleep to conserve compute, re-attaching when execution resumes.
-3. **Discrete Tool Results:** Tool results must be submitted in separate `agent.session.input.tool_result` event payloads rather than bundled into a single batch submission.
+1. **Model Parameter:** The `model` parameter is accepted and preserved on the agent entity. However, actual inference execution routes through the preview deployment's configured model provider (`deepseek-flash`).
+2. **Container Lease Lifecycles:** While a turn waits for a caller's client function result, the agent's underlying sandbox container **may be handed back**, and anything in the container filesystem not persisted with `keep` is lost.
+3. **Event Batching Rules:** Several `tool_result` events may be submitted in a single request. However, `tool_result` events cannot be mixed with `input.message` or `input.cancel` in the same request. Furthermore, every result must name a valid `call_id` emitted by the model during that turn; unknown `call_id`s return a 400 error and discard the request.
