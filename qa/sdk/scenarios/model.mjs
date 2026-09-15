@@ -75,7 +75,10 @@ export default [
         },
       });
       assert(calls.length >= 1 && /oslo/i.test(String(calls[0]?.city)), `handler calls: ${JSON.stringify(calls)}`);
-      assert(t.types.includes("agent.session.requires_action"), `no requires_action: ${t.types}`);
+      // Two correct paths, and which one happens is a race the caller does not control: the turn pauses
+      // (requires_action) when the object reaches the call before the SDK answers it, or the SDK's answer
+      // arrives first and the tool returns it without pausing (src/runtime/client-calls.ts). The record says which.
+      const paused = t.types.includes("agent.session.requires_action");
       assert(t.ended?.type === "agent.session.turn.completed", `turn ended ${t.ended?.type}: ${t.ended?.turn?.error?.message ?? ""}`);
       assert(/13|rain/i.test(t.text), `the answer does not use the function's result: ${JSON.stringify(t.text)}`);
       const items = [];
@@ -83,7 +86,7 @@ export default [
       const out = items.find((i) => i.type === "function_call_output");
       assert(items.some((i) => i.type === "function_call" && i.name === "get_weather" && i.status === "completed"), `items: ${items.map((i) => `${i.type}:${i.status ?? ""}`)}`);
       assert(out && String(out.output).includes("light rain") && !String(out.output).includes("waiting for the caller"), `output item: ${JSON.stringify(out)}`);
-      return `handler got ${JSON.stringify(calls[0])} · answer ${JSON.stringify(t.text)}`;
+      return `${paused ? "paused for the caller (requires_action)" : "answered before the tool ran (no pause)"} · handler got ${JSON.stringify(calls[0])} · answer ${JSON.stringify(t.text)}`;
     },
   },
   {
