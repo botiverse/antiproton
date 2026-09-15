@@ -28,6 +28,8 @@
   "exclude": [
     "node_modules",
     "test/auth.ts",
+    "test/admin-transcript.ts",
+    "test/transcript-read.ts",
     "test/agents-api-keys.ts",
     "test/agents-api-shapes.ts",
     "test/agents-api-store.ts",

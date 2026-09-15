@@ -11,7 +11,7 @@ import {
   seal, open, resolveViewer, sessionCookieFor, b64url, unb64url,
   readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
-  GITHUB_TOKEN, GITHUB_API, programmaticAccess, type Viewer,
+  GITHUB_TOKEN, GITHUB_API, programmaticAccess, isOperator, type Viewer,
 } from "../cf/src/auth.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -202,6 +202,17 @@ await check("programmatic routes: nobody, anonymous and QA are refused; automati
   assert(programmaticAccess(QA_VIEWER, "bench", target) === "unauthorized", "a QA session reached the benchmark routes");
   assert(programmaticAccess(auto, "agent", target) === "allow", "automation was refused an agent");
   assert(programmaticAccess(auto, "bench", target) === "allow", "automation was refused the benchmark routes");
+});
+
+await check("operator routes: only the configured token, and no token configured refuses", async () => {
+  // /admin/transcript returns a person's whole conversation. The older /admin
+  // routes open when AUTOMATION_TOKEN is unset; this one must not.
+  assert(isOperator("tok-123", "tok-123") === true, "the configured token was refused");
+  assert(isOperator("tok-123", "tok-124") === false, "a different token was let in");
+  assert(isOperator("tok-123", null) === false, "no header was let in");
+  assert(isOperator(undefined, null) === false, "no token configured and no header was let in");
+  assert(isOperator(undefined, "") === false, "no token configured and an empty header was let in");
+  assert(isOperator("", "") === false, "an empty configured token matched an empty header");
 });
 
 await check("programmatic routes: a signed-in person reaches their own agents, in their own tenant, and nothing else", async () => {

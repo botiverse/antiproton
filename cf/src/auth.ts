@@ -221,6 +221,15 @@ export function programmaticAccess(
   return "not-found";
 }
 
+/**
+ * The operator's token, and nothing else: no token configured refuses rather
+ * than opens. The older /admin routes open when AUTOMATION_TOKEN is unset, for
+ * a local dev server; a route that returns a person's conversation does not.
+ */
+export function isOperator(expected: string | undefined, presented: string | null): boolean {
+  return !!expected && presented !== null && constantTimeEqual(presented, expected);
+}
+
 export async function sessionCookieFor(secret: string, v: Viewer, sub: string, now = Date.now()): Promise<string> {
   const claims: SessionClaims = {
     v: 1, who: v.email, name: v.name, username: v.username, picture: v.picture, sub,

@@ -56,6 +56,9 @@ import {
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
+import { adminTranscript } from "./admin-transcript.ts";
+import { agentObjectName } from "./object-name.ts";
+import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { d1ApiKeys, admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
 import { staticAsset } from "./static.ts";
@@ -238,26 +241,7 @@ async function failLoudly(m: QueuedModelCall, env: Env) {
     { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }), 0);
 }
 
-/**
- * One Durable Object per (tenant, agent).
- *
- * §12.1 rule 1 asks for isolation that is structural rather than a predicate.
- * Sharing one object put every tenant's rows in one SQLite database, so the
- * only thing standing between two customers was a WHERE clause being correct
- * everywhere, forever. Addressing by identity means the other tenant's data is
- * not in the database being queried at all.
- *
- * The separator is not a legal character in either id (both are validated on
- * the way in), so no two distinct pairs can collide on one name.
- */
-export function agentObjectName(tenantId: string, agentId: string): string {
-  for (const [label, v] of [["tenant", tenantId], ["agent", agentId]] as const) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v)) {
-      throw new Error(`invalid ${label} id: ${JSON.stringify(v).slice(0, 60)}`);
-    }
-  }
-  return `a/${tenantId}/${agentId}`;
-}
+export { agentObjectName };
 
 const RUNNER = (body: string) => `
 export default {
@@ -1810,39 +1794,22 @@ export class AgentDO extends DurableObject<Env> {
     const session = await this.#conversation(tenantId, agentId, taskId);
     const rt = this.runtime();
     const agent = await rt.agent(tenantId, agentId, session);
-    const entries = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
-    // A run that failed before its first model call leaves no entry, only
-    // pi's outcome record; without this the page shows the message and then
-    // nothing, which is what an hour of today looked like.
-    const failed = failedRuns(this.sql, session).map((f) => ({
-      sequence: f.seq, kind: "model.failed",
-      payload: { error: `${f.code}: ${f.message}`, operationId: f.operationId, at: f.at } as Record<string, unknown>,
-    }));
-    const all = [...entries, ...failed].sort((a, b) => a.sequence - b.sequence);
-    const total = all.length;
-    // Shown to a person: a stored tool result written before references
-    // changed shape still names the bucket, tenant and agent (tygg, 2026-09-14).
-    const owner = { tenantId, agentId };
-    const events = (tail > 0 ? all.slice(-tail) : all).map((e) => ({
-      sequence: e.sequence, kind: e.kind,
-      payload: JSON.parse(maskRawRefs(JSON.stringify(e.payload), owner)) as typeof e.payload,
-      createdAt: Number((e.payload as any)?.at ?? 0),
-    }));
+    const shown = transcriptEvents(
+      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT), this.sql, session, { tenantId, agentId }, tail);
     const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
     const pendingApproval = (await rt.store.listApprovals(tenantId, "pending")).length > 0;
-    const busy: "thinking" | "waiting-for-approval" | null = pendingApproval
-      ? "waiting-for-approval"
-      : running ? "thinking" : null;
-    // Approvals are keyed by operation so the trajectory can show a held call
-    // where it happened, with who signed it, instead of in a separate panel.
-    const byOp: UiTranscript["byOp"] = {};
-    for (const a of await rt.store.listApprovals(tenantId)) {
-      byOp[a.operationId] = {
-        state: a.state, approver: a.approver ?? null, tool: `${a.mountAlias}.${a.tool}`, request: a.request,
-      };
-    }
-    return {
-      total, shown: events.length, events, byOp, busy };
+    const busy: UiTranscript["busy"] = pendingApproval ? "waiting-for-approval" : running ? "thinking" : null;
+    return { ...shown, byOp: approvalsByOp(await rt.store.listApprovals(tenantId)), busy };
+  }
+
+  /**
+   * uiTranscript for an operator (/admin/transcript), read straight from this object's SQLite and nothing
+   * else (cf/src/transcript-read.ts). Opening the agent re-pins its mounts and reconciles its session, and the
+   * store's init runs migrations; a GET that can name anyone must do neither (Ada, #336). Null for an agent or
+   * conversation this object does not hold.
+   */
+  async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<TranscriptEvents | null> {
+    return readTranscript(this.sql, tenantId, agentId, taskId);
   }
 
   #ownerAgent(): string | null {
@@ -2986,6 +2953,9 @@ export default {
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.diagnose(t, a, k));
         }
+        case "/admin/transcript":
+          return adminTranscript(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/ui": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
