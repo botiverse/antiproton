@@ -106,6 +106,9 @@ export function nextReadDelay(next: Snapshot, idleReads: number): number {
 }
 
 export const STREAM_MAX_MS = 30 * 60_000;
+/** With change notices, how long to wait before reading anyway: a fallback for a lost notice, not a schedule. */
+export const NOTICE_FALLBACK_ACTIVE_MS = 5_000;
+export const NOTICE_FALLBACK_IDLE_MS = 15_000;
 export const KEEPALIVE_MS = 15_000;
 
 /**
@@ -118,6 +121,8 @@ export async function pumpSessionEvents(o: {
   read(): Promise<Snapshot>;
   write(text: string): Promise<void>;
   sleep(ms: number): Promise<void>;
+  /** Resolves when the agent's object says something changed, or after the fallback (watch.ts). Absent: poll. */
+  wait?(fallbackMs: number): Promise<unknown>;
   now(): number;
   sessionId: string;
   sessionWith(status: Snapshot["status"], pending?: PendingCall[]): Record<string, unknown>;
@@ -131,7 +136,8 @@ export async function pumpSessionEvents(o: {
   let lastWrite = start;
   try {
     while (o.now() - start < maxMs) {
-      await o.sleep(nextReadDelay(prev, idleReads));
+      if (o.wait) await o.wait(isActive(prev) ? NOTICE_FALLBACK_ACTIVE_MS : NOTICE_FALLBACK_IDLE_MS);
+      else await o.sleep(nextReadDelay(prev, idleReads));
       const next = await o.read();
       const events = eventsBetween(prev, next, { sessionId: o.sessionId }, o.sessionWith, o.eventId);
       if (events.length) {

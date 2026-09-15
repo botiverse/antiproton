@@ -16,12 +16,15 @@ import {
 } from "./shapes.ts";
 import { sessionTranscript } from "./transcript.ts";
 import { pumpSessionEvents, type PendingCall, type Snapshot } from "./events.ts";
+import type { Watch } from "./watch.ts";
 
 export type SessionStatus = "idle" | "in_progress" | "requires_action" | "failed";
 
 export interface AgentsApiDeps {
   now(): number;
   sleep(ms: number): Promise<void>;
+  /** Change notices from an agent's object (watch.ts); without it the stream polls. */
+  watch?(agentId: string): Promise<Watch | null>;
   /** How long one event stream may stay open (events.ts STREAM_MAX_MS when unset). */
   streamMaxMs?: number;
   mintAgentId(): string;
@@ -107,6 +110,8 @@ async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: ()
       status: t.running ? "in_progress" : pending.length ? "requires_action" : "idle", pending,
     };
   };
+  // Listening before the baseline read, so a change between the two is heard rather than waited out.
+  const watch = deps.watch ? await deps.watch(s.agentId).catch(() => null) : null;
   const baseline = await read();
   if (thenStart) await thenStart();
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
@@ -116,10 +121,11 @@ async function eventStream(deps: AgentsApiDeps, s: StoredSession, thenStart?: ()
   let n = 0;
   void pumpSessionEvents({
     baseline, read, sessionId: s.id, sleep: deps.sleep, now: deps.now, maxMs: deps.streamMaxMs,
+    ...(watch ? { wait: (ms: number) => watch.next(ms) } : {}),
     write: (text) => writer.write(encoder.encode(text)),
     sessionWith: (status, pending) => toOpenAISession(s, agent, { status, pending }) as unknown as Record<string, unknown>,
     eventId: () => `evt_${prefix}_${++n}`,
-  }).finally(() => writer.close().catch(() => {}));
+  }).finally(() => { watch?.close(); writer.close().catch(() => {}); });
   return new Response(readable, {
     headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-accel-buffering": "no" },
   });

@@ -138,6 +138,22 @@ await check("a call for the caller: the call is shown, then requires_action; its
   assert(sdkStopsAt(all) === all.length - 1, `the SDK would stop at ${sdkStopsAt(all)} of ${all.length}`);
 });
 
+await check("with change notices the pump waits for them instead of sleeping, and reads as soon as one arrives", async () => {
+  const reads: number[] = []; const waits: number[] = []; let sleeps = 0; let clock = 0;
+  const started = snap([...history, user("go")], true);
+  const outcome = await pumpSessionEvents({
+    baseline: snap(history, false), sessionId: "sess_1", sessionWith, eventId, maxMs: 30_000,
+    read: async () => { reads.push(clock); return started; },
+    write: async () => {},
+    sleep: async () => { sleeps++; },
+    wait: async (ms) => { waits.push(ms); clock += 1_000; return "changed"; },
+    now: () => clock,
+  });
+  assert(outcome === "ceiling" && sleeps === 0, `the pump slept ${sleeps} times despite change notices`);
+  assert(waits.length === reads.length && waits.length > 0, `waits ${waits.length} vs reads ${reads.length}`);
+  assert(waits[0] === 15_000 && waits[1] === 5_000, `fallbacks: idle first then active: ${waits.slice(0, 3)}`);
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

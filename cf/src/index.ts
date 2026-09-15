@@ -16,6 +16,7 @@ import type { Json } from "../../src/core/types.ts";
 import { bearerKey, hashApiKey, newApiKey } from "./agents-api/keys.ts";
 import { handleAgentsApi, type AgentsApiDeps } from "./agents-api/handlers.ts";
 import { apiAgentSeeds } from "./agents-api/provisioning.ts";
+import { watchChanges } from "./agents-api/watch.ts";
 import { openAIError, type StoredAgent, type StoredSession } from "./agents-api/shapes.ts";
 import {
   deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, issueKeyRow, listApiAgents, listApiSessions,
@@ -1360,6 +1361,8 @@ export class AgentDO extends DurableObject<Env> {
       await rt.bindOperatorModel(tenantId, agentId);
       await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
       await this.ctx.storage.setAlarm(Date.now());
+      // The turn is on record now: say so, rather than leaving it for the step that follows.
+      await this.broadcast();
       return { ok: true as const };
     });
   }
@@ -1376,6 +1379,7 @@ export class AgentDO extends DurableObject<Env> {
       }
       const out = await rt.cancelSession(tenantId, agentId, sessionId);
       await this.ctx.storage.setAlarm(Date.now());
+      await this.broadcast();
       return out;
     });
   }
@@ -1423,7 +1427,7 @@ export class AgentDO extends DurableObject<Env> {
       await rt.ready();
       if (!(await rt.store.getModelBinding(tenantId, agentId))) return { unknown: results.map((r) => r.callId) };
       const out = await rt.submitToolResults(tenantId, agentId, sessionId, results);
-      if (!out.unknown.length) await this.ctx.storage.setAlarm(Date.now());
+      if (!out.unknown.length) { await this.ctx.storage.setAlarm(Date.now()); await this.broadcast(); }
       return out;
     });
   }
@@ -1975,6 +1979,12 @@ export class AgentDO extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server);
+    // A change notice socket for the agents API's event stream (agents-api/watch.ts): told only that something
+    // changed, never sent the transcript, so a push costs this object one small send.
+    if (url.searchParams.get("kind") === "notify") {
+      (server as any).serializeAttachment({ notify: true });
+      return new Response(null, { status: 101, webSocket: client });
+    }
     const cursor = {
       after: Number(url.searchParams.get("after") ?? 0),
       tenantId: url.searchParams.get("tenantId") ?? "tenant-a",
@@ -1995,6 +2005,7 @@ export class AgentDO extends DurableObject<Env> {
       | { after: number; tenantId: string; agentId: string }
       | null;
     if (!cur) return;
+    if ((cur as any).notify) { ws.send('{"kind":"changed"}'); return; }
     // The bench object has its own runtime; readying the tenant one would build
     // a second harness over the same store and push from the wrong catalogue.
     const rt = this.#activeRuntime();
@@ -2470,6 +2481,15 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const deps: AgentsApiDeps = {
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // The agent's object pushes after every change; the stream reads when it hears (agents-api/watch.ts).
+    watch: async (agentId) => {
+      try { agentObjectName(tenantId, agentId); } catch { return null; }
+      const res = await agentStub(agentId).fetch("https://agent.internal/events?kind=notify", { headers: { Upgrade: "websocket" } });
+      const ws = res.webSocket;
+      if (!ws) return null;
+      ws.accept();
+      return watchChanges(ws as any);
+    },
     mintAgentId: () => mintAgentId(ownerAgentId),
     mintSessionId,
     index: {
