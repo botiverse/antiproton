@@ -1920,6 +1920,39 @@ await check("a running container's GitHub access follows the mount: held, remove
 });
 
 /**
+ * The full reminder once per container, a short line after.
+ *
+ * It went on every result when it was 132 bytes (2026-09-13). With the lease
+ * terms it grew past 400, and background-job notices carry the whole result, so
+ * one conversation repeated it dozens of times (cody, reading the task #19
+ * trajectory). The reason it was on every result still holds, since an agent
+ * that thought the box was volatile reinstalled on every call, so the short line
+ * keeps that fact, and the full terms stay where they are always present: the
+ * run and shell descriptions, sent every turn, and the first result of each box.
+ */
+await check("a container's first result carries the full reminder, and later ones a short line that agrees with it", async () => {
+  const sb: any = await import("../src/plugins/sandbox.ts");
+  const lease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
+  const cfg = { maxOutputBytes: 24_000 } as any;
+  const rec = { state: "succeeded", exit_code: 0, output_summary: "ok" };
+  for (const [label, l] of [["leased", lease], ["no lease", null]] as const) {
+    const first = sb.finished(rec, cfg, { boxId: "b", createdAt: 1, lastUsedAt: 1, execs: 0 }, "box", l);
+    const later = sb.finished(rec, cfg, { boxId: "b", createdAt: 1, lastUsedAt: 1, execs: 3 }, "box", l);
+    if (first.reminder !== boxReminder("box", l as any)) throw new Error(`${label}: the first result lost the full reminder`);
+    const short = String(later.reminder ?? "");
+    if (!short || short.length >= 140) throw new Error(`${label}: a later result's reminder is ${short.length} characters: ${short}`);
+    if (!/same container/.test(short)) throw new Error(`${label}: the short line no longer says it is the same container: ${short}`);
+    if (l) {
+      if (!/until you release it/.test(short) || !/30 idle minutes/.test(short) || /turn ends/.test(short)) {
+        throw new Error(`leased: the short line disagrees with the lease: ${short}`);
+      }
+    } else if (!/turn ends/.test(short) || /release it or/.test(short)) {
+      throw new Error(`no lease: the short line disagrees with the turn's lifetime: ${short}`);
+    }
+  }
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",
