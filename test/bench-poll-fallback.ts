@@ -25,8 +25,9 @@ await check("the lost final answer is taken from poll (the stalled trial: answer
 });
 
 await check("a previous turn's answer is never taken: a new message with no reply after it yet", () => {
+  // The cursor is behind (71, as after a reconnect), so only the message guard can refuse the stale answer at 193.
   const events = [...turn, { sequence: 210, kind: "message" }];
-  const d = decideFromPoll({ status: "idle", answer: "Your exchange has been submitted.", events }, 193);
+  const d = decideFromPoll({ status: "idle", answer: "Your exchange has been submitted.", events }, 71);
   assert(d === null, `a stale answer ended the new turn: ${JSON.stringify(d)}`);
 });
 
