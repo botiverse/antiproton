@@ -46,6 +46,20 @@ await check("what antiproton does not do is refused by name, and its off/default
     const r: any = parseAgentParams(body, "create", undefined, now);
     assert(!r.ok && r.param === param && r.status === 400 && r.code === "unsupported_parameter", `${param} was not refused: ${JSON.stringify(r)}`);
   }
+  // A function tool's description and parameters are required by the SDK's request type: missing is refused by
+  // name, never filled in (Vera, 2026-09-15: a tool without parameters was accepted).
+  const incomplete: Array<[unknown, string]> = [
+    [{ type: "function", name: "f", parameters: { type: "object", properties: {} } }, "tools[0].description"],
+    [{ type: "function", name: "f", description: "d" }, "tools[0].parameters"],
+    [{ type: "function", name: "f", description: "d", parameters: null }, "tools[0].parameters"],
+    [{ type: "function", name: "f", description: "d", parameters: "x" }, "tools[0].parameters"],
+  ];
+  for (const [tool, param] of incomplete) {
+    const r: any = parseAgentParams({ model: "m", tools: [tool] }, "create", undefined, now);
+    assert(!r.ok && r.param === param && r.status === 400 && r.code === "invalid_value", `${param} was not refused: ${JSON.stringify(r)}`);
+  }
+  const complete: any = parseAgentParams({ model: "m", tools: [{ type: "function", name: "f", description: "d", parameters: { type: "object", properties: {} } }] }, "create", undefined, now);
+  assert(complete.ok, `a complete function tool was refused: ${JSON.stringify(complete)}`);
   const defaults: any = parseAgentParams({ model: "m", multi_agent: { enabled: false }, reasoning: { effort: null, summary: null }, service_tier: "auto", text: { format: { type: "text" }, verbosity: "medium" } }, "create", undefined, now);
   assert(defaults.ok, `the SDK's own defaults were refused: ${JSON.stringify(defaults)}`);
   const missing: any = parseAgentParams({ name: "x" }, "create", undefined, now);

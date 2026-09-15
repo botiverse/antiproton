@@ -9,6 +9,7 @@
  * silently dropped setting reads to the caller as a setting that worked.
  *
  * Depends on: openai 7.15.0 — resources/beta/agents/agents.d.ts (Agent, AgentSession, environments,
+ *   PersistedAgentToolParam: a function tool's name, description and parameters are required),
  *   AgentTool), core/pagination (CursorPage) and core/error (APIError reads body.error). When the SDK's
  *   agents types change, re-check every object, default and refusal here.
  */
@@ -74,11 +75,11 @@ function toolsOf(v: unknown): FunctionTool[] | Invalid | ReturnType<typeof unsup
     if (t.type !== "function") return unsupported(`tools[${i}].type`, `the tool type ${JSON.stringify(t.type)}`);
     if (typeof t.name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(t.name)) return invalid(`tools[${i}].name`, "a function tool needs a name of letters, digits, _ or -");
     if (t.defer_loading === true) return unsupported(`tools[${i}].defer_loading`, "deferred tool loading");
-    out.push({
-      name: t.name,
-      description: typeof t.description === "string" ? t.description : "",
-      parameters: isObj(t.parameters) ? (t.parameters as Record<string, Json>) : { type: "object", properties: {} },
-    });
+    // Both are required by the SDK's request type; a default filled in here would be a setting accepted and ignored
+    // (Vera, 2026-09-15: a tool without parameters was taken, and the model could not know its arguments).
+    if (typeof t.description !== "string") return invalid(`tools[${i}].description`, "a function tool needs a description string");
+    if (!isObj(t.parameters)) return invalid(`tools[${i}].parameters`, "a function tool needs parameters: a JSON Schema object");
+    out.push({ name: t.name, description: t.description, parameters: t.parameters as Record<string, Json> });
   }
   return out;
 }
