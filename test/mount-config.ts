@@ -12,7 +12,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf, KEPT_NOTE, SAVED_NOTE, NOT_A_REASON_TO_RELEASE } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -1500,6 +1500,33 @@ await check("release says to leave a container someone will come back to, and wh
   if (!/`quiet` keeps it longer/.test(release)) throw new Error(`release does not point to quiet: ${release}`);
   if (!/for starting a fresh machine later/.test(release)) throw new Error(`release does not say what keep and save are for: ${release}`);
   if (/as soon as you no longer need the machine/.test(release)) throw new Error(`release still says to destroy the box as soon as the work is done: ${release}`);
+});
+
+/**
+ * What `keep` and `save` hand back does not read as permission to release.
+ *
+ * Vera's blind-use round 4 (2026-09-15): told the user would come back, an agent kept the environment, saved an
+ * archive, and released the container "since I've kept the environment and saved the archive". Both notes it had
+ * just been handed said the copy "survives release" and nothing else about release. This holds the words; whether
+ * an agent now leaves the container running is judged by re-running that prompt, not here.
+ */
+await check("keep and save say a surviving copy is not a reason to release", async () => {
+  const texts: [string, string][] = [
+    ["keep's result", KEPT_NOTE],
+    ["save's result", SAVED_NOTE],
+    ["keep", run9.tools.find((t) => t.name === "keep")!.summary],
+    ["save", run9.tools.find((t) => t.name === "save")!.summary],
+  ];
+  for (const [where, text] of texts) {
+    if (!text.includes(NOT_A_REASON_TO_RELEASE)) throw new Error(`${where} does not say a copy is no reason to release: ${text}`);
+    if (/survives (its )?release/.test(text)) throw new Error(`${where} still offers survival as the whole story: ${text}`);
+  }
+  const leased = sandboxPlugin(null as any, "local", { warnMs: 5 * 60_000, maxMs: 30 * 60_000 })
+    .tools.find((t) => t.name === "release")!.summary;
+  if (!/leave it running, even after keeping or saving/.test(leased)) throw new Error(`release does not rule out keeping as a reason: ${leased}`);
+  if (leased.indexOf("leave it running") > leased.indexOf("released on its own")) {
+    throw new Error(`release says the container goes on its own before it says to leave it running: ${leased}`);
+  }
 });
 
 await check("without a lease, release promises nothing a lease would keep", async () => {
