@@ -10,7 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { limitForCall, offloadLimit, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
+import { limitForCall, offloadLimit, parkResult, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 
@@ -119,6 +119,37 @@ await check("a parked result keeps its summary and gives the exact call that rea
   must(/discarded, not stored/.test(String(gone.note)), `the loss must be stated: ${gone.note}`);
   must(Object.keys(gone).join() === "preview,bytes,note" && Object.keys(parked).join() === "preview,bytes,ref,note",
     `one shape: ${Object.keys(parked)} / ${Object.keys(gone)}`);
+});
+
+await check("a storage failure while parking does not fail a call that succeeded: one retry, then the loss stated", async () => {
+  // R2 answered a put with an internal error (10001) and the model was told its GitHub read had failed (task #19).
+  const value = { full_name: "cloudflare/workerd", description: "x".repeat(9_000) };
+  const body = JSON.stringify(value);
+  const run = async (failures: number) => {
+    let puts = 0; const completed: string[] = [];
+    const result = await parkResult(value, body, "t/t/a/op.json", "artifacts__read", {
+      async put(key) {
+        puts++;
+        if (puts <= failures) throw new Error(`We encountered an internal error. (10001) key ${key}`);
+        return { ref: `r2://bucket/${key}` };
+      },
+      async complete(ref) { completed.push(ref); },
+      shownRef: (ref) => ref.replace("r2://bucket/t/t/a/", "artifact://"),
+    });
+    return { result, puts, completed };
+  };
+  const first = await run(0);
+  must(first.puts === 1 && first.result.ref === "artifact://op.json" && first.completed.join() === "r2://bucket/t/t/a/op.json",
+    `a put that works is made once and recorded: ${JSON.stringify(first).slice(0, 200)}`);
+  const retried = await run(1);
+  must(retried.puts === 2 && retried.result.ref === "artifact://op.json" && retried.completed.length === 1,
+    `one failed put is retried and the result is parked: ${JSON.stringify(retried).slice(0, 200)}`);
+  const lost = await run(2);
+  must(lost.puts === 2, `a second failure is not retried again: ${lost.puts} puts`);
+  must(!("ref" in lost.result) && lost.completed.length === 0, `nothing stored, so no reference and no record: ${JSON.stringify(lost).slice(0, 200)}`);
+  must((lost.result.preview as any)?.full_name === "cloudflare/workerd", "the summary is still returned");
+  must(/not kept/.test(String(lost.result.note)) && /succeeded/.test(String(lost.result.note)), `the loss and the success are both said: ${lost.result.note}`);
+  must(!/10001|t\/t\/a|bucket/.test(JSON.stringify(lost.result)), `the storage error's text and the key stay out of the result: ${lost.result.note}`);
 });
 
 await check("following the note of a result too big for one read returns the exact result", async () => {

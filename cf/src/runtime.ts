@@ -144,9 +144,16 @@ export function tooLargeResult(
   value: unknown,
   body: string,
   parked: { ref: string; readBack: string } | null,
+  /** A reader was there, and storage refused the result anyway. */
+  storeFailed = false,
 ): Record<string, Json> {
   const preview = summarise(value);
   const what = `a summary of a ${body.length}-character result`;
+  if (!parked && storeFailed) {
+    return { preview, bytes: body.length,
+      note: `${what}; the rest is not kept: storing it failed twice, so there is nothing to read back. ` +
+        "The call itself succeeded; ask again for a smaller part of it (fields/offset/limit) rather than repeating it whole" };
+  }
   if (!parked) {
     return { preview, bytes: body.length,
       note: `${what}; the rest was discarded, not stored, because nothing is mounted that could read a parked result back` };
@@ -156,6 +163,38 @@ export function tooLargeResult(
     : `${parked.readBack} { ref: "${parked.ref}", from: 0 }, which returns it in pages`;
   return { preview, bytes: body.length, ref: parked.ref,
     note: `${what}; all of it is stored: read it with ${call} (or fields/offset/limit for part of a list)` };
+}
+
+/**
+ * Store a result too large to hand back, and say how to read it; or say it was not kept.
+ *
+ * The call has already succeeded by the time its result is parked, so a storage
+ * failure must not turn it into a failed call: R2 answered one put with an
+ * internal error (10001) and the model was told the GitHub read itself had failed
+ * (task #19, agent u-zty0826…, 2026-09-15). One retry, then the summary with the
+ * loss stated. The storage error's own text stays out of the result: it can name
+ * the key, which names where the agent lives. The operation row gets the
+ * reference only once there is one.
+ */
+export async function parkResult(
+  value: unknown,
+  body: string,
+  key: string,
+  readBack: string,
+  deps: {
+    put: (key: string, body: string) => Promise<{ ref: string }>;
+    complete: (ref: string) => Promise<unknown>;
+    /** The reference as the model is shown it. */
+    shownRef: (ref: string) => string;
+  },
+): Promise<Record<string, Json>> {
+  let stored: { ref: string } | null = null;
+  for (let attempt = 0; attempt < 2 && !stored; attempt++) {
+    try { stored = await deps.put(key, body); } catch { /* retried once, then stated in the result */ }
+  }
+  if (!stored) return tooLargeResult(value, body, null, true);
+  await deps.complete(stored.ref);
+  return tooLargeResult(value, body, { ref: deps.shownRef(stored.ref), readBack });
 }
 
 /**
@@ -723,16 +762,18 @@ export class AgentRuntime {
           };
         }
         const key = `t/${ctx.tenantId}/${ctx.agentId}/${res.operationId}.json`;
-        const stored = await artifacts.put(key, body);
-        await store.completeOperation(ctx.tenantId, res.operationId, "succeeded", stored.ref);
         return {
           status: "succeeded",
           operationId: res.operationId,
-          // The operations row keeps the raw reference; the model is shown the
-          // agent's own path and nothing about where that agent lives (tygg,
-          // 2026-09-14). The key was built from ctx two lines up, so it is
-          // always under this agent's scope.
-          result: tooLargeResult(res.result, body, { ref: toAgentRef(stored.ref, ctx)!, readBack }),
+          result: await parkResult(res.result, body, key, readBack, {
+            put: (k, b) => artifacts.put(k, b),
+            complete: (ref) => store.completeOperation(ctx.tenantId, res.operationId, "succeeded", ref),
+            // The operations row keeps the raw reference; the model is shown the
+            // agent's own path and nothing about where that agent lives (tygg,
+            // 2026-09-14). The key is built from ctx above, so it is always under
+            // this agent's scope.
+            shownRef: (ref) => toAgentRef(ref, ctx)!,
+          }),
         };
       },
     };
