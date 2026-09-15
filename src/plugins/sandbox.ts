@@ -530,7 +530,7 @@ const DEFAULTS = {
   shellPrefix: "",
   network: "open" as const,
   endpoint: "https://api.run.sys9.ai",
-  image: "public.ecr.aws/docker/library/node:22-bookworm",
+  image: "public.ecr.aws/docker/library/node:24-bookworm",
   project: "default",
   timeoutMs: 120_000,
   graceMs: 5_000,
@@ -716,6 +716,43 @@ export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "
   return open ? argv : ["unshare", "-n", "--", ...argv];
 }
 
+/**
+ * What a default image was measured to contain, on a fresh box, by image.
+ *
+ * The shell description tells the agent what is there, because finding out costs
+ * a billed call and a model turn. That is a claim about a registry tag nothing in
+ * this repo can see, so it is kept as a dated measurement, and the suite fails
+ * when the default image has no entry: changing the default stays red until
+ * someone measures the new one. It cannot prove the measurement was honest; it
+ * removes the case where nobody took one (Rex and Vera, 2026-09-15).
+ */
+export const MEASURED_IMAGES: Record<string, {
+  measured: string; os: string; present: string[]; missing: string[]; install: string;
+  /** What was run on the fresh box, so the next person can run it again and compare. */
+  command: string;
+}> = {
+  // cody and Piper, separately, on fresh run9 boxes: Node v24.21.0, npm 11.19.0.
+  "public.ecr.aws/docker/library/node:24-bookworm": {
+    measured: "2026-09-15", os: "Debian",
+    present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash"],
+    missing: ["pip", "jq", "rg", "gh"],
+    install: "apt-get update && apt-get install -y <pkg>",
+    command: "for t in node npm git curl make gcc g++ python3 bash ssh apt-get pip3 jq rg gh; do " +
+      "command -v $t >/dev/null && echo \"present $t\" || echo \"missing $t\"; done",
+  },
+};
+
+const listed = (xs: string[]) => xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}` : (xs[0] ?? "");
+
+/** The description's sentence about the default image, from its measurement, or saying there is none. */
+export function defaultImageSentence(image: string): string {
+  const tag = image.split("/").pop();
+  const m = MEASURED_IMAGES[image];
+  if (!m) return `The default image is ${tag}; what it contains has not been measured, so check for a tool before relying on it.`;
+  return `The default image is ${tag} (${m.os}): ${listed(m.present)} are present; ${listed(m.missing)} are NOT, ` +
+    `and \`${m.install}\` installs more.`;
+}
+
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
   // `run`, `shell` and every result state the same lifetime (boxReminder): with a lease, the box stays until
   // the agent releases it or the idle ceiling takes it; without one, a settled turn hands it back.
@@ -828,9 +865,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Pass `workdir` to run one command in another directory instead of starting it with `cd`. " +
         "Exported variables and aliases do not carry over, so set them in the command that needs them, " +
         "and a command handed over as a job does not move the directory. Only for what needs a real " +
-        "machine (builds, tests, git). The default image is node:22-bookworm (Debian): Node, npm, git, " +
-        "curl, make, gcc/g++, Python 3 and bash are present; pip, jq, rg and gh are NOT, and " +
-        "`apt-get update && apt-get install -y <pkg>` installs more. An operator may have configured a " +
+        "machine (builds, tests, git). " + defaultImageSentence(DEFAULTS.image) + " An operator may have configured a " +
         "different image; every result reports which one this container started from, so read that " +
         "instead of probing for it. Save anything worth keeping, then release.",
       parameters: {

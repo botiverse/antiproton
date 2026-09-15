@@ -1548,6 +1548,33 @@ await check("the shell description names the default image and how to install mo
 });
 
 /**
+ * The tool list is a measurement, and a default without one is red.
+ *
+ * What a registry tag contains cannot be asserted from here, so the list lives
+ * in `MEASURED_IMAGES` with the date it was taken, and this case is what makes a
+ * change of default fail until somebody measures the new image. The sentence is
+ * built from that entry, so the two cannot drift apart either.
+ */
+await check("the default image has a dated measurement, and the description says what it measured", async () => {
+  const sb: any = await import("../src/plugins/sandbox.ts");
+  const plugin = sandboxPlugin(null as any, "local");
+  const defaultImage = String(plugin.config!.find((f) => f.name === "image")!.default);
+  const m = sb.MEASURED_IMAGES?.[defaultImage];
+  if (!m) throw new Error(`${defaultImage} is the default and nobody has measured what is in it: add it to MEASURED_IMAGES after checking a fresh box`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(m.measured) || !m.present.length || !/command -v/.test(m.command ?? "")) {
+    throw new Error(`the measurement is incomplete, or does not say how to take it again: ${JSON.stringify(m)}`);
+  }
+  const summary = plugin.tools.find((t) => t.name === "shell")!.summary;
+  if (!summary.includes(sb.defaultImageSentence(defaultImage))) throw new Error("the description is not built from the measurement");
+  for (const tool of [...m.present, ...m.missing]) {
+    if (!summary.includes(tool)) throw new Error(`the description does not mention ${tool}`);
+  }
+  if (!/not been measured/.test(sb.defaultImageSentence("example.test/unmeasured:1"))) {
+    throw new Error("an unmeasured image is described as if it had been measured");
+  }
+});
+
+/**
  * Dropped entries are counted where the page reads, not dropped in silence.
  *
  * `asBoxState` drops what it cannot read so a corrupt history cannot lose a
