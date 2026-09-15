@@ -971,7 +971,8 @@ export class AgentRuntime {
           apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
             name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
           })),
-          { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane })
+          { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
+            branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
       : [];
     const extraTools = [
       ...(extras.runJs

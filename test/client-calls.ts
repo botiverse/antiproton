@@ -28,7 +28,8 @@ async function fixture() {
   const ref: { agent: PiAgent | null } = { agent: null };
   const weather = clientTools(
     [{ name: "get_weather", description: "weather for a city", parameters: { type: "object", properties: { city: { type: "string" } } } }],
-    { sql: host.sql as any, session: SESSION, lane: () => ref.agent!.lane as any });
+    { sql: host.sql as any, session: SESSION, lane: () => ref.agent!.lane as any,
+      branch: (tip) => ref.agent!.storage.scanBranch({ start: tip, order: "oldestFirst" }, CTX) as any });
   const lookup = {
     name: "lookup", label: "lookup", description: "runs here", parameters: { type: "object", properties: {} } as any,
     async execute() { return { content: [{ type: "text" as const, text: "\"found\"" }], details: {} }; },
@@ -113,6 +114,62 @@ await check("in a mixed batch the call that ran here keeps its result when the t
   await f.agent.step();
   const req = f.nextRequest();
   assert(roles(req).join() === "user,assistant,toolResult:call_a,toolResult:call_b", `the model saw ${roles(req)}`);
+  await f.agent.close();
+});
+
+await check("two caller functions in one batch both reach the model with the caller's results, never as aborted", async () => {
+  // The first call's pause requests the abort; pi may then cancel the second before it runs and record an
+  // aborted result for it. The caller answers both, and the model must see both answers (task #17, 2026-09-15).
+  const f = await fixture();
+  await f.agent.say("weather in Rome and Oslo?");
+  await f.agent.step();
+  f.reply({ toolCalls: [
+    { id: "call_x", name: "get_weather", arguments: { city: "Rome" } },
+    { id: "call_y", name: "get_weather", arguments: { city: "Oslo" } },
+  ] });
+  await f.agent.step();
+  const waiting = pendingClientCalls(f.host.sql as any, SESSION).map((c) => c.call_id).join();
+  // The caller is asked for both: a call pi cancelled before it ran is still the caller's to answer.
+  assert(waiting === "call_x,call_y", `waiting for ${waiting || "none"}, not both calls`);
+  assert(!(await f.resume()), "resumed before the caller answered");
+  answerClientCall(f.host.sql as any, SESSION, "call_x", { output: "hot", isError: false });
+  assert(!(await f.resume()), "resumed with one of the two calls still unanswered");
+  answerClientCall(f.host.sql as any, SESSION, "call_y", { output: "cold", isError: false });
+  assert(await f.resume(), `did not continue (waiting before the answers: ${waiting || "none"})`);
+  await f.agent.step();
+  const req = f.nextRequest();
+  assert(roles(req).join() === "user,assistant,toolResult:call_x,toolResult:call_y", `the model saw ${roles(req)} (waiting was ${waiting || "none"})`);
+  const results = (req?.context?.messages ?? []).filter((m: any) => m.role === "toolResult");
+  const text = (m: any) => (m.content ?? []).map((c: any) => c.text ?? "").join("");
+  assert(text(results[0]) === "hot" && text(results[1]) === "cold" && results.every((m: any) => !m.isError),
+    `the model saw ${JSON.stringify(results.map((m: any) => ({ id: m.toolCallId, text: text(m), isError: m.isError })))} (waiting was ${waiting || "none"})`);
+  await f.agent.close();
+});
+
+await check("in a batch, a call the caller answered early is not asked for again, and both answers reach the model", async () => {
+  // Whether pi runs call_y (the early answer is used) or cancels it first (the answer waits in its row), the pause
+  // recorded for call_x must not turn call_y back into a call the caller is asked for.
+  const f = await fixture();
+  answerClientCall(f.host.sql as any, SESSION, "call_y", { output: "sunny", isError: false });
+  await f.agent.say("weather in Rome and Oslo?");
+  await f.agent.step();
+  f.reply({ toolCalls: [
+    { id: "call_x", name: "get_weather", arguments: { city: "Rome" } },
+    { id: "call_y", name: "get_weather", arguments: { city: "Oslo" } },
+  ] });
+  await f.agent.step();
+  const waiting = pendingClientCalls(f.host.sql as any, SESSION).map((c) => c.call_id).join();
+  assert(waiting === "call_x", `waiting for ${waiting || "none"}; only call_x is unanswered`);
+  answerClientCall(f.host.sql as any, SESSION, "call_x", { output: "hot", isError: false });
+  assert(await f.resume(), "did not continue once call_x was answered");
+  await f.agent.step();
+  const req = f.nextRequest();
+  const results = (req?.context?.messages ?? []).filter((m: any) => m.role === "toolResult");
+  const text = (m: any) => (m.content ?? []).map((c: any) => c.text ?? "").join("");
+  assert(roles(req).join() === "user,assistant,toolResult:call_x,toolResult:call_y" && text(results[0]) === "hot" && text(results[1]) === "sunny"
+    && results.every((m: any) => !m.isError),
+    `the model saw ${JSON.stringify(results.map((m: any) => ({ id: m.toolCallId, text: text(m), isError: m.isError })))}`);
+  assert(pendingClientCalls(f.host.sql as any, SESSION).length === 0 && !(await f.resume()), "a call was left waiting after the turn continued");
   await f.agent.close();
 });
 

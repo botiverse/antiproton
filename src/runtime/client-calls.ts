@@ -15,8 +15,15 @@
  * the stream shows the call, which can be before this object executes it. It
  * is kept, and the tool returns it at once instead of pausing.
  *
+ * Several caller functions can arrive in one model message. Once the first of them requests the abort, pi
+ * cancels the calls that have not started and records "Tool execution was cancelled before completion." as
+ * their result, so the caller was never asked for them and the model read them as cancelled (found
+ * 2026-09-15; it was so in every build before). The pause therefore records every caller function of its
+ * message as waiting, and the turn continues only when the caller has answered all of them.
+ *
  * Depends on: @earendil-works/pi-agent-core 0.85.1 — AgentLane requestAbort / navigateTree / accept, the
- *   measured behaviour that a tool throwing after an abort is recorded as that call's result, and the tool
+ *   measured behaviour that a tool throwing after an abort is recorded as that call's result, that pi
+ *   cancels a batch's unstarted calls once the abort is requested (harness/runtime/drive/tools.js), and the tool
  *   signature execute(toolCallId, params, onUpdate, toolContext, invocation, context) with the abort on
  *   context.abortSignal (harness/execution/tools.js). When pi is upgraded, re-run test/client-calls.ts
  *   (it times the pause) and re-check the pause-and-branch design.
@@ -75,6 +82,25 @@ export function dropClientCalls(sql: Sql, session: string): number {
   return waiting;
 }
 
+/**
+ * Every other caller function in the model message that made `toolCallId`, recorded as waiting. A call the
+ * caller already answered keeps its state and gains its name, so the resume uses that answer.
+ */
+async function recordBatch(
+  d: { sql: Sql; session: string; branch(tipId: string): Promise<any[]> }, names: Set<string>, toolCallId: string, tipId: string, at: number,
+) {
+  const path = await d.branch(tipId);
+  const message = [...path].reverse().find((e) => e?.type === "message" && e.message?.role === "assistant"
+    && (e.message.content ?? []).some((c: any) => c?.type === "toolCall" && String(c.id) === toolCallId))?.message;
+  for (const c of (message?.content ?? []) as any[]) {
+    if (c?.type !== "toolCall" || String(c.id) === toolCallId || !names.has(String(c.name))) continue;
+    d.sql.exec(
+      `INSERT INTO ${TABLE}(session, call_id, name, arguments, state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)
+       ON CONFLICT(session, call_id) DO UPDATE SET name = excluded.name, arguments = excluded.arguments`,
+      d.session, String(c.id), String(c.name), JSON.stringify(c.arguments ?? {}), at);
+  }
+}
+
 /** Resolves when the signal aborts, or after `capMs`, whichever is first. */
 function abortedOrAfter(signal: AbortSignal | undefined, capMs: number): Promise<void> {
   if (!signal || signal.aborted) return Promise.resolve();
@@ -91,7 +117,10 @@ type PausingLane = {
 };
 
 /** The harness tools for an agent's client functions, in one session. */
-export function clientTools(defs: ClientToolDef[], d: { sql: Sql; session: string; lane(): PausingLane; now?: () => number }) {
+export function clientTools(defs: ClientToolDef[], d: {
+  sql: Sql; session: string; lane(): PausingLane; branch(tipId: string): Promise<any[]>; now?: () => number;
+}) {
+  const names = new Set(defs.map((def) => def.name));
   return defs.map((def) => ({
     name: def.name,
     label: def.name,
@@ -103,14 +132,20 @@ export function clientTools(defs: ClientToolDef[], d: { sql: Sql; session: strin
       const early = d.sql.exec(
         `SELECT state, output, is_error FROM ${TABLE} WHERE session = ? AND call_id = ?`, d.session, toolCallId).toArray()[0];
       if (early?.state === "answered") {
-        d.sql.exec(`DELETE FROM ${TABLE} WHERE session = ? AND call_id = ?`, d.session, toolCallId);
+        // Marked used, not deleted: a pause elsewhere in this message records all of its caller functions,
+        // and must find this one already answered instead of asking the caller for it again.
+        d.sql.exec(`UPDATE ${TABLE} SET state = 'used' WHERE session = ? AND call_id = ?`, d.session, toolCallId);
         if (Number(early.is_error)) throw new Error(String(early.output ?? "the caller's function failed"));
         return { content: [{ type: "text" as const, text: String(early.output ?? "") }], details: { client: true } };
       }
+      const at = (d.now ?? Date.now)();
       d.sql.exec(
         `INSERT OR REPLACE INTO ${TABLE}(session, call_id, name, arguments, state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)`,
-        d.session, toolCallId, def.name, JSON.stringify(params ?? {}), (d.now ?? Date.now)());
-      const current = (await d.lane().inspectExecution(CTX))?.current;
+        d.session, toolCallId, def.name, JSON.stringify(params ?? {}), at);
+      const info = await d.lane().inspectExecution(CTX);
+      // Before the abort: the calls it cancels must already be waiting when the caller next reads the session.
+      if (info?.tipId) await recordBatch(d, names, toolCallId, String(info.tipId), at);
+      const current = info?.current;
       if (current) await d.lane().requestAbort(current.id, CTX);
       // The abort lands on the signal a moment later; failing before it would record a failure the model acts on.
       // The signal is the sixth argument's abortSignal. This read the third (onUpdate, a function) until
@@ -168,6 +203,7 @@ export async function resumeClientCalls(d: {
   if (moved?.ok === false) return false;
   const started = await d.lane.accept({ kind: "prompt", prompt: results }, CTX);
   if (started?.ok === false) return false;
-  d.sql.exec(`DELETE FROM ${TABLE} WHERE session = ? AND name != ''`, d.session);
+  // The paused calls, and early answers already used (none can belong to a run in flight: the lane is idle).
+  d.sql.exec(`DELETE FROM ${TABLE} WHERE session = ? AND (name != '' OR state = 'used')`, d.session);
   return true;
 }
