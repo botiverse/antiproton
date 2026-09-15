@@ -285,7 +285,9 @@ export function boxReminder(alias: string, lease: BoxLease | null = null): strin
  *
  * It checks what every path depends on and not one field more: the id, and
  * that the two clocks are numbers. A checker that insisted on the whole record
- * would reject rows this code can in fact use.
+ * would reject rows this code can in fact use. The session and environment
+ * lists are filtered instead, entry by entry, because a bad line of history is
+ * not a reason to forget a container that is running.
  */
 /**
  * A box path as path segments, resolved: empty and `.` segments drop out and
@@ -405,13 +407,42 @@ export function asBoxState(v: Json): BoxState | null {
   const o = v as Record<string, unknown>;
   if (typeof o.boxId !== "string") return null;
   if (typeof o.createdAt !== "number" || typeof o.lastUsedAt !== "number") return null;
-  // Present but the wrong shape is the case that throws: `usage` maps over
-  // `sessions` and `start_from` searches `envs`, so an object where an array
-  // belongs is a crash rather than a miss. Absent stays fine — every reader
-  // already defaults it (Rex, 2026-09-12).
-  if (o.sessions !== undefined && !Array.isArray(o.sessions)) return null;
-  if (o.envs !== undefined && !Array.isArray(o.envs)) return null;
-  return v as BoxState;
+  // Only the id and the clocks decide whether this is a container record. The
+  // two lists are read element by element, and what cannot be read is dropped
+  // rather than taking the row with it: a row whose id reads names a box that
+  // exists and is billed, so answering "nothing is running" would start a
+  // second one and leave this one for nobody to release. Dropped, not
+  // repaired — a guessed `lastUsedAt` is a reading nobody took, and the window
+  // already forgets entries without saying so. The cost is chosen, not missed:
+  // a corrupt `envs` reads as "nothing kept", so the agent rebuilds instead of
+  // being told, and the snapshots it named stay in run9 with nothing here
+  // naming them. That is one wasted setup against a second container nobody
+  // releases, for a shape no version of this code writes. Unread, an element is worse
+  // than a miss: `null` throws at `s.boxId` or `e.name`, and one missing a
+  // field ships `undefined` into the console's usage report (Rex, 2026-09-12
+  // for the lists, 2026-09-15 for what is in them).
+  const { sessions, envs, ...rest } = o;
+  return {
+    ...(rest as unknown as BoxState),
+    ...(Array.isArray(sessions) ? { sessions: sessions.filter(isSession) } : {}),
+    ...(Array.isArray(envs) ? { envs: envs.filter(isEnv) } : {}),
+  };
+}
+
+function isSession(v: unknown): v is Session {
+  if (!v || typeof v !== "object") return false;
+  const s = v as Record<string, unknown>;
+  return typeof s.boxId === "string" && typeof s.startedAt === "number"
+    && typeof s.endedAt === "number" && typeof s.lastUsedAt === "number"
+    && typeof s.execs === "number"
+    && Array.isArray(s.saved) && s.saved.every((x) => typeof x === "string");
+}
+
+function isEnv(v: unknown): v is Env {
+  if (!v || typeof v !== "object") return false;
+  const e = v as Record<string, unknown>;
+  return typeof e.name === "string" && typeof e.snapId === "string"
+    && typeof e.savedAt === "number" && (e.note === undefined || typeof e.note === "string");
 }
 
 const SESSIONS_KEPT = 20;
