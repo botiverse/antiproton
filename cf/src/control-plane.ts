@@ -35,15 +35,6 @@ export interface IdentityRow extends Invitation {
   createdAt: number;
 }
 
-export interface ImportReport {
-  read: number;
-  inserted: number;
-  /** Rows D1 already had from open sign-up, replaced by the object's row. */
-  replacedSelf: number;
-  /** Rows the operator had already written to D1, left as they were. */
-  kept: number;
-}
-
 export interface IdentityDirectory {
   lookup(key: string): Promise<Invitation | null>;
   /** The operator's write: the row becomes this, whatever it was. Keeps the first created_at. */
@@ -52,14 +43,6 @@ export interface IdentityDirectory {
   register(key: string, row: Invitation, by: string): Promise<Invitation>;
   remove(key: string): Promise<void>;
   list(): Promise<IdentityRow[]>;
-  /**
-   * Copies the rows the object kept (task #18 cutover). An object row replaces a D1 row only when
-   * that row came from open sign-up: in the moments between the deploy and the import, sign-up
-   * can write a derived row for someone whose invitation still sits in the object, and the
-   * object's row is the one the operator meant. A row the operator wrote to D1 is newer intent.
-   * Remove with /admin/identity/import once production has imported.
-   */
-  importRows(rows: IdentityRow[]): Promise<ImportReport>;
 }
 
 const COLUMNS = "provider_key, agent_id, tenant_id, added_by, created_at";
@@ -96,27 +79,6 @@ export function d1Identities(db: D1Database): IdentityDirectory {
       return (results as any[]).map((r) => ({
         key: String(r.provider_key), ...invitation(r), addedBy: String(r.added_by), createdAt: Number(r.created_at),
       }));
-    },
-    async importRows(rows) {
-      const { results } = await db.prepare("SELECT provider_key, added_by FROM identities").all();
-      const had = new Map((results as any[]).map((r) => [String(r.provider_key), String(r.added_by)]));
-      const report: ImportReport = { read: rows.length, inserted: 0, replacedSelf: 0, kept: 0 };
-      for (const r of rows) {
-        const by = had.get(r.key);
-        if (by === undefined) report.inserted++;
-        else if (by === "self") report.replacedSelf++;
-        else report.kept++;
-      }
-      if (rows.length === 0) return report;
-      // The rule is in the statement, not in the counting above: the counts describe the batch,
-      // the WHERE decides it.
-      await db.batch(rows.map((r) => db.prepare(
-        `INSERT INTO identities(${COLUMNS}) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(provider_key) DO UPDATE SET agent_id = excluded.agent_id, tenant_id = excluded.tenant_id,
-           added_by = excluded.added_by, created_at = excluded.created_at
-         WHERE identities.added_by = 'self'`,
-      ).bind(r.key, r.agentId, r.tenantId, r.addedBy, r.createdAt)));
-      return report;
     },
   };
 }

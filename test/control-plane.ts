@@ -30,7 +30,6 @@ function directory(seed: Record<string, Invitation & { addedBy: string }> = {}) 
     },
     async remove(key) { rows.delete(key); },
     async list() { return [] as IdentityRow[]; },
-    async importRows() { throw new Error("not used here"); },
   };
   return { dir, rows, writes, hooks };
 }
