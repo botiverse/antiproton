@@ -12,20 +12,26 @@
  * Shapes only, chosen to be specific: a false positive costs one deliberate
  * "send anyway", a false negative costs a leaked secret, and a shape so loose it
  * refuses ordinary text would teach people to send anyway by reflex.
+ *
+ * Two sources. A plugin that takes a credential declares what it looks like
+ * (CredentialSpec.looksLike, #349), so a match names the mount it belongs in and
+ * the shape lives in one place, beside the form that takes it. What no plugin
+ * takes stays in the generic list below, and matches it with no plugin: there is
+ * nowhere to put it, and the refusal says so.
  */
+import { recogniseCredentials, type Plugin } from "../../src/plugins/types.ts";
+import { githubPlugin } from "../../src/plugins/github.ts";
 
-export type SecretKind =
-  | "github-token"
-  | "api-key"
-  | "aws-access-key"
-  | "private-key"
-  | "slack-token"
-  | "url-with-password"
-  | "neon-password";
+/**
+ * The plugins whose credential declares what it looks like. Recognition runs in the
+ * Worker, before an Agents API session exists (a refused request leaves nothing), where
+ * the runtime's own plugin list is not at hand. test/secret-shape.ts fails when a plugin
+ * under src/plugins declares `looksLike` and is missing here.
+ */
+export const SHAPE_DECLARING_PLUGINS: ReadonlyArray<Pick<Plugin, "id" | "credential">> = [githubPlugin];
 
-const SHAPES: ReadonlyArray<readonly [SecretKind, RegExp]> = [
-  // Classic and fine-grained GitHub tokens: a fixed prefix and a long random body.
-  ["github-token", /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})/],
+/** Credentials no plugin takes, so none declares them. */
+const GENERIC_SHAPES: ReadonlyArray<readonly [string, RegExp]> = [
   // OpenAI-style and Anthropic keys.
   ["api-key", /\bsk-(?:ant-[a-z0-9]+-|proj-)?[A-Za-z0-9_-]{32,}/],
   ["aws-access-key", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
@@ -36,26 +42,42 @@ const SHAPES: ReadonlyArray<readonly [SecretKind, RegExp]> = [
   ["neon-password", /\bnpg_[A-Za-z0-9]{12,}/],
 ];
 
-/** The kind of credential the text looks like, or null. Never returns any of the text. */
-export function secretShape(text: string): SecretKind | null {
-  for (const [kind, shape] of SHAPES) if (shape.test(text)) return kind;
+/**
+ * What the text looks like, and which plugins' mounts take that kind (empty when none does).
+ * Never returns any of the text.
+ */
+export function secretMatch(text: string): { kind: string; plugins: string[] } | null {
+  const declared = recogniseCredentials(text, [...SHAPE_DECLARING_PLUGINS]);
+  if (declared.length) {
+    const kind = declared[0]!.kind;
+    return { kind, plugins: [...new Set(declared.filter((d) => d.kind === kind).map((d) => d.plugin))] };
+  }
+  for (const [kind, shape] of GENERIC_SHAPES) if (shape.test(text)) return { kind, plugins: [] };
   return null;
 }
 
+/** The kind of credential the text looks like, or null. Never returns any of the text. */
+export function secretShape(text: string): string | null {
+  return secretMatch(text)?.kind ?? null;
+}
+
 /**
- * The console's refusal: 422 with the kind, and nothing of the text, so the page can keep what the person
- * typed, say where a credential goes, and offer to send it anyway. `allow` is that deliberate second send.
+ * The console's refusal: 422 with the kind and the plugins that take it, and nothing of the text,
+ * so the page can keep what the person typed, point at the mount that takes it (or say none does),
+ * and offer to send it anyway. `allow` is that deliberate second send.
  */
 export function refuseSecret(text: string, allow: boolean): Response | null {
   if (allow) return null;
-  const kind = secretShape(text);
-  if (!kind) return null;
+  const match = secretMatch(text);
+  if (!match) return null;
+  const where = match.plugins.length
+    ? `It belongs in the credential form of a ${match.plugins.join(" or ")} mount (the plugins page), where the agent can use it and the model never sees it.`
+    // No plugin takes a database connection string, for one (Piper): there is nowhere to put it.
+    : "No mount here takes this kind of credential, so do not paste it into chat.";
   return Response.json({
-    // Not every kind has a mount to go to (none takes a database connection string, Piper): the line says so.
-    error: `This looks like a ${kind}. It was not sent. A credential belongs in the credential form of the mount that uses it `
-      + `(the plugins page), where the agent can use it and the model never sees it; if no mount takes this kind, `
-      + `do not paste it here. If it is not a credential, send it anyway.`,
+    error: `This looks like a ${match.kind}. It was not sent. ${where} If it is not a credential, send it anyway.`,
     secret: true,
-    kind,
+    kind: match.kind,
+    plugins: match.plugins,
   }, { status: 422, headers: { "cache-control": "no-store" } });
 }

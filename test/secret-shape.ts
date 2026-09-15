@@ -4,7 +4,10 @@
  * The values below are built at run time from repeated characters, so nothing
  * in this file is itself shaped like a real secret for a scanner to flag.
  */
-import { secretShape } from "../cf/src/secret-shape.ts";
+import { secretShape, secretMatch, SHAPE_DECLARING_PLUGINS } from "../cf/src/secret-shape.ts";
+
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -48,6 +51,30 @@ check("ordinary text that only resembles part of a shape is not refused", () => 
   for (const text of plain) assert(secretShape(text) === null, `ordinary text was refused as ${secretShape(text)}: ${JSON.stringify(text.slice(0, 40))}`);
 });
 
+check("a GitHub token is recognised by the github plugin's own declaration and names it; what no plugin takes names none", () => {
+  // One shape per credential, beside the form that takes it (#349): the generic list has no GitHub row to drift.
+  const token = "gh" + "p_" + r("f", 36);
+  const gh = secretMatch(`token ${token}`);
+  assert(gh?.kind === "github-token" && JSON.stringify(gh.plugins) === '["github"]', `github token: ${JSON.stringify(gh)}`);
+  const dsn = secretMatch("postgresql://owner:" + r("p", 12) + "@db.example.com/app");
+  assert(dsn?.kind === "url-with-password" && dsn.plugins.length === 0, `connection string: ${JSON.stringify(dsn)}`);
+});
+
+check("every plugin that declares what its credential looks like is one the Worker recognises", () => {
+  // Recognition runs where the runtime's plugin list is not at hand, so the list is explicit; this keeps it whole.
+  const { readdirSync, readFileSync } = require("node:fs") as typeof import("node:fs");
+  const dir = new URL("../src/plugins/", import.meta.url);
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ts") && f !== "types.ts");
+  assert(files.length >= 5, `read only ${files.length} plugin files, so this checked nothing`);
+  const declaring = files.filter((f) => /\blooksLike\s*:/.test(readFileSync(new URL(f, dir), "utf8")));
+  assert(declaring.length >= 1, "no plugin declares looksLike, so this checked nothing");
+  const listed = new Set(SHAPE_DECLARING_PLUGINS.map((p) => p.id));
+  for (const f of declaring) {
+    const id = /\bid:\s*"([^"]+)"/.exec(readFileSync(new URL(f, dir), "utf8"))?.[1];
+    assert(id && listed.has(id), `${f} declares looksLike but plugin ${id} is not in SHAPE_DECLARING_PLUGINS`);
+  }
+});
+
 check("the answer is a kind name and carries none of the text", () => {
   const token = "gh" + "p_" + r("c", 36);
   const kind = secretShape(`token ${token}`);
@@ -61,7 +88,7 @@ pending.push((async () => {
   const res = refuseSecret(`use ${token} please`, false);
   const ok = res !== null && res.status === 422 && res.headers.get("cache-control") === "no-store";
   const body: any = res ? await res.json() : null;
-  const clean = body && body.secret === true && body.kind === "github-token" && !JSON.stringify(body).includes("ddd");
+  const clean = body && body.secret === true && body.kind === "github-token" && JSON.stringify(body.plugins) === '["github"]' && !JSON.stringify(body).includes("ddd");
   const allowed = refuseSecret(`use ${token} please`, true) === null && refuseSecret("hello", false) === null;
   results.push({ name: "the console's refusal is 422 with the kind and none of the text, and a deliberate resend passes",
     ok: Boolean(ok && clean && allowed), ...(ok && clean && allowed ? {} : { error: `status ${res?.status} body ${JSON.stringify(body)} allowed ${allowed}` }) });
