@@ -19,13 +19,20 @@ type Json = Record<string, unknown>;
 /**
  * The custom entry written right after a turn is cancelled. pi's abort ends the
  * run and drops its model call but appends nothing (measured 2026-09-14), so
- * without this a cancelled turn reads as a prompt never picked up. Custom
- * entries are not projected into the model's context.
+ * without this a cancelled turn reads as a prompt never picked up. The runtime
+ * also projects it into the model's context as CANCELLED_NOTE: without that the
+ * cancelled request stays in the history as if still open, and the next turn
+ * carried it out (QA, 2026-09-15: asked only for "OK", the model wrote the
+ * cancelled story).
  *
  * Depends on: @earendil-works/pi-agent-core 0.85.1 — lane.abort appending no entry (measured). If an
  *   upgrade records aborts itself, re-check whether this marker is still needed.
  */
 export const TURN_CANCELLED = "agents_api.turn_cancelled";
+
+/** What the model is shown where a turn was cancelled. */
+export const CANCELLED_NOTE =
+  "[The request above was cancelled by the user before it finished. Do not continue or complete it; respond only to what follows.]";
 type TurnStatus = "queued" | "in_progress" | "waiting" | "completed" | "failed" | "cancelled";
 
 export interface ApiTurn {

@@ -251,6 +251,32 @@ await check("取消一轮:模型调用被丢掉,留下一条点名这一轮的�
   await f.agent.close();
 });
 
+await check("取消标记若被投射,下一轮模型请求里就有那句说明,被取消的请求不会被当成还没做完", async () => {
+  const host = sqliteHost();
+  const agent = await PiAgent.open({
+    host, sessionId: "s", systemPrompt: "be brief", model: MODEL, tools: TOOLS,
+    toolHost: { async invoke() { return { status: "succeeded", result: { ok: true } }; } },
+    async dispatch() {},
+    entryProjectors: { "test.turn_cancelled": (e) => [{ role: "user", content: [{ type: "text", text: "NOTE: cancelled" }], timestamp: e.timestamp }] },
+  });
+  const w = worker(agent);
+  await agent.say("write a long story");
+  await agent.step();
+  if (!(await agent.cancel("test.turn_cancelled"))) throw new Error("nothing was cancelled");
+  await agent.say("just say OK");
+  await agent.step();
+  const job = w.pending(host)[0];
+  if (!job) throw new Error("no model call after the new prompt");
+  const request: any = agent.takeJob(String(job.id));
+  const texts = (request?.context?.messages ?? []).map((m: any) => (Array.isArray(m.content) ? m.content.map((c: any) => c.text ?? "").join("") : String(m.content)));
+  const at = (needle: string) => texts.findIndex((t: string) => t.includes(needle));
+  if (at("NOTE: cancelled") < 0) throw new Error(`the note is not in the model's context: ${JSON.stringify(texts)}`);
+  if (!(at("write a long story") < at("NOTE: cancelled") && at("NOTE: cancelled") < at("just say OK"))) {
+    throw new Error(`the note is not between the cancelled request and the new one: ${JSON.stringify(texts)}`);
+  }
+  await agent.close();
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

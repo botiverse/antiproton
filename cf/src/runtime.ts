@@ -24,7 +24,7 @@ import {
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
-import { callTurns, TURN_CANCELLED } from "./agents-api/transcript.ts";
+import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
 import {
   answerClientCall, clientTools, dropClientCalls, pendingClientCalls, resumeClientCalls,
 } from "../../src/runtime/client-calls.ts";
@@ -980,6 +980,11 @@ export class AgentRuntime {
     ];
 
     const agent = await PiAgent.open({
+      // A cancelled turn's request stays in the history, so the model is told it was cancelled; otherwise the
+      // next turn finishes it (QA, 2026-09-15).
+      entryProjectors: {
+        [TURN_CANCELLED]: (entry) => [{ role: "user", content: [{ type: "text", text: CANCELLED_NOTE }], timestamp: entry.timestamp }],
+      },
       host: this.#deps.ctx.storage,
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       session,
