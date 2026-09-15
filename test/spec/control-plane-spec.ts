@@ -117,6 +117,20 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert((await keys.issueWithin({ ...me, hash: "after", label: "after" }, 3)) === true, "a revoked key still counted against the limit");
   });
 
+  add("revokes and creates at the same time never leave more live keys than the limit", async () => {
+    const me = { tenantId: "t", ownerAgentId: "u-me" };
+    for (let i = 0; i < 3; i++) await keys.issue({ ...me, hash: `r${i}`, label: `r${i}` });
+    // At the limit: one revoke and four creates race. Whatever order D1 runs them in, one create at most fits.
+    const [revoked, ...created] = await Promise.all([
+      keys.revokeOwned("r0", me),
+      ...Array.from({ length: 4 }, (_, i) => keys.issueWithin({ ...me, hash: `n${i}`, label: `n${i}` }, 3)),
+    ]);
+    const live = (await keys.list(me)).filter((k) => k.revokedAt === null).length;
+    assert(revoked === true, "the revoke did not happen");
+    assert(created.filter(Boolean).length <= 1 && live <= 3, `created ${created.filter(Boolean).length}, live ${live}`);
+    assert(live === 3 - 1 + created.filter(Boolean).length, `live ${live} does not match what was revoked and created`);
+  });
+
   add("a person revokes only their own key", async () => {
     await keys.issue({ hash: "k5", tenantId: "t", ownerAgentId: "u-other", label: "theirs" });
     assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-me" })) === false, "revoked another owner's key");
