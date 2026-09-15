@@ -60,7 +60,14 @@
     // on the node mount, operator model account, a shared tenant quota) and
     // will tighten when needed (tygg, 2026-09-12 04:54Z). Set to 0 to close.
     "GITHUB_OPEN_SIGNUP": "1",
-    "UI_ORIGIN": "https://antiproton.ai"
+    "UI_ORIGIN": "https://antiproton.ai",
+    // The container lease (tygg, 2026-09-15 11:28Z: a container is destroyed by
+    // the agent's own release, not by the end of a turn). Kept between turns;
+    // the agent is asked after 10 idle minutes and the box is taken at 30,
+    // whatever it answered. Plain vars, never secrets: a secret of the same
+    // name would outlive a deploy that changed these.
+    "RUN9_IDLE_MINUTES": "10",
+    "RUN9_MAX_IDLE_MINUTES": "30"
   },
   "observability": { "enabled": true }
 }

@@ -33,7 +33,10 @@
     "ARTIFACT_BUCKET": "antiproton-preview-artifacts",
     // Open to look at until the Access application exists; the write routes
     // refuse the anonymous viewer regardless, and there are no keys to spend.
-    "UI_ALLOW_ANONYMOUS": "1"
+    "UI_ALLOW_ANONYMOUS": "1",
+    // Same container lease as production (cf/wrangler.jsonc says why).
+    "RUN9_IDLE_MINUTES": "10",
+    "RUN9_MAX_IDLE_MINUTES": "30"
   },
   "observability": { "enabled": true }
 }

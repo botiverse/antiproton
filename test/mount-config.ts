@@ -813,6 +813,29 @@ await check("run, shell and the per-execution reminder end the container the sam
   const run = run9.tools.find((t) => t.name === "run")!.summary;
   const shell = run9.tools.find((t) => t.name === "shell")!.summary;
   const reminder = boxReminder("box");
+  // With a lease (tygg, 2026-09-15) all three state the other lifetime, and none of them the turn's.
+  const lease = { afterMs: 10 * 60_000, maxMs: 30 * 60_000 };
+  const leased = sandboxPlugin(null as any, "local", lease);
+  const leasedReminder = boxReminder("box", lease);
+  for (const [where, text] of [
+    ["leased run", leased.tools.find((t) => t.name === "run")!.summary],
+    ["leased shell", leased.tools.find((t) => t.name === "shell")!.summary],
+    ["the leased reminder", leasedReminder],
+  ] as const) {
+    if (!/until you release it/.test(text) || !/later ones/.test(text)) {
+      throw new Error(`${where} does not say the container stays, in later turns, until the agent releases it: ${text.slice(0, 200)}`);
+    }
+    if (!/goes idle for 10 minutes/.test(text) || !/at 30 minutes idle it is released/.test(text)) {
+      throw new Error(`${where} does not state the lease's own numbers: ${text.slice(0, 240)}`);
+    }
+    if (/handed back when the turn ends|every call in this turn uses/.test(text)) {
+      throw new Error(`${where} still ends the container with the turn under a lease: ${text.slice(0, 200)}`);
+    }
+  }
+  // Silence has a consequence under a lease, and the reminder is the one an agent holds when it matters.
+  if (!/\bkeep\b/.test(leasedReminder) || !leasedReminder.includes("box")) {
+    throw new Error(`the leased reminder does not name what survives it, or the mount: ${leasedReminder}`);
+  }
   for (const [where, text] of [["run", run], ["shell", shell], ["the reminder", reminder]] as const) {
     // Each says how far the container reaches: every call in this turn, which
     // is the part an agent can plan against.
@@ -1092,11 +1115,17 @@ await check("the container's wording and the lease switch say the same thing", a
     return m ? Number(m[1]) : 0;
   };
   const leaseOn = setting("RUN9_IDLE_MINUTES") > 0 && setting("RUN9_MAX_IDLE_MINUTES") > 0;
+  // The plugin as this deployment builds it: cf/src/runtime.ts hands it the lease these two numbers make
+  // (cf/src/index.ts), so the wording checked is the wording production sends.
+  const lease = leaseOn
+    ? { afterMs: setting("RUN9_IDLE_MINUTES") * 60_000, maxMs: setting("RUN9_MAX_IDLE_MINUTES") * 60_000 }
+    : null;
+  const deployed = sandboxPlugin(null as any, "local", lease);
 
   const says = [
-    ["run", run9.tools.find((t) => t.name === "run")!.summary],
-    ["shell", run9.tools.find((t) => t.name === "shell")!.summary],
-    ["the reminder", boxReminder("box")],
+    ["run", deployed.tools.find((t) => t.name === "run")!.summary],
+    ["shell", deployed.tools.find((t) => t.name === "shell")!.summary],
+    ["the reminder", boxReminder("box", lease)],
   ] as const;
   for (const [where, text] of says) {
     const promises = /goes idle|idle long enough|asked whether to keep/.test(text);
@@ -1105,6 +1134,9 @@ await check("the container's wording and the lease switch say the same thing", a
     }
     if (!leaseOn && promises) {
       throw new Error(`${where} promises the idle question, and no lease is configured to ask it: ${text.slice(0, 140)}`);
+    }
+    if (leaseOn && !text.includes(`at ${setting("RUN9_MAX_IDLE_MINUTES")} minutes idle`)) {
+      throw new Error(`${where} does not state the configured ceiling (${setting("RUN9_MAX_IDLE_MINUTES")} minutes): ${text.slice(0, 200)}`);
     }
   }
 });
