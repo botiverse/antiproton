@@ -413,7 +413,11 @@ export function asBoxState(v: Json): BoxState | null {
   // exists and is billed, so answering "nothing is running" would start a
   // second one and leave this one for nobody to release. Dropped, not
   // repaired — a guessed `lastUsedAt` is a reading nobody took, and the window
-  // already forgets entries without saying so. Unread, an element is worse
+  // already forgets entries without saying so. The cost is chosen, not missed:
+  // a corrupt `envs` reads as "nothing kept", so the agent rebuilds instead of
+  // being told, and the snapshots it named stay in run9 with nothing here
+  // naming them. That is one wasted setup against a second container nobody
+  // releases, for a shape no version of this code writes. Unread, an element is worse
   // than a miss: `null` throws at `s.boxId` or `e.name`, and one missing a
   // field ships `undefined` into the console's usage report (Rex, 2026-09-12
   // for the lists, 2026-09-15 for what is in them).
