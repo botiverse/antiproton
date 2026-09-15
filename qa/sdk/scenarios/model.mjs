@@ -90,6 +90,59 @@ export default [
     },
   },
   {
+    name: "a function the caller answers only after requires_action: the turn pauses, then resumes with the result",
+    tier: "model",
+    async run(ctx) {
+      // The pause path, made certain: this client ignores the call when it first appears and answers only
+      // once the session asks (requires_action), so the object has always paused the turn by then. The
+      // toolHandlers scenario above usually takes the other path; together the two cover both every run.
+      const { client, assert } = ctx;
+      const { session } = await agentWithSession(ctx, {
+        instructions: "For weather questions always call get_weather, then answer in one sentence using its result.",
+        tools: [{
+          type: "function", name: "get_weather", description: "Current weather for a city.",
+          parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false },
+        }],
+      });
+      const stream = await client.beta.agents.sessions.events.stream(session.id);
+      await client.beta.agents.sessions.events.create(session.id, {
+        events: [{ type: "agent.session.input.message", input: [{ role: "user", content: [{ type: "input_text", text: "What's the weather in Bergen right now?" }] }] }],
+      });
+      const types = [];
+      let asked = null, answered = false, ended = null, text = "";
+      const deadline = Date.now() + 180_000;
+      for await (const e of stream) {
+        types.push(e.type);
+        if (e.type === "agent.session.requires_action" && !answered) {
+          asked = e.session?.required_actions?.[0] ?? null;
+          assert(asked?.type === "function_call" && asked.name === "get_weather" && asked.call_id && asked.turn_id, `required_actions: ${JSON.stringify(e.session?.required_actions)}`);
+          await client.beta.agents.sessions.events.create(session.id, {
+            events: [{ type: "agent.session.input.tool_result", turn_id: asked.turn_id, call_id: asked.call_id, success: true,
+              output: JSON.stringify({ city: "Bergen", forecast: "heavy rain", temperature_c: 9 }) }],
+          });
+          answered = true;
+        }
+        if (e.type === "agent.session.turn.output_text.done") text += e.text;
+        if (/^agent\.session\.turn\.(completed|failed|cancelled)$/.test(e.type) && answered) ended = e.type;
+        if (e.type === "agent.session.idle" && ended) break;
+        if (Date.now() > deadline) break;
+      }
+      stream.controller.abort();
+      assert(asked, `the turn never paused for the caller: ${types}`);
+      assert(/bergen/i.test(String(JSON.parse(String(asked.arguments || "{}")).city)), `the call's arguments: ${JSON.stringify(asked.arguments)}`);
+      assert(ended === "agent.session.turn.completed", `after the result the turn ended ${ended}: ${types}`);
+      assert(/9|heavy rain/i.test(text), `the answer does not use the result: ${JSON.stringify(text)}`);
+      const s = await client.beta.agents.sessions.retrieve(session.id);
+      assert(s.status === "idle" && s.required_actions.length === 0, `session after: ${s.status} ${JSON.stringify(s.required_actions)}`);
+      const items = [];
+      for await (const i of client.beta.agents.sessions.items.list(session.id, { order: "asc" })) items.push(i);
+      const outputs = items.filter((i) => i.type === "function_call_output");
+      assert(outputs.length === 1 && String(outputs[0].output).includes("heavy rain"), `outputs: ${JSON.stringify(outputs)}`);
+      assert(!JSON.stringify(items).includes("waiting for the caller"), "the placeholder result is visible in the history");
+      return `paused (requires_action for ${asked.name} ${asked.arguments}) · answer ${JSON.stringify(text)}`;
+    },
+  },
+  {
     name: "cancelling a real turn mid-answer, then the next turn still answers",
     tier: "model",
     async run(ctx) {
