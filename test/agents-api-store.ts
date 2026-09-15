@@ -1,12 +1,11 @@
 /**
- * What the OpenAI-compatible agents API remembers (task #17): keys that stop
- * resolving once revoked, agents and sessions indexed in the owner's object that
+ * What the OpenAI-compatible agents API remembers (task #17) in objects: agents and sessions indexed in the owner's object that
  * disappear from the API when deleted, ids that are valid object names, and the
  * store's new way to update an agent's config.
  */
 import {
-  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, issueKeyRow, listApiAgents, listApiSessions,
-  lookupKeyRow, mintAgentId, mintSessionId, putApiAgent, putApiSession, revokeKeyRow, touchApiSession,
+  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  mintAgentId, mintSessionId, putApiAgent, putApiSession, touchApiSession,
 } from "../cf/src/agents-api/store.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
@@ -19,19 +18,6 @@ async function check(name: string, fn: () => Promise<void>) {
 function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 const now = 1_800_000_000_000;
 const agentCfg = (name: string) => ({ name, instructions: null, model: "m", metadata: {}, tools: [], createdAt: now, updatedAt: now });
-
-await check("a key resolves to its tenant and owner until it is revoked, and never after", async () => {
-  const host = sqliteHost(); const sql = host.sql as any;
-  try {
-    issueKeyRow(sql, { hash: "h1", tenantId: "t-me", ownerAgentId: "u-me", label: "ci" }, now);
-    const r = lookupKeyRow(sql, "h1");
-    assert(r?.tenantId === "t-me" && r?.ownerAgentId === "u-me", `lookup: ${JSON.stringify(r)}`);
-    assert(lookupKeyRow(sql, "nope") === null, "an unknown hash resolved");
-    assert(revokeKeyRow(sql, "h1", now + 1) === true, "revoking a live key reported nothing");
-    assert(lookupKeyRow(sql, "h1") === null, "a revoked key still resolves");
-    assert(revokeKeyRow(sql, "h1", now + 2) === false, "revoking twice reported a revoke");
-  } finally { host.dispose(); }
-});
 
 await check("ids are valid object names, distinct, and refuse an owner too long to extend", async () => {
   const a = mintAgentId("u-automation_mu02ye2p", now); const b = mintAgentId("u-automation_mu02ye2p", now);

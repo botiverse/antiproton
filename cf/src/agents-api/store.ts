@@ -31,34 +31,6 @@ export function mintAgentId(ownerAgentId: string, now: number = Date.now()): str
 
 export const mintSessionId = () => `sess_${hex(12)}`;
 
-// ---- keys (in the identities object) --------------------------------------
-
-export function ensureKeyTable(sql: Sql) {
-  sql.exec(`CREATE TABLE IF NOT EXISTS api_keys(
-    hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_agent_id TEXT NOT NULL,
-    label TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER)`);
-}
-
-export function issueKeyRow(sql: Sql, row: { hash: string; tenantId: string; ownerAgentId: string; label: string }, now = Date.now()) {
-  ensureKeyTable(sql);
-  sql.exec("INSERT INTO api_keys(hash, tenant_id, owner_agent_id, label, created_at) VALUES (?,?,?,?,?)",
-    row.hash, row.tenantId, row.ownerAgentId, row.label, now);
-}
-
-/** A key resolves only while it is not revoked. */
-export function lookupKeyRow(sql: Sql, hash: string): { tenantId: string; ownerAgentId: string } | null {
-  ensureKeyTable(sql);
-  const r = sql.exec("SELECT tenant_id, owner_agent_id FROM api_keys WHERE hash = ? AND revoked_at IS NULL", hash).toArray()[0] as any;
-  return r ? { tenantId: String(r.tenant_id), ownerAgentId: String(r.owner_agent_id) } : null;
-}
-
-export function revokeKeyRow(sql: Sql, hash: string, now = Date.now()): boolean {
-  ensureKeyTable(sql);
-  const before = sql.exec("SELECT 1 AS x FROM api_keys WHERE hash = ? AND revoked_at IS NULL", hash).toArray().length;
-  sql.exec("UPDATE api_keys SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL", now, hash);
-  return before > 0;
-}
-
 // ---- agents and sessions (in the owner's object) ---------------------------
 
 export function ensureApiTables(sql: Sql) {

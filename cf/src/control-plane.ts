@@ -19,8 +19,8 @@
  *   object is created on first use and records its (tenant, agent) then (AgentDO #claim), so
  *   sign-in builds nothing and has nothing to undo if the first request never comes.
  *
- * Schema: cf/migrations/0001_identities.sql, applied by cf/scripts/deploy.sh before the Worker
- * ships. Depends on: that file. A column changed there is changed in the queries below.
+ * Schema: cf/migrations/0001_identities.sql and 0002_api_keys.sql, applied by cf/scripts/deploy.sh
+ * before the Worker ships. Depends on: those files. A column changed there is changed in the queries below.
  */
 
 /** What sign-in needs from a row. */
@@ -107,4 +107,41 @@ export async function admit(
   } catch (e) {
     return { ok: false, reason: "unavailable", error: String((e as Error)?.message ?? e) };
   }
+}
+
+/**
+ * Agents API keys (task #17): which tenant and owner a bearer key speaks for. The same kind of fact as an
+ * invitation — who may call, and as whom — so it lives here rather than in an agent object, where it sat
+ * while the Agents API was a branch. Only the hash is stored (agents-api/keys.ts); the key is shown once.
+ */
+export interface ApiKeyOwner {
+  tenantId: string;
+  ownerAgentId: string;
+}
+
+export interface ApiKeyDirectory {
+  issue(row: ApiKeyOwner & { hash: string; label: string }): Promise<void>;
+  /** A key resolves only while it is not revoked. */
+  lookup(hash: string): Promise<ApiKeyOwner | null>;
+  /** Whether a live key was revoked by this call. */
+  revoke(hash: string): Promise<boolean>;
+}
+
+export function d1ApiKeys(db: D1Database, now: () => number = Date.now): ApiKeyDirectory {
+  return {
+    async issue(row) {
+      await db.prepare("INSERT INTO api_keys(hash, tenant_id, owner_agent_id, label, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(row.hash, row.tenantId, row.ownerAgentId, row.label, now()).run();
+    },
+    async lookup(hash) {
+      const r: any = await db.prepare("SELECT tenant_id, owner_agent_id FROM api_keys WHERE hash = ? AND revoked_at IS NULL")
+        .bind(hash).first();
+      return r ? { tenantId: String(r.tenant_id), ownerAgentId: String(r.owner_agent_id) } : null;
+    },
+    async revoke(hash) {
+      const res = await db.prepare("UPDATE api_keys SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL")
+        .bind(now(), hash).run();
+      return Number(res.meta?.changes ?? 0) > 0;
+    },
+  };
 }

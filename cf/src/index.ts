@@ -19,8 +19,8 @@ import { apiAgentSeeds } from "./agents-api/provisioning.ts";
 import { watchChanges } from "./agents-api/watch.ts";
 import { openAIError, type StoredAgent, type StoredSession } from "./agents-api/shapes.ts";
 import {
-  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, issueKeyRow, listApiAgents, listApiSessions,
-  lookupKeyRow, mintAgentId, mintSessionId, putApiAgent, putApiSession, revokeKeyRow,
+  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  mintAgentId, mintSessionId, putApiAgent, putApiSession,
 } from "./agents-api/store.ts";
 import { maskRawRefs } from "../../src/store/refs.ts";
 import { chatPanel } from "./chat.ts";
@@ -71,7 +71,7 @@ import {
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
-import { admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
+import { d1ApiKeys, admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -1260,13 +1260,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   // ---- OpenAI-compatible agents API (task #17) -------------------------------
-  // Keys live, as hashes, in the object the sign-in table used to share (see apiKeyObject).
-  async apiKeyIssue(hash: string, tenantId: string, ownerAgentId: string, label: string) {
-    issueKeyRow(this.sql, { hash, tenantId, ownerAgentId, label });
-    return { ok: true as const };
-  }
-  async apiKeyLookup(hash: string) { return lookupKeyRow(this.sql, hash); }
-  async apiKeyRevoke(hash: string) { return revokeKeyRow(this.sql, hash); }
+  // Keys are control-plane data and live in D1 (cf/src/control-plane.ts d1ApiKeys).
 
   // The owner's object indexes the agents and sessions its key created.
   // An agent's tools carry JSON Schema (recursive Json), which the RPC stub types
@@ -2220,15 +2214,6 @@ function identities(env: Env): IdentityDirectory {
   return d1Identities(env.CONTROL_DB);
 }
 
-/**
- * The object that holds Agents API keys (task #17): the one the sign-in table lived in before it moved to
- * D1 (task #18), kept so keys already issued on preview stay valid. Keys are control-plane data too, and
- * belong in D1 with the invitations when this branch is merged.
- */
-function apiKeyObject(env: Env) {
-  return env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", "identities")));
-}
-
 /** A refusal the browser sees as a page and a CLI sees as typed JSON. */
 function refuse(request: Request, reason: RefusalReason, hint: string, status = 403): Response {
   const wantsHtml = (request.headers.get("accept") ?? "").includes("text/html");
@@ -2434,7 +2419,7 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   const tenantId = String(b?.tenantId ?? ""), ownerAgentId = String(b?.ownerAgentId ?? ""), label = String(b?.label ?? "");
   try { agentObjectName(tenantId, ownerAgentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
   const key = newApiKey();
-  await apiKeyObject(env).apiKeyIssue(await hashApiKey(key), tenantId, ownerAgentId, label);
+  await d1ApiKeys(env.CONTROL_DB).issue({ hash: await hashApiKey(key), tenantId, ownerAgentId, label });
   return Response.json({ key, tenantId, ownerAgentId, label });
 }
 
@@ -2442,7 +2427,7 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
 async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const key = bearerKey(request);
   if (!key) return openAIError(401, "Missing or malformed API key. Send Authorization: Bearer <key>.", { code: "invalid_api_key" });
-  const row = await apiKeyObject(env).apiKeyLookup(await hashApiKey(key));
+  const row = await d1ApiKeys(env.CONTROL_DB).lookup(await hashApiKey(key));
   if (!row) return openAIError(401, "Incorrect API key provided.", { code: "invalid_api_key" });
   const { tenantId, ownerAgentId } = row;
   const owner = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, ownerAgentId)));
