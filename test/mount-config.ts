@@ -1422,6 +1422,46 @@ await check("an unreadable session or environment is dropped, and the container 
 });
 
 /**
+ * A new container does not forget what was kept.
+ *
+ * Release carries `envs` over on purpose: a forked snapshot outlives the box it
+ * came from. Creation then wrote the new record without them, so the first
+ * command in the next container erased the list — `start_from` answered
+ * "nothing kept", and the snapshots stayed in run9, billed, with nothing here
+ * naming them (Piper, 2026-09-15, found while recording images).
+ */
+await check("starting a new container keeps the list of kept environments", async () => {
+  const kept = globalThis.fetch;
+  let n = 0;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const path = String(url);
+    if (init?.method === "POST" && /background-execs$/.test(path)) return new Response(JSON.stringify({ exec_id: `e${++n}` }));
+    if (/execs\/e\d+$/.test(path)) {
+      return new Response(JSON.stringify({ state: "succeeded", exit_code: 0, output_summary: "ok\n__AP_CWD__/work\n" }));
+    }
+    return new Response("{}");
+  }) as any;
+  let stored: any = { boxId: "", createdAt: 0, lastUsedAt: 0, sessions: [],
+    envs: [{ name: "ready", snapId: "s-1", savedAt: 5 }] };
+  const ctx: any = {
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: JSON.stringify({ ak: "a", sk: "b" }),
+    publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
+    connection: { get: async () => stored, set: async (v: unknown) => { stored = v; } },
+    sibling: async () => null,
+  };
+  try {
+    await sandboxPlugin(null as any, "local").invoke("shell", { command: "echo ok" } as any, ctx);
+    if (!stored.boxId) throw new Error("no container was started, so this case checked nothing");
+    if (stored.envs?.[0]?.snapId !== "s-1") throw new Error(`the new container's record lost what was kept: ${JSON.stringify(stored.envs)}`);
+    const listed: any = await sandboxPlugin(null as any, "local").invoke("start_from", {} as any, ctx);
+    if (listed.kept?.[0]?.name !== "ready") throw new Error(`start_from lists ${JSON.stringify(listed)}`);
+  } finally {
+    globalThis.fetch = kept;
+  }
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",

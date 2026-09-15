@@ -1163,8 +1163,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
     // One box per mount, remembered, so an install survives to the next call.
     let state = asBoxState(await ctx.connection.get());
-    // An emptied record keeps the session history but has no box.
+    // An emptied record keeps the session history and what was kept, but has no box.
     const history = state?.sessions ?? [];
+    const kept = state?.envs ?? [];
     if (state && !state.boxId) state = null;
     if (!state) {
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
@@ -1229,6 +1230,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
         sessions: history,
+        // Release carries these over because a snapshot outlives its box; a new
+        // record written without them erased the list on the next container's
+        // first command, stranding the snapshots in run9 with nothing naming them.
+        ...(kept.length ? { envs: kept } : {}),
         ...(Object.keys(placeholders).length ? { placeholders } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
