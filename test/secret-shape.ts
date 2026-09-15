@@ -95,6 +95,22 @@ pending.push((async () => {
 })());
 await Promise.all(pending);
 
+check("every route that takes a person's text for an agent refuses a credential before it reaches the agent", () => {
+  // /ui/message and /agent/message both accept a signed-in person (Vera found the second); each must call
+  // refuseSecret before it hands the text on. The Agents API has its own check in handlers.ts.
+  const { readFileSync } = require("node:fs") as typeof import("node:fs");
+  const src = readFileSync(new URL("../cf/src/index.ts", import.meta.url), "utf8");
+  const routes: Array<[string, string]> = [["/ui/message", "stub.uiSay("], ["/agent/message", "stub.startTask("]];
+  for (const [route, send] of routes) {
+    const start = src.indexOf(`case "${route}": {`);
+    assert(start >= 0, `${route} was not found in cf/src/index.ts, so this checked nothing`);
+    const body = src.slice(start, src.indexOf("\n        case ", start + 10));
+    const refuse = body.indexOf("refuseSecret("), hand = body.indexOf(send);
+    assert(hand >= 0, `${route} no longer calls ${send}, so this check describes nothing`);
+    assert(refuse >= 0 && refuse < hand, `${route} hands the text on before refusing a credential`);
+  }
+});
+
 for (const x of results) console.log(`${x.ok ? "ok " : "FAIL"} ${x.name}${x.error ? ` — ${x.error}` : ""}`);
 const failed = results.filter((x) => !x.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

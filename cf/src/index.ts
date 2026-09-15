@@ -2652,6 +2652,11 @@ export default {
           const g = await guardSpending(request, env);
           if (g) return g;
           const body = (await request.json()) as any;
+          // The same check as the console's form (#350): a signed-in person can reach their own agents here too,
+          // so credential-shaped text is refused before it starts a task; `allowSecret: true` is the deliberate
+          // resend (Vera, task #19).
+          const refused = refuseSecret(String(body.text ?? ""), body.allowSecret === true);
+          if (refused) return refused;
           await stub.setOffload(String(body.offload ?? "1") !== "0");
           return Response.json(await stub.startTask(
             body.tenantId ?? "tenant-a", body.agentId ?? "agent-1",
