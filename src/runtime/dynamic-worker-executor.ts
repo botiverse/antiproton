@@ -120,6 +120,12 @@ ${source}
   }
 };`;
 
+/** Whether a load failed because the script itself does not parse. */
+export function isCompileError(err: unknown): boolean {
+  const e = err as { name?: unknown; message?: unknown } | null | undefined;
+  return e?.name === "SyntaxError" || /\bSyntaxError\b/.test(String(e?.message ?? err));
+}
+
 /**
  * Cloudflare Dynamic Workers as the JS executor. Compared with the QuickJS
  * implementation the isolation and the budgets stop being things we implement
@@ -205,6 +211,13 @@ export class DynamicWorkerExecutor implements JsExecutor {
       // A CPU or subrequest kill is not catchable inside the sandbox: it lands
       // here, in the supervisor. Unwrapped, it takes down the whole request.
       const message = String((err as Error)?.message ?? err);
+      // A script that does not parse never ran: its module failed to compile and
+      // the load rejected here, beside the kills. That is the script's error, as
+      // QuickJS reports it, and one the model can fix; "interrupted" told it the
+      // outcome was unknown (task #19).
+      if (isCompileError(err)) {
+        return finish({ status: "failed", outputs: [], error: { code: "eval_error", message } });
+      }
       const code = /CPU/i.test(message)
         ? "wall_time_exceeded"
         : /subrequest/i.test(message)
