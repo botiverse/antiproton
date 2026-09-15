@@ -157,6 +157,8 @@ interface BoxState {
   githubPlaceholder?: string;
   /** The GitHub mount whose token was not wired in because its policy holds or denies calls. */
   githubWithheld?: string;
+  /** SHA-256 of the token wired in, so a replaced token is noticed without keeping it. */
+  githubTokenDigest?: string;
   execs?: number;
   saved?: string[];
   /**
@@ -791,9 +793,15 @@ interface Registration { name: string; value: string; placeholder: string; heade
  * auth, `base64(user:P)`, which it does not, so git's header is registered
  * whole, as exactly what git sends for the helper in `githubEnv`.
  */
-export function githubSecrets(token: string, boxId: string): Registration[] {
-  // Qualified by box: run9 requires a placeholder to be unique across the project.
-  const placeholder = `__AP_GH_TOKEN_${boxId.slice(-8).replace(/[^A-Za-z0-9]/g, "_")}__`;
+export function githubSecrets(
+  token: string, boxId: string,
+  fresh = [...crypto.getRandomValues(new Uint8Array(3))].map((b) => b.toString(16).padStart(2, "0")).join(""),
+): Registration[] {
+  // Qualified by box, because run9 requires a placeholder to be unique across the
+  // project, and fresh on every registration, because a placeholder that belonged
+  // to a deleted secret is accepted again and then not substituted (measured on
+  // run9, 2026-09-15: re-registered after a policy change, GitHub answered 401).
+  const placeholder = `__AP_GH_TOKEN_${boxId.slice(-8).replace(/[^A-Za-z0-9]/g, "_")}_${fresh}__`;
   return [
     { name: "GH_TOKEN", value: token, placeholder, header: "authorization",
       hosts: ["api.github.com", "uploads.github.com"] },
@@ -833,6 +841,85 @@ export function policyLetsContainerAct(policy: MountPolicy | null | undefined): 
 }
 
 const envFor = (state: BoxState | null) => state?.githubPlaceholder ? githubEnv(state.githubPlaceholder) : {};
+
+type Run9Api = (method: string, path: string, body?: unknown) => Promise<any>;
+
+/** A token's identity, to notice it changed without keeping it: SHA-256, hex. */
+async function tokenDigest(token: string): Promise<string> {
+  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * The GitHub access a container of this mount may have right now: the token to
+ * wire in or none, and the alias it was withheld for when policy is the reason.
+ * Only a GitHub mount's credential, since the value goes to GitHub's hosts; and
+ * a container with no network has no use for one.
+ */
+async function githubWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>) {
+  const open = cfg.network === undefined || cfg.network === "open";
+  const gh = cfg.github && open ? await ctx.sibling(cfg.github) : null;
+  const usable = gh?.plugin === "github" && gh.credential ? gh : null;
+  const held = !!usable && !policyLetsContainerAct(usable.policy);
+  return { token: usable && !held ? usable.credential! : null, withheld: held ? String(cfg.github) : null };
+}
+
+async function registerGithub(api: Run9Api, project: string, boxId: string, token: string): Promise<string> {
+  const regs = githubSecrets(token, boxId);
+  for (const g of regs) {
+    await api("POST", `/projects/${project}/workspace/boxes/${boxId}/secrets`, {
+      name: g.name, value: g.value, placeholder: g.placeholder,
+      inject_header_name: g.header, allowed_hosts: g.hosts,
+    });
+  }
+  return regs[0]!.placeholder;
+}
+
+/**
+ * Bring a running container's GitHub access in line with the mount, before a
+ * command runs in it.
+ *
+ * Checked only at creation, a mount switched to approval kept its container
+ * signed in until release, hours under a lease (cody, reviewing #339), and a
+ * token removed or replaced was the same gap. So the mount is read again here.
+ * When what may be wired in has changed, the box's GitHub secrets are deleted,
+ * which run9 honours on the very next request (measured 2026-09-15), and are
+ * registered again only if allowed. Deleted by name rather than by id, so a
+ * container from before this change is covered too. A deletion that fails stops
+ * the command: running it would use access the mount no longer grants.
+ */
+async function reconcileGithub(
+  ctx: PluginContext, cfg: ReturnType<typeof cfgOf>, state: BoxState, api: Run9Api,
+): Promise<BoxState> {
+  const want = await githubWanted(ctx, cfg);
+  const digest = want.token ? await tokenDigest(want.token) : null;
+  // A placeholder with no digest is a container from before digests: unknown, so redone.
+  const had = state.githubPlaceholder ? (state.githubTokenDigest ?? "unrecorded") : null;
+  if (digest === had && (state.githubWithheld ?? null) === want.withheld) return state;
+  const next: BoxState = { ...state };
+  if (digest !== had) {
+    const base = `/projects/${cfg.project}/workspace/boxes/${state.boxId}/secrets`;
+    if (state.githubPlaceholder) {
+      const listed = await api("GET", base);
+      for (const s of Array.isArray(listed) ? listed : []) {
+        if (s?.name === "GH_TOKEN" || s?.name === "GH_TOKEN_GIT") await api("DELETE", `${base}/${s.secret_id}`);
+      }
+    }
+    delete next.githubPlaceholder;
+    delete next.githubTokenDigest;
+  }
+  delete next.githubWithheld;
+  if (want.withheld) next.githubWithheld = want.withheld;
+  // Recorded as gone before registering again, so a registration that fails
+  // does not leave the record promising access the box no longer has.
+  await ctx.connection.set(next as unknown as Json);
+  if (digest !== had && want.token) {
+    next.githubPlaceholder = await registerGithub(api, cfg.project, state.boxId, want.token);
+    next.githubTokenDigest = digest!;
+    await ctx.connection.set(next as unknown as Json);
+  }
+  return next;
+}
 
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
   // `run`, `shell` and every result state the same lifetime (boxReminder): with a lease, the box stays until
@@ -1322,7 +1409,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     const history = state?.sessions ?? [];
     const kept = state?.envs ?? [];
     if (state && !state.boxId) state = null;
+    let created = false;
     if (!state) {
+      created = true;
       const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
         .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
       // `state` is null in this branch by construction — the line above nulls an
@@ -1337,11 +1426,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // creation because run9 registers credentials per box. Only a GitHub
       // mount's: the value goes to GitHub's hosts, and an alias naming anything
       // else would send that mount's credential there. No network, no use for it.
-      const open = cfg.network === undefined || cfg.network === "open";
-      const gh = cfg.github && open ? await ctx.sibling(cfg.github) : null;
-      const usable = gh?.plugin === "github" && gh.credential ? gh : null;
-      const withheld = !!usable && !policyLetsContainerAct(usable.policy);
-      const github = usable && !withheld ? githubSecrets(usable.credential!, boxId) : [];
+      // Read again before every later command (reconcileGithub).
+      const want = await githubWanted(ctx, cfg);
       const declared = cfg.secrets ?? [];
       // Before the box exists, because after it exists a throw leaks it.
       //
@@ -1366,7 +1452,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           // Injection happens on run9's egress proxy, which only exists in
           // managed mode. Measured: under `normal` the placeholder goes out
           // unchanged, which would look like a working credential and not be one.
-          ...(declared.length || github.length ? { network_mode: "managed" } : {}),
+          ...(declared.length || want.token ? { network_mode: "managed" } : {}),
           ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
           description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
         });
@@ -1393,12 +1479,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Register the declared credentials against the new box. The value never
       // enters the box and never reaches the model: only the placeholder does.
       const placeholders: Placeholders = {};
-      for (const g of github) {
-        await api("POST", `/projects/${cfg.project}/workspace/boxes/${boxId}/secrets`, {
-          name: g.name, value: g.value, placeholder: g.placeholder,
-          inject_header_name: g.header, allowed_hosts: g.hosts,
-        });
-      }
+      const githubPlaceholder = want.token ? await registerGithub(api, cfg.project, boxId, want.token) : null;
       for (const d of declared) {
         const value = cred.secrets![d.name]!;
         // Qualified by box, because a placeholder is unique across the project
@@ -1416,8 +1497,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       state = {
         ...state,
         ...(Object.keys(placeholders).length ? { placeholders } : {}),
-        ...(github.length ? { githubPlaceholder: github[0]!.placeholder } : {}),
-        ...(withheld ? { githubWithheld: String(cfg.github) } : {}),
+        ...(githubPlaceholder ? { githubPlaceholder, githubTokenDigest: await tokenDigest(want.token!) } : {}),
+        ...(want.withheld ? { githubWithheld: want.withheld } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
     }
@@ -1578,6 +1659,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       "POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/background-execs`,
       { command: argv, ...(workdir ? { workdir } : {}) },
     )).exec_id as string;
+    // The box just created was wired from the mount a moment ago; any other is checked again.
+    if (!created) state = await reconcileGithub(ctx, cfg, state!, api);
     let execId = await start(execArgv(cfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 
