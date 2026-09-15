@@ -3300,7 +3300,10 @@ export default {
       if (/^no such conversation:/.test(String(e?.message ?? ""))) {
         return Response.json({ error: String(e.message) }, { status: 404 });
       }
-      return Response.json({ error: String(e?.message ?? e), stack: String(e?.stack ?? "").slice(0, 600) }, { status: 500 });
+      // The stack goes to the Worker's log, not to whoever made the request: it names our files and call
+      // paths, and the console now puts the response body on the page under a failed form (#334).
+      console.error("request failed:", url.pathname, e?.stack ?? e);
+      return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
     }
   },
 };
