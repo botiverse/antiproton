@@ -12,7 +12,7 @@ import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/t
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf, KEPT_NOTE, SAVED_NOTE, NOT_A_REASON_TO_RELEASE } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
@@ -1164,9 +1164,15 @@ await check("the container's wording and the lease switch say the same thing", a
     ["the reminder", boxReminder("box", lease), true],
     ["release", deployed.tools.find((t) => t.name === "release")!.summary, false],
     ["quiet", deployed.tools.find((t) => t.name === "quiet")!.summary, false],
+    // `keep` and `save` say what a copy does not license, and "leave it running" is a lease promise too; they
+    // said it unconditionally for one merge, with nothing on this list to go red (cody, #327 review).
+    ["keep", deployed.tools.find((t) => t.name === "keep")!.summary, false],
+    ["save", deployed.tools.find((t) => t.name === "save")!.summary, false],
+    ["keep's result", keptNote(lease), false],
+    ["save's result", savedNote(lease), false],
   ] as const;
   for (const [where, text, statesMinutes] of says) {
-    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release|released on its own|keeps it longer|Postpone the release/.test(text);
+    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release|released on its own|keeps it longer|Postpone the release|leave it running/.test(text);
     if (leaseOn && !promises) {
       throw new Error(`the lease is configured but ${where} still describes a box that only you can end: ${text.slice(0, 140)}`);
     }
@@ -1511,17 +1517,29 @@ await check("release says to leave a container someone will come back to, and wh
  * an agent now leaves the container running is judged by re-running that prompt, not here.
  */
 await check("keep and save say a surviving copy is not a reason to release", async () => {
-  const texts: [string, string][] = [
-    ["keep's result", KEPT_NOTE],
-    ["save's result", SAVED_NOTE],
-    ["keep", run9.tools.find((t) => t.name === "keep")!.summary],
-    ["save", run9.tools.find((t) => t.name === "save")!.summary],
-  ];
-  for (const [where, text] of texts) {
-    if (!text.includes(NOT_A_REASON_TO_RELEASE)) throw new Error(`${where} does not say a copy is no reason to release: ${text}`);
-    if (/survives (its )?release/.test(text)) throw new Error(`${where} still offers survival as the whole story: ${text}`);
+  const lease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
+  // Both sides: the sentence is owed with or without a lease, and what it may promise differs (the switch case
+  // holds "leave it running" to the lease; this one holds that the sentence is there at all).
+  for (const l of [lease, null]) {
+    const plugin = sandboxPlugin(null as any, "local", l);
+    const texts: [string, string][] = [
+      ["keep's result", keptNote(l)],
+      ["save's result", savedNote(l)],
+      ["keep", plugin.tools.find((t) => t.name === "keep")!.summary],
+      ["save", plugin.tools.find((t) => t.name === "save")!.summary],
+    ];
+    for (const [where, text] of texts) {
+      const which = `${where}${l ? "" : " without a lease"}`;
+      if (!text.includes(notAReasonToRelease(l))) throw new Error(`${which} does not say a copy is no reason to release: ${text}`);
+      if (/survives (its )?release/.test(text)) throw new Error(`${which} still offers survival as the whole story: ${text}`);
+      // The side the switch case cannot reach while cf/wrangler.jsonc has the lease on: it only ever builds the
+      // deployed plugin, so an unconditional lease promise here passed it once already.
+      if (!l && /leave it running|released on its own|`quiet`/.test(text)) {
+        throw new Error(`${which} promises what only a lease keeps: ${text}`);
+      }
+    }
   }
-  const leased = sandboxPlugin(null as any, "local", { warnMs: 5 * 60_000, maxMs: 30 * 60_000 })
+  const leased = sandboxPlugin(null as any, "local", lease)
     .tools.find((t) => t.name === "release")!.summary;
   if (!/leave it running, even after keeping or saving/.test(leased)) throw new Error(`release does not rule out keeping as a reason: ${leased}`);
   if (leased.indexOf("leave it running") > leased.indexOf("released on its own")) {
