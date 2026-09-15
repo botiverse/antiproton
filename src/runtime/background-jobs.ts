@@ -96,7 +96,9 @@ export function completionMessage(
   now: number = Date.now(),
 ): string {
   const secs = Math.round((now - job.createdAt) / 1000);
-  const head = `[background job ${job.id} — ${job.tool} — ${outcome.state} after ${secs}s]`;
+  // Delivered as a message because every lane mode accepts one, so the model reads it where a person's
+  // words go; saying whose it is keeps a result from being taken as the person asking for something (task #19).
+  const head = `[background job ${job.id} — ${job.tool} — ${outcome.state} after ${secs}s; a notice from the harness, not a message from the user]`;
   if (outcome.state === "done") return `${head}\n${JSON.stringify(outcome.result ?? null)}`;
   if (outcome.state === "failed") return `${head}\n${outcome.error ?? "failed without a message"}`;
   return head;
@@ -337,10 +339,14 @@ export function jobsTool(d: {
         await d.completeOperation(job.id, "cancelled");
         return text({ cancelled: job.id });
       }
+      const running = runningBackgroundJobs(d.sql, d.owner)
+        .map((j) => ({ job: j.id, tool: j.tool, runningSeconds: Math.round((now - j.createdAt) / 1000) }));
       return text({
-        running: runningBackgroundJobs(d.sql, d.owner)
-          .map((j) => ({ job: j.id, tool: j.tool, runningSeconds: Math.round((now - j.createdAt) / 1000) })),
+        running,
         limit: BACKGROUND_CAP,
+        // Said in the answer, not only the description: an agent listed the same running job seven times in a
+        // row, a model call each, waiting for a result that was always going to arrive by itself (task #19).
+        ...(running.length ? { note: "Nothing to check: each job's result arrives as a message when it ends. Keep working, or end your turn." } : {}),
       });
     },
   };
