@@ -4,7 +4,7 @@
  * store's new way to update an agent's config.
  */
 import {
-  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  deleteApiAgent, deleteApiSession, deletedApiAgentIds, getApiAgent, getApiSession, listApiAgents, listApiSessions,
   mintAgentId, mintSessionId, putApiAgent, putApiSession, touchApiSession,
 } from "../cf/src/agents-api/store.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -38,6 +38,17 @@ await check("agents: put, update in place, list oldest first, and a deleted agen
     assert(deleteApiAgent(sql, "a1", now + 10) === true && deleteApiAgent(sql, "a1", now + 11) === false, "delete result");
     assert(getApiAgent(sql, "a1") === null, "a deleted agent is still retrievable");
     assert(listApiAgents(sql).map((x) => x.id).join() === "a2", "a deleted agent is still listed");
+  } finally { host.dispose(); }
+});
+
+await check("the ids of deleted agents, and only those, are what the console hides", async () => {
+  const host = sqliteHost(); const sql = host.sql as any;
+  try {
+    assert(deletedApiAgentIds(sql).size === 0, "an empty index reported deleted agents");
+    putApiAgent(sql, "a1", agentCfg("one"));
+    putApiAgent(sql, "a2", agentCfg("two"));
+    deleteApiAgent(sql, "a1", now + 10);
+    assert([...deletedApiAgentIds(sql)].join() === "a1", `deleted: ${[...deletedApiAgentIds(sql)]}`);
   } finally { host.dispose(); }
 });
 

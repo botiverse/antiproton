@@ -16,6 +16,11 @@ function fakeDeps() {
   let t = 1_800_000_000_000, n = 0;
   const agents = new Map<string, StoredAgent>(), sessions = new Map<string, StoredSession>();
   const log = { toolResults: [] as Array<{ session: string; results: Array<{ turnId: string; callId: string; output: string; isError: boolean }> }>, cancelled: [] as string[], adopted: [] as string[], persona: [] as Array<{ id: string; instructions: string | null }>, opened: [] as string[], inputs: [] as Array<{ session: string; text: string }> };
+  // What the agents' own objects hold (agent id -> instructions), and the dependency calls made to fail.
+  const built = new Map<string, string | null>(), fail = new Set<string>();
+  const maybeFail = (name: string) => { if (fail.has(name)) throw new Error(`${name} failed (injected)`); };
+  // Tolerates a missing agent, so a handler that passes none fails an assertion rather than this fake.
+  const build = (id: string, a: StoredAgent | null) => { built.set(id, a?.instructions ?? null); log.persona.push({ id, instructions: a?.instructions ?? null }); };
   const deps: AgentsApiDeps = {
     now: () => (t += 1000),
     // A macrotask, so input posted by another request lands between two reads of the stream.
@@ -24,32 +29,32 @@ function fakeDeps() {
     mintAgentId: () => `agent_${++n}`,
     mintSessionId: () => `sess_${++n}`,
     index: {
-      putAgent: async (id, a) => { agents.set(id, a); },
+      putAgent: async (id, a) => { maybeFail("putAgent"); agents.set(id, a); },
       getAgent: async (id) => agents.get(id) ?? null,
       listAgents: async () => [...agents.entries()].map(([id, agent]) => ({ id, agent })),
       deleteAgent: async (id) => agents.delete(id),
-      putSession: async (s) => { sessions.set(s.id, s); },
+      putSession: async (s) => { maybeFail("putSession"); sessions.set(s.id, s); },
       getSession: async (id) => sessions.get(id) ?? null,
       listSessions: async (agentId) => [...sessions.values()].filter((s) => !agentId || s.agentId === agentId),
       deleteSession: async (id) => sessions.delete(id),
     },
     agents: {
-      adopt: async (id) => { log.adopted.push(id); },
-      updatePersona: async (id, a) => { log.persona.push({ id, instructions: a.instructions }); },
-      openSession: async (_a, s) => { log.opened.push(s); },
-      postInput: async (_a, s, text) => { log.inputs.push({ session: s, text }); },
+      adopt: async (id, a) => { maybeFail("adopt"); log.adopted.push(id); build(id, a); },
+      openSession: async (id, a, s) => { maybeFail("openSession"); build(id, a); log.opened.push(s); },
+      postInput: async (id, a, s, text) => { maybeFail("postInput"); build(id, a); log.inputs.push({ session: s, text }); },
       status: async () => ({ status: "idle" as const, pending: [] }),
       toolResults: async (_a, s, results) => { log.toolResults.push({ session: s, results }); return { unknown: results.filter((r) => r.callId.startsWith("unknown")).map((r) => r.callId) }; },
       cancel: async (_a, s) => { log.cancelled.push(s); },
       transcript: async () => ({ entries: [], running: false, pending: [] }),
     },
   };
-  return { deps, log, agents, sessions };
+  return { deps, log, agents, sessions, built, fail };
 }
 const call = async (deps: AgentsApiDeps, method: string, path: string, body?: unknown, qs = "") => {
   const r = await handleAgentsApi(method, path, new URLSearchParams(qs), body, deps);
   if (!r) return { status: 0, body: null as any };
-  return { status: r.status, body: await r.json() as any };
+  const text = await r.text();
+  return { status: r.status, body: (text ? JSON.parse(text) : null) as any };
 };
 
 await check("agents: create, retrieve, list, update reaching the persona, delete making it unreachable", async () => {
@@ -88,10 +93,58 @@ await check("sessions: create with agent_id and text input, retrieve, list by ag
   assert((await call(deps, "GET", `/agents/sessions/${s.body.id}`)).status === 404, "a deleted session is still reachable");
 });
 
+const throws = async (p: Promise<unknown>) => { try { await p; return false; } catch { return true; } };
+
+await check("a create that fails at the index has made nothing in any agent's object", async () => {
+  const a = fakeDeps();
+  a.fail.add("putAgent");
+  assert(await throws(call(a.deps, "POST", "/agents", { model: "m", instructions: "x" })), "a failed index write did not fail the create");
+  assert(await throws(call(a.deps, "POST", "/agents/sessions", { agent: { model: "m" }, environment: { type: "none" }, input: "hi" })), "a failed index write did not fail the inline create");
+  assert(a.built.size === 0 && a.log.opened.length === 0 && a.log.inputs.length === 0, `an object was written without its index row: ${JSON.stringify([...a.built])}`);
+
+  const s = fakeDeps();
+  await call(s.deps, "POST", "/agents", { model: "m" });
+  s.fail.add("putSession");
+  assert(await throws(call(s.deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" }, input: "hi" })), "a failed session index write did not fail the create");
+  assert(s.log.opened.length === 0 && s.log.inputs.length === 0, `a session was opened without its index row: ${JSON.stringify(s.log)}`);
+});
+
+await check("a failure in the agent's object after the index write is repaired by the next use, not duplicated by a retry", async () => {
+  const { deps, log, agents, sessions, built, fail } = fakeDeps();
+  fail.add("adopt");
+  const c = await call(deps, "POST", "/agents", { model: "m", instructions: "Write clean code." });
+  assert(c.status === 200 && agents.size === 1 && !built.has("agent_1"), `create with a failing object: ${JSON.stringify(c)}`);
+  const u = await call(deps, "POST", "/agents/agent_1", { instructions: "Be brief." });
+  assert(u.status === 200 && agents.get("agent_1")?.instructions === "Be brief." && !built.has("agent_1"), `update with a failing object: ${JSON.stringify(u)}`);
+  fail.clear();
+
+  fail.add("openSession");
+  const s = await call(deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" } });
+  assert(s.status === 200 && sessions.size === 1 && log.opened.length === 0, `session create with a failing open: ${JSON.stringify(s)}`);
+  fail.clear();
+
+  const sent = await call(deps, "POST", `/agents/sessions/${s.body.id}/events`, { events: [{ type: "agent.session.input.message", input: "go" }] });
+  assert(sent.status === 204 && log.inputs.at(-1)?.text === "go", `input after the failures: ${JSON.stringify(sent)}`);
+  assert(built.get("agent_1") === "Be brief.", `the first input did not bring the object to the index: ${JSON.stringify([...built])}`);
+  assert(agents.size === 1 && sessions.size === 1, "a repair made a second agent or session");
+
+  fail.add("postInput");
+  assert(await throws(call(deps, "POST", `/agents/sessions/${s.body.id}/events`, { events: [{ type: "agent.session.input.message", input: "again" }] })), "undelivered input reported as delivered");
+});
+
+await check("input to a session whose agent was deleted is refused like every other read of that agent", async () => {
+  const { deps, log } = fakeDeps();
+  await call(deps, "POST", "/agents", { model: "m" });
+  const s = await call(deps, "POST", "/agents/sessions", { agent_id: "agent_1", environment: { type: "none" } });
+  await call(deps, "DELETE", "/agents/agent_1");
+  const sent = await call(deps, "POST", `/agents/sessions/${s.body.id}/events`, { events: [{ type: "agent.session.input.message", input: "go" }] });
+  assert(sent.status === 404 && log.inputs.length === 0, `input reached a deleted agent: ${JSON.stringify(sent)}`);
+});
+
 await check("a session with an inline agent creates that agent; the sessions path is never read as an agent id", async () => {
-  const { deps, log, agents } = fakeDeps();
+  const { deps, log, agents, built } = fakeDeps();
   const s = await call(deps, "POST", "/agents/sessions", { agent: { model: "gpt-6-astra", instructions: "Run it." }, environment: { type: "none" } });
-  assert(s.status === 200 && agents.size === 1 && log.adopted.length === 1, `inline agent: ${JSON.stringify(s)}`);
+  assert(s.status === 200 && agents.size === 1 && log.opened.length === 1 && built.get(s.body.agent.id) === "Run it.", `inline agent: ${JSON.stringify(s)}`);
   assert(s.body.environment.type === "none" && s.body.agent.instructions === "Run it.", `fields: ${JSON.stringify(s.body)}`);
   const list = await call(deps, "GET", "/agents/sessions");
   assert(list.status === 200 && list.body.object === "list", `GET /agents/sessions was routed as an agent: ${JSON.stringify(list)}`);
@@ -134,7 +187,7 @@ await check("events: GET streams from now on; POST input starts a turn it report
     { type: "message", seq: 2, timestamp: 2_000, message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "old answer" }] } },
   ];
   deps.agents.transcript = async () => ({ entries, running: false, pending: [] });
-  deps.agents.postInput = async (_a, s, text) => {
+  deps.agents.postInput = async (_id, _a, s, text) => {
     log.inputs.push({ session: s, text });
     const seq = entries.length;
     entries = [...entries,
@@ -190,7 +243,7 @@ await check("events: GET streams from now on; POST input starts a turn it report
   const order: string[] = [];
   deps.agents.cancel = async () => { order.push("cancel"); };
   const prior = deps.agents.postInput;
-  deps.agents.postInput = async (a, s2, text, env) => { order.push(`message:${text}`); await prior(a, s2, text, env); };
+  deps.agents.postInput = async (id, a, s2, text, env) => { order.push(`message:${text}`); await prior(id, a, s2, text, env); };
   const both = (await handleAgentsApi("POST", `/agents/sessions/${sess.id}/events`, new URLSearchParams(),
     { events: [{ type: "agent.session.input.cancel" }, { type: "agent.session.input.message", input: "instead" }] }, deps))!;
   assert(both.status === 204 && order.join() === "cancel,message:instead", `cancel then message: ${both.status} ${order}`);

@@ -39,15 +39,18 @@ export interface AgentsApiDeps {
     listSessions(agentId?: string | null): Promise<StoredSession[]>;
     deleteSession(id: string): Promise<boolean>;
   };
+  /**
+   * The agent's own object, which is never written before the index row it serves. The index is what
+   * the API answers from; the object is brought to match it by every call below that takes the agent,
+   * so a call that failed is repaired by the next one instead of leaving half of a create behind.
+   */
   agents: {
-    /** Create the agent's own object and its persona. Idempotent. */
+    /** Make the agent's object match `a`: created when absent, its persona rewritten only when it differs, and listed in the console. Idempotent. */
     adopt(agentId: string, a: StoredAgent): Promise<void>;
-    /** Rewrite the persona the harness reads after an update. */
-    updatePersona(agentId: string, a: StoredAgent): Promise<void>;
-    /** Make the session a conversation the agent's object will run. */
-    openSession(agentId: string, sessionId: string): Promise<void>;
-    /** Deliver text to the session: starts a turn when idle. */
-    postInput(agentId: string, sessionId: string, text: string, environment: "none" | "container"): Promise<void>;
+    /** Adopt, then make the session a conversation the agent's object will run. Idempotent. */
+    openSession(agentId: string, a: StoredAgent, sessionId: string): Promise<void>;
+    /** Open the session as above, then deliver text to it: starts a turn when idle. */
+    postInput(agentId: string, a: StoredAgent, sessionId: string, text: string, environment: "none" | "container"): Promise<void>;
     /** The session's status and the function calls it waits on the caller for. */
     status(agentId: string, sessionId: string): Promise<{ status: SessionStatus; pending: PendingCall[] }>;
     /**
@@ -67,6 +70,13 @@ const refuse = (r: Refusal) => openAIError(r.status, r.message, { param: r.param
 const notFound = (what: string, id: string) => openAIError(404, `No ${what} found with id '${id}'.`, { code: "not_found" });
 const ok = (v: unknown) => Response.json(v);
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * A write to the agent's own object after its index row is in place. Not the request's failure: the
+ * row already answers for the agent or session, and the next call that takes the agent repeats the write.
+ */
+const repairedLater = (p: Promise<void>) =>
+  p.catch((e) => { console.warn(`agents api: left for the next use to repair: ${String((e as Error)?.message ?? e)}`); });
 
 /** Text from `input`: a string, or messages whose content is input_text parts. Anything else is refused by name. */
 export function inputText(input: unknown): { ok: true; text: string | null } | Refusal {
@@ -153,31 +163,32 @@ export async function handleAgentsApi(
       if ("ok" in (metadata as object)) return refuse(metadata as unknown as Refusal);
       const text = inputText(body.input);
       if (!text.ok) return refuse(text);
-      let agentId: string;
+      let agentId: string, agent: StoredAgent;
       if (typeof body.agent_id === "string" && body.agent_id) {
         if (body.agent !== undefined && body.agent !== null) return openAIError(400, "give agent_id or agent, not both", { param: "agent", code: "invalid_value" });
-        if (!(await deps.index.getAgent(body.agent_id))) return notFound("agent", body.agent_id);
-        agentId = body.agent_id;
+        const found = await deps.index.getAgent(body.agent_id);
+        if (!found) return notFound("agent", body.agent_id);
+        agentId = body.agent_id; agent = found;
       } else {
         if (!isObj(body.agent)) return openAIError(400, "agent_id or agent is required", { param: "agent", code: "invalid_value" });
         const parsed = parseAgentParams(body.agent, "create", undefined, deps.now());
         if (!parsed.ok) return refuse(parsed);
-        agentId = deps.mintAgentId();
-        await deps.agents.adopt(agentId, parsed.value);
-        await deps.index.putAgent(agentId, parsed.value);
+        agentId = deps.mintAgentId(); agent = parsed.value;
+        await deps.index.putAgent(agentId, agent);
       }
       const now = deps.now();
       const session: StoredSession = {
         id: deps.mintSessionId(), agentId, environment: env.kind,
         metadata: metadata as Record<string, string>, createdAt: now, lastActiveAt: now,
       };
-      await deps.agents.openSession(agentId, session.id);
       await deps.index.putSession(session);
+      // The session exists from here. Opening it is repeated by its first input, so a failure is left to that.
+      await repairedLater(deps.agents.openSession(agentId, agent, session.id));
       const input = text.text;
       if (body.stream === true) {
-        return eventStream(deps, session, input ? () => deps.agents.postInput(agentId, session.id, input, session.environment) : undefined);
+        return eventStream(deps, session, input ? () => deps.agents.postInput(agentId, agent, session.id, input, session.environment) : undefined);
       }
-      if (input) await deps.agents.postInput(agentId, session.id, input, session.environment);
+      if (input) await deps.agents.postInput(agentId, agent, session.id, input, session.environment);
       return ok(await sessionObject(deps, session));
     }
     if (seg.length === 2 && method === "GET") {
@@ -235,6 +246,9 @@ export async function handleAgentsApi(
           if (!t.text) return openAIError(400, "input must not be empty", { param: `events[${i}].input`, code: "invalid_value" });
           actions.push({ kind: "message", text: t.text });
         }
+        // Input opens the agent's object from its index row, and an agent deleted there takes nothing more.
+        const agent = await deps.index.getAgent(s.agentId);
+        if (!agent) return notFound("agent", s.agentId);
         if (results.length) {
           // Kept together or not at all, so they are not mixed with input that acts at once.
           if (actions.length) return openAIError(400, "send tool results in their own request", { param: `events[${at[0]}].type`, code: "invalid_value" });
@@ -247,7 +261,7 @@ export async function handleAgentsApi(
         }
         for (const a of actions) {
           if (a.kind === "cancel") await deps.agents.cancel(s.agentId, s.id);
-          else await deps.agents.postInput(s.agentId, s.id, a.text, s.environment);
+          else await deps.agents.postInput(s.agentId, agent, s.id, a.text, s.environment);
         }
         return new Response(null, { status: 204 });
       }
@@ -290,8 +304,9 @@ export async function handleAgentsApi(
     const parsed = parseAgentParams(body, "create", undefined, deps.now());
     if (!parsed.ok) return refuse(parsed);
     const id = deps.mintAgentId();
-    await deps.agents.adopt(id, parsed.value);
+    // The index row first: a create that fails there has made nothing, so a retry cannot duplicate it.
     await deps.index.putAgent(id, parsed.value);
+    await repairedLater(deps.agents.adopt(id, parsed.value));
     return ok(toOpenAIAgent(id, parsed.value));
   }
   if (seg.length === 1 && method === "GET") {
@@ -308,7 +323,7 @@ export async function handleAgentsApi(
       const parsed = parseAgentParams(body, "update", a, deps.now());
       if (!parsed.ok) return refuse(parsed);
       await deps.index.putAgent(id, parsed.value);
-      await deps.agents.updatePersona(id, parsed.value);
+      await repairedLater(deps.agents.adopt(id, parsed.value));
       return ok(toOpenAIAgent(id, parsed.value));
     }
   }
