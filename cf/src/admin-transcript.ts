@@ -15,6 +15,16 @@ export interface TranscriptSource {
   adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<unknown | null>;
 }
 
+/**
+ * Every answer from this route, refusals included, is never stored by a cache. The route returns a person's
+ * whole conversation, and its authority is a custom header that HTTP caches neither treat as authorization
+ * nor key on; not being cached must not rest on a deployment's defaults (Ada, #336). No `Vary` on the token:
+ * that would make the secret a cache key.
+ */
+function answer(body: unknown, status: number, headers: Record<string, string> = {}): Response {
+  return Response.json(body, { status, headers: { "cache-control": "no-store", ...headers } });
+}
+
 export async function adminTranscript(
   request: Request,
   token: string | undefined,
@@ -22,9 +32,9 @@ export async function adminTranscript(
 ): Promise<Response> {
   // No token configured refuses too: the older /admin routes open then, for a local dev server.
   if (!isOperator(token, request.headers.get("x-harness-token"))) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
+    return answer({ error: "unauthorized" }, 401);
   }
-  if (request.method !== "GET") return Response.json({ error: "GET" }, { status: 405, headers: { allow: "GET" } });
+  if (request.method !== "GET") return answer({ error: "GET" }, 405, { allow: "GET" });
   const url = new URL(request.url);
   const tenantId = url.searchParams.get("tenantId") ?? "demo";
   // Asked for by name, never defaulted: a missing id used to become the agent "null".
@@ -33,11 +43,11 @@ export async function adminTranscript(
   try {
     agentObjectName(tenantId, agentId);
   } catch (e) {
-    return Response.json({ error: String((e as Error)?.message ?? e) }, { status: 400 });
+    return answer({ error: String((e as Error)?.message ?? e) }, 400);
   }
   const transcript = await open(tenantId, agentId).adminTranscript(tenantId, agentId, taskId);
   if (transcript === null) {
-    return Response.json({ error: `no such agent or conversation: ${tenantId}/${agentId} ${taskId}` }, { status: 404 });
+    return answer({ error: `no such agent or conversation: ${tenantId}/${agentId} ${taskId}` }, 404);
   }
-  return Response.json(transcript);
+  return answer(transcript, 200);
 }

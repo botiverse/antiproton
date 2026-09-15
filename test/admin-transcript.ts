@@ -88,6 +88,23 @@ await check("the right token and a named agent: 200 with the object's transcript
     `asked ${o.asked.join(", ")} and ${named.asked.join(", ")}`);
 });
 
+await check("no answer is stored by a cache: every status carries cache-control no-store, and none varies on the token", async () => {
+  // The 200 is a person's whole conversation, and the token is a custom header caches do not key on (Ada, #336).
+  const cases: Array<[string, Request, string | undefined, unknown | null]> = [
+    ["401", request("?agentId=u-a", {}), TOKEN, TRANSCRIPT],
+    ["405", request("?agentId=u-a", undefined, "POST"), TOKEN, TRANSCRIPT],
+    ["400", request("?agentId="), TOKEN, TRANSCRIPT],
+    ["404", request("?agentId=u-a"), TOKEN, null],
+    ["200", request("?agentId=u-a"), TOKEN, TRANSCRIPT],
+  ];
+  for (const [status, req, token, answer] of cases) {
+    const res = await adminTranscript(req, token, objects(answer).open);
+    assert(String(res.status) === status, `expected ${status}, got ${res.status}`);
+    assert(res.headers.get("cache-control") === "no-store", `${status}: cache-control is ${res.headers.get("cache-control")}`);
+    assert(!/x-harness-token/i.test(res.headers.get("vary") ?? ""), `${status}: varies on the token`);
+  }
+});
+
 await check("the object's half only reads: adminTranscript opens no agent, runtime or store, and reads through readTranscript", async () => {
   // It runs inside the Durable Object, which this suite cannot start; uiTranscript, beside it, creates the
   // default conversation on first use (Ada, #336). So the body is read, and the read is checked to have found it.
