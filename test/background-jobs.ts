@@ -50,6 +50,7 @@ await check("the completion message names the job and carries the result or the 
   assert(done.includes("j1") && done.includes("node__shell") && done.includes("130s"), `header incomplete: ${done}`);
   assert(!done.includes("node.shell"), `the message names a dispatch address: ${done}`);
   assert(done.includes('"exitCode":0'), `result missing: ${done}`);
+  assert(/not a message from the user/.test(done.split("\n")[0]!), `the header does not say whose message it is: ${done.split("\n")[0]}`);
   const failed = completionMessage(job("j2"), { state: "failed", error: "box gone" }, now);
   assert(failed.includes("failed") && failed.includes("box gone"), `error missing: ${failed}`);
 });
@@ -194,10 +195,13 @@ await check("the jobs tool lists running work by offered name, and cancels one b
     const listed = JSON.parse((await t.execute("c1", { action: "list" })).content[0]!.text);
     assert(listed.running[0]?.job === "op1" && listed.running[0]?.tool === "node__shell" && listed.running[0]?.runningSeconds === 42,
       `list: ${JSON.stringify(listed)}`);
+    assert(/arrives as a message/.test(String(listed.note)), `listing running work does not say there is nothing to check: ${JSON.stringify(listed)}`);
     let msg = "";
     try { await t.execute("c2", { action: "cancel", job: "nope" }); } catch (e) { msg = String((e as Error).message); }
     assert(/no running job/.test(msg), `cancelling an unknown job did not say so: ${msg}`);
     await t.execute("c3", { action: "cancel", job: "op1" });
+    const empty = JSON.parse((await t.execute("c4", { action: "list" })).content[0]!.text);
+    assert(empty.running.length === 0 && !("note" in empty), `an empty list still tells the agent to wait: ${JSON.stringify(empty)}`);
     assert(f.log.cancelled.join() === "op1" && f.log.completed.join() === "op1:cancelled", `cancel: ${JSON.stringify(f.log)}`);
     assert(runningBackgroundJobs(sql, me).length === 0, "a cancelled job still runs");
   } finally { host.dispose(); }
