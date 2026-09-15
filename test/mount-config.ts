@@ -1462,6 +1462,117 @@ await check("starting a new container keeps the list of kept environments", asyn
 });
 
 /**
+ * A result names the image this container started from, not the mount's setting.
+ *
+ * The shell description tells the agent to read `image` instead of probing, so
+ * it has to be true of the machine the command ran on. Read from the setting, it
+ * stopped being true the moment the default changed (alpine to bookworm): a box
+ * still running from before, or one started from an environment kept then, is
+ * alpine while the setting says bookworm, and the agent runs apt-get on it.
+ * Where nothing was recorded, the result says so rather than guessing.
+ */
+await check("a result reports the image its container started from, and says so when that was never recorded", async () => {
+  const original = globalThis.fetch;
+  const creates: any[] = [];
+  let n = 0;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const path = String(url).replace("https://sandbox.example", "");
+    const method = init?.method ?? "GET";
+    if (method === "POST" && /workspace\/boxes$/.test(path)) { creates.push(JSON.parse(init.body)); return new Response("{}"); }
+    if (method === "POST" && /background-execs$/.test(path)) return new Response(JSON.stringify({ exec_id: `e${++n}` }));
+    if (/execs\/e\d+$/.test(path)) {
+      return new Response(JSON.stringify({ state: "succeeded", exit_code: 0, output_summary: "ok\n__AP_CWD__/work\n" }));
+    }
+    if (method === "GET" && /workspace\/boxes$/.test(path)) {
+      return new Response(JSON.stringify(creates.map((c) => ({ box_id: c.box_id, box_snap_id: "src-1" }))));
+    }
+    if (method === "POST" && /snaps\/src-1\/fork$/.test(path)) return new Response(JSON.stringify({ snap_id: "s-new" }));
+    return new Response("{}");
+  }) as any;
+  const plugin = sandboxPlugin(null as any, "local");
+  const defaultImage = String(plugin.config!.find((f) => f.name === "image")!.default);
+  const mount = (stored: any, publicConfig: Record<string, unknown> = {}) => {
+    const box = { stored };
+    const ctx: any = {
+      caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+      credential: JSON.stringify({ ak: "a", sk: "b" }),
+      publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000, ...publicConfig },
+      connection: { get: async () => box.stored, set: async (v: unknown) => { box.stored = v; } },
+      sibling: async () => null,
+    };
+    return { box, ctx };
+  };
+  try {
+    // A new container from the setting: recorded, reported, and carried into what is kept from it.
+    const fresh = mount(null);
+    const r1: any = await plugin.invoke("shell", { command: "echo ok" } as any, fresh.ctx);
+    if (r1.image !== defaultImage || fresh.box.stored.image !== defaultImage) {
+      throw new Error(`a new container reported ${r1.image} and recorded ${fresh.box.stored.image}, not ${defaultImage}`);
+    }
+    await plugin.invoke("keep", { name: "ready" } as any, fresh.ctx);
+    if (fresh.box.stored.envs?.[0]?.image !== defaultImage) {
+      throw new Error(`keep did not record the image: ${JSON.stringify(fresh.box.stored.envs)}`);
+    }
+
+    // Started from a kept environment: its image, whatever the setting says now.
+    const restored = mount({ boxId: "", createdAt: 0, lastUsedAt: 0, startFrom: "s-old",
+      envs: [{ name: "old", snapId: "s-old", savedAt: 1, image: "img-then" }] }, { image: "img-now" });
+    const r2: any = await plugin.invoke("shell", { command: "echo ok" } as any, restored.ctx);
+    if (creates.at(-1)?.source_snap_id !== "s-old") throw new Error("the case did not start from the kept environment");
+    if (r2.image !== "img-then") throw new Error(`a container started from a kept environment reported ${r2.image}`);
+
+    // Nothing recorded — a box from before this, or an environment kept before
+    // it — is not reported as the setting.
+    for (const stored of [
+      { boxId: "b-old", createdAt: 1, lastUsedAt: 1 },
+      { boxId: "", createdAt: 0, lastUsedAt: 0, startFrom: "s-legacy", envs: [{ name: "legacy", snapId: "s-legacy", savedAt: 1 }] },
+    ]) {
+      const legacy = mount(stored, { image: "img-now" });
+      const r: any = await plugin.invoke("shell", { command: "echo ok" } as any, legacy.ctx);
+      if (r.image !== null) throw new Error(`an unrecorded image was reported as ${r.image}`);
+      if (!/not recorded/.test(String(r.imageNote))) throw new Error(`the result does not say the image is unknown: ${JSON.stringify(r).slice(0, 300)}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+await check("the shell description names the default image and how to install more on it", () => {
+  const plugin = sandboxPlugin(null as any, "local");
+  const defaultImage = String(plugin.config!.find((f) => f.name === "image")!.default);
+  const summary = plugin.tools.find((t) => t.name === "shell")!.summary;
+  const tag = defaultImage.split("/").pop()!;
+  if (!/bookworm/.test(tag)) throw new Error(`the default image is ${defaultImage}`);
+  if (!summary.includes(tag)) throw new Error(`the description does not name the default image ${tag}: ${summary}`);
+  if (!/apt-get/.test(summary) || /\bapk\b/.test(summary)) throw new Error(`the description gives the wrong installer: ${summary}`);
+});
+
+/**
+ * Dropped entries are counted where the page reads, not dropped in silence.
+ *
+ * `asBoxState` drops what it cannot read so a corrupt history cannot lose a
+ * billed container. Rex asked for a count (2026-09-15) and it was deferred to
+ * the first change to `Env`'s shape, which is when an older row can really
+ * differ: recording images is that change.
+ */
+await check("a mount reports how many entries of its record it could not read", async () => {
+  const plugin = sandboxPlugin(null as any, "local");
+  const activity = (raw: unknown) => plugin.activity!({
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox", credential: null, publicConfig: {},
+    connection: { get: async () => raw, set: async () => {} }, sibling: async () => null,
+  } as any);
+  const box = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 };
+  const session = { boxId: "b-0", startedAt: 1, endedAt: 2, lastUsedAt: 2, execs: 1, saved: [] };
+  const env = { name: "py", snapId: "s-1", savedAt: 3, image: "img" };
+  const clean = await activity({ ...box, sessions: [session], envs: [env] });
+  if (clean.unreadable !== undefined) throw new Error(`a clean record reported ${clean.unreadable} unreadable entries`);
+  const dirty = await activity({ ...box, sessions: [null, session, { boxId: "b-9" }], envs: [env, { ...env, image: 5 }] });
+  if (dirty.live?.id !== "b-1" || dirty.unreadable !== 3) throw new Error(`dirty record: ${JSON.stringify(dirty)}`);
+  const lists = await activity({ ...box, sessions: { 0: {} }, envs: "none" });
+  if (lists.unreadable !== 2) throw new Error(`lists that are not lists: ${JSON.stringify(lists)}`);
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",
