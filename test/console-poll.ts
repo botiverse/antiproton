@@ -89,6 +89,15 @@ check("the compact button marks its flight: label flips for the request, flips b
   must(/busy\(form, on\) \{[\s\S]*?b\.disabled = true[\s\S]*?b\.disabled = false/.test(html), "busy() disables and re-enables; label round-trips through data-label");
 });
 
+check("the composer hint is one breath and steps aside on mobile", () => {
+  // tygg (2026-09-13, #design): the legend under the composer filled a phone's
+  // bottom third. It now reads one short line, and the phone hides it.
+  const css = html.slice(html.indexOf("<style>"), html.indexOf("</style>"));
+  must(/class="hint send-hint"[\s\S]*?<b>send<\/b> steers it mid-flight; <b>after<\/b> holds until it finishes\./.test(html),
+    "the hint names both buttons in one sentence, and a held call shows in the flow");
+  must(/@media\(max-width:760px\)[\s\S]*?\.send-hint\{display:none\}/.test(css), "the hint is hidden at phone width");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);

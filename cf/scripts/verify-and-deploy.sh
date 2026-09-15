@@ -71,6 +71,8 @@ for f in test/*.ts; do
 done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
 run_suite pi-storage-do bash test/pi-storage-do.sh
+# The control plane's queries on real D1 SQLite, after the migrations in cf/migrations (local workerd, no network).
+run_suite control-plane-d1 bash test/control-plane-d1.sh
 # Captured, then printed, then tested. It used to be piped through
 # \`tee /dev/stderr\`, and when the run is redirected to a log file, /dev/stderr
 # reopens that file with truncation: every suite line above was erased and the

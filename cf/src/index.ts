@@ -71,6 +71,7 @@ import {
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
+import { admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -79,6 +80,9 @@ import {
 
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
+  /** The control plane (cf/src/control-plane.ts): who may sign in, and as which
+   *  tenant and agent. Never agent data, which stays in each agent's object. */
+  CONTROL_DB: D1Database;
   ARTIFACTS: R2Bucket;
   DEEPSEEK_API_KEY: string;
   DEEPSEEK_BASE_URL: string;
@@ -1253,49 +1257,8 @@ export class AgentDO extends DurableObject<Env> {
     return rec;
   }
 
-  // ---- the identity table ---------------------------------------------------
-  // One object, named "identities", consulted at sign-in only: which agent a
-  // provider-scoped identity (github:<numeric id>) owns here. A row is the
-  // operator's invitation; without one the sign-in is refused. The row for a
-  // person who already had an agent points at that agent, so a new front door
-  // opens onto the same mounts, credentials and memory.
-  #identities() {
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS identities(
-      provider_key TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
-      added_by TEXT NOT NULL, created_at INTEGER NOT NULL)`);
-    // Rows written before tenants were per person live in "demo", and stay
-    // there: moving an agent between tenants is moving it to another object.
-    try { this.sql.exec("ALTER TABLE identities ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'demo'"); } catch { /* already there */ }
-  }
-
-  async identityLookup(key: string): Promise<{ agentId: string; tenantId: string } | null> {
-    this.#identities();
-    const r = this.sql.exec("SELECT agent_id, tenant_id FROM identities WHERE provider_key = ?", key).toArray()[0] as any;
-    return r ? { agentId: String(r.agent_id), tenantId: String(r.tenant_id) } : null;
-  }
-
-  async identityUpsert(key: string, agentId: string, tenantId: string, by: string) {
-    this.#identities();
-    this.sql.exec(
-      "INSERT INTO identities(provider_key, agent_id, tenant_id, added_by, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(provider_key) DO UPDATE SET agent_id = excluded.agent_id, tenant_id = excluded.tenant_id, added_by = excluded.added_by",
-      key, agentId, tenantId, by, Date.now());
-    return { ok: true as const };
-  }
-
-  async identityDelete(key: string) {
-    this.#identities();
-    this.sql.exec("DELETE FROM identities WHERE provider_key = ?", key);
-    return { ok: true as const };
-  }
-
-  async identityList() {
-    this.#identities();
-    return this.sql.exec("SELECT provider_key, agent_id, tenant_id, added_by, created_at FROM identities ORDER BY created_at").toArray()
-      .map((r: any) => ({ key: String(r.provider_key), agentId: String(r.agent_id), tenantId: String(r.tenant_id), addedBy: String(r.added_by), createdAt: Number(r.created_at) }));
-  }
-
   // ---- OpenAI-compatible agents API (task #17) -------------------------------
-  // Keys live in the identities object beside the sign-in table, as hashes.
+  // Keys live, as hashes, in the object the sign-in table used to share (see apiKeyObject).
   async apiKeyIssue(hash: string, tenantId: string, ownerAgentId: string, label: string) {
     issueKeyRow(this.sql, { hash, tenantId, ownerAgentId, label });
     return { ok: true as const };
@@ -2250,8 +2213,17 @@ function githubConfig(env: Env): GithubConfig | null {
   return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET, redirectUri: `${env.UI_ORIGIN}/login/github/callback` };
 }
 
-/** The one object that holds the identity table (see AgentDO.identityLookup). */
-function identities(env: Env) {
+/** The identity table, in the control plane (cf/src/control-plane.ts). */
+function identities(env: Env): IdentityDirectory {
+  return d1Identities(env.CONTROL_DB);
+}
+
+/**
+ * The object that holds Agents API keys (task #17): the one the sign-in table lived in before it moved to
+ * D1 (task #18), kept so keys already issued on preview stay valid. Keys are control-plane data too, and
+ * belong in D1 with the invitations when this branch is merged.
+ */
+function apiKeyObject(env: Env) {
   return env.AGENT.get(env.AGENT.idFromName(agentObjectName("demo", "identities")));
 }
 
@@ -2269,6 +2241,7 @@ const REFUSALS: Record<string, string> = {
   state: "The sign-in did not start here, or took longer than ten minutes. Start again.",
   exchange: "The sign-in provider did not accept the code. Start again.",
   unconfigured: "This sign-in is not configured on this deployment.",
+  unavailable: "The list of who may sign in did not answer. Try again shortly; signed-in sessions are not affected.",
 };
 
 /**
@@ -2318,25 +2291,27 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
         console.error("login: github exchange failed", String(e?.message ?? e));
         return refuse(request, "exchange", REFUSALS.exchange, 502);
       }
-      // The id is the identity; the table says whether it owns an agent here.
-      // No row, no entry: the console is one operator's, and a GitHub account
-      // is not an invitation.
+      // The id is the identity; the control plane says whether it owns an agent
+      // here. No row, no entry: the console is one operator's, and a GitHub
+      // account is not an invitation. Open sign-up writes the first row itself:
+      // the agent is a new one (default mounts, empty memory) in a tenant of its
+      // own (quota and data per person), never an existing person's, and an
+      // operator's row always wins (control-plane.ts admit).
       const key = githubIdentityKey(profile);
-      const dir = identities(env);
-      let row: { agentId: string; tenantId: string } | null = await dir.identityLookup(key);
-      if (!row && env.GITHUB_OPEN_SIGNUP === "1") {
-        // Open sign-up: the first sign-in writes its own row, and the agent
-        // is a new one (default mounts, empty memory) in a tenant of its own
-        // (quota and data per person), never an existing person's. The
-        // operator's rows still win, since they are looked up first.
-        row = { agentId: githubDefaultAgentId(profile), tenantId: githubDefaultTenantId(profile) };
-        await dir.identityUpsert(key, row.agentId, row.tenantId, "self");
-        console.log(`login: ${key} (${profile.login}) registered as ${row.tenantId}/${row.agentId}`);
+      const admission = await admit(identities(env), key, {
+        openSignup: env.GITHUB_OPEN_SIGNUP === "1",
+        derive: () => ({ agentId: githubDefaultAgentId(profile), tenantId: githubDefaultTenantId(profile) }),
+      });
+      if (!admission.ok && admission.reason === "unavailable") {
+        console.error(`login: ${key} (${profile.login}) could not be checked against the control plane: ${admission.error}`);
+        return refuse(request, "unavailable", REFUSALS.unavailable, 503);
       }
-      if (!row) {
+      if (!admission.ok) {
         console.warn(`login: ${key} (${profile.login}) is not on the identity table`);
         return refuse(request, "not-invited", REFUSALS["not-invited"]);
       }
+      const row = admission.row;
+      if (admission.registered) console.log(`login: ${key} (${profile.login}) registered as ${row.tenantId}/${row.agentId}`);
       const headers = new Headers({ location: new URL(st.returnTo, url).toString() });
       headers.append("set-cookie", await sessionCookieFor(env.SESSION_SECRET!, githubViewer(profile, emails, row.agentId, row.tenantId), key));
       headers.append("set-cookie", clearCookieHeader(LOGIN_COOKIE, "/login/github"));
@@ -2457,7 +2432,7 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   const tenantId = String(b?.tenantId ?? ""), ownerAgentId = String(b?.ownerAgentId ?? ""), label = String(b?.label ?? "");
   try { agentObjectName(tenantId, ownerAgentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
   const key = newApiKey();
-  await identities(env).apiKeyIssue(await hashApiKey(key), tenantId, ownerAgentId, label);
+  await apiKeyObject(env).apiKeyIssue(await hashApiKey(key), tenantId, ownerAgentId, label);
   return Response.json({ key, tenantId, ownerAgentId, label });
 }
 
@@ -2465,7 +2440,7 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
 async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const key = bearerKey(request);
   if (!key) return openAIError(401, "Missing or malformed API key. Send Authorization: Bearer <key>.", { code: "invalid_api_key" });
-  const row = await identities(env).apiKeyLookup(await hashApiKey(key));
+  const row = await apiKeyObject(env).apiKeyLookup(await hashApiKey(key));
   if (!row) return openAIError(401, "Incorrect API key provided.", { code: "invalid_api_key" });
   const { tenantId, ownerAgentId } = row;
   const owner = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, ownerAgentId)));
@@ -2927,43 +2902,49 @@ export default {
             return Response.json({ error: "unauthorized" }, { status: 401 });
           }
           const dir = identities(env);
-          if (request.method === "POST") {
-            const body: any = await request.json().catch(() => null);
-            const key = String(body?.key ?? "").trim();
-            const agentId = String(body?.agentId ?? "").trim();
-            const tenantId = String(body?.tenantId ?? "demo").trim();
-            // Admission equals the naming rule: a row the object name would
-            // refuse must not be written, or it fails at sign-in instead
-            // (Piper, 2026-09-12).
-            let named = "";
-            try { named = agentObjectName(tenantId, agentId); } catch (e: any) { named = ""; }
-            if (!/^github:\d+$/.test(key) || !agentId.startsWith("u-") || !named) {
-              return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo); both must be valid object-name parts" }, { status: 400 });
+          try {
+            if (request.method === "POST") {
+              const body: any = await request.json().catch(() => null);
+              const key = String(body?.key ?? "").trim();
+              const agentId = String(body?.agentId ?? "").trim();
+              const tenantId = String(body?.tenantId ?? "demo").trim();
+              // Admission equals the naming rule: a row the object name would
+              // refuse must not be written, or it fails at sign-in instead
+              // (Piper, 2026-09-12).
+              let named = "";
+              try { named = agentObjectName(tenantId, agentId); } catch (e: any) { named = ""; }
+              if (!/^github:\d+$/.test(key) || !agentId.startsWith("u-") || !named) {
+                return Response.json({ error: "BAD_ROW", hint: "key is github:<numeric id>; agentId is u-<…>; tenantId (optional, default demo); both must be valid object-name parts" }, { status: 400 });
+              }
+              await dir.upsert(key, { agentId, tenantId }, "automation");
+              return Response.json({ ok: true, key, agentId, tenantId });
             }
-            await dir.identityUpsert(key, agentId, tenantId, "automation");
-            return Response.json({ ok: true, key, agentId, tenantId });
+            if (request.method === "DELETE") {
+              // Removes the invitation, not the agent: the object and its data
+              // stay where they are; the person just cannot sign in to it.
+              const key = String(url.searchParams.get("key") ?? "").trim();
+              if (!/^github:\d+$/.test(key)) return Response.json({ error: "BAD_KEY", hint: "?key=github:<numeric id>" }, { status: 400 });
+              // The same button is two operations. A self-registered row is
+              // rebuilt by the next sign-in as the same tenant/agent pair (the
+              // derivations are pure in the id), so deleting it is an un-invite
+              // the person undoes themselves. A row that lives elsewhere (the
+              // pre-tenant rows in "demo") is rebuilt as a FRESH pair: the old
+              // object keeps the data and nothing reads it. Say so in the reply
+              // (Piper, Vera, Dora, 2026-09-12).
+              const row = await dir.lookup(key);
+              const rebuiltAs = githubDefaultTenantId({ id: Number(key.slice("github:".length)) });
+              const warning = row && row.tenantId !== rebuiltAs
+                ? `this row lives in tenant ${row.tenantId}; a re-registration under open sign-up lands in ${rebuiltAs}, a fresh object, and the data in ${row.tenantId}/${row.agentId} stays there unread. To restore access to the old object, POST the same row back with tenantId ${row.tenantId}.`
+                : null;
+              await dir.remove(key);
+              return Response.json({ ok: true, key, removed: row, ...(warning ? { warning } : {}) });
+            }
+            return Response.json({ identities: await dir.list() });
+          } catch (e: any) {
+            // D1 did not answer. Say that, rather than a bare 500 that reads as a bug in the route.
+            console.error("admin/identity: control plane unavailable", String(e?.message ?? e));
+            return Response.json({ error: "CONTROL_PLANE_UNAVAILABLE", hint: String(e?.message ?? e) }, { status: 503 });
           }
-          if (request.method === "DELETE") {
-            // Removes the invitation, not the agent: the object and its data
-            // stay where they are; the person just cannot sign in to it.
-            const key = String(url.searchParams.get("key") ?? "").trim();
-            if (!/^github:\d+$/.test(key)) return Response.json({ error: "BAD_KEY", hint: "?key=github:<numeric id>" }, { status: 400 });
-            // The same button is two operations. A self-registered row is
-            // rebuilt by the next sign-in as the same tenant/agent pair (the
-            // derivations are pure in the id), so deleting it is an un-invite
-            // the person undoes themselves. A row that lives elsewhere (the
-            // pre-tenant rows in "demo") is rebuilt as a FRESH pair: the old
-            // object keeps the data and nothing reads it. Say so in the reply
-            // (Piper, Vera, Dora, 2026-09-12).
-            const row = await dir.identityLookup(key);
-            const rebuiltAs = githubDefaultTenantId({ id: Number(key.slice("github:".length)) });
-            const warning = row && row.tenantId !== rebuiltAs
-              ? `this row lives in tenant ${row.tenantId}; a re-registration under open sign-up lands in ${rebuiltAs}, a fresh object, and the data in ${row.tenantId}/${row.agentId} stays there unread. To restore access to the old object, POST the same row back with tenantId ${row.tenantId}.`
-              : null;
-            await dir.identityDelete(key);
-            return Response.json({ ok: true, key, removed: row, ...(warning ? { warning } : {}) });
-          }
-          return Response.json({ identities: await dir.identityList() });
         }
         case "/admin/compact": {
           // The operator's way in, alongside /admin/diagnose. The UI button
@@ -3281,7 +3262,7 @@ export default {
         default:
           return Response.json({
             demo: "/ui",
-            diagnostics: ["/conformance/kernel", "/conformance/executor", "/isolation",
+            diagnostics: ["/conformance/executor", "/isolation",
                           "/eviction", "/model-binding", "/ui/whoami"],
             probes: ["/storage", "/sandbox", "/latency", "/alarm/status"],
           }, { status: 404 });

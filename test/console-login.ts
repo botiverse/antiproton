@@ -60,9 +60,9 @@ check("every refusal says what happened, what to do, and leads back to /login", 
     must(!/class="reason"/.test(h), `${reason}: a known reason is not echoed as a tag`);
     must(/You are not signed in/.test(h), `${reason}: it says no session exists`);
   }
-  // Every reason index.ts's refuse() can redirect with (admit()'s three, plus
-  // the three the routes name themselves) has words of its own.
-  for (const r of ["not-invited", "state", "exchange", "unconfigured"]) must(r in REFUSALS, `reason "${r}" has a page`);
+  // Every reason index.ts's refuse() can redirect with has words of its own,
+  // including the control plane not answering (task #18).
+  for (const r of ["not-invited", "state", "exchange", "unconfigured", "unavailable"]) must(r in REFUSALS, `reason "${r}" has a page`);
   for (const r of ["not-human", "no-email", "wrong-server"]) must(!(r in REFUSALS), `reason "${r}" belonged to the old provider`);
 });
 

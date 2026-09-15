@@ -462,7 +462,8 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
-      sandboxPlugin(this.#artifacts as any, deps.bucketName),
+      // The lease reaches the plugin so its tools state the lifetime this deployment gives a box.
+      sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       ...(deps.extraPlugins ?? []),

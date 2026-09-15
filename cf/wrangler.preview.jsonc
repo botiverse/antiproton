@@ -15,6 +15,9 @@
   "routes": [{ "pattern": "preview.antiproton.ai", "custom_domain": true }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentDO"] }],
   "durable_objects": { "bindings": [{ "name": "AGENT", "class_name": "AgentDO" }] },
+  "d1_databases": [
+    { "binding": "CONTROL_DB", "database_name": "antiproton-preview-control", "database_id": "a0e85fd1-e19a-4a05-a583-c85e3539622a", "migrations_dir": "migrations" }
+  ],
   "worker_loaders": [{ "binding": "LOADER" }],
   "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "antiproton-preview-artifacts" }],
   "queues": {
@@ -30,7 +33,10 @@
     "ARTIFACT_BUCKET": "antiproton-preview-artifacts",
     // Open to look at until the Access application exists; the write routes
     // refuse the anonymous viewer regardless, and there are no keys to spend.
-    "UI_ALLOW_ANONYMOUS": "1"
+    "UI_ALLOW_ANONYMOUS": "1",
+    // Same container lease as production (cf/wrangler.jsonc says why).
+    "RUN9_IDLE_MINUTES": "10",
+    "RUN9_MAX_IDLE_MINUTES": "30"
   },
   "observability": { "enabled": true }
 }

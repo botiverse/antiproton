@@ -381,7 +381,11 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] button:disabled{box-shadow:none}
 [data-theme="brutal"] input[type=text],[data-theme="brutal"] input[type=password]{border:2px solid var(--line-strong);background:var(--layer-panel);box-shadow:var(--theme-shadow-sm)}
 [data-theme="brutal"] input[type=text]:focus,[data-theme="brutal"] input[type=password]:focus{box-shadow:var(--theme-shadow-md)}
-[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug,[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
+[data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug{border:1px solid var(--line-strong);margin:8px 0;box-shadow:none}
+/* A card inside a framed panel keeps a hairline, not the offset shadow:
+   stacked 2px borders + shadows read as black boxes overlapping each other
+   (tygg, 2026-09-13). */
 [data-theme="brutal"] .card{border-left-width:2px}
 [data-theme="brutal"] .task,[data-theme="brutal"] .mount-link{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .task.on,[data-theme="brutal"] .mount-link.on{background:var(--primary-soft)}
@@ -420,6 +424,9 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
   input[type=text],input[type=password]{min-height:40px;font-size:15px}
   .view-head h2{font-size:14px}
   .conv .body{max-height:none}
+  /* The composer hint explains steer/after; on a phone that legend costs the
+     conversation real space it already is short of (tygg, 2026-09-13). */
+  .send-hint{display:none}
 }
 @media(max-width:760px){.sidebar .pane-close,.inspector .pane-close{display:inline-flex;margin:10px 12px 0}}
 `;
@@ -556,8 +563,8 @@ ${HEAD_ASSETS}
       </form>
       <div class="err send-err" id="send-err" hidden></div>
     </div>
-    <div class="hint" style="padding:0">Sending while it works steers it: the message reaches the model before its next call.
-      <b>after</b> holds the message until it has finished. A held call shows above the composer until you sign it.</div>
+    <div class="hint send-hint" style="padding:0"><b>send</b> steers it mid-flight; <b>after</b> holds until it finishes.
+      A held call shows in the flow until you sign it.</div>
   </section>
   <section class="view" data-view="plugins">
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
