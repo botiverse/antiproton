@@ -417,6 +417,9 @@ export class PiAgent {
    * so a `marker` custom entry naming the run is written, for whoever needs to
    * tell a cancelled turn from one not yet started. Custom entries are not in
    * the model's context. Null when nothing was running.
+   *
+   * Depends on: @earendil-works/pi-agent-core 0.85.1 — lane.abort ends the run, drops the offloaded job
+   *   and appends no entry (measured). When pi is upgraded, re-check with test/pi-agent.ts.
    */
   async cancel(marker: string): Promise<string | null> {
     const aborted: any = await this.#lane.abort(CTX);

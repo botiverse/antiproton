@@ -5,6 +5,10 @@
  * effect goes through `deps`: the owner's index and the agent's own object.
  * That keeps what the SDK sees testable without a Worker, and leaves index.ts
  * only the wiring — which is proven with the real SDK against a deployment.
+ *
+ * Depends on: openai 7.15.0 — request paths and params in resources/beta/agents/agents.js and
+ *   sessions/{sessions,events,items,turns}.js, and AgentSessionInputParam. When they change, re-check the
+ *   routes and the list of refused parameters.
  */
 import {
   agentDeleted, cursorPage, metadataOf, openAIError, parseAgentParams, parseEnvironment, sessionDeleted,

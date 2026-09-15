@@ -10,6 +10,10 @@
  * subscribes to an idle session and then sends input, and follows the first
  * turn it sees created, so a replayed old turn followed by `idle` would end its
  * iteration before the new turn began.
+ *
+ * Depends on: openai 7.15.0 — resources/beta/agents/agents.d.ts (AgentSessionEvent and its members) and
+ *   lib/agents/turn-state.js (when sessions.stream stops). When either changes, re-check the event shapes
+ *   and order here, and sdkStopsAt in test/agents-api-events.ts.
  */
 import type { ApiItem, ApiTurn } from "./transcript.ts";
 

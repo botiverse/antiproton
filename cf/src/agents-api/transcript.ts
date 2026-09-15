@@ -7,6 +7,11 @@
  * view over the entries, like the console's (pi-view.ts), so ids are derived
  * from entry sequence numbers and stay the same on every read — which is what
  * lets `after` cursors walk a list that is still growing.
+ *
+ * Depends on: openai 7.15.0 — resources/beta/agents/agents.d.ts (AgentSessionItem and its members) and
+ *   resources/beta/agents/sessions/turns.d.ts (Turn). When they change, re-check the item and turn shapes.
+ * Depends on: @earendil-works/pi-agent-core 0.85.1 — harness/session/types.d.ts (Entry, message roles,
+ *   stopReason values including "deferred"). When pi is upgraded, re-check turn grouping and statuses.
  */
 
 type Json = Record<string, unknown>;
@@ -16,6 +21,9 @@ type Json = Record<string, unknown>;
  * run and drops its model call but appends nothing (measured 2026-09-14), so
  * without this a cancelled turn reads as a prompt never picked up. Custom
  * entries are not projected into the model's context.
+ *
+ * Depends on: @earendil-works/pi-agent-core 0.85.1 — lane.abort appending no entry (measured). If an
+ *   upgrade records aborts itself, re-check whether this marker is still needed.
  */
 export const TURN_CANCELLED = "agents_api.turn_cancelled";
 type TurnStatus = "queued" | "in_progress" | "waiting" | "completed" | "failed" | "cancelled";

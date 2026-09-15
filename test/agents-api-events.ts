@@ -22,7 +22,11 @@ let n = 0;
 const eventId = () => `evt_${++n}`;
 const sessionWith = (status: string) => ({ id: "sess_1", object: "agent.session", status });
 
-/** The SDK's own stop rule (lib/agents/turn-state.js): follow the first turn created; stop at its end followed by idle. */
+/**
+ * The SDK's own stop rule, re-implemented: follow the first turn created; stop at its end followed by idle.
+ * Depends on: openai 7.15.0 — lib/agents/turn-state.js (TurnState.accept / terminal). When it changes,
+ *   update this function to match, then re-check cf/src/agents-api/events.ts.
+ */
 function sdkStopsAt(events: Array<{ type: string; turn_id?: unknown }>): number {
   let turn: unknown, ended = false;
   for (const [i, e] of events.entries()) {

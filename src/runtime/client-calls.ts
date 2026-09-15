@@ -14,6 +14,10 @@
  * A result can also arrive before the tool has run: the SDK answers as soon as
  * the stream shows the call, which can be before this object executes it. It
  * is kept, and the tool returns it at once instead of pausing.
+ *
+ * Depends on: @earendil-works/pi-agent-core 0.85.1 — AgentLane requestAbort / navigateTree / accept, and
+ *   the measured behaviour that a tool throwing after an abort is recorded as that call's result. When pi
+ *   is upgraded, re-run test/client-calls.ts and re-check the pause-and-branch design.
  */
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 

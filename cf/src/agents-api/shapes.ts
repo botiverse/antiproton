@@ -7,6 +7,10 @@
  * the SDK's own defaults. What antiproton does not do is refused with an error
  * shaped like OpenAI's, naming the parameter — never accepted and ignored: a
  * silently dropped setting reads to the caller as a setting that worked.
+ *
+ * Depends on: openai 7.15.0 — resources/beta/agents/agents.d.ts (Agent, AgentSession, environments,
+ *   AgentTool), core/pagination (CursorPage) and core/error (APIError reads body.error). When the SDK's
+ *   agents types change, re-check every object, default and refusal here.
  */
 
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
