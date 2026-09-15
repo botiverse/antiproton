@@ -122,6 +122,8 @@ check("a 422 with secret:true names the mount and offers send-anyway as a second
   must(/d\.plugins\[0\][\s\S]*?mount on the plugins page/.test(html), "when the server names a plugin, the hint points at its mount");
   must(/No mount here takes this kind/.test(html), "when nothing takes it, the hint says so instead of guessing");
   must(/type="submit" form="composer" name="allowSecret" value="1"/.test(html), "send-anyway resubmits the same text with allowSecret=1 — an explicit second click");
+  must(/htmx\.process\(err\)/.test(html), "the injected button must be htmx-processed, or it submits natively and allowSecret never reaches the request");
+  must(/esc\(String\(d\.plugins\[0\]\)\)/.test(html), "the plugin name is server data — it must be escaped like kind");
 });
 
 const failed = results.filter((r) => !r.ok);
