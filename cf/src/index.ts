@@ -19,7 +19,7 @@ import { apiAgentSeeds } from "./agents-api/provisioning.ts";
 import { watchChanges } from "./agents-api/watch.ts";
 import { openAIError, type StoredAgent, type StoredSession } from "./agents-api/shapes.ts";
 import {
-  deleteApiAgent, deleteApiSession, getApiAgent, getApiSession, listApiAgents, listApiSessions,
+  deleteApiAgent, deleteApiSession, deletedApiAgentIds, getApiAgent, getApiSession, listApiAgents, listApiSessions,
   mintAgentId, mintSessionId, putApiAgent, putApiSession,
 } from "./agents-api/store.ts";
 import { maskRawRefs } from "../../src/store/refs.ts";
@@ -1279,42 +1279,52 @@ export class AgentDO extends DurableObject<Env> {
     return { name: a.name ?? nameFor(agentId), description: a.instructions ?? "", avatar, openai: a } as unknown as Json;
   }
 
-  /** Run in the agent's own object: create it with its persona, or refresh the persona if it exists. */
+  /**
+   * Run in the agent's own object: make it match the API's record of the agent (the owner's index,
+   * which is written first). Created when absent; the persona rewritten only when it differs, so the
+   * calls that repeat this on every use write nothing once it matches. Returns what the console lists.
+   */
   async apiAdopt(tenantId: string, agentId: string, agentJson: string) {
-    const a = JSON.parse(agentJson) as StoredAgent;
     this.#claim(tenantId, agentId);
     const rt = this.runtime();
     await rt.ready();
+    return this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
+  }
+
+  async #adopt(rt: AgentRuntime, tenantId: string, agentId: string, a: StoredAgent) {
     const existing = await rt.store.loadAgent(tenantId, agentId);
-    const avatar = String((existing?.config as any)?.avatar ?? mintAvatar());
+    const config = existing?.config as any;
+    const avatar = String(config?.avatar ?? mintAvatar());
     if (!existing) await rt.store.createAgent(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
-    else await rt.store.updateAgentConfig(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
+    else if (JSON.stringify(config?.openai) !== JSON.stringify(a)) await rt.store.updateAgentConfig(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
     return { name: a.name ?? nameFor(agentId), description: a.instructions ?? "", avatar };
   }
 
-  async apiUpdatePersona(tenantId: string, agentId: string, agentJson: string) {
-    const a = JSON.parse(agentJson) as StoredAgent;
+  /** A session is a conversation in this agent's object; the task row is what #conversation accepts. Adopts first. */
+  async apiOpenSession(tenantId: string, agentId: string, agentJson: string, sessionId: string) {
     this.#claim(tenantId, agentId);
     const rt = this.runtime();
     await rt.ready();
-    const existing = await rt.store.loadAgent(tenantId, agentId);
-    const avatar = String((existing?.config as any)?.avatar ?? mintAvatar());
-    await rt.store.updateAgentConfig(tenantId, agentId, this.#apiPersona(agentId, a, avatar));
+    const made = await this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
+    await this.#openTask(rt, tenantId, agentId, sessionId);
+    return made;
   }
 
-  /** A session is a conversation in this agent's object; the task row is what #conversation accepts. */
-  async apiOpenSession(tenantId: string, agentId: string, sessionId: string) {
-    this.#claim(tenantId, agentId);
-    const rt = this.runtime();
-    await rt.ready();
+  async #openTask(rt: AgentRuntime, tenantId: string, agentId: string, sessionId: string) {
     if (!(await rt.store.loadTask(tenantId, sessionId))) await rt.store.createTask(tenantId, agentId, sessionId, {});
   }
 
-  /** Text into the session, the way startTask does it for the main conversation. */
-  async apiPostInput(tenantId: string, agentId: string, sessionId: string, text: string, environment: "none" | "container" = "none") {
+  /**
+   * Text into the session, the way startTask does it for the main conversation. The agent and the
+   * session are opened first, so input repairs an object a failed create or update left behind.
+   */
+  async apiPostInput(tenantId: string, agentId: string, agentJson: string, sessionId: string, text: string, environment: "none" | "container" = "none") {
     this.#claim(tenantId, agentId);
     return this.#busy("apiPostInput", async () => {
       const rt = this.runtime();
+      await rt.ready();
+      const made = await this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
+      await this.#openTask(rt, tenantId, agentId, sessionId);
       // Not the console's default mounts: an API agent has what its caller declared (agents-api/provisioning.ts).
       await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment));
       await rt.bindOperatorModel(tenantId, agentId);
@@ -1322,7 +1332,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now());
       // The turn is on record now: say so, rather than leaving it for the step that follows.
       await this.broadcast();
-      return { ok: true as const };
+      return { ok: true as const, made };
     });
   }
 
@@ -1394,7 +1404,10 @@ export class AgentDO extends DurableObject<Env> {
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
-    const rows = this.sql.exec("SELECT * FROM owned_agents ORDER BY created_at DESC").toArray() as any[];
+    // An agent deleted through the API is gone here too; its object is kept, as for every agent.
+    const deleted = deletedApiAgentIds(this.sql);
+    const rows = (this.sql.exec("SELECT * FROM owned_agents ORDER BY created_at DESC").toArray() as any[])
+      .filter((r) => !deleted.has(String(r.agent_id)));
     const owned = rows.map((r) => ({
       agentId: String(r.agent_id), name: String(r.name), description: String(r.description),
       avatar: String(r.avatar), createdAt: Number(r.created_at),
@@ -1409,6 +1422,7 @@ export class AgentDO extends DurableObject<Env> {
     if (agentId === ownerAgentId) return true;
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
+    if (deletedApiAgentIds(this.sql).has(agentId)) return false;
     return this.sql.exec("SELECT 1 FROM owned_agents WHERE agent_id=?", agentId).toArray().length > 0;
   }
 
@@ -2440,6 +2454,10 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
       catch { return openAIError(400, "We could not parse the JSON body of your request.", { code: "invalid_json" }); }
     } else body = {};
   }
+  // Listed in the owner's directory too, so the console shows what the API made. Idempotent.
+  const listInConsole = async (agentId: string, a: StoredAgent, made: { name: string; description: string; avatar: string }) => {
+    await owner.uiRecordAgent(tenantId, ownerAgentId, { agentId, ...made, createdAt: a.createdAt });
+  };
   const deps: AgentsApiDeps = {
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -2470,13 +2488,16 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
     },
     agents: {
       adopt: async (agentId, a) => {
-        const made = await agentStub(agentId).apiAdopt(tenantId, agentId, JSON.stringify(a));
-        // Listed in the owner's directory too, so the console shows what the API made.
-        await owner.uiRecordAgent(tenantId, ownerAgentId, { agentId, ...made, createdAt: a.createdAt });
+        await listInConsole(agentId, a, await agentStub(agentId).apiAdopt(tenantId, agentId, JSON.stringify(a)));
       },
-      updatePersona: async (agentId, a) => { await agentStub(agentId).apiUpdatePersona(tenantId, agentId, JSON.stringify(a)); },
-      openSession: async (agentId, sessionId) => { await agentStub(agentId).apiOpenSession(tenantId, agentId, sessionId); },
-      postInput: async (agentId, sessionId, text, environment) => { await agentStub(agentId).apiPostInput(tenantId, agentId, sessionId, text, environment); },
+      openSession: async (agentId, a, sessionId) => {
+        await listInConsole(agentId, a, await agentStub(agentId).apiOpenSession(tenantId, agentId, JSON.stringify(a), sessionId));
+      },
+      postInput: async (agentId, a, sessionId, text, environment) => {
+        const posted = await agentStub(agentId).apiPostInput(tenantId, agentId, JSON.stringify(a), sessionId, text, environment);
+        // The input is delivered: a failure to list it now must not read as undelivered, and invite a resend.
+        await listInConsole(agentId, a, posted.made).catch(() => undefined);
+      },
       status: (agentId, sessionId) => agentStub(agentId).apiSessionStatus(tenantId, agentId, sessionId),
       cancel: async (agentId, sessionId) => { await agentStub(agentId).apiCancelSession(tenantId, agentId, sessionId); },
       toolResults: (agentId, sessionId, results) => agentStub(agentId).apiToolResults(tenantId, agentId, sessionId, results),

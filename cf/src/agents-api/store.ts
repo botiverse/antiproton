@@ -4,8 +4,8 @@
  * Agents and sessions created through the API are indexed in the owner's
  * object — the one the API key names — so a key can list, find and delete
  * them without a directory service. Each agent is still its own object; each
- * session is a conversation in that agent's object. Keys live in the
- * "identities" object beside the sign-in table, as hashes only.
+ * session is a conversation in that agent's object. Keys are control-plane data
+ * and live in D1, as hashes only (cf/src/control-plane.ts d1ApiKeys).
  *
  * Everything takes the same two-method SQL a Durable Object has, so node:sqlite
  * tests it exactly as the object runs it.
@@ -69,6 +69,15 @@ export function deleteApiAgent(sql: Sql, agentId: string, now = Date.now()): boo
   const had = sql.exec("SELECT 1 AS x FROM api_agents WHERE agent_id = ? AND deleted_at IS NULL", agentId).toArray().length > 0;
   sql.exec("UPDATE api_agents SET deleted_at = ? WHERE agent_id = ? AND deleted_at IS NULL", now, agentId);
   return had;
+}
+
+/**
+ * The agents the API deleted, for the console's own directory (owned_agents), which lists every agent
+ * the owner made: without this, an agent gone from the API stayed in the console.
+ */
+export function deletedApiAgentIds(sql: Sql): Set<string> {
+  ensureApiTables(sql);
+  return new Set(sql.exec("SELECT agent_id FROM api_agents WHERE deleted_at IS NOT NULL").toArray().map((r: any) => String(r.agent_id)));
 }
 
 const rowToSession = (r: any): StoredSession => ({
