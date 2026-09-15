@@ -62,8 +62,13 @@ await check("a client call pauses the turn and the step returns; the caller's re
   await f.agent.say("weather in Paris?");
   await f.agent.step();
   f.reply({ toolCalls: [{ id: "call_1", name: "get_weather", arguments: { city: "Paris" } }] });
+  const t0 = Date.now();
   const paused = await Promise.race([f.agent.step(), new Promise((r) => setTimeout(() => r("hung"), 5000))]);
+  const pauseMs = Date.now() - t0;
   assert(paused !== "hung", "the step waited for the caller");
+  // The pause ends when the abort lands, not on a timer: a wait that misses the abort runs to its 2 s cap,
+  // and the caller then sees every function's output 2 s late (preview, 2026-09-15).
+  assert(pauseMs < 1000, `pausing took ${pauseMs} ms: the tool waited out its cap instead of the abort`);
   assert((await f.agent.lane.inspectExecution(CTX)).current === null, "the run is still current while waiting for the caller");
   const waiting = pendingClientCalls(f.host.sql as any, SESSION);
   assert(waiting.length === 1 && waiting[0]!.call_id === "call_1" && waiting[0]!.name === "get_weather" && JSON.parse(waiting[0]!.arguments).city === "Paris",

@@ -15,9 +15,11 @@
  * the stream shows the call, which can be before this object executes it. It
  * is kept, and the tool returns it at once instead of pausing.
  *
- * Depends on: @earendil-works/pi-agent-core 0.85.1 — AgentLane requestAbort / navigateTree / accept, and
- *   the measured behaviour that a tool throwing after an abort is recorded as that call's result. When pi
- *   is upgraded, re-run test/client-calls.ts and re-check the pause-and-branch design.
+ * Depends on: @earendil-works/pi-agent-core 0.85.1 — AgentLane requestAbort / navigateTree / accept, the
+ *   measured behaviour that a tool throwing after an abort is recorded as that call's result, and the tool
+ *   signature execute(toolCallId, params, onUpdate, toolContext, invocation, context) with the abort on
+ *   context.abortSignal (harness/execution/tools.js). When pi is upgraded, re-run test/client-calls.ts
+ *   (it times the pause) and re-check the pause-and-branch design.
  */
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 
@@ -73,6 +75,16 @@ export function dropClientCalls(sql: Sql, session: string): number {
   return waiting;
 }
 
+/** Resolves when the signal aborts, or after `capMs`, whichever is first. */
+function abortedOrAfter(signal: AbortSignal | undefined, capMs: number): Promise<void> {
+  if (!signal || signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
+    const timer = setTimeout(done, capMs);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
 type PausingLane = {
   inspectExecution(context: typeof CTX): Promise<any>;
   requestAbort(operationId: string, context: typeof CTX): Promise<any>;
@@ -85,7 +97,8 @@ export function clientTools(defs: ClientToolDef[], d: { sql: Sql; session: strin
     label: def.name,
     description: def.description,
     parameters: def.parameters as any,
-    async execute(toolCallId: string, params: unknown, signal?: AbortSignal) {
+    async execute(toolCallId: string, params: unknown, _onUpdate?: unknown, _toolContext?: unknown, _invocation?: unknown,
+      context?: { abortSignal?: AbortSignal }) {
       ensureClientCalls(d.sql);
       const early = d.sql.exec(
         `SELECT state, output, is_error FROM ${TABLE} WHERE session = ? AND call_id = ?`, d.session, toolCallId).toArray()[0];
@@ -100,7 +113,11 @@ export function clientTools(defs: ClientToolDef[], d: { sql: Sql; session: strin
       const current = (await d.lane().inspectExecution(CTX))?.current;
       if (current) await d.lane().requestAbort(current.id, CTX);
       // The abort lands on the signal a moment later; failing before it would record a failure the model acts on.
-      for (let i = 0; i < 200 && signal && !signal.aborted; i++) await new Promise((r) => setTimeout(r, 10));
+      // The signal is the sixth argument's abortSignal. This read the third (onUpdate, a function) until
+      // 2026-09-15, so the wait never saw the abort and always ran to its cap: every caller-run function
+      // showed its output 2.00 s after the result was posted (measured on preview, 3 of 3 and 6 of 6).
+      // The cap stays only for an abort that never lands.
+      await abortedOrAfter(context?.abortSignal, 2000);
       throw new Error(CLIENT_PENDING);
     },
   }));
