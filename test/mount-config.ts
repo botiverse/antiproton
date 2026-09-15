@@ -1803,6 +1803,123 @@ await check("a container acts as a mount only when nothing on that mount is held
 });
 
 /**
+ * A running container's GitHub access follows the mount, not the moment it started.
+ *
+ * Checked only at creation, a mount switched to approval kept its container
+ * signed in until the container was released, which under a lease can be hours
+ * (cody, reviewing #339); a token taken away or replaced was the same gap. So
+ * before each command the mount is read again, and when what may be wired in
+ * has changed, the container's GitHub secrets are deleted, measured on run9 to
+ * stop substitution on the next request, and registered again only if allowed.
+ */
+await check("a running container's GitHub access follows the mount: held, removed, replaced, attached later", async () => {
+  const original = globalThis.fetch;
+  let secrets: Array<Record<string, any>> = [];
+  const log: string[] = [];
+  let failDelete = false;
+  let n = 0;
+  let sid = 0;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const path = String(url).replace("https://sandbox.example", "");
+    const method = init?.method ?? "GET";
+    if (/\/secrets$/.test(path) && method === "POST") {
+      const b = JSON.parse(init.body);
+      const created = { secret_id: `s${++sid}`, ...b };
+      secrets.push(created);
+      log.push(`POST ${b.name}`);
+      return new Response(JSON.stringify(created));
+    }
+    if (/\/secrets$/.test(path) && method === "GET") { log.push("LIST"); return new Response(JSON.stringify(secrets)); }
+    const del = /\/secrets\/([^/]+)$/.exec(path);
+    if (del && method === "DELETE") {
+      log.push(`DELETE ${del[1]}`);
+      if (failDelete) return new Response("no", { status: 500 });
+      secrets = secrets.filter((x) => x.secret_id !== del[1]);
+      return new Response("");
+    }
+    if (method === "POST" && /background-execs$/.test(path)) {
+      log.push(`EXEC ${JSON.parse(init.body).command.join(" ").includes("GH_TOKEN") ? "with" : "without"} GH_TOKEN`);
+      return new Response(JSON.stringify({ exec_id: `e${++n}` }));
+    }
+    if (/execs\/e\d+$/.test(path)) {
+      return new Response(JSON.stringify({ state: "succeeded", exit_code: 0, output_summary: "ok\n__AP_CWD__/work\n" }));
+    }
+    return new Response("{}");
+  }) as any;
+  const plugin = sandboxPlugin(null as any, "local");
+  let mount: any = { plugin: "github", credential: "tok-1", connection: null, policy: null };
+  const box: any = { stored: null };
+  const ctx: any = {
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+    credential: JSON.stringify({ ak: "a", sk: "b" }),
+    publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
+    connection: { get: async () => box.stored, set: async (v: unknown) => { box.stored = v; } },
+    sibling: async () => mount,
+  };
+  const run = async () => { log.length = 0; return await plugin.invoke("shell", { command: "gh repo view" } as any, ctx) as any; };
+  const registered = (name: string) => secrets.find((x) => x.name === name);
+  const holds = (token: string) => secrets.some((x) => x.value === token || x.value === btoa(`x-access-token:${token}`));
+  try {
+    await run();
+    if (secrets.length !== 2 || !box.stored.githubPlaceholder) throw new Error(`not wired in at creation: ${JSON.stringify(box.stored)}`);
+    if (JSON.stringify(box.stored).includes("tok-1")) throw new Error("the record holds the token");
+    const placeholder = box.stored.githubPlaceholder;
+
+    await run();
+    if (log.some((l) => /LIST|DELETE|POST GH/.test(l))) throw new Error(`an unchanged mount touched the box's secrets: ${log}`);
+
+    mount = { ...mount, policy: { write: "approval" } };
+    let r = await run();
+    if (secrets.length || box.stored.githubPlaceholder || box.stored.githubWithheld !== "gh"
+      || !log.includes("EXEC without GH_TOKEN") || !/approval or denied/.test(String(r.github))) {
+      throw new Error(`a policy held after creation: ${log} ${JSON.stringify(box.stored)}`);
+    }
+
+    mount = { ...mount, policy: null, credential: "tok-2" };
+    await run();
+    // A new placeholder, not the old one: run9 accepts a deleted secret's placeholder
+    // again and then does not substitute it (measured, 2026-09-15).
+    if (!holds("tok-2") || secrets.length !== 2 || !box.stored.githubPlaceholder || box.stored.githubPlaceholder === placeholder
+      || box.stored.githubWithheld || !log.includes("EXEC with GH_TOKEN")) {
+      throw new Error(`allowed again with a new token: ${log} ${JSON.stringify(box.stored)}`);
+    }
+
+    mount = { ...mount, credential: "tok-3" };
+    await run();
+    if (holds("tok-2") || !holds("tok-3") || secrets.length !== 2) throw new Error(`a replaced token stayed registered: ${log}`);
+
+    mount = { ...mount, credential: null };
+    r = await run();
+    if (secrets.length || box.stored.githubPlaceholder || box.stored.githubWithheld || !log.includes("EXEC without GH_TOKEN")) {
+      throw new Error(`a removed token stayed: ${log} ${JSON.stringify(box.stored)}`);
+    }
+
+    mount = { ...mount, credential: "tok-4" };
+    await run();
+    if (!holds("tok-4") || !log.includes("EXEC with GH_TOKEN")) throw new Error(`a token attached later was not wired in: ${log}`);
+
+    mount = { ...mount, policy: { write: "deny" } };
+    failDelete = true;
+    let threw = false;
+    try { await run(); } catch { threw = true; }
+    if (!threw || log.some((l) => l.startsWith("EXEC"))) throw new Error(`a failed revocation still ran the command: ${log}`);
+    if (!box.stored.githubPlaceholder) throw new Error("the record stopped naming access that is still registered");
+    failDelete = false;
+
+    // A container from before this change: a placeholder and no digest.
+    secrets = [{ secret_id: "old1", name: "GH_TOKEN", value: "tok-5" }, { secret_id: "old2", name: "GH_TOKEN_GIT", value: btoa("x-access-token:tok-5") }];
+    box.stored = { boxId: "h-t-a-legacy", createdAt: 1, lastUsedAt: 1, execs: 1, sessions: [], githubPlaceholder: "__AP_GH_TOKEN_legacy__" };
+    mount = { plugin: "github", credential: "tok-5", connection: null, policy: null };
+    await run();
+    if (!box.stored.githubTokenDigest || !registered("GH_TOKEN") || !log.includes("EXEC with GH_TOKEN")) {
+      throw new Error(`a container from before was not brought in line: ${log} ${JSON.stringify(box.stored)}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",
