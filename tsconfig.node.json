@@ -52,6 +52,7 @@
     "test/plugin-enable.ts",
     "test/prompt-contributions.ts",
     "test/control-plane.ts",
-    "test/spec/control-plane-spec.ts"
+    "test/spec/control-plane-spec.ts",
+    "test/mount-reports.ts"
   ]
 }
