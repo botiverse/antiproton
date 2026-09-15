@@ -82,7 +82,7 @@ check("the quiet-until notice shows when the agent postponed, and artifacts unio
       ],
     } },
   });
-  must(html.includes("quiet until"), "the postponed notice did not render");
+  must(html.includes("kept until") && html.includes("postponed its release"), "the postponed release did not render");
   must(html.includes("3 artifact(s)"), "kept was not unioned across sessions");
 });
 

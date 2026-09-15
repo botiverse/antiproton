@@ -13,7 +13,7 @@
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
-import { idleDecision, nudgeText } from "../../src/runtime/idle-lease.ts";
+import { idleDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
@@ -328,9 +328,10 @@ export interface RuntimeDeps {
    * "the container persists between calls" false wherever the tools say it.
    * Present means the lease: see src/runtime/idle-lease.ts for the schedule.
    * A deployment turns it on by setting both numbers, because both are prices
-   * — a reminder costs a model turn, a box costs seconds.
+   * — a warning costs a model turn, a box costs seconds. `warnMs` is how long
+   * before the release the agent is told; `maxMs` is idle time before release.
    */
-  idle?: { afterMs: number; maxMs: number };
+  idle?: { warnMs: number; maxMs: number };
 }
 
 /**
@@ -1207,11 +1208,13 @@ export class AgentRuntime {
   async #idlePass(tenantId: string, agentId: string): Promise<{
     wakeInMs: number | null; releaseFailed: Array<{ alias: string; error: string }>;
   }> {
-    const { afterMs, maxMs } = this.#deps.idle!;
+    const { warnMs, maxMs } = this.#deps.idle!;
     const now = Date.now();
     const sql = this.#deps.ctx.storage.sql;
-    sql.exec(`CREATE TABLE IF NOT EXISTS box_reminders(
-      alias TEXT NOT NULL, box_id TEXT NOT NULL, sent INTEGER NOT NULL,
+    // Which release time each box's agent was already told about (idle-lease.ts): one warning per release
+    // time. The old `box_reminders` counted escalating reminders and is no longer read.
+    sql.exec(`CREATE TABLE IF NOT EXISTS box_warnings(
+      alias TEXT NOT NULL, box_id TEXT NOT NULL, release_at INTEGER NOT NULL,
       PRIMARY KEY (alias, box_id))`);
     let wakeInMs: number | null = null;
     let releaseFailed: Array<{ alias: string; error: string }> = [];
@@ -1236,28 +1239,30 @@ export class AgentRuntime {
       // schedule from, and inventing a clock here is how a box in use gets
       // taken mid-task.
       if (!boxId || !lastUsedAt) continue;
-      const row = sql.exec("SELECT sent FROM box_reminders WHERE alias = ? AND box_id = ?", mount.alias, boxId)
+      const row = sql.exec("SELECT release_at FROM box_warnings WHERE alias = ? AND box_id = ?", mount.alias, boxId)
         .toArray()[0] as any;
-      const sent = Number(row?.sent) || 0;
-      const d = idleDecision({ lastUsedAt, quietUntil: Number(state?.quietUntil) || 0, sent, now, afterMs, maxMs });
+      const warnedFor = Number(row?.release_at) || 0;
+      // `quietUntil` is the agent's postponement, written by the plugin's `quiet` and capped there.
+      const d = idleDecision({ lastUsedAt, postponedUntil: Number(state?.quietUntil) || 0, warnedFor, now, warnMs, maxMs });
       if (d.do === "wait") { soon(d.wakeInMs); continue; }
-      if (d.do === "nudge") {
-        // The reminder is a turn the agent takes, so it is a message rather
+      if (d.do === "warn") {
+        // The warning is a turn the agent takes, so it is a message rather
         // than a signal: the model has to be able to answer it with a call.
+        const limit = Number((mount.publicConfig as any)?.maxQuietMinutes) || null;
         await this.postMessage(tenantId, agentId,
-          nudgeText(mount.alias,
+          warningText(mount.alias,
             { release: offeredName(mount.alias, "release"), quiet: offeredName(mount.alias, "quiet") },
-            d.idleMs, lastUsedAt + maxMs - now), "prompt");
-        sql.exec("INSERT INTO box_reminders(alias, box_id, sent) VALUES (?,?,?) " +
-          "ON CONFLICT(alias, box_id) DO UPDATE SET sent = excluded.sent", mount.alias, boxId, d.nth);
+            d.idleMs, d.untilReleaseMs, limit), "prompt");
+        sql.exec("INSERT INTO box_warnings(alias, box_id, release_at) VALUES (?,?,?) " +
+          "ON CONFLICT(alias, box_id) DO UPDATE SET release_at = excluded.release_at", mount.alias, boxId, d.releaseAt);
         soon(d.wakeInMs);
         continue;
       }
-      // Past the ceiling. This box only: each mount has its own idle clock, so
-      // one reaching its ceiling says nothing about another's.
+      // Past its release time. This box only: each mount has its own idle clock,
+      // so one reaching its time says nothing about another's.
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: mount.alias });
       releaseFailed = [...releaseFailed, ...r.failed];
-      sql.exec("DELETE FROM box_reminders WHERE alias = ? AND box_id = ?", mount.alias, boxId);
+      sql.exec("DELETE FROM box_warnings WHERE alias = ? AND box_id = ?", mount.alias, boxId);
     }
     return { wakeInMs, releaseFailed };
   }
