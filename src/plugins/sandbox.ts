@@ -246,6 +246,21 @@ export interface BoxLease {
 const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 
 /**
+ * What `keep` and `save` say about release, in their summaries and in what they hand back.
+ *
+ * "It survives release" was true and read as permission: in Vera's blind-use round 4 (2026-09-15) an agent told
+ * the user would come back kept the environment, saved an archive, and reasoned "since I've kept the environment
+ * and saved the archive, I could release the container". The note it had just been handed was the last thing it
+ * read before deciding, so the copy's survival is said together with what it is not.
+ */
+export const NOT_A_REASON_TO_RELEASE =
+  "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
+  "will come back to this machine, leave it running.";
+export const KEPT_NOTE =
+  "independent of this container; start a fresh machine from it later with `start_from`. " + NOT_A_REASON_TO_RELEASE;
+export const SAVED_NOTE = "kept outside the box, for later. " + NOT_A_REASON_TO_RELEASE;
+
+/**
  * What happens to an idle box under a lease, said once for the reminder, `run` and `shell`.
  *
  * "Files survive" is true of the box's root disk, not of /tmp. In a run9 box /tmp is a tmpfs; measured on
@@ -796,7 +811,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Copy a file out of the container into durable storage before it is destroyed. Returns an " +
         "r2:// reference the artifacts mount can read back, and that outlives the box. Set " +
         "archive for a directory. Do this for anything worth keeping — a build output, a report, a " +
-        "diff — the moment it exists, not at the end.",
+        "diff — the moment it exists, not at the end. " + NOT_A_REASON_TO_RELEASE,
       parameters: {
         type: "object",
         properties: {
@@ -818,7 +833,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Save this container's filesystem under a name, so a later task can start from it instead " +
         "of installing everything again. Use it once the environment is set up — interpreter, " +
         "packages, a cloned repository — not for the results, which belong in `save`. The " +
-        "container keeps running; the snapshot is independent of it and survives its release.",
+        "container keeps running; the snapshot is independent of it. " + NOT_A_REASON_TO_RELEASE,
       parameters: {
         type: "object",
         properties: {
@@ -846,13 +861,23 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
     {
       name: "release",
-      summary:
-        "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-        "first, in the same call. Release it when this machine will not be needed again. If you or the " +
-        "person you are working for will come back to it, leave it running: an idle container is released " +
-        "on its own after a while, you are told before that, and `quiet` keeps it longer. A kept " +
-        "environment or a saved file is for starting a fresh machine later, not a reason to destroy one " +
-        "you are about to use again.",
+      // Which advice is true depends on the lease, as it does for `run` and
+      // `shell`: without one a box is handed back when the turn ends, so
+      // "leave it running" and "`quiet` keeps it longer" would be promises
+      // nothing keeps (the SWE-bench runner, or a Worker without the two
+      // settings). No number here: the minutes are said where they are read.
+      summary: lease
+        ? "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+          "first, in the same call. If you or the person you are working for will come back to it, leave it " +
+          "running, even after keeping or saving what is in it. Release it only when this machine will not be " +
+          "needed again. Leaving it running costs at most its idle time — an idle container is released on its " +
+          "own after a while, you are told before that, and `quiet` keeps it longer — while releasing it early " +
+          "saves little and makes the next visit start over. A kept environment or a saved file is for " +
+          "starting a fresh machine later, not a reason to destroy one someone will use again."
+        : "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
+          "first, in the same call. It is handed back when the turn ends anyway, so release it sooner once " +
+          "this machine will not be needed again in this turn. A later turn starts a fresh machine: what it " +
+          "needs has to be kept or saved before this turn ends.",
       parameters: {
         type: "object",
         properties: {
@@ -873,12 +898,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
     {
       name: "quiet",
-      summary:
-        "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
-        "you are not told about it again until shortly before then. Use it when you are coming back to " +
-        "the machine — a build you are waiting on, work you return to after reading something. It is " +
-        "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
-        "and it can save files out in the same call.",
+      summary: lease
+        ? "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
+          "you are not told about it again until shortly before then. Use it when you are coming back to " +
+          "the machine — a build you are waiting on, work you return to after reading something. It is " +
+          "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
+          "and it can save files out in the same call."
+        : "Has no effect here: this mount has no idle release to put off, and the container is handed " +
+          "back when the turn ends whatever you ask. To carry work into a later turn, keep or save it.",
       parameters: {
         type: "object",
         properties: {
@@ -1090,6 +1117,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           `Ask for ${cap} or fewer, or release the container — it is billed for every second either way.`,
         );
       }
+      // After the refusals, so a malformed request is refused the same everywhere; before the write, so a
+      // mount with no lease does not record a postponement nothing will read and answer as if it had one.
+      if (!lease) {
+        return {
+          quiet: false,
+          note: "this mount has no idle release to postpone: the container is handed back when the turn ends",
+        };
+      }
       if (!prior?.boxId) return { quiet: false, note: "nothing is running, so there is no release to postpone" };
       const quietUntil = Date.now() + asked * 60_000;
       // The postponement is its own instant, and `lastUsedAt` is deliberately
@@ -1261,14 +1296,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       await ctx.connection.set(state as unknown as Json);
       return {
         kept: name, snapshot: snapId,
-        note: "independent of this container and survives its release; " +
-          "start a later one from it with `start_from`",
+        note: KEPT_NOTE,
       };
     }
 
     if (tool === "save") {
       const r = await saveOut(String((args as any)?.path ?? ""), (args as any)?.archive === true);
-      return { ...r, note: "kept outside the box; it survives release" };
+      return { ...r, note: SAVED_NOTE };
     }
 
     if (tool === "release") {
