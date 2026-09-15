@@ -305,6 +305,18 @@ export function leaseTerms(lease: BoxLease): string {
     + `files under /tmp do not survive while it sits idle, so keep your work in the working directory`;
 }
 
+/**
+ * The reminder after a container's first result: the fact the full one exists
+ * for, that this is the same container as before, and its lifetime in a
+ * clause. The full terms stay in the run and shell descriptions, sent every
+ * turn, and in the first result of each container.
+ */
+export function boxReminderShort(lease: BoxLease | null = null): string {
+  return lease
+    ? `same container as your earlier calls; it stays until you release it or it sits ${Math.round(lease.maxMs / 60_000)} idle minutes`
+    : "same container as your earlier calls in this turn; handed back when the turn ends";
+}
+
 export function boxReminder(alias: string, lease: BoxLease | null = null): string {
   if (lease) {
     return `every call uses this same container, in this turn and later ones, until you release it; ${leaseTerms(lease)}`
@@ -426,7 +438,10 @@ export function finished(
     // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
     // nothing between executions" concluded this box was volatile too — which
     // would have it reinstalling packages on every call.
-    reminder: boxReminder(alias, lease),
+    // In full on a container's first result only. It is over 400 characters with
+    // the lease terms, and background-job notices carry the whole result, so on
+    // every result one conversation read it dozens of times (cody, task #19).
+    reminder: (state?.execs ?? 0) === 0 ? boxReminder(alias, lease) : boxReminderShort(lease),
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
     // So the agent learns the environment from a result it already has,
