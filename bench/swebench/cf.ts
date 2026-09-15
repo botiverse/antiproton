@@ -28,6 +28,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
+import { decideFromPoll } from "../poll-fallback.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -130,12 +131,25 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
   const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
     `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
   return new Promise<string | null>((resolve) => {
+    let done = false;
     const stop = (v: string | null) => {
+      if (done) return;
+      done = true;
       clearInterval(keepalive); clearTimeout(timer);
       try { ws.close(); } catch { /* already gone */ }
       resolve(v);
     };
-    const keepalive = setInterval(() => { try { ws.send("ping"); } catch { /* closing */ } }, 20_000);
+    const keepalive = setInterval(() => {
+      try { ws.send("ping"); } catch { /* closing */ }
+      // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
+      void api(`/bench/poll?taskId=${taskId}`).then((poll: any) => {
+        const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
+        if (!d) return;
+        seen.set(taskId, d.seq);
+        if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
+        else stop(d.text);
+      }).catch(() => { /* the socket or the next tick will do */ });
+    }, 20_000);
     const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
     ws.onerror = () => stop(null);
     ws.onclose = () => stop(null);
