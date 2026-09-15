@@ -20,7 +20,7 @@ npm install openai@7.15.0
 ```
 
 > ⚠️ **Important Versioning & Module Resolution Caveats:**
-> - **SDK Version Must Be >= 7.15.0 (Tested on 7.15.0):** Older versions (such as `openai` 6.x) do not include `client.beta.agents`. Attempting to call `client.beta.agents.create()` on older versions will fail client-side with `TypeError: Cannot read properties of undefined (reading 'create')`.
+> - **SDK Version Must Be 7.15.0 (the only version tested):** Older versions (such as `openai` 6.x) do not include `client.beta.agents`. Attempting to call `client.beta.agents.create()` on older versions will fail client-side with `TypeError: Cannot read properties of undefined (reading 'create')`.
 > - **Node.js ESM Symlink Resolution:** Node.js resolves ESM imports using the real filesystem path of the executing script (`realpath`), walking up to find `node_modules`. If your project or repository root has an older version of `openai` installed (e.g. 6.40.0), a script executing across symlinks may inadvertently resolve the older `openai` package. Always ensure the resolved package directory carries `openai@7.15.0`.
 
 ### Configuration
