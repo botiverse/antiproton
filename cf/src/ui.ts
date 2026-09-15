@@ -1443,7 +1443,7 @@ ${live
          <div>box</div><div>${esc(live.id)}</div>
          <div>alive for</div><div>${esc(secs(liveMs))} <span class="tag bad">still billing</span></div>
          <div>last used</div><div>${esc(ago(Number(live.lastUsedAt)))}</div>
-         ${quietUntil ? `<div>quiet until</div><div>${esc(when(Number(quietUntil)))} — the agent asked not to be asked</div>` : ""}
+         ${quietUntil ? `<div>kept until</div><div>${esc(when(Number(quietUntil)))} — the agent postponed its release</div>` : ""}
        </div>
        <div class="hint" style="padding:8px 0 0">${billing ? esc(billing) + "." : "It costs the same whether or not anything is running inside it."} If the agent has finished with the machine and not released it, that is the bug to look at.</div></div>`
     : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}

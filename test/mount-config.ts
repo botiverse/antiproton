@@ -726,9 +726,9 @@ await check("an accepted quiet request records when to ask again, and leaves the
   if (saved.boxId !== "b-1" || saved.execs !== 4) throw new Error("the rest of the box state was dropped");
   // The one field it must not move. Every other handler in the plugin bumps
   // `lastUsedAt`, so "make quiet consistent with the rest" is a plausible edit
-  // — and it would defeat the absolute ceiling, because an agent could push the
-  // idle clock forward indefinitely with legal requests under the cap.
-  if (saved.lastUsedAt !== 2_000) throw new Error(`quiet moved lastUsedAt to ${saved.lastUsedAt}, so the idle ceiling can be pushed forever`);
+  // — and it would record a postponement as a use, which the idle pass and the
+  // console both need to tell apart (idle-lease.ts `releaseAt`).
+  if (saved.lastUsedAt !== 2_000) throw new Error(`quiet moved lastUsedAt to ${saved.lastUsedAt}, recording a postponement as a use`);
 
   // No box: nothing will be asked about, so there is nothing to put off. It
   // answers instead of throwing, the way `release` does on an empty mount.
@@ -814,7 +814,7 @@ await check("run, shell and the per-execution reminder end the container the sam
   const shell = run9.tools.find((t) => t.name === "shell")!.summary;
   const reminder = boxReminder("box");
   // With a lease (tygg, 2026-09-15) all three state the other lifetime, and none of them the turn's.
-  const lease = { afterMs: 10 * 60_000, maxMs: 30 * 60_000 };
+  const lease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
   const leased = sandboxPlugin(null as any, "local", lease);
   const leasedReminder = boxReminder("box", lease);
   for (const [where, text] of [
@@ -825,8 +825,12 @@ await check("run, shell and the per-execution reminder end the container the sam
     if (!/until you release it/.test(text) || !/later ones/.test(text)) {
       throw new Error(`${where} does not say the container stays, in later turns, until the agent releases it: ${text.slice(0, 200)}`);
     }
-    if (!/goes idle for 10 minutes/.test(text) || !/at 30 minutes idle it is released/.test(text)) {
+    if (!/after 30 idle minutes it is released/.test(text) || !/5 minutes before that you are told/.test(text)) {
       throw new Error(`${where} does not state the lease's own numbers: ${text.slice(0, 240)}`);
+    }
+    // The agent can keep the box, and the text says with what (tygg, 2026-09-15).
+    if (!/`quiet` postpones the release/.test(text)) {
+      throw new Error(`${where} does not say the release can be postponed with quiet: ${text.slice(0, 240)}`);
     }
     if (/handed back when the turn ends|every call in this turn uses/.test(text)) {
       throw new Error(`${where} still ends the container with the turn under a lease: ${text.slice(0, 200)}`);
@@ -1096,8 +1100,8 @@ await check("the session window keeps the newest and drops the rest, which is wh
  * reminder itself carried for months, only pointing the other way (Vera).
  *
  * So the configuration is the input. Whether the lease runs is decided by
- * `RUN9_IDLE_MINUTES` and `RUN9_MAX_IDLE_MINUTES` being set to something
- * positive (`cf/src/index.ts`), and the wording has to agree with them. Turning
+ * `RUN9_WARN_MINUTES` being positive and `RUN9_MAX_IDLE_MINUTES` larger
+ * (`cf/src/index.ts`), and the wording has to agree with them. Turning
  * the lease on without rewriting the strings fails here, and rewriting them
  * without turning it on fails above. Neither direction needs anyone to
  * remember anything.
@@ -1114,11 +1118,12 @@ await check("the container's wording and the lease switch say the same thing", a
     const m = code.match(new RegExp(`"${name}"\\s*:\\s*"?(\\d+)"?`));
     return m ? Number(m[1]) : 0;
   };
-  const leaseOn = setting("RUN9_IDLE_MINUTES") > 0 && setting("RUN9_MAX_IDLE_MINUTES") > 0;
+  // The same rule cf/src/index.ts applies to the same two numbers.
+  const leaseOn = setting("RUN9_WARN_MINUTES") > 0 && setting("RUN9_MAX_IDLE_MINUTES") > setting("RUN9_WARN_MINUTES");
   // The plugin as this deployment builds it: cf/src/runtime.ts hands it the lease these two numbers make
   // (cf/src/index.ts), so the wording checked is the wording production sends.
   const lease = leaseOn
-    ? { afterMs: setting("RUN9_IDLE_MINUTES") * 60_000, maxMs: setting("RUN9_MAX_IDLE_MINUTES") * 60_000 }
+    ? { warnMs: setting("RUN9_WARN_MINUTES") * 60_000, maxMs: setting("RUN9_MAX_IDLE_MINUTES") * 60_000 }
     : null;
   const deployed = sandboxPlugin(null as any, "local", lease);
 
@@ -1128,14 +1133,14 @@ await check("the container's wording and the lease switch say the same thing", a
     ["the reminder", boxReminder("box", lease)],
   ] as const;
   for (const [where, text] of says) {
-    const promises = /goes idle|idle long enough|asked whether to keep/.test(text);
+    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release/.test(text);
     if (leaseOn && !promises) {
       throw new Error(`the lease is configured but ${where} still describes a box that only you can end: ${text.slice(0, 140)}`);
     }
     if (!leaseOn && promises) {
       throw new Error(`${where} promises the idle question, and no lease is configured to ask it: ${text.slice(0, 140)}`);
     }
-    if (leaseOn && !text.includes(`at ${setting("RUN9_MAX_IDLE_MINUTES")} minutes idle`)) {
+    if (leaseOn && !text.includes(`after ${setting("RUN9_MAX_IDLE_MINUTES")} idle minutes`)) {
       throw new Error(`${where} does not state the configured ceiling (${setting("RUN9_MAX_IDLE_MINUTES")} minutes): ${text.slice(0, 200)}`);
     }
   }

@@ -63,10 +63,10 @@
     "UI_ORIGIN": "https://antiproton.ai",
     // The container lease (tygg, 2026-09-15 11:28Z: a container is destroyed by
     // the agent's own release, not by the end of a turn). Kept between turns;
-    // the agent is asked after 10 idle minutes and the box is taken at 30,
-    // whatever it answered. Plain vars, never secrets: a secret of the same
-    // name would outlive a deploy that changed these.
-    "RUN9_IDLE_MINUTES": "10",
+    // after 30 idle minutes it is released, and 5 minutes before that the agent
+    // is told and may postpone it (tygg 11:38Z). Plain vars, never secrets: a
+    // secret of the same name would outlive a deploy that changed these.
+    "RUN9_WARN_MINUTES": "5",
     "RUN9_MAX_IDLE_MINUTES": "30"
   },
   "observability": { "enabled": true }
