@@ -50,12 +50,14 @@ import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
 import {
   resolveViewer,
-  programmaticAccess, isOperator,
+  programmaticAccess,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
+import { adminTranscript } from "./admin-transcript.ts";
+import { agentObjectName } from "./object-name.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { d1ApiKeys, admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
 import { staticAsset } from "./static.ts";
@@ -238,26 +240,7 @@ async function failLoudly(m: QueuedModelCall, env: Env) {
     { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }), 0);
 }
 
-/**
- * One Durable Object per (tenant, agent).
- *
- * §12.1 rule 1 asks for isolation that is structural rather than a predicate.
- * Sharing one object put every tenant's rows in one SQLite database, so the
- * only thing standing between two customers was a WHERE clause being correct
- * everywhere, forever. Addressing by identity means the other tenant's data is
- * not in the database being queried at all.
- *
- * The separator is not a legal character in either id (both are validated on
- * the way in), so no two distinct pairs can collide on one name.
- */
-export function agentObjectName(tenantId: string, agentId: string): string {
-  for (const [label, v] of [["tenant", tenantId], ["agent", agentId]] as const) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(v)) {
-      throw new Error(`invalid ${label} id: ${JSON.stringify(v).slice(0, 60)}`);
-    }
-  }
-  return `a/${tenantId}/${agentId}`;
-}
+export { agentObjectName };
 
 const RUNNER = (body: string) => `
 export default {
@@ -1807,7 +1790,26 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0): Promise<UiTranscript> {
-    const session = await this.#conversation(tenantId, agentId, taskId);
+    return this.#transcript(tenantId, agentId, await this.#conversation(tenantId, agentId, taskId), tail);
+  }
+
+  /**
+   * uiTranscript for an operator (/admin/transcript), and read-only: null for an object that holds no such
+   * agent, and for a conversation the agent does not have. uiTranscript opens the owner's default conversation
+   * on first use, which is right for their own page and wrong for a GET that can name anyone (Ada, #336).
+   */
+  async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<UiTranscript | null> {
+    const owner = await this.owner();
+    if (!owner || owner.tenantId !== tenantId || owner.agentId !== agentId) return null;
+    const rt = this.runtime();
+    await rt.ready();
+    if (taskId === `t_${agentId}`) return this.#transcript(tenantId, agentId, MAIN_SESSION, 0);
+    const task = await rt.store.loadTask(tenantId, taskId);
+    if (!task || task.agentId !== agentId) return null;
+    return this.#transcript(tenantId, agentId, taskId, 0);
+  }
+
+  async #transcript(tenantId: string, agentId: string, session: string, tail: number): Promise<UiTranscript> {
     const rt = this.runtime();
     const agent = await rt.agent(tenantId, agentId, session);
     const entries = entriesToEvents(await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
@@ -2986,19 +2988,9 @@ export default {
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s2.diagnose(t, a, k));
         }
-        case "/admin/transcript": {
-          // The whole conversation, payloads included: what the console's trajectory tab shows its owner,
-          // for an operator asked to look at someone's agent. diagnose keeps six events at 220 characters.
-          // Refused when no token is configured, unlike diagnose: this is a person's conversation.
-          if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-          const t = url.searchParams.get("tenantId") ?? "demo";
-          const a = String(url.searchParams.get("agentId"));
-          const k = url.searchParams.get("taskId") ?? `t_${a}`;
-          const s4 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          return Response.json(await s4.uiTranscript(t, a, k));
-        }
+        case "/admin/transcript":
+          return adminTranscript(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/ui": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
