@@ -171,6 +171,38 @@ interface BoxState {
    * "never release it".
    */
   quietUntil?: number;
+  /**
+   * The directory the last `shell` command ended in, so the next one starts
+   * there. Each run9 exec is a fresh process: a `cd` does not carry over, and
+   * agents were writing `cd /testbed && …` into every call (tygg, 2026-09-15).
+   * Absent on a new box, where the first call starts in the working directory.
+   */
+  cwd?: string;
+}
+
+/** Printed after a `shell` command to report where it ended; stripped before the agent sees the output. */
+const CWD_MARK = "__AP_CWD__";
+
+/**
+ * The command, then a line that reports its final directory and exits with the
+ * command's own status. On its own line, so a trailing comment or an unfinished
+ * `&&` in the command cannot swallow it. A command that exits itself, or leaves
+ * a quote open, reports nothing, and the directory stays where it was.
+ */
+export function withCwdTrailer(command: string): string {
+  return `${command}\n__ap_rc=$?; printf '\\n${CWD_MARK}%s\\n' "$PWD"; exit $__ap_rc`;
+}
+
+/**
+ * The output without the directory report, and the directory. Only a report at
+ * the very end counts: run9's summary of a long output keeps its head and tail
+ * (measured, 2026-09-15: 400,000 lines, the report still last), and a marker a
+ * command printed itself further up is output, not a report.
+ */
+export function splitCwd(out: string): { output: string; cwd: string | null } {
+  const m = /\n?__AP_CWD__([^\n]*)\n?\s*$/.exec(out);
+  if (!m || !m[1]) return { output: out, cwd: null };
+  return { output: out.slice(0, m.index), cwd: m[1] };
 }
 
 /**
@@ -213,10 +245,18 @@ export interface BoxLease {
 
 const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 
-/** What happens to an idle box under a lease, said once for the reminder, `run` and `shell`. */
+/**
+ * What happens to an idle box under a lease, said once for the reminder, `run` and `shell`.
+ *
+ * "Files survive" is true of the box's root disk, not of /tmp. In a run9 box /tmp is a tmpfs; measured on
+ * production on 2026-09-15, a marker in /tmp was gone after 18 idle minutes while one in /work (the default
+ * working directory) was still there, in the same box, with no reboot in between. An agent that writes its
+ * work to /tmp and comes back after a pause would find it missing, so the sentence says where to keep it.
+ */
 export function leaseTerms(lease: BoxLease): string {
   return `after ${leaseMinutes(lease.maxMs)} idle minutes it is released; ${leaseMinutes(lease.warnMs)} minutes `
-    + `before that you are told, and \`quiet\` postpones the release by as long as you choose, within the mount's limit`;
+    + `before that you are told, and \`quiet\` postpones the release by as long as you choose, within the mount's limit; `
+    + `files under /tmp do not survive while it sits idle, so keep your work in the working directory`;
 }
 
 export function boxReminder(alias: string, lease: BoxLease | null = null): string {
@@ -263,8 +303,15 @@ export function segmentsOf(path: string): string[] {
   return out;
 }
 
-/** The states run9 reports for an execution that will not change again. */
-const TERMINAL = ["succeeded", "failed", "killed", "cancelled", "timeout"];
+/**
+ * The states run9 reports for an execution that will not change again.
+ *
+ * `error` included: run9 documents it as platform trouble rather than an app
+ * exit, and an exec that could not start (a working directory that does not
+ * exist, measured 2026-09-15) sits in it for good. Left out, such an exec was
+ * never finished: the call handed it over as a job and every poll said "not yet".
+ */
+const TERMINAL = ["succeeded", "failed", "killed", "cancelled", "timeout", "error"];
 
 /** This mount's settings, defaults filled in. */
 function cfgOf(ctx: PluginContext) {
@@ -315,10 +362,18 @@ export function finished(
   alias: string,
   lease: BoxLease | null = null,
 ): Record<string, unknown> {
-  const out = String(rec.output_summary ?? "");
+  // A `shell` command reports where it ended; the report is ours, not the command's output.
+  const { output: out, cwd } = splitCwd(String(rec.output_summary ?? ""));
   return {
     state: rec.state,
     exitCode: rec.exit_code ?? null,
+    ...(cwd ? { cwd } : {}),
+    // Allowed, not refused: an agent may need to look in /tmp. But work left there is gone after an idle
+    // spell (tmpfs, measured 2026-09-15), so the result says so while the agent is still standing in it.
+    ...(cwd && (cwd === "/tmp" || cwd.startsWith("/tmp/"))
+      ? { cwdNote: "files under /tmp do not survive while the container sits idle; keep work in the working directory" }
+      : {}),
+    ...(rec.state === "error" && rec.reason ? { error: String(rec.reason) } : {}),
     // "container", never "sandbox": the harness already calls the per-execution
     // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
     // nothing between executions" concluded this box was volatile too — which
@@ -681,14 +736,24 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     {
       name: "shell",
       summary:
-        shellLifetime + " Only for what needs a real " +
+        shellLifetime + " Each call starts in the directory the previous call ended in, like one terminal " +
+        "session, and its result says where that is (`cwd`); the first starts in the working directory. " +
+        "Pass `workdir` to run one command in another directory instead of starting it with `cd`. " +
+        "Exported variables and aliases do not carry over, so set them in the command that needs them, " +
+        "and a command handed over as a job does not move the directory. Only for what needs a real " +
         "machine (builds, tests, git). The default image is node:22-alpine: Node and npm are present, " +
         "Python and gcc are NOT, and `apk add --no-cache <pkg>` installs more. An operator may " +
         "have configured a different image; every result reports which one is running, so read " +
         "that instead of probing for it. Save anything worth keeping, then release.",
       parameters: {
         type: "object",
-        properties: { command: { type: "string" } },
+        properties: {
+          command: { type: "string" },
+          workdir: {
+            type: "string",
+            description: "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended",
+          },
+        },
         required: ["command"],
       },
       sideEffects: "write",
@@ -1188,7 +1253,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
 
     const wd = cfg.workdir;
-    const a = (args ?? {}) as { code?: string; install?: string[]; command?: string };
+    const a = (args ?? {}) as { code?: string; install?: string[]; command?: string; workdir?: string };
+    const askedDir = tool === "shell" && typeof a.workdir === "string" && a.workdir.trim()
+      ? (a.workdir.trim().startsWith("/")
+          ? a.workdir.trim()
+          : "/" + segmentsOf(`${state.cwd ?? wd}/${a.workdir.trim()}`).join("/"))
+      : null;
     let command: string;
     if (tool === "run") {
       if (!a.code) throw new Error("code is required");
@@ -1211,7 +1281,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         `echo '${b64}' | base64 -d > ${file} && node ${file}`;
     } else if (tool === "shell") {
       if (!a.command) throw new Error("command is required");
-      command = `mkdir -p ${wd} && cd ${wd} && ${a.command}`;
+      // Like one terminal session: the command starts where the previous one
+      // ended, passed as run9's `workdir` rather than a `cd` glued in front (run9's
+      // own advice for "run this from that directory"). A new box has no such
+      // directory yet, so its first command makes and enters the working one.
+      // An explicit `workdir` (tygg, 2026-09-15) runs this one command there; a
+      // relative one is taken from where the shell is now.
+      command = (askedDir ?? state.cwd) ? withCwdTrailer(a.command) : withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`);
     } else {
       throw new Error(`unknown tool: ${tool}`);
     }
@@ -1234,24 +1310,54 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // back in the same shape either way — state, exit_code, output_summary —
     // which is what lets `finished` stay one function (checked live: exit 3 and
     // both streams came back identically).
-    const started = await api(
-      "POST", `/projects/${cfg.project}/workspace/boxes/${state.boxId}/background-execs`,
-      { command: execArgv(cfg, command) },
-    );
-    const execId = started.exec_id as string;
+    const startIn = tool === "shell" ? (askedDir ?? state.cwd ?? null) : null;
+    const start = async (argv: string[], workdir: string | null) => (await api(
+      "POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/background-execs`,
+      { command: argv, ...(workdir ? { workdir } : {}) },
+    )).exec_id as string;
+    let execId = await start(execArgv(cfg, command), startIn);
+    let movedFrom: string | null = null;
 
     // The work has begun. From here the call may finish it or hand it over,
     // and both have to produce the same thing — `finished` is that thing, in
     // one place, because a result built twice is two rules about one shape
     // and they drift (the lesson of #291).
-    await ctx.connection.set({
-      ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1,
-    } as unknown as Json);
+    const afterStart: BoxState = { ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1 };
+    await ctx.connection.set(afterStart as unknown as Json);
 
     const grace = Date.now() + cfg.graceMs;
     for (;;) {
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${execId}`);
-      if (TERMINAL.includes(rec.state)) return finished(rec, cfg, state, ctx.alias, lease);
+      // run9 does not start an exec in a directory that is gone (it may have been
+      // removed, or lived under /tmp, which does not survive an idle box).
+      // A directory the agent named is its own answer: say it does not exist
+      // rather than run the command somewhere it did not ask for.
+      if (rec.state === "error" && askedDir && /failed to start/i.test(String(rec.reason ?? ""))) {
+        return {
+          ...finished(rec, cfg, state, ctx.alias, lease),
+          note: `${askedDir} does not exist in the container; create it first, or leave workdir out`,
+        };
+      }
+      // A remembered one that vanished: once, start again in the working directory, and say so.
+      if (rec.state === "error" && startIn && !askedDir && !movedFrom && /failed to start/i.test(String(rec.reason ?? ""))) {
+        movedFrom = startIn;
+        execId = await start(execArgv(cfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`)), null);
+        continue;
+      }
+      if (TERMINAL.includes(rec.state)) {
+        const result = finished(rec, cfg, state, ctx.alias, lease);
+        // Only the call that ran the command writes the directory: a job finished
+        // later through the poll must not write connection state (see pollBackground),
+        // so a command handed over does not move the shell, as `&` would not.
+        const cwd = tool === "shell" ? splitCwd(String(rec.output_summary ?? "")).cwd : null;
+        const moved = movedFrom !== null && (state.cwd ?? null) !== null;
+        if (tool === "shell" && (cwd ?? null) !== (state.cwd ?? null)) {
+          await ctx.connection.set({ ...afterStart, cwd: cwd ?? undefined } as unknown as Json);
+        }
+        return moved
+          ? { ...result, note: `${movedFrom} no longer exists, so this command started in ${wd}` }
+          : result;
+      }
       if (Date.now() > grace) {
         // Handed over rather than waited on: the turn is serialised while this
         // call is open (`exclusive`), so waiting here costs the agent every

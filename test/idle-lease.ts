@@ -27,10 +27,13 @@ check("a box in use is left alone, and the wake is when the warning is due", () 
   must(d.wakeInMs === MAX - WARN - MIN, `wake should be the warning time, got ${d.wakeInMs}`);
 });
 
-check("five minutes before the release the agent is told once, and the wake is the release", () => {
+check("five minutes before the release the agent is told once, and the object wakes at once to run that turn", () => {
   const d = idleDecision({ ...base, now: ceiling - WARN });
   if (d.do !== "warn") throw new Error(`expected a warning, got ${JSON.stringify(d)}`);
-  must(d.releaseAt === ceiling && d.untilReleaseMs === WARN && d.wakeInMs === WARN, `warning: ${JSON.stringify(d)}`);
+  must(d.releaseAt === ceiling && d.untilReleaseMs === WARN, `warning: ${JSON.stringify(d)}`);
+  // Posting the warning only marks the session; the object must wake now for the agent to read it while it can
+  // still postpone. A wake at the release time is how a production reminder sat unread for twenty minutes.
+  must(d.wakeInMs === 0, `the warning's turn must run now, but the wake is in ${d.wakeInMs} ms`);
   // One millisecond earlier there is nothing to say.
   must(idleDecision({ ...base, now: ceiling - WARN - 1 }).do === "wait", "a warning came early");
 });

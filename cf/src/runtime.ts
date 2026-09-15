@@ -1255,6 +1255,7 @@ export class AgentRuntime {
             d.idleMs, d.untilReleaseMs, limit), "prompt");
         sql.exec("INSERT INTO box_warnings(alias, box_id, release_at) VALUES (?,?,?) " +
           "ON CONFLICT(alias, box_id) DO UPDATE SET release_at = excluded.release_at", mount.alias, boxId, d.releaseAt);
+        // 0: postMessage only marks the session, so this wake is what runs the warning's turn (idle-lease.ts).
         soon(d.wakeInMs);
         continue;
       }

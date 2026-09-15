@@ -42,7 +42,7 @@ export interface IdleInput {
 export type IdleAction =
   /** Take the box: it has been idle past its release time. */
   | { do: "release"; idleMs: number }
-  /** Tell the agent the box is about to go, then come back at the release time. */
+  /** Tell the agent the box is about to go. `wakeInMs` is 0: the warning's turn has to run now. */
   | { do: "warn"; releaseAt: number; idleMs: number; untilReleaseMs: number; wakeInMs: number }
   /** Nothing to say yet. */
   | { do: "wait"; wakeInMs: number };
@@ -61,7 +61,12 @@ export function idleDecision(i: IdleInput): IdleAction {
   if (i.warnedFor === at) return { do: "wait", wakeInMs: Math.max(1, at - i.now) };
   const warnAt = at - Math.max(0, i.warnMs);
   if (i.warnMs > 0 && i.now >= warnAt) {
-    return { do: "warn", releaseAt: at, idleMs, untilReleaseMs: at - i.now, wakeInMs: Math.max(1, at - i.now) };
+    // Wake now. The warning is a message the agent has to answer, and posting it only marks the session: its
+    // turn runs on the next wake. Scheduling that wake for the release time (as this once did) meant the agent
+    // read its warning when the box was already due to go, and could not postpone anything (production,
+    // 2026-09-15: a reminder posted at 11:47:21 sat unread until the 12:07:21 alarm). The pass after the
+    // warning finds it recorded and waits for the release.
+    return { do: "warn", releaseAt: at, idleMs, untilReleaseMs: at - i.now, wakeInMs: 0 };
   }
   return { do: "wait", wakeInMs: Math.max(1, (i.warnMs > 0 ? warnAt : at) - i.now) };
 }
