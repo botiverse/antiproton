@@ -3,24 +3,12 @@
 # the migrations in cf/migrations applied to a fresh local database, then
 # test/spec/control-plane-spec.ts run inside workerd by the conformance worker.
 # Never deployed, no network. See test/pi-storage-do.sh for the same shape.
+# The port and the server it starts are this run's own (test/local-worker.sh).
 set -euo pipefail
-PORT="${PORT:-8792}"
+. "$(dirname "$0")/local-worker.sh"
 cd "$(dirname "$0")/../cf"
 state=$(mktemp -d)
-dev=""
-# The whole tree `npx wrangler dev` started, children first: killing only what listens on the port stopped
-# workerd and left npm and wrangler running, and every run left another orphan on the port (2026-09-15).
-kill_tree() {
-  local pid="$1" child
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill_tree "$child"; done
-  kill "$pid" 2>/dev/null || true
-}
-cleanup() {
-  [ -n "$dev" ] && kill_tree "$dev"
-  for p in $(lsof -ti "tcp:$PORT" 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
-  rm -rf "$state"
-}
-trap cleanup EXIT
+trap 'stop_worker; rm -rf "$state"' EXIT
 
 # The schema comes from the migration files, as it does in production, never
 # from a CREATE in the test: a column the migration lacks fails here.
@@ -29,9 +17,7 @@ if ! CI=1 npx wrangler d1 migrations apply CONTROL_DB --local --persist-to "$sta
   cat "$state/migrate.log"
   exit 1
 fi
-npx wrangler dev --config wrangler.conformance.jsonc --local --persist-to "$state/d1" \
-  --port "$PORT" --inspector-port 0 >"$state/dev.log" 2>&1 &
-dev=$!
+start_worker "$state/dev.log" --persist-to "$state/d1"
 answered=""
 for _ in $(seq 1 60); do
   sleep 1
