@@ -753,7 +753,7 @@ export const MEASURED_IMAGES: Record<string, {
   // cody and Piper, separately, on fresh run9 boxes: Node v24.21.0, npm 11.19.0.
   "public.ecr.aws/docker/library/node:24-bookworm": {
     measured: "2026-09-15", os: "Debian",
-    present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash"],
+    present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash", "ssh", "apt-get"],
     missing: ["pip", "jq", "rg", "gh"],
     install: "apt-get update && apt-get install -y <pkg>",
     command: "for t in node npm git curl make gcc g++ python3 bash ssh apt-get pip3 jq rg gh; do " +

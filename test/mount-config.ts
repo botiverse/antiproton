@@ -1741,6 +1741,40 @@ await check("a container gets a GitHub mount's token only as a placeholder, and 
 });
 
 /**
+ * A sibling says which plugin it is.
+ *
+ * The sandbox sends a sibling's credential to GitHub's hosts, so it has to know
+ * the alias still names a GitHub mount; an alias pointing at anything else would
+ * send that mount's credential to GitHub. Only the gateway knows, so this goes
+ * through the real one rather than a hand-built context.
+ */
+await check("the gateway's sibling names the plugin of the mount it found", async () => {
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const { ToolGateway } = await import("../src/runtime/gateway.ts");
+  const probe: any = {
+    id: "probe", version: "1.0.0", defaultForAllAgents: true,
+    tools: [{ name: "peek", summary: "x", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "safe" }],
+    invoke: async (_t: string, _a: unknown, ctx: any) => ({ found: await ctx.sibling("gh"), missing: await ctx.sibling("nope") }),
+  };
+  const github: any = { id: "github", version: "1.0.0", defaultForAllAgents: true, tools: [], invoke: async () => null };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k", {});
+  const mount = (alias: string, plugin: string, secretRef: string | null) => store.addMount({
+    tenantId: "t", agentId: "a", alias, plugin, installationId: `i-${alias}`, connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef, policy: null,
+  } as any);
+  await mount("p", "probe", null);
+  await mount("gh", "github", "ref:gh");
+  const gw = new ToolGateway(store, [probe, github], { async resolve(ref: string) { return ref === "ref:gh" ? "tok" : null; } } as any);
+  const r: any = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "p.peek", {});
+  if (r.status !== "succeeded") throw new Error(`the probe did not run: ${JSON.stringify(r)}`);
+  if (r.result.found?.plugin !== "github" || r.result.found.credential !== "tok") throw new Error(`sibling answered ${JSON.stringify(r.result.found)}`);
+  if (r.result.missing !== null) throw new Error("a missing sibling was invented");
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",
