@@ -253,12 +253,18 @@ const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
  * and saved the archive, I could release the container". The note it had just been handed was the last thing it
  * read before deciding, so the copy's survival is said together with what it is not.
  */
-export const NOT_A_REASON_TO_RELEASE =
-  "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
-  "will come back to this machine, leave it running.";
-export const KEPT_NOTE =
-  "independent of this container; start a fresh machine from it later with `start_from`. " + NOT_A_REASON_TO_RELEASE;
-export const SAVED_NOTE = "kept outside the box, for later. " + NOT_A_REASON_TO_RELEASE;
+export function notAReasonToRelease(lease: BoxLease | null): string {
+  // "Leave it running" is only something an agent can do under a lease: without one the box is handed back
+  // when the turn ends whatever it decides, so that half would be a promise nothing keeps (cody, #327 review).
+  return lease
+    ? "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
+      "will come back to this machine, leave it running."
+    : "A copy outliving the container is not a reason to release it early: it is handed back when the turn " +
+      "ends anyway, and until then it is still the machine you are working on.";
+}
+export const keptNote = (lease: BoxLease | null) =>
+  "independent of this container; start a fresh machine from it later with `start_from`. " + notAReasonToRelease(lease);
+export const savedNote = (lease: BoxLease | null) => "kept outside the box, for later. " + notAReasonToRelease(lease);
 
 /**
  * What happens to an idle box under a lease, said once for the reminder, `run` and `shell`.
@@ -811,7 +817,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Copy a file out of the container into durable storage before it is destroyed. Returns an " +
         "r2:// reference the artifacts mount can read back, and that outlives the box. Set " +
         "archive for a directory. Do this for anything worth keeping — a build output, a report, a " +
-        "diff — the moment it exists, not at the end. " + NOT_A_REASON_TO_RELEASE,
+        "diff — the moment it exists, not at the end. " + notAReasonToRelease(lease),
       parameters: {
         type: "object",
         properties: {
@@ -833,7 +839,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Save this container's filesystem under a name, so a later task can start from it instead " +
         "of installing everything again. Use it once the environment is set up — interpreter, " +
         "packages, a cloned repository — not for the results, which belong in `save`. The " +
-        "container keeps running; the snapshot is independent of it. " + NOT_A_REASON_TO_RELEASE,
+        "container keeps running; the snapshot is independent of it. " + notAReasonToRelease(lease),
       parameters: {
         type: "object",
         properties: {
@@ -1296,13 +1302,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       await ctx.connection.set(state as unknown as Json);
       return {
         kept: name, snapshot: snapId,
-        note: KEPT_NOTE,
+        note: keptNote(lease),
       };
     }
 
     if (tool === "save") {
       const r = await saveOut(String((args as any)?.path ?? ""), (args as any)?.archive === true);
-      return { ...r, note: SAVED_NOTE };
+      return { ...r, note: savedNote(lease) };
     }
 
     if (tool === "release") {
