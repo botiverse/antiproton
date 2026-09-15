@@ -57,6 +57,7 @@ import {
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
+import { refuseSecret } from "./secret-shape.ts";
 import { adminDiagnose } from "./admin-diagnose.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
@@ -3082,6 +3083,10 @@ export default {
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
           const text = String(form.get("text") ?? "").trim();
           const mode = String(form.get("mode")) === "followUp" ? "followUp" as const : "steer" as const;
+          // Credential-shaped text is refused before it reaches the agent; the page offers a deliberate resend
+          // with allowSecret=1 (Nova, task #19).
+          const refused = text ? refuseSecret(text, form.get("allowSecret") === "1") : null;
+          if (refused) return refused;
           if (text) {
             // A refusal returned as a value is still a refusal: the page shows
             // it only if the status says so (Vera, after the day the lane

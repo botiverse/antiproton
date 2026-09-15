@@ -28,6 +28,7 @@
   "exclude": [
     "node_modules",
     "test/auth.ts",
+    "test/secret-shape.ts",
     "test/admin-transcript.ts",
     "test/transcript-read.ts",
     "test/admin-diagnose.ts",
