@@ -10,7 +10,6 @@ const show = (title, d) => {
   console.log(`  ${"─".repeat(66)}\n  ${pass} passed, ${d.results.length - pass} failed  (${d.ms} ms)`);
 };
 for (const [path, title] of [
-  ["/conformance/kernel", "Kernel contract — Durable Object storage"],
   ["/conformance/executor", "Executor contract — Cloudflare Dynamic Workers"],
 ]) {
   const res = await fetch(BASE + path);

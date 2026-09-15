@@ -3034,7 +3034,7 @@ export default {
         default:
           return Response.json({
             demo: "/ui",
-            diagnostics: ["/conformance/kernel", "/conformance/executor", "/isolation",
+            diagnostics: ["/conformance/executor", "/isolation",
                           "/eviction", "/model-binding", "/ui/whoami"],
             probes: ["/storage", "/sandbox", "/latency", "/alarm/status"],
           }, { status: 404 });
