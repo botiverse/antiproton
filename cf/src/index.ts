@@ -3178,14 +3178,10 @@ export default {
             if (!form) return new Response("expected a form body", { status: 400 });
             if (url.pathname === "/ui/api-keys/new") {
               const label = String(form.get("label") ?? "").trim().slice(0, 60);
-              const live = (await keys.list(owner)).filter((k) => k.revokedAt === null).length;
+              const key = newApiKey();
               if (!label) error = "a key needs a name";
-              else if (live >= max) error = `you have ${live} live keys, the most one person may hold; revoke one first`;
-              else {
-                const key = newApiKey();
-                await keys.issue({ hash: await hashApiKey(key), ...owner, label });
-                issued = { key, label };
-              }
+              else if (await keys.issueWithin({ hash: await hashApiKey(key), ...owner, label }, max)) issued = { key, label };
+              else error = `${max} live keys is the most one person may hold; revoke one first`;
             } else if (!(await keys.revokeOwned(String(form.get("hash") ?? ""), owner))) {
               error = "that key is not one of yours, or it is already revoked";
             }

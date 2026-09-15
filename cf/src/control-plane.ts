@@ -140,6 +140,11 @@ export interface ApiKeyDirectory {
   list(owner: ApiKeyOwner): Promise<ApiKeyRow[]>;
   /** As revoke, but only a key of this owner: a person revokes their own keys and never another's. */
   revokeOwned(hash: string, owner: ApiKeyOwner): Promise<boolean>;
+  /**
+   * Issue only while the owner holds fewer than `max` live keys; whether it was issued. The count and the
+   * insert are one statement, so requests at the same time cannot all pass a count read before any insert.
+   */
+  issueWithin(row: ApiKeyOwner & { hash: string; label: string }, max: number): Promise<boolean>;
 }
 
 export function d1ApiKeys(db: D1Database, now: () => number = Date.now): ApiKeyDirectory {
@@ -171,6 +176,14 @@ export function d1ApiKeys(db: D1Database, now: () => number = Date.now): ApiKeyD
       const res = await db.prepare(
         "UPDATE api_keys SET revoked_at = ? WHERE hash = ? AND tenant_id = ? AND owner_agent_id = ? AND revoked_at IS NULL",
       ).bind(now(), hash, owner.tenantId, owner.ownerAgentId).run();
+      return Number(res.meta?.changes ?? 0) > 0;
+    },
+    async issueWithin(row, max) {
+      const res = await db.prepare(
+        `INSERT INTO api_keys(hash, tenant_id, owner_agent_id, label, created_at)
+         SELECT ?, ?, ?, ?, ?
+         WHERE (SELECT COUNT(*) FROM api_keys WHERE tenant_id = ? AND owner_agent_id = ? AND revoked_at IS NULL) < ?`,
+      ).bind(row.hash, row.tenantId, row.ownerAgentId, row.label, now(), row.tenantId, row.ownerAgentId, max).run();
       return Number(res.meta?.changes ?? 0) > 0;
     },
   };

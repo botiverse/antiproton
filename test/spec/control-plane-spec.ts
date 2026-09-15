@@ -106,6 +106,17 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert((await keys.list({ tenantId: "t", ownerAgentId: "u-nobody" })).length === 0, "an owner with no keys listed some");
   });
 
+  add("the live-key limit holds for requests at the same time, and a revoke makes room", async () => {
+    const me = { tenantId: "t", ownerAgentId: "u-me" };
+    await keys.issue({ hash: "theirs", tenantId: "t", ownerAgentId: "u-other", label: "not counted" });
+    const tries = await Promise.all(Array.from({ length: 5 }, (_, i) => keys.issueWithin({ ...me, hash: `c${i}`, label: `c${i}` }, 3)));
+    const live = (await keys.list(me)).filter((k) => k.revokedAt === null);
+    assert(tries.filter(Boolean).length === 3 && live.length === 3, `issued ${tries.filter(Boolean).length}, live ${live.length}`);
+    assert((await keys.issueWithin({ ...me, hash: "over", label: "over" }, 3)) === false && (await keys.lookup("over")) === null, "a key past the limit was issued");
+    await keys.revokeOwned(live[0]!.hash, me);
+    assert((await keys.issueWithin({ ...me, hash: "after", label: "after" }, 3)) === true, "a revoked key still counted against the limit");
+  });
+
   add("a person revokes only their own key", async () => {
     await keys.issue({ hash: "k5", tenantId: "t", ownerAgentId: "u-other", label: "theirs" });
     assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-me" })) === false, "revoked another owner's key");
