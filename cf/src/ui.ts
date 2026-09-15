@@ -587,7 +587,9 @@ ${HEAD_ASSETS}
   </section>
   <section class="view" data-view="keys">
     <div class="view-head"><h2>API keys</h2><span class="sub">for the OpenAI Agents SDK; the agents a key makes are yours</span></div>
-    <!-- Read when shown and not polled: a poll would take a new key off the page before it is copied. -->
+    <!-- Read when shown and not polled: a poll would take a new key off the page before it is copied.
+         Any re-read (showing this view again, or the tab becoming visible, both send ap:show) also takes
+         the new key off the page. That is the shape of "shown once", not a bug: do not keep it around. -->
     <div class="body" id="api-keys" data-lazy hx-get="/ui/api-keys" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
   </section>
 </main>
