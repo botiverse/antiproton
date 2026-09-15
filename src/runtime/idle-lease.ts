@@ -99,7 +99,10 @@ export function warningText(
   const done = names.release
     ? `If you are done with it, call \`${names.release}\` — it can save files out in the same call.`
     : "";
-  return `The container on the \`${alias}\` mount has been idle for ${mins(idleMs)} minutes and will be released `
+  // Delivered as a message, so it arrives where a person's words go; saying whose it is keeps the warning
+  // from being read as the person asking for something (task #19).
+  return `[a notice from the harness, not a message from the user] `
+    + `The container on the \`${alias}\` mount has been idle for ${mins(idleMs)} minutes and will be released `
     + `in ${mins(untilReleaseMs)} minutes, with anything not saved in it. `
     + keep + done;
 }

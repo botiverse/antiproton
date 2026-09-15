@@ -97,6 +97,7 @@ check("the warning carries the names it was given, the time left, and the postpo
   must(/at most 60/.test(t), `the postponement limit must be stated: ${t}`);
   must(/not be told again/.test(t), `it must say the agent will be left alone: ${t}`);
   must(/not saved/.test(t), "it must say what is lost");
+  must(t.startsWith("[a notice from the harness, not a message from the user]"), `it must say whose message it is: ${t.slice(0, 80)}`);
 });
 
 check("a mount that offers no tools still gets a warning that is true", () => {
