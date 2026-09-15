@@ -1600,6 +1600,209 @@ await check("a mount reports how many entries of its record it could not read", 
 });
 
 /**
+ * GitHub from inside the container, without the token inside it.
+ *
+ * Measured on run9 (2026-09-15, fake values echoed back by httpbin): the egress
+ * proxy swaps a placeholder that appears verbatim in a header (`token P`,
+ * `Bearer P`), leaves it alone for a host not listed, and does not see one
+ * inside Basic auth, which base64-encodes `user:P`. So git's header is
+ * registered whole: placeholder `base64(x-access-token:P)`, value
+ * `base64(x-access-token:<token>)` — exactly what git sends when its credential
+ * helper answers `x-access-token` and P, as `gh auth git-credential` also does.
+ */
+await check("the GitHub token becomes two placeholders, one of them what git sends, and neither is the token", async () => {
+  const sb: any = await import("../src/plugins/sandbox.ts");
+  if (typeof sb.githubSecrets !== "function") throw new Error("githubSecrets is not exported");
+  const token = "github_pat_FAKE0123456789";
+  const regs = sb.githubSecrets(token, "h-t-a-0123456789-abcdefgh");
+  const api = regs.find((r: any) => r.hosts.includes("api.github.com"));
+  const git = regs.find((r: any) => r.hosts.includes("github.com"));
+  if (regs.length !== 2 || !api || !git || api === git) throw new Error(`registrations: ${JSON.stringify(regs)}`);
+  if (api.value !== token || api.placeholder.includes(token)) throw new Error("the API registration is wrong");
+  if (!/^[A-Za-z0-9_]+$/.test(api.placeholder)) throw new Error(`the placeholder is not safe to put in a shell: ${api.placeholder}`);
+  if (git.placeholder !== btoa(`x-access-token:${api.placeholder}`)) throw new Error("the git placeholder is not the header git sends");
+  if (git.value !== btoa(`x-access-token:${token}`)) throw new Error("the git value is not the header GitHub expects");
+  if (sb.githubSecrets(token, "h-t-a-0123456789-zzzzzzzz")[0].placeholder === api.placeholder) {
+    throw new Error("two boxes got the same placeholder; run9 requires them unique across the project");
+  }
+});
+
+await check("every command sees GH_TOKEN as the placeholder, and git gets it for github.com and nowhere else", async () => {
+  const sb: any = await import("../src/plugins/sandbox.ts");
+  if (typeof sb.githubEnv !== "function") throw new Error("githubEnv is not exported");
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const P = "__AP_GH_TOKEN_probe1234__";
+  const command = `echo "token=$GH_TOKEN"; ` +
+    `printf 'protocol=https\nhost=github.com\n\n' | git credential fill; ` +
+    `printf 'protocol=https\nhost=gitlab.com\n\n' | git credential fill`;
+  const argv: string[] = sb.execArgv({ shell: "/bin/sh" }, command, sb.githubEnv(P));
+  const r = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", env: {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: mkdtempSync(join(tmpdir(), "gh-env-")),
+    GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1",
+  } });
+  const out = `${r.stdout}${r.stderr}`;
+  if (!out.includes(`token=${P}`)) throw new Error(`GH_TOKEN was not the placeholder: ${out}`);
+  if (!out.includes("username=x-access-token") || (out.match(/password=/g) ?? []).length !== 1 || !out.includes(`password=${P}`)) {
+    throw new Error(`git credentials were not scoped to github.com: ${out}`);
+  }
+});
+
+await check("a container gets a GitHub mount's token only as a placeholder, and nothing from anything else", async () => {
+  const original = globalThis.fetch;
+  const calls: Array<{ method: string; path: string; body: any }> = [];
+  let n = 0;
+  globalThis.fetch = (async (url: string, init?: any) => {
+    const path = String(url).replace("https://sandbox.example", "");
+    const method = init?.method ?? "GET";
+    calls.push({ method, path, body: init?.body ? JSON.parse(init.body) : undefined });
+    if (method === "POST" && /background-execs$/.test(path)) return new Response(JSON.stringify({ exec_id: `e${++n}` }));
+    if (/execs\/e\d+$/.test(path)) {
+      return new Response(JSON.stringify({ state: "succeeded", exit_code: 0, output_summary: "ok\n__AP_CWD__/work\n" }));
+    }
+    return new Response("{}");
+  }) as any;
+  const token = "github_pat_FAKE0123456789";
+  const plugin = sandboxPlugin(null as any, "local");
+  const start = async (sibling: unknown, publicConfig: Record<string, unknown> = {}) => {
+    calls.length = 0;
+    const box: any = { stored: null };
+    const asked: string[] = [];
+    const ctx: any = {
+      caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+      credential: JSON.stringify({ ak: "a", sk: "b" }),
+      publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000, ...publicConfig },
+      connection: { get: async () => box.stored, set: async (v: unknown) => { box.stored = v; } },
+      sibling: async (alias: string) => { asked.push(alias); return sibling; },
+    };
+    const result: any = await plugin.invoke("shell", { command: "gh repo view" } as any, ctx);
+    return {
+      result, stored: box.stored, asked,
+      create: calls.find((c) => c.method === "POST" && /workspace\/boxes$/.test(c.path))?.body,
+      secrets: calls.filter((c) => /\/secrets$/.test(c.path)).map((c) => c.body),
+      exec: calls.find((c) => /background-execs$/.test(c.path))?.body,
+    };
+  };
+  try {
+    const gh = await start({ plugin: "github", credential: token, connection: null });
+    if (gh.asked.join() !== "gh") throw new Error(`asked for mounts ${JSON.stringify(gh.asked)}`);
+    if (gh.create?.network_mode !== "managed") throw new Error(`the box was not created with managed networking: ${JSON.stringify(gh.create)}`);
+    const hosts = gh.secrets.map((b: any) => (b.allowed_hosts ?? []).join(",")).sort();
+    if (gh.secrets.length !== 2 || !hosts.some((h: string) => h.split(",").includes("github.com"))) {
+      throw new Error(`registered ${JSON.stringify(hosts)}`);
+    }
+    const P = gh.stored?.githubPlaceholder;
+    if (!P || !gh.exec?.command.join(" ").includes(P)) throw new Error(`the command does not carry the placeholder: ${JSON.stringify(gh.exec)}`);
+    for (const [what, v] of [["command", gh.exec], ["record", gh.stored], ["result", gh.result]] as const) {
+      if (JSON.stringify(v).includes(token)) throw new Error(`the token is in the ${what}`);
+    }
+    if (!/GitHub/.test(String(gh.result.github))) throw new Error(`the result does not say GitHub works here: ${JSON.stringify(gh.result).slice(0, 300)}`);
+
+    for (const [why, sibling, cfg] of [
+      ["another plugin's credential", { plugin: "http", credential: token, connection: null }, {}],
+      ["a GitHub mount with no token", { plugin: "github", credential: null, connection: null }, {}],
+      ["no such mount", null, {}],
+      ["a container with no network", { plugin: "github", credential: token, connection: null }, { network: "none" }],
+      ["the setting turned off", { plugin: "github", credential: token, connection: null }, { github: "" }],
+      ["a GitHub mount whose writes need approval", { plugin: "github", credential: token, connection: null, policy: { write: "approval" } }, {}],
+      ["a GitHub mount with one tool denied", { plugin: "github", credential: token, connection: null, policy: { tools: { pr_create: "deny" } } }, {}],
+    ] as const) {
+      const r = await start(sibling, cfg);
+      if (r.secrets.length || r.create?.network_mode === "managed" || r.stored?.githubPlaceholder
+        || JSON.stringify(r.exec).includes("GH_TOKEN") || JSON.stringify(calls).includes(token)) {
+        throw new Error(`${why}: something was registered or exported`);
+      }
+    }
+
+    // Withheld because of policy: the agent is told why, and where GitHub still works.
+    const held = await start({ plugin: "github", credential: token, connection: null, policy: { write: "approval" } });
+    if (held.stored?.githubWithheld !== "gh" || !/approval or denied/.test(String(held.result.github))) {
+      throw new Error(`a policy-held mount did not say why GitHub is missing: ${JSON.stringify(held.result.github)}`);
+    }
+
+    // run9 refusing the registration: the box already exists and is billed, so
+    // the call fails but the record still names the box, without a placeholder
+    // that would promise GitHub works in it.
+    const working = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: any) => /\/secrets$/.test(String(url))
+      ? new Response("no", { status: 500 })
+      : working(url, init)) as any;
+    let threw = false;
+    const box: any = { stored: null };
+    try {
+      await plugin.invoke("shell", { command: "gh repo view" } as any, {
+        caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+        credential: JSON.stringify({ ak: "a", sk: "b" }),
+        publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
+        connection: { get: async () => box.stored, set: async (v: unknown) => { box.stored = v; } },
+        sibling: async () => ({ plugin: "github", credential: token, connection: null }),
+      } as any);
+    } catch { threw = true; }
+    if (!threw) throw new Error("a refused registration was treated as success");
+    if (!box.stored?.boxId) throw new Error("a refused registration left the billed box with no record naming it");
+    if (box.stored.githubPlaceholder) throw new Error("the record promises GitHub in a box where registration failed");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+/**
+ * A sibling says which plugin it is.
+ *
+ * The sandbox sends a sibling's credential to GitHub's hosts, so it has to know
+ * the alias still names a GitHub mount; an alias pointing at anything else would
+ * send that mount's credential to GitHub. Only the gateway knows, so this goes
+ * through the real one rather than a hand-built context.
+ */
+await check("the gateway's sibling names the plugin of the mount it found", async () => {
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const { ToolGateway } = await import("../src/runtime/gateway.ts");
+  const probe: any = {
+    id: "probe", version: "1.0.0", defaultForAllAgents: true,
+    tools: [{ name: "peek", summary: "x", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "safe" }],
+    invoke: async (_t: string, _a: unknown, ctx: any) => ({
+      found: await ctx.sibling("gh"), held: await ctx.sibling("held"), missing: await ctx.sibling("nope"),
+    }),
+  };
+  const github: any = { id: "github", version: "1.0.0", defaultForAllAgents: true, tools: [], invoke: async () => null };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k", {});
+  const mount = (alias: string, plugin: string, secretRef: string | null, policy: unknown = null) => store.addMount({
+    tenantId: "t", agentId: "a", alias, plugin, installationId: `i-${alias}`, connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef, policy,
+  } as any);
+  await mount("p", "probe", null);
+  await mount("gh", "github", "ref:gh");
+  await mount("held", "github", "ref:gh", { write: "approval" });
+  const gw = new ToolGateway(store, [probe, github], { async resolve(ref: string) { return ref === "ref:gh" ? "tok" : null; } } as any);
+  const r: any = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "p.peek", {});
+  if (r.status !== "succeeded") throw new Error(`the probe did not run: ${JSON.stringify(r)}`);
+  if (r.result.found?.plugin !== "github" || r.result.found.credential !== "tok") throw new Error(`sibling answered ${JSON.stringify(r.result.found)}`);
+  if (r.result.missing !== null) throw new Error("a missing sibling was invented");
+  // And its policy, because a plugin acting for that mount outside the gateway must honour it.
+  if (r.result.found.policy !== null || r.result.held?.policy?.write !== "approval") {
+    throw new Error(`sibling did not pass the policy through: ${JSON.stringify(r.result)}`);
+  }
+});
+
+await check("a container acts as a mount only when nothing on that mount is held or denied", async () => {
+  const sb: any = await import("../src/plugins/sandbox.ts");
+  if (typeof sb.policyLetsContainerAct !== "function") throw new Error("policyLetsContainerAct is not exported");
+  const cases: Array<[unknown, boolean]> = [
+    [null, true], [{}, true], [{ read: "allow", write: "allow", tools: { pr_create: "allow" } }, true],
+    [{ write: "approval" }, false], [{ write: "deny" }, false], [{ read: "approval" }, false],
+    [{ tools: { issue_create: "deny" } }, false], [{ write: "allow", tools: { api: "approval" } }, false],
+  ];
+  for (const [policy, want] of cases) {
+    if (sb.policyLetsContainerAct(policy) !== want) throw new Error(`${JSON.stringify(policy)} should be ${want}`);
+  }
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",

@@ -1,4 +1,4 @@
-import type { Json } from "../core/types.ts";
+import type { Json, MountPolicy } from "../core/types.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
 import { backgrounded } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
@@ -69,6 +69,12 @@ export interface SandboxConfig {
    * the values come from the mount's own credential.
    */
   secrets?: InjectedSecret[];
+  /**
+   * Alias of this agent's GitHub mount. When it holds a token, `gh` and git in
+   * the container act as that account without holding the token. Empty turns
+   * it off.
+   */
+  github?: string;
 }
 
 interface Run9Credential {
@@ -147,6 +153,10 @@ interface BoxState {
   image?: string;
   /** What the agent may write; never the values behind them. */
   placeholders?: Placeholders;
+  /** What GH_TOKEN is in this container, when GitHub is wired in; never the token. */
+  githubPlaceholder?: string;
+  /** The GitHub mount whose token was not wired in because its policy holds or denies calls. */
+  githubWithheld?: string;
   execs?: number;
   saved?: string[];
   /**
@@ -427,6 +437,15 @@ export function finished(
         "kept before then); read /etc/os-release",
     }),
     ...(state?.envs?.length ? { kept: state.envs.map((e) => e.name) } : {}),
+    ...(state?.githubWithheld ? {
+      github: `GitHub is not signed in here: calls on the \`${state.githubWithheld}\` mount are held for approval or ` +
+        "denied, and a container cannot ask for either. Use that mount's tools for GitHub.",
+    } : {}),
+    ...(state?.githubPlaceholder ? {
+      github: "gh and git work here as this agent's GitHub account, on GitHub only. GH_TOKEN holds a " +
+        "placeholder that is swapped for the token on the way out, so neither you nor anything in this " +
+        "container can read the token. If gh is missing, `apt-get update && apt-get install -y gh` installs it.",
+    } : {}),
     ...(state?.placeholders && Object.keys(state.placeholders).length
       ? {
           credentials: Object.entries(state.placeholders).map(([name, ph]) => ({
@@ -529,6 +548,7 @@ const DEFAULTS = {
   shell: "/bin/sh",
   shellPrefix: "",
   network: "open" as const,
+  github: "gh",
   endpoint: "https://api.run.sys9.ai",
   image: "public.ecr.aws/docker/library/node:24-bookworm",
   project: "default",
@@ -709,8 +729,13 @@ export function execOutput(out: string, maxOutputBytes: number): {
   };
 }
 
-export function execArgv(cfg: { shell: string; shellPrefix?: string; network?: "open" | "none" }, command: string): string[] {
-  const line = cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command;
+export function execArgv(
+  cfg: { shell: string; shellPrefix?: string; network?: "open" | "none" },
+  command: string,
+  env: Record<string, string> = {},
+): string[] {
+  const exports = Object.entries(env).map(([k, v]) => `export ${k}='${v.replace(/'/g, `'\\''`)}'; `).join("");
+  const line = exports + (cfg.shellPrefix ? `${cfg.shellPrefix}${command}` : command);
   const argv = [cfg.shell, "-lc", line];
   const open = cfg.network === undefined || cfg.network === "open";
   return open ? argv : ["unshare", "-n", "--", ...argv];
@@ -734,7 +759,7 @@ export const MEASURED_IMAGES: Record<string, {
   // cody and Piper, separately, on fresh run9 boxes: Node v24.21.0, npm 11.19.0.
   "public.ecr.aws/docker/library/node:24-bookworm": {
     measured: "2026-09-15", os: "Debian",
-    present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash"],
+    present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash", "ssh", "apt-get"],
     missing: ["pip", "jq", "rg", "gh"],
     install: "apt-get update && apt-get install -y <pkg>",
     command: "for t in node npm git curl make gcc g++ python3 bash ssh apt-get pip3 jq rg gh; do " +
@@ -752,6 +777,62 @@ export function defaultImageSentence(image: string): string {
   return `The default image is ${tag} (${m.os}): ${listed(m.present)} are present; ${listed(m.missing)} are NOT, ` +
     `and \`${m.install}\` installs more.`;
 }
+
+/** One credential registered with run9's egress for one box. */
+interface Registration { name: string; value: string; placeholder: string; header: string; hosts: string[] }
+
+/**
+ * What a GitHub token becomes for one container: two registrations with run9's
+ * egress, and nothing the container can read.
+ *
+ * Measured on run9 (2026-09-15, fake values echoed back by httpbin): the proxy
+ * replaces a placeholder only where it appears verbatim in a header, and only
+ * for the hosts listed. `gh` sends `token P`, which it sees. git sends Basic
+ * auth, `base64(user:P)`, which it does not, so git's header is registered
+ * whole, as exactly what git sends for the helper in `githubEnv`.
+ */
+export function githubSecrets(token: string, boxId: string): Registration[] {
+  // Qualified by box: run9 requires a placeholder to be unique across the project.
+  const placeholder = `__AP_GH_TOKEN_${boxId.slice(-8).replace(/[^A-Za-z0-9]/g, "_")}__`;
+  return [
+    { name: "GH_TOKEN", value: token, placeholder, header: "authorization",
+      hosts: ["api.github.com", "uploads.github.com"] },
+    { name: "GH_TOKEN_GIT", value: btoa(`x-access-token:${token}`), placeholder: btoa(`x-access-token:${placeholder}`),
+      header: "authorization", hosts: ["github.com"] },
+  ];
+}
+
+/**
+ * The environment every command runs with when GitHub is wired in: `gh` reads
+ * GH_TOKEN, and git asks a helper scoped to https://github.com, which answers
+ * with the same placeholder. Set per command rather than written to a file, so
+ * it holds for a git installed later and there is no file to overwrite.
+ */
+export function githubEnv(placeholder: string): Record<string, string> {
+  return {
+    GH_TOKEN: placeholder,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
+    GIT_CONFIG_VALUE_0: `!f() { echo username=x-access-token; echo password=${placeholder}; }; f`,
+  };
+}
+
+/**
+ * Whether a container may act as a mount whose calls the gateway would police.
+ *
+ * Policy is enforced at the gateway, and a container holding the mount's token
+ * reaches GitHub without passing through it: `gh pr create` or `git push` in
+ * the box would skip the approval the same call through the gh tools waits for
+ * (cody, 2026-09-15). So the token goes in only when nothing on that mount is
+ * held or denied, reads included, since the box reads GitHub directly too.
+ */
+export function policyLetsContainerAct(policy: MountPolicy | null | undefined): boolean {
+  if (!policy) return true;
+  return [policy.read, policy.write, ...Object.values(policy.tools ?? {})]
+    .every((d) => d === undefined || d === "allow");
+}
+
+const envFor = (state: BoxState | null) => state?.githubPlaceholder ? githubEnv(state.githubPlaceholder) : {};
 
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
   // `run`, `shell` and every result state the same lifetime (boxReminder): with a lease, the box stays until
@@ -819,6 +900,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
     { name: "secrets", type: "string[]", references: "credential",
       summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
+    { name: "github", type: "string", default: DEFAULTS.github,
+      summary: "Alias of this agent's GitHub mount. When it holds a token, gh and git in the container act as that account without being able to read the token: they hold a placeholder that run9 swaps for it only on requests to GitHub. Empty turns this off." },
     { name: "maxQuietMinutes", type: "number", default: 60,
       summary: "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
@@ -1250,6 +1333,15 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // What every result will report this container as: the setting, or the
       // image the kept environment itself started from. Unknown stays unknown.
       const image = from ? kept.find((e) => e.snapId === from)?.image : cfg.image;
+      // GitHub, when this agent has a GitHub mount holding a token. Asked at
+      // creation because run9 registers credentials per box. Only a GitHub
+      // mount's: the value goes to GitHub's hosts, and an alias naming anything
+      // else would send that mount's credential there. No network, no use for it.
+      const open = cfg.network === undefined || cfg.network === "open";
+      const gh = cfg.github && open ? await ctx.sibling(cfg.github) : null;
+      const usable = gh?.plugin === "github" && gh.credential ? gh : null;
+      const withheld = !!usable && !policyLetsContainerAct(usable.policy);
+      const github = usable && !withheld ? githubSecrets(usable.credential!, boxId) : [];
       const declared = cfg.secrets ?? [];
       // Before the box exists, because after it exists a throw leaks it.
       //
@@ -1274,7 +1366,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           // Injection happens on run9's egress proxy, which only exists in
           // managed mode. Measured: under `normal` the placeholder goes out
           // unchanged, which would look like a working credential and not be one.
-          ...(declared.length ? { network_mode: "managed" } : {}),
+          ...(declared.length || github.length ? { network_mode: "managed" } : {}),
           ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
           description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
         });
@@ -1288,9 +1380,25 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         const boxes = await api("GET", `/projects/${cfg.project}/workspace/boxes`);
         if (!(Array.isArray(boxes) && boxes.some((b: any) => b.box_id === boxId))) throw e;
       }
+      // Recorded before anything else can fail: the box exists and is billed, so
+      // a registration that throws must not leave it with no record naming it.
+      // The record gains the placeholders only once run9 has accepted them.
+      state = {
+        boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
+        sessions: history,
+        ...(image ? { image } : {}),
+        ...(kept.length ? { envs: kept } : {}),
+      };
+      await ctx.connection.set(state as unknown as Json);
       // Register the declared credentials against the new box. The value never
       // enters the box and never reaches the model: only the placeholder does.
       const placeholders: Placeholders = {};
+      for (const g of github) {
+        await api("POST", `/projects/${cfg.project}/workspace/boxes/${boxId}/secrets`, {
+          name: g.name, value: g.value, placeholder: g.placeholder,
+          inject_header_name: g.header, allowed_hosts: g.hosts,
+        });
+      }
       for (const d of declared) {
         const value = cred.secrets![d.name]!;
         // Qualified by box, because a placeholder is unique across the project
@@ -1302,15 +1410,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         });
         placeholders[d.name] = placeholder;
       }
+      // `envs` above: release carries them over because a snapshot outlives its
+      // box, and a new record written without them erased the list on the next
+      // container's first command, stranding the snapshots in run9.
       state = {
-        boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
-        sessions: history,
-        // Release carries these over because a snapshot outlives its box; a new
-        // record written without them erased the list on the next container's
-        // first command, stranding the snapshots in run9 with nothing naming them.
-        ...(image ? { image } : {}),
-        ...(kept.length ? { envs: kept } : {}),
+        ...state,
         ...(Object.keys(placeholders).length ? { placeholders } : {}),
+        ...(github.length ? { githubPlaceholder: github[0]!.placeholder } : {}),
+        ...(withheld ? { githubWithheld: String(cfg.github) } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
     }
@@ -1471,7 +1578,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       "POST", `/projects/${cfg.project}/workspace/boxes/${state!.boxId}/background-execs`,
       { command: argv, ...(workdir ? { workdir } : {}) },
     )).exec_id as string;
-    let execId = await start(execArgv(cfg, command), startIn);
+    let execId = await start(execArgv(cfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 
     // The work has begun. From here the call may finish it or hand it over,
@@ -1497,7 +1604,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // A remembered one that vanished: once, start again in the working directory, and say so.
       if (rec.state === "error" && startIn && !askedDir && !movedFrom && /failed to start/i.test(String(rec.reason ?? ""))) {
         movedFrom = startIn;
-        execId = await start(execArgv(cfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`)), null);
+        execId = await start(execArgv(cfg, withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`), envFor(state)), null);
         continue;
       }
       if (TERMINAL.includes(rec.state)) {
