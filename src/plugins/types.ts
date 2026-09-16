@@ -302,9 +302,13 @@ export interface MountActivity {
    */
   billing?: string;
   /**
-   * Entries of this mount's record it could not read and ignored; absent when
-   * none. A record is read leniently so one bad entry cannot lose a running
-   * container, and this keeps that leniency from being silent.
+   * Entries of this mount's record it could not read and ignored, and the
+   * record itself when that is what did not read; absent when none. A record is
+   * read leniently so one bad entry cannot lose a running container, and this
+   * keeps that leniency from being silent. The row counts too because a reader
+   * that only asks about the fields inside a record can never report that the
+   * record was not a record (Rex, 2026-09-16) — and that is the case where a
+   * mount looks idle while whatever its id named goes unreleased.
    */
   unreadable?: number;
 }

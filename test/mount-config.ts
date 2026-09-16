@@ -1609,6 +1609,43 @@ await check("a mount reports how many entries of its record it could not read", 
 });
 
 /**
+ * The row itself, and not only what its lists hold.
+ *
+ * The count exists so that leniency which keeps a billed container does not
+ * also hide a corrupt record (Rex, 2026-09-15), and the case it did not cover
+ * is the one that costs the most: when the row does not read at all,
+ * `asBoxState` answers "no container", the idle sweep skips a mount with no
+ * `boxId` (cf/src/runtime.ts), and the console draws a clean idle mount. Those
+ * three agree and all three are wrong together — an id scrambled in that row
+ * names a container nobody releases and nobody can see, which is the outcome
+ * the element-level leniency was written to avoid.
+ *
+ * What must stay silent is the reason this is a count and not a flag: a record
+ * that was never written reads as nothing, and so does the one `release`
+ * leaves behind (`boxId: ""`). Reporting either would put "corrupt" on every
+ * idle mount, which is how an alarm stops being read.
+ */
+await check("a record that is present but does not read at all is reported, and an absent one is not", async () => {
+  const plugin = sandboxPlugin(null as any, "local");
+  const activity = (raw: unknown) => plugin.activity!({
+    caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox", credential: null, publicConfig: {},
+    connection: { get: async () => raw, set: async () => {} }, sibling: async () => null,
+  } as any);
+  for (const raw of ["nonsense", 42, { boxId: 123, createdAt: "x" }]) {
+    const a = await activity(raw);
+    if (a.live !== null) throw new Error(`an unreadable row reported a container: ${JSON.stringify(a)}`);
+    if (!a.unreadable) throw new Error(`an unreadable row said nothing was wrong: ${JSON.stringify(a)}`);
+  }
+  for (const raw of [null, undefined, { boxId: "", createdAt: 0, lastUsedAt: 0 }]) {
+    const a = await activity(raw);
+    if (a.unreadable !== undefined) throw new Error(`a readable record reported ${a.unreadable}: ${JSON.stringify(a)}`);
+  }
+  // Damage at both levels is counted at both: the row, and the entries inside it.
+  const both = await activity({ boxId: 123, createdAt: "x", sessions: [null, null] });
+  if (both.unreadable !== 3) throw new Error(`a bad row with bad entries: ${JSON.stringify(both)}`);
+});
+
+/**
  * GitHub from inside the container, without the token inside it.
  *
  * Measured on run9 (2026-09-15, fake values echoed back by httpbin): the egress
