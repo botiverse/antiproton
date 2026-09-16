@@ -23,6 +23,19 @@ page and this file cite it in 28 places, and they all break together if the
 bucket is renamed or deleted. Move the objects first if that ever has to
 change.
 
+## What the bucket does and does not promise
+
+`manifest.tsv` here lists every published record as `key`, SHA-256, size. It is
+what makes a link checkable: fetch the object, hash it, compare. Every one of
+the 28 records published on 2026-09-16 was verified this way against the bytes
+in the bucket.
+
+A public bucket gives **availability, not immutability**. Anyone with write
+access to the account can overwrite or delete an object, and
+`Cache-Control: immutable` is a hint to caches, not a property of the store.
+The manifest is the anchor: it says what the bytes were when the figure was
+computed, so a record that changed can be noticed instead of trusted.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working
@@ -30,8 +43,12 @@ tree, where it is ignored by git. After a run, upload it:
 
     bash scripts/publish-runs.sh
 
-The script uploads every file under `report/runs/` that is not already in the
-bucket, and prints the URL of each. Capture a runner's log with a redirect
+The script uploads every file under `report/runs/` whose bytes are not already
+in the bucket, and prints the URL of each. It compares hashes rather than
+checking that a key exists, so a key holding different bytes is reported and
+not overwritten, and a local record that no longer matches `manifest.tsv` stops
+the publish. If the credential check cannot run at all, the script stops rather
+than publishing unchecked. Capture a runner's log with a redirect
 (`> report/runs/<day>/<name>.log 2>&1`) rather than a pipe into `tail`, or the
 byte-for-byte record is lost and only the JSON survives.
 
