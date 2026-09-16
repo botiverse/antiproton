@@ -1999,6 +1999,69 @@ await check("a container's first result carries the full reminder, and later one
 });
 
 /**
+ * Releasing writes over its own record, not over somebody else's.
+ *
+ * `releaseTask` does not take the per-mount lock that `invoke` takes
+ * (`gateway.ts` uses `#queues` only there), so an operator release or the idle
+ * sweep can interleave with a command on the same mount. The bad order is:
+ * the command finds no container, creates one and records it, and then the
+ * release — which read the old state before deleting the old box — clears the
+ * record on top. The new container is alive and billed with nothing naming it,
+ * which is the orphan `asBoxState` exists to avoid. cody is taking the lock in
+ * the gateway; this is the half that does not depend on the caller, since a
+ * lock only holds inside one object instance (cody and Piper, 2026-09-16).
+ */
+await check("a release does not clear a record that names a different container, and still records its own session", async () => {
+  const original = globalThis.fetch;
+  const plugin = sandboxPlugin(null as any, "local");
+  const released = { boxId: "b-old", createdAt: 1_000, lastUsedAt: 2_000, execs: 2, saved: [], sessions: [],
+    envs: [{ name: "kept", snapId: "s-1", savedAt: 5 }] };
+  // What a command racing this release would have written: a different container.
+  const raced = { boxId: "b-new", createdAt: 9_000, lastUsedAt: 9_100, execs: 1, saved: [], sessions: [] };
+  // The interleaving is defined by when the other writer lands, not by how many
+  // reads happen first: it arrives while the box is being deleted.
+  const run = async (raceAtDelete: boolean) => {
+    let landed = false;
+    let stored: any = released;
+    globalThis.fetch = (async (_url: string, init?: any) => {
+      if ((init?.method ?? "GET") === "DELETE" && raceAtDelete) { landed = true; stored = raced; }
+      return new Response("");
+    }) as any;
+    const ctx: any = {
+      caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
+      credential: JSON.stringify({ ak: "a", sk: "b" }),
+      publicConfig: { endpoint: "https://sandbox.example" },
+      connection: { get: async () => stored, set: async (v: unknown) => { stored = v; } },
+      sibling: async () => null,
+    };
+    const result: any = await plugin.invoke("release", {} as any, ctx);
+    return { result, stored, landed };
+  };
+  try {
+    const contended = await run(true);
+    if (!contended.landed) throw new Error("the case never raced: no delete was sent");
+    if (contended.result.released !== true) throw new Error(`the old container was not released: ${JSON.stringify(contended.result)}`);
+    if (contended.stored.boxId !== "b-new") {
+      throw new Error(`the release cleared a record naming another container: ${JSON.stringify(contended.stored)}`);
+    }
+    const kept = contended.stored.sessions ?? [];
+    if (!kept.some((x: any) => x.boxId === "b-old")) throw new Error(`the released container's session was lost: ${JSON.stringify(kept)}`);
+    if (kept.some((x: any) => x.boxId === "b-new")) throw new Error(`a running container was recorded as finished: ${JSON.stringify(kept)}`);
+
+    // Uncontended: nothing else touched the record, so it is cleared as before.
+    const alone = await run(false);
+    if (alone.result.released !== true || alone.stored.boxId !== "") {
+      throw new Error(`an uncontended release did not clear: ${JSON.stringify(alone.stored)}`);
+    }
+    if (!alone.stored.sessions?.length || alone.stored.envs?.[0]?.name !== "kept") {
+      throw new Error(`the cleared record lost history: ${JSON.stringify(alone.stored)}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+/**
  * What the catalogue calls a mount's label, and why it is not "account".
  *
  * The `mounts` tool used to say it listed "which account each is bound to",
