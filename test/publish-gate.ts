@@ -44,10 +44,15 @@ function root(record: string, matcher: string | null, mode = 0o644): string {
   return dir;
 }
 
+/** The token the script needs to reach the bucket. Every case here stops
+ *  before the upload, so its value is never used — but without one set, the
+ *  script refuses at the top, which is a different case (below). */
+const WITH_TOKEN = { ...process.env, CF_API_TOKEN: "unused-tests-stop-before-upload" };
+
 /** Runs the script in `dir` and reports how it ended. */
-function run(dir: string): { code: number; out: string } {
+function run(dir: string, env: NodeJS.ProcessEnv = WITH_TOKEN): { code: number; out: string } {
   try {
-    const out = execFileSync("bash", [join(dir, "scripts/publish-runs.sh")], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const out = execFileSync("bash", [join(dir, "scripts/publish-runs.sh")], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env });
     return { code: 0, out };
   } catch (e) {
     const err = e as { status?: number; stdout?: string; stderr?: string };
@@ -86,6 +91,22 @@ check("a credential the matcher recognises is refused, not published", () => {
   rmSync(dir, { recursive: true, force: true });
   if (!out.includes("REFUSED")) throw new Error(`the credential was not refused: ${out}`);
   if (code === 0) throw new Error(`a run that refused a file reported success (${code})`);
+});
+
+check("with no token at all, it stops before reading or fetching anything", () => {
+  // wrangler reads CLOUDFLARE_API_TOKEN and the credential file calls it
+  // CF_API_TOKEN, so the first run of this script failed at the upload with
+  // every check already passed (Vera, 2026-09-16). It must say so at the top.
+  const { CF_API_TOKEN, CLOUDFLARE_API_TOKEN, ...bare } = process.env;
+  const dir = root(`token gho_${"A".repeat(36)}\n`, WORKING);
+  const { code, out } = run(dir, bare);
+  rmSync(dir, { recursive: true, force: true });
+  if (code !== 3) throw new Error(`a missing token ended with ${code}, not 3: ${out}`);
+  if (!out.includes("CLOUDFLARE_API_TOKEN") || !out.includes("CF_API_TOKEN")) {
+    throw new Error(`the refusal does not name both variables, so a reader cannot act on it: ${out}`);
+  }
+  // A credential sat in that file, and the run ended before anything read it.
+  if (out.includes("REFUSED")) throw new Error(`it read the records before asking for a token: ${out}`);
 });
 
 console.log(`\n  Publish gate\n  ${"─".repeat(56)}`);
