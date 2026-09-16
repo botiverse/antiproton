@@ -1504,7 +1504,13 @@ export function sandboxPanel(d: any): string {
   return `
 <h3>right now</h3>
 ${live
-    ? `<div class="card"><div class="tool">a container is running</div>
+    ? `<div class="card"><div class="tool">a container is running
+         <form hx-post="/ui/sandbox/release" hx-target="closest .body" hx-swap="innerHTML"
+               hx-confirm="Release this container? If the agent is still working in it, the request is refused."
+               style="padding:0;border:0">
+           <input type="hidden" name="alias" value="${esc(name)}">
+           <button type="submit" class="ghost" title="Release it now. The idle lease would get it anyway; this just does not wait.">release now</button>
+         </form></div>
        <div class="kv" style="margin-top:6px">
          <div>box</div><div>${esc(live.id)}</div>
          <div>alive for</div><div>${esc(secs(liveMs))} <span class="tag bad">still billing</span></div>

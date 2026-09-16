@@ -43,6 +43,19 @@ const report = {
   usage: [],
 };
 
+
+check("a live container offers release now — one form, alias in body, confirmation that warns about the refusal", () => {
+  const html = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mountReports: { box: report },
+  });
+  const forms = html.match(/<form[^>]*hx-post="\/ui\/sandbox\/release"[^>]*>[\s\S]*?<\/form>/g) ?? [];
+  must(forms.length === 1, `release forms: ${forms.length}`);
+  must(forms[0]!.includes('name="alias" value="box"'), "the alias rides in the body, not the query");
+  must(/hx-confirm="[^"]*refused/.test(forms[0]!), "the confirmation must warn that a working agent makes the request refused");
+  must(/hx-target="closest \.body"/.test(forms[0]!), "it must repaint whichever panel shows the sandbox fragment (rail #sandbox or inspector #insp)");
+});
+
 check("the sandbox panel asks the mount, under any alias", () => {
   const html = sandboxPanel({
     mounts: [{ alias: "box", plugin: "sandbox" }],
