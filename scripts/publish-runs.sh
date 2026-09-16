@@ -112,7 +112,12 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
     # manifest was written before publishing, and it happened twice (Vera,
     # 2026-09-16). A duplicate passes every "does it resolve" check, because
     # both copies name the same object and both fetch 200.
-    if [ -f "$MANIFEST" ]; then grep -v -P "^\Q$key\E\t" "$MANIFEST" > "$MANIFEST.tmp" || true; else : > "$MANIFEST.tmp"; fi
+    # awk, not `grep -P`: PCRE is a GNU extension, and a grep that does not
+    # have it exits non-zero with an empty file already created — which would
+    # replace the manifest with nothing rather than duplicate a row (Piper,
+    # 2026-09-16). Losing every anchor is worse than the defect above, so the
+    # filter must not be the thing that can fail here.
+    if [ -f "$MANIFEST" ]; then awk -F'\t' -v k="$key" '$1 != k' "$MANIFEST" > "$MANIFEST.tmp"; else : > "$MANIFEST.tmp"; fi
     printf '%s\t%s\t%s\n' "$key" "$local_sha" "$(wc -c < "$f" | tr -d ' ')" >> "$MANIFEST.tmp"
     LC_ALL=C sort -o "$MANIFEST.tmp" "$MANIFEST.tmp"
     mv "$MANIFEST.tmp" "$MANIFEST"
