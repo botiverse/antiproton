@@ -24,3 +24,5 @@ bench/tau2/data/db.json
 
 # Local QA run records (qa/sdk/README.md)
 qa/sdk/out/
+report/runs/*/
+!report/runs/README.md
