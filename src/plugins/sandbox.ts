@@ -611,15 +611,33 @@ async function stopBox(
   // delete only means the next call tries to reuse something that may not be
   // there — but the session survives it. A container is the one thing here
   // billed for merely existing, so how long it lived outlives the box.
+  //
+  // Built from the state this call read, not from whatever the record says now:
+  // the two differ exactly when something else has already recorded another
+  // container, and a session describing *that* box would report a container
+  // that is still running as finished.
   const session = sessionOf(state, Date.now());
-  await ctx.connection.set({
-    boxId: "", createdAt: 0, lastUsedAt: 0,
-    sessions: keepSessions(state.sessions, session),
-    // Kept environments outlive the container by construction — a forked
-    // snapshot is independent of the box it came from — so losing the record of
-    // them here would strand real storage under ids nobody can name any more.
-    ...(state.envs?.length ? { envs: state.envs } : {}),
-  } as unknown as Json);
+  // Read again before overwriting. `releaseTask` does not take the per-mount
+  // lock that `invoke` takes, so an operator release or the idle sweep can
+  // interleave with a command on this mount: the command finds no container,
+  // creates one and records it, and clearing the record on top would leave that
+  // container alive and billed with nothing naming it — the orphan `asBoxState`
+  // refuses to create. A lock in the gateway (cody, 2026-09-16) closes the
+  // window inside one object; this half does not depend on the caller.
+  const now = asBoxState(await ctx.connection.get());
+  const mine = !now?.boxId || now.boxId === state.boxId;
+  await ctx.connection.set(mine
+    ? {
+      boxId: "", createdAt: 0, lastUsedAt: 0,
+      sessions: keepSessions(state.sessions, session),
+      // Kept environments outlive the container by construction — a forked
+      // snapshot is independent of the box it came from — so losing the record of
+      // them here would strand real storage under ids nobody can name any more.
+      ...(state.envs?.length ? { envs: state.envs } : {}),
+    }
+    // Somebody else's container is in the record. Leave it named, and add only
+    // what this release knows: the session the released box just finished.
+    : { ...now, sessions: keepSessions(now.sessions, session) } as unknown as Json);
   return { boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt };
 }
 
