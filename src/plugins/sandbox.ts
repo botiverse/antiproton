@@ -922,11 +922,15 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   credential: {
     required: true,
     summary: "run9 access and secret keys, as JSON.",
-    // The credential also carries `secrets`: a value per injected secret the
-    // mount declares. Those names come from the `secrets` setting rather than
-    // from here, so a fixed list cannot name them and this one does not try.
-    // No mount injects secrets in production yet; when one does, the field
-    // gains a way to say "one entry per name in that setting".
+    // A `secrets` setting once let a mount name further secrets to wire into
+    // the container, and the credential carried a value per name. Both are
+    // gone (#360): no mount could configure it — the validator's `typeOf`
+    // (src/runtime/mount-config.ts) reads an object array as "unknown", so the
+    // only shape that passed was not the shape the consumer wanted — and no
+    // gate watched it. Recorded because the shape of the replacement is
+    // decided: the one route that puts a credential in a container is
+    // GitHub's, which checks the sibling's plugin and its policy before
+    // registering anything, so a future injected secret starts there.
     shape: { keys: [
       { name: "ak", summary: "run9 access key, from the run9 console." },
       { name: "sk", summary: "run9 secret key, issued with the access key." },
