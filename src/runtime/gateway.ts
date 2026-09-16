@@ -340,7 +340,7 @@ export class ToolGateway {
       const plugin = this.#plugins.get(mount.plugin);
       if (!plugin?.release) continue;
       try {
-        const did = await plugin.release({
+        const release = async () => plugin.release!({
           caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
           alias: mount.alias,
           credential: mount.secretRef
@@ -354,6 +354,13 @@ export class ToolGateway {
           },
           async sibling() { return null; },
         });
+        // Behind the same lock as a call on this mount, for an exclusive
+        // plugin: a release reads the state, destroys the box and writes the
+        // state back, and a `shell` landing between those steps leaves a live
+        // container nothing refers to.
+        const did = plugin.exclusive
+          ? await this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, release)
+          : await release();
         // Only report what was actually holding something: a release log that
         // names every mount tells you nothing about what was costing anything.
         if (did !== false) released.push(mount.alias);
@@ -391,12 +398,26 @@ export class ToolGateway {
     if ("error" in r0) return { status: "rejected", error: r0.error };
     if (!this.#plugins.get(r0.mount.plugin)?.exclusive) return this.#invoke(ctx, raw, args, opts);
 
-    const key = `${ctx.tenantId}/${ctx.agentId}/${r0.mount.alias}`;
-    // The chain is the lock: each call waits for the one before it to settle.
-    // A failure must not break the chain — the caller behind a refused call is
-    // owed its turn, not the refusal.
+    return this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${r0.mount.alias}`, () => this.#invoke(ctx, raw, args, opts));
+  }
+
+  /**
+   * One mount's turn, for callers that must not interleave on it.
+   *
+   * The chain is the lock: each call waits for the one before it to settle. A
+   * failure must not break the chain — the caller behind a refused call is
+   * owed its turn, not the refusal.
+   *
+   * `invoke` is not the only caller any more. A release is a read-modify-write
+   * on the same connection state a `shell` call rewrites, and outside this
+   * chain the two interleave: the command reads "no container", starts box B
+   * and records it, while the release writes back the empty state it read
+   * first. Box B then exists, bills, and is named by nothing (Piper,
+   * 2026-09-16).
+   */
+  #onMount<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const tail = this.#queues.get(key) ?? Promise.resolve();
-    const run = tail.then(() => this.#invoke(ctx, raw, args, opts), () => this.#invoke(ctx, raw, args, opts));
+    const run = tail.then(fn, fn);
     const settled = run.then(() => {}, () => {});
     this.#queues.set(key, settled);
     // Dropped when it settles, but only if nobody queued behind it — otherwise

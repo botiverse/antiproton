@@ -1643,6 +1643,13 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
   }
 
+  /** Hand a container back now. Refused while a job is running on that mount;
+   *  the runtime says why, and the page shows it. */
+  async uiReleaseSandbox(tenantId: string, agentId: string, alias: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias));
+  }
+
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
     const session = await this.#conversation(tenantId, agentId, taskId);
@@ -2283,7 +2290,7 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke"]);
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release"]);
 
 /**
  * What a person may name an agent. Checked in the route before any object is
@@ -2981,6 +2988,29 @@ export default {
           const alias = String(form.get("alias") ?? "").trim();
           if (alias) await stub.uiRemoveCredential(gate.tenantId, agentId, alias);
           return html(mountFragment(await stub.uiPlugins(gate.tenantId, agentId), alias));
+        }
+        // An operator handing a container back, from the panel that shows it
+        // billing (Nova, 2026-09-16). The alias travels in the form body like
+        // every other console write: a query string reaches logs and referrers,
+        // and this one names a machine someone is being charged for.
+        case "/ui/sandbox/release": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          const form = await formOf(request);
+          if (!form) return new Response("expected a form body", { status: 400 });
+          const alias = String(form.get("alias") ?? "").trim();
+          if (!alias) return new Response("expected an alias", { status: 400 });
+          const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias);
+          const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
+          const panel = sandboxPanel(await stub.uiStorage(gate.tenantId, agentId, taskId));
+          // A refusal is the answer, not an error page: the panel is still the
+          // truth, and the reason belongs above it where the button was. The
+          // reason names a mount and a plugin's error, so it is escaped here —
+          // `esc` is ui.ts's, and this file does not import a renderer.
+          const reason = r.ok ? "" : String(r.error).replace(/[&<>"']/g, (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
+          return html(r.ok ? panel : `<div class="err">${reason}</div>${panel}`);
         }
         case "/ui/storage":
         case "/ui/memory":

@@ -621,6 +621,48 @@ export class AgentRuntime {
   }
 
   /**
+   * Hand a mount's container back now, on an operator's say-so.
+   *
+   * The agent has `release`, and an idle box is reclaimed on its own after the
+   * lease runs out. Neither helps a person looking at a box that is billing
+   * for an agent that has stopped asking: the console could see it and not act
+   * on it (Nova, 2026-09-16).
+   *
+   * Refused while a background job is running on that mount, which is the same
+   * reason #idlePass skips it: a background exec does not touch `lastUsedAt`,
+   * so the box looks idle while a command is still inside it, and taking the
+   * machine away discards that work. The operator cannot see that from the
+   * panel, which is exactly why this asks instead of trusting the click.
+   *
+   * `releaseTask` reports what it could not release, and that is passed back
+   * rather than folded into a success: a box that stayed up is still costing
+   * money, and the page must not say it is gone.
+   */
+  async releaseMount(
+    tenantId: string, agentId: string, alias: string,
+  ): Promise<{ ok: true; released: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { ok: false, error: `no mount named ${alias}` };
+
+    const sql = this.#deps.ctx.storage.sql;
+    if (mountsWithRunningJobs(sql, { tenantId, agentId }).has(alias)) {
+      return { ok: false, error: `${alias} is running a background job; releasing it now would discard that work` };
+    }
+
+    const state = (await this.store.getConnection(tenantId, agentId, alias)) as any;
+    const boxId = typeof state?.boxId === "string" ? state.boxId : "";
+    const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias });
+    const failed = r.failed.find((f) => f.alias === alias);
+    if (failed) return { ok: false, error: `${alias} was not released: ${failed.error}` };
+
+    // The warning row is keyed by the box that is now gone. Left behind, the
+    // next box under this alias inherits a release time it was never told.
+    if (boxId) sql.exec("DELETE FROM box_warnings WHERE alias = ? AND box_id = ?", alias, boxId);
+    return { ok: true, released: r.released.includes(alias) };
+  }
+
+  /**
    * Rename a mount, with the one thing a rename must not do to a container.
    *
    * The alias is the operator's word for a mount, and until now it was the one
