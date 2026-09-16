@@ -58,7 +58,7 @@ await check("凭据可选的插件,没有账号也能挂", () => {
 await check("合法配置不报任何问题", () => {
   const p = validateMount(run9, {
     account: "operator", image: "node:22-alpine", workdir: "/work",
-    timeoutMs: 300000, secrets: ["STRIPE_KEY"],
+    timeoutMs: 300000,
   } as any, "env:RUN9");
   if (p.length) throw new Error(JSON.stringify(p));
 });
@@ -202,11 +202,20 @@ await check("no plugin takes a credential as a setting", () => {
   }
 });
 
-await check("the marker is what makes run9's secrets setting legitimate, not its name", () => {
-  const field = run9.config!.find((f) => f.name === "secrets")!;
-  if (field.references !== "credential") throw new Error("run9's secrets setting lost its marker");
-  const { references, ...unmarked } = field;
-  if (!CREDENTIAL_SHAPED.test(unmarked.name)) throw new Error("the pattern stopped matching the case it exists for");
+await check("a credential-shaped setting is refused unless it says it only names one", () => {
+  // This used to pin the marker to run9's `secrets` setting. That setting is gone
+  // (task #20: its declared type contradicted every consumer, nothing could
+  // configure it through a validated mount, and it handed a credential to a
+  // container with no policy gate). The rule it existed for still matters, so the
+  // case now tests the rule rather than a field that happened to carry it — and it
+  // no longer disappears with the next setting that does.
+  const marked = (references?: "credential") =>
+    [{ name: "apiKeys", type: "string[]" as const, summary: "names only", ...(references ? { references } : {}) }];
+  const offending = (config: ReturnType<typeof marked>) =>
+    config.filter((f) => CREDENTIAL_SHAPED.test(f.name) && f.references !== "credential");
+  if (!offending(marked()).length) throw new Error("a credential-shaped setting without the marker was accepted");
+  if (offending(marked("credential")).length) throw new Error("the marker no longer makes such a setting legitimate");
+  if (!CREDENTIAL_SHAPED.test("apiKeys")) throw new Error("the pattern stopped matching the case it exists for");
 });
 
 await check("a sign-in is a credential the page must not ask anyone to paste", () => {
