@@ -174,15 +174,15 @@ footer a{color:var(--accent)}
 </header>
 
 <div class="thesis">
-  <p><b>The standard, stated once.</b> A figure counts only when it was measured on the deployed Durable Object. Every figure names the run it came from, the run names its object and the record under <code>report/runs/</code> that a reader can open, and nothing measured in a Node process ever stands in for an on-object number.</p>
+  <p><b>The standard, stated once.</b> A figure counts only when it was measured on the deployed Durable Object. Every figure names the run it came from, the run names its object and the record in the public run archive that a reader can open, and nothing measured in a Node process ever stands in for an on-object number.</p>
   <p><b>Samples, not trends.</b> Eight tasks by three trials and ten instances are samples. Runs of the same code on the same benchmark differ, a single instance passes and fails on the same commit, and no figure here should be read as a trend.</p>
 </div>
 
 <section>
   <h2>SWE-bench Verified</h2>
   <p class="sec-note">can the loop carry a multi-turn task on a real machine to a graded result &middot; 10 instances, official scoring, the container without network, inside a deployed Durable Object</p>
-  <p class="how">object <code>bench-swe3</code> &middot; 2026-09-11 &middot; Worker at <code>60580fd</code> &middot; model deepseek-flash &middot; driver <code>bench/swebench/cf.ts</code> &middot; record <code>report/runs/2026-09-11/swebench-swe3-mtwgij3r.json</code></p>
-  <p><b>The container has no network.</b> Every command the agent runs starts in an empty network namespace: no interface, no route, no DNS. SWE-bench&rsquo;s answer is a public commit, and with the network open this agent fetches it &mdash; an earlier run of the same ten instances with egress, kept only as a record under <code>report/runs/2026-09-10</code>, had the upstream fix fetched in six of nine archived transcripts, and is not a solve rate. In this run all ten transcripts are archived and were read: seven commands in six instances tried to reach GitHub, none received anything, and no patch came from outside the box. This is the condition SWE-bench&rsquo;s published runs use, so this is the first number on this page comparable to them.</p>
+  <p class="how">object <code>bench-swe3</code> &middot; 2026-09-11 &middot; Worker at <code>60580fd</code> &middot; model deepseek-flash &middot; driver <code>bench/swebench/cf.ts</code> &middot; record <a href="https://pub-212e604eb60944c6854033a8ee1b3cef.r2.dev/runs/2026-09-11/swebench-swe3-mtwgij3r.json"><code>swebench-swe3-mtwgij3r.json</code></a></p>
+  <p><b>The container has no network.</b> Every command the agent runs starts in an empty network namespace: no interface, no route, no DNS. SWE-bench&rsquo;s answer is a public commit, and with the network open this agent fetches it &mdash; an earlier run of the same ten instances with egress, kept only as a record in the <a href="https://pub-212e604eb60944c6854033a8ee1b3cef.r2.dev/runs/2026-09-10/README.md">run archive</a>, had the upstream fix fetched in six of nine archived transcripts, and is not a solve rate. In this run all ten transcripts are archived and were read: seven commands in six instances tried to reach GitHub, none received anything, and no patch came from outside the box. This is the condition SWE-bench&rsquo;s published runs use, so this is the first number on this page comparable to them.</p>
 
   <div class="scroll">
   <table>
@@ -216,7 +216,7 @@ footer a{color:var(--accent)}
 <section>
   <h2>&tau;&sup2;-bench retail</h2>
   <p class="sec-note">does it follow a written policy while a person changes their mind &middot; 8 tasks &times; 3 trials, inside a deployed Durable Object</p>
-  <p class="how">object <code>bench-v5</code> &middot; 2026-09-13 &middot; build <code>c493981</code> &middot; model deepseek-flash &middot; driver <code>bench/tau2/cf.ts</code> &middot; record <code>report/runs/2026-09-13/tau2-v5-mtz6ecej.json</code></p>
+  <p class="how">object <code>bench-v5</code> &middot; 2026-09-13 &middot; build <code>c493981</code> &middot; model deepseek-flash &middot; driver <code>bench/tau2/cf.ts</code> &middot; record <a href="https://pub-212e604eb60944c6854033a8ee1b3cef.r2.dev/runs/2026-09-13/tau2-v5-mtz6ecej.json"><code>tau2-v5-mtz6ecej.json</code></a></p>
   <p class="how">Verified on the deployed Worker: 10 domain tools actively called, 20 of 24 trials successful (83.3%), with the object active for only 19.3s out of 1026s wall clock (under 2%). Below, this run is compared directly with the pre-fix <code>0/8</code> baseline (<code>bench-v2</code>) where domain mounts were filtered out, proving the domain mounting boundary.</p>
 
   <div class="col">
