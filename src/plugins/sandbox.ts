@@ -478,16 +478,29 @@ function isEnv(v: unknown): v is Env {
 
 /**
  * How many entries `asBoxState` will drop from this record: unreadable elements,
- * and a list that is not a list counts as one. Reported through `activity` so
- * leniency that keeps a billed container does not also hide a corrupt record
- * (Rex, 2026-09-15).
+ * a list that is not a list counts as one, and a record that is present but does
+ * not read at all counts as one. Reported through `activity` so leniency that
+ * keeps a billed container does not also hide a corrupt record (Rex, 2026-09-15).
+ *
+ * The row was the case that leniency missed. Reading its fields without ever
+ * asking whether the row is a row cannot report a broken row (Rex, 2026-09-16),
+ * and the three ways `asBoxState` answers `null` are told apart by what is
+ * present rather than by what parses: never written is clean, the record
+ * `release` leaves behind is clean because `{boxId: ""}` reads, and present but
+ * unreadable is damage. That last one is why this matters more than the
+ * elements do — `asBoxState` answers "no container", the sweep skips a mount
+ * with no `boxId` (cf/src/runtime.ts), and the console draws an idle mount, so
+ * a real id scrambled in that row names a container nobody releases and nobody
+ * sees. Counting the absent ones instead would put "corrupt" on every idle
+ * mount, which is how an alarm stops being read.
  */
 export function unreadableEntries(v: Json): number {
-  if (!v || typeof v !== "object") return 0;
+  if (v === null || v === undefined) return 0;
+  if (typeof v !== "object") return 1;
   const o = v as Record<string, unknown>;
   const count = (list: unknown, readable: (x: unknown) => boolean) =>
     list === undefined ? 0 : Array.isArray(list) ? list.filter((x) => !readable(x)).length : 1;
-  return count(o.sessions, isSession) + count(o.envs, isEnv);
+  return (asBoxState(v) === null ? 1 : 0) + count(o.sessions, isSession) + count(o.envs, isEnv);
 }
 
 const SESSIONS_KEPT = 20;
