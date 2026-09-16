@@ -65,11 +65,6 @@ export interface SandboxConfig {
    */
   network?: "open" | "none";
   /**
-   * Credentials the container may use but not read. Declares the shape only —
-   * the values come from the mount's own credential.
-   */
-  secrets?: InjectedSecret[];
-  /**
    * Alias of this agent's GitHub mount. When it holds a token, `gh` and git in
    * the container act as that account without holding the token. Empty turns
    * it off.
@@ -80,32 +75,8 @@ export interface SandboxConfig {
 interface Run9Credential {
   ak: string;
   sk: string;
-  /** Values for the injected secrets the mount declares, by name. Here rather
-   *  than in publicConfig because publicConfig is not a secret: it is shown in
-   *  the console and derived from configuration the operator can read. */
-  secrets?: Record<string, string>;
 }
 
-/**
- * A credential the container may use without ever holding.
- *
- * run9 substitutes the real value into a named header on the way out, and only
- * for the hosts listed — so a shell in the box writes the placeholder, the far
- * end receives the credential, and the agent never sees it. That is the same
- * bargain the gateway makes, enforced at run9's egress instead.
- *
- * Measured, because the documentation for it is a 404: injection happens only
- * under `network_mode: "managed"`; `inject_header_name` is required; and a
- * placeholder is unique across the project, so it is qualified per box.
- */
-interface InjectedSecret {
-  /** Key in the mount's credential holding the value. */
-  name: string;
-  /** Header the value is injected into, e.g. "authorization". */
-  header: string;
-  /** Hosts it may be sent to. Everything else keeps the placeholder. */
-  hosts: string[];
-}
 /** A saved filesystem, under a name the agent chose rather than an id. */
 interface Env {
   name: string;
@@ -115,9 +86,6 @@ interface Env {
   /** The image the kept container started from; absent for one kept before that was recorded. */
   image?: string;
 }
-
-/** Placeholders handed to the agent for this box, by credential name. */
-type Placeholders = Record<string, string>;
 
 interface Session {
   boxId: string;
@@ -151,8 +119,6 @@ interface BoxState {
    * known, which results say rather than falling back to the setting.
    */
   image?: string;
-  /** What the agent may write; never the values behind them. */
-  placeholders?: Placeholders;
   /** What GH_TOKEN is in this container, when GitHub is wired in; never the token. */
   githubPlaceholder?: string;
   /** The GitHub mount whose token was not wired in because its policy holds or denies calls. */
@@ -463,18 +429,6 @@ export function finished(
         "placeholder that is swapped for the token on the way out, so neither you nor anything in this " +
         "container can read the token. If gh is missing, `apt-get update && apt-get install -y gh` installs it.",
     } : {}),
-    ...(state?.placeholders && Object.keys(state.placeholders).length
-      ? {
-          credentials: Object.entries(state.placeholders).map(([name, ph]) => ({
-            name, writeThis: ph,
-            toHosts: (cfg.secrets ?? []).find((d) => d.name === name)?.hosts ?? [],
-            header: (cfg.secrets ?? []).find((d) => d.name === name)?.header,
-          })),
-          note: "write the placeholder where the credential would go; it is substituted " +
-            "on the way out, only for those hosts. You cannot read the value, and neither " +
-            "can anything running in this container.",
-        }
-      : {}),
   };
 }
 
@@ -1000,8 +954,6 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "graceMs", type: "number", default: 5000,
       summary: "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on." },
     { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
-    { name: "secrets", type: "string[]", references: "credential",
-      summary: "Names of secrets to inject into the container. Needs managed networking; the container can use them but never read them." },
     { name: "github", type: "string", default: DEFAULTS.github,
       summary: "Alias of this agent's GitHub mount. When it holds a token, gh and git in the container act as that account without being able to read the token: they hold a placeholder that run9 swaps for it only on requests to GitHub. Empty turns this off." },
     { name: "maxQuietMinutes", type: "number", default: 60,
@@ -1443,21 +1395,6 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // else would send that mount's credential there. No network, no use for it.
       // Read again before every later command (reconcileGithub).
       const want = await githubWanted(ctx, cfg);
-      const declared = cfg.secrets ?? [];
-      // Before the box exists, because after it exists a throw leaks it.
-      //
-      // A declared secret with no value used to be skipped. The box came up,
-      // the placeholder was never registered, and the agent wrote a string
-      // run9 had never heard of — so a half-filled credential surfaced as the
-      // far end rejecting the request, which points at everything except the
-      // mount. Saying it here costs nothing and names the actual mistake.
-      const missing = declared.filter((d) => !cred.secrets?.[d.name]);
-      if (missing.length) {
-        throw new Error(
-          `run9 mount declares ${missing.map((d) => `"${d.name}"`).join(", ")} in its secrets ` +
-          `setting, and the credential carries no value for ${missing.length > 1 ? "them" : "it"}`,
-        );
-      }
       try {
         await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
           box_id: boxId,
@@ -1467,7 +1404,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           // Injection happens on run9's egress proxy, which only exists in
           // managed mode. Measured: under `normal` the placeholder goes out
           // unchanged, which would look like a working credential and not be one.
-          ...(declared.length || want.token ? { network_mode: "managed" } : {}),
+          ...(want.token ? { network_mode: "managed" } : {}),
           ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
           description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
         });
@@ -1483,7 +1420,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       }
       // Recorded before anything else can fail: the box exists and is billed, so
       // a registration that throws must not leave it with no record naming it.
-      // The record gains the placeholders only once run9 has accepted them.
+      // The record gains the GitHub placeholder only once run9 has accepted it.
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
         sessions: history,
@@ -1491,27 +1428,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(kept.length ? { envs: kept } : {}),
       };
       await ctx.connection.set(state as unknown as Json);
-      // Register the declared credentials against the new box. The value never
-      // enters the box and never reaches the model: only the placeholder does.
-      const placeholders: Placeholders = {};
+      // The value never enters the box and never reaches the model: only the
+      // placeholder does, and run9 swaps it in on the way out.
       const githubPlaceholder = want.token ? await registerGithub(api, cfg.project, boxId, want.token) : null;
-      for (const d of declared) {
-        const value = cred.secrets![d.name]!;
-        // Qualified by box, because a placeholder is unique across the project
-        // and two agents would otherwise collide on the same name.
-        const placeholder = `__AP_${d.name}_${boxId.slice(-8)}__`;
-        await api("POST", `/projects/${cfg.project}/workspace/boxes/${boxId}/secrets`, {
-          name: d.name, value, placeholder,
-          inject_header_name: d.header, allowed_hosts: d.hosts,
-        });
-        placeholders[d.name] = placeholder;
-      }
       // `envs` above: release carries them over because a snapshot outlives its
       // box, and a new record written without them erased the list on the next
       // container's first command, stranding the snapshots in run9.
       state = {
         ...state,
-        ...(Object.keys(placeholders).length ? { placeholders } : {}),
         ...(githubPlaceholder ? { githubPlaceholder, githubTokenDigest: await tokenDigest(want.token!) } : {}),
         ...(want.withheld ? { githubWithheld: want.withheld } : {}),
       };
