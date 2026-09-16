@@ -15,7 +15,7 @@
  * network and no bucket.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, chmodSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -107,6 +107,26 @@ check("with no token at all, it stops before reading or fetching anything", () =
   }
   // A credential sat in that file, and the run ended before anything read it.
   if (out.includes("REFUSED")) throw new Error(`it read the records before asking for a token: ${out}`);
+});
+
+check("publishing a key the manifest already lists leaves one row, not two", () => {
+  // scripts/publish-runs.sh appended a row for every upload without asking
+  // whether that key was already there, so writing the manifest first and
+  // publishing second duplicated every key — twice in one day (Vera). A
+  // duplicate passes every "does it resolve" check, because both copies name
+  // the same object and both fetch 200, so nothing could go red for it.
+  const script = readFileSync(new URL("../scripts/publish-runs.sh", import.meta.url), "utf8");
+  const append = script.split("\n").filter((l) => l.includes('>> "$MANIFEST"'));
+  if (append.length) {
+    throw new Error(`the manifest is still appended blind (${append.length} site(s)): ${append[0].trim()}`);
+  }
+  // What it must do instead: drop this key's row, then write the new one.
+  if (!/grep -v[^\n]*\$key[^\n]*"\$MANIFEST"/.test(script)) {
+    throw new Error("nothing removes an existing row for the key before writing it");
+  }
+  if (!/mv "\$MANIFEST\.tmp" "\$MANIFEST"/.test(script)) {
+    throw new Error("the rewritten manifest is never moved into place");
+  }
 });
 
 console.log(`\n  Publish gate\n  ${"─".repeat(56)}`);
