@@ -46,6 +46,18 @@ function racer(id: string, exclusive: boolean) {
       inside -= 1;
       return { ok: true };
     },
+    // Read, pause, write — the same shape as the real release: it reads the
+    // connection state, destroys the box, and writes the emptied state back.
+    async release(c: any) {
+      inside += 1;
+      if (inside > 1) overlapped = true;
+      await c.connection.get();
+      await new Promise((r) => setTimeout(r, 5));
+      await c.connection.set({});
+      seen.push("release");
+      inside -= 1;
+      return true;
+    },
   } as any;
   return { plugin, seen, overlapped: () => overlapped };
 }
@@ -81,6 +93,22 @@ await check("独占的挂载:两个并发调用不重叠,两次写都留下", as
   if (r.seen.length !== 2) throw new Error(`both calls should have run: ${r.seen.join(",")}`);
   const state: any = await store.getConnection("t", "a", "node");
   if (!state?.last) throw new Error("neither write survived");
+});
+
+await check("释放与调用不重叠 —— 释放走的是同一把锁", async () => {
+  // A release is a read-modify-write on the state a `shell` call rewrites, and
+  // it used to run outside the per-mount chain: the command reads "no
+  // container", starts box B and records it, while the release writes back the
+  // empty state it read first. Box B is then alive, billing, and named by
+  // nothing (Piper, 2026-09-16). Overlap is the property; the racer watches it.
+  const r = racer("node", true);
+  const { gw } = await fixture(r.plugin);
+  await Promise.all([
+    gw.invoke(ctx, "node.touch", { mark: "during" } as any),
+    gw.releaseTask(ctx, { alias: "node" }),
+  ]);
+  if (r.overlapped()) throw new Error("a release ran while a call on the same mount was still inside the plugin");
+  if (!r.seen.includes("release")) throw new Error(`the release did not run: ${r.seen.join(",")}`);
 });
 
 await check("没有声明独占的挂载不排队 —— 这条规则是挂载自己说的", async () => {
