@@ -26,14 +26,18 @@ carries_secret() {
     import { readFileSync } from "node:fs";
     import { pathToFileURL } from "node:url";
     const [root, file] = process.argv.slice(1);
-    let secretMatch;
+    let hit;
     try {
-      ({ secretMatch } = await import(pathToFileURL(`${root}/cf/src/secret-shape.ts`).href));
+      const { secretMatch } = await import(pathToFileURL(`${root}/cf/src/secret-shape.ts`).href);
+      hit = secretMatch(readFileSync(file, "utf8"));
     } catch (e) {
-      console.error(`the credential check could not load secret-shape.ts: ${e.message}`);
+      // Loading the matcher, reading the file and running the match are all
+      // "could not judge". Each exits 1 on its own, and 1 is what the caller
+      // reads as clean, so all three are mapped here instead (Ada, #354):
+      // a plugin whose looksLike regex throws must stop the publish.
+      console.error(`the credential check could not run on ${file}: ${e.message}`);
       process.exit(2);
     }
-    const hit = secretMatch(readFileSync(file, "utf8"));
     if (hit) { process.stdout.write(hit.kind); process.exit(0); }
     process.exit(1);
   ' "$ROOT" "$1"
