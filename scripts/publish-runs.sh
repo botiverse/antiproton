@@ -8,9 +8,27 @@
 set -uo pipefail
 
 BUCKET=antiproton-report-runs
-BASE=https://pub-212e604eb60944c6854033a8ee1b3cef.r2.dev
+# Overridable so the tests can point at an address that answers nothing; the
+# default is the bucket the report page links to.
+BASE=${PUBLISH_RUNS_BASE:-https://pub-212e604eb60944c6854033a8ee1b3cef.r2.dev}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MANIFEST="$ROOT/report/runs/manifest.tsv"
+
+# wrangler reads CLOUDFLARE_API_TOKEN; this repo's credential file calls the
+# same value CF_API_TOKEN. Without this, every check passed and the run died at
+# the upload, which is the last place a person can act on it (Vera, 2026-09-16).
+# Asked here instead, before anything is read or fetched.
+if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+  if [ -n "${CF_API_TOKEN:-}" ]; then
+    export CLOUDFLARE_API_TOKEN="$CF_API_TOKEN"
+  else
+    echo "publishing needs a Cloudflare API token, and none is set." >&2
+    echo "wrangler reads CLOUDFLARE_API_TOKEN; ours is CF_API_TOKEN in ~/.secrets/antiproton.env." >&2
+    echo "  set -a; . ~/.secrets/antiproton.env; set +a; bash scripts/publish-runs.sh" >&2
+    echo "Nothing was read or uploaded." >&2
+    exit 3
+  fi
+fi
 
 # Whether a file carries a credential shape is decided by secretMatch — the
 # function the console and /agent/message refuse with, which asks each plugin

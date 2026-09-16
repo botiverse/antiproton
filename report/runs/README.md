@@ -41,7 +41,12 @@ computed, so a record that changed can be noticed instead of trusted.
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working
 tree, where it is ignored by git. After a run, upload it:
 
+    set -a; . ~/.secrets/antiproton.env; set +a
     bash scripts/publish-runs.sh
+
+Publishing needs a Cloudflare API token. wrangler reads `CLOUDFLARE_API_TOKEN`;
+the credential file calls the same value `CF_API_TOKEN`, and the script accepts
+either. With neither it stops before reading or fetching anything.
 
 The script uploads every file under `report/runs/` whose bytes are not already
 in the bucket, and prints the URL of each. It compares hashes rather than
