@@ -10,15 +10,26 @@ BUCKET=antiproton-report-runs
 BASE=https://pub-212e604eb60944c6854033a8ee1b3cef.r2.dev
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
-# The shapes cf/src/secret-shape.ts recognises, plus the generic ones a runner
-# could echo. Kept here rather than imported: this script runs without a build.
-SECRET_RE='ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{10,}|postgres(ql)?://[^[:space:]"]*:[^[:space:]"@]*@|ap-[A-Za-z0-9_-]{24,}'
+# Whether a file carries a credential shape is decided by secretMatch — the
+# same function the console and /agent/message refuse with, which asks each
+# plugin for its own declaration (Piper, #354). A regex copied to here would be
+# a third copy of the GitHub shape and would drift from the declaration; the
+# first copy of it already did.
+carries_secret() {
+  node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    import { secretMatch } from "./cf/src/secret-shape.ts";
+    const hit = secretMatch(readFileSync(process.argv[1], "utf8"));
+    if (hit) { process.stdout.write(hit.kind); process.exit(0); }
+    process.exit(1);
+  ' "$1" 2>/dev/null
+}
 
 uploaded=0 skipped=0 refused=0
 for f in $(find "$ROOT/report/runs" -type f ! -name README.md | sort); do
   key="runs/${f#"$ROOT"/report/runs/}"
-  if grep -qE "$SECRET_RE" "$f"; then
-    echo "REFUSED  $key — credential shape in the file; it was not uploaded"
+  if kind=$(carries_secret "$f"); then
+    echo "REFUSED  $key — looks like a ${kind}; it was not uploaded"
     refused=$((refused+1)); continue
   fi
   if curl -fsS -o /dev/null -m 20 --head "$BASE/$key" 2>/dev/null; then
