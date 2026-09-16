@@ -37,10 +37,20 @@ cleanup() {
 trap cleanup EXIT
 
 if [ "$tier" != "contract" ]; then
-  printf '%s' "$DEEPSEEK_API_KEY" | (cd "$repo/cf" && npx wrangler secret put DEEPSEEK_API_KEY --config wrangler.preview.jsonc >/dev/null 2>&1)
-  model_key_on=1
-  echo "  model key put on antiproton-preview for this run; waiting 30s for the new version to take traffic"
-  sleep 30
+  # The preview Worker now carries the dev key as a standing secret (tygg,
+  # 2026-09-16: "预览worker 也用开发的 key"). Putting our own copy would be
+  # harmless; deleting it on the way out would not — cleanup removes whatever
+  # is there, so a run that borrowed an existing secret would take it with it.
+  # So only add, and only clean up, when the Worker had none.
+  if (cd "$repo/cf" && npx wrangler secret list --config wrangler.preview.jsonc 2>/dev/null \
+        | grep -q '"name": *"DEEPSEEK_API_KEY"'); then
+    echo "  antiproton-preview already holds a model key; leaving it alone"
+  else
+    printf '%s' "$DEEPSEEK_API_KEY" | (cd "$repo/cf" && npx wrangler secret put DEEPSEEK_API_KEY --config wrangler.preview.jsonc >/dev/null 2>&1)
+    model_key_on=1
+    echo "  model key put on antiproton-preview for this run; waiting 30s for the new version to take traffic"
+    sleep 30
+  fi
 fi
 
 OPENAI_BASE_URL="$base/v1" OPENAI_API_KEY="$key" QA_TIER="$tier" node "$here/run.mjs"
