@@ -127,6 +127,12 @@ check("publishing the same key twice leaves one row for it, not two", () => {
   // PUBLISH_RUNS_BASE points at a closed port, so the "already in the bucket?"
   // fetch fails and falls through to the upload.
   const dir = root("an ordinary line\n", WORKING);
+  // The manifest must already list something else. With only the key being
+  // published in it, "one row per key" is satisfied by a manifest holding a
+  // single row — so a script that threw the existing rows away would read
+  // green, and truncation is the worse failure of the two (Vera, 2026-09-16).
+  const untouched = "runs/2026-01-01/other.log";
+  writeFileSync(join(dir, "report/runs/manifest.tsv"), `${untouched}\tdeadbeef\t7\n`);
   const bin = join(dir, "bin");
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(bin, "npx"), "#!/bin/sh\nexit 0\n");
@@ -150,6 +156,9 @@ check("publishing the same key twice leaves one row for it, not two", () => {
   if (rows.length === 0) throw new Error(`the manifest is empty after two publishes: ${first.out}${second.out}`);
   const keys = rows.map((l) => l.split("\t")[0]);
   const distinct = new Set(keys);
+  if (!keys.includes(untouched)) {
+    throw new Error(`publishing dropped an unrelated anchor — ${untouched} is gone:\n${rows.join("\n")}`);
+  }
   if (rows.length !== distinct.size) {
     throw new Error(`${rows.length} rows for ${distinct.size} key(s) — publishing twice duplicated a row:\n${rows.join("\n")}`);
   }
