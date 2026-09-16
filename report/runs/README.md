@@ -53,9 +53,23 @@ in the bucket, and prints the URL of each. It compares hashes rather than
 checking that a key exists, so a key holding different bytes is reported and
 not overwritten, and a local record that no longer matches `manifest.tsv` stops
 the publish. If the credential check cannot run at all, the script stops rather
-than publishing unchecked. Capture a runner's log with a redirect
-(`> report/runs/<day>/<name>.log 2>&1`) rather than a pipe into `tail`, or the
-byte-for-byte record is lost and only the JSON survives.
+than publishing unchecked. Capture a runner's log with a redirect rather than a pipe into `tail`, or the
+byte-for-byte record is lost and only the JSON survives. **Name it after the
+record the runner prints**, so the pair shares one stem:
+
+    node bench/tau2/cf.ts … > /tmp/run.log 2>&1        # runner prints: recorded report/runs/<day>/<stem>.json
+    mv /tmp/run.log report/runs/<day>/<stem>.log        # same <stem>, so one name opens both
+
+A name invented at the keyboard breaks that pairing and has leaked machine
+details into a world-readable bucket: three logs went up as
+names taken from the machine they ran on, on 2026-09-16, and the
+credential check cannot catch that — a hostname is only sensitive if you know
+what it is. Those objects were re-uploaded under their record's stem and the
+originals deleted. `TAU2-RUNNER-CORRECTION-v4.md` in that day's records is the
+note to read: it states no fact about the bucket, it tells you to fetch the key
+and read the answer, so it holds either side of the deletion. Earlier notes in
+that chain were written before it and do state the old keys' status: v2 says one
+is "still live", which stopped being true when it was deleted.
 
 ## Before uploading
 
