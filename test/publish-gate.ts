@@ -15,7 +15,7 @@
  * network and no bucket.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, chmodSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -107,6 +107,61 @@ check("with no token at all, it stops before reading or fetching anything", () =
   }
   // A credential sat in that file, and the run ended before anything read it.
   if (out.includes("REFUSED")) throw new Error(`it read the records before asking for a token: ${out}`);
+});
+
+check("publishing the same key twice leaves one row for it, not two", () => {
+  // scripts/publish-runs.sh appended a row for every upload without asking
+  // whether that key was already listed, so writing the manifest first and
+  // publishing second duplicated the key — it happened twice in one day (Vera).
+  // A duplicate passes every "does it resolve" check, because both copies name
+  // the same object and both fetch 200.
+  //
+  // This is the first case here that reaches the upload branch, and it has to
+  // be: asserting the script's *text* does not bite. A blind append spelled
+  // `>>"$MANIFEST"` satisfies such a check while duplicating, and renaming the
+  // temp file breaks it while behaving identically (both measured, Piper and
+  // Vera, 2026-09-16). What cannot be faked is running publish twice and
+  // finding one row — that pins idempotence, not a spelling.
+  //
+  // It still needs no network: `npx` is a stub that reports success, and
+  // PUBLISH_RUNS_BASE points at a closed port, so the "already in the bucket?"
+  // fetch fails and falls through to the upload.
+  const dir = root("an ordinary line\n", WORKING);
+  // The manifest must already list something else. With only the key being
+  // published in it, "one row per key" is satisfied by a manifest holding a
+  // single row — so a script that threw the existing rows away would read
+  // green, and truncation is the worse failure of the two (Vera, 2026-09-16).
+  const untouched = "runs/2026-01-01/other.log";
+  writeFileSync(join(dir, "report/runs/manifest.tsv"), `${untouched}\tdeadbeef\t7\n`);
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "npx"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(bin, "npx"), 0o755);
+  const env = {
+    ...WITH_TOKEN,
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    PUBLISH_RUNS_BASE: "http://127.0.0.1:9",
+  };
+  const first = run(dir, env);
+  const second = run(dir, env);
+  const manifest = join(dir, "report/runs/manifest.tsv");
+  let rows: string[] = [];
+  try {
+    rows = readFileSync(manifest, "utf8").split("\n").filter((l) => l.trim() !== "");
+  } catch {
+    rmSync(dir, { recursive: true, force: true });
+    throw new Error(`no manifest was written, so the upload branch was never reached: ${first.out}${second.out}`);
+  }
+  rmSync(dir, { recursive: true, force: true });
+  if (rows.length === 0) throw new Error(`the manifest is empty after two publishes: ${first.out}${second.out}`);
+  const keys = rows.map((l) => l.split("\t")[0]);
+  const distinct = new Set(keys);
+  if (!keys.includes(untouched)) {
+    throw new Error(`publishing dropped an unrelated anchor — ${untouched} is gone:\n${rows.join("\n")}`);
+  }
+  if (rows.length !== distinct.size) {
+    throw new Error(`${rows.length} rows for ${distinct.size} key(s) — publishing twice duplicated a row:\n${rows.join("\n")}`);
+  }
 });
 
 console.log(`\n  Publish gate\n  ${"─".repeat(56)}`);

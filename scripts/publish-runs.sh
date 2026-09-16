@@ -107,8 +107,20 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
   esac
   if npx wrangler r2 object put "$BUCKET/$key" --file "$f" --content-type "$ct" \
        --cache-control "public, max-age=31536000, immutable" --remote > /dev/null 2>&1; then
-    printf '%s\t%s\t%s\n' "$key" "$local_sha" "$(wc -c < "$f" | tr -d ' ')" >> "$MANIFEST"
-    LC_ALL=C sort -o "$MANIFEST" "$MANIFEST"
+    # Replace this key's row rather than adding one. Appending blind duplicates
+    # a key whenever the row already exists — which is the normal case when the
+    # manifest was written before publishing, and it happened twice (Vera,
+    # 2026-09-16). A duplicate passes every "does it resolve" check, because
+    # both copies name the same object and both fetch 200.
+    # awk, not `grep -P`: PCRE is a GNU extension, and a grep that does not
+    # have it exits non-zero with an empty file already created — which would
+    # replace the manifest with nothing rather than duplicate a row (Piper,
+    # 2026-09-16). Losing every anchor is worse than the defect above, so the
+    # filter must not be the thing that can fail here.
+    if [ -f "$MANIFEST" ]; then awk -F'\t' -v k="$key" '$1 != k' "$MANIFEST" > "$MANIFEST.tmp"; else : > "$MANIFEST.tmp"; fi
+    printf '%s\t%s\t%s\n' "$key" "$local_sha" "$(wc -c < "$f" | tr -d ' ')" >> "$MANIFEST.tmp"
+    LC_ALL=C sort -o "$MANIFEST.tmp" "$MANIFEST.tmp"
+    mv "$MANIFEST.tmp" "$MANIFEST"
     echo "uploaded $BASE/$key"
     uploaded=$((uploaded+1))
   else
