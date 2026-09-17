@@ -1,7 +1,7 @@
 /**
  * Raft messaging for an agent running inside Antiproton.
  *
- * The QuickJS program sees three structured tools. The Raft credential stays
+ * The QuickJS program sees structured tools. The Raft credential stays
  * in the host plugin and is attached only to the operator-configured Raft
  * origin. Responses are projected so a new server field cannot silently enter
  * the model's context.
@@ -11,9 +11,9 @@ import type { Plugin, PluginContext } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
-const PUSH_SCHEMA = "raft-agent-message.v1";
-const PUSH_QUOTE_CHARS = 1_000;
+const PUSH_SCHEMA = "raft-agent-inbox.v1";
 const PUSH_EVENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const PUSH_FIELDS = new Set(["schema", "eventId", "recipientAgentId"]);
 
 type ObjectValue = Record<string, any>;
 
@@ -188,15 +188,6 @@ async function validPushSignature(body: Uint8Array, signature: string | undefine
   return crypto.subtle.verify("HMAC", key, actual, body);
 }
 
-function oneLine(value: unknown, limit: number): string {
-  return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
-}
-
-function quote(value: string): string {
-  const clipped = value.trim().slice(0, PUSH_QUOTE_CHARS);
-  return clipped.split(/\r\n|[\r\n]/).map((line) => `> ${line}`).join("\n");
-}
-
 function attachment(value: unknown): Json | null {
   const a = object(value);
   if (typeof a.id !== "string" || typeof a.filename !== "string") return null;
@@ -313,21 +304,21 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "enable_push",
-      summary: "Accept signed Raft message webhooks for this mount. An operator must separately register this mount's inbound hook URL and secret with Raft.",
+      summary: "Accept signed, content-free Raft inbox wake notifications for this mount. An operator must separately register this mount's inbound hook URL and secret with Raft.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
       idempotency: "native",
     },
     {
       name: "disable_push",
-      summary: "Stop signed Raft message webhooks from waking this agent through this mount.",
+      summary: "Stop signed Raft inbox notifications from waking this agent through this mount.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
       idempotency: "native",
     },
     {
       name: "push_status",
-      summary: "Show whether signed Raft message webhooks are enabled and when one last reached this mount.",
+      summary: "Show whether signed Raft inbox notifications are enabled and when one last reached this mount.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "read",
       idempotency: "native",
@@ -414,7 +405,7 @@ export const raftPlugin: Plugin = {
         account: identity.agentDisplayName
           ? `${identity.agentDisplayName} (@${identity.agentName})`
           : `@${identity.agentName}`,
-        note: "An operator must register this mount's inbound hook URL and secret with Raft before events can arrive.",
+        note: "An operator must register this mount's inbound hook URL and secret with Raft before inbox notifications can arrive.",
       };
     }
     if (name === "disable_push") {
@@ -447,12 +438,20 @@ export const raftPlugin: Plugin = {
     let payload: ObjectValue;
     try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
     catch { return { deliver: false, rejected: true, reason: "signed, but the body is not JSON" }; }
-    if (payload.schema !== PUSH_SCHEMA || typeof payload.eventId !== "string" || !PUSH_EVENT_ID.test(payload.eventId)) {
+    if (payload.schema !== PUSH_SCHEMA || typeof payload.eventId !== "string" || !PUSH_EVENT_ID.test(payload.eventId) ||
+        typeof payload.recipientAgentId !== "string" || !PUSH_EVENT_ID.test(payload.recipientAgentId)) {
       return { deliver: false, rejected: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} event` };
     }
     const headerEventId = inbound.headers["x-raft-event-id"];
     if (!headerEventId || headerEventId !== payload.eventId) {
       return { deliver: false, rejected: true, reason: "the Raft event id header does not match the signed body" };
+    }
+    if (Object.keys(payload).some((field) => !PUSH_FIELDS.has(field))) {
+      return {
+        deliver: false,
+        rejected: true,
+        reason: "signed, but Raft inbox notifications must not carry message content",
+      };
     }
 
     const state = await loadPushState(ctx);
@@ -465,25 +464,10 @@ export const raftPlugin: Plugin = {
       return { deliver: false, reason: "the signed event names a different Raft agent" };
     }
 
-    const message = object(payload.message);
-    const senderId = text(message.senderId) ?? text(message.sender_id);
-    if (senderId === state.agentId) {
-      return { deliver: false, reason: "the event was caused by this mount's own Raft agent" };
-    }
-    const content = text(message.content);
-    const messageId = text(message.messageId) ?? text(message.message_id);
-    const senderType = text(message.senderType) ?? text(message.sender_type);
-    if (!senderId || !content?.trim() || !messageId ||
-        !["human", "agent", "system", "third_party_app"].includes(senderType ?? "")) {
-      return { deliver: false, rejected: true, reason: "the signed Raft event has an invalid message projection" };
-    }
-
-    const senderName = oneLine(text(message.senderName) ?? text(message.sender_name) ?? senderType, 80);
-    const target = oneLine(text(message.target) ?? text(message.channelName) ?? text(message.channel_name) ?? "Raft", 120);
-    const quoted = quote(content);
     return {
       deliver: true,
-      text: `Raft ${senderType} message from ${senderName || "unknown"} in ${target}.${quoted ? `\n${quoted}` : ""}`,
+      text: `Raft inbox state changed. Call \`${ctx.alias}.receive_events\` exactly once to retrieve and acknowledge ` +
+        "the current canonical inbox batch. Do not retry automatically if that call reports uncertain delivery.",
       dedupeKey: payload.eventId,
     };
   },

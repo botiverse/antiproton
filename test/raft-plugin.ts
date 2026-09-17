@@ -51,17 +51,9 @@ function pushed(payload: unknown, options: { secret?: string; eventId?: string }
 
 function pushPayload(overrides: Record<string, unknown> = {}) {
   return {
-    schema: "raft-agent-message.v1",
+    schema: "raft-agent-inbox.v1",
     eventId: "event-1",
     recipientAgentId: "agent-1",
-    message: {
-      messageId: "message-1",
-      senderId: "human-1",
-      senderName: "tygg",
-      senderType: "human",
-      target: "#wg-raft-sdk",
-      content: "plugin docs changed",
-    },
     ...overrides,
   };
 }
@@ -315,19 +307,16 @@ await check("enable_push binds the receiving mount to the credential's Raft iden
   }
 });
 
-await check("a signed subscribed Raft push is projected, quoted, and deduplicated without network access", async () => {
+await check("a signed Raft inbox notification wakes one canonical pull without network access", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
-  const incoming = pushPayload({
-    message: {
-      messageId: "message-1", senderId: "human-1", senderName: "tygg\nspoof", senderType: "human",
-      target: "#wg-raft-sdk", content: "line one\rline two\r\nline three\nline four",
-    },
-  });
+  const incoming = pushPayload();
   const out = await raftPlugin.receive!(pushed(incoming), PUSH_SECRET, m.ctx);
   if (!out.deliver || out.dedupeKey !== "event-1") throw new Error(JSON.stringify(out));
-  if (!out.text.includes("tygg spoof") ||
-      !out.text.includes("> line one\n> line two\n> line three\n> line four")) throw new Error(out.text);
+  if (!out.text.includes("`raft.receive_events` exactly once") ||
+      !out.text.includes("canonical inbox batch") || !out.text.includes("Do not retry automatically")) {
+    throw new Error(out.text);
+  }
   if (m.state()?.lastReached?.eventId !== "event-1") throw new Error(`last reach not stored: ${JSON.stringify(m.state())}`);
 });
 
@@ -360,7 +349,7 @@ await check("push rejects event ids that cannot be used as bounded dedupe keys",
   if (reads !== 0) throw new Error(`invalid event ids reached mount state: ${reads}`);
 });
 
-await check("push drops disabled, cross-agent, and self-authored events", async () => {
+await check("push drops disabled and cross-agent inbox notifications", async () => {
   const disabled = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const disabledOut = await raftPlugin.receive!(pushed(pushPayload()), PUSH_SECRET, disabled.ctx);
   if (disabledOut.deliver || !/disabled/.test(disabledOut.reason)) throw new Error(JSON.stringify(disabledOut));
@@ -368,23 +357,20 @@ await check("push drops disabled, cross-agent, and self-authored events", async 
   const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const cross = await raftPlugin.receive!(pushed(pushPayload({ recipientAgentId: "agent-2" })), PUSH_SECRET, enabled.ctx);
   if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
-  const self = await raftPlugin.receive!(pushed(pushPayload({
-    message: {
-      messageId: "message-1", senderId: "agent-1", senderName: "raft-bot", senderType: "agent",
-      target: "#wg-raft-sdk", content: "echo",
-    },
-  })), PUSH_SECRET, enabled.ctx);
-  if (self.deliver || !/own/.test(self.reason)) throw new Error(JSON.stringify(self));
 });
 
-await check("push refuses projections that cannot enforce self filtering or safely quote content", async () => {
+await check("push refuses raw content instead of creating a second message delivery plane", async () => {
   const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  for (const message of [
-    { messageId: "message-1", senderName: "unknown", senderType: "human", target: "#x", content: "hello" },
-    { messageId: "message-1", senderId: "human-1", senderName: "x", senderType: "human", target: "#x", content: "   " },
+  for (const extra of [
+    { message: { messageId: "message-1", content: "raw message" } },
+    { content: "raw message" },
+    { events: [{ content: "raw message" }] },
   ]) {
-    const out = await raftPlugin.receive!(pushed(pushPayload({ message })), PUSH_SECRET, enabled.ctx);
-    if (out.deliver || !out.rejected) throw new Error(JSON.stringify({ message, out }));
+    const out = await raftPlugin.receive!(pushed(pushPayload(extra)), PUSH_SECRET, enabled.ctx);
+    if (out.deliver || !out.rejected || !/must not carry message content/.test(out.reason)) {
+      throw new Error(JSON.stringify({ extra, out }));
+    }
+    if (JSON.stringify(out).includes("raw message")) throw new Error(`content leaked in rejection: ${JSON.stringify(out)}`);
   }
 });
 
