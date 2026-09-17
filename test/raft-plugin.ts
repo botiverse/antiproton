@@ -41,6 +41,7 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & { retryable?
 }
 
 await check("declares the queue drain as a non-idempotent write", async () => {
+  if (raftPlugin.version !== "1.0.0") throw new Error(`unexpected plugin version: ${raftPlugin.version}`);
   const receive = raftPlugin.tools.find((tool) => tool.name === "receive_events");
   if (receive?.sideEffects !== "write" || receive.idempotency !== "none") {
     throw new Error(`unsafe declaration: ${JSON.stringify(receive)}`);
@@ -226,9 +227,24 @@ await check("credential check distinguishes rejection from an unreachable server
 });
 
 await check("credential check returns the bound Raft identity", async () => {
-  one(json(200, { runtimeContext: { agentId: "agent-1", serverId: "server-1", workspacePath: "/private/path" } }));
+  const calls = one(json(200, {
+    agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1",
+    credentialId: "secret-id", scopes: ["all"],
+  }));
   const checked = await raftPlugin.checkCredential!(ctx());
-  if (!checked.ok || checked.account !== "agent-1 @ server-1") throw new Error(JSON.stringify(checked));
+  if (!checked.ok || checked.account !== "Release Bot (@raft-bot)") throw new Error(JSON.stringify(checked));
+  if (calls.length !== 1 || calls[0]!.url !== "https://raft.example/internal/agent-api") {
+    throw new Error(`credential check used the wrong endpoint: ${JSON.stringify(calls)}`);
+  }
+});
+
+await check("credential check falls back to the stable Raft agent name", async () => {
+  one(json(200, {
+    agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1",
+    credentialId: "secret-id", scopes: ["all"],
+  }));
+  const checked = await raftPlugin.checkCredential!(ctx());
+  if (!checked.ok || checked.account !== "@raft-bot") throw new Error(JSON.stringify(checked));
 });
 
 globalThis.fetch = originalFetch;

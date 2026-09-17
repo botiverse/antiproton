@@ -186,7 +186,7 @@ function integer(value: unknown, name: string, min: number, max: number): number
 
 export const raftPlugin: Plugin = {
   id: "raft",
-  version: "1",
+  version: "1.0.0",
   config: [
     { name: "serverUrl", type: "string", required: true, summary: "Raft server origin, for example https://api.raft.build." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
@@ -243,12 +243,14 @@ export const raftPlugin: Plugin = {
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false, kind: "rejected", reason: "no Raft agent credential was supplied" };
     try {
-      const { data } = await call(ctx, "GET", "/internal/agent-api/server");
-      const runtime = object(data.runtimeContext);
-      if (typeof runtime.agentId !== "string" || typeof runtime.serverId !== "string") {
+      const { data } = await call(ctx, "GET", "/internal/agent-api");
+      if (typeof data.agentId !== "string" || typeof data.agentName !== "string" || typeof data.serverId !== "string") {
         return { ok: false, kind: "unreachable", reason: "Raft returned an unexpected server identity response" };
       }
-      return { ok: true, account: `${runtime.agentId} @ ${runtime.serverId}` };
+      const displayName = typeof data.agentDisplayName === "string" && data.agentDisplayName.trim()
+        ? data.agentDisplayName
+        : null;
+      return { ok: true, account: displayName ? `${displayName} (@${data.agentName})` : `@${data.agentName}` };
     } catch (e) {
       const reason = String((e as Error)?.message ?? e);
       return { ok: false, kind: /HTTP (401|403)\b/.test(reason) ? "rejected" : "unreachable", reason };
