@@ -649,6 +649,8 @@ export class AgentRuntime {
     const hooks = this.#deps.hooks!;
     return {
       create: async () => {
+        // Checked, then created: two creates at once can both pass and leave
+        // one more than the cap. It bounds a leak; it is not an exact limit.
         const live = (await hooks.directory.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null);
         if (live.length >= INBOUND_HOOKS_PER_MOUNT) {
           throw new Error(`${alias} already has ${live.length} live hooks; revoke one first`);

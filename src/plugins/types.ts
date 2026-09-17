@@ -37,6 +37,19 @@ export interface PluginContext {
   /**
    * This mount's inbound hooks. Present only for a plugin that implements
    * `receive`, on a deployment that can take pushed events.
+   *
+   * Rules for a plugin using them (Piper, #388 review):
+   * - **The secret and the URL never go into a tool result or an error**:
+   *   what `invoke` returns lands in the transcript. The secret is handed to
+   *   the service and nowhere else, `ctx.connection` included.
+   * - **Keep the live `hookId` in `ctx.connection`**, and revoke the previous
+   *   one once a new one is registered: every `create()` is another address
+   *   that stays valid until something revokes it, and only the plugin knows it.
+   * - **If registering with the service definitely fails, revoke the new hook.**
+   * - **A tool that calls `create()` is not natively idempotent**: a replay
+   *   makes another hook. Declare it `idempotency: "none"` or key it yourself.
+   * - **A mount holds at most `INBOUND_HOOKS_PER_MOUNT` live hooks**; `create()`
+   *   past that is refused, so a leak stops at a few addresses.
    */
   inbound?: InboundHooks;
   /**
@@ -77,18 +90,6 @@ export const INBOUND_HOOKS_PER_MOUNT = 3;
  * (Raft push: tygg and XX, 2026-09-17).
  */
 export interface InboundHooks {
-  // Rules for a plugin using these (Piper, #388 review):
-  // - The secret and the URL never go into a tool result or an error: what
-  //   `invoke` returns lands in the transcript. The secret is handed to the
-  //   service and nowhere else, `ctx.connection` included.
-  // - Keep the live `hookId` in `ctx.connection`, and revoke the previous one
-  //   once a new one is registered: every `create()` is another address that
-  //   stays valid until something revokes it, and only the plugin knows it.
-  // - If registering with the service definitely fails, revoke the new hook.
-  // - A tool that calls `create()` is not natively idempotent: a replay makes
-  //   another hook. Declare it `idempotency: "none"` or key it yourself.
-  // - A mount holds at most INBOUND_HOOKS_PER_MOUNT live hooks; `create()` past
-  //   that is refused, so a leak stops at a few addresses.
   /**
    * A new hook for this mount. The secret is generated here, sealed in the
    * agent's store, and returned this once: the plugin hands it to the service
