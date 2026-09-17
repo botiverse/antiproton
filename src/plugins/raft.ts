@@ -11,6 +11,9 @@ import type { Plugin, PluginContext } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
+const PUSH_SCHEMA = "raft-agent-message.v1";
+const PUSH_QUOTE_CHARS = 1_000;
+const PUSH_EVENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 type ObjectValue = Record<string, any>;
 
@@ -24,6 +27,34 @@ function text(value: unknown): string | undefined {
 
 function number(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+type PushState = {
+  enabled: boolean;
+  agentId: string | null;
+  agentName: string | null;
+  lastReached: { eventId: string; at: number } | null;
+};
+
+function pushState(value: unknown): PushState {
+  const state = object(value);
+  const reached = object(state.lastReached);
+  return {
+    enabled: state.enabled === true,
+    agentId: text(state.agentId) ?? null,
+    agentName: text(state.agentName) ?? null,
+    lastReached: typeof reached.eventId === "string" && typeof reached.at === "number"
+      ? { eventId: reached.eventId, at: reached.at }
+      : null,
+  };
+}
+
+async function loadPushState(ctx: PluginContext): Promise<PushState> {
+  return pushState(await ctx.connection.get());
+}
+
+async function savePushState(ctx: PluginContext, state: PushState): Promise<void> {
+  await ctx.connection.set(state as unknown as Json);
 }
 
 function baseUrl(ctx: PluginContext): URL {
@@ -122,6 +153,47 @@ async function call(
       : retryable(new Error(message), response.status === 429 || response.status >= 500);
   }
   return { status: response.status, data: object(data) };
+}
+
+async function raftIdentity(ctx: PluginContext): Promise<{
+  agentId: string;
+  agentName: string;
+  agentDisplayName: string | null;
+}> {
+  const { data } = await call(ctx, "GET", "/internal/agent-api");
+  if (typeof data.agentId !== "string" || typeof data.agentName !== "string" || typeof data.serverId !== "string") {
+    throw new Error("Raft returned an unexpected server identity response");
+  }
+  return {
+    agentId: data.agentId,
+    agentName: data.agentName,
+    agentDisplayName: typeof data.agentDisplayName === "string" && data.agentDisplayName.trim()
+      ? data.agentDisplayName
+      : null,
+  };
+}
+
+async function validPushSignature(body: Uint8Array, signature: string | undefined, secret: string): Promise<boolean> {
+  const hex = /^sha256=([0-9a-f]{64})$/i.exec(signature ?? "")?.[1];
+  if (!hex || !secret) return false;
+  const actual = Uint8Array.from(hex.match(/../g)!, (pair) => Number.parseInt(pair, 16));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  return crypto.subtle.verify("HMAC", key, actual, body);
+}
+
+function oneLine(value: unknown, limit: number): string {
+  return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function quote(value: string): string {
+  const clipped = value.trim().slice(0, PUSH_QUOTE_CHARS);
+  return clipped.split(/\r?\n/).map((line) => `> ${line}`).join("\n");
 }
 
 function attachment(value: unknown): Json | null {
@@ -238,19 +310,39 @@ export const raftPlugin: Plugin = {
       sideEffects: "write",
       idempotency: "native",
     },
+    {
+      name: "enable_push",
+      summary: "Accept signed Raft message webhooks for this mount. An operator must separately register this mount's inbound hook URL and secret with Raft.",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      sideEffects: "write",
+      idempotency: "native",
+    },
+    {
+      name: "disable_push",
+      summary: "Stop signed Raft message webhooks from waking this agent through this mount.",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      sideEffects: "write",
+      idempotency: "native",
+    },
+    {
+      name: "push_status",
+      summary: "Show whether signed Raft message webhooks are enabled and when one last reached this mount.",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      sideEffects: "read",
+      idempotency: "native",
+    },
   ],
 
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false, kind: "rejected", reason: "no Raft agent credential was supplied" };
     try {
-      const { data } = await call(ctx, "GET", "/internal/agent-api");
-      if (typeof data.agentId !== "string" || typeof data.agentName !== "string" || typeof data.serverId !== "string") {
-        return { ok: false, kind: "unreachable", reason: "Raft returned an unexpected server identity response" };
-      }
-      const displayName = typeof data.agentDisplayName === "string" && data.agentDisplayName.trim()
-        ? data.agentDisplayName
-        : null;
-      return { ok: true, account: displayName ? `${displayName} (@${data.agentName})` : `@${data.agentName}` };
+      const identity = await raftIdentity(ctx);
+      return {
+        ok: true,
+        account: identity.agentDisplayName
+          ? `${identity.agentDisplayName} (@${identity.agentName})`
+          : `@${identity.agentName}`,
+      };
     } catch (e) {
       const reason = String((e as Error)?.message ?? e);
       return { ok: false, kind: /HTTP (401|403)\b/.test(reason) ? "rejected" : "unreachable", reason };
@@ -307,6 +399,91 @@ export const raftPlugin: Plugin = {
       if (joined.data.ok !== true) throw new Error("raft join response did not match the expected contract");
       return { state: "joined", target: a.target, channelId: channel.id, status: joined.status };
     }
+    if (name === "enable_push") {
+      const identity = await raftIdentity(ctx);
+      const current = await loadPushState(ctx);
+      await savePushState(ctx, {
+        ...current,
+        enabled: true,
+        agentId: identity.agentId,
+        agentName: identity.agentName,
+      });
+      return {
+        enabled: true,
+        account: identity.agentDisplayName
+          ? `${identity.agentDisplayName} (@${identity.agentName})`
+          : `@${identity.agentName}`,
+        note: "An operator must register this mount's inbound hook URL and secret with Raft before events can arrive.",
+      };
+    }
+    if (name === "disable_push") {
+      const current = await loadPushState(ctx);
+      await savePushState(ctx, { ...current, enabled: false });
+      return { enabled: false };
+    }
+    if (name === "push_status") {
+      const current = await loadPushState(ctx);
+      return {
+        enabled: current.enabled,
+        account: current.agentName ? `@${current.agentName}` : null,
+        lastReached: current.lastReached
+          ? { eventId: current.lastReached.eventId, at: new Date(current.lastReached.at).toISOString() }
+          : null,
+      };
+    }
     throw new Error(`unknown raft tool: ${name}`);
+  },
+
+  async receive(inbound, secret, ctx) {
+    const signature = inbound.headers["x-raft-signature-256"];
+    if (!signature) {
+      return { deliver: false, rejected: true, reason: "unsigned: the Raft webhook signature is missing" };
+    }
+    if (!(await validPushSignature(inbound.body, signature, secret))) {
+      return { deliver: false, rejected: true, reason: "the signature does not match this mount's inbound secret" };
+    }
+
+    let payload: ObjectValue;
+    try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
+    catch { return { deliver: false, rejected: true, reason: "signed, but the body is not JSON" }; }
+    if (payload.schema !== PUSH_SCHEMA || typeof payload.eventId !== "string" || !PUSH_EVENT_ID.test(payload.eventId)) {
+      return { deliver: false, rejected: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} event` };
+    }
+    const headerEventId = inbound.headers["x-raft-event-id"];
+    if (!headerEventId || headerEventId !== payload.eventId) {
+      return { deliver: false, rejected: true, reason: "the Raft event id header does not match the signed body" };
+    }
+
+    const state = await loadPushState(ctx);
+    await savePushState(ctx, {
+      ...state,
+      lastReached: { eventId: payload.eventId, at: Date.now() },
+    });
+    if (!state.enabled) return { deliver: false, reason: "push is disabled for this mount" };
+    if (!state.agentId || payload.recipientAgentId !== state.agentId) {
+      return { deliver: false, reason: "the signed event names a different Raft agent" };
+    }
+
+    const message = object(payload.message);
+    const senderId = text(message.senderId) ?? text(message.sender_id);
+    if (senderId === state.agentId) {
+      return { deliver: false, reason: "the event was caused by this mount's own Raft agent" };
+    }
+    const content = text(message.content);
+    const messageId = text(message.messageId) ?? text(message.message_id);
+    const senderType = text(message.senderType) ?? text(message.sender_type);
+    if (!senderId || !content?.trim() || !messageId ||
+        !["human", "agent", "system", "third_party_app"].includes(senderType ?? "")) {
+      return { deliver: false, rejected: true, reason: "the signed Raft event has an invalid message projection" };
+    }
+
+    const senderName = oneLine(text(message.senderName) ?? text(message.sender_name) ?? senderType, 80);
+    const target = oneLine(text(message.target) ?? text(message.channelName) ?? text(message.channel_name) ?? "Raft", 120);
+    const quoted = quote(content);
+    return {
+      deliver: true,
+      text: `Raft ${senderType} message from ${senderName || "unknown"} in ${target}.${quoted ? `\n${quoted}` : ""}`,
+      dedupeKey: payload.eventId,
+    };
   },
 };

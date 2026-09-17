@@ -1,8 +1,10 @@
+import { createHmac } from "node:crypto";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 
 const originalFetch = globalThis.fetch;
+const PUSH_SECRET = "raft-push-secret-for-tests";
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 
 async function check(name: string, fn: () => Promise<void>) {
@@ -19,6 +21,49 @@ function ctx(credential: string | null = "sk_agent_test_1234567890", config: Rec
     connection: { get: async () => null, set: async () => {} },
     sibling: async () => null,
   } as any;
+}
+
+function mount(initial: unknown = null) {
+  let state = initial;
+  return {
+    ctx: {
+      ...ctx(),
+      connection: {
+        get: async () => state,
+        set: async (value: unknown) => { state = value; },
+      },
+    } as any,
+    state: () => state as any,
+  };
+}
+
+function pushed(payload: unknown, options: { secret?: string; eventId?: string } = {}) {
+  const body = new TextEncoder().encode(JSON.stringify(payload));
+  const signature = createHmac("sha256", options.secret ?? PUSH_SECRET).update(body).digest("hex");
+  return {
+    headers: {
+      "x-raft-signature-256": `sha256=${signature}`,
+      "x-raft-event-id": options.eventId ?? String((payload as any)?.eventId ?? ""),
+    },
+    body,
+  };
+}
+
+function pushPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    schema: "raft-agent-message.v1",
+    eventId: "event-1",
+    recipientAgentId: "agent-1",
+    message: {
+      messageId: "message-1",
+      senderId: "human-1",
+      senderName: "tygg",
+      senderType: "human",
+      target: "#wg-raft-sdk",
+      content: "plugin docs changed",
+    },
+    ...overrides,
+  };
 }
 
 function json(status: number, body: unknown) {
@@ -50,6 +95,12 @@ await check("declares the queue drain as a non-idempotent write", async () => {
   if (send?.sideEffects !== "write" || send.idempotency !== "key") throw new Error("send lost its key idempotency");
   const join = raftPlugin.tools.find((tool) => tool.name === "join_channel");
   if (join?.sideEffects !== "write" || join.idempotency !== "native") throw new Error("join lost native idempotency");
+  const enable = raftPlugin.tools.find((tool) => tool.name === "enable_push");
+  const disable = raftPlugin.tools.find((tool) => tool.name === "disable_push");
+  const status = raftPlugin.tools.find((tool) => tool.name === "push_status");
+  if (enable?.sideEffects !== "write" || enable.idempotency !== "native") throw new Error("enable_push declaration changed");
+  if (disable?.sideEffects !== "write" || disable.idempotency !== "native") throw new Error("disable_push declaration changed");
+  if (status?.sideEffects !== "read" || status.idempotency !== "native") throw new Error("push_status declaration changed");
 });
 
 await check("send uses the configured origin, keeps the credential host-side, and projects the response", async () => {
@@ -245,6 +296,118 @@ await check("credential check falls back to the stable Raft agent name", async (
   }));
   const checked = await raftPlugin.checkCredential!(ctx());
   if (!checked.ok || checked.account !== "@raft-bot") throw new Error(JSON.stringify(checked));
+});
+
+await check("enable_push binds the receiving mount to the credential's Raft identity", async () => {
+  const calls = one(json(200, {
+    agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1",
+  }));
+  const m = mount();
+  const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
+  if (!out.enabled || out.account !== "Release Bot (@raft-bot)" || !/operator/.test(out.note)) {
+    throw new Error(`enable result: ${JSON.stringify(out)}`);
+  }
+  if (calls.length !== 1 || calls[0]!.url !== "https://raft.example/internal/agent-api") {
+    throw new Error(`enable used the wrong identity endpoint: ${JSON.stringify(calls)}`);
+  }
+  if (JSON.stringify(m.state()) !== JSON.stringify({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null })) {
+    throw new Error(`push state: ${JSON.stringify(m.state())}`);
+  }
+});
+
+await check("a signed subscribed Raft push is projected, quoted, and deduplicated without network access", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
+  const incoming = pushPayload({
+    message: {
+      messageId: "message-1", senderId: "human-1", senderName: "tygg\nspoof", senderType: "human",
+      target: "#wg-raft-sdk", content: "line one\nline two",
+    },
+  });
+  const out = await raftPlugin.receive!(pushed(incoming), PUSH_SECRET, m.ctx);
+  if (!out.deliver || out.dedupeKey !== "event-1") throw new Error(JSON.stringify(out));
+  if (!out.text.includes("tygg spoof") || !out.text.includes("> line one\n> line two")) throw new Error(out.text);
+  if (m.state()?.lastReached?.eventId !== "event-1") throw new Error(`last reach not stored: ${JSON.stringify(m.state())}`);
+});
+
+await check("push verifies the signature and matching event id before reading mount state", async () => {
+  let reads = 0;
+  const guarded = {
+    ...ctx(),
+    connection: { get: async () => { reads++; return null; }, set: async () => { throw new Error("state written"); } },
+  } as any;
+  const unsigned = pushed(pushPayload());
+  delete (unsigned.headers as any)["x-raft-signature-256"];
+  const missing = await raftPlugin.receive!(unsigned, PUSH_SECRET, guarded);
+  if (missing.deliver || !missing.rejected) throw new Error(JSON.stringify(missing));
+  const wrongSecret = await raftPlugin.receive!(pushed(pushPayload(), { secret: "wrong" }), PUSH_SECRET, guarded);
+  if (wrongSecret.deliver || !wrongSecret.rejected) throw new Error(JSON.stringify(wrongSecret));
+  const wrongId = await raftPlugin.receive!(pushed(pushPayload(), { eventId: "other" }), PUSH_SECRET, guarded);
+  if (wrongId.deliver || !wrongId.rejected || reads !== 0) throw new Error(JSON.stringify({ wrongId, reads }));
+});
+
+await check("push rejects event ids that cannot be used as bounded dedupe keys", async () => {
+  let reads = 0;
+  const guarded = {
+    ...ctx(),
+    connection: { get: async () => { reads++; return null; }, set: async () => { throw new Error("state written"); } },
+  } as any;
+  for (const eventId of ["contains space", "x".repeat(129), ""]) {
+    const out = await raftPlugin.receive!(pushed(pushPayload({ eventId })), PUSH_SECRET, guarded);
+    if (out.deliver || !out.rejected) throw new Error(JSON.stringify({ eventId, out }));
+  }
+  if (reads !== 0) throw new Error(`invalid event ids reached mount state: ${reads}`);
+});
+
+await check("push drops disabled, cross-agent, and self-authored events", async () => {
+  const disabled = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const disabledOut = await raftPlugin.receive!(pushed(pushPayload()), PUSH_SECRET, disabled.ctx);
+  if (disabledOut.deliver || !/disabled/.test(disabledOut.reason)) throw new Error(JSON.stringify(disabledOut));
+
+  const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const cross = await raftPlugin.receive!(pushed(pushPayload({ recipientAgentId: "agent-2" })), PUSH_SECRET, enabled.ctx);
+  if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
+  const self = await raftPlugin.receive!(pushed(pushPayload({
+    message: {
+      messageId: "message-1", senderId: "agent-1", senderName: "raft-bot", senderType: "agent",
+      target: "#wg-raft-sdk", content: "echo",
+    },
+  })), PUSH_SECRET, enabled.ctx);
+  if (self.deliver || !/own/.test(self.reason)) throw new Error(JSON.stringify(self));
+});
+
+await check("push refuses projections that cannot enforce self filtering or safely quote content", async () => {
+  const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  for (const message of [
+    { messageId: "message-1", senderName: "unknown", senderType: "human", target: "#x", content: "hello" },
+    { messageId: "message-1", senderId: "human-1", senderName: "x", senderType: "human", target: "#x", content: "   " },
+  ]) {
+    const out = await raftPlugin.receive!(pushed(pushPayload({ message })), PUSH_SECRET, enabled.ctx);
+    if (out.deliver || !out.rejected) throw new Error(JSON.stringify({ message, out }));
+  }
+});
+
+await check("disable_push stops later delivery and push_status exposes no secret", async () => {
+  const m = mount({
+    enabled: true, agentId: "agent-1", agentName: "raft-bot",
+    lastReached: { eventId: "event-old", at: Date.parse("2026-09-17T00:00:00.000Z") },
+  });
+  const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
+  const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
+  if (disabled.enabled !== false || status.enabled !== false || status.account !== "@raft-bot") {
+    throw new Error(JSON.stringify({ disabled, status }));
+  }
+  if (status.lastReached?.eventId !== "event-old" || JSON.stringify(status).includes(PUSH_SECRET)) {
+    throw new Error(JSON.stringify(status));
+  }
+});
+
+await check("push_status safely normalizes corrupt persisted connection state", async () => {
+  const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached: { eventId: 9, at: "yesterday" } });
+  const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
+  if (JSON.stringify(status) !== JSON.stringify({ enabled: false, account: null, lastReached: null })) {
+    throw new Error(JSON.stringify(status));
+  }
 });
 
 globalThis.fetch = originalFetch;
