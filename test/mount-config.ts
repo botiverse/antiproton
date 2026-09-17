@@ -18,6 +18,7 @@ import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
+import { raftPlugin } from "../src/plugins/raft.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { credentialForm, originProblem } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
@@ -183,6 +184,7 @@ const everyPlugin: Plugin[] = [
   githubPlugin, httpPlugin, demoPlugin, run9,
   statePlugin(null as any, null, "local"),
   artifactsPlugin(null as any, "local"),
+  raftPlugin,
   builtinToolsPlugin(null as any, () => []),
   ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
 ];
