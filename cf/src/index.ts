@@ -1703,6 +1703,12 @@ export class AgentDO extends DurableObject<Env> {
     mode: "steer" | "followUp" = "steer",
   ) {
     this.#claim(tenantId, agentId);
+    // A message can come before the page was ever opened (a script, or the
+    // API-made agent a person has not looked at): open it the way the page
+    // would, rather than answering 500 for a binding nobody wrote yet.
+    const opened = this.runtime();
+    await opened.ready();
+    if (!(await opened.store.getModelBinding(tenantId, agentId))) await this.uiEnsure(tenantId, agentId, taskId);
     const session = await this.#conversation(tenantId, agentId, taskId);
     return this.#busy("uiSay", async () => {
       const rt = this.runtime();
