@@ -5,6 +5,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
+import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -13,12 +14,23 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 function must(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 
+const NEEDS_ACCOUNT: Plugin = {
+  id: "needs-account", version: "1.0.0", defaultForAllAgents: true,
+  config: [
+    { name: "origin", type: "string", required: true, summary: "Where it calls." },
+    { name: "scope", type: "string", requiredWithCredential: true, summary: "What the account may do." },
+  ],
+  credential: { required: true, summary: "An account.", shape: "token" },
+  tools: [{ name: "ping", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+  async invoke() { return { ok: true }; },
+};
+
 async function runtime() {
   const store = new SqliteStore(":memory:");
   await store.init();
   const rt = new AgentRuntime({
     ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b",
-    models: { resolve: () => null } as any,
+    models: { resolve: () => null } as any, extraPlugins: [NEEDS_ACCOUNT],
   } as any);
   (rt as any).store = store;
   (rt as any).ready = async () => {};
@@ -66,6 +78,19 @@ await check("an unknown plugin, a bad alias and an undeclared setting are refuse
   const typo = await rt.addMount("t", "a", { ...web, config: { account: "open web", max_bytes: 1 } });
   must(!typo.ok, `undeclared setting: ${JSON.stringify(typo)}`);
   must((await store.listMounts("t", "a")).length === 0, "something was mounted");
+});
+
+await check("a plugin that needs an account is mounted without one", async () => {
+  // The credential form needs the mount to exist, so requiring the account at
+  // mount time would make such a plugin unmountable. Its other rules still hold.
+  const { store, rt } = await runtime();
+  const r = await rt.addMount("t", "a", { alias: "acct", plugin: "needs-account", config: { origin: "https://x.test" } });
+  must(r.ok && r.added, `needs an account: ${JSON.stringify(r)}`);
+  must((await store.getMountByAlias("t", "a", "acct"))?.secretRef === null, "a credential reference was set");
+  const noOrigin = await rt.addMount("t", "a", { alias: "acct2", plugin: "needs-account", config: {} });
+  must(!noOrigin.ok && /origin/.test(noOrigin.error), `a required setting missing: ${JSON.stringify(noOrigin)}`);
+  // The switch only lifts the account rule for this call; the plugin itself is unchanged.
+  must(NEEDS_ACCOUNT.credential?.required === true, "the plugin's own declaration was changed");
 });
 
 console.log(`\n  Adding a mount by hand\n  ${"─".repeat(56)}`);
