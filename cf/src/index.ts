@@ -1660,7 +1660,7 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("hookCreateSecret", () => this.runtime().createHookSecret(tenantId, agentId, alias, hookId));
   }
 
-  async adminAddMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Json }) {
+  async adminAddMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }) {
     this.#claim(tenantId, agentId);
     return this.#busy("adminAddMount", () => this.runtime().addMount(tenantId, agentId, seed));
   }

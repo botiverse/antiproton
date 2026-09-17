@@ -1066,7 +1066,7 @@ export class AgentRuntime {
    * because a mount carries a credential and connection state that a replace
    * would orphan. It is always added without a credential.
    */
-  async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Json }):
+  async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }):
     Promise<{ ok: true; added: boolean } | { ok: false; error: string }> {
     await this.ready();
     if (!MOUNT_ALIAS.test(seed.alias)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
@@ -1089,7 +1089,7 @@ export class AgentRuntime {
     // the account is attached its calls fail on the missing credential, and
     // attaching re-judges the settings with the account in place.
     const accountLater = plugin.credential ? { ...plugin, credential: { ...plugin.credential, required: false } } : plugin;
-    const problems = validateMount(accountLater, seed.config as Record<string, Json>, null);
+    const problems = validateMount(accountLater, seed.config, null);
     if (problems.length) return { ok: false, error: `cannot mount ${plugin.id}: ${problems.map((p) => p.message).join("; ")}` };
     await this.store.addMount({
       tenantId, agentId, alias: seed.alias, plugin: plugin.id,
