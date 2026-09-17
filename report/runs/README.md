@@ -36,6 +36,28 @@ access to the account can overwrite or delete an object, and
 The manifest is the anchor: it says what the bytes were when the figure was
 computed, so a record that changed can be noticed instead of trusted.
 
+## Reading a τ² record: which rows a tally counted
+
+A count in a record is only readable if its name says which rows it counted.
+Two fields in a τ² record tally the same thing over different sets, and reading
+one as the other produced a wrong finding on 2026-09-17: the 18:53Z run was
+reported as "five failures ended in transfer, about three times the earlier
+rate", from two numbers that were both right about different rows — 5 rows
+ended in `transfer`, **two of which passed**, and 3 of the 6 failures ended
+there.
+
+- `endingsAllRows` — every trial, passing ones included, keyed by how it ended.
+- `failingRowsByEndingAndCause` — only trials that scored 0, keyed `ended` or
+  `ended (cause)`. A cause appears only for `agent_stalled`, where it names why
+  the turn had no answer (`bench/poll-fallback.ts`).
+
+Records from a `driver` older than this split carry a single `endings` field
+instead. It is the failing-rows tally under a name that does not say so — the
+name this section exists because of. In records whose `driver` also predates
+commit `7685246` (2026-09-17 09:24Z) its keys never carry a cause, because the
+field that holds one did not exist yet; the last such run is the 06:53Z one of
+2026-09-17.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working

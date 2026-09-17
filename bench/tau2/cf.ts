@@ -25,6 +25,7 @@ import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallCause } from "../poll-fallback.ts";
+import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -392,14 +393,15 @@ for (const r of results) for (const [n, c] of Object.entries(r.byTool ?? {})) {
 console.log(`  tools: ${Object.entries(toolTotals).sort((a: any, b: any) => b[1] - a[1])
   .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}`);
 
-const endings: Record<string, number> = {};
-for (const r of results.filter((x) => !x.reward)) {
-  const key = r.stall ? `${r.ended} (${r.stall})` : String(r.ended);
-  endings[key] = (endings[key] ?? 0) + 1;
-}
-if (Object.keys(endings).length) {
-  console.log(`  failures by ending: ${Object.entries(endings)
-    .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ")}`);
+// Two tallies over two different sets of rows, each written under a name that
+// says which set it counted (bench/tau2/endings.ts).
+const allEndings = endingsAllRows(results);
+const failEndings = failingRowsByEndingAndCause(results);
+const tally = (t: Record<string, number>) => Object.entries(t)
+  .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ");
+console.log(`  endings, all ${results.length} rows: ${tally(allEndings) || "(none)"}`);
+if (Object.keys(failEndings).length) {
+  console.log(`  failures by ending: ${tally(failEndings)}`);
 }
 
 /**
@@ -421,7 +423,7 @@ const recorded = recordRun("tau2", OBJ, {
   bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
   tasks: selected.map((t) => t.id), trials: TRIALS, startedAt: new Date(t0Run).toISOString(),
   results, passAtK: TRIALS > 1 ? Object.fromEntries([...Array(TRIALS)].map((_, k) => [k + 1, passAtK(results, k + 1)])) : undefined,
-  tools: toolTotals, endings, activity: act,
+  tools: toolTotals, endingsAllRows: allEndings, failingRowsByEndingAndCause: failEndings, activity: act,
 });
 console.log(`  recorded ${recorded}`);
 console.log();

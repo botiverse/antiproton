@@ -14,6 +14,7 @@
  *   N=5 node bench/tau2/run.ts
  */
 import { readFileSync } from "node:fs";
+import { failingRowsByEndingAndCause } from "./endings.ts";
 import { homedir } from "node:os";
 import { SqliteStore } from "../../src/store/sqlite.ts";
 import { sqliteHost } from "../../src/store/sqlite-host.ts";
@@ -296,12 +297,9 @@ console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.leng
  * the agent had done anything. Counting those against the loop would be
  * measuring the benchmark's user simulator and calling it a harness score.
  */
-const endings: Record<string, number> = {};
-for (const r of results.filter((x) => !x.reward)) {
-  endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;
-}
-if (Object.keys(endings).length) {
-  console.log(`  failures by ending: ${Object.entries(endings)
+const failEndings = failingRowsByEndingAndCause(results);
+if (Object.keys(failEndings).length) {
+  console.log(`  failures by ending: ${Object.entries(failEndings)
     .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ")}`);
 }
 console.log(`  ${prompt} prompt tokens (${prompt ? Math.round((cached / prompt) * 100) : 0}% cached)   ` +
