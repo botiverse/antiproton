@@ -27,7 +27,8 @@ service is contributed as a pull request that adds:
 
 Pull requests adding plugins are open to anyone (see `AGENTS.md`). A plugin
 for a well-known service (an issue tracker, a calendar, a store) is the
-expected kind of contribution.
+expected kind of contribution. Other changes under `cf/` need an issue first;
+the one line that registers a new plugin is exempt.
 
 ## The smallest plugin
 
