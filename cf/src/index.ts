@@ -70,6 +70,13 @@ import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
 
+/** The inspector's runtime tab: the object, then its containers. Storage is a
+ *  developer dump, not an answer the page owes by default (Nova's Inspector
+ *  review, 2026-09-17): it stays one fold away. */
+const runtimeStack = (d: any) =>
+  `<h3>the object</h3>${runtimePanel(d)}<h3>containers</h3>${sandboxPanel(d)}` +
+  `<details class="raw"><summary>storage — everything the object is holding</summary>${storage(d)}</details>`;
+
 export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
   /** The control plane (cf/src/control-plane.ts): who may sign in, and as which
@@ -3003,7 +3010,10 @@ export default {
           if (!alias) return new Response("expected an alias", { status: 400 });
           const r = await stub.uiReleaseSandbox(gate.tenantId, agentId, alias);
           const taskId = url.searchParams.get("taskId") || `t_${agentId}`;
-          const panel = sandboxPanel(await stub.uiStorage(gate.tenantId, agentId, taskId));
+          // The button lives in the inspector's runtime tab, which shows the
+          // panels stacked, so the answer is that same stack: a lone container
+          // panel would replace the others until the next poll.
+          const panel = runtimeStack(await stub.uiStorage(gate.tenantId, agentId, taskId));
           // A refusal is the answer, not an error page: the panel is still the
           // truth, and the reason belongs above it where the button was. The
           // reason names a mount and a plugin's error, so it is escaped here —
@@ -3026,11 +3036,7 @@ export default {
             // panels stacked into one fragment, object first, then the
             // container, then everything the object is holding.
             : url.searchParams.get("stack") === "1"
-              ? `<h3>the object</h3>${runtimePanel(d)}<h3>containers</h3>${sandboxPanel(d)}` +
-              // Storage is a developer dump, not an answer the page owes by
-              // default (Nova's Inspector review, 2026-09-17): it stays one
-              // fold away.
-              `<details class="raw"><summary>storage — everything the object is holding</summary>${storage(d)}</details>`
+              ? runtimeStack(d)
             : runtimePanel(d), v.etag);
         }
         // Data routes for the console shell, rendered by the shell's own

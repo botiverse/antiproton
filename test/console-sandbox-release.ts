@@ -48,6 +48,14 @@ check("the route asks the runtime, and refuses a body without an alias", () => {
   must(/expected an alias/.test(body), "an empty alias is no longer refused");
 });
 
+check("the release answers with the whole runtime tab, not the container panel alone", () => {
+  // The button sits in the inspector's runtime tab (hx-target="closest .body"), whose body holds all three
+  // panels; answering with one of them blanks the other two until the next poll (2026-09-17, #core).
+  const body = routeBody(index, "/ui/sandbox/release");
+  must(/runtimeStack\(await stub\.uiStorage\(/.test(body), "the release no longer answers with the stacked runtime tab");
+  must(!/sandboxPanel\(/.test(body), "the release answers with the container panel alone");
+});
+
 check("releasing is refused while a background job runs on that mount", () => {
   const start = runtime.indexOf("async releaseMount(");
   must(start >= 0, "releaseMount is gone, so this checks nothing");
