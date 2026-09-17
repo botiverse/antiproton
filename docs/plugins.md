@@ -280,12 +280,19 @@ export const statusPlugin: Plugin = {
     if (!(await signedBy(event.body, event.headers["x-signature"], secret))) {
       return { deliver: false, rejected: true, reason: "missing or wrong signature" };
     }
-    let p: { id?: string; component?: string; status?: string };
+    let parsed: unknown;
     try {
-      p = JSON.parse(new TextDecoder().decode(event.body));
+      parsed = JSON.parse(new TextDecoder().decode(event.body));
     } catch {
-      return { deliver: false, rejected: true, reason: "the body is not JSON" };
+      parsed = undefined;
     }
+    // `null`, `5` and `[]` are valid JSON too; reading a field of them would
+    // throw, and a throw is recorded as the runtime failing (503), not as a
+    // bad request (401).
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { deliver: false, rejected: true, reason: "the body is not a JSON object" };
+    }
+    const p = parsed as { id?: string; component?: string; status?: string };
     const watched = ((await ctx.connection.get()) as string[] | null) ?? [];
     if (!p.component || !watched.includes(p.component)) {
       return { deliver: false, reason: `${p.component}: not watched` };
@@ -299,6 +306,10 @@ export const statusPlugin: Plugin = {
   },
 };
 ```
+
+The plugin does not set `defaultForAllAgents`, so it has to be switched on for
+an agent; until it is, every event is ignored at the mount check below, with
+the reason "switched off".
 
 Nothing the agent does can change a component's status, so this plugin needs
 no check for events the agent caused itself. A service the agent can write to
