@@ -7,7 +7,7 @@
  */
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
-import type { InboundHooks, Plugin } from "../src/plugins/types.ts";
+import { INBOUND_HOOKS_PER_MOUNT, type InboundHooks, type Plugin } from "../src/plugins/types.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -35,6 +35,7 @@ async function runtime(opts: { hooks?: boolean } = {}) {
   const directory = {
     async create(r: { hookId: string; tenantId: string; agentId: string; alias: string }) { rows.set(r.hookId, { ...r, createdAt: 1, revokedAt: null }); },
     async lookup(id: string) { const r = rows.get(id); return r && r.revokedAt === null ? r : null; },
+    async list(t: string, a: string) { return [...rows.values()].filter((r) => r.tenantId === t && r.agentId === a); },
     async revoke(id: string) { const r = rows.get(id); if (!r || r.revokedAt !== null) return null; r.revokedAt = 2; return r; },
   };
   const rt = new AgentRuntime({
@@ -107,6 +108,20 @@ await check("no hook is made for a mount that is switched off, and nothing is in
   let err = "";
   try { await inbound!.create(); } catch (e) { err = String((e as Error).message); }
   must(/switched off/.test(err) && rows.size === 0, `created while off: ${err} ${rows.size}`);
+  host.dispose();
+});
+
+await check("a mount holds a few live hooks at most; revoking one makes room", async () => {
+  const { host, rows, grab } = await runtime();
+  const inbound = await grab("a", "p");
+  const made = [];
+  for (let i = 0; i < INBOUND_HOOKS_PER_MOUNT; i++) made.push(await inbound!.create());
+  let err = "";
+  try { await inbound!.create(); } catch (e) { err = String((e as Error).message); }
+  must(/already has 3 live hooks/.test(err) && rows.size === INBOUND_HOOKS_PER_MOUNT, `past the cap: ${err} ${rows.size}`);
+  must(!!(await (await grab("a", "p2"))!.create()), "another mount was held to this mount's cap");
+  await inbound!.revoke(made[0].hookId);
+  must(!!(await inbound!.create()), "revoking did not make room");
   host.dispose();
 });
 

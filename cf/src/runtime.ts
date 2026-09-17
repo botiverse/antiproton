@@ -48,6 +48,7 @@ import {
   INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
 } from "../../src/runtime/inbound.ts";
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
+import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
 
 /** The persona fields of an agent record, if it carries any. */
@@ -363,7 +364,7 @@ export interface RuntimeDeps {
    * Where hook URLs point and the index that resolves them. Absent: plugins
    * are offered no `inbound` and cannot make hooks themselves.
    */
-  hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke"> };
+  hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke" | "list"> };
   maxTurns?: number;
   /**
    * What the bound model can hold, in tokens.
@@ -648,6 +649,10 @@ export class AgentRuntime {
     const hooks = this.#deps.hooks!;
     return {
       create: async () => {
+        const live = (await hooks.directory.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null);
+        if (live.length >= INBOUND_HOOKS_PER_MOUNT) {
+          throw new Error(`${alias} already has ${live.length} live hooks; revoke one first`);
+        }
         const hookId = newHookId();
         const made = await this.createHookSecret(tenantId, agentId, alias, hookId);
         if (!made.ok) throw new Error(made.error);
