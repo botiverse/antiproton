@@ -21,7 +21,10 @@ const triggers = [...html.matchAll(/hx-trigger="([^"]*)"/g)].map((m) => m[1]);
 const polls = triggers.filter((t) => /every \d+s/.test(t));
 
 check("every poll pauses while the tab is hidden", () => {
-  must(polls.length >= 8, `expected the panels' polls, found ${polls.length}`);
+  // The rail's runtime view is gone (2026-09-17, #core: the inspector's
+  // runtime tab already showed the same three panels), so five panels poll:
+  // agents 5s, mounts 5s, transcript 2s, plugins 3s, inspector 3s.
+  must(polls.length === 5, `expected the five panels' polls, found ${polls.length}`);
   for (const t of polls) for (const clause of t.match(/every \d+s\[[^\]]*\]/g) ?? []) must(/every \d+s\[!document\.hidden( &&|\])/.test(clause), `poll without a visibility guard: ${clause}`);
 });
 
