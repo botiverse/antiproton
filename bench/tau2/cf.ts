@@ -182,6 +182,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
       try { ws.send("ping"); } catch { /* closing */ }
       // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
       void api(`/bench/poll?taskId=${taskId}`).then((poll: any) => {
+        count(taskId, "pollChecks");
         const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
         if (!d) return;
         seen.set(taskId, d.seq);
@@ -190,8 +191,10 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
       }).catch(() => { /* the socket or the next tick will do */ });
     }, 20_000);
     const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
-    ws.onerror = () => stop(null);
-    ws.onclose = () => stop(null);
+    // A socket that ends before this turn's answer is a drop, whatever comes next.
+    const drop = () => { if (!done) count(taskId, "dropped"); stop(null); };
+    ws.onerror = drop;
+    ws.onclose = drop;
     ws.onmessage = (ev: MessageEvent) => {
       let e: any;
       try { e = JSON.parse(String(ev.data)); } catch { return; }
@@ -217,11 +220,17 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
  *  previous turn's answer and end the conversation a turn early. */
 const seen = new Map<string, number>();
 
-/** Which path brought each turn's answer, so a record says whether the socket or the poll delivered. */
-const delivered = new Map<string, { push: number; poll: number }>();
-function count(taskId: string, path: "push" | "poll") {
-  const d = delivered.get(taskId) ?? { push: 0, poll: 0 };
-  d[path] += 1;
+/**
+ * Which path brought each turn's answer, and how often each path was given
+ * the chance. `poll: 0` alone cannot tell "no push was lost" from "the
+ * fallback never ran" (Vera, 2026-09-17): `pollChecks` says the fallback ran,
+ * and `dropped` counts sockets that closed or failed before an answer.
+ */
+type Delivered = { push: number; poll: number; pollChecks: number; dropped: number };
+const delivered = new Map<string, Delivered>();
+function count(taskId: string, what: keyof Delivered) {
+  const d = delivered.get(taskId) ?? { push: 0, poll: 0, pollChecks: 0, dropped: 0 };
+  d[what] += 1;
   delivered.set(taskId, d);
 }
 
@@ -282,7 +291,7 @@ async function runTask(task: any) {
 
   return {
     id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall,
-    delivered: delivered.get(taskId) ?? { push: 0, poll: 0 },
+    delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollChecks: 0, dropped: 0 },
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
     seconds: Math.round((Date.now() - t0) / 1000),
