@@ -30,7 +30,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice,
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice,
 } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -1354,32 +1354,16 @@ export class AgentDO extends DurableObject<Env> {
       await rt.provision(tenantId, agentId, desired);
       const byId = new Map(rt.plugins().map((p) => [p.id, p]));
       for (const d of desired) {
-        const config = d.config ?? { account: d.account };
         const have = await rt.store.getMountByAlias(tenantId, agentId, d.alias);
         if (!have) continue;
-        if (JSON.stringify(have.publicConfig) !== JSON.stringify(config)) {
-          // The third write path, checked like the other two. Provision
-          // validates a seed as it adds it; attaching a credential re-validates
-          // with the ref about to be set (#140); this is the config changing
-          // under a credential that is already there, so the check runs with
-          // the ref that stayed. A seed that would leave the mount in a state
-          // the runtime forbids — a credential and no host allowlist — is not
-          // applied: the mount keeps the config it had, which the page shows
-          // as fine because it is. So the refusal itself is logged; otherwise
-          // "refused" and "nothing to do" would be the same observable, and
-          // the only way to learn the seed and the mount disagree would be to
-          // notice the config never changed.
-          const plugin = byId.get(d.plugin);
-          const problems = plugin ? validateMount(plugin, config as any, have.secretRef) : [];
-          if (problems.length) {
-            const reason = problems.map((x) => x.message).join("; ");
-            console.warn(`reconcile refused for ${agentId}/${d.alias}: ${reason}`);
-            this.#reconcileRefused.set(d.alias, { at: new Date().toISOString(), reason });
-          } else {
-            await rt.store.updateMountConfig(tenantId, agentId, d.alias, config);
-            this.#reconcileRefused.delete(d.alias);
-          }
+        const step = reconcileSeed(have, d, byId.get(d.plugin));
+        if ("refused" in step) {
+          console.warn(`reconcile refused for ${agentId}/${d.alias}: ${step.refused}`);
+          this.#reconcileRefused.set(d.alias, { at: new Date().toISOString(), reason: step.refused });
+          // Another plugin under this alias is not this seed's to touch at all.
+          if (have.plugin !== d.plugin) continue;
         } else {
+          if (step.update) await rt.store.updateMountConfig(tenantId, agentId, d.alias, step.update);
           this.#reconcileRefused.delete(d.alias);
         }
         if (JSON.stringify(have.policy ?? null) !== JSON.stringify(d.policy ?? null)) {

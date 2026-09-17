@@ -4,7 +4,8 @@
  * alias that is already taken is never replaced.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
-import { AgentRuntime } from "../cf/src/runtime.ts";
+import { AgentRuntime, reconcileSeed } from "../cf/src/runtime.ts";
+import { httpPlugin } from "../src/plugins/http.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -57,6 +58,17 @@ await check("an alias that is a different mount is refused, not replaced", async
   const plugin = await rt.addMount("t", "a", { alias: "web2", plugin: "state", config: { account: "x" } });
   must(!plugin.ok, `other plugin: ${JSON.stringify(plugin)}`);
   must((await store.getMountByAlias("t", "a", "web2"))?.publicConfig?.maxBytes === 24_000, "the mount changed");
+  // Same settings, another plugin: only the plugin comparison can refuse this.
+  const samePlugin = await rt.addMount("t", "a", { ...web, plugin: "needs-account" });
+  must(!samePlugin.ok && /already a different mount/.test(samePlugin.error), `same settings, other plugin: ${JSON.stringify(samePlugin)}`);
+});
+
+await check("a default alias is not given to another plugin, even while its seed is switched off", async () => {
+  const { store, rt } = await runtime();
+  await store.setPluginChoice("t", "a", "http", "disable");
+  const r = await rt.addMount("t", "a", { alias: "web", plugin: "needs-account", config: { origin: "https://x.test" } });
+  must(!r.ok && /default http mount/.test(r.error), `took web: ${JSON.stringify(r)}`);
+  must(!(await store.getMountByAlias("t", "a", "web")), "mounted anyway");
 });
 
 await check("a switched-off plugin is an answer, not a silent skip", async () => {
@@ -91,6 +103,19 @@ await check("a plugin that needs an account is mounted without one", async () =>
   must(!noOrigin.ok && /origin/.test(noOrigin.error), `a required setting missing: ${JSON.stringify(noOrigin)}`);
   // The switch only lifts the account rule for this call; the plugin itself is unchanged.
   must(NEEDS_ACCOUNT.credential?.required === true, "the plugin's own declaration was changed");
+});
+
+await check("the console's reconcile leaves another plugin's mount under a seed alias alone", async () => {
+  const seed = { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 } };
+  const other = reconcileSeed({ plugin: "raft", publicConfig: { serverUrl: "https://r.test" }, secretRef: null }, seed, httpPlugin);
+  must("refused" in other && /raft mount, not the http seed/.test(other.refused), `other plugin: ${JSON.stringify(other)}`);
+  const same = reconcileSeed({ plugin: "http", publicConfig: seed.config, secretRef: null }, seed, httpPlugin);
+  must("update" in same && same.update === null, `unchanged: ${JSON.stringify(same)}`);
+  const drift = reconcileSeed({ plugin: "http", publicConfig: { account: "open web", maxBytes: 48_000 }, secretRef: null }, seed, httpPlugin);
+  must("update" in drift && drift.update?.maxBytes === 24_000, `drifted: ${JSON.stringify(drift)}`);
+  // A credential and no allowlist is forbidden, so that seed is not applied under a key.
+  const keyed = reconcileSeed({ plugin: "http", publicConfig: { account: "x" }, secretRef: "agent:web" }, seed, httpPlugin);
+  must("refused" in keyed, `under a credential: ${JSON.stringify(keyed)}`);
 });
 
 console.log(`\n  Adding a mount by hand\n  ${"─".repeat(56)}`);

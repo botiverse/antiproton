@@ -62,6 +62,33 @@ import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
 
+/**
+ * What the console's reconcile does with one seed whose alias exists (the
+ * third write path). Provision validates a seed as it adds it; attaching a
+ * credential re-validates with the ref about to be set (#140); this is the
+ * config changing under a credential that is already there, so the check runs
+ * with the ref that stayed. A seed that would leave the mount in a state the
+ * runtime forbids (a credential and no host allowlist) is not applied, and the
+ * refusal is reported: otherwise "refused" and "nothing to do" would look the
+ * same. A seed's settings belong to its plugin, so another plugin under the
+ * alias (added or renamed while the seed was switched off) is refused too:
+ * one plugin's settings on another would silently drop what it needs.
+ */
+export function reconcileSeed(
+  have: Pick<MountRecord, "plugin" | "publicConfig" | "secretRef">,
+  seed: SeedMount,
+  plugin: Plugin | undefined,
+): { update: Record<string, Json> | null } | { refused: string } {
+  if (have.plugin !== seed.plugin) {
+    return { refused: `${seed.alias} is a ${have.plugin} mount, not the ${seed.plugin} seed; left as it is` };
+  }
+  const config = (seed.config ?? { account: seed.account }) as Record<string, Json>;
+  if (JSON.stringify(have.publicConfig) === JSON.stringify(config)) return { update: null };
+  const problems = plugin ? validateMount(plugin, config, have.secretRef) : [];
+  if (problems.length) return { refused: problems.map((x) => x.message).join("; ") };
+  return { update: config };
+}
+
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {
   alias: string; plugin: string;
@@ -1072,6 +1099,12 @@ export class AgentRuntime {
     if (!MOUNT_ALIAS.test(seed.alias)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
     const plugin = this.#plugins.find((p) => p.id === seed.plugin);
     if (!plugin) return { ok: false, error: `no plugin named ${seed.plugin}` };
+    // A default alias stays its seed's, even while that plugin is switched
+    // off and the alias is free: the seed would come back to find it taken.
+    const seeded = AgentRuntime.DEFAULT_MOUNTS.find((d) => d.alias === seed.alias);
+    if (seeded && seeded.plugin !== plugin.id) {
+      return { ok: false, error: `${seed.alias} is the default ${seeded.plugin} mount's alias` };
+    }
     const have = await this.store.getMountByAlias(tenantId, agentId, seed.alias);
     if (have) {
       if (have.plugin === seed.plugin && JSON.stringify(have.publicConfig) === JSON.stringify(seed.config)) {
