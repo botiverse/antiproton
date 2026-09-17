@@ -2,7 +2,7 @@
  * Icons, inlined.
  *
  * rUI draws its icons with lucide, so the console does too, under lucide's
- * own names: bot, plug, key-round and chart-column for the rail; square, sun and moon
+ * own names: bot, plug, gauge, key-round and chart-column for the rail; square, sun and moon
  * for the theme control (Brutal, Elegant, Elegant dark); chevron-left, list-todo and panel-right
  * for the phone's pane controls; plus for a new conversation; log-out behind the viewer's
  * face in the rail. Path data is from lucide-react 1.44.0
@@ -14,6 +14,8 @@
  * aria-label, so the SVG itself is aria-hidden.
  */
 export const ICONS: Record<string, string> = {
+  // gauge, lucide-static 1.44.0 (ISC): the usage view.
+  "usage": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"m12 14 4-4\"/><path d=\"M3.34 19a10 10 0 1 1 17.32 0\"/></svg>",
   // key-round, lucide-static 1.44.0 (ISC): the API keys view.
   "keys": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z\"/><circle cx=\"16.5\" cy=\"7.5\" r=\".5\" fill=\"currentColor\"/></svg>",
   "plus": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M5 12h14\"/><path d=\"M12 5v14\"/></svg>",
