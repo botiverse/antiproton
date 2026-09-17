@@ -3,7 +3,7 @@
  * the agent's outbox (cf/src/usage-d1.ts, src/usage/outbox.ts). Run inside
  * workerd by cf/src/conformance.ts; see test/control-plane-d1.sh.
  */
-import { flushUsage, readUsage, sendUsage, usageCursor, DAY_MS } from "../../cf/src/usage-d1.ts";
+import { flushUsage, parseUsageQuery, priceFor, readUsage, sendUsage, usageCursor, usageGroup, DAY_MS, type UsageQuery } from "../../cf/src/usage-d1.ts";
 import { appendUsage, pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
 import type { SpecCase } from "./control-plane-spec.ts";
 
@@ -15,7 +15,7 @@ const T0 = 1_800_000_000_000 - (1_800_000_000_000 % DAY_MS); // a UTC midnight
 
 export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
   const wipe = async () => {
-    await db.batch([db.prepare("DELETE FROM usage_hourly"), db.prepare("DELETE FROM usage_cursor")]);
+    await db.batch([db.prepare("DELETE FROM usage_hourly"), db.prepare("DELETE FROM usage_cursor"), db.prepare("DELETE FROM usage_prices")]);
     sql.exec("DROP TABLE IF EXISTS usage_outbox");
     sql.exec("DROP TABLE IF EXISTS usage_sent");
   };
@@ -72,8 +72,8 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
 
   add("a key with two units keeps them apart", async () => {
     assert(await sendUsage(db, "t", "a", 0, [
-      row(1, { resource: "tool.call", key: "github.issue_list:ok", quantity: 1, unit: "calls" }),
-      row(2, { resource: "tool.call", key: "github.issue_list:ok", quantity: 250, unit: "ms" }),
+      row(1, { resource: "tool.call", key: "github.issue_list", quantity: 1, unit: "calls" }),
+      row(2, { resource: "tool.call", key: "github.issue_list", quantity: 250, unit: "ms" }),
     ]), "refused");
     const { results } = await db.prepare("SELECT unit, quantity FROM usage_hourly ORDER BY unit").all();
     assert((results as any[]).map((r) => `${r.unit}=${r.quantity}`).join(",") === "calls=1,ms=250", JSON.stringify(results));
@@ -110,25 +110,60 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     assert(r.rows === 0 && (await sum()) === 20 && pendingUsage(sql as any, 0).length === 0, `flush ${JSON.stringify(r)}, sum ${await sum()}`);
   });
 
+  const read = (from: number, to: number, bucket: "1h" | "1d", by: UsageQuery["by"]) =>
+    readUsage(db, "t", { window: "custom", from, to, bucket, by }).then((r) => r.rows);
+
   add("a read groups by hour or day, and by agent, model or tool", async () => {
     await sendUsage(db, "t", "a", 0, [
       row(1), row(2, { at: T0 + H + 5, key: "m2:output", quantity: 4 }),
       row(3, { at: T0 + DAY_MS + 1, quantity: 100 }),
-      row(4, { resource: "tool.call", key: "github.issue_list:ok", quantity: 1, unit: "calls" }),
+      row(4, { resource: "tool.call", key: "github.issue_list", quantity: 1, unit: "calls" }),
+      row(5, { resource: "js.run", key: "run_js", quantity: 1, unit: "runs" }),
     ]);
     await sendUsage(db, "t", "b", 0, [row(1, { agentId: "b", quantity: 1 })]);
     await sendUsage(db, "u", "a", 0, [row(1, { tenantId: "u", quantity: 999 })]);
-    const hourly = await readUsage(db, "t", { from: T0, to: T0 + DAY_MS, bucket: "1h", by: "total" });
-    const h = hourly.map((r) => `${r.bucket - T0}/${r.resource}/${r.key}/${r.unit}=${r.quantity}`).join(" ");
-    assert(h === `0/model.tokens/m1:input/tokens=11 0/tool.call/github.issue_list:ok/calls=1 ${H}/model.tokens/m2:output/tokens=4`, h);
-    const daily = await readUsage(db, "t", { from: T0, to: T0 + 2 * DAY_MS, bucket: "1d", by: "model" });
+    const hourly = await read(T0, T0 + DAY_MS, "1h", "total");
+    const h = hourly.map((r) => `${r.bucket - T0}/${r.group}/${r.resource}/${r.key}/${r.unit}=${r.quantity}`).join(" ");
+    assert(h === `0/total/js.run/run_js/runs=1 0/total/model.tokens/m1:input/tokens=11 0/total/tool.call/github.issue_list/calls=1 ${H}/total/model.tokens/m2:output/tokens=4`, h);
+    assert(hourly.every((r) => !("cost" in r)), "cost before any price");
+    const daily = await read(T0, T0 + 2 * DAY_MS, "1d", "model");
     const d = daily.map((r) => `${(r.bucket - T0) / DAY_MS}/${r.group}/${r.key}=${r.quantity}`).join(" ");
-    assert(d === "0/m1/m1:input=11 0/m2/m2:output=4 0//github.issue_list:ok=1 1/m1/m1:input=100", d);
-    const byAgent = await readUsage(db, "t", { from: T0, to: T0 + H, bucket: "1h", by: "agent" });
+    assert(d === "0//run_js=1 0/m1/m1:input=11 0/m2/m2:output=4 0//github.issue_list=1 1/m1/m1:input=100", d);
+    const byAgent = await read(T0, T0 + H, "1h", "agent");
     const a = byAgent.filter((r) => r.resource === "model.tokens").map((r) => `${r.group}=${r.quantity}`).sort().join(",");
     assert(a === "a=10,b=1", a);
-    const byTool = await readUsage(db, "t", { from: T0, to: T0 + H, bucket: "1h", by: "tool" });
-    assert(byTool.find((r) => r.resource === "tool.call")?.group === "github.issue_list", JSON.stringify(byTool));
+    const byTool = await read(T0, T0 + H, "1h", "tool");
+    const t = byTool.map((r) => `${r.resource}:${r.group}`).sort().join(",");
+    assert(t === "js.run:run_js,model.tokens:,tool.call:github.issue_list", t);
+    // A window that starts mid-bucket still reads that whole bucket.
+    const mid = await read(T0 + 30 * 60_000, T0 + H, "1h", "total");
+    assert(mid.length === 3, `mid-hour window: ${mid.length}`);
+  });
+
+  add("once a price exists every row carries its cost, and a row without a price is free", async () => {
+    await sendUsage(db, "t", "a", 0, [row(1, { quantity: 1000 }), row(2, { key: "m1:output", quantity: 10 }), row(3, { at: T0 + DAY_MS + 1, quantity: 1000 })]);
+    await db.batch([
+      db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', '*', 'tokens', 0.001, 0)"),
+      db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', 'm1:input', 'tokens', 0.002, ?)").bind(T0),
+      db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', 'm1:input', 'tokens', 0.01, ?)").bind(T0 + DAY_MS),
+    ]);
+    const { rows, priced } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + 2 * DAY_MS, bucket: "1d", by: "total" });
+    const c = rows.map((r) => `${(r.bucket - T0) / DAY_MS}/${r.key}=${r.cost}`).join(" ");
+    assert(priced && c === "0/m1:input=2 0/m1:output=0.01 1/m1:input=10", `${priced} ${c}`);
+  });
+
+  add("the query string: windows, default buckets, and refusals", async () => {
+    const now = T0 + 5 * DAY_MS;
+    const d = parseUsageQuery(new URLSearchParams(""), now);
+    assert(typeof d === "object" && d.window === "24h" && d.bucket === "1h" && d.by === "total" && d.to === now && d.from === now - DAY_MS, JSON.stringify(d));
+    const w = parseUsageQuery(new URLSearchParams("window=7d&by=agent"), now);
+    assert(typeof w === "object" && w.bucket === "1d" && w.from === now - 7 * DAY_MS, JSON.stringify(w));
+    for (const bad of ["window=1h", "bucket=5m", "by=plugin", "window=30d&bucket=hour"]) {
+      assert(typeof parseUsageQuery(new URLSearchParams(bad), now) === "string", `accepted ${bad}`);
+    }
+    assert(usageGroup("tool", { agentId: "a", resource: "sandbox.container", key: "sandbox" }) === "sandbox", "sandbox group");
+    assert(usageGroup("model", { agentId: "a", resource: "model.tokens", key: "vendor:model:input" }) === "vendor:model", "a model name with a colon");
+    assert(priceFor([], { bucket: 0, resource: "r", key: "k", unit: "u" }) === null, "no price is free");
   });
 
   return cases;

@@ -22,7 +22,7 @@ export interface UsageRow {
   agentId: string;
   /** What kind of thing: `model.tokens`, `tool.call`, `js.run`, … */
   resource: string;
-  /** Which one, within the resource: `deepseek-chat:input`, `github.issue_list:ok`, … */
+  /** Which one, within the resource: `deepseek-chat:input`, `github.issue_list`, `run_js`, … */
   key: string;
   quantity: number;
   /** What `quantity` counts: `tokens`, `calls`, `ms`, `runs`, … */
@@ -116,25 +116,31 @@ export function modelTokenRows(
     .map(([kind, n]) => ({ ...base, resource: "model.tokens", key: `${model || "unknown"}:${kind}`, quantity: n!, unit: "tokens" }));
 }
 
-/** A tool call through a mount: one call, and how long it took. */
+/**
+ * A tool call through a mount: one call, one more failure if it failed, and
+ * how long it took. The key is the tool alone; `failed` is a unit, so a
+ * reader sums calls and failures for one tool without joining two keys.
+ */
 export function toolCallRows(
   base: { at: number; tenantId: string; agentId: string },
   tool: string, outcome: "ok" | "failed", ms: number,
 ): UsageRow[] {
   return [
-    { ...base, resource: "tool.call", key: `${tool}:${outcome}`, quantity: 1, unit: "calls" },
-    { ...base, resource: "tool.call", key: `${tool}:${outcome}`, quantity: Math.max(0, Math.round(ms)), unit: "ms" },
+    { ...base, resource: "tool.call", key: tool, quantity: 1, unit: "calls" },
+    ...(outcome === "failed" ? [{ ...base, resource: "tool.call", key: tool, quantity: 1, unit: "failed" }] : []),
+    { ...base, resource: "tool.call", key: tool, quantity: Math.max(0, Math.round(ms)), unit: "ms" },
   ];
 }
 
-/** One run_js: the run, its time, and how many tools it called. */
+/** One run_js: the run, a failure if it failed, its time, and how many tools it called. */
 export function jsRunRows(
   base: { at: number; tenantId: string; agentId: string },
   outcome: "ok" | "failed", ms: number, toolCalls: number,
 ): UsageRow[] {
   return [
-    { ...base, resource: "js.run", key: outcome, quantity: 1, unit: "runs" },
-    { ...base, resource: "js.run", key: outcome, quantity: Math.max(0, Math.round(ms)), unit: "ms" },
-    { ...base, resource: "js.run", key: outcome, quantity: toolCalls, unit: "tool_calls" },
+    { ...base, resource: "js.run", key: "run_js", quantity: 1, unit: "runs" },
+    ...(outcome === "failed" ? [{ ...base, resource: "js.run", key: "run_js", quantity: 1, unit: "failed" }] : []),
+    { ...base, resource: "js.run", key: "run_js", quantity: Math.max(0, Math.round(ms)), unit: "ms" },
+    { ...base, resource: "js.run", key: "run_js", quantity: toolCalls, unit: "tool_calls" },
   ];
 }

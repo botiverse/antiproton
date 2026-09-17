@@ -100,10 +100,10 @@ await check("a tool call through a mount is counted once, as ok or failed, with 
   await gw.invoke(ctx, "m.boom", {});
   await gw.invoke(ctx, "m.nope", {});
   const rows = store.usageOutbox();
-  const got = rows.filter((r) => r.unit === "calls").map((r) => `${r.key}=${r.quantity}`).join(",");
-  must(got === "p.fine:ok=1,p.boom:failed=1", got);
+  const got = rows.filter((r) => r.unit !== "ms").map((r) => `${r.key}/${r.unit}=${r.quantity}`).join(",");
+  must(got === "p.fine/calls=1,p.boom/calls=1,p.boom/failed=1", got);
   // A zero duration is not a row; a call that took time is.
-  const fineMs = rows.find((r) => r.unit === "ms" && r.key === "p.fine:ok")?.quantity ?? 0;
+  const fineMs = rows.find((r) => r.unit === "ms" && r.key === "p.fine")?.quantity ?? 0;
   must(fineMs >= 10, `time row ${fineMs}`);
   await store.close?.();
 });
@@ -124,8 +124,10 @@ await check("every run_js is counted, however it ends, and a counting failure do
   await tool.execute("c3", { source: "1" } as any, undefined as any, undefined as any, undefined as any, undefined as any).catch((e) => { threw = String(e.message); });
   must(threw === "executor down", `the run's own error was replaced: ${threw}`);
   must(seen.map((r) => `${r.ok}/${r.hostCalls}`).join(",") === "true/2,false/2,false/0", JSON.stringify(seen));
-  must(describe(jsRunRows(base, "ok", 12.6, 2)) === "js.run/ok/13ms js.run/ok/1runs js.run/ok/2tool_calls", describe(jsRunRows(base, "ok", 12.6, 2)));
-  must(describe(toolCallRows(base, "p.t", "failed", 3)) === "tool.call/p.t:failed/1calls tool.call/p.t:failed/3ms", "tool rows");
+  must(describe(jsRunRows(base, "ok", 12.6, 2)) === "js.run/run_js/13ms js.run/run_js/1runs js.run/run_js/2tool_calls", describe(jsRunRows(base, "ok", 12.6, 2)));
+  must(describe(jsRunRows(base, "failed", 1, 0)) === "js.run/run_js/0tool_calls js.run/run_js/1failed js.run/run_js/1ms js.run/run_js/1runs", describe(jsRunRows(base, "failed", 1, 0)));
+  must(describe(toolCallRows(base, "p.t", "failed", 3)) === "tool.call/p.t/1calls tool.call/p.t/1failed tool.call/p.t/3ms", "tool rows");
+  must(describe(toolCallRows(base, "p.t", "ok", 3)) === "tool.call/p.t/1calls tool.call/p.t/3ms", "ok tool rows");
 });
 
 console.log(`\n  Usage outbox\n  ${"─".repeat(56)}`);

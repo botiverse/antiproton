@@ -48,64 +48,94 @@ export type UsageGroupBy = "total" | "agent" | "model" | "tool";
 export interface UsageReadRow {
   /** Start of the bucket, ms since the epoch (UTC). */
   bucket: number;
-  /** The agent, model or tool for that grouping; "" where it does not apply. */
+  /** The agent, model or tool for that grouping; "" where it does not apply; "total" for by=total. */
   group: string;
   resource: string;
   key: string;
   quantity: number;
   unit: string;
+  /** Credits, once any price exists; absent before. */
+  cost?: number | null;
 }
 
-/** The longest window one read may ask for. */
-export const USAGE_READ_MAX_MS = 400 * DAY_MS;
+/** The windows the page offers (cf/src/usage.ts), and how long each is. */
+export const USAGE_WINDOWS: Record<string, number> = { "24h": DAY_MS, "7d": 7 * DAY_MS, "30d": 30 * DAY_MS };
+
+export interface UsageQuery { window: string; from: number; to: number; bucket: "1h" | "1d"; by: UsageGroupBy }
 
 /** What a read asks for, from the query string; a string says what is wrong. */
-export function parseUsageQuery(q: URLSearchParams, now: number):
-  { from: number; to: number; bucket: "1h" | "1d"; by: UsageGroupBy } | string {
-  const time = (name: string, fallback: number) => {
-    const v = q.get(name);
-    if (v === null || v === "") return fallback;
-    const n = /^\d+$/.test(v) ? Number(v) : Date.parse(v);
-    return Number.isFinite(n) ? n : NaN;
-  };
-  const to = time("to", now);
-  const from = time("from", to - DAY_MS);
-  if (Number.isNaN(from) || Number.isNaN(to)) return "from and to are ms since the epoch or ISO dates";
-  if (from >= to) return "from must be before to";
-  if (to - from > USAGE_READ_MAX_MS) return "the window is at most 400 days";
-  const bucket = q.get("bucket") ?? (to - from > 2 * DAY_MS ? "1d" : "1h");
+export function parseUsageQuery(q: URLSearchParams, now: number): UsageQuery | string {
+  const window = q.get("window") ?? "24h";
+  const span = USAGE_WINDOWS[window];
+  if (!span) return `window is one of ${Object.keys(USAGE_WINDOWS).join(", ")}`;
+  const bucket = q.get("bucket") ?? (window.endsWith("d") ? "1d" : "1h");
   if (bucket !== "1h" && bucket !== "1d") return "bucket is 1h or 1d";
   const by = q.get("by") ?? "total";
   if (by !== "total" && by !== "agent" && by !== "model" && by !== "tool") return "by is total, agent, model or tool";
-  return { from, to, bucket, by };
+  return { window, from: now - span, to: now, bucket, by };
 }
 
-/** The group a row belongs to under `by`; keys are `<model>:<kind>` and `<tool>:<outcome>`. */
+/**
+ * The group a row belongs to under `by`. Keys are `<model>:<kind>` for model
+ * tokens and the tool, run_js or plugin for the rest (cf/src/usage.ts).
+ */
 export function usageGroup(by: UsageGroupBy, row: { agentId: string; resource: string; key: string }): string {
-  const head = row.key.slice(0, Math.max(0, row.key.lastIndexOf(":")));
+  if (by === "total") return "total";
   if (by === "agent") return row.agentId;
-  if (by === "model") return row.resource === "model.tokens" ? head : "";
-  if (by === "tool") return row.resource === "tool.call" ? head : "";
-  return "";
+  if (by === "model") return row.resource === "model.tokens" ? row.key.slice(0, Math.max(0, row.key.lastIndexOf(":"))) : "";
+  return row.resource === "tool.call" || row.resource === "js.run" || row.resource === "sandbox.container" ? row.key : "";
 }
 
-export async function readUsage(
-  db: D1Database, tenantId: string, q: { from: number; to: number; bucket: "1h" | "1d"; by: UsageGroupBy },
-): Promise<UsageReadRow[]> {
+export interface UsagePrice { resource: string; key: string; unit: string; creditsPerUnit: number; effectiveFrom: number }
+
+export async function usagePrices(db: D1Database): Promise<UsagePrice[]> {
+  const { results } = await db.prepare("SELECT resource, key, unit, credits_per_unit, effective_from FROM usage_prices").all();
+  return (results as any[]).map((r) => ({
+    resource: String(r.resource), key: String(r.key), unit: String(r.unit),
+    creditsPerUnit: Number(r.credits_per_unit), effectiveFrom: Number(r.effective_from),
+  }));
+}
+
+/**
+ * The price that applied to a row: the newest one in effect at the start of
+ * its bucket, for its exact key before the resource's `*`. Null: free.
+ * A bucket straddling a price change is priced at its start.
+ */
+export function priceFor(prices: readonly UsagePrice[], row: { bucket: number; resource: string; key: string; unit: string }): number | null {
+  const newest = (key: string) => prices
+    .filter((p) => p.resource === row.resource && p.key === key && p.unit === row.unit && p.effectiveFrom <= row.bucket)
+    .sort((a, b) => b.effectiveFrom - a.effectiveFrom)[0];
+  const p = newest(row.key) ?? newest("*");
+  return p ? p.creditsPerUnit : null;
+}
+
+export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery):
+  Promise<{ rows: UsageReadRow[]; priced: boolean }> {
   const size = q.bucket === "1d" ? DAY_MS : 3_600_000;
   const withAgent = q.by === "agent";
   const { results } = await db.prepare(
     // D1 binds a JS number as REAL, and REAL division would not round down to the bucket.
-    `SELECT (hour / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, ${withAgent ? "agent_id" : "'' AS agent_id"}, resource, key, unit, SUM(quantity) AS quantity
+    `SELECT (hour / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, ${withAgent ? "agent_id" : "'' AS agent_id"},
+       resource, key, unit, SUM(quantity) AS quantity
      FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ?
      GROUP BY bucket, ${withAgent ? "agent_id, " : ""}resource, key, unit
      ORDER BY bucket, resource, key, unit`,
-  ).bind(size, size, tenantId, Math.floor(q.from / 3_600_000) * 3_600_000, q.to).all();
-  return (results as any[]).map((r) => ({
-    bucket: Number(r.bucket),
-    group: usageGroup(q.by, { agentId: String(r.agent_id), resource: String(r.resource), key: String(r.key) }),
-    resource: String(r.resource), key: String(r.key), quantity: Number(r.quantity), unit: String(r.unit),
-  }));
+  ).bind(size, size, tenantId, Math.floor(q.from / size) * size, q.to).all();
+  const prices = await usagePrices(db);
+  const priced = prices.length > 0;
+  const rows = (results as any[]).map((r) => {
+    const row: UsageReadRow = {
+      bucket: Number(r.bucket),
+      group: usageGroup(q.by, { agentId: String(r.agent_id), resource: String(r.resource), key: String(r.key) }),
+      resource: String(r.resource), key: String(r.key), quantity: Number(r.quantity), unit: String(r.unit),
+    };
+    if (priced) {
+      const p = priceFor(prices, row);
+      row.cost = p === null ? null : p * row.quantity;
+    }
+    return row;
+  });
+  return { rows, priced };
 }
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS usage_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";
