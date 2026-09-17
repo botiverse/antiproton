@@ -1,4 +1,6 @@
 import { raftPlugin } from "../src/plugins/raft.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
+import { SqliteStore } from "../src/store/sqlite.ts";
 
 const originalFetch = globalThis.fetch;
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -126,6 +128,49 @@ await check("receive HTTP and non-JSON failures preserve acknowledgement uncerta
       throw new Error(`uncertainty was lost: ${why.message}`);
     }
     if (/private upstream detail|private proxy page/.test(why.message)) throw new Error(`body leaked: ${why.message}`);
+  }
+});
+
+await check("the gateway persists every post-dispatch receive failure as unknown", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({
+    tenantId: "tenant", agentId: "agent", alias: "raft", plugin: "raft",
+    installationId: "raft-test", connectionId: null, toolVersion: raftPlugin.version,
+    publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null,
+  });
+  const gateway = new ToolGateway(
+    store,
+    [{ ...raftPlugin, defaultForAllAgents: true }],
+    { async resolve() { return "sk_agent_test_1234567890"; } },
+  );
+  const invoke = () => gateway.invoke(
+    { tenantId: "tenant", agentId: "agent", taskId: "task" },
+    "raft.receive_events",
+    {},
+  );
+  const cases: Array<[string, () => void]> = [
+    ["transport", () => {
+      globalThis.fetch = (async () => { throw new Error("private socket detail"); }) as any;
+    }],
+    ["HTTP JSON", () => { one(json(500, { message: "private upstream detail" })); }],
+    ["HTTP non-JSON", () => {
+      one(new Response("private proxy page", { status: 200, headers: { "content-type": "text/html" } }));
+    }],
+    ["invalid success", () => { one(json(200, { events: "wrong", secret: "body-secret" })); }],
+  ];
+  for (const [name, arrange] of cases) {
+    arrange();
+    const out = await invoke();
+    if (out.status !== "unknown") throw new Error(`${name} persisted as ${out.status}: ${JSON.stringify(out)}`);
+    const message = out.error?.message ?? "";
+    if (!/acknowledgement may already have occurred/.test(message) || !/no retry was attempted/.test(message)) {
+      throw new Error(`${name} lost the uncertainty/no-retry contract: ${message}`);
+    }
+    if (/private socket detail|private upstream detail|private proxy page|body-secret/.test(message)) {
+      throw new Error(`${name} leaked a response or transport detail: ${message}`);
+    }
   }
 });
 

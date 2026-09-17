@@ -57,6 +57,16 @@ function retryable(error: Error, value = true): Error {
   return error;
 }
 
+const DELIVERY_UNCERTAIN =
+  "delivery acknowledgement may already have occurred; no retry was attempted";
+
+function receiveFailure(message: string): Error {
+  // `ToolGateway` uses this marker to persist an attempted write as `unknown`.
+  // It does not mean callers may retry: receive_events drains/acks a batch, so
+  // the message explicitly says the opposite.
+  return retryable(new Error(`${message}; ${DELIVERY_UNCERTAIN}`));
+}
+
 async function call(
   ctx: PluginContext,
   method: "GET" | "POST",
@@ -86,34 +96,30 @@ async function call(
     };
     response = await fetch(url, init);
   } catch {
-    throw retryable(new Error(options.deliveryMayHaveOccurred
-      ? "raft event receive failed before a response was received; delivery acknowledgement may already have occurred; no retry was attempted"
-      : "raft request failed before a response was received; the operation may already have landed"));
+    throw options.deliveryMayHaveOccurred
+      ? receiveFailure("raft event receive failed before a response was received")
+      : retryable(new Error("raft request failed before a response was received; the operation may already have landed"));
   }
   let data: unknown = null;
   try { data = await response.json(); }
   catch {
     if (!response.ok) {
-      throw retryable(new Error(
-        `raft returned HTTP ${response.status}` + (options.deliveryMayHaveOccurred
-          ? "; delivery acknowledgement may already have occurred; no retry was attempted"
-          : ""),
-      ), response.status === 429 || response.status >= 500);
+      const message = `raft returned HTTP ${response.status}`;
+      throw options.deliveryMayHaveOccurred
+        ? receiveFailure(message)
+        : retryable(new Error(message), response.status === 429 || response.status >= 500);
     }
-    throw new Error("raft returned a response that was not JSON" + (options.deliveryMayHaveOccurred
-      ? "; delivery acknowledgement may already have occurred; no retry was attempted"
-      : ""));
+    throw options.deliveryMayHaveOccurred
+      ? receiveFailure("raft returned a response that was not JSON")
+      : new Error("raft returned a response that was not JSON");
   }
   if (!response.ok) {
     const parsed = object(data);
     const code = text(parsed.errorCode) ?? text(parsed.code);
-    throw retryable(
-      new Error(`raft returned HTTP ${response.status}${code ? ` (${code})` : ""}` +
-        (options.deliveryMayHaveOccurred
-          ? "; delivery acknowledgement may already have occurred; no retry was attempted"
-          : "")),
-      response.status === 429 || response.status >= 500,
-    );
+    const message = `raft returned HTTP ${response.status}${code ? ` (${code})` : ""}`;
+    throw options.deliveryMayHaveOccurred
+      ? receiveFailure(message)
+      : retryable(new Error(message), response.status === 429 || response.status >= 500);
   }
   return { status: response.status, data: object(data) };
 }
@@ -274,7 +280,7 @@ export const raftPlugin: Plugin = {
         { cache: "no-store", deliveryMayHaveOccurred: true },
       );
       if (!Array.isArray(data.events) || typeof data.has_more !== "boolean") {
-        throw new Error("raft events response did not match the expected contract; delivery acknowledgement may already have occurred");
+        throw receiveFailure("raft events response did not match the expected contract");
       }
       return {
         events: data.events.map(event),
