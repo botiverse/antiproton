@@ -44,10 +44,10 @@ import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
 import {
-  ensureInboundTable, hookSecretName, inboundMessage, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
+  ensureInboundTable, hookSecretName, inboundMessage, newHookId, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
   INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
 } from "../../src/runtime/inbound.ts";
-import type { InboundEvent } from "../../src/plugins/types.ts";
+import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
 
 /** The persona fields of an agent record, if it carries any. */
@@ -58,6 +58,7 @@ export function personaOf(config: unknown): { name?: string; description?: strin
   return name || description ? { name, description } : null;
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
+import type { HookDirectory } from "./control-plane.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
@@ -358,6 +359,11 @@ export interface RuntimeDeps {
   offloadModel?: (job: ModelJob) => Promise<void>;
   /** Domain plugins beyond the built-ins (the benchmark mounts `retail` here). */
   extraPlugins?: Plugin[];
+  /**
+   * Where hook URLs point and the index that resolves them. Absent: plugins
+   * are offered no `inbound` and cannot make hooks themselves.
+   */
+  hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke"> };
   maxTurns?: number;
   /**
    * What the bound model can hold, in tokens.
@@ -596,7 +602,8 @@ export class AgentRuntime {
     this.#secrets = {
       resolve: async (ref, scope) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope),
     };
-    this.#gateway = new ToolGateway(this.store, plugins, this.#secrets);
+    this.#gateway = new ToolGateway(this.store, plugins, this.#secrets,
+      deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined);
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
@@ -630,6 +637,31 @@ export class AgentRuntime {
     const sealed = await seal(kek, secret);
     await this.store.putSecret(tenantId, agentId, hookSecretName(hookId), { ciphertext: sealed.ciphertext, iv: sealed.iv });
     return { ok: true, secret };
+  }
+
+  /**
+   * One mount's hooks, for its plugin (`PluginContext.inbound`). The secret
+   * first, then the index, as the operator's route does: a URL that resolves
+   * always has a secret. Revoke is the reverse, and only for this mount.
+   */
+  #inboundFor(tenantId: string, agentId: string, alias: string): InboundHooks {
+    const hooks = this.#deps.hooks!;
+    return {
+      create: async () => {
+        const hookId = newHookId();
+        const made = await this.createHookSecret(tenantId, agentId, alias, hookId);
+        if (!made.ok) throw new Error(made.error);
+        await hooks.directory.create({ hookId, tenantId, agentId, alias });
+        return { hookId, url: `${hooks.origin}/hooks/${hookId}`, secret: made.secret };
+      },
+      revoke: async (hookId) => {
+        const row = await hooks.directory.lookup(hookId);
+        if (!row || row.tenantId !== tenantId || row.agentId !== agentId || row.alias !== alias) return false;
+        if (!(await hooks.directory.revoke(hookId))) return false;
+        await this.dropHookSecret(tenantId, agentId, hookId);
+        return true;
+      },
+    };
   }
 
   /** Forget a hook's secret. Whether there was one. */

@@ -3,7 +3,7 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundResult } from "../plugins/types.ts";
+import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 
@@ -112,11 +112,17 @@ export class ToolGateway {
    */
   #queues = new Map<string, Promise<unknown>>();
 
-  constructor(store: StorageAdapter, plugins: Plugin[], secrets: SecretResolver = envSecrets) {
+  constructor(
+    store: StorageAdapter, plugins: Plugin[], secrets: SecretResolver = envSecrets,
+    inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks,
+  ) {
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
+    this.#inbound = inbound;
   }
+
+  #inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks;
 
   /** alias.tool  →  exact mount.  plugin.tool  →  only if unambiguous. */
   async resolve(ctx: CallContext, raw: string): Promise<Resolution> {
@@ -607,6 +613,9 @@ export class ToolGateway {
       // Scoped to the mount, not the plugin: two accounts of the same service
       // must never see each other's session.
       connection: connectionFor(mount.alias),
+      // A mount's own hooks, and only for a plugin that can take what they carry.
+      ...(this.#inbound && this.#plugins.get(mount.plugin)?.receive
+        ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
       async sibling(alias: string) {
         // Only this agent's own mounts: never a lookup by tenant or by plugin.
         const other = await store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);

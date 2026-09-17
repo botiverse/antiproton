@@ -35,6 +35,11 @@ export interface PluginContext {
   /** Survives across calls and across executions; never reaches the model. */
   connection: ConnectionState;
   /**
+   * This mount's inbound hooks. Present only for a plugin that implements
+   * `receive`, on a deployment that can take pushed events.
+   */
+  inbound?: InboundHooks;
+  /**
    * Another mount of the same agent, by alias.
    *
    * Some actions genuinely need two connected accounts — "file this receipt
@@ -59,6 +64,24 @@ export interface PluginContext {
      */
     policy: MountPolicy | null;
   } | null>;
+}
+
+/**
+ * A mount's own inbound hooks: public URLs a service pushes events to (see
+ * `Plugin.receive`). Offered only to a plugin that can receive, and only for
+ * the mount being called, so a plugin can register its hook with the service
+ * itself using the mount's own account, the way a GitHub webhook is set up
+ * (Raft push: tygg and XX, 2026-09-17).
+ */
+export interface InboundHooks {
+  /**
+   * A new hook for this mount. The secret is generated here, sealed in the
+   * agent's store, and returned this once: the plugin hands it to the service
+   * and keeps no copy. Refused while the mount cannot take events.
+   */
+  create(): Promise<{ hookId: string; url: string; secret: string }>;
+  /** Revoke one of this mount's hooks, secret included. Whether it was live; another mount's hook is never touched. */
+  revoke(hookId: string): Promise<boolean>;
 }
 
 /**
