@@ -6,6 +6,7 @@ import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
+import { toolCallRows } from "../usage/outbox.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
@@ -564,6 +565,16 @@ export class ToolGateway {
     const credential = r.mount.secretRef
       ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
       : null;
+    const started = Date.now();
+    // Counting is never the call's problem: a failure here must not turn a
+    // call that succeeded into one reported as failed.
+    const counted = async (outcome: "ok" | "failed") => {
+      try {
+        await this.#store.recordUsage?.(toolCallRows(
+          { at: started, tenantId: ctx.tenantId, agentId: ctx.agentId }, `${r.mount.plugin}.${r.tool}`, outcome, Date.now() - started,
+        ));
+      } catch { /* the count is lost, the call is not */ }
+    };
     try {
       const result = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
       // Checked on the value the plugin returned, before anything serialises
@@ -572,6 +583,8 @@ export class ToolGateway {
       // runtime records the job and the operation stays running until it ends.
       if (result instanceof Backgrounded) {
         await this.#store.completeOperation(ctx.tenantId, operationId, "running", null);
+        // Counted as started; the time it runs in the background is the sandbox's to count.
+        await counted("ok");
         return {
           status: "running", operationId,
           background: {
@@ -581,12 +594,14 @@ export class ToolGateway {
         };
       }
       await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null);
+      await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
       const e = err as Error & { retryable?: boolean };
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
+      await counted("failed");
       return { status, operationId, error: { code: "tool_error", message: e.message } };
     }
   }

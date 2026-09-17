@@ -98,6 +98,51 @@ check("without prices the page says free; with prices it adds credits up", () =>
   must(/<th class="num">credits<\/th>/.test(paid), "the table gains a credits column");
 });
 
+check("an amount with no price reads 'not priced yet', never 0 credits", () => {
+  // What the page looks like the day the first price is set: model tokens are
+  // priced, tool calls are not. A `cost` of null is the ledger saying no price
+  // exists for that row — summing it as 0 would make it read as free.
+  const unpriced = (r: UsageRow): UsageRow => ({ ...r, cost: null });
+  const html = usagePanel(data([
+    row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 1.5),
+    unpriced(row("a1", "tool.call", "gh.x", "calls", 2)),
+  ], { priced: true }));
+  must(/<span class="u-big">1\.50<\/span> credits in this window/.test(html), "the headline counts only what has a price");
+  must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "and names what it leaves out, by resource, not by row count");
+  must(/tool calls<\/h3>[\s\S]*?<span class="u-cost">not priced yet<\/span>/.test(html), "the unpriced tile says so instead of 0 credits");
+  must(!/tool calls<\/h3>[\s\S]*?<span class="u-cost">0 credits/.test(html), "the unpriced tile never claims a zero cost it cannot know");
+  must(/1\.50<span class="faint" title="some amounts here are not priced yet"> \+<\/span>/.test(html), "the table marks a group whose sum leaves something out");
+});
+
+check("a resource priced in part says so, and the sum stays the priced part", () => {
+  const html = usagePanel(data([
+    row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 2),
+    { ...row("a1", "model.tokens", "n:input", "tokens", 500), cost: null },
+  ], { priced: true }));
+  must(/<span class="u-cost">2\.00 credits, some not priced yet<\/span>/.test(html), "the tile names the part it could not price");
+  must(/<span class="u-big">2\.00<\/span> credits in this window\. Not priced yet, so not in this number: some model tokens/.test(html), "the headline agrees with the tile, and says only part of that resource is priced");
+});
+
+check("many unpriced rows of one resource are named once, not counted", () => {
+  // The route hands one row per bucket per group, so an unpriced resource
+  // arrives as dozens of rows. The headline has to name the resource, or it
+  // reports a number that means nothing to a person.
+  const rows: UsageRow[] = [row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 1.5)];
+  for (let h = 1; h <= 20; h++) for (const g of ["a1", "a2"]) rows.push({ ...row(g, "tool.call", "gh.x", "calls", 2, h), cost: null });
+  const html = usagePanel(data(rows, { priced: true }));
+  must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "the resource is named once");
+  must(!/\d+ amounts? (is|are) not priced/.test(html), "no row count leaks into the sentence");
+});
+
+check("every amount priced: no hedge anywhere", () => {
+  const html = usagePanel(data([
+    row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 1.5),
+    row("a1", "tool.call", "gh.x", "calls", 2, 1, 0.25),
+  ], { priced: true }));
+  must(!/not priced/.test(html), "nothing says 'not priced' when everything is");
+  must(!/some not priced yet/.test(html) && !/not in this number/.test(html), "and the headline carries no caveat");
+});
+
 check("failed runs and calls show in the tile's small print, only when there are any", () => {
   const html = usagePanel(data([row("a1", "js.run", "run_js", "runs", 4), row("a1", "js.run", "run_js", "failed", 1), row("a1", "tool.call", "gh.x", "calls", 3)]));
   must(/1 failed · avg/.test(html), "a failed run is counted");

@@ -282,6 +282,8 @@ export function runJsTool(
   opts: {
     limits?: unknown;
     onCalls?: (n: number) => void | Promise<void>;
+    /** Every run, however it ended: for the usage count. A failure here does not fail the run. */
+    onRun?: (run: { ok: boolean; ms: number; hostCalls: number }) => void | Promise<void>;
     /** The tools the model was offered, so a script may name them the way the
      *  model's own tool list names them. Without this the prompt asks for two
      *  different strings for one tool: `web__get` outside the sandbox, and the
@@ -337,7 +339,14 @@ export function runJsTool(
     replay: "never",
     async execute(toolCallId: string, params: { source: string }) {
       let n = 0;
-      const r = await sandbox.execute(String(params.source), {
+      const started = Date.now();
+      // Counting is never the run's problem: a failure here is dropped.
+      const countRun = async (run: { ok: boolean; ms: number; hostCalls: number }) => {
+        try { await opts.onRun?.(run); } catch { /* the count is lost, the run is not */ }
+      };
+      let r: Awaited<ReturnType<Sandbox["execute"]>>;
+      try {
+        r = await sandbox.execute(String(params.source), {
         // A stable key per call inside one execution, so a repeat reaches the
         // same operation rather than minting a new one.
         invoke: (call: any) => {
@@ -400,6 +409,11 @@ export function runJsTool(
           });
         },
       }, opts.limits);
+      } catch (e) {
+        await countRun({ ok: false, ms: Date.now() - started, hostCalls: n });
+        throw e;
+      }
+      await countRun({ ok: r.status === "completed", ms: Date.now() - started, hostCalls: r.hostCalls ?? 0 });
       await opts.onCalls?.(r.hostCalls ?? 0);
       // "completed" is the whole of success here. Both executors return it
       // (executor.ts, dynamic-worker-executor.ts); "failed" and "interrupted"

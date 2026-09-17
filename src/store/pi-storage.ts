@@ -43,6 +43,7 @@ import {
   type Write,
 } from "@earendil-works/pi-agent-core/harness/session";
 import type { Context } from "@earendil-works/pi-agent-core/harness/context";
+import { appendUsage, modelTokenRows } from "../usage/outbox.ts";
 
 type Usage = SessionStats["usage"];
 
@@ -160,8 +161,12 @@ export class PiSqliteStorage implements Storage {
 
   #t: PiTables;
 
-  constructor(host: SqlHost, opts: { now?: () => number; session?: string } = {}) {
+  /** Whose usage this transcript's model replies are; absent: not counted (benchmarks, conformance). */
+  #usageOwner: { tenantId: string; agentId: string } | null;
+
+  constructor(host: SqlHost, opts: { now?: () => number; session?: string; usageOwner?: { tenantId: string; agentId: string } } = {}) {
     this.#host = host;
+    this.#usageOwner = opts.usageOwner ?? null;
     this.#now = opts.now ?? (() => Date.now());
     this.#t = piTables(opts.session ?? MAIN_SESSION);
     ensurePiTables(host.sql, opts.session ?? MAIN_SESSION);
@@ -246,6 +251,13 @@ export class PiSqliteStorage implements Storage {
           this.#host.sql.exec(`INSERT INTO ${this.#t.usage}(id, seq, body) VALUES (?,?,?)`,
             row.id, row.seq, JSON.stringify(row));
           usage = addUsage(usage, row.usage);
+          // Into the usage outbox in the same transaction, so a counted reply
+          // and its outbox row land together or not at all.
+          if (this.#usageOwner) {
+            appendUsage(this.#host.sql, modelTokenRows(
+              { at: this.#now(), ...this.#usageOwner }, this.#modelOf(row.entryId, writes), row.usage as any,
+            ));
+          }
           break;
         }
         case "value": {
@@ -280,6 +292,18 @@ export class PiSqliteStorage implements Storage {
       this.#setMeta("usage", usage);
     }
     return { messageCount, usage };
+  }
+
+  /** Which model a usage row was for: the assistant entry it names, from this commit or one before. */
+  #modelOf(entryId: string | undefined, writes: readonly CommittedWrite[]): string {
+    if (!entryId) return "unknown";
+    const inCommit: any = writes.find((w: any) => w.kind === "entry" && w.id === entryId);
+    const entry: any = inCommit ?? (() => {
+      const r = this.#one(`SELECT body FROM ${this.#t.entries} WHERE id = ?`, entryId);
+      return r ? JSON.parse(r.body) : null;
+    })();
+    const model = entry?.message?.model;
+    return typeof model === "string" && model ? model : "unknown";
   }
 
   getEntries(ids: string[], _context: Context): Promise<Map<string, Entry>> {

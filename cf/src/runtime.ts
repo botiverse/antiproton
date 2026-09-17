@@ -60,6 +60,7 @@ export function personaOf(config: unknown): { name?: string; description?: strin
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { HookDirectory } from "./control-plane.ts";
+import { jsRunRows } from "../../src/usage/outbox.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
@@ -1307,6 +1308,9 @@ export class AgentRuntime {
       ...(extras.runJs
         ? [runJsTool(this.#executor as any, host, {
             onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+            onRun: (run) => store.recordUsage?.(jsRunRows(
+              { at: Date.now() - run.ms, tenantId, agentId }, run.ok ? "ok" : "failed", run.ms, run.hostCalls,
+            )),
             // So a script names a tool the way the model's own list names it.
             tools: offered,
             // So a stale name for a mount that cannot be offered is answered with
@@ -1325,6 +1329,7 @@ export class AgentRuntime {
         [TURN_CANCELLED]: (entry) => [{ role: "user", content: [{ type: "text", text: CANCELLED_NOTE }], timestamp: entry.timestamp }],
       },
       host: this.#deps.ctx.storage,
+      usageOwner: { tenantId, agentId },
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       session,
       // Read here rather than inside the harness, so the harness keeps holding
