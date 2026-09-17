@@ -51,6 +51,7 @@
     "test/console-plugins.ts",
     "test/console-poll.ts",
     "test/console-storage.ts",
+    "test/console-usage.ts",
     "test/console-version.ts",
     "test/markdown.ts",
     "test/mount-config.ts",

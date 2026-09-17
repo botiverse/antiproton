@@ -17,6 +17,7 @@ import { ICONS } from "./icons.ts";
 import { md } from "./md.ts";
 import { asMountReports, type MountReports } from "./mount-reports.ts";
 import { FONT_CSS, HEAD_ASSETS } from "./static.ts";
+import { USAGE_CSS } from "./usage.ts";
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -84,8 +85,11 @@ font:14px/1.55 var(--mono-font)}
    has all four, while plugins and runtime leave the inspector and sidebar out. */
 body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
-body.shell[data-view=keys]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=keys],body.shell[data-view=usage]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
+/* A zero-width column still paints its padding and border: without this the
+   inspector showed as a sliver of text beside every view but agents. */
+body.shell[data-view]:not([data-view=agents]) .inspector{display:none}
 @media(max-width:1100px){body.shell[data-view=agents]{grid-template-columns:56px 0 minmax(0,1fr) 0}}
 
 .rail{grid-area:rail;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 0;
@@ -498,11 +502,12 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
 <link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
 <script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
 ${HEAD_ASSETS}
-<style>${FONT_CSS}${RUI_TOKENS}${CSS}</style></head><body class="shell" data-view="agents" data-agent="${esc(agentId)}">
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}${USAGE_CSS}</style></head><body class="shell" data-view="agents" data-agent="${esc(agentId)}">
 <nav class="rail" aria-label="sections">
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
+  ${rail("usage", "usage")}
   ${rail("keys", "api keys")}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
@@ -573,6 +578,13 @@ ${HEAD_ASSETS}
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
     <div class="body plugins-root" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
          hx-trigger="ap:show, every 3s[${awake} && ${inView} && !ap.editing('#plugins')]">loading…</div>
+  </section>
+  <section class="view" data-view="usage">
+    <div class="view-head"><h2>Usage</h2><span class="sub">what every agent in this account used, and what it would cost</span></div>
+    <!-- Tenant-wide: the route reads the account's ledger, never an agent, so showing this view wakes nobody.
+         Read when shown and not polled: the ledger moves once per finished turn, and showing the view again
+         or returning to the tab (both send ap:show) reads it fresh. -->
+    <div class="body" id="usage" data-lazy hx-get="/ui/usage" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
   </section>
   <section class="view" data-view="keys">
     <div class="view-head"><h2>API keys</h2><span class="sub">for the OpenAI Agents SDK; the agents a key makes are yours</span></div>
@@ -711,6 +723,17 @@ ${HEAD_ASSETS}
       document.getElementById('plugins-title').textContent = alias || 'Installed';
       ap.markMount();
     },
+    // The usage controls: the choice lives in the URL (a link to this view
+    // reopens the same window and split) and in the panel's hx-get, so a
+    // re-read when the tab comes back keeps it. A long window reads by day.
+    usage(form, changed) {
+      if (changed && changed.name === 'window') form.bucket.value = /d$/.test(form.window.value) ? '1d' : '1h';
+      const q = new URLSearchParams(new FormData(form));
+      const u = new URL(location.href); q.forEach((v, k) => u.searchParams.set(k, v)); history.replaceState(null, '', u);
+      const panel = document.getElementById('usage');
+      panel.setAttribute('hx-get', '/ui/usage?' + q); delete panel.dataset.ver;
+      htmx.process(panel); htmx.trigger(panel, 'ap:show');
+    },
     markMount() {
       const a = new URL(location.href).searchParams.get('alias') || '';
       document.querySelectorAll('#mounts .mount-link').forEach(el => el.classList.toggle('on', el.dataset.alias === a));
@@ -755,10 +778,17 @@ ${HEAD_ASSETS}
     const url = new URL(location.href), v = url.searchParams.get('view');
     if (url.searchParams.has('alias')) {
       const panel = document.getElementById('plugins'), a = url.searchParams.get('alias');
-      panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver;
+      // htmx read the old URL when it processed the page, before this ran: re-process, or a link to one mount opens the whole page.
+      panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver; htmx.process(panel);
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
-    ap.show(['agents', 'plugins', 'keys'].includes(v) ? v : 'agents');
+    if (v === 'usage') {
+      const q = new URLSearchParams();
+      ['window', 'bucket', 'by'].forEach(k => url.searchParams.has(k) && q.set(k, url.searchParams.get(k)));
+      const panel = document.getElementById('usage');
+      if ([...q].length) { panel.setAttribute('hx-get', '/ui/usage?' + q); delete panel.dataset.ver; htmx.process(panel); }
+    }
+    ap.show(['agents', 'plugins', 'usage', 'keys'].includes(v) ? v : 'agents');
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
