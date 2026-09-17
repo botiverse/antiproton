@@ -59,6 +59,36 @@ export function personaOf(config: unknown): { name?: string; description?: strin
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 
+/** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
+export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
+
+/**
+ * What the console's reconcile does with one seed whose alias exists (the
+ * third write path). Provision validates a seed as it adds it; attaching a
+ * credential re-validates with the ref about to be set (#140); this is the
+ * config changing under a credential that is already there, so the check runs
+ * with the ref that stayed. A seed that would leave the mount in a state the
+ * runtime forbids (a credential and no host allowlist) is not applied, and the
+ * refusal is reported: otherwise "refused" and "nothing to do" would look the
+ * same. A seed's settings belong to its plugin, so another plugin under the
+ * alias (added or renamed while the seed was switched off) is refused too:
+ * one plugin's settings on another would silently drop what it needs.
+ */
+export function reconcileSeed(
+  have: Pick<MountRecord, "plugin" | "publicConfig" | "secretRef">,
+  seed: SeedMount,
+  plugin: Plugin | undefined,
+): { update: Record<string, Json> | null } | { refused: string } {
+  if (have.plugin !== seed.plugin) {
+    return { refused: `${seed.alias} is a ${have.plugin} mount, not the ${seed.plugin} seed; left as it is` };
+  }
+  const config = (seed.config ?? { account: seed.account }) as Record<string, Json>;
+  if (JSON.stringify(have.publicConfig) === JSON.stringify(config)) return { update: null };
+  const problems = plugin ? validateMount(plugin, config, have.secretRef) : [];
+  if (problems.length) return { refused: problems.map((x) => x.message).join("; ") };
+  return { update: config };
+}
+
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {
   alias: string; plugin: string;
@@ -1053,6 +1083,54 @@ export class AgentRuntime {
       });
     }
     return { agentId, created };
+  }
+
+  /**
+   * One mount the defaults do not give, added by an operator (`/admin/mounts`).
+   * Where `provision` skips quietly (plugin switched off, alias present), this
+   * answers. An alias that is already there is left alone: the same plugin and
+   * settings is a repeat, anything else is refused rather than overwritten,
+   * because a mount carries a credential and connection state that a replace
+   * would orphan. It is always added without a credential.
+   */
+  async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }):
+    Promise<{ ok: true; added: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    if (!MOUNT_ALIAS.test(seed.alias)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
+    const plugin = this.#plugins.find((p) => p.id === seed.plugin);
+    if (!plugin) return { ok: false, error: `no plugin named ${seed.plugin}` };
+    // A default alias stays its seed's, even while that plugin is switched
+    // off and the alias is free: the seed would come back to find it taken.
+    const seeded = AgentRuntime.DEFAULT_MOUNTS.find((d) => d.alias === seed.alias);
+    if (seeded && seeded.plugin !== plugin.id) {
+      return { ok: false, error: `${seed.alias} is the default ${seeded.plugin} mount's alias` };
+    }
+    const have = await this.store.getMountByAlias(tenantId, agentId, seed.alias);
+    if (have) {
+      if (have.plugin === seed.plugin && JSON.stringify(have.publicConfig) === JSON.stringify(seed.config)) {
+        return { ok: true, added: false };
+      }
+      return { ok: false, error: `${seed.alias} is already a different mount` };
+    }
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    if (!pluginEnabled(plugin, choices[plugin.id])) {
+      return { ok: false, error: `${plugin.id} is switched off for this agent; switch it on first` };
+    }
+    // Judged as a mount with no account yet, minus the one rule that says it
+    // must have one: the credential form needs the mount to exist, so a plugin
+    // whose account is required (raft) could not be mounted otherwise. Until
+    // the account is attached its calls fail on the missing credential, and
+    // attaching re-judges the settings with the account in place.
+    const accountLater = plugin.credential ? { ...plugin, credential: { ...plugin.credential, required: false } } : plugin;
+    const problems = validateMount(accountLater, seed.config, null);
+    if (problems.length) return { ok: false, error: `cannot mount ${plugin.id}: ${problems.map((p) => p.message).join("; ")}` };
+    await this.store.addMount({
+      tenantId, agentId, alias: seed.alias, plugin: plugin.id,
+      installationId: `inst-${seed.alias}`, connectionId: null,
+      toolVersion: this.pluginVersion(plugin.id) ?? "1.0.0",
+      publicConfig: seed.config, secretRef: null, policy: null,
+    });
+    return { ok: true, added: true };
   }
 
   /**
