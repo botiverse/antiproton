@@ -3012,9 +3012,7 @@ export default {
             ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
           return html(r.ok ? panel : `<div class="err">${reason}</div>${panel}`);
         }
-        case "/ui/storage":
         case "/ui/memory":
-        case "/ui/sandbox":
         case "/ui/runtime": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
@@ -3023,13 +3021,10 @@ export default {
           const v = await versionOf(request, stub, gate.tenantId, agentId, taskId);
           if (v.unchanged) return v.unchanged;
           const d = await stub.uiStorage(gate.tenantId, agentId, taskId);
-          return html(url.pathname === "/ui/storage" ? storage(d)
+          return html(url.pathname === "/ui/memory" ? memoryPanel(d)
             // The inspector's runtime tab asks with stack=1: the three cost
             // panels stacked into one fragment, object first, then the
-            // container, then everything the object is holding. The rail's
-            // runtime screen still polls each panel alone.
-            : url.pathname === "/ui/memory" ? memoryPanel(d)
-            : url.pathname === "/ui/sandbox" ? sandboxPanel(d)
+            // container, then everything the object is holding.
             : url.searchParams.get("stack") === "1"
               ? `<h3>the object</h3>${runtimePanel(d)}<h3>containers</h3>${sandboxPanel(d)}<h3>storage</h3>${storage(d)}`
             : runtimePanel(d), v.etag);

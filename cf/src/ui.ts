@@ -84,7 +84,7 @@ font:14px/1.55 var(--mono-font)}
    has all four, while plugins and runtime leave the inspector and sidebar out. */
 body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
-body.shell[data-view=runtime],body.shell[data-view=keys]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=keys]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 @media(max-width:1100px){body.shell[data-view=agents]{grid-template-columns:56px 0 minmax(0,1fr) 0}}
 
@@ -444,7 +444,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
  * held call above the composer — approve or refuse it right there; beside
  * it the inspector opens what is hard to see from outside — the events,
  * the plugins, what the agent believes, where the time went — one tab at a
- * time. Plugins and runtime are their own sections.
+ * time. Plugins is its own section.
  * Every panel is still a plain GET that renders the store directly; the
  * shell keeps only which section is showing and which mode the viewer chose.
  */
@@ -487,9 +487,6 @@ export function page(_taskId: string, who: string, agentId: string, viewer?: Vie
   // on the page starts with `awake`, and the visibilitychange listener at
   // the bottom catches the panels up the moment the tab is shown again.
   const awake = "!document.hidden";
-  const lazy = (id: string, path: string, every: string, cond: string) =>
-    `<div class="body" id="${id}" data-lazy hx-get="${path}" hx-swap="innerHTML"
-          hx-trigger="ap:show, every ${every}[${awake} && ${cond}]">loading…</div>`;
   const inView = "this.closest('.view').classList.contains('on')";
   const inspTab = (name: string) => `<button type="button" role="tab" data-insp="${name}" onclick="ap.insp('${name}')">${name}</button>`;
   const a = encodeURIComponent(agentId);
@@ -506,7 +503,6 @@ ${HEAD_ASSETS}
   <a class="rail-brand" href="/ui" title="antiproton">${MARK_OUTLINED_SVG}</a>
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
-  ${rail("runtime", "runtime")}
   ${rail("keys", "api keys")}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
@@ -577,15 +573,6 @@ ${HEAD_ASSETS}
     <div class="view-head"><h2 id="plugins-title">Plugins</h2><span class="sub">what is mounted, what it may do, and what it acts as</span></div>
     <div class="body plugins-root" id="plugins" data-lazy hx-get="/ui/plugins" hx-swap="innerHTML"
          hx-trigger="ap:show, every 3s[${awake} && ${inView} && !ap.editing('#plugins')]">loading…</div>
-  </section>
-  <section class="view" data-view="runtime">
-    <div class="view-head"><h2>Runtime</h2><span class="sub">what the object is billed for, and what it is holding</span></div>
-    <h3>the object</h3>
-    ${lazy("runtime", "/ui/runtime", "3s", inView)}
-    <h3>containers</h3>
-    ${lazy("sandbox", "/ui/sandbox", "3s", inView)}
-    <h3>storage</h3>
-    ${lazy("storage", "/ui/storage", "3s", inView)}
   </section>
   <section class="view" data-view="keys">
     <div class="view-head"><h2>API keys</h2><span class="sub">for the OpenAI Agents SDK; the agents a key makes are yours</span></div>
@@ -771,7 +758,7 @@ ${HEAD_ASSETS}
       panel.setAttribute('hx-get', a ? '/ui/plugins?part=mount&alias=' + encodeURIComponent(a) : '/ui/plugins?part=catalogue'); delete panel.dataset.ver;
       document.getElementById('plugins-title').textContent = a || 'Installed';
     }
-    ap.show(['agents', 'plugins', 'runtime', 'keys'].includes(v) ? v : 'agents');
+    ap.show(['agents', 'plugins', 'keys'].includes(v) ? v : 'agents');
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
