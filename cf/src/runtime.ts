@@ -57,7 +57,7 @@ export function personaOf(config: unknown): { name?: string; description?: strin
   const description = typeof c.description === "string" ? c.description : undefined;
   return name || description ? { name, description } : null;
 }
-import type { MountPolicy } from "../../src/core/types.ts";
+import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {
@@ -441,6 +441,34 @@ export function unofferedMounts<T extends { plugin: string }>(
 }
 
 /**
+ * What an agent's harness was built from: its mounts as the catalogue reads
+ * them, and its plugin switches. A cached harness whose key no longer matches
+ * offers a tool list that is not true any more — switching a plugin back on
+ * did not reach a conversation opened while it was off, and its run_js still
+ * answered plugin_disabled (found on preview, 2026-09-17). The credential
+ * itself never enters the key, only whether there is one.
+ */
+export function catalogueKey(
+  mounts: Array<Pick<MountRecord, "alias" | "plugin" | "toolVersion" | "publicConfig" | "secretRef" | "policy">>,
+  choices: Record<string, PluginChoice>,
+): string {
+  const m = [...mounts].sort((a, b) => a.alias.localeCompare(b.alias)).map((x) =>
+    [x.alias, x.plugin, x.toolVersion, x.publicConfig, !!x.secretRef, x.policy ?? null]);
+  const c = Object.keys(choices).sort().map((k) => [k, choices[k]]);
+  return JSON.stringify([m, c]);
+}
+
+/**
+ * Whether a cached harness may be handed out again. A changed catalogue
+ * rebuilds it, but never under a turn that is running: that turn keeps the
+ * tools it started with, and the next call after it ends gets the new list.
+ * Rebuilding an idle one is what an eviction does anyway.
+ */
+export function reuseHarness(builtFrom: string, now: string, running: boolean): boolean {
+  return builtFrom === now || running;
+}
+
+/**
  * One of the three words, or nothing.
  *
  * The console posts a form, so what arrives is a string of the user's shape
@@ -500,7 +528,7 @@ export class AgentRuntime {
   // agent's object, with its own transcript and the agent's shared mounts,
   // credentials and memory. Keyed so a second conversation never reads the
   // first one's transcript, and cached so a wake does not rebuild them all.
-  #agents = new Map<string, PiAgent>();
+  #agents = new Map<string, { agent: PiAgent; builtFrom: string }>();
   #executor: DynamicWorkerExecutor;
   #models: ModelResolver;
   #artifacts: BoundArtifacts;
@@ -1048,6 +1076,10 @@ export class AgentRuntime {
   /** Mounts as the model sees them: a plain name, plus the mount-qualified
    *  address the harness dispatches to, because providers restrict name
    *  charsets. */
+  async #catalogueKeyFor(tenantId: string, agentId: string): Promise<string> {
+    return catalogueKey(await this.store.listMounts(tenantId, agentId), await this.store.pluginChoices(tenantId, agentId));
+  }
+
   async #catalogueFor(tenantId: string, agentId: string) {
     const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
     const all = await this.store.listMounts(tenantId, agentId);
@@ -1086,7 +1118,13 @@ export class AgentRuntime {
     const key = `${tenantId}/${agentId}`;
     const cacheKey = `${key}#${session}`;
     const cached = this.#agents.get(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      const now = await this.#catalogueKeyFor(tenantId, agentId);
+      const running = cached.builtFrom !== now &&
+        (await cached.agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+      if (reuseHarness(cached.builtFrom, now, running)) return cached.agent;
+      this.#agents.delete(cacheKey);
+    }
 
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
@@ -1094,6 +1132,7 @@ export class AgentRuntime {
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
     await this.repinMounts(tenantId, agentId);
+    const builtFrom = await this.#catalogueKeyFor(tenantId, agentId);
     const { tools, records, unoffered } = await this.#catalogueFor(tenantId, agentId);
     const sandbox = this.#deps.sandbox ?? true;
     // The call context's task is the conversation, so held calls and audit
@@ -1204,7 +1243,7 @@ export class AgentRuntime {
       },
     });
     agentRef.current = agent;
-    this.#agents.set(cacheKey, agent);
+    this.#agents.set(cacheKey, { agent, builtFrom });
     return agent;
   }
 

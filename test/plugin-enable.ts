@@ -21,7 +21,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { AgentRuntime, enabledMounts, parsePluginChoice, unofferedMounts } from "../cf/src/runtime.ts";
+import { AgentRuntime, catalogueKey, enabledMounts, parsePluginChoice, reuseHarness, unofferedMounts } from "../cf/src/runtime.ts";
 import { pluginEnabled, credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -229,6 +229,38 @@ await check("unofferedMounts: 关了的算 switched_off · 没装的算 plugin_u
   if (offered.some((a) => not.includes(a)) || offered.length + not.length !== mounts.length) {
     throw new Error(`offered ${JSON.stringify(offered)} and unoffered ${JSON.stringify(not)} do not partition the mounts`);
   }
+});
+
+const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); };
+
+await check("a harness built while a plugin was off is rebuilt once it is back on, but never under a running turn", async () => {
+  // Found on preview 2026-09-17: the tool list of a conversation opened while
+  // github was off stayed off after it was switched back on.
+  const mount = { alias: "gh", plugin: "github", toolVersion: "2.0.0", publicConfig: {}, secretRef: null, policy: null };
+  const off = catalogueKey([mount], { github: "disable" });
+  const on = catalogueKey([mount], {});
+  must(off !== on, "switching a plugin back on left the key unchanged, so nothing would be rebuilt");
+  must(!reuseHarness(off, on, false), "an idle harness built while the plugin was off was handed out again");
+  must(reuseHarness(off, on, true), "a running turn had its harness replaced under it");
+  must(reuseHarness(on, on, false), "an unchanged catalogue rebuilt the harness");
+});
+
+await check("the key follows every mount change the catalogue reads, and never holds the credential", async () => {
+  const base = { alias: "gh", plugin: "github", toolVersion: "2.0.0", publicConfig: { a: 1 }, secretRef: null as string | null, policy: null as any };
+  const k = (m: typeof base, extra: typeof base[] = []) => catalogueKey([m, ...extra], {});
+  const other = { ...base, alias: "web", plugin: "http" };
+  const changed = [
+    ["a mount added", k(base, [other])],
+    ["a version repinned", k({ ...base, toolVersion: "2.1.0" })],
+    ["a setting changed", k({ ...base, publicConfig: { a: 2 } })],
+    ["a credential attached", k({ ...base, secretRef: "agent:gh" })],
+    ["a policy changed", k({ ...base, policy: { write: "approval" } })],
+    ["a mount renamed", k({ ...base, alias: "github" })],
+  ] as const;
+  for (const [what, key] of changed) must(key !== k(base), `${what} left the key unchanged`);
+  must(k(base, [other]) === catalogueKey([other, base], {}), "the same mounts in another order gave another key");
+  const withRef = k({ ...base, secretRef: "agent:gh-very-specific-ref" });
+  must(!withRef.includes("very-specific"), "the key carries the credential reference");
 });
 
 console.log(`\n  Switching a plugin off\n  ${"─".repeat(56)}`);
