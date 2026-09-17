@@ -526,6 +526,15 @@ export interface InboundEvent {
  * subscribed, the mount's own doing, a ping), and the answer is a success, so
  * the service does not report a working webhook as broken (cody, 2026-09-17).
  */
+/** What `Plugin.confirmInboundAccount` found. Only `identity_unreachable` is temporary. */
+export type InboundAccountCheck =
+  | { ok: true }
+  | {
+    ok: false;
+    code: "push_disabled" | "bound_account_mismatch" | "credential_rejected" | "identity_mismatch" | "identity_unreachable";
+    reason?: string;
+  };
+
 export type InboundResult =
   | { deliver: false; reason: string; rejected?: boolean }
   | { deliver: true; text: string; dedupeKey?: string };
@@ -763,4 +772,32 @@ export interface Plugin {
    * it returns is short and quotes rather than forwards.
    */
   receive?(event: InboundEvent, secret: string, ctx: PluginContext): Promise<InboundResult>;
+
+  /**
+   * Whether inbound events for this mount may be registered to `accountId`,
+   * the service's stable id for the account asking (a Raft agent id; never a
+   * name or display name). Asked before an operator's provisioning creates a
+   * hook or issues a secret grant, so a registration made by one account
+   * cannot reach a mount holding another's. Host-only: never a model tool.
+   *
+   * Both must hold, and the plugin checks both:
+   * - its own inbound (push) state is on, and names `accountId`;
+   * - the credential attached now, read fresh from the service with the
+   *   plugin's own timeout (a network call, unlike `receive`; never a cached
+   *   answer), belongs to `accountId`. A credential replaced or revoked since
+   *   push was switched on must not keep the old binding alive.
+   *
+   * It writes no state: it may be asked more than once. A network answer it
+   * cannot interpret is `identity_unreachable`, never a yes.
+   *
+   * `reason` goes to the audit record only. The caller learns just "mismatch"
+   * or "could not confirm" (the runtime maps `code`), so trying ids one by one
+   * does not reveal which account the mount holds.
+   *
+   * A yes holds only for that moment: the credential can still change later,
+   * so `receive` must keep checking each event's recipient itself.
+   *
+   * Absent means no registration is ever allowed for the plugin.
+   */
+  confirmInboundAccount?(ctx: PluginContext, accountId: string): Promise<InboundAccountCheck>;
 }

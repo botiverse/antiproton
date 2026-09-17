@@ -57,6 +57,7 @@
     "test/plugin-enable.ts",
     "test/admin-mount.ts",
     "test/hook-rotation.ts",
+    "test/raft-provision.ts",
     "test/prompt-contributions.ts",
     "test/control-plane.ts",
     "test/spec/control-plane-spec.ts",

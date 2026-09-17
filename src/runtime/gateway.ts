@@ -672,6 +672,33 @@ export class ToolGateway {
     return { result: await plugin.receive!(event, secret, context) };
   }
 
+  /**
+   * Whether an inbound registration for `accountId` may reach this mount: it
+   * must take events now, run `pluginId`, and the plugin must confirm the
+   * account (`Plugin.confirmInboundAccount`). A refusal keeps the plugin's
+   * code and reason for the audit record; callers show only its `kind`.
+   */
+  async confirmInboundAccount(tenantId: string, agentId: string, alias: string, pluginId: string, accountId: string):
+    Promise<{ ok: true } | { ok: false; kind: "mismatch" | "unreachable"; code: string; reason: string }> {
+    const no = (code: string, reason: string, kind: "mismatch" | "unreachable" = "mismatch") => ({ ok: false as const, kind, code, reason });
+    const gate = await this.#receiveGate(tenantId, agentId, alias);
+    if ("skipped" in gate) return no("mount_unavailable", gate.skipped);
+    const { mount, plugin } = gate;
+    if (plugin.id !== pluginId) return no("wrong_plugin", `${alias} is a ${plugin.id} mount, not ${pluginId}`);
+    if (!plugin.confirmInboundAccount) return no("not_supported", `${plugin.id} cannot confirm an inbound account`);
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+      : null;
+    try {
+      const r = await plugin.confirmInboundAccount(this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential), accountId);
+      if (r.ok) return { ok: true };
+      return no(r.code, String(r.reason ?? r.code).slice(0, 300), r.code === "identity_unreachable" ? "unreachable" : "mismatch");
+    } catch (e) {
+      // No verdict is not a yes.
+      return no("identity_unreachable", String((e as Error)?.message ?? e).slice(0, 300), "unreachable");
+    }
+  }
+
   /** Whether this mount could take a pushed event now, and if not, why. */
   async receiveBlocked(tenantId: string, agentId: string, alias: string): Promise<string | null> {
     const gate = await this.#receiveGate(tenantId, agentId, alias);

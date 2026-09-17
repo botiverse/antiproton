@@ -63,6 +63,7 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
+import { provisionRaft } from "./raft-provision.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type HookDirectory, type IdentityDirectory } from "./control-plane.ts";
 import {
   grantFromHeader, HOOK_SECRET_PATTERN, inboundStatus, lowerHeaders, newGrantNonce, newHookGrant, newHookId, readCapped, sha256Hex,
@@ -85,6 +86,8 @@ export interface Env {
   /** The control plane (cf/src/control-plane.ts): who may sign in, and as which
    *  tenant and agent. Never agent data, which stays in each agent's object. */
   CONTROL_DB: D1Database;
+  /** Where Raft's provisioning API lives (`/provision/raft`). Unset: that route answers 503. */
+  RAFT_ORIGIN?: string;
   ARTIFACTS: R2Bucket;
   DEEPSEEK_API_KEY: string;
   DEEPSEEK_BASE_URL: string;
@@ -1661,6 +1664,17 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("hookSecretVersion", () => this.runtime().hookSecretVersion(tenantId, agentId, hookId));
   }
 
+  async hookConfirmInboundAccount(tenantId: string, agentId: string, alias: string, pluginId: string, accountId: string, recordAs: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookConfirmInboundAccount",
+      () => this.runtime().confirmInboundAccount(tenantId, agentId, alias, pluginId, accountId, recordAs));
+  }
+
+  async hookRecord(tenantId: string, agentId: string, alias: string, recordAs: string, reason: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookRecord", () => this.runtime().recordInboundNote(recordAs, alias, reason));
+  }
+
   async hookReceiveBlocked(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookReceiveBlocked", () => this.runtime().receiveBlocked(tenantId, agentId, alias));
@@ -2801,6 +2815,14 @@ export default {
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
     // A service's push: addressed by the hook id alone, before any sign-in.
+    if (url.pathname === "/provision/raft") {
+      return provisionRaft(request, {
+        raftOrigin: env.RAFT_ORIGIN, origin: url.origin, fetch: (i, init) => fetch(i, init), now: () => Date.now(),
+        hooks: d1InboundHooks(env.CONTROL_DB), newHookId, newGrant: newHookGrant, sha256Hex,
+        agent: (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))),
+        checkAgentName: (t, a) => { agentObjectName(t, a); },
+      });
+    }
     const secretPath = /^\/hooks\/([A-Za-z0-9_-]{43})\/secret$/.exec(url.pathname);
     if (secretPath) return hookSecretRoute(request, env, url, secretPath[1]);
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);

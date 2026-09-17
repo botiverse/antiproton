@@ -663,6 +663,30 @@ export class AgentRuntime {
     return { ok: true };
   }
 
+  /**
+   * Whether an inbound registration for `accountId` may reach this mount (see
+   * the gateway). A refusal is recorded against `recordAs` with the plugin's
+   * code and reason, which the caller never sees.
+   */
+  async confirmInboundAccount(tenantId: string, agentId: string, alias: string, pluginId: string, accountId: string, recordAs: string):
+    Promise<{ ok: true } | { ok: false; kind: "mismatch" | "unreachable" }> {
+    await this.ready();
+    const r = await this.#gateway.confirmInboundAccount(tenantId, agentId, alias, pluginId, accountId);
+    if (r.ok) return r;
+    const sql = this.#deps.ctx.storage.sql;
+    ensureInboundTable(sql);
+    recordInbound(sql, { hookId: recordAs, alias, outcome: "rejected", reason: `registration refused (${r.code}): ${r.reason}`, now: Date.now() });
+    return { ok: false, kind: r.kind };
+  }
+
+  /** A line in the inbound record that no event caused (provisioning's own outcomes). */
+  async recordInboundNote(recordAs: string, alias: string, reason: string) {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    ensureInboundTable(sql);
+    recordInbound(sql, { hookId: recordAs, alias, outcome: "failed", reason, now: Date.now() });
+  }
+
   /** Why this mount could not take pushed events now, or null. */
   async receiveBlocked(tenantId: string, agentId: string, alias: string): Promise<string | null> {
     await this.ready();
