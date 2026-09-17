@@ -105,6 +105,7 @@ import { statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
+import { raftPlugin } from "../../src/plugins/raft.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
@@ -584,6 +585,7 @@ export class AgentRuntime {
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
+      raftPlugin,
       ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),
     );
