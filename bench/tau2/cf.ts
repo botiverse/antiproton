@@ -24,7 +24,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
-import { decideFromPoll } from "../poll-fallback.ts";
+import { decideFromPoll, stallCause } from "../poll-fallback.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -237,6 +237,7 @@ async function runTask(task: any) {
 
   let agentSaid = "Hi! How can I help you today?";
   let turns = 0, simCalls = 0, ended = "max_turns";
+  let stall: string | undefined;
 
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
@@ -251,7 +252,12 @@ async function runTask(task: any) {
 
     const answered = await waitForAnswer(taskId);
     if (!answered) {
-      ended = failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled";
+      if (failed.has(taskId)) ended = `model: ${failed.get(taskId)}`.slice(0, 60);
+      else {
+        ended = "agent_stalled";
+        const last = await api(`/bench/poll?taskId=${taskId}`).catch(() => null);
+        stall = stallCause(last, seen.get(taskId) ?? 0);
+      }
       break;
     }
     agentSaid = answered;
@@ -266,7 +272,7 @@ async function runTask(task: any) {
     writes.some((w: any) => w.name === e.name && canonArgs(w.args) === canonArgs(e.args)));
 
   return {
-    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
+    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall,
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
     seconds: Math.round((Date.now() - t0) / 1000),
@@ -363,7 +369,10 @@ console.log(`  tools: ${Object.entries(toolTotals).sort((a: any, b: any) => b[1]
   .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}`);
 
 const endings: Record<string, number> = {};
-for (const r of results.filter((x) => !x.reward)) endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;
+for (const r of results.filter((x) => !x.reward)) {
+  const key = r.stall ? `${r.ended} (${r.stall})` : String(r.ended);
+  endings[key] = (endings[key] ?? 0) + 1;
+}
 if (Object.keys(endings).length) {
   console.log(`  failures by ending: ${Object.entries(endings)
     .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ")}`);
