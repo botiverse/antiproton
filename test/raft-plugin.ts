@@ -321,12 +321,13 @@ await check("a signed subscribed Raft push is projected, quoted, and deduplicate
   const incoming = pushPayload({
     message: {
       messageId: "message-1", senderId: "human-1", senderName: "tygg\nspoof", senderType: "human",
-      target: "#wg-raft-sdk", content: "line one\nline two",
+      target: "#wg-raft-sdk", content: "line one\rline two\r\nline three\nline four",
     },
   });
   const out = await raftPlugin.receive!(pushed(incoming), PUSH_SECRET, m.ctx);
   if (!out.deliver || out.dedupeKey !== "event-1") throw new Error(JSON.stringify(out));
-  if (!out.text.includes("tygg spoof") || !out.text.includes("> line one\n> line two")) throw new Error(out.text);
+  if (!out.text.includes("tygg spoof") ||
+      !out.text.includes("> line one\n> line two\n> line three\n> line four")) throw new Error(out.text);
   if (m.state()?.lastReached?.eventId !== "event-1") throw new Error(`last reach not stored: ${JSON.stringify(m.state())}`);
 });
 
@@ -403,10 +404,12 @@ await check("disable_push stops later delivery and push_status exposes no secret
 });
 
 await check("push_status safely normalizes corrupt persisted connection state", async () => {
-  const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached: { eventId: 9, at: "yesterday" } });
-  const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
-  if (JSON.stringify(status) !== JSON.stringify({ enabled: false, account: null, lastReached: null })) {
-    throw new Error(JSON.stringify(status));
+  for (const lastReached of [{ eventId: 9, at: "yesterday" }, { eventId: "event-future", at: 1e100 }]) {
+    const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached });
+    const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
+    if (JSON.stringify(status) !== JSON.stringify({ enabled: false, account: null, lastReached: null })) {
+      throw new Error(JSON.stringify(status));
+    }
   }
 });
 

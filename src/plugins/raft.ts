@@ -43,7 +43,8 @@ function pushState(value: unknown): PushState {
     enabled: state.enabled === true,
     agentId: text(state.agentId) ?? null,
     agentName: text(state.agentName) ?? null,
-    lastReached: typeof reached.eventId === "string" && typeof reached.at === "number"
+    lastReached: typeof reached.eventId === "string" && typeof reached.at === "number" &&
+        Number.isFinite(reached.at) && Math.abs(reached.at) <= 8.64e15
       ? { eventId: reached.eventId, at: reached.at }
       : null,
   };
@@ -193,7 +194,7 @@ function oneLine(value: unknown, limit: number): string {
 
 function quote(value: string): string {
   const clipped = value.trim().slice(0, PUSH_QUOTE_CHARS);
-  return clipped.split(/\r?\n/).map((line) => `> ${line}`).join("\n");
+  return clipped.split(/\r\n|[\r\n]/).map((line) => `> ${line}`).join("\n");
 }
 
 function attachment(value: unknown): Json | null {
