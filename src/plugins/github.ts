@@ -219,6 +219,87 @@ const runOut = (r: any) => ({
   createdAt: r.created_at, url: r.html_url,
 });
 
+// ---- inbound events ---------------------------------------------------------
+
+/**
+ * What this mount has asked to hear about, kept in its connection state.
+ *
+ * `login` is the account the mount acts as, recorded when a subscription is
+ * made so that `receive` can drop the mount's own comments without calling
+ * GitHub — it has ten seconds to answer. Null means the mount had no account
+ * then, so it could not have written anything to hear back.
+ */
+interface Inbound {
+  login: string | null;
+  subscriptions: Array<{ repo: string; number: number | null }>;
+  /** The last signed delivery of any kind: proof the webhook reaches this mount. */
+  lastReached?: { at: number; event: string };
+}
+
+const MAX_SUBSCRIPTIONS = 50;
+/** How much of a stranger's text reaches the agent. Enough to decide whether to look. */
+const QUOTE_CHARS = 500;
+const TITLE_CHARS = 200;
+/** What is worth waking an agent for. Labels and assignments are not, yet. */
+const ISSUE_ACTIONS = new Set(["opened", "edited", "closed", "reopened", "deleted", "transferred"]);
+const COMMENT_ACTIONS = new Set(["created", "edited", "deleted"]);
+
+async function inboundOf(ctx: PluginContext): Promise<Inbound> {
+  const state = (await ctx.connection.get()) as { inbound?: Inbound } | null;
+  const i = state?.inbound;
+  return { login: i?.login ?? null, subscriptions: i?.subscriptions ?? [], ...(i?.lastReached ? { lastReached: i.lastReached } : {}) };
+}
+
+async function saveInbound(ctx: PluginContext, inbound: Inbound) {
+  const state = ((await ctx.connection.get()) ?? {}) as Record<string, Json>;
+  await ctx.connection.set({ ...state, inbound: inbound as unknown as Json });
+}
+
+function issueNumberOf(a: Record<string, any>): number | null {
+  if (a.number === undefined || a.number === null) return null;
+  const n = Number(a.number);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`number must be a positive integer, got ${JSON.stringify(a.number)}`);
+  return n;
+}
+
+const sameRepo = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+/**
+ * Whether `header` is GitHub's signature of `body` under `secret`.
+ *
+ * `crypto.subtle.verify` compares in constant time, which a string comparison
+ * of two hex digests does not. Anything not shaped like `sha256=<64 hex>` is
+ * false rather than an exception: a malformed header is a refusal, not a crash.
+ */
+export async function validGithubSignature(body: Uint8Array, header: string, secret: string): Promise<boolean> {
+  const m = /^sha256=([0-9a-f]{64})$/i.exec(header.trim());
+  if (!m || !secret) return false;
+  const sig = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) sig[i] = parseInt(m[1]!.slice(i * 2, i * 2 + 2), 16);
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  return crypto.subtle.verify("HMAC", key, sig, body);
+}
+
+/**
+ * The payload, from either of the two content types a GitHub webhook can be
+ * configured with. `application/x-www-form-urlencoded` carries the JSON in a
+ * `payload` field, and an operator picking it in the settings page is not a
+ * mistake worth losing events over.
+ */
+function payloadOf(event: { headers: Record<string, string>; body: Uint8Array }): any {
+  const text = new TextDecoder().decode(event.body);
+  const type = event.headers["content-type"] ?? "";
+  const json = /x-www-form-urlencoded/i.test(type) ? new URLSearchParams(text).get("payload") ?? "" : text;
+  return JSON.parse(json);
+}
+
+const clip = (s: unknown, n: number) => {
+  const text = String(s ?? "").trim();
+  return text.length > n ? `${text.slice(0, n)}…` : text;
+};
+const quote = (s: unknown) => clip(s, QUOTE_CHARS).split("\n").map((l) => `> ${l}`).join("\n");
+
 const t = (
   name: string, summary: string, properties: Record<string, unknown>,
   required: string[], sideEffects: "read" | "write",
@@ -283,6 +364,18 @@ export const githubPlugin: Plugin = {
       ...REPO_ARG, number: { type: "integer" },
       reason: { type: "string", enum: ["completed", "not_planned"] },
     }, ["repo", "number"], "write"),
+
+    // Subscriptions choose which webhook events wake the agent. They do not
+    // create the webhook: that needs admin rights on the repository, so for now
+    // a person adds it in the repository's settings with this mount's inbound
+    // URL and secret. Both are writes, so a mount's policy can hold them.
+    t("issue_subscribe", "Be told when something happens on an issue, or on any issue or pull request in a repository if number is omitted: opened, edited, closed, reopened, commented. Events arrive as messages, with no need to poll. Needs a webhook on the repository pointing at this mount, which a person adds; issue_subscriptions shows whether one has reached it.", {
+      ...REPO_ARG, number: { type: "integer", description: "omit to hear about every issue and pull request in the repository" },
+    }, ["repo"], "write", "native"),
+    t("issue_unsubscribe", "Stop being told about an issue, or about a repository if number is omitted. Removes exactly the subscription named.", {
+      ...REPO_ARG, number: { type: "integer" },
+    }, ["repo"], "write", "native"),
+    t("issue_subscriptions", "What this mount is subscribed to, and when GitHub last reached it.", {}, [], "read"),
 
     t("pr_list", "Pull requests in a repository.", {
       ...REPO_ARG, state: { type: "string", enum: ["open", "closed", "all"] }, ...PAGE_ARGS,
@@ -358,6 +451,67 @@ export const githubPlugin: Plugin = {
     }
   },
 
+  /**
+   * A repository webhook delivery. See `receive` in `types.ts` for the rules;
+   * what is GitHub's own is below.
+   */
+  async receive(event, secret, ctx) {
+    const signature = event.headers["x-hub-signature-256"];
+    // A webhook saved without a secret sends no signature at all, and then
+    // anyone who learns the URL can speak for GitHub.
+    if (!signature) {
+      return { deliver: false, rejected: true, reason: "unsigned: the webhook has no secret set, so the sender cannot be checked" };
+    }
+    if (!(await validGithubSignature(event.body, signature, secret))) {
+      return { deliver: false, rejected: true, reason: "the signature does not match this mount's inbound secret" };
+    }
+    let p: any;
+    try { p = payloadOf(event); } catch {
+      return { deliver: false, rejected: true, reason: "signed, but the body is not a GitHub payload" };
+    }
+
+    const kind = event.headers["x-github-event"] ?? "";
+    const inbound = await inboundOf(ctx);
+    // Any signed delivery proves the webhook reaches this mount, which is the
+    // thing a person setting one up needs to know; a ping is only the first.
+    inbound.lastReached = { at: Date.now(), event: kind };
+    await saveInbound(ctx, inbound);
+    if (kind === "ping") return { deliver: false, reason: "ping: the webhook reaches this mount" };
+
+    const actions = kind === "issues" ? ISSUE_ACTIONS : kind === "issue_comment" ? COMMENT_ACTIONS : null;
+    if (!actions) return { deliver: false, reason: `${kind || "an unnamed"} event: not one this plugin delivers` };
+    if (!actions.has(p?.action)) return { deliver: false, reason: `${kind} ${p?.action}: not an action worth waking the agent for` };
+
+    const repo = String(p?.repository?.full_name ?? "");
+    const issue = p?.issue ?? {};
+    const number = Number(issue.number);
+    const sender = String(p?.sender?.login ?? "");
+    if (!inbound.subscriptions.some((s) => sameRepo(s.repo, repo) && (s.number === null || s.number === number))) {
+      return { deliver: false, reason: `${repo}#${number}: not subscribed` };
+    }
+    if (ctx.credential && inbound.login === null) {
+      // An account was attached after the subscription was made, so this
+      // mount can now write and does not know under which name. Delivering
+      // would let its own comments wake it.
+      return { deliver: false, reason: "an account was attached after subscribing; subscribe again so the mount knows its own name" };
+    }
+    if (inbound.login && sender.toLowerCase() === inbound.login.toLowerCase()) {
+      return { deliver: false, reason: `${repo}#${number}: caused by this mount's own account` };
+    }
+
+    const what = issue.pull_request ? "pull request" : "issue";
+    // One line, whatever the title holds: the header is the plugin's own line,
+    // and a title with a newline in it could otherwise start a second one.
+    const head = `GitHub ${repo}#${number} (${what} "${clip(String(issue.title ?? "").replace(/\s+/g, " "), TITLE_CHARS)}")`;
+    const lines = kind === "issues"
+      ? [`${head}: ${what} ${p.action} by @${sender}`, ...(p.action === "opened" || p.action === "edited" ? [quote(issue.body)] : [])]
+      : [`${head}: comment ${p.action} by @${sender}`, ...(p.action === "deleted" ? [] : [quote(p?.comment?.body)])];
+    const url = kind === "issue_comment" ? p?.comment?.html_url : issue.html_url;
+    if (url) lines.push(String(url));
+    const dedupeKey = event.headers["x-github-delivery"];
+    return { deliver: true, text: lines.filter(Boolean).join("\n"), ...(dedupeKey ? { dedupeKey } : {}) };
+  },
+
   async invoke(name, args, ctx): Promise<Json> {
     const a = (args ?? {}) as Record<string, any>;
     switch (name) {
@@ -418,6 +572,53 @@ export const githubPlugin: Plugin = {
           state_reason: a.reason === "not_planned" ? "not_planned" : "completed",
         });
         return { number: i.number, state: i.state } as Json;
+      }
+
+      case "issue_subscribe": {
+        const repo = repoOf(a);
+        const number = issueNumberOf(a);
+        const inbound = await inboundOf(ctx);
+        // Re-read on every subscription: the account attached to a mount can
+        // change, and the loop guard is only as good as this name. If it
+        // cannot be learnt, nothing is subscribed — a subscription that cannot
+        // recognise the mount's own comments would answer them for ever.
+        inbound.login = ctx.credential ? (await call("GET", "/user", ctx)).login : null;
+        const exists = inbound.subscriptions.some((s) => sameRepo(s.repo, repo) && s.number === number);
+        if (!exists) {
+          if (inbound.subscriptions.length >= MAX_SUBSCRIPTIONS) {
+            throw new Error(`this mount already has ${MAX_SUBSCRIPTIONS} subscriptions; remove one with issue_unsubscribe first`);
+          }
+          inbound.subscriptions.push({ repo, number });
+        }
+        await saveInbound(ctx, inbound);
+        return {
+          subscribed: { repo, number },
+          alreadySubscribed: exists,
+          lastReached: inbound.lastReached ? new Date(inbound.lastReached.at).toISOString() : null,
+          note: inbound.lastReached
+            ? "events arrive as messages; nothing to poll"
+            : "no webhook has reached this mount yet — a person adds one on the repository with this mount's inbound URL and secret, and until then nothing arrives",
+        } as Json;
+      }
+      case "issue_unsubscribe": {
+        const repo = repoOf(a);
+        const number = issueNumberOf(a);
+        const inbound = await inboundOf(ctx);
+        const before = inbound.subscriptions.length;
+        inbound.subscriptions = inbound.subscriptions.filter((s) => !(sameRepo(s.repo, repo) && s.number === number));
+        await saveInbound(ctx, inbound);
+        return {
+          removed: before !== inbound.subscriptions.length,
+          remaining: inbound.subscriptions as unknown as Json,
+        } as Json;
+      }
+      case "issue_subscriptions": {
+        const inbound = await inboundOf(ctx);
+        return {
+          subscriptions: inbound.subscriptions as unknown as Json,
+          account: inbound.login,
+          lastReached: inbound.lastReached ? new Date(inbound.lastReached.at).toISOString() : null,
+        } as Json;
       }
 
       case "pr_list": {

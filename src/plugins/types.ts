@@ -451,6 +451,45 @@ export class Backgrounded {
   }
 }
 
+/**
+ * One request a service sent to a mount's inbound URL, as it arrived.
+ *
+ * The body is bytes, not text, because services sign the bytes: GitHub's
+ * signature is an HMAC of the raw body, and a body decoded and re-encoded on
+ * the way in is only the same bytes when the service happened to send valid
+ * UTF-8. A plugin checks the signature first and decodes after (Piper, cody,
+ * 2026-09-17).
+ *
+ * Header names are lowercase, so every plugin looks one up the same way.
+ */
+export interface InboundEvent {
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
+/**
+ * What a plugin makes of an inbound request.
+ *
+ * `text` is the whole of what reaches the agent, and the plugin writes it: a
+ * line saying what happened, never the payload passed through. What a service
+ * sends is written by whoever triggered it — anyone can comment on a public
+ * issue — so the runtime delivers it labelled as outside content, and the
+ * plugin keeps what it quotes short.
+ *
+ * `reason` is for the audit record, which is where a person looks when an
+ * event they expected never arrived. It never goes into the HTTP answer.
+ *
+ * `rejected` says the request itself is wrong — unsigned, badly signed,
+ * unreadable — and the runtime answers it with a failure the service shows in
+ * its own delivery log, which is where the person setting up the webhook is
+ * looking. Without it the request was fine and simply not for this mount (not
+ * subscribed, the mount's own doing, a ping), and the answer is a success, so
+ * the service does not report a working webhook as broken (cody, 2026-09-17).
+ */
+export type InboundResult =
+  | { deliver: false; reason: string; rejected?: boolean }
+  | { deliver: true; text: string; dedupeKey?: string };
+
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {
   return new Backgrounded(handle, note);
@@ -653,4 +692,35 @@ export interface Plugin {
    * that has to be complete has to be written where it happens.
    */
   usage?(ctx: PluginContext): Promise<MountUsage[]>;
+
+  /**
+   * A service telling this mount that something happened, without the agent
+   * having asked.
+   *
+   * Everything else in this interface starts with the agent: a call, or work a
+   * call started. This is the one way in from outside, so the plugin is the
+   * gate, not a pipe:
+   *
+   * - **Check the signature before reading anything else.** Each service
+   *   signs differently, which is why this is the plugin's job. `secret` is
+   *   the one the runtime generated for this mount's inbound URL and the
+   *   operator gave the service; it is not the mount's credential. A request
+   *   that is unsigned, or signed with anything else, is refused.
+   * - **Deliver only what this mount subscribed to**, as recorded in
+   *   `ctx.connection` by the plugin's own tools.
+   * - **Drop what the mount's own account caused.** An agent that comments on
+   *   an issue it is subscribed to would otherwise be woken by its own comment,
+   *   and answer it.
+   * - **Return a `dedupeKey`** when the service marks redeliveries, so a retry
+   *   is not a second event.
+   *
+   * The service is waiting for an answer — GitHub gives up after ten seconds —
+   * so this reads connection state and answers; it does not call the service.
+   * The runtime acknowledges once the text is posted, never after the model
+   * runs.
+   *
+   * A plugin that implements this can be woken by a stranger's text, so what
+   * it returns is short and quotes rather than forwards.
+   */
+  receive?(event: InboundEvent, secret: string, ctx: PluginContext): Promise<InboundResult>;
 }
