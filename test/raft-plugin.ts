@@ -116,7 +116,9 @@ await check("send uses the configured origin, keeps the credential host-side, an
   if (body.idempotencyKey !== "stable-1" || body.target !== "#general" || body.content !== "hello") {
     throw new Error(`wrong send body: ${JSON.stringify(body)}`);
   }
-  if (calls[0]!.init.redirect !== "error") throw new Error("fetch may forward the credential through a redirect");
+  if (calls[0]!.init.redirect !== "manual") {
+    throw new Error(`fetch must use the Workers-compatible manual redirect guard: ${calls[0]!.init.redirect}`);
+  }
 });
 
 await check("send requires a stable idempotency key before reaching Raft", async () => {
@@ -313,7 +315,7 @@ await check("a signed Raft inbox notification wakes one canonical pull without n
   const incoming = pushPayload();
   const out = await raftPlugin.receive!(pushed(incoming), PUSH_SECRET, m.ctx);
   if (!out.deliver || out.dedupeKey !== "event-1") throw new Error(JSON.stringify(out));
-  if (!out.text.includes("`raft.receive_events` exactly once") ||
+  if (!out.text.includes("the `receive_events` tool from the `raft` mount exactly once") ||
       !out.text.includes("canonical inbox batch") || !out.text.includes("Do not retry automatically")) {
     throw new Error(out.text);
   }

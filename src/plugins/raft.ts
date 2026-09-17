@@ -123,7 +123,10 @@ async function call(
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       ...(options.cache ? { cache: options.cache } : {}),
-      redirect: "error",
+      // workerd only accepts "follow" or "manual". Keep redirects manual so
+      // the response-status check below rejects 3xx without forwarding the
+      // Raft credential to the redirect target.
+      redirect: "manual",
       signal: AbortSignal.timeout(timeout(ctx)),
     };
     response = await fetch(url, init);
@@ -466,7 +469,7 @@ export const raftPlugin: Plugin = {
 
     return {
       deliver: true,
-      text: `Raft inbox state changed. Call \`${ctx.alias}.receive_events\` exactly once to retrieve and acknowledge ` +
+      text: `Raft inbox state changed. Call the \`receive_events\` tool from the \`${ctx.alias}\` mount exactly once to retrieve and acknowledge ` +
         "the current canonical inbox batch. Do not retry automatically if that call reports uncertain delivery.",
       dedupeKey: payload.eventId,
     };
