@@ -59,6 +59,9 @@ export function personaOf(config: unknown): { name?: string; description?: strin
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 
+/** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
+export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
+
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {
   alias: string; plugin: string;
@@ -1053,6 +1056,40 @@ export class AgentRuntime {
       });
     }
     return { agentId, created };
+  }
+
+  /**
+   * One mount the defaults do not give, added by an operator (`/admin/mounts`).
+   * It goes through `provision`, the one add path, so it is validated the same
+   * way; the checks before it turn that path's silent skips into answers. An
+   * alias that is already there is left alone: the same plugin and settings is
+   * a repeat, anything else is refused rather than overwritten, because a
+   * mount carries a credential and connection state that a replace would orphan.
+   */
+  async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Json }):
+    Promise<{ ok: true; added: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    if (!MOUNT_ALIAS.test(seed.alias)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
+    const plugin = this.#plugins.find((p) => p.id === seed.plugin);
+    if (!plugin) return { ok: false, error: `no plugin named ${seed.plugin}` };
+    const have = await this.store.getMountByAlias(tenantId, agentId, seed.alias);
+    if (have) {
+      if (have.plugin === seed.plugin && JSON.stringify(have.publicConfig) === JSON.stringify(seed.config)) {
+        return { ok: true, added: false };
+      }
+      return { ok: false, error: `${seed.alias} is already a different mount` };
+    }
+    const choices = await this.store.pluginChoices(tenantId, agentId);
+    if (!pluginEnabled(plugin, choices[plugin.id])) {
+      return { ok: false, error: `${plugin.id} is switched off for this agent; switch it on first` };
+    }
+    try { assertMountConfig(plugin, seed.config as Record<string, Json>, null); }
+    catch (e) { return { ok: false, error: String((e as Error)?.message ?? e) }; }
+    await this.provision(tenantId, agentId, [{ ...seed, secretRef: null, policy: null }]);
+    if (!(await this.store.getMountByAlias(tenantId, agentId, seed.alias))) {
+      return { ok: false, error: `${seed.alias} was not added` };
+    }
+    return { ok: true, added: true };
   }
 
   /**

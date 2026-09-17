@@ -1660,6 +1660,11 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("hookCreateSecret", () => this.runtime().createHookSecret(tenantId, agentId, alias, hookId));
   }
 
+  async adminAddMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Json }) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminAddMount", () => this.runtime().addMount(tenantId, agentId, seed));
+  }
+
   async hookDropSecret(tenantId: string, agentId: string, hookId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
@@ -2414,6 +2419,27 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
   return Response.json({ hookId, url: `${url.origin}/hooks/${hookId}`, secret: made.secret, tenantId, agentId, alias });
 }
 
+/**
+ * `/admin/mounts`, automation token only: add one mount the defaults do not
+ * give, for a test or an operator's setup. `POST {tenantId, agentId, alias,
+ * plugin, config}` -> `{added}` (false when the same mount was already there).
+ * No credential travels here; it is attached on the mount afterwards.
+ */
+async function adminMounts(request: Request, env: Env): Promise<Response> {
+  if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+  const b = (await request.json().catch(() => null)) as any;
+  const tenantId = String(b?.tenantId ?? ""), agentId = String(b?.agentId ?? "");
+  try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  const config = b?.config ?? {};
+  if (typeof config !== "object" || Array.isArray(config)) return Response.json({ error: "config is an object" }, { status: 400 });
+  const r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)))
+    .adminAddMount(tenantId, agentId, { alias: String(b?.alias ?? ""), plugin: String(b?.plugin ?? ""), config });
+  return r.ok ? Response.json({ added: r.added }) : Response.json({ error: r.error }, { status: 400 });
+}
+
 /** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
 async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const key = bearerKey(request);
@@ -2673,6 +2699,7 @@ export default {
     // A service's push: addressed by the hook id alone, before any sign-in.
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
+    if (url.pathname === "/admin/mounts") return adminMounts(request, env);
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.
