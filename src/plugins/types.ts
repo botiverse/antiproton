@@ -141,6 +141,11 @@ export function originProblem(value: string): string | null {
   if (url.pathname !== "/" || url.search || url.hash || /[?#]/.test(value)) {
     return `must be an origin with no path, query or fragment, such as ${url.origin}`;
   }
+  // Written exactly as the origin, so a plugin that pastes the string into a
+  // URL gets what one that parses it gets: `https:x.test`, a trailing space,
+  // `/.` or `:443` all parse to the right place and read as something else
+  // (cody, 2026-09-17).
+  if (value !== url.origin && value !== `${url.origin}/`) return `must be written as ${url.origin}`;
   return null;
 }
 

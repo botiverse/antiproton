@@ -2230,6 +2230,9 @@ const ILLEGAL_ORIGINS = [
   "https://api.example.com#top", "https://user:pw@api.example.com", "https://user@api.example.com",
   "http://api.example.com", "http://10.0.0.1", "ftp://api.example.com", "file:///etc/passwd",
   "api.example.com", "", "/internal",
+  // Parse to the right origin but are not written as one (cody, 2026-09-17).
+  "https:api.example.com", "https://api.example.com/.", "https://api.example.com/ ", " https://api.example.com",
+  "https://api.example.com:443", "https://API.example.com", "http://LOCALHOST:8787",
 ];
 
 await check("a declared origin is refused at mount time when it has a path, query, user or plain http", () => {
@@ -2242,6 +2245,23 @@ await check("a declared origin is refused at mount time when it has a path, quer
   for (const v of LEGAL_ORIGINS) {
     const problems = validateMount(ORIGIN_PLUGIN, { serverUrl: v }, null);
     if (problems.length) throw new Error(`${JSON.stringify(v)} was refused: ${JSON.stringify(problems)}`);
+  }
+});
+
+await check("a refused origin says what is wrong with it, not only that it is wrong", () => {
+  // The exact-spelling rule refuses all of these on its own; the reasons are
+  // for the person at the console, so each is pinned here.
+  const said: Array<[string, RegExp]> = [
+    ["https://user@api.example.com", /user name or password/],
+    ["https://api.example.com/x", /no path, query or fragment/],
+    ["https://api.example.com/?", /no path, query or fragment/],
+    ["http://api.example.com", /must be https/],
+    ["api.example.com", /absolute URL/],
+    ["https://api.example.com:443", /written as https:\/\/api\.example\.com$/],
+  ];
+  for (const [v, want] of said) {
+    const got = originProblem(v);
+    if (!got || !want.test(got)) throw new Error(`${v}: ${got}`);
   }
 });
 
