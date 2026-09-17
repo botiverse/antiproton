@@ -56,6 +56,7 @@
     "test/mount-config.ts",
     "test/plugin-enable.ts",
     "test/admin-mount.ts",
+    "test/hook-rotation.ts",
     "test/prompt-contributions.ts",
     "test/control-plane.ts",
     "test/spec/control-plane-spec.ts",

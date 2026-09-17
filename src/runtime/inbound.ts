@@ -141,8 +141,66 @@ export function newHookSecret(): string {
   return [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export function hookSecretName(hookId: string): string {
-  return `hook:${hookId}`;
+export function hookSecretName(hookId: string, version?: number): string {
+  return version === undefined ? `hook:${hookId}` : `hook:${hookId}:v${version}`;
+}
+
+/**
+ * Secrets a service wrote itself, by version. A hook whose secret this
+ * deployment generated has no rows here and one unversioned secret.
+ * Two versions live side by side only while a rotation is in progress.
+ */
+const VERSIONS = `CREATE TABLE IF NOT EXISTS hook_secret_versions (
+  hook_id TEXT NOT NULL, version INTEGER NOT NULL, added_at INTEGER NOT NULL,
+  PRIMARY KEY (hook_id, version))`;
+
+/** How long an older version keeps working once a newer one is stored. */
+export const HOOK_ROTATION_MS = 24 * 60 * 60 * 1000;
+/** A service-written secret: base64url, 32 to 256 bytes. */
+export const HOOK_SECRET_PATTERN = /^[A-Za-z0-9_-]{43,342}$/;
+
+export function ensureHookVersionTable(sql: SqlHost["sql"]) {
+  sql.exec(VERSIONS);
+}
+
+/** The stored versions of one hook, newest first. */
+export function hookVersions(sql: SqlHost["sql"], hookId: string): Array<{ version: number; addedAt: number }> {
+  return sql.exec(
+    "SELECT version, added_at FROM hook_secret_versions WHERE hook_id = ? ORDER BY version DESC", hookId,
+  ).toArray().map((r: any) => ({ version: Number(r.version), addedAt: Number(r.added_at) }));
+}
+
+/**
+ * Which versions to try for one event, newest first, and which to forget
+ * now. An older version is forgotten once a newer one has proved itself, or
+ * once the newer one has been stored for the rotation window. At most two are
+ * kept: a third write drops the oldest.
+ */
+export function versionsFor(stored: Array<{ version: number; addedAt: number }>, now: number):
+  { tryOrder: number[]; expired: number[] } {
+  const [newest, ...older] = stored;
+  if (!newest) return { tryOrder: [], expired: [] };
+  const expired = now - newest.addedAt >= HOOK_ROTATION_MS ? older.map((v) => v.version) : older.slice(1).map((v) => v.version);
+  return { tryOrder: stored.map((v) => v.version).filter((v) => !expired.includes(v)), expired };
+}
+
+/** After an event verified with `used`: the versions older than it are done. */
+export function supersededBy(stored: Array<{ version: number }>, used: number): number[] {
+  return stored.filter((v) => v.version < used).map((v) => v.version);
+}
+
+/** A grant to write one hook secret: shown once, kept only as a hash. */
+export function newHookGrant(): string {
+  return `aphg_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
+}
+
+export function newGrantNonce(): string {
+  return base64url(crypto.getRandomValues(new Uint8Array(16)));
+}
+
+export async function sha256Hex(text: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function base64url(bytes: Uint8Array): string {

@@ -14,7 +14,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   let clock = 1_800_000_000_000;
   const keys = d1ApiKeys(db, () => ++clock);
   const hooks = d1InboundHooks(db, () => ++clock);
-  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks")]);
+  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM hook_grants")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -27,7 +27,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("inbound_hooks has exactly the columns the hook queries read", async () => {
     const { results } = await db.prepare("PRAGMA table_info(inbound_hooks)").all();
     const names = (results as any[]).map((r) => String(r.name)).sort().join(",");
-    assert(names === "agent_id,alias,created_at,hook_id,revoked_at,tenant_id", `columns ${names}`);
+    assert(names === "activated_at,agent_id,alias,created_at,hook_id,revoked_at,tenant_id", `columns ${names}`);
   });
 
   add("a hook resolves to its agent's mount until it is revoked, and a revoke reports the row once", async () => {
@@ -41,6 +41,57 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert((await hooks.lookup("h1")) === null, "a revoked hook still resolves");
     const [row] = await hooks.list("t-1", "a-1");
     assert(row?.revokedAt !== null && row.hookId === "h1", `list ${JSON.stringify(row)}`);
+  });
+
+  add("hook_grants has exactly the columns the grant queries read", async () => {
+    const { results } = await db.prepare("PRAGMA table_info(hook_grants)").all();
+    const names = (results as any[]).map((r) => String(r.name)).sort().join(",");
+    assert(names === "created_at,expires_at,grant_hash,hook_id,nonce,outcome,used_at,version", `columns ${names}`);
+  });
+
+  add("a pending hook does not resolve until its first secret is stored, and can be revoked while it waits", async () => {
+    await hooks.create({ hookId: "p1", tenantId: "t-1", agentId: "a-1", alias: "raft" }, { pending: true });
+    assert((await hooks.lookup("p1")) === null, "a pending hook resolved");
+    const live = await hooks.lookupLive("p1");
+    assert(live?.pending === true && live.alias === "raft", `lookupLive ${JSON.stringify(live)}`);
+    assert((await hooks.activate("p1")) === true, "activate did nothing");
+    assert((await hooks.activate("p1")) === false, "a second activate reported a change");
+    assert((await hooks.lookup("p1"))?.agentId === "a-1", "an activated hook does not resolve");
+    await hooks.create({ hookId: "p2", tenantId: "t-1", agentId: "a-1", alias: "raft" }, { pending: true });
+    assert((await hooks.revoke("p2"))?.hookId === "p2", "a pending hook could not be revoked");
+    assert((await hooks.activate("p2")) === false && (await hooks.lookupLive("p2")) === null, "a revoked pending hook came back");
+    const plain = await hooks.create({ hookId: "g1", tenantId: "t-1", agentId: "a-1", alias: "gh" });
+    assert(plain === undefined && (await hooks.lookup("g1"))?.alias === "gh", "a hook created with its secret did not resolve at once");
+  });
+
+  add("a grant writes once, only for its hook, version and nonce, and only before it expires", async () => {
+    const t0 = clock;
+    await hooks.grant({ grantHash: "g", hookId: "h1", version: 1, nonce: "n", expiresAt: t0 + 1_000 });
+    assert((await hooks.grantState("g", "h1"))?.state === "unused", "a fresh grant is not unused");
+    assert((await hooks.grantState("g", "h2")) === null, "a grant read back for another hook");
+    assert((await hooks.useGrant("g", "h2", 1, "n")) === null, "used for another hook");
+    assert((await hooks.useGrant("g", "h1", 2, "n")) === null, "used for another version");
+    assert((await hooks.useGrant("g", "h1", 1, "m")) === null, "used with another nonce");
+    assert((await hooks.useGrant("x", "h1", 1, "n")) === null, "an unknown grant was used");
+    assert((await hooks.useGrant("g", "h1", 1, "n"))?.version === 1, "the right write was refused");
+    assert((await hooks.useGrant("g", "h1", 1, "n")) === null, "a grant wrote twice");
+    assert((await hooks.grantState("g", "h1"))?.state === "in_progress", "a used, unfinished grant");
+    await hooks.finishGrant("g", "stored");
+    await hooks.finishGrant("g", "something later");
+    const st = await hooks.grantState("g", "h1");
+    assert(st?.state === "stored" && st.reason === null && st.usedAt !== null, `finished ${JSON.stringify(st)}`);
+    await hooks.grant({ grantHash: "f", hookId: "h1", version: 2, nonce: "n", expiresAt: clock + 1_000 });
+    await hooks.useGrant("f", "h1", 2, "n");
+    await hooks.finishGrant("f", "no mount named raft");
+    const failed = await hooks.grantState("f", "h1");
+    assert(failed?.state === "failed" && failed.reason === "no mount named raft", `failed ${JSON.stringify(failed)}`);
+    assert((await hooks.useGrant("f", "h1", 2, "n")) === null, "a failed grant wrote again");
+    await hooks.grant({ grantHash: "e", hookId: "h1", version: 3, nonce: "n", expiresAt: clock + 2 });
+    clock += 10;
+    assert((await hooks.useGrant("e", "h1", 3, "n")) === null, "an expired grant was used");
+    assert((await hooks.grantState("e", "h1"))?.state === "expired", "an expired grant did not say so");
+    assert((await hooks.finishGrant("e", "stored")) === undefined && (await hooks.grantState("e", "h1"))?.state === "expired",
+      "an unused grant was finished");
   });
 
   add("an agent's hook list holds only that agent's hooks", async () => {

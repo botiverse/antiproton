@@ -63,8 +63,10 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
-import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
-import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
+import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type HookDirectory, type IdentityDirectory } from "./control-plane.ts";
+import {
+  HOOK_SECRET_PATTERN, inboundStatus, lowerHeaders, newGrantNonce, newHookGrant, newHookId, readCapped, sha256Hex,
+} from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -1649,6 +1651,21 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("adminAddMount", () => this.runtime().addMount(tenantId, agentId, seed));
   }
 
+  async hookPutSecret(tenantId: string, agentId: string, alias: string, hookId: string, version: number, secret: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookPutSecret", () => this.runtime().putHookSecret(tenantId, agentId, alias, hookId, version, secret));
+  }
+
+  async hookSecretVersion(tenantId: string, agentId: string, hookId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookSecretVersion", () => this.runtime().hookSecretVersion(tenantId, agentId, hookId));
+  }
+
+  async hookReceiveBlocked(tenantId: string, agentId: string, alias: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookReceiveBlocked", () => this.runtime().receiveBlocked(tenantId, agentId, alias));
+  }
+
   async hookDropSecret(tenantId: string, agentId: string, hookId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
@@ -2392,9 +2409,26 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
     if (row) await stubFor(row.tenantId, row.agentId).hookDropSecret(row.tenantId, row.agentId, row.hookId);
     return Response.json({ revoked: !!row });
   }
+  if (typeof b?.rotate === "string") {
+    // The next secret version, written by the service itself with this grant.
+    const row = await dir.lookupLive(b.rotate);
+    if (!row || row.pending) return Response.json({ error: "no live hook with a secret by that id" }, { status: 404 });
+    const at = await stubFor(row.tenantId, row.agentId).hookSecretVersion(row.tenantId, row.agentId, row.hookId);
+    if (at.generatedHere) return Response.json({ error: "this hook's secret was generated here; it has no versions to rotate" }, { status: 400 });
+    return issueGrant(dir, url, row.hookId, b?.grant, at.current + 1);
+  }
   const tenantId = String(b?.tenantId ?? ""), agentId = String(b?.agentId ?? ""), alias = String(b?.alias ?? "");
   try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
   if (!alias) return Response.json({ error: "expected an alias" }, { status: 400 });
+  if (b?.grant !== undefined) {
+    // The service brings the secret: the hook waits, unresolvable, until the
+    // grant's one write stores version 1.
+    const blocked = await stubFor(tenantId, agentId).hookReceiveBlocked(tenantId, agentId, alias);
+    if (blocked) return Response.json({ error: blocked }, { status: 400 });
+    const hookId = newHookId();
+    await dir.create({ hookId, tenantId, agentId, alias }, { pending: true });
+    return issueGrant(dir, url, hookId, b.grant, 1, { tenantId, agentId, alias });
+  }
   const hookId = newHookId();
   // The secret first: a URL that exists always has a secret behind it.
   const made = await stubFor(tenantId, agentId).hookCreateSecret(tenantId, agentId, alias, hookId);
@@ -2422,6 +2456,91 @@ async function adminMounts(request: Request, env: Env): Promise<Response> {
   const r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)))
     .adminAddMount(tenantId, agentId, { alias: String(b?.alias ?? ""), plugin: String(b?.plugin ?? ""), config });
   return r.ok ? Response.json({ added: r.added }) : Response.json({ error: r.error }, { status: 400 });
+}
+
+/** Grants live minutes: long enough for one service call, short enough that a leaked one is stale. */
+const GRANT_TTL_MAX_S = 600;
+
+async function hookEndpointHash(origin: string, hookId: string): Promise<string> {
+  return sha256Hex(`${origin}/hooks/${hookId}`);
+}
+
+/**
+ * Issue a grant to write `version` of a hook's secret. The grant is in this
+ * response and nowhere else; the table keeps its hash. The version is the
+ * deployment's to name, so a service cannot skip or reuse one.
+ */
+async function issueGrant(dir: HookDirectory, url: URL, hookId: string, ask: any, version: number,
+  where?: { tenantId: string; agentId: string; alias: string }): Promise<Response> {
+  const wanted = ask?.version;
+  if (wanted !== undefined && wanted !== version) {
+    return Response.json({ error: `the next version is ${version}, not ${JSON.stringify(wanted)}` }, { status: 400 });
+  }
+  const ttl = ask?.ttlSeconds === undefined ? 300 : Number(ask.ttlSeconds);
+  if (!Number.isInteger(ttl) || ttl < 30 || ttl > GRANT_TTL_MAX_S) {
+    return Response.json({ error: `ttlSeconds is a whole number from 30 to ${GRANT_TTL_MAX_S}` }, { status: 400 });
+  }
+  const grant = newHookGrant(), nonce = newGrantNonce();
+  const expiresAt = Date.now() + ttl * 1000;
+  await dir.grant({ grantHash: await sha256Hex(grant), hookId, version, nonce, expiresAt });
+  return Response.json({
+    hookId, url: `${url.origin}/hooks/${hookId}`, endpointHash: await hookEndpointHash(url.origin, hookId),
+    grant, version, nonce, expiresAt, ...(where ?? {}),
+  });
+}
+
+/**
+ * `/hooks/<id>/secret`: a service writing the secret it generated.
+ *   PUT {version, nonce, secret}, Authorization: Bearer <grant>  -> 201 receipt
+ *   GET, the same bearer                                         -> the grant's state
+ * The grant is used before anything is stored, so it writes once whatever
+ * happens next; a failure after that is recorded, and the hook stays
+ * unresolvable (an operator revokes it and issues a new one). A GET only
+ * reads: a used grant never writes again.
+ */
+async function hookSecretRoute(request: Request, env: Env, url: URL, hookId: string): Promise<Response> {
+  const bearer = bearerKey(request);
+  if (!bearer) return Response.json({ error: "a grant is required" }, { status: 401 });
+  const grantHash = await sha256Hex(bearer);
+  const dir = d1InboundHooks(env.CONTROL_DB);
+  const hook = await dir.lookupLive(hookId);
+  if (!hook) return new Response(null, { status: 404 });
+  if (request.method === "GET") {
+    const st = await dir.grantState(grantHash, hookId);
+    if (!st) return Response.json({ error: "no such grant for this hook" }, { status: 401 });
+    return Response.json({ registrationId: hookId, ...st });
+  }
+  if (request.method !== "PUT") return new Response(null, { status: 405, headers: { allow: "PUT, GET" } });
+  const read = await readCapped(request, 4096);
+  if (!read.ok) return Response.json({ error: "the body is over 4 KB" }, { status: 413 });
+  let b: any;
+  try { b = JSON.parse(new TextDecoder().decode(read.body)); } catch { b = null; }
+  const version = b?.version, nonce = b?.nonce, secret = b?.secret;
+  if (!b || typeof b !== "object" || !Number.isSafeInteger(version) || typeof nonce !== "string" || typeof secret !== "string") {
+    return Response.json({ error: "expected {version, nonce, secret}" }, { status: 400 });
+  }
+  if (!HOOK_SECRET_PATTERN.test(secret)) {
+    return Response.json({ error: "secret is base64url, 32 to 256 bytes" }, { status: 400 });
+  }
+  const used = await dir.useGrant(grantHash, hookId, version, nonce);
+  if (!used) return Response.json({ error: "the grant is not valid for this write (unknown, used, expired, or another version or nonce)" }, { status: 401 });
+  let stored: { ok: true } | { ok: false; error: string };
+  try {
+    stored = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(hook.tenantId, hook.agentId)))
+      .hookPutSecret(hook.tenantId, hook.agentId, hook.alias, hookId, version, secret);
+  } catch (e: any) {
+    stored = { ok: false, error: `the agent could not store it: ${String(e?.message ?? e)}` };
+  }
+  if (!stored.ok) {
+    await dir.finishGrant(grantHash, stored.error);
+    return Response.json({ error: stored.error, state: "failed" }, { status: 409 });
+  }
+  // The secret first, then the hook: a URL that resolves always has one.
+  if (hook.pending) await dir.activate(hookId);
+  await dir.finishGrant(grantHash, "stored");
+  return Response.json({
+    registrationId: hookId, version, endpointHash: await hookEndpointHash(url.origin, hookId), at: Date.now(),
+  }, { status: 201 });
 }
 
 /** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
@@ -2681,6 +2800,8 @@ export default {
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
     // A service's push: addressed by the hook id alone, before any sign-in.
+    const secretPath = /^\/hooks\/([A-Za-z0-9_-]{43})\/secret$/.exec(url.pathname);
+    if (secretPath) return hookSecretRoute(request, env, url, secretPath[1]);
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
     if (url.pathname === "/admin/mounts") return adminMounts(request, env);
