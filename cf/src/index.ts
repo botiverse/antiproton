@@ -63,7 +63,8 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
-import { d1ApiKeys, admit, d1Identities, type IdentityDirectory } from "./control-plane.ts";
+import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
+import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
@@ -1652,6 +1653,36 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Hand a container back now. Refused while a job is running on that mount;
    *  the runtime says why, and the page shows it. */
+  // Inbound events (src/runtime/inbound.ts). The Worker has already found this
+  // object from the hook's public index; the object still refuses a foreign identity.
+  async hookCreateSecret(tenantId: string, agentId: string, alias: string, hookId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookCreateSecret", () => this.runtime().createHookSecret(tenantId, agentId, alias, hookId));
+  }
+
+  async hookDropSecret(tenantId: string, agentId: string, hookId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
+  }
+
+  async hookReceive(tenantId: string, agentId: string, alias: string, hookId: string,
+    event: { headers: Record<string, string>; body: Uint8Array } | null) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("hookReceive", async () => {
+      const r = await this.runtime().receiveHook(tenantId, agentId, alias, hookId, event);
+      if (r.outcome === "delivered") {
+        await this.ctx.storage.setAlarm(Date.now());
+        await this.broadcast();
+      }
+      return r;
+    });
+  }
+
+  async hookLog(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return this.runtime().inboundLog();
+  }
+
   async uiReleaseSandbox(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiReleaseSandbox", () => this.runtime().releaseMount(tenantId, agentId, alias));
@@ -2320,6 +2351,63 @@ async function adminApiKeys(request: Request, env: Env): Promise<Response> {
   return Response.json({ key, tenantId, ownerAgentId, label });
 }
 
+/**
+ * `POST /hooks/<id>`: an event a service pushed (src/runtime/inbound.ts).
+ * An unknown and a revoked hook answer alike, so the URL space cannot be
+ * mapped; past that, the agent's object records every request, and the
+ * plugin's reason stays there rather than in the response.
+ */
+async function inboundHook(request: Request, env: Env, url: URL): Promise<Response> {
+  const hookId = url.pathname.slice("/hooks/".length);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(hookId)) return new Response(null, { status: 404 });
+  if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
+  const hook = await d1InboundHooks(env.CONTROL_DB).lookup(hookId);
+  if (!hook) return new Response(null, { status: 404 });
+  const read = await readCapped(request);
+  const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(hook.tenantId, hook.agentId)));
+  const r = await stub.hookReceive(hook.tenantId, hook.agentId, hook.alias, hookId,
+    read.ok ? { headers: lowerHeaders(request.headers), body: read.body } : null);
+  return Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome) });
+}
+
+/**
+ * `/admin/hooks`, automation token only, until the console has a page:
+ *   POST {tenantId, agentId, alias}   -> {hookId, url, secret}  (the secret is shown this once)
+ *   POST {revoke: hookId}             -> {revoked}
+ *   GET  ?tenantId=&agentId=          -> {hooks, recent}
+ */
+async function adminHooks(request: Request, env: Env, url: URL): Promise<Response> {
+  if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  const dir = d1InboundHooks(env.CONTROL_DB);
+  const stubFor = (tenantId: string, agentId: string) =>
+    env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  if (request.method === "GET") {
+    const tenantId = url.searchParams.get("tenantId") ?? "", agentId = url.searchParams.get("agentId") ?? "";
+    try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+    return Response.json({ hooks: await dir.list(tenantId, agentId), recent: await stubFor(tenantId, agentId).hookLog(tenantId, agentId) });
+  }
+  if (request.method !== "POST") return Response.json({ error: "GET or POST" }, { status: 405 });
+  const b = (await request.json().catch(() => null)) as any;
+  if (typeof b?.revoke === "string") {
+    const row = await dir.revoke(b.revoke);
+    // The index first: once it is revoked no request reaches the secret, so
+    // dropping it after cannot race a delivery that still needs it.
+    if (row) await stubFor(row.tenantId, row.agentId).hookDropSecret(row.tenantId, row.agentId, row.hookId);
+    return Response.json({ revoked: !!row });
+  }
+  const tenantId = String(b?.tenantId ?? ""), agentId = String(b?.agentId ?? ""), alias = String(b?.alias ?? "");
+  try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  if (!alias) return Response.json({ error: "expected an alias" }, { status: 400 });
+  const hookId = newHookId();
+  // The secret first: a URL that exists always has a secret behind it.
+  const made = await stubFor(tenantId, agentId).hookCreateSecret(tenantId, agentId, alias, hookId);
+  if (!made.ok) return Response.json({ error: made.error }, { status: 400 });
+  await dir.create({ hookId, tenantId, agentId, alias });
+  return Response.json({ hookId, url: `${url.origin}/hooks/${hookId}`, secret: made.secret, tenantId, agentId, alias });
+}
+
 /** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
 async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const key = bearerKey(request);
@@ -2576,6 +2664,9 @@ export default {
     // The OpenAI-compatible agents API and its key issuance answer before any
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
+    // A service's push: addressed by the hook id alone, before any sign-in.
+    if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
+    if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.

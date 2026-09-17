@@ -6,6 +6,7 @@ import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
+import type { InboundEvent, InboundResult, ReceiveHook } from "./inbound.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
  *  checkpoint, the trajectory, or a model prompt. */
@@ -647,6 +648,33 @@ export class ToolGateway {
     const { plugin, context } = await this.#backgroundTarget(ctx, alias);
     if (!plugin.cancelBackground) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot stop it`);
     await plugin.cancelBackground(handle, context);
+  }
+
+  /**
+   * An event a service pushed at this mount's hook (src/runtime/inbound.ts).
+   * The plugin checks it with the hook's secret and says what, if anything,
+   * the agent should read. Never a tool: the model cannot call it, and the
+   * context is the one a call on this mount would get, with no task.
+   * Null when the mount is gone or its plugin cannot receive.
+   */
+  async receive(tenantId: string, agentId: string, alias: string, event: InboundEvent, secret: string):
+    Promise<InboundResult | null> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return null;
+    const plugin = this.#plugins.get(mount.plugin) as (Plugin & { receive?: ReceiveHook }) | undefined;
+    if (!plugin?.receive) return null;
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+      : null;
+    const context = this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential);
+    return plugin.receive(event, secret, context);
+  }
+
+  /** Whether this mount's plugin can take pushed events at all. */
+  async canReceive(tenantId: string, agentId: string, alias: string): Promise<boolean> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) as (Plugin & { receive?: ReceiveHook }) | undefined : undefined;
+    return typeof plugin?.receive === "function";
   }
 
   /**

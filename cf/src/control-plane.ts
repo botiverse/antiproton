@@ -188,3 +188,54 @@ export function d1ApiKeys(db: D1Database, now: () => number = Date.now): ApiKeyD
     },
   };
 }
+
+/** A hook's public index row: which agent's mount its URL reaches. */
+export interface HookRow {
+  hookId: string;
+  tenantId: string;
+  agentId: string;
+  alias: string;
+  createdAt: number;
+  revokedAt: number | null;
+}
+
+export interface HookDirectory {
+  create(row: { hookId: string; tenantId: string; agentId: string; alias: string }): Promise<void>;
+  /** A hook resolves only while it is not revoked. */
+  lookup(hookId: string): Promise<Omit<HookRow, "createdAt" | "revokedAt"> | null>;
+  /** The revoked row, or null if there was no live hook by that id. */
+  revoke(hookId: string): Promise<Omit<HookRow, "createdAt" | "revokedAt"> | null>;
+  /** One agent's hooks, newest first, revoked ones included. */
+  list(tenantId: string, agentId: string): Promise<HookRow[]>;
+}
+
+export function d1InboundHooks(db: D1Database, now: () => number = Date.now): HookDirectory {
+  const row = (r: any) => ({ hookId: String(r.hook_id), tenantId: String(r.tenant_id), agentId: String(r.agent_id), alias: String(r.alias) });
+  return {
+    async create(r) {
+      await db.prepare("INSERT INTO inbound_hooks(hook_id, tenant_id, agent_id, alias, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(r.hookId, r.tenantId, r.agentId, r.alias, now()).run();
+    },
+    async lookup(hookId) {
+      const r: any = await db.prepare(
+        "SELECT hook_id, tenant_id, agent_id, alias FROM inbound_hooks WHERE hook_id = ? AND revoked_at IS NULL",
+      ).bind(hookId).first();
+      return r ? row(r) : null;
+    },
+    async revoke(hookId) {
+      // One statement, so two revokes at once cannot both report the row.
+      const r: any = await db.prepare(
+        "UPDATE inbound_hooks SET revoked_at = ? WHERE hook_id = ? AND revoked_at IS NULL RETURNING hook_id, tenant_id, agent_id, alias",
+      ).bind(now(), hookId).first();
+      return r ? row(r) : null;
+    },
+    async list(tenantId, agentId) {
+      const { results } = await db.prepare(
+        "SELECT * FROM inbound_hooks WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC, hook_id",
+      ).bind(tenantId, agentId).all();
+      return (results as any[]).map((r) => ({
+        ...row(r), createdAt: Number(r.created_at), revokedAt: r.revoked_at === null ? null : Number(r.revoked_at),
+      }));
+    },
+  };
+}
