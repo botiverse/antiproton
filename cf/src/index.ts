@@ -113,6 +113,8 @@ export interface Env {
   RUN9_WARN_MINUTES?: string;
   RUN9_MAX_IDLE_MINUTES?: string;
   UI_ORIGIN?: string;
+  /** The public origin hook URLs a plugin makes point at. Unset: plugins cannot make hooks. */
+  HOOK_ORIGIN?: string;
   /** The commit this Worker was built from, set per deploy by
    *  cf/scripts/deploy.sh (`--var GIT_COMMIT:<sha>`); whoami shows it, and
    *  the bench drivers write it into every record. A record that names its
@@ -388,6 +390,11 @@ export class AgentDO extends DurableObject<Env> {
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       secretKek: this.env.SECRET_KEK,
+      // Plugins may make their own mount's hooks (Raft push); the URL must be
+      // one a service can reach, which the console's own origin may not be.
+      hooks: this.env.HOOK_ORIGIN
+        ? { origin: this.env.HOOK_ORIGIN, directory: d1InboundHooks(this.env.CONTROL_DB) }
+        : undefined,
       // Native tool calling by default. The alternative asks the model to
       // reply in a convention invented here, and a model under any pressure
       // falls back to the one it was trained on — four different markups

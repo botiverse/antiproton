@@ -61,6 +61,8 @@
     // will tighten when needed (tygg, 2026-09-12 04:54Z). Set to 0 to close.
     "GITHUB_OPEN_SIGNUP": "1",
     "UI_ORIGIN": "https://antiproton.ai",
+    // Where hook URLs a plugin makes point (Raft push). antiproton.ai has no Access gate in front.
+    "HOOK_ORIGIN": "https://antiproton.ai",
     // The container lease (tygg, 2026-09-15 11:28Z: a container is destroyed by
     // the agent's own release, not by the end of a turn). Kept between turns;
     // after 30 idle minutes it is released, and 5 minutes before that the agent
