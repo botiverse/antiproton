@@ -268,7 +268,12 @@ and `receive` turns a webhook delivery into a short message. It delivers:
    into the turn it is already running.
 
 Every event leaves a row in the agent's event record (kept 7 days) with its
-outcome and reason. The service only sees the status code:
+outcome and reason. The service only sees the status code. When an expected
+event never arrived, read the record with
+`GET /admin/hooks?tenantId=…&agentId=…`, which lists the agent's hooks and
+its recent events. `POST /admin/hooks` with `{ "revoke": "<hookId>" }`
+revokes a hook.
+
 
 | Outcome | Status | When |
 |---|---|---|
@@ -341,4 +346,6 @@ one failure; then restore it. A case that cannot go red guards nothing. Run
 | Examples | `src/plugins/demo.ts`, `http.ts`, `github.ts` |
 | Settings and activity tests | `test/mount-config.ts` |
 | Version and plugin-id refusals | `test/mount-pin.ts` |
-| Pushed events: route, limits, record | `src/runtime/inbound.ts`, `cf/src/index.ts` |
+| Pushed events: limits and statuses | `src/runtime/inbound.ts` |
+| Pushed events: route and admin calls | `cf/src/index.ts` |
+| Pushed events: mount check, delivery, record | `cf/src/runtime.ts` (`receiveHook`), `src/runtime/gateway.ts` |
