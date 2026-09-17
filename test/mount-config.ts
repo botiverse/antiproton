@@ -184,6 +184,25 @@ const everyPlugin: Plugin[] = [
   ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
 ];
 
+await check("every plugin the runtime registers is in everyPlugin", () => {
+  // The checks below run over this list, and it is written by hand: a plugin
+  // added to the runtime and not here is skipped by all of them, silently —
+  // the list still passes, it just stops describing production. So the list is
+  // compared with what the runtime actually registers, the way
+  // `test/plugin-enable.ts` builds one.
+  const rt = new AgentRuntime({
+    ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b",
+    models: { resolve: () => null } as any,
+  } as any);
+  const registered = rt.plugins().map((p) => p.id);
+  if (registered.length === 0) throw new Error("the runtime registered nothing, so this compares nothing");
+  const listed = new Set(everyPlugin.map((p) => p.id));
+  const missing = registered.filter((id) => !listed.has(id));
+  if (missing.length) {
+    throw new Error(`registered but not in everyPlugin, so no check below covers them: ${missing.join(", ")}`);
+  }
+});
+
 await check("no plugin takes a credential as a setting", () => {
   for (const plugin of everyPlugin) {
     const form = credentialForm(plugin.credential);
