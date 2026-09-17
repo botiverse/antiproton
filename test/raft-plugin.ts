@@ -403,7 +403,45 @@ await check("enable_push preserves an ambiguous new registration for recovery wi
   if (m.inbound.revoked.length !== 0) throw new Error(`ambiguous hook was revoked: ${m.inbound.revoked}`);
 });
 
-await check("a successful replacement revokes every superseded hook only after the new registration lands", async () => {
+await check("enable_push recovers after three ambiguous registrations without exhausting hook capacity", async () => {
+  let serial = 0;
+  const active = new Set<string>();
+  const inbound = {
+    api: {
+      create: async () => {
+        if (active.size >= 3) throw new Error("already has 3 live hooks");
+        const hookId = `hook-${++serial}`;
+        active.add(hookId);
+        return { hookId, url: `https://hooks.example/${hookId}`, secret: `hook-secret-${serial}` };
+      },
+      revoke: async (hookId: string) => active.delete(hookId),
+    },
+    revoked: [],
+  };
+  let registrations = 0;
+  globalThis.fetch = (async (url: any) => {
+    if (String(url) === "https://raft.example/internal/agent-api") {
+      return json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" });
+    }
+    registrations++;
+    if (registrations <= 3) throw new Error("private transport detail");
+    return json(200, { ok: true });
+  }) as any;
+  const m = mount(null, inbound);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
+    if (!/may already have landed/.test(why.message)) throw why;
+  }
+  const enabled = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
+  if (!enabled.enabled || enabled.registration !== "active" || active.size !== 1 || !active.has("hook-4")) {
+    throw new Error(JSON.stringify({ enabled, active: [...active], state: m.state() }));
+  }
+  if (m.state().hookId !== "hook-4" || m.state().staleHookIds.length !== 0) {
+    throw new Error(JSON.stringify(m.state()));
+  }
+});
+
+await check("enable_push clears stale hooks before create and revokes the current hook after replacement", async () => {
   const order: string[] = [];
   const inbound = fakeInbound();
   const originalRevoke = inbound.api.revoke;
@@ -420,7 +458,7 @@ await check("a successful replacement revokes every superseded hook only after t
     staleHookIds: ["hook-older"], registration: "uncertain", lastReached: null,
   }, inbound);
   await raftPlugin.invoke("enable_push", {}, m.ctx);
-  if (order.join(",") !== "register:PUT,revoke:hook-old,revoke:hook-older") throw new Error(order.join(","));
+  if (order.join(",") !== "revoke:hook-older,register:PUT,revoke:hook-old") throw new Error(order.join(","));
   if (m.state().hookId !== "hook-1" || m.state().staleHookIds.length !== 0 || m.state().registration !== "active") {
     throw new Error(JSON.stringify(m.state()));
   }

@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext } from "./types.ts";
+import { INBOUND_HOOKS_PER_MOUNT, type Plugin, type PluginContext } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -45,7 +45,8 @@ function pushState(value: unknown): PushState {
   const state = object(value);
   const reached = object(state.lastReached);
   const staleHookIds = Array.isArray(state.staleHookIds)
-    ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_EVENT_ID.test(value)))].slice(0, 2)
+    ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_EVENT_ID.test(value)))]
+      .slice(0, INBOUND_HOOKS_PER_MOUNT - 1)
     : [];
   return {
     enabled: state.enabled === true,
@@ -193,7 +194,7 @@ function retainHookForCleanup(state: PushState, hookId: string): PushState {
   if (!state.hookId) return { ...state, hookId };
   return {
     ...state,
-    staleHookIds: [...new Set([...state.staleHookIds, hookId])].slice(0, 2),
+    staleHookIds: [...new Set([...state.staleHookIds, hookId])].slice(0, INBOUND_HOOKS_PER_MOUNT - 1),
   };
 }
 
@@ -435,7 +436,15 @@ export const raftPlugin: Plugin = {
     if (name === "enable_push") {
       if (!ctx.inbound) throw new Error("this deployment cannot receive pushed Raft events");
       const identity = await raftIdentity(ctx);
-      const current = await loadPushState(ctx);
+      let current = await loadPushState(ctx);
+      if (current.staleHookIds.length > 0) {
+        const staleHookIds = await revokeHooks(ctx, current.staleHookIds);
+        current = { ...current, staleHookIds };
+        await savePushState(ctx, current);
+        if (staleHookIds.length > 0) {
+          throw retryable(new Error("superseded Raft push endpoints could not be cleaned up; try enable_push again"));
+        }
+      }
       const created = await ctx.inbound.create();
       const replaced = hookIds(current);
       try {
@@ -448,7 +457,7 @@ export const raftPlugin: Plugin = {
             agentId: identity.agentId,
             agentName: identity.agentName,
             hookId: created.hookId,
-            staleHookIds: replaced.slice(0, 2),
+            staleHookIds: replaced.slice(0, INBOUND_HOOKS_PER_MOUNT - 1),
             registration: "uncertain",
           });
         } else {
@@ -463,7 +472,7 @@ export const raftPlugin: Plugin = {
         agentId: identity.agentId,
         agentName: identity.agentName,
         hookId: created.hookId,
-        staleHookIds: replaced.slice(0, 2),
+        staleHookIds: replaced.slice(0, INBOUND_HOOKS_PER_MOUNT - 1),
         registration: "active",
       };
       await savePushState(ctx, next);
