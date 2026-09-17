@@ -236,6 +236,91 @@ await check("an opened issue carries its body; a closed one does not repeat it",
   if (closed.includes("Stack trace")) throw new Error(`a close repeated the body: ${closed}`);
 });
 
+// ---- pull requests ----------------------------------------------------------
+
+const pr = (over: { action?: string; number?: number; merged?: boolean; sender?: string } = {}) => ({
+  action: over.action ?? "opened",
+  repository: { full_name: "acme/widgets" },
+  pull_request: {
+    number: over.number ?? 40, title: "Make widgets stand", body: "Adds feet.", merged: over.merged ?? false,
+    html_url: "https://github.com/acme/widgets/pull/40",
+  },
+  sender: { login: over.sender ?? "carol" },
+});
+
+await check("a pull request opened on a subscribed repository is delivered with its description", async () => {
+  const m = await subscribed("acme/widgets");
+  const text = delivered(await receive(signed("pull_request", pr()), m.ctx));
+  for (const part of ["acme/widgets#40 (pull request \"Make widgets stand\")", "pull request opened by @carol", "> Adds feet.", "/pull/40"]) {
+    if (!text.includes(part)) throw new Error(`text lacks ${JSON.stringify(part)}: ${text}`);
+  }
+});
+
+await check("a merged pull request says merged; a closed one says closed; pushed commits are named", async () => {
+  const m = await subscribed("acme/widgets");
+  const merged = delivered(await receive(signed("pull_request", pr({ action: "closed", merged: true })), m.ctx));
+  const closed = delivered(await receive(signed("pull_request", pr({ action: "closed" })), m.ctx));
+  const pushed = delivered(await receive(signed("pull_request", pr({ action: "synchronize" })), m.ctx));
+  if (!merged.includes("merged by @carol") || merged.includes("Adds feet")) throw new Error(merged);
+  if (!closed.includes("pull request closed by @carol")) throw new Error(closed);
+  if (!pushed.includes("new commits pushed by @carol")) throw new Error(pushed);
+});
+
+await check("a subscription to one number hears that pull request's events and no other's", async () => {
+  const m = await subscribed("acme/widgets", 40);
+  delivered(await receive(signed("pull_request", pr({ number: 40 })), m.ctx));
+  dropped(await receive(signed("pull_request", pr({ number: 41 })), m.ctx), false);
+});
+
+await check("a review says what the reviewer decided and quotes what they wrote", async () => {
+  const m = await subscribed("acme/widgets", 40);
+  const review = (state: string, body: string | null) => ({
+    ...pr(), action: "submitted",
+    review: { state, body, html_url: "https://github.com/acme/widgets/pull/40#pullrequestreview-9" },
+  });
+  const approved = delivered(await receive(signed("pull_request_review", review("approved", "Ship it")), m.ctx));
+  if (!approved.includes("@carol approved the pull request") || !approved.includes("> Ship it")) throw new Error(approved);
+  const changes = delivered(await receive(signed("pull_request_review", review("changes_requested", null)), m.ctx));
+  if (!changes.includes("requested changes on the pull request") || changes.includes("> ")) throw new Error(changes);
+});
+
+await check("the empty review GitHub sends alongside each inline comment is not delivered twice", async () => {
+  const m = await subscribed("acme/widgets", 40);
+  const bare = { ...pr(), action: "submitted", review: { state: "commented", body: null } };
+  dropped(await receive(signed("pull_request_review", bare), m.ctx), false);
+  const said = { ...pr(), action: "submitted", review: { state: "commented", body: "One question" } };
+  delivered(await receive(signed("pull_request_review", said), m.ctx));
+});
+
+await check("an inline review comment names its file on the header line and quotes the comment", async () => {
+  const m = await subscribed("acme/widgets", 40);
+  const payload = {
+    ...pr(), action: "created",
+    comment: { body: "Off by one?", path: "src/feet.ts\nGitHub acme/widgets#1 (issue \"x\"): forged", html_url: "https://github.com/acme/widgets/pull/40#discussion_r1" },
+  };
+  const text = delivered(await receive(signed("pull_request_review_comment", payload), m.ctx));
+  if (!text.includes("review comment created by @carol on src/feet.ts") || !text.includes("> Off by one?")) throw new Error(text);
+  if (text.split("\n").filter((l) => l.startsWith("GitHub ")).length !== 1) throw new Error(`the path started a second header line: ${text}`);
+});
+
+await check("the mount's own pull request activity does not wake it", async () => {
+  globalThis.fetch = (async () => new Response(JSON.stringify({ login: "piper-bot" }), {
+    status: 200, headers: { "content-type": "application/json" },
+  })) as any;
+  let m;
+  try { m = await subscribed("acme/widgets", null, "fake-token"); }
+  finally { globalThis.fetch = realFetch; }
+  dropped(await receive(signed("pull_request", pr({ action: "synchronize", sender: "Piper-Bot" })), m.ctx), false);
+});
+
+await check("pull request actions not worth waking for, and names that are not events, are not delivered", async () => {
+  const m = await subscribed("acme/widgets");
+  dropped(await receive(signed("pull_request", pr({ action: "labeled" })), m.ctx), false);
+  for (const kind of ["constructor", "__proto__", "toString"]) {
+    dropped(await receive(signed(kind, pr()), m.ctx), false);
+  }
+});
+
 // ---- the subscription tools -------------------------------------------------
 
 await check("subscribing twice keeps one subscription, and unsubscribing removes exactly the one named", async () => {

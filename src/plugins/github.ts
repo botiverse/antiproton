@@ -240,9 +240,82 @@ const MAX_SUBSCRIPTIONS = 50;
 /** How much of a stranger's text reaches the agent. Enough to decide whether to look. */
 const QUOTE_CHARS = 500;
 const TITLE_CHARS = 200;
-/** What is worth waking an agent for. Labels and assignments are not, yet. */
-const ISSUE_ACTIONS = new Set(["opened", "edited", "closed", "reopened", "deleted", "transferred"]);
-const COMMENT_ACTIONS = new Set(["created", "edited", "deleted"]);
+/** On one line, whatever it holds: a newline in a title or path could start a line that reads as the plugin's own. */
+const oneLine = (s: unknown, n: number) => clip(String(s ?? "").replace(/\s+/g, " "), n);
+
+/**
+ * The events that wake an agent, and how each is told.
+ *
+ * Pull requests and issues share one number space, so a subscription to a
+ * number covers either; what differs is where GitHub puts the thing in the
+ * payload. `subject` finds it, `tell` says what happened and what to quote.
+ * Labels and assignments are not worth waking for, yet.
+ *
+ * A comment on a pull request's conversation arrives as `issue_comment`, not
+ * as a pull request event, which is why the pull request half was needed only
+ * for everything else.
+ */
+interface EventRule {
+  actions: Set<string>;
+  subject: (p: any) => any;
+  tell: (p: any, sender: string) => { says: string; quote?: unknown; url?: unknown } | null;
+}
+const REVIEW_STATE: Record<string, string> = {
+  approved: "approved", changes_requested: "requested changes on", commented: "reviewed", dismissed: "had a review dismissed on",
+};
+const EVENTS: Record<string, EventRule> = {
+  issues: {
+    actions: new Set(["opened", "edited", "closed", "reopened", "deleted", "transferred"]),
+    subject: (p) => p?.issue,
+    tell: (p, by) => ({
+      says: `${p.issue?.pull_request ? "pull request" : "issue"} ${p.action} by @${by}`,
+      quote: p.action === "opened" || p.action === "edited" ? p.issue?.body : undefined,
+      url: p.issue?.html_url,
+    }),
+  },
+  issue_comment: {
+    actions: new Set(["created", "edited", "deleted"]),
+    subject: (p) => p?.issue,
+    tell: (p, by) => ({
+      says: `comment ${p.action} by @${by}`,
+      quote: p.action === "deleted" ? undefined : p.comment?.body,
+      url: p.comment?.html_url,
+    }),
+  },
+  pull_request: {
+    actions: new Set(["opened", "edited", "closed", "reopened", "ready_for_review", "synchronize"]),
+    subject: (p) => p?.pull_request,
+    tell: (p, by) => ({
+      says: p.action === "closed" && p.pull_request?.merged ? `pull request merged by @${by}`
+        : p.action === "synchronize" ? `new commits pushed by @${by}`
+        : p.action === "ready_for_review" ? `pull request marked ready for review by @${by}`
+        : `pull request ${p.action} by @${by}`,
+      quote: p.action === "opened" || p.action === "edited" ? p.pull_request?.body : undefined,
+      url: p.pull_request?.html_url,
+    }),
+  },
+  pull_request_review: {
+    actions: new Set(["submitted", "dismissed"]),
+    subject: (p) => p?.pull_request,
+    tell: (p, by) => {
+      const state = String(p.review?.state ?? "").toLowerCase();
+      // Each inline comment also arrives as a bodiless "commented" review; the
+      // comment itself is the event worth reading, so this one is dropped.
+      if (p.action === "submitted" && state === "commented" && !String(p.review?.body ?? "").trim()) return null;
+      const verb = p.action === "dismissed" ? REVIEW_STATE.dismissed : REVIEW_STATE[state] ?? "reviewed";
+      return { says: `@${by} ${verb} the pull request`, quote: p.review?.body || undefined, url: p.review?.html_url };
+    },
+  },
+  pull_request_review_comment: {
+    actions: new Set(["created", "edited", "deleted"]),
+    subject: (p) => p?.pull_request,
+    tell: (p, by) => ({
+      says: `review comment ${p.action} by @${by} on ${oneLine(p.comment?.path, TITLE_CHARS)}`,
+      quote: p.action === "deleted" ? undefined : p.comment?.body,
+      url: p.comment?.html_url,
+    }),
+  },
+};
 
 async function inboundOf(ctx: PluginContext): Promise<Inbound> {
   const state = (await ctx.connection.get()) as { inbound?: Inbound } | null;
@@ -369,7 +442,7 @@ export const githubPlugin: Plugin = {
     // create the webhook: that needs admin rights on the repository, so for now
     // a person adds it in the repository's settings with this mount's inbound
     // URL and secret. Both are writes, so a mount's policy can hold them.
-    t("issue_subscribe", "Be told when something happens on an issue, or on any issue or pull request in a repository if number is omitted: opened, edited, closed, reopened, commented. Events arrive as messages, with no need to poll. Needs a webhook on the repository pointing at this mount, which a person adds; issue_subscriptions shows whether one has reached it.", {
+    t("issue_subscribe", "Be told when something happens on an issue or pull request (they share numbers), or on every one in a repository if number is omitted: opened, edited, closed, merged, reopened, new commits, comments, reviews and review comments. Events arrive as messages, with no need to poll. Needs a webhook on the repository pointing at this mount, which a person adds; issue_subscriptions shows whether one has reached it.", {
       ...REPO_ARG, number: { type: "integer", description: "omit to hear about every issue and pull request in the repository" },
     }, ["repo"], "write", "native"),
     t("issue_unsubscribe", "Stop being told about an issue, or about a repository if number is omitted. Removes exactly the subscription named.", {
@@ -478,13 +551,13 @@ export const githubPlugin: Plugin = {
     await saveInbound(ctx, inbound);
     if (kind === "ping") return { deliver: false, reason: "ping: the webhook reaches this mount" };
 
-    const actions = kind === "issues" ? ISSUE_ACTIONS : kind === "issue_comment" ? COMMENT_ACTIONS : null;
-    if (!actions) return { deliver: false, reason: `${kind || "an unnamed"} event: not one this plugin delivers` };
-    if (!actions.has(p?.action)) return { deliver: false, reason: `${kind} ${p?.action}: not an action worth waking the agent for` };
+    const rule = Object.hasOwn(EVENTS, kind) ? EVENTS[kind]! : null;
+    if (!rule) return { deliver: false, reason: `${kind || "an unnamed"} event: not one this plugin delivers` };
+    if (!rule.actions.has(p?.action)) return { deliver: false, reason: `${kind} ${p?.action}: not an action worth waking the agent for` };
 
     const repo = String(p?.repository?.full_name ?? "");
-    const issue = p?.issue ?? {};
-    const number = Number(issue.number);
+    const subject = rule.subject(p) ?? {};
+    const number = Number(subject.number);
     const sender = String(p?.sender?.login ?? "");
     if (!inbound.subscriptions.some((s) => sameRepo(s.repo, repo) && (s.number === null || s.number === number))) {
       return { deliver: false, reason: `${repo}#${number}: not subscribed` };
@@ -499,15 +572,13 @@ export const githubPlugin: Plugin = {
       return { deliver: false, reason: `${repo}#${number}: caused by this mount's own account` };
     }
 
-    const what = issue.pull_request ? "pull request" : "issue";
-    // One line, whatever the title holds: the header is the plugin's own line,
-    // and a title with a newline in it could otherwise start a second one.
-    const head = `GitHub ${repo}#${number} (${what} "${clip(String(issue.title ?? "").replace(/\s+/g, " "), TITLE_CHARS)}")`;
-    const lines = kind === "issues"
-      ? [`${head}: ${what} ${p.action} by @${sender}`, ...(p.action === "opened" || p.action === "edited" ? [quote(issue.body)] : [])]
-      : [`${head}: comment ${p.action} by @${sender}`, ...(p.action === "deleted" ? [] : [quote(p?.comment?.body)])];
-    const url = kind === "issue_comment" ? p?.comment?.html_url : issue.html_url;
-    if (url) lines.push(String(url));
+    const told = rule.tell(p, sender);
+    if (!told) return { deliver: false, reason: `${kind} ${p.action}: carries nothing the other events do not` };
+    const what = kind.startsWith("pull_request") || subject.pull_request ? "pull request" : "issue";
+    const head = `GitHub ${repo}#${number} (${what} "${oneLine(subject.title, TITLE_CHARS)}")`;
+    const lines = [`${head}: ${told.says}`];
+    if (String(told.quote ?? "").trim()) lines.push(quote(told.quote));
+    if (told.url) lines.push(String(told.url));
     const dedupeKey = event.headers["x-github-delivery"];
     return { deliver: true, text: lines.filter(Boolean).join("\n"), ...(dedupeKey ? { dedupeKey } : {}) };
   },
