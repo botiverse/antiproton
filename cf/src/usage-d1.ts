@@ -2,6 +2,11 @@
  * The tenant's hourly usage in D1: what agents send (`sendUsage`) and what the
  * dashboard reads (`readUsage`). The rows come from each agent's outbox
  * (src/usage/outbox.ts); migration 0005 made the tables.
+ *
+ * `usage_hourly` is never trimmed here. The outbox side is pruned on every
+ * send, bounded by the cursor; this side has no retention at all, and that is
+ * a gap rather than a decision — README's "What is not done" carries it, and
+ * folding whole hours into days past a cutoff is the intended fix.
  */
 import { pendingUsage, pruneUsage, toHourly, type OutboxRow } from "../../src/usage/outbox.ts";
 

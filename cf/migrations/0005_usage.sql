@@ -2,6 +2,8 @@
 -- Each agent's object sends its outbox (src/usage/outbox.ts) here once per turn; cf/src/usage-d1.ts
 -- reads and writes it, and test/control-plane-d1.sh runs both.
 
+-- No retention: nothing deletes or folds these rows yet. It grows with
+-- tenants x agents x hours x (resource, key, unit). See README, "What is not done".
 CREATE TABLE IF NOT EXISTS usage_hourly (
   tenant_id TEXT NOT NULL,
   hour      INTEGER NOT NULL,   -- start of the hour, ms since the epoch (UTC)
