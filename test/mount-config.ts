@@ -19,7 +19,7 @@ import { statePlugin } from "../src/plugins/state.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
-import { credentialForm } from "../src/plugins/types.ts";
+import { credentialForm, originProblem } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -176,6 +176,9 @@ await check("a credential field carries a label and says which part is secret", 
  * forgets to say fails here rather than in the console.
  */
 const CREDENTIAL_SHAPED = /token|secret|key|password|credential|auth|bearer/i;
+// The bench's `retail` plugin (an extraPlugins entry, not registered here) is
+// deliberately absent: it declares no settings, credential or hooks, so no
+// check below has anything to read. Add it when it gains any of them.
 const everyPlugin: Plugin[] = [
   githubPlugin, httpPlugin, demoPlugin, run9,
   statePlugin(null as any, null, "local"),
@@ -2211,6 +2214,78 @@ await check("without a lease, release promises nothing a lease would keep", asyn
   if (/leave it running|released on its own|`quiet`/.test(release)) throw new Error(`release promises the lease with none configured: ${release}`);
   if (!/handed back when the turn ends/.test(release)) throw new Error(`release does not say the box ends with the turn: ${release}`);
   if (!/will not be needed again/.test(release)) throw new Error(`release does not say when to release: ${release}`);
+});
+
+const ORIGIN_PLUGIN: Plugin = {
+  id: "remote", version: "1.0.0", tools: [],
+  config: [{ name: "serverUrl", type: "string", format: "origin", summary: "Where the credential goes." }],
+  async invoke() { return null; },
+};
+const LEGAL_ORIGINS = [
+  "https://api.example.com", "https://api.example.com/", "https://api.example.com:8443",
+  "http://localhost:8787", "http://127.0.0.1", "http://[::1]:3000/",
+];
+const ILLEGAL_ORIGINS = [
+  "https://api.example.com/x", "https://api.example.com?x=1", "https://api.example.com/?",
+  "https://api.example.com#top", "https://user:pw@api.example.com", "https://user@api.example.com",
+  "http://api.example.com", "http://10.0.0.1", "ftp://api.example.com", "file:///etc/passwd",
+  "api.example.com", "", "/internal",
+  // Parse to the right origin but are not written as one (cody, 2026-09-17).
+  "https:api.example.com", "https://api.example.com/.", "https://api.example.com/ ", " https://api.example.com",
+  "https://api.example.com:443", "https://API.example.com", "http://LOCALHOST:8787",
+];
+
+await check("a declared origin is refused at mount time when it has a path, query, user or plain http", () => {
+  for (const v of ILLEGAL_ORIGINS) {
+    const problems = validateMount(ORIGIN_PLUGIN, { serverUrl: v }, null);
+    if (problems.length !== 1 || problems[0]!.key !== "serverUrl") {
+      throw new Error(`${JSON.stringify(v)} was not refused once: ${JSON.stringify(problems)}`);
+    }
+  }
+  for (const v of LEGAL_ORIGINS) {
+    const problems = validateMount(ORIGIN_PLUGIN, { serverUrl: v }, null);
+    if (problems.length) throw new Error(`${JSON.stringify(v)} was refused: ${JSON.stringify(problems)}`);
+  }
+});
+
+await check("a refused origin says what is wrong with it, not only that it is wrong", () => {
+  // The exact-spelling rule refuses all of these on its own; the reasons are
+  // for the person at the console, so each is pinned here.
+  const said: Array<[string, RegExp]> = [
+    ["https://user@api.example.com", /user name or password/],
+    ["https://api.example.com/x", /no path, query or fragment/],
+    ["https://api.example.com/?", /no path, query or fragment/],
+    ["http://api.example.com", /must be https/],
+    ["api.example.com", /absolute URL/],
+    ["https://api.example.com:443", /written as https:\/\/api\.example\.com$/],
+  ];
+  for (const [v, want] of said) {
+    const got = originProblem(v);
+    if (!got || !want.test(got)) throw new Error(`${v}: ${got}`);
+  }
+});
+
+await check("an origin the mount accepted is one a plugin can call: every path stays on it", () => {
+  // The consumer's side (Vera's rule): accepting a value is only half; the way
+  // a plugin uses it — `new URL(path, origin)` — must land on that origin.
+  for (const v of LEGAL_ORIGINS) {
+    if (originProblem(v) !== null) throw new Error(`${v} is legal to the validator but not to originProblem`);
+    const origin = new URL(v).origin;
+    for (const path of ["/internal/agent-api", "/a/b?c=1", "x"]) {
+      const url = new URL(path, v);
+      if (url.origin !== origin) throw new Error(`${path} on ${v} went to ${url.origin}`);
+      if (!url.href.startsWith(`${origin}/`)) throw new Error(`${path} on ${v} became ${url.href}`);
+    }
+  }
+});
+
+await check("format is declared only on string settings", () => {
+  const wrong = everyPlugin.flatMap((p) => (p.config ?? [])
+    .filter((f) => f.format !== undefined && f.type !== "string").map((f) => `${p.id}.${f.name}`));
+  if (wrong.length) throw new Error(`format on a non-string setting: ${wrong.join(", ")}`);
+  const odd = { ...ORIGIN_PLUGIN, config: [{ ...ORIGIN_PLUGIN.config![0]!, type: "number" as const }] };
+  const problems = validateMount(odd, { serverUrl: 5 }, null);
+  if (problems.length) throw new Error(`a number setting was judged as an origin: ${JSON.stringify(problems)}`);
 });
 
 for (const r of results) {

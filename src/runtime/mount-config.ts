@@ -16,7 +16,7 @@
  * is a typo that survives, and there is no case where silently ignoring a
  * setting someone deliberately wrote is the helpful thing to do.
  */
-import type { ConfigField, Plugin } from "../plugins/types.ts";
+import { originProblem, type ConfigField, type Plugin } from "../plugins/types.ts";
 import type { Json } from "../core/types.ts";
 
 export interface MountProblem {
@@ -88,6 +88,8 @@ export function validateMount(
     if (field.choices && !field.choices.includes(String(value))) {
       problems.push({ key, message: `"${key}" should be one of ${field.choices.join(", ")}` });
     }
+    const bad = field.format === "origin" && typeof value === "string" ? originProblem(value) : null;
+    if (bad) problems.push({ key, message: `"${key}" ${bad}` });
   }
 
   for (const f of fields) {
