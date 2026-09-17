@@ -3,7 +3,7 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, MountActivity, MountUsage } from "../plugins/types.ts";
+import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundResult } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 
@@ -647,6 +647,49 @@ export class ToolGateway {
     const { plugin, context } = await this.#backgroundTarget(ctx, alias);
     if (!plugin.cancelBackground) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot stop it`);
     await plugin.cancelBackground(handle, context);
+  }
+
+  /**
+   * An event a service pushed at this mount's hook (src/runtime/inbound.ts).
+   * The plugin checks it with the hook's secret and says what, if anything,
+   * the agent should read. Never a tool: the model cannot call it, and the
+   * context is the one a call on this mount would get, with no task.
+   *
+   * The same two gates as a call, because this is a way into the agent too:
+   * a plugin a person switched off is not woken by strangers, and a mount
+   * pinned to another version is not handed to code it was not set up for
+   * (Piper, #377 review). `skipped` says why nothing was asked.
+   */
+  async receive(tenantId: string, agentId: string, alias: string, event: InboundEvent, secret: string):
+    Promise<{ skipped: string } | { result: InboundResult }> {
+    const gate = await this.#receiveGate(tenantId, agentId, alias);
+    if ("skipped" in gate) return gate;
+    const { mount, plugin } = gate;
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+      : null;
+    const context = this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential);
+    return { result: await plugin.receive!(event, secret, context) };
+  }
+
+  /** Whether this mount could take a pushed event now, and if not, why. */
+  async receiveBlocked(tenantId: string, agentId: string, alias: string): Promise<string | null> {
+    const gate = await this.#receiveGate(tenantId, agentId, alias);
+    return "skipped" in gate ? gate.skipped : null;
+  }
+
+  async #receiveGate(tenantId: string, agentId: string, alias: string):
+    Promise<{ skipped: string } | { mount: MountRecord; plugin: Plugin }> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { skipped: `no mount named ${alias}` };
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin?.receive) return { skipped: `the plugin on ${alias} cannot receive pushed events` };
+    const choices = await this.#store.pluginChoices(tenantId, agentId);
+    if (!pluginEnabled(plugin, choices[mount.plugin])) return { skipped: `${mount.plugin} is switched off for this agent` };
+    if (plugin.version !== mount.toolVersion) {
+      return { skipped: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` };
+    }
+    return { mount, plugin };
   }
 
   /**

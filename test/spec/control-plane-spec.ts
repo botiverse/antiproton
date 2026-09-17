@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Identities } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Identities, d1InboundHooks } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -13,7 +13,8 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   const dir = d1Identities(db);
   let clock = 1_800_000_000_000;
   const keys = d1ApiKeys(db, () => ++clock);
-  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys")]);
+  const hooks = d1InboundHooks(db, () => ++clock);
+  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -21,6 +22,33 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     const { results } = await db.prepare("PRAGMA table_info(identities)").all();
     const names = (results as any[]).map((r) => String(r.name)).sort().join(",");
     assert(names === "added_by,agent_id,created_at,provider_key,tenant_id", `columns ${names}`);
+  });
+
+  add("inbound_hooks has exactly the columns the hook queries read", async () => {
+    const { results } = await db.prepare("PRAGMA table_info(inbound_hooks)").all();
+    const names = (results as any[]).map((r) => String(r.name)).sort().join(",");
+    assert(names === "agent_id,alias,created_at,hook_id,revoked_at,tenant_id", `columns ${names}`);
+  });
+
+  add("a hook resolves to its agent's mount until it is revoked, and a revoke reports the row once", async () => {
+    await hooks.create({ hookId: "h1", tenantId: "t-1", agentId: "a-1", alias: "gh" });
+    const got = await hooks.lookup("h1");
+    assert(got?.tenantId === "t-1" && got.agentId === "a-1" && got.alias === "gh", `lookup ${JSON.stringify(got)}`);
+    assert((await hooks.lookup("h2")) === null, "an absent hook resolved");
+    const first = await hooks.revoke("h1");
+    assert(first?.agentId === "a-1", `revoke ${JSON.stringify(first)}`);
+    assert((await hooks.revoke("h1")) === null, "a second revoke reported the row again");
+    assert((await hooks.lookup("h1")) === null, "a revoked hook still resolves");
+    const [row] = await hooks.list("t-1", "a-1");
+    assert(row?.revokedAt !== null && row.hookId === "h1", `list ${JSON.stringify(row)}`);
+  });
+
+  add("an agent's hook list holds only that agent's hooks", async () => {
+    await hooks.create({ hookId: "h1", tenantId: "t-1", agentId: "a-1", alias: "gh" });
+    await hooks.create({ hookId: "h2", tenantId: "t-1", agentId: "a-2", alias: "gh" });
+    await hooks.create({ hookId: "h3", tenantId: "t-2", agentId: "a-1", alias: "gh" });
+    const ids = (await hooks.list("t-1", "a-1")).map((h) => h.hookId).join(",");
+    assert(ids === "h1", `listed ${ids}`);
   });
 
   add("an upserted row reads back; a second upsert changes it and keeps the first created_at", async () => {

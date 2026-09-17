@@ -43,6 +43,11 @@ import { assertMountConfig, validateMount } from "../../src/runtime/mount-config
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
+import {
+  ensureInboundTable, hookSecretName, inboundMessage, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
+  INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
+} from "../../src/runtime/inbound.ts";
+import type { InboundEvent } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
 
 /** The persona fields of an agent record, if it carries any. */
@@ -546,6 +551,79 @@ export class AgentRuntime {
           ? (deps.operatorModel?.apiKey ?? null)
           : envSecrets.resolve(ref),
     });
+  }
+
+  // ---- inbound events: a service pushes at a mount's hook (src/runtime/inbound.ts).
+
+  /**
+   * Give a mount a hook secret, sealed in this agent's own store under the
+   * hook's id, and return it once. The caller writes the public index only
+   * after this succeeds, so a live URL always has a secret behind it.
+   */
+  async createHookSecret(tenantId: string, agentId: string, alias: string, hookId: string):
+    Promise<{ ok: true; secret: string } | { ok: false; error: string }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a hook secret" };
+    if (!(await this.store.getMountByAlias(tenantId, agentId, alias))) return { ok: false, error: `no mount named ${alias}` };
+    const blocked = await this.#gateway.receiveBlocked(tenantId, agentId, alias);
+    if (blocked) return { ok: false, error: blocked };
+    const secret = newHookSecret();
+    const sealed = await seal(kek, secret);
+    await this.store.putSecret(tenantId, agentId, hookSecretName(hookId), { ciphertext: sealed.ciphertext, iv: sealed.iv });
+    return { ok: true, secret };
+  }
+
+  /** Forget a hook's secret. Whether there was one. */
+  async dropHookSecret(tenantId: string, agentId: string, hookId: string): Promise<boolean> {
+    await this.ready();
+    return this.store.removeSecret(tenantId, agentId, hookSecretName(hookId));
+  }
+
+  /**
+   * One pushed event. Answered as soon as the message is posted: the model
+   * runs afterwards, on the object's own time, because the service wants its
+   * answer within seconds (GitHub: 10 s). Every event leaves a row, delivered
+   * or not, so an operator can see what arrived and why it went nowhere.
+   */
+  async receiveHook(tenantId: string, agentId: string, alias: string, hookId: string,
+    event: InboundEvent | null): Promise<{ outcome: InboundOutcome }> {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    ensureInboundTable(sql);
+    const now = Date.now();
+    const done = (outcome: InboundOutcome, reason?: string | null, dedupeKey?: string | null) => {
+      recordInbound(sql, { hookId, alias, outcome, reason, dedupeKey, now });
+      return { outcome };
+    };
+    if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
+    const secret = await this.#secrets.resolve(agentRef(hookSecretName(hookId)), { tenantId, agentId });
+    if (!secret) return done("failed", "this hook has no secret in the agent's store");
+    let answer;
+    try {
+      answer = await this.#gateway.receive(tenantId, agentId, alias, event, secret);
+    } catch (e: any) {
+      // The plugin's own words stay in the record; the service only hears 503.
+      return done("failed", String(e?.message ?? e));
+    }
+    // Switched off, gone, or pinned elsewhere: the request was fine and the
+    // mount is not taking events, which the service should not report as broken.
+    if ("skipped" in answer) return done("ignored", answer.skipped);
+    const result = answer.result;
+    if (!result.deliver) return done(result.rejected ? "rejected" : "ignored", result.reason);
+    const key = result.dedupeKey ?? null;
+    if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
+    if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
+    await this.postMessage(tenantId, agentId, inboundMessage(alias, String(result.text)), "prompt", MAIN_SESSION);
+    return done("delivered", null, key);
+  }
+
+  /** What arrived at this agent's hooks lately, newest first. No bodies are kept. */
+  async inboundLog(limit = 50) {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    ensureInboundTable(sql);
+    return recentInbound(sql, limit);
   }
 
   // ---- per-agent credentials, from the console. Value in, metadata out.
