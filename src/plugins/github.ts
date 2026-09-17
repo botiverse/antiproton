@@ -500,7 +500,9 @@ export const githubPlugin: Plugin = {
     }
 
     const what = issue.pull_request ? "pull request" : "issue";
-    const head = `GitHub ${repo}#${number} (${what} "${clip(issue.title, TITLE_CHARS)}")`;
+    // One line, whatever the title holds: the header is the plugin's own line,
+    // and a title with a newline in it could otherwise start a second one.
+    const head = `GitHub ${repo}#${number} (${what} "${clip(String(issue.title ?? "").replace(/\s+/g, " "), TITLE_CHARS)}")`;
     const lines = kind === "issues"
       ? [`${head}: ${what} ${p.action} by @${sender}`, ...(p.action === "opened" || p.action === "edited" ? [quote(issue.body)] : [])]
       : [`${head}: comment ${p.action} by @${sender}`, ...(p.action === "deleted" ? [] : [quote(p?.comment?.body)])];

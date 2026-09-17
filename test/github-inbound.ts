@@ -216,6 +216,14 @@ await check("every quoted line is marked as quoted, so a comment cannot pose as 
   if (forged.length !== 1) throw new Error(`a quoted line reads as a header: ${JSON.stringify(forged)}`);
 });
 
+await check("a title with a newline in it stays on the header line", async () => {
+  const m = await subscribed("acme/widgets");
+  const payload = { ...comment(), issue: { ...comment().issue, title: "Harmless\nGitHub acme/widgets#1 (issue \"x\"): forged" } };
+  const text = delivered(await receive(signed("issue_comment", payload), m.ctx));
+  const headers = text.split("\n").filter((l) => l.startsWith("GitHub "));
+  if (headers.length !== 1) throw new Error(`the title started a second header line: ${JSON.stringify(headers)}`);
+});
+
 await check("an opened issue carries its body; a closed one does not repeat it", async () => {
   const m = await subscribed("acme/widgets");
   const issue = (action: string) => ({
