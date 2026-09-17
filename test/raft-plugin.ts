@@ -12,18 +12,38 @@ async function check(name: string, fn: () => Promise<void>) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
-function ctx(credential: string | null = "sk_agent_test_1234567890", config: Record<string, unknown> = {}) {
+function fakeInbound() {
+  let serial = 0;
+  const revoked: string[] = [];
+  return {
+    api: {
+      create: async () => {
+        serial++;
+        return { hookId: `hook-${serial}`, url: `https://hooks.example/hook-${serial}`, secret: `hook-secret-${serial}` };
+      },
+      revoke: async (hookId: string) => { revoked.push(hookId); return true; },
+    },
+    revoked,
+  };
+}
+
+function ctx(
+  credential: string | null = "sk_agent_test_1234567890",
+  config: Record<string, unknown> = {},
+  inbound: ReturnType<typeof fakeInbound>["api"] | undefined = fakeInbound().api,
+) {
   return {
     caller: { tenantId: "tenant", agentId: "agent", taskId: "task" },
     alias: "raft",
     credential,
     publicConfig: { serverUrl: "https://raft.example", ...config },
     connection: { get: async () => null, set: async () => {} },
+    inbound,
     sibling: async () => null,
   } as any;
 }
 
-function mount(initial: unknown = null) {
+function mount(initial: unknown = null, inbound = fakeInbound()) {
   let state = initial;
   return {
     ctx: {
@@ -32,8 +52,10 @@ function mount(initial: unknown = null) {
         get: async () => state,
         set: async (value: unknown) => { state = value; },
       },
+      inbound: inbound.api,
     } as any,
     state: () => state as any,
+    inbound,
   };
 }
 
@@ -54,6 +76,7 @@ function pushPayload(overrides: Record<string, unknown> = {}) {
     schema: "raft-agent-inbox.v1",
     eventId: "event-1",
     recipientAgentId: "agent-1",
+    reason: "inbox_changed",
     ...overrides,
   };
 }
@@ -66,6 +89,17 @@ function one(answer: Response) {
   const calls: Array<{ url: string; init: any }> = [];
   globalThis.fetch = (async (url: any, init?: any) => {
     calls.push({ url: String(url), init: init ?? {} });
+    return answer;
+  }) as any;
+  return calls;
+}
+
+function many(...answers: Response[]) {
+  const calls: Array<{ url: string; init: any }> = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    const answer = answers.shift();
+    if (!answer) throw new Error("unexpected fetch");
     return answer;
   }) as any;
   return calls;
@@ -90,7 +124,7 @@ await check("declares the queue drain as a non-idempotent write", async () => {
   const enable = raftPlugin.tools.find((tool) => tool.name === "enable_push");
   const disable = raftPlugin.tools.find((tool) => tool.name === "disable_push");
   const status = raftPlugin.tools.find((tool) => tool.name === "push_status");
-  if (enable?.sideEffects !== "write" || enable.idempotency !== "native") throw new Error("enable_push declaration changed");
+  if (enable?.sideEffects !== "write" || enable.idempotency !== "none") throw new Error("enable_push declaration changed");
   if (disable?.sideEffects !== "write" || disable.idempotency !== "native") throw new Error("disable_push declaration changed");
   if (status?.sideEffects !== "read" || status.idempotency !== "native") throw new Error("push_status declaration changed");
 });
@@ -292,20 +326,103 @@ await check("credential check falls back to the stable Raft agent name", async (
   if (!checked.ok || checked.account !== "@raft-bot") throw new Error(JSON.stringify(checked));
 });
 
-await check("enable_push binds the receiving mount to the credential's Raft identity", async () => {
-  const calls = one(json(200, {
-    agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1",
-  }));
+await check("enable_push creates a hook and registers it without exposing its secret", async () => {
+  const calls = many(
+    json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1" }),
+    json(200, { ok: true }),
+  );
   const m = mount();
   const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
-  if (!out.enabled || out.account !== "Release Bot (@raft-bot)" || !/operator/.test(out.note)) {
+  if (!out.enabled || out.account !== "Release Bot (@raft-bot)" || out.registration !== "active") {
     throw new Error(`enable result: ${JSON.stringify(out)}`);
   }
-  if (calls.length !== 1 || calls[0]!.url !== "https://raft.example/internal/agent-api") {
+  if (calls.length !== 2 || calls[0]!.url !== "https://raft.example/internal/agent-api" ||
+      calls[1]!.url !== "https://raft.example/internal/agent-api/push-webhook" || calls[1]!.init.method !== "PUT") {
     throw new Error(`enable used the wrong identity endpoint: ${JSON.stringify(calls)}`);
   }
-  if (JSON.stringify(m.state()) !== JSON.stringify({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null })) {
+  const registered = JSON.parse(String(calls[1]!.init.body));
+  if (registered.url !== "https://hooks.example/hook-1" || registered.secret !== "hook-secret-1") {
+    throw new Error(`wrong registration: ${JSON.stringify(registered)}`);
+  }
+  const encoded = JSON.stringify({ out, state: m.state() });
+  if (encoded.includes("hook-secret") || encoded.includes("hooks.example")) throw new Error(`hook material leaked: ${encoded}`);
+  if (JSON.stringify(m.state()) !== JSON.stringify({
+    enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-1",
+    staleHookIds: [], registration: "active", lastReached: null,
+  })) {
     throw new Error(`push state: ${JSON.stringify(m.state())}`);
+  }
+});
+
+await check("enable_push revokes a newly created hook after a definite registration failure", async () => {
+  many(
+    json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" }),
+    json(400, { errorCode: "INVALID_PUSH_ENDPOINT" }),
+  );
+  const original = {
+    enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
+    staleHookIds: [], registration: "active", lastReached: null,
+  };
+  const m = mount(original);
+  const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
+  if (!/HTTP 400/.test(why.message) || JSON.stringify(m.state()) !== JSON.stringify(original)) throw why;
+  if (m.inbound.revoked.join(",") !== "hook-1") throw new Error(`revoked ${m.inbound.revoked}`);
+});
+
+await check("a failed hook cleanup remains recorded without replacing the registration error", async () => {
+  many(
+    json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" }),
+    json(400, { errorCode: "INVALID_PUSH_ENDPOINT" }),
+  );
+  const inbound = fakeInbound();
+  inbound.api.revoke = async () => { throw new Error("private cleanup detail"); };
+  const m = mount(null, inbound);
+  const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
+  if (!/HTTP 400/.test(why.message) || /private cleanup detail/.test(why.message)) throw why;
+  if (m.state().hookId !== "hook-1" || m.state().enabled !== false) throw new Error(JSON.stringify(m.state()));
+});
+
+await check("enable_push preserves an ambiguous new registration for recovery without leaking its secret", async () => {
+  let call = 0;
+  globalThis.fetch = (async () => {
+    call++;
+    if (call === 1) return json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" });
+    throw new Error("private transport detail");
+  }) as any;
+  const m = mount({
+    enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
+    staleHookIds: [], registration: "active", lastReached: null,
+  });
+  const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
+  const encoded = JSON.stringify({ message: why.message, state: m.state() });
+  if (!/may already have landed/.test(why.message) || m.state().registration !== "uncertain" ||
+      m.state().hookId !== "hook-1" || m.state().staleHookIds.join(",") !== "hook-old") throw why;
+  if (encoded.includes("hook-secret") || encoded.includes("hooks.example") || /private transport detail/.test(encoded)) {
+    throw new Error(`hook material leaked: ${encoded}`);
+  }
+  if (m.inbound.revoked.length !== 0) throw new Error(`ambiguous hook was revoked: ${m.inbound.revoked}`);
+});
+
+await check("a successful replacement revokes every superseded hook only after the new registration lands", async () => {
+  const order: string[] = [];
+  const inbound = fakeInbound();
+  const originalRevoke = inbound.api.revoke;
+  inbound.api.revoke = async (hookId: string) => { order.push(`revoke:${hookId}`); return originalRevoke(hookId); };
+  let request = 0;
+  globalThis.fetch = (async (_url: any, init?: any) => {
+    request++;
+    if (request === 1) return json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" });
+    order.push(`register:${init?.method}`);
+    return json(200, { ok: true });
+  }) as any;
+  const m = mount({
+    enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
+    staleHookIds: ["hook-older"], registration: "uncertain", lastReached: null,
+  }, inbound);
+  await raftPlugin.invoke("enable_push", {}, m.ctx);
+  if (order.join(",") !== "register:PUT,revoke:hook-old,revoke:hook-older") throw new Error(order.join(","));
+  if (m.state().hookId !== "hook-1" || m.state().staleHookIds.length !== 0 || m.state().registration !== "active") {
+    throw new Error(JSON.stringify(m.state()));
   }
 });
 
@@ -376,11 +493,21 @@ await check("push refuses raw content instead of creating a second message deliv
   }
 });
 
+await check("push requires the exact content-free Phase 0 reason", async () => {
+  const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  for (const reason of [undefined, "message_available", "inbox_changed "]) {
+    const out = await raftPlugin.receive!(pushed(pushPayload({ reason })), PUSH_SECRET, enabled.ctx);
+    if (out.deliver || !out.rejected) throw new Error(JSON.stringify({ reason, out }));
+  }
+});
+
 await check("disable_push stops later delivery and push_status exposes no secret", async () => {
   const m = mount({
     enabled: true, agentId: "agent-1", agentName: "raft-bot",
+    hookId: "hook-old", staleHookIds: ["hook-stale"], registration: "active",
     lastReached: { eventId: "event-old", at: Date.parse("2026-09-17T00:00:00.000Z") },
   });
+  const calls = one(new Response(null, { status: 204 }));
   const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
   const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
   if (disabled.enabled !== false || status.enabled !== false || status.account !== "@raft-bot") {
@@ -389,13 +516,34 @@ await check("disable_push stops later delivery and push_status exposes no secret
   if (status.lastReached?.eventId !== "event-old" || JSON.stringify(status).includes(PUSH_SECRET)) {
     throw new Error(JSON.stringify(status));
   }
+  if (calls.length !== 1 || calls[0]!.init.method !== "DELETE" ||
+      calls[0]!.url !== "https://raft.example/internal/agent-api/push-webhook") throw new Error(JSON.stringify(calls));
+  if (m.inbound.revoked.sort().join(",") !== "hook-old,hook-stale" || m.state().hookId !== null) {
+    throw new Error(JSON.stringify({ state: m.state(), revoked: m.inbound.revoked }));
+  }
+});
+
+await check("an ambiguous disable keeps the local hook and enabled state", async () => {
+  globalThis.fetch = (async () => { throw new Error("private delete detail"); }) as any;
+  const original = {
+    enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
+    staleHookIds: [], registration: "active", lastReached: null,
+  };
+  const m = mount(original);
+  const why = await failure(() => raftPlugin.invoke("disable_push", {}, m.ctx));
+  if (!/may already have landed/.test(why.message) || /private delete detail/.test(why.message)) throw why;
+  if (JSON.stringify(m.state()) !== JSON.stringify(original) || m.inbound.revoked.length !== 0) {
+    throw new Error(JSON.stringify({ state: m.state(), revoked: m.inbound.revoked }));
+  }
 });
 
 await check("push_status safely normalizes corrupt persisted connection state", async () => {
   for (const lastReached of [{ eventId: 9, at: "yesterday" }, { eventId: "event-future", at: 1e100 }]) {
     const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached });
     const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
-    if (JSON.stringify(status) !== JSON.stringify({ enabled: false, account: null, lastReached: null })) {
+    if (JSON.stringify(status) !== JSON.stringify({
+      enabled: false, account: null, registration: null, cleanupPending: 0, lastReached: null,
+    })) {
       throw new Error(JSON.stringify(status));
     }
   }

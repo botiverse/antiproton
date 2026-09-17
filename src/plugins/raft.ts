@@ -12,8 +12,10 @@ import type { Plugin, PluginContext } from "./types.ts";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
 const PUSH_SCHEMA = "raft-agent-inbox.v1";
+const PUSH_REASON = "inbox_changed";
+const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const PUSH_EVENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const PUSH_FIELDS = new Set(["schema", "eventId", "recipientAgentId"]);
+const PUSH_FIELDS = new Set(["schema", "eventId", "recipientAgentId", "reason"]);
 
 type ObjectValue = Record<string, any>;
 
@@ -33,16 +35,25 @@ type PushState = {
   enabled: boolean;
   agentId: string | null;
   agentName: string | null;
+  hookId: string | null;
+  staleHookIds: string[];
+  registration: "active" | "uncertain" | null;
   lastReached: { eventId: string; at: number } | null;
 };
 
 function pushState(value: unknown): PushState {
   const state = object(value);
   const reached = object(state.lastReached);
+  const staleHookIds = Array.isArray(state.staleHookIds)
+    ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_EVENT_ID.test(value)))].slice(0, 2)
+    : [];
   return {
     enabled: state.enabled === true,
     agentId: text(state.agentId) ?? null,
     agentName: text(state.agentName) ?? null,
+    hookId: typeof state.hookId === "string" && PUSH_EVENT_ID.test(state.hookId) ? state.hookId : null,
+    staleHookIds,
+    registration: state.registration === "active" || state.registration === "uncertain" ? state.registration : null,
     lastReached: typeof reached.eventId === "string" && typeof reached.at === "number" &&
         Number.isFinite(reached.at) && Math.abs(reached.at) <= 8.64e15
       ? { eventId: reached.eventId, at: reached.at }
@@ -101,7 +112,7 @@ function receiveFailure(message: string): Error {
 
 async function call(
   ctx: PluginContext,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
   options: { cache?: "no-store"; deliveryMayHaveOccurred?: boolean } = {},
@@ -136,6 +147,7 @@ async function call(
       : retryable(new Error("raft request failed before a response was received; the operation may already have landed"));
   }
   let data: unknown = null;
+  if (response.status === 204) return { status: response.status, data: {} };
   try { data = await response.json(); }
   catch {
     if (!response.ok) {
@@ -157,6 +169,32 @@ async function call(
       : retryable(new Error(message), response.status === 429 || response.status >= 500);
   }
   return { status: response.status, data: object(data) };
+}
+
+function operationMayHaveLanded(error: unknown): boolean {
+  return error instanceof Error && /operation may already have landed/.test(error.message);
+}
+
+function hookIds(state: PushState): string[] {
+  return [...new Set([state.hookId, ...state.staleHookIds].filter((value): value is string => value !== null))];
+}
+
+async function revokeHooks(ctx: PluginContext, ids: string[]): Promise<string[]> {
+  if (!ctx.inbound) return ids;
+  const failed: string[] = [];
+  for (const id of ids) {
+    try { await ctx.inbound.revoke(id); }
+    catch { failed.push(id); }
+  }
+  return failed;
+}
+
+function retainHookForCleanup(state: PushState, hookId: string): PushState {
+  if (!state.hookId) return { ...state, hookId };
+  return {
+    ...state,
+    staleHookIds: [...new Set([...state.staleHookIds, hookId])].slice(0, 2),
+  };
 }
 
 async function raftIdentity(ctx: PluginContext): Promise<{
@@ -307,10 +345,10 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "enable_push",
-      summary: "Accept signed, content-free Raft inbox wake notifications for this mount. An operator must separately register this mount's inbound hook URL and secret with Raft.",
+      summary: "Create and register this mount's signed, content-free Raft inbox wake endpoint.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
-      idempotency: "native",
+      idempotency: "none",
     },
     {
       name: "disable_push",
@@ -395,25 +433,63 @@ export const raftPlugin: Plugin = {
       return { state: "joined", target: a.target, channelId: channel.id, status: joined.status };
     }
     if (name === "enable_push") {
+      if (!ctx.inbound) throw new Error("this deployment cannot receive pushed Raft events");
       const identity = await raftIdentity(ctx);
       const current = await loadPushState(ctx);
-      await savePushState(ctx, {
+      const created = await ctx.inbound.create();
+      const replaced = hookIds(current);
+      try {
+        await call(ctx, "PUT", PUSH_REGISTRATION_PATH, { url: created.url, secret: created.secret });
+      } catch (error) {
+        if (operationMayHaveLanded(error)) {
+          await savePushState(ctx, {
+            ...current,
+            enabled: true,
+            agentId: identity.agentId,
+            agentName: identity.agentName,
+            hookId: created.hookId,
+            staleHookIds: replaced.slice(0, 2),
+            registration: "uncertain",
+          });
+        } else {
+          const failed = await revokeHooks(ctx, [created.hookId]);
+          if (failed.length > 0) await savePushState(ctx, retainHookForCleanup(current, created.hookId));
+        }
+        throw error;
+      }
+      const next: PushState = {
         ...current,
         enabled: true,
         agentId: identity.agentId,
         agentName: identity.agentName,
-      });
+        hookId: created.hookId,
+        staleHookIds: replaced.slice(0, 2),
+        registration: "active",
+      };
+      await savePushState(ctx, next);
+      const staleHookIds = await revokeHooks(ctx, replaced);
+      if (staleHookIds.length !== next.staleHookIds.length) {
+        await savePushState(ctx, { ...next, staleHookIds });
+      }
       return {
         enabled: true,
         account: identity.agentDisplayName
           ? `${identity.agentDisplayName} (@${identity.agentName})`
           : `@${identity.agentName}`,
-        note: "An operator must register this mount's inbound hook URL and secret with Raft before inbox notifications can arrive.",
+        registration: "active",
       };
     }
     if (name === "disable_push") {
       const current = await loadPushState(ctx);
-      await savePushState(ctx, { ...current, enabled: false });
+      await call(ctx, "DELETE", PUSH_REGISTRATION_PATH);
+      const staleHookIds = await revokeHooks(ctx, hookIds(current));
+      await savePushState(ctx, {
+        ...current,
+        enabled: false,
+        hookId: null,
+        staleHookIds,
+        registration: null,
+      });
       return { enabled: false };
     }
     if (name === "push_status") {
@@ -421,6 +497,8 @@ export const raftPlugin: Plugin = {
       return {
         enabled: current.enabled,
         account: current.agentName ? `@${current.agentName}` : null,
+        registration: current.registration,
+        cleanupPending: current.staleHookIds.length,
         lastReached: current.lastReached
           ? { eventId: current.lastReached.eventId, at: new Date(current.lastReached.at).toISOString() }
           : null,
@@ -441,7 +519,8 @@ export const raftPlugin: Plugin = {
     let payload: ObjectValue;
     try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
     catch { return { deliver: false, rejected: true, reason: "signed, but the body is not JSON" }; }
-    if (payload.schema !== PUSH_SCHEMA || typeof payload.eventId !== "string" || !PUSH_EVENT_ID.test(payload.eventId) ||
+    if (payload.schema !== PUSH_SCHEMA || payload.reason !== PUSH_REASON ||
+        typeof payload.eventId !== "string" || !PUSH_EVENT_ID.test(payload.eventId) ||
         typeof payload.recipientAgentId !== "string" || !PUSH_EVENT_ID.test(payload.recipientAgentId)) {
       return { deliver: false, rejected: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} event` };
     }
