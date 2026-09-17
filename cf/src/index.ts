@@ -65,7 +65,7 @@ import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents 
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type HookDirectory, type IdentityDirectory } from "./control-plane.ts";
 import {
-  HOOK_SECRET_PATTERN, inboundStatus, lowerHeaders, newGrantNonce, newHookGrant, newHookId, readCapped, sha256Hex,
+  grantFromHeader, HOOK_SECRET_PATTERN, inboundStatus, lowerHeaders, newGrantNonce, newHookGrant, newHookId, readCapped, sha256Hex,
 } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -2499,7 +2499,8 @@ async function issueGrant(dir: HookDirectory, url: URL, hookId: string, ask: any
  * reads: a used grant never writes again.
  */
 async function hookSecretRoute(request: Request, env: Env, url: URL, hookId: string): Promise<Response> {
-  const bearer = bearerKey(request);
+  // Not bearerKey: that one accepts only Agents API keys, and would turn every grant away.
+  const bearer = grantFromHeader(request);
   if (!bearer) return Response.json({ error: "a grant is required" }, { status: 401 });
   const grantHash = await sha256Hex(bearer);
   const dir = d1InboundHooks(env.CONTROL_DB);

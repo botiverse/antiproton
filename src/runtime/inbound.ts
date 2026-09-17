@@ -194,6 +194,12 @@ export function newHookGrant(): string {
   return `aphg_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
+/** The grant in an `Authorization: Bearer` header, or null. Only a grant's shape is accepted. */
+export function grantFromHeader(request: Request): string | null {
+  const m = /^Bearer\s+(aphg_[A-Za-z0-9_-]{43})$/i.exec((request.headers.get("authorization") ?? "").trim());
+  return m ? m[1]! : null;
+}
+
 export function newGrantNonce(): string {
   return base64url(crypto.getRandomValues(new Uint8Array(16)));
 }

@@ -7,7 +7,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import {
   ensureInboundTable, inboundMessage, inboundStatus, lowerHeaders, newHookId, newHookSecret, readCapped,
   recordInbound, recentInbound, seenBefore, underRate, INBOUND_DEDUPE_MS, INBOUND_KEEP_MS, INBOUND_TEXT_MAX,
-  ensureHookVersionTable, hookSecretName, hookVersions, newGrantNonce, newHookGrant, supersededBy, versionsFor,
+  ensureHookVersionTable, grantFromHeader, hookSecretName, hookVersions, newGrantNonce, newHookGrant, supersededBy, versionsFor,
   HOOK_ROTATION_MS, HOOK_SECRET_PATTERN,
 } from "../src/runtime/inbound.ts";
 
@@ -145,6 +145,11 @@ await check("versioned secret names never collide with the generated one, and gr
   const g = newHookGrant();
   assert(/^aphg_[A-Za-z0-9_-]{43}$/.test(g) && g !== newHookGrant(), g.length.toString());
   assert(/^[A-Za-z0-9_-]{22}$/.test(newGrantNonce()), "nonce");
+  const req = (h?: string) => new Request("https://x/hooks/h/secret", h === undefined ? {} : { headers: { authorization: h } });
+  assert(grantFromHeader(req(`Bearer ${g}`)) === g && grantFromHeader(req(`bearer  ${g} `)) === g, "a grant header was not read");
+  for (const bad of [undefined, g, `Bearer ${g}x`, `Bearer ap-${"a".repeat(40)}`, `Basic ${g}`, `Bearer ${g} extra`]) {
+    assert(grantFromHeader(req(bad)) === null, `accepted ${JSON.stringify(bad?.slice(0, 12))}`);
+  }
   assert(HOOK_SECRET_PATTERN.test("a".repeat(43)) && !HOOK_SECRET_PATTERN.test("a".repeat(42)), "32 bytes is the floor");
   assert(HOOK_SECRET_PATTERN.test("a".repeat(342)) && !HOOK_SECRET_PATTERN.test("a".repeat(343)), "256 bytes is the ceiling");
   assert(!HOOK_SECRET_PATTERN.test("a".repeat(42) + "=") && !HOOK_SECRET_PATTERN.test("a".repeat(42) + "+"), "base64url only");
