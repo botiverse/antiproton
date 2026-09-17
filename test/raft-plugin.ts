@@ -127,6 +127,16 @@ await check("declares the queue drain as a non-idempotent write", async () => {
   if (enable?.sideEffects !== "write" || enable.idempotency !== "none") throw new Error("enable_push declaration changed");
   if (disable?.sideEffects !== "write" || disable.idempotency !== "native") throw new Error("disable_push declaration changed");
   if (status?.sideEffects !== "read" || status.idempotency !== "native") throw new Error("push_status declaration changed");
+  const serverUrl = raftPlugin.config?.find((field) => field.name === "serverUrl");
+  if (serverUrl?.format !== "origin") throw new Error("serverUrl lost its origin guard");
+});
+
+await check("serverUrl rejects cleartext non-loopback origins before sending the credential", async () => {
+  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
+  const why = await failure(() => raftPlugin.invoke("send_message", {
+    target: "#general", content: "hello", idempotencyKey: "stable-http-rejection",
+  }, ctx("sk_agent_test_1234567890", { serverUrl: "http://raft.example" })));
+  if (!/https/.test(why.message) || /network reached/.test(why.message)) throw why;
 });
 
 await check("send uses the configured origin, keeps the credential host-side, and projects the response", async () => {
@@ -464,6 +474,18 @@ await check("enable_push clears stale hooks before create and revokes the curren
   }
 });
 
+await check("push state keeps every valid hook id until it is explicitly revoked", async () => {
+  const m = mount({
+    enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-current",
+    staleHookIds: ["hook-1", "hook-2", "hook-3"], registration: "uncertain", lastReached: null,
+  });
+  one(new Response(null, { status: 204 }));
+  const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
+  if (disabled.cleanupPending !== 0 || m.inbound.revoked.sort().join(",") !== "hook-1,hook-2,hook-3,hook-current") {
+    throw new Error(JSON.stringify({ disabled, revoked: m.inbound.revoked, state: m.state() }));
+  }
+});
+
 await check("a signed Raft inbox notification wakes one canonical pull without network access", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
@@ -548,7 +570,8 @@ await check("disable_push stops later delivery and push_status exposes no secret
   const calls = one(new Response(null, { status: 204 }));
   const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
   const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
-  if (disabled.enabled !== false || status.enabled !== false || status.account !== "@raft-bot") {
+  if (disabled.enabled !== false || disabled.remoteDeregistration !== "confirmed" || disabled.cleanupPending !== 0 ||
+      status.enabled !== false || status.account !== "@raft-bot") {
     throw new Error(JSON.stringify({ disabled, status }));
   }
   if (status.lastReached?.eventId !== "event-old" || JSON.stringify(status).includes(PUSH_SECRET)) {
@@ -561,17 +584,38 @@ await check("disable_push stops later delivery and push_status exposes no secret
   }
 });
 
-await check("an ambiguous disable keeps the local hook and enabled state", async () => {
+await check("disable_push closes the local endpoint even when Raft returns an error", async () => {
+  for (const remote of ["network", "not-found"] as const) {
+    globalThis.fetch = remote === "network"
+      ? (async () => { throw new Error("private delete detail"); }) as any
+      : (async () => json(404, { errorCode: "PUSH_WEBHOOK_NOT_FOUND" })) as any;
+    const m = mount({
+      enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: `hook-${remote}`,
+      staleHookIds: [`stale-${remote}`], registration: "active", lastReached: null,
+    });
+    const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
+    const expectedRemote = remote === "not-found" ? "confirmed" : "unconfirmed";
+    if (disabled.enabled !== false || disabled.remoteDeregistration !== expectedRemote || disabled.cleanupPending !== 0 ||
+        m.state().enabled !== false || m.state().hookId !== null || m.state().staleHookIds.length !== 0 ||
+        m.inbound.revoked.sort().join(",") !== `hook-${remote},stale-${remote}`) {
+      throw new Error(JSON.stringify({ remote, disabled, state: m.state(), revoked: m.inbound.revoked }));
+    }
+  }
+});
+
+await check("disable_push stays disabled while retaining hooks whose local revoke failed", async () => {
   globalThis.fetch = (async () => { throw new Error("private delete detail"); }) as any;
-  const original = {
+  const inbound = fakeInbound();
+  inbound.api.revoke = async () => { throw new Error("private cleanup detail"); };
+  const m = mount({
     enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
-    staleHookIds: [], registration: "active", lastReached: null,
-  };
-  const m = mount(original);
-  const why = await failure(() => raftPlugin.invoke("disable_push", {}, m.ctx));
-  if (!/may already have landed/.test(why.message) || /private delete detail/.test(why.message)) throw why;
-  if (JSON.stringify(m.state()) !== JSON.stringify(original) || m.inbound.revoked.length !== 0) {
-    throw new Error(JSON.stringify({ state: m.state(), revoked: m.inbound.revoked }));
+    staleHookIds: ["hook-stale"], registration: "active", lastReached: null,
+  }, inbound);
+  const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
+  if (disabled.enabled !== false || disabled.remoteDeregistration !== "unconfirmed" || disabled.cleanupPending !== 2 ||
+      m.state().enabled !== false || m.state().hookId !== null ||
+      m.state().staleHookIds.sort().join(",") !== "hook-old,hook-stale") {
+    throw new Error(JSON.stringify({ disabled, state: m.state() }));
   }
 });
 

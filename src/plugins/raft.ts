@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { INBOUND_HOOKS_PER_MOUNT, type Plugin, type PluginContext } from "./types.ts";
+import { INBOUND_HOOKS_PER_MOUNT, originProblem, type Plugin, type PluginContext } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -46,7 +46,6 @@ function pushState(value: unknown): PushState {
   const reached = object(state.lastReached);
   const staleHookIds = Array.isArray(state.staleHookIds)
     ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_EVENT_ID.test(value)))]
-      .slice(0, INBOUND_HOOKS_PER_MOUNT - 1)
     : [];
   return {
     enabled: state.enabled === true,
@@ -73,13 +72,9 @@ async function savePushState(ctx: PluginContext, state: PushState): Promise<void
 function baseUrl(ctx: PluginContext): URL {
   const raw = ctx.publicConfig.serverUrl;
   if (typeof raw !== "string") throw new Error("raft needs the serverUrl mount setting");
-  let url: URL;
-  try { url = new URL(raw); }
-  catch { throw new Error("raft serverUrl must be an absolute http or https origin"); }
-  if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash ||
-      (url.pathname !== "/" && url.pathname !== "")) {
-    throw new Error("raft serverUrl must be an http or https origin without credentials, path, query, or fragment");
-  }
+  const problem = originProblem(raw);
+  if (problem) throw new Error(`raft serverUrl ${problem}`);
+  const url = new URL(raw);
   url.pathname = "/";
   return url;
 }
@@ -194,7 +189,7 @@ function retainHookForCleanup(state: PushState, hookId: string): PushState {
   if (!state.hookId) return { ...state, hookId };
   return {
     ...state,
-    staleHookIds: [...new Set([...state.staleHookIds, hookId])].slice(0, INBOUND_HOOKS_PER_MOUNT - 1),
+    staleHookIds: [...new Set([...state.staleHookIds, hookId])],
   };
 }
 
@@ -294,7 +289,7 @@ export const raftPlugin: Plugin = {
   id: "raft",
   version: "1.0.0",
   config: [
-    { name: "serverUrl", type: "string", required: true, summary: "Raft server origin, for example https://api.raft.build." },
+    { name: "serverUrl", type: "string", required: true, format: "origin", summary: "Raft server origin, for example https://api.raft.build." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
   ],
   credential: {
@@ -445,6 +440,9 @@ export const raftPlugin: Plugin = {
           throw retryable(new Error("superseded Raft push endpoints could not be cleaned up; try enable_push again"));
         }
       }
+      if (hookIds(current).length >= INBOUND_HOOKS_PER_MOUNT) {
+        throw retryable(new Error("Raft push endpoint state is full; disable push before enabling it again"));
+      }
       const created = await ctx.inbound.create();
       const replaced = hookIds(current);
       try {
@@ -457,7 +455,7 @@ export const raftPlugin: Plugin = {
             agentId: identity.agentId,
             agentName: identity.agentName,
             hookId: created.hookId,
-            staleHookIds: replaced.slice(0, INBOUND_HOOKS_PER_MOUNT - 1),
+            staleHookIds: replaced,
             registration: "uncertain",
           });
         } else {
@@ -472,7 +470,7 @@ export const raftPlugin: Plugin = {
         agentId: identity.agentId,
         agentName: identity.agentName,
         hookId: created.hookId,
-        staleHookIds: replaced.slice(0, INBOUND_HOOKS_PER_MOUNT - 1),
+        staleHookIds: replaced,
         registration: "active",
       };
       await savePushState(ctx, next);
@@ -490,7 +488,13 @@ export const raftPlugin: Plugin = {
     }
     if (name === "disable_push") {
       const current = await loadPushState(ctx);
-      await call(ctx, "DELETE", PUSH_REGISTRATION_PATH);
+      let remoteDeregistration: "confirmed" | "unconfirmed" = "confirmed";
+      try { await call(ctx, "DELETE", PUSH_REGISTRATION_PATH); }
+      catch (error) {
+        if (!(error instanceof Error) || !/\(PUSH_WEBHOOK_NOT_FOUND\)/.test(error.message)) {
+          remoteDeregistration = "unconfirmed";
+        }
+      }
       const staleHookIds = await revokeHooks(ctx, hookIds(current));
       await savePushState(ctx, {
         ...current,
@@ -499,7 +503,7 @@ export const raftPlugin: Plugin = {
         staleHookIds,
         registration: null,
       });
-      return { enabled: false };
+      return { enabled: false, remoteDeregistration, cleanupPending: staleHookIds.length };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);
