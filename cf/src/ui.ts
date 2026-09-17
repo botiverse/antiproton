@@ -1799,12 +1799,12 @@ function mountBlock(d: any, m: any): string {
       <div class="hint" style="padding-top:6px">${
         m.tools.length
           ? m.tools.map((t: string) => {
-              // The usage map is keyed by the plugin's own tool name; the
-              // list carries the model-visible one, alias first. Strip the
-              // alias whichever separator the route joined it with (#118
-              // moves it from "." to "__"), and print the name as given.
-              const bare = bareTool(t, String(m.alias ?? ""));
-              const n = used[bare] ?? 0;
+              // The usage map is keyed by the name the transcript recorded,
+              // which is the model-visible one, the same name this list
+              // carries. Transcripts from before #118 recorded "alias.tool".
+              // Never fall back to the bare name: two mounts of one plugin
+              // share it, and one would wear the other's count.
+              const n = used[t] ?? used[`${m.alias}.${bareTool(t, String(m.alias ?? ""))}`] ?? 0;
               return `<code class="${n ? "hot" : ""}">${esc(t)}${n ? ` ×${n}` : ""}</code>`;
             }).join(" ")
           : "no tools"

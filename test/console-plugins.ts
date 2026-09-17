@@ -335,17 +335,17 @@ check("the sidebar has no conversations section and no new-conversation button",
   must(/<h2 id="agent-name">u-x<\/h2>\s*<span class="spacer">/.test(html), "the header is the agent, with no conversation title beside it");
 });
 
-// The plugins page prints the model-visible tool name as the route gives it
-// and looks usage up by the plugin's own name, whichever separator joined
-// the alias on (#118 moves it from "." to "__").
-check("a mount's tools show the model-visible name and the usage count under either separator", () => {
+// The plugins page prints the model-visible tool name as the route gives it,
+// and the route counts usage under the name the transcript recorded: the
+// model-visible one ("gh__issue_list"), or "gh.issue_list" before #118.
+check("a mount's tools show the model-visible name and the usage count the transcript recorded", () => {
   must(bareTool("gh__issue_list", "gh") === "issue_list" && bareTool("gh.issues.list", "gh") === "issues.list", "the alias is stripped under both separators");
   must(bareTool("gh_public__api", "gh") === "gh_public__api" && bareTool("api", "gh") === "api", "another alias's tool, or a bare name, is left alone");
-  const d = (tools: string[]) => ({ installed: [{ id: "github", version: "2", tools: [{ name: "issue_list", summary: "List", sideEffects: "none", idempotency: "safe" }], config: [], credential: null }],
-    mounts: [{ alias: "gh", plugin: "github", version: "2", connected: true, config: {}, problems: [], tools, credential: { attached: false } }], used: { issue_list: 3 } });
-  const newForm = mountFragment(d(["gh__issue_list"]), "gh"), oldForm = mountFragment(d(["gh.issue_list"]), "gh");
-  must(/<code class="hot">gh__issue_list ×3<\/code>/.test(newForm), "the new form prints as given and finds its count");
-  must(/<code class="hot">gh\.issue_list ×3<\/code>/.test(oldForm), "the old form still finds its count");
+  const d = (alias: string, used: Record<string, number>) => ({ installed: [{ id: "github", version: "2", tools: [{ name: "issue_list", summary: "List", sideEffects: "none", idempotency: "safe" }], config: [], credential: null }],
+    mounts: [{ alias, plugin: "github", version: "2", connected: true, config: {}, problems: [], tools: [`${alias}__issue_list`], credential: { attached: false } }], used });
+  must(/<code class="hot">gh__issue_list ×3<\/code>/.test(mountFragment(d("gh", { gh__issue_list: 3 }), "gh")), "a count recorded under the model-visible name is found");
+  must(/<code class="hot">gh__issue_list ×2<\/code>/.test(mountFragment(d("gh", { "gh.issue_list": 2 }), "gh")), "a count recorded before #118 is found");
+  must(/<code class="">work__issue_list<\/code>/.test(mountFragment(d("work", { gh__issue_list: 3, issue_list: 4 }), "work")), "another mount's count, or a bare name, is not borrowed");
 });
 
 // A 304 poll must not swap: htmx 1.9 swaps 2xx and 3xx alike, and the empty
