@@ -146,6 +146,17 @@ export const RESOURCES: Resource[] = [
   },
 ];
 
+/**
+ * The resources the headline leaves out, named the way the tiles name them.
+ * A count of unpriced rows would be an artifact of the split — one row per
+ * bucket per group — so a single unpriced resource could read "63 amounts".
+ * A resource priced only in part is named too, with "some".
+ */
+const unpricedNames = (rows: UsageRow[]) =>
+  RESOURCES.map((res) => ({ res, m: money(rows, (r) => r.resource === res.id) }))
+    .filter(({ m }) => m.unpriced)
+    .map(({ res, m }) => (m.priced ? `some ${res.title}` : res.title));
+
 /** A group's name as a person reads it. */
 const label = (d: UsageData, g: string) =>
   g === "total" ? "total" : g === "" ? "—" : d.labels?.[g] ?? (d.by === "agent" ? g.slice(0, 12) : g);
@@ -235,9 +246,10 @@ export function usagePanel(d: UsageData): string {
     : "";
 
   const whole = money(d.rows);
+  const left = unpricedNames(d.rows);
   const headline = d.priced
     ? `<div class="u-credits"><span class="u-big">${credits(whole.credits)}</span> credits in this window${
-      whole.unpriced ? `, and ${whole.unpriced} amount${whole.unpriced === 1 ? " is" : "s are"} not priced yet, so ${whole.unpriced === 1 ? "it is" : "they are"} not in this number` : ""}</div>`
+      left.length ? `. Not priced yet, so not in this number: ${esc(left.join(", "))}` : ""}</div>`
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
   const tiles = RESOURCES.map((res) => {

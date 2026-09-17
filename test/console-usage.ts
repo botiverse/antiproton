@@ -108,7 +108,7 @@ check("an amount with no price reads 'not priced yet', never 0 credits", () => {
     unpriced(row("a1", "tool.call", "gh.x", "calls", 2)),
   ], { priced: true }));
   must(/<span class="u-big">1\.50<\/span> credits in this window/.test(html), "the headline counts only what has a price");
-  must(/1 amount is not priced yet, so it is not in this number/.test(html), "and says what it leaves out");
+  must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "and names what it leaves out, by resource, not by row count");
   must(/tool calls<\/h3>[\s\S]*?<span class="u-cost">not priced yet<\/span>/.test(html), "the unpriced tile says so instead of 0 credits");
   must(!/tool calls<\/h3>[\s\S]*?<span class="u-cost">0 credits/.test(html), "the unpriced tile never claims a zero cost it cannot know");
   must(/1\.50<span class="faint" title="some amounts here are not priced yet"> \+<\/span>/.test(html), "the table marks a group whose sum leaves something out");
@@ -120,7 +120,18 @@ check("a resource priced in part says so, and the sum stays the priced part", ()
     { ...row("a1", "model.tokens", "n:input", "tokens", 500), cost: null },
   ], { priced: true }));
   must(/<span class="u-cost">2\.00 credits, some not priced yet<\/span>/.test(html), "the tile names the part it could not price");
-  must(/<span class="u-big">2\.00<\/span> credits in this window, and 1 amount is not priced yet/.test(html), "the headline agrees with the tile");
+  must(/<span class="u-big">2\.00<\/span> credits in this window\. Not priced yet, so not in this number: some model tokens/.test(html), "the headline agrees with the tile, and says only part of that resource is priced");
+});
+
+check("many unpriced rows of one resource are named once, not counted", () => {
+  // The route hands one row per bucket per group, so an unpriced resource
+  // arrives as dozens of rows. The headline has to name the resource, or it
+  // reports a number that means nothing to a person.
+  const rows: UsageRow[] = [row("a1", "model.tokens", "m:input", "tokens", 1000, 1, 1.5)];
+  for (let h = 1; h <= 20; h++) for (const g of ["a1", "a2"]) rows.push({ ...row(g, "tool.call", "gh.x", "calls", 2, h), cost: null });
+  const html = usagePanel(data(rows, { priced: true }));
+  must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "the resource is named once");
+  must(!/\d+ amounts? (is|are) not priced/.test(html), "no row count leaks into the sentence");
 });
 
 check("every amount priced: no hedge anywhere", () => {
