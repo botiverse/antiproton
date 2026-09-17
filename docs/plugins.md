@@ -369,7 +369,12 @@ revokes a hook.
   (not `ctx.credential`), and refuse anything unsigned. Answer a bad request
   with `rejected: true`, so the service's own delivery log shows the failure
   to the person setting it up. Services sign differently, which is why this is
-  the plugin's job.
+  the plugin's job. Every other answer comes after that check, a ping or an
+  event the plugin does not handle included: anything but `rejected` tells
+  the service its request was accepted.
+- **Write nothing before refusing.** A request that ends in `rejected` must
+  leave `ctx.connection` as it was: a stranger's request must not change what
+  the mount remembers.
 - **Deliver only what the mount subscribed to**, as the plugin's own tools
   recorded it in `ctx.connection`.
 - **Drop what the mount's own account caused**, whenever the agent can act on
