@@ -7,6 +7,8 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import {
   ensureInboundTable, inboundMessage, inboundStatus, lowerHeaders, newHookId, newHookSecret, readCapped,
   recordInbound, recentInbound, seenBefore, underRate, INBOUND_DEDUPE_MS, INBOUND_KEEP_MS, INBOUND_TEXT_MAX,
+  ensureHookVersionTable, grantFromHeader, hookSecretName, hookVersions, newGrantNonce, newHookGrant, supersededBy, versionsFor,
+  HOOK_ROTATION_MS, HOOK_SECRET_PATTERN,
 } from "../src/runtime/inbound.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -118,6 +120,39 @@ await check("hook ids are 43 url-safe characters and secrets 64 hex, each fresh"
   assert(/^[A-Za-z0-9_-]{43}$/.test(a) && a !== b, `${a} ${b}`);
   const s = newHookSecret();
   assert(/^[0-9a-f]{64}$/.test(s) && s !== newHookSecret(), s.length.toString());
+});
+
+await check("a hook's versions: newest first, one older kept during a rotation, and none past the window", () => {
+  const host = sqliteHost();
+  ensureHookVersionTable(host.sql);
+  for (const [v, at] of [[1, 100], [2, 200]]) host.sql.exec("INSERT INTO hook_secret_versions(hook_id, version, added_at) VALUES (?, ?, ?)", "h", v, at);
+  host.sql.exec("INSERT INTO hook_secret_versions(hook_id, version, added_at) VALUES (?, ?, ?)", "other", 9, 1);
+  const stored = hookVersions(host.sql, "h");
+  assert(JSON.stringify(stored.map((x) => x.version)) === "[2,1]", `order ${JSON.stringify(stored)}`);
+  const during = versionsFor(stored, 200 + HOOK_ROTATION_MS - 1);
+  assert(JSON.stringify(during) === JSON.stringify({ tryOrder: [2, 1], expired: [] }), `during ${JSON.stringify(during)}`);
+  const after = versionsFor(stored, 200 + HOOK_ROTATION_MS);
+  assert(JSON.stringify(after) === JSON.stringify({ tryOrder: [2], expired: [1] }), `after ${JSON.stringify(after)}`);
+  const three = versionsFor([{ version: 3, addedAt: 300 }, ...stored], 301);
+  assert(JSON.stringify(three) === JSON.stringify({ tryOrder: [3, 2], expired: [1] }), `three ${JSON.stringify(three)}`);
+  assert(JSON.stringify(versionsFor([], 0)) === JSON.stringify({ tryOrder: [], expired: [] }), "none");
+  assert(JSON.stringify(supersededBy(stored, 2)) === "[1]" && supersededBy(stored, 1).length === 0, "superseded");
+  host.dispose();
+});
+
+await check("versioned secret names never collide with the generated one, and grants look like nothing else", () => {
+  assert(hookSecretName("h") === "hook:h" && hookSecretName("h", 1) === "hook:h:v1" && hookSecretName("h", 0) !== hookSecretName("h"), "names");
+  const g = newHookGrant();
+  assert(/^aphg_[A-Za-z0-9_-]{43}$/.test(g) && g !== newHookGrant(), g.length.toString());
+  assert(/^[A-Za-z0-9_-]{22}$/.test(newGrantNonce()), "nonce");
+  const req = (h?: string) => new Request("https://x/hooks/h/secret", h === undefined ? {} : { headers: { authorization: h } });
+  assert(grantFromHeader(req(`Bearer ${g}`)) === g && grantFromHeader(req(`bearer  ${g} `)) === g, "a grant header was not read");
+  for (const bad of [undefined, g, `Bearer ${g}x`, `Bearer ap-${"a".repeat(40)}`, `Basic ${g}`, `Bearer ${g} extra`]) {
+    assert(grantFromHeader(req(bad)) === null, `accepted ${JSON.stringify(bad?.slice(0, 12))}`);
+  }
+  assert(HOOK_SECRET_PATTERN.test("a".repeat(43)) && !HOOK_SECRET_PATTERN.test("a".repeat(42)), "32 bytes is the floor");
+  assert(HOOK_SECRET_PATTERN.test("a".repeat(342)) && !HOOK_SECRET_PATTERN.test("a".repeat(343)), "256 bytes is the ceiling");
+  assert(!HOOK_SECRET_PATTERN.test("a".repeat(42) + "=") && !HOOK_SECRET_PATTERN.test("a".repeat(42) + "+"), "base64url only");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

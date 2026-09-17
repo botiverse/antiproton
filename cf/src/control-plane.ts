@@ -128,6 +128,8 @@ export interface ApiKeyRow {
   label: string;
   createdAt: number;
   revokedAt: number | null;
+  /** Waiting for its first secret. */
+  pending?: boolean;
 }
 
 export interface ApiKeyDirectory {
@@ -200,27 +202,65 @@ export interface HookRow {
 }
 
 export interface HookDirectory {
-  create(row: { hookId: string; tenantId: string; agentId: string; alias: string }): Promise<void>;
-  /** A hook resolves only while it is not revoked. */
+  /** `pending`: the secret comes later, from the service (see `grant`); until then the hook does not resolve. */
+  create(row: { hookId: string; tenantId: string; agentId: string; alias: string }, opts?: { pending?: boolean }): Promise<void>;
+  /** A hook resolves only while it is live and has its first secret. */
   lookup(hookId: string): Promise<Omit<HookRow, "createdAt" | "revokedAt"> | null>;
-  /** The revoked row, or null if there was no live hook by that id. */
+  /** Live, whether or not it has its first secret yet: the secret-writing route's lookup. */
+  lookupLive(hookId: string): Promise<(Omit<HookRow, "createdAt" | "revokedAt"> & { pending: boolean }) | null>;
+  /** The first secret is stored: the hook starts resolving. Whether this call did it. */
+  activate(hookId: string): Promise<boolean>;
+  /** The revoked row, or null if there was no live hook by that id. Pending hooks are revoked too. */
   revoke(hookId: string): Promise<Omit<HookRow, "createdAt" | "revokedAt"> | null>;
   /** One agent's hooks, newest first, revoked ones included. */
   list(tenantId: string, agentId: string): Promise<HookRow[]>;
+  /** Record a grant to write one secret version. Only its hash is kept. */
+  grant(row: { grantHash: string; hookId: string; version: number; nonce: string; expiresAt: number }): Promise<void>;
+  /**
+   * Use a grant: one statement, so it succeeds once. Null unless the grant is
+   * for this hook, version and nonce, unused, and unexpired.
+   */
+  useGrant(grantHash: string, hookId: string, version: number, nonce: string): Promise<{ version: number } | null>;
+  /** What happened to the write a used grant allowed. */
+  finishGrant(grantHash: string, outcome: string): Promise<void>;
+  /** A grant's state, for the service to read back. Null if there is no such grant for this hook. */
+  grantState(grantHash: string, hookId: string): Promise<GrantState | null>;
+}
+
+export interface GrantState {
+  state: "unused" | "expired" | "stored" | "failed" | "in_progress";
+  version: number;
+  expiresAt: number;
+  usedAt: number | null;
+  /** Why a used grant's write failed; null otherwise. */
+  reason: string | null;
 }
 
 export function d1InboundHooks(db: D1Database, now: () => number = Date.now): HookDirectory {
   const row = (r: any) => ({ hookId: String(r.hook_id), tenantId: String(r.tenant_id), agentId: String(r.agent_id), alias: String(r.alias) });
   return {
-    async create(r) {
-      await db.prepare("INSERT INTO inbound_hooks(hook_id, tenant_id, agent_id, alias, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(r.hookId, r.tenantId, r.agentId, r.alias, now()).run();
+    async create(r, opts) {
+      const at = now();
+      await db.prepare("INSERT INTO inbound_hooks(hook_id, tenant_id, agent_id, alias, created_at, activated_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(r.hookId, r.tenantId, r.agentId, r.alias, at, opts?.pending ? null : at).run();
     },
     async lookup(hookId) {
       const r: any = await db.prepare(
-        "SELECT hook_id, tenant_id, agent_id, alias FROM inbound_hooks WHERE hook_id = ? AND revoked_at IS NULL",
+        "SELECT hook_id, tenant_id, agent_id, alias FROM inbound_hooks WHERE hook_id = ? AND revoked_at IS NULL AND activated_at IS NOT NULL",
       ).bind(hookId).first();
       return r ? row(r) : null;
+    },
+    async lookupLive(hookId) {
+      const r: any = await db.prepare(
+        "SELECT hook_id, tenant_id, agent_id, alias, activated_at FROM inbound_hooks WHERE hook_id = ? AND revoked_at IS NULL",
+      ).bind(hookId).first();
+      return r ? { ...row(r), pending: r.activated_at === null } : null;
+    },
+    async activate(hookId) {
+      const res = await db.prepare(
+        "UPDATE inbound_hooks SET activated_at = ? WHERE hook_id = ? AND revoked_at IS NULL AND activated_at IS NULL",
+      ).bind(now(), hookId).run();
+      return (res.meta?.changes ?? 0) === 1;
     },
     async revoke(hookId) {
       // One statement, so two revokes at once cannot both report the row.
@@ -235,7 +275,37 @@ export function d1InboundHooks(db: D1Database, now: () => number = Date.now): Ho
       ).bind(tenantId, agentId).all();
       return (results as any[]).map((r) => ({
         ...row(r), createdAt: Number(r.created_at), revokedAt: r.revoked_at === null ? null : Number(r.revoked_at),
+        pending: r.activated_at === null,
       }));
+    },
+    async grant(r) {
+      await db.prepare("INSERT INTO hook_grants(grant_hash, hook_id, version, nonce, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(r.grantHash, r.hookId, r.version, r.nonce, now(), r.expiresAt).run();
+    },
+    async useGrant(grantHash, hookId, version, nonce) {
+      const t = now();
+      const r: any = await db.prepare(
+        "UPDATE hook_grants SET used_at = ? WHERE grant_hash = ? AND hook_id = ? AND version = ? AND nonce = ? " +
+        "AND used_at IS NULL AND expires_at > ? RETURNING version",
+      ).bind(t, grantHash, hookId, version, nonce, t).first();
+      return r ? { version: Number(r.version) } : null;
+    },
+    async finishGrant(grantHash, outcome) {
+      await db.prepare("UPDATE hook_grants SET outcome = ? WHERE grant_hash = ? AND used_at IS NOT NULL AND outcome IS NULL")
+        .bind(outcome.slice(0, 300), grantHash).run();
+    },
+    async grantState(grantHash, hookId) {
+      const r: any = await db.prepare(
+        "SELECT version, expires_at, used_at, outcome FROM hook_grants WHERE grant_hash = ? AND hook_id = ?",
+      ).bind(grantHash, hookId).first();
+      if (!r) return null;
+      const usedAt = r.used_at === null ? null : Number(r.used_at);
+      const outcome = r.outcome === null ? null : String(r.outcome);
+      const state: GrantState["state"] = usedAt === null
+        ? (Number(r.expires_at) > now() ? "unused" : "expired")
+        : outcome === null ? "in_progress" : outcome === "stored" ? "stored" : "failed";
+      return { state, version: Number(r.version), expiresAt: Number(r.expires_at), usedAt,
+        reason: state === "failed" ? outcome : null };
     },
   };
 }
