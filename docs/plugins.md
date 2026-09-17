@@ -218,6 +218,48 @@ plugin writes nothing there, so work done by any route other than the
 plugin's own hooks (`invoke`, the background hooks, `release`) is work the
 record cannot show.
 
+## Events a service pushes
+
+A plugin can let a service wake the agent, without the agent polling, by
+implementing `receive`. `github` is the example: `issue_subscribe` records what
+the agent wants to hear about, and `receive` turns a webhook delivery into a
+message.
+
+How an event travels:
+
+1. An operator creates a hook for a mount. Until the console has a page for
+   this, that is `POST /admin/hooks` with the automation token. The answer is a
+   URL (`/hooks/<id>`) and a secret, shown once, which the operator gives to
+   the service.
+2. The service posts to that URL. The runtime finds the agent, checks the
+   mount the same way a tool call is checked (the mount exists, its plugin is
+   switched on, the version matches), and calls `receive` with the raw body
+   bytes, lowercase header names and the hook's secret.
+3. What `receive` returns decides what happens. `{ deliver: true, text }`
+   posts `text` into the agent's conversation, labelled as outside content.
+   `{ deliver: false, reason }` delivers nothing. Add `rejected: true` when
+   the request itself is bad, so the service's own delivery log shows a
+   failure. Every outcome is recorded with its reason.
+
+What `receive` must do:
+
+- **Check the signature first**, with the `secret` argument (not
+  `ctx.credential`), and refuse anything unsigned.
+- **Deliver only what the mount subscribed to**, as the plugin's own tools
+  recorded it in `ctx.connection`.
+- **Drop what the mount's own account caused.** Otherwise the agent's own
+  comment wakes it, and it answers itself.
+- **Write the text itself:** one line saying what happened, and a short quote
+  with each line marked as quoted. Never pass the payload through, since
+  anyone can write an issue comment.
+- **Return a `dedupeKey`** when the service marks redeliveries
+  (`X-GitHub-Delivery` for GitHub).
+- **Make no network calls.** The service waits only a few seconds (ten for
+  GitHub), and the runtime answers it once the message is posted.
+
+The rules above are held by `test/github-inbound.ts` for the plugin side and
+`test/inbound.ts` and `test/inbound-gateway.ts` for the runtime.
+
 ## Tests
 
 Every `test/*.ts` runs in the deploy gate (`cf/scripts/verify-and-deploy.sh`).
@@ -255,3 +297,4 @@ one failure; then restore it. A case that cannot go red guards nothing. Run
 | Examples | `src/plugins/demo.ts`, `http.ts`, `github.ts` |
 | Settings and activity tests | `test/mount-config.ts` |
 | Version and plugin-id refusals | `test/mount-pin.ts` |
+| Pushed events: route, limits, record | `src/runtime/inbound.ts`, `cf/src/index.ts` |
