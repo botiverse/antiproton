@@ -62,6 +62,7 @@ async function call(
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  options: { cache?: "no-store"; deliveryMayHaveOccurred?: boolean } = {},
 ): Promise<{ status: number; data: ObjectValue }> {
   const origin = baseUrl(ctx);
   const url = new URL(path, origin);
@@ -73,29 +74,44 @@ async function call(
   if (body !== undefined) headers["content-type"] = "application/json";
   let response: Response;
   try {
-    response = await fetch(url, {
+    // Node's bundled RequestInit type omits `cache`; Workers and fetch accept
+    // it. Keep the runtime contract even when the Node type surface lags it.
+    const init: any = {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      ...(options.cache ? { cache: options.cache } : {}),
       redirect: "error",
       signal: AbortSignal.timeout(timeout(ctx)),
-    });
+    };
+    response = await fetch(url, init);
   } catch {
-    throw retryable(new Error("raft request failed before a response was received; the operation may already have landed"));
+    throw retryable(new Error(options.deliveryMayHaveOccurred
+      ? "raft event receive failed before a response was received; delivery acknowledgement may already have occurred; no retry was attempted"
+      : "raft request failed before a response was received; the operation may already have landed"));
   }
   let data: unknown = null;
   try { data = await response.json(); }
   catch {
     if (!response.ok) {
-      throw retryable(new Error(`raft returned HTTP ${response.status}`), response.status === 429 || response.status >= 500);
+      throw retryable(new Error(
+        `raft returned HTTP ${response.status}` + (options.deliveryMayHaveOccurred
+          ? "; delivery acknowledgement may already have occurred; no retry was attempted"
+          : ""),
+      ), response.status === 429 || response.status >= 500);
     }
-    throw new Error("raft returned a response that was not JSON");
+    throw new Error("raft returned a response that was not JSON" + (options.deliveryMayHaveOccurred
+      ? "; delivery acknowledgement may already have occurred; no retry was attempted"
+      : ""));
   }
   if (!response.ok) {
     const parsed = object(data);
     const code = text(parsed.errorCode) ?? text(parsed.code);
     throw retryable(
-      new Error(`raft returned HTTP ${response.status}${code ? ` (${code})` : ""}`),
+      new Error(`raft returned HTTP ${response.status}${code ? ` (${code})` : ""}` +
+        (options.deliveryMayHaveOccurred
+          ? "; delivery acknowledgement may already have occurred; no retry was attempted"
+          : "")),
       response.status === 429 || response.status >= 500,
     );
   }
@@ -250,7 +266,13 @@ export const raftPlugin: Plugin = {
       const query = new URLSearchParams();
       if (since !== undefined) query.set("since", String(since));
       if (limit !== undefined) query.set("limit", String(limit));
-      const { data } = await call(ctx, "GET", `/internal/agent-api/events${query.size ? `?${query}` : ""}`);
+      const { data } = await call(
+        ctx,
+        "GET",
+        `/internal/agent-api/events${query.size ? `?${query}` : ""}`,
+        undefined,
+        { cache: "no-store", deliveryMayHaveOccurred: true },
+      );
       if (!Array.isArray(data.events) || typeof data.has_more !== "boolean") {
         throw new Error("raft events response did not match the expected contract; delivery acknowledgement may already have occurred");
       }

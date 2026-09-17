@@ -24,8 +24,8 @@ function json(status: number, body: unknown) {
 }
 
 function one(answer: Response) {
-  const calls: Array<{ url: string; init: RequestInit }> = [];
-  globalThis.fetch = (async (url: any, init?: RequestInit) => {
+  const calls: Array<{ url: string; init: any }> = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
     calls.push({ url: String(url), init: init ?? {} });
     return answer;
   }) as any;
@@ -93,6 +93,7 @@ await check("receive makes exactly one request and returns only the message proj
   if (calls.length !== 1 || calls[0]!.url !== "https://raft.example/internal/agent-api/events?since=3&limit=4") {
     throw new Error(`receive calls: ${JSON.stringify(calls)}`);
   }
+  if (calls[0]!.init.cache !== "no-store") throw new Error(`receive cache mode: ${calls[0]!.init.cache}`);
   const encoded = JSON.stringify(out);
   if (!encoded.includes('"messageId":"m-2"') || !encoded.includes('"senderName":"tygg"')) throw new Error(encoded);
   if (/internalSecret|storageKey|pending_notice_ids|wake_reason/.test(encoded)) throw new Error(`unprojected data: ${encoded}`);
@@ -103,7 +104,7 @@ await check("receive transport failure is uncertain and is never retried inside 
   globalThis.fetch = (async () => { calls++; throw new Error("socket closed"); }) as any;
   const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
   if (calls !== 1) throw new Error(`receive made ${calls} attempts`);
-  if (why.retryable !== true || !/may already have landed/.test(why.message)) {
+  if (why.retryable !== true || !/acknowledgement may already have occurred/.test(why.message)) {
     throw new Error(`uncertainty was lost: ${why.message}, retryable=${why.retryable}`);
   }
 });
@@ -112,6 +113,20 @@ await check("receive rejects an invalid response without exposing its body", asy
   one(json(200, { events: "wrong", secret: "body-secret" }));
   const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
   if (!/acknowledgement may already have occurred/.test(why.message) || /body-secret/.test(why.message)) throw why;
+});
+
+await check("receive HTTP and non-JSON failures preserve acknowledgement uncertainty without leaking bodies", async () => {
+  for (const response of [
+    json(500, { message: "private upstream detail" }),
+    new Response("private proxy page", { status: 502, headers: { "content-type": "text/html" } }),
+  ]) {
+    one(response);
+    const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
+    if (!/acknowledgement may already have occurred/.test(why.message) || !/no retry was attempted/.test(why.message)) {
+      throw new Error(`uncertainty was lost: ${why.message}`);
+    }
+    if (/private upstream detail|private proxy page/.test(why.message)) throw new Error(`body leaked: ${why.message}`);
+  }
 });
 
 await check("join resolves a visible channel, then joins its encoded id", async () => {

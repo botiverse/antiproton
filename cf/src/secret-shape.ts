@@ -21,6 +21,7 @@
  */
 import { recogniseCredentials, type Plugin } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
+import { raftPlugin } from "../../src/plugins/raft.ts";
 
 /**
  * The plugins whose credential declares what it looks like. Recognition runs in the
@@ -28,7 +29,7 @@ import { githubPlugin } from "../../src/plugins/github.ts";
  * the runtime's own plugin list is not at hand. test/secret-shape.ts fails when a plugin
  * under src/plugins declares `looksLike` and is missing here.
  */
-export const SHAPE_DECLARING_PLUGINS: ReadonlyArray<Pick<Plugin, "id" | "credential">> = [githubPlugin];
+export const SHAPE_DECLARING_PLUGINS: ReadonlyArray<Pick<Plugin, "id" | "credential">> = [githubPlugin, raftPlugin];
 
 /** Credentials no plugin takes, so none declares them. */
 const GENERIC_SHAPES: ReadonlyArray<readonly [string, RegExp]> = [

@@ -22,6 +22,7 @@ check("each credential shape is recognised by kind, wherever it sits in a messag
   const cases: Array<[string, string]> = [
     ["github-token", `here is my token ${"gh" + "p_" + r("a", 36)} use it`],
     ["github-token", `${"github" + "_pat_" + r("B", 60)}`],
+    ["Raft agent credential", `${"sk" + "_agent_" + r("R", 24)}`],
     ["api-key", `key: ${"sk" + "-" + r("x", 40)}`],
     ["api-key", `${"sk" + "-ant-api03-" + r("y", 40)}`],
     ["aws-access-key", `${"AK" + "IA" + r("Q", 16)}`],
@@ -58,6 +59,13 @@ check("a GitHub token is recognised by the github plugin's own declaration and n
   assert(gh?.kind === "github-token" && JSON.stringify(gh.plugins) === '["github"]', `github token: ${JSON.stringify(gh)}`);
   const dsn = secretMatch("postgresql://owner:" + r("p", 12) + "@db.example.com/app");
   assert(dsn?.kind === "url-with-password" && dsn.plugins.length === 0, `connection string: ${JSON.stringify(dsn)}`);
+});
+
+check("a Raft agent credential is recognised by the raft plugin's declaration and names its mount", () => {
+  const token = "sk" + "_agent_" + r("r", 24);
+  const match = secretMatch(`credential ${token}`);
+  assert(match?.kind === "Raft agent credential" && JSON.stringify(match.plugins) === '["raft"]',
+    `raft credential: ${JSON.stringify(match)}`);
 });
 
 check("every plugin that declares what its credential looks like is one the Worker recognises", () => {
