@@ -17,6 +17,7 @@ import type {
 // than defining a second copy of the same three words. Type-only, and
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
 import type { PluginChoice } from "../plugins/types.ts";
+import type { UsageRow } from "../usage/outbox.ts";
 
 /** A stored value: inline when small, a reference to object storage when not. */
 export interface StateEntry {
@@ -111,6 +112,12 @@ export interface StorageAdapter {
    *  scheduling possible later (§12.1). */
   claimOutbox(limit: number, tenantId?: string): Promise<Array<{ commandId: string; taskId: string; kind: string; payload: Json }>>;
   markDispatched(commandId: string): Promise<void>;
+
+  /**
+   * Append to this object's usage outbox (src/usage/outbox.ts). Optional: a
+   * store without it counts nothing, which is right for a test double.
+   */
+  recordUsage?(rows: readonly UsageRow[]): Promise<void>;
 
   recordOperation(op: Omit<OperationRecord, "status" | "resultRef">): Promise<void>;
   getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null>;

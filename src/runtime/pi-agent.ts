@@ -147,6 +147,8 @@ export interface PiAgentOptions {
    */
   entryProjectors?: Record<string, (entry: { timestamp: number; data?: unknown }) => unknown[] | undefined>;
   sessionId: string;
+  /** Whose usage this agent's model replies count as (the usage outbox). Absent: not counted. */
+  usageOwner?: { tenantId: string; agentId: string };
   /** Which of the agent's transcripts this is. Absent means the first one,
    *  which keeps the tables it has always had. */
   session?: string;
@@ -205,7 +207,9 @@ export class PiAgent {
   static async open(opts: PiAgentOptions): Promise<PiAgent> {
     const conversation = opts.session ?? MAIN_SESSION;
     ensureAgentTables(opts.host.sql, conversation);
-    const storage = new PiSqliteStorage(opts.host, { session: conversation, ...(opts.now ? { now: opts.now } : {}) });
+    const storage = new PiSqliteStorage(opts.host, {
+      session: conversation, ...(opts.now ? { now: opts.now } : {}), ...(opts.usageOwner ? { usageOwner: opts.usageOwner } : {}),
+    });
     const session = new StorageBackedSession(
       { id: opts.sessionId, createdAt: (opts.now ?? Date.now)(), storageVersion: 1 },
       storage as any,
