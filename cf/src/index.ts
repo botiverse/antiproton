@@ -3026,7 +3026,11 @@ export default {
             // panels stacked into one fragment, object first, then the
             // container, then everything the object is holding.
             : url.searchParams.get("stack") === "1"
-              ? `<h3>the object</h3>${runtimePanel(d)}<h3>containers</h3>${sandboxPanel(d)}<h3>storage</h3>${storage(d)}`
+              ? `<h3>the object</h3>${runtimePanel(d)}<h3>containers</h3>${sandboxPanel(d)}` +
+              // Storage is a developer dump, not an answer the page owes by
+              // default (Nova's Inspector review, 2026-09-17): it stays one
+              // fold away.
+              `<details class="raw"><summary>storage — everything the object is holding</summary>${storage(d)}</details>`
             : runtimePanel(d), v.etag);
         }
         // Data routes for the console shell, rendered by the shell's own
