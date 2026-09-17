@@ -15,6 +15,20 @@ read the whole contract as one page, generate it from the source:
 
     node scripts/plugin-map.ts > plugin-contract.html
 
+## Contributing a plugin
+
+Plugins are part of this repository and are built into the deployment. There
+is no way yet to install a plugin into a running deployment, so a plugin for a
+service is contributed as a pull request that adds:
+
+- the plugin, as a file under `src/plugins/`;
+- its tests, under `test/`;
+- one line registering it in `cf/src/runtime.ts` (see below).
+
+Pull requests adding plugins are open to anyone (see `AGENTS.md`). A plugin
+for a well-known service (an issue tracker, a calendar, a store) is the
+expected kind of contribution.
+
 ## The smallest plugin
 
 ```ts
