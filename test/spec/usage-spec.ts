@@ -140,7 +140,7 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     assert(mid.length === 3, `mid-hour window: ${mid.length}`);
   });
 
-  add("once a price exists every row carries its cost, and a row without a price is free", async () => {
+  add("once a price exists every row carries its cost, and a key with no price of its own falls back to the resource's *", async () => {
     await sendUsage(db, "t", "a", 0, [row(1, { quantity: 1000 }), row(2, { key: "m1:output", quantity: 10 }), row(3, { at: T0 + DAY_MS + 1, quantity: 1000 })]);
     await db.batch([
       db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', '*', 'tokens', 0.001, 0)"),
@@ -150,6 +150,23 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     const { rows, priced } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + 2 * DAY_MS, bucket: "1d", by: "total" });
     const c = rows.map((r) => `${(r.bucket - T0) / DAY_MS}/${r.key}=${r.cost}`).join(" ");
     assert(priced && c === "0/m1:input=2 0/m1:output=0.01 1/m1:input=10", `${priced} ${c}`);
+  });
+
+  add("a resource nobody priced reads null, not zero: the absence survives the read", async () => {
+    // The case the suite above cannot reach. Its rows are all `model.tokens`,
+    // so an unpriced key is still rescued by that resource's `*` price and
+    // comes back as a number. A resource with no price at all has no fallback,
+    // and `null` is the only answer that does not read as "free".
+    await sendUsage(db, "t", "a", 0, [
+      row(1, { quantity: 1000 }),
+      row(2, { resource: "tool.call", key: "github.issue_list", quantity: 4, unit: "calls" }),
+    ]);
+    await db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', '*', 'tokens', 0.001, 0)").run();
+    const { rows, priced } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + DAY_MS, bucket: "1d", by: "total" });
+    const c = rows.map((r) => `${r.resource}=${r.cost}`).sort().join(" ");
+    assert(priced && c === "model.tokens=1 tool.call=null", `${priced} ${c}`);
+    const call = rows.find((r) => r.resource === "tool.call")!;
+    assert(call.cost === null && !(call.cost === 0), "an unpriced row is null, never 0");
   });
 
   add("the query string: windows, default buckets, and refusals", async () => {
