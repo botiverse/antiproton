@@ -617,6 +617,16 @@ them:
   the idle-cost claim above: compute really does go to zero, and storage really
   does not, so a genuinely long-running agent's floor rises for ever and will
   eventually exhaust one object's 10 GB.
+- **Usage retention.** Each agent's object prunes its own usage outbox on every
+  send, bounded by the cursor, so the object side cannot grow. The table those
+  rows land in, `usage_hourly` in the control-plane database, is never trimmed:
+  nothing deletes it, nothing folds it, and no schedule touches it. It grows
+  with tenants × agents × hours × (resource, key, unit) — an agent using one
+  model and a few tools writes on the order of fifteen rows for each hour it is
+  active, so a busy agent adds tens of thousands of rows a year. Folding whole
+  hours into days past a cutoff is the intended fix and is not written yet. The
+  care taken over the outbox's pruning has no counterpart on the side that can
+  actually grow (Rex, reviewing #391).
 - **Plugin lifecycle.** A mount's config and policy are reconciled on every
   visit, so drift self-heals, and a seed mount is validated on the first agent
   it reaches. Mounts can be switched on, switched off, or set to inherit via the

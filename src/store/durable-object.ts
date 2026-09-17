@@ -1,5 +1,6 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice } from "../plugins/types.ts";
+import { appendUsage, type UsageRow } from "../usage/outbox.ts";
 import type {
   AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
@@ -417,6 +418,10 @@ export class DurableObjectStore implements StorageAdapter {
       mountAlias: r.mount_alias, tool: r.tool, toolVersion: r.tool_version, status: r.status,
       resultRef: r.result_ref,
     };
+  }
+
+  async recordUsage(rows: readonly UsageRow[]) {
+    appendUsage(this.#sql as any, rows);
   }
 
   async completeOperation(

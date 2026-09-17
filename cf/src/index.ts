@@ -63,6 +63,8 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
+import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
+import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
@@ -1985,7 +1987,18 @@ export class AgentDO extends DurableObject<Env> {
           this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", Date.now(), f.alias, f.error);
         }
         await this.broadcast();
-        if (out.wakeInMs !== null) {
+        // This pass's usage, to the tenant's hourly table. A failure is kept
+        // for later rather than failing the pass: the rows stay in the outbox.
+        let usagePending = false;
+        try {
+          await flushUsage(this.env.CONTROL_DB, this.sql as any, who.tenantId, who.agentId);
+        } catch (e: any) {
+          usagePending = true;
+          console.warn(`usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
+        }
+        if (out.wakeInMs === null && usagePending) {
+          await this.ctx.storage.setAlarm(Date.now() + 60_000);
+        } else if (out.wakeInMs !== null) {
           // The pass said when to come back — a retry has a time, a model call
           // has a poll interval. Nothing here waits for either.
           await this.ctx.storage.setAlarm(Date.now() + Math.max(50, out.wakeInMs));
@@ -3178,6 +3191,26 @@ export default {
           const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, home)));
           await homeStub.uiRecordAgent(gate.tenantId, home, made);
           return Response.json(made);
+        }
+        case "/ui/usage": {
+          // The signed-in person's tenant, all of its agents: no agent in the
+          // URL, and no agent object woken for the figures (usage view, Nova).
+          // The person's own first object is read once, for agent names.
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const q = parseUsageQuery(url.searchParams, Date.now());
+          if (typeof q === "string") return Response.json({ error: q }, { status: 400 });
+          const { rows, priced } = await readUsage(env.CONTROL_DB, gate.tenantId, q);
+          const labels: Record<string, string> = {};
+          if (q.by === "agent" && rows.length) {
+            const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, gate.agentId)));
+            for (const a of await homeStub.uiListAgents(gate.tenantId, gate.agentId)) labels[a.agentId] = a.name;
+          }
+          const data = { ...q, rows, labels, priced };
+          const headers = { "cache-control": "no-store" };
+          return request.headers.get("hx-request")
+            ? new Response(usagePanel(data), { headers: { ...headers, "content-type": "text/html; charset=utf-8" } })
+            : Response.json({ tenantId: gate.tenantId, ...data }, { headers });
         }
         case "/ui/api-keys":
         case "/ui/api-keys/new":

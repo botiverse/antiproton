@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice } from "../plugins/types.ts";
+import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -631,6 +632,27 @@ export class SqliteStore implements StorageAdapter {
       status: r.status,
       resultRef: r.result_ref,
     };
+  }
+
+  /** The two-method SQL face the usage outbox takes, over this database. Statements run when called. */
+  #usageSql() {
+    const db = this.#db;
+    return {
+      exec: (q: string, ...b: unknown[]) => {
+        const st = db.prepare(q);
+        const rows = st.columns().length ? st.all(...(b as any[])) : (st.run(...(b as any[])), []);
+        return { toArray: () => rows };
+      },
+    };
+  }
+
+  async recordUsage(rows: readonly UsageRow[]) {
+    appendUsage(this.#usageSql() as any, rows);
+  }
+
+  /** The usage outbox, for tests. */
+  usageOutbox() {
+    return pendingUsage(this.#usageSql() as any, 0);
   }
 
   async completeOperation(
