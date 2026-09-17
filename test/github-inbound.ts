@@ -380,6 +380,39 @@ await check("subscribing and unsubscribing are writes, so a mount's policy can h
   if (list.sideEffects !== "read") throw new Error("listing subscriptions is declared a write");
 });
 
+// ---- a refusal decides before anything else, and leaves no trace ------------
+
+await check("a bad signature is refused for every event kind, ping included, and writes nothing", async () => {
+  // The contract (types.ts, `receive`): only a request that passed the
+  // signature check may be ignored or delivered, and a refused one changes no
+  // state. A ping or an unknown kind answered before the check would let an
+  // unsigned request look like a working webhook.
+  const events: Array<[string, unknown, boolean?]> = [
+    ["ping", { zen: "Keep it simple.", hook_id: 7 }],
+    ["issues", { ...comment(), action: "opened" }],
+    ["issue_comment", comment()],
+    ["issue_comment", comment(), true],
+    ["pull_request", pr()],
+    ["pull_request_review", { ...pr({ action: "submitted" }), review: { state: "approved", body: "ok" } }],
+    ["pull_request_review_comment", { ...pr({ action: "created" }), comment: { body: "why?", path: "a.ts" } }],
+    ["push", { ref: "refs/heads/main" }],
+    ["", {}],
+  ];
+  for (const secret of ["someone-else", ""]) {
+    for (const [kind, payload, form] of events) {
+      const m = await subscribed("acme/widgets");
+      const before = JSON.stringify(m.state());
+      let writes = 0;
+      const set = m.ctx.connection.set;
+      m.ctx.connection.set = async (v: any) => { writes++; return set(v); };
+      const r = await receive(signed(kind, payload, { secret, form }), m.ctx);
+      const label = `${kind || "(no kind)"}${form ? " (form)" : ""} signed with ${JSON.stringify(secret)}`;
+      if (r.deliver || !r.rejected) throw new Error(`${label} was not refused: ${JSON.stringify(r)}`);
+      if (writes || JSON.stringify(m.state()) !== before) throw new Error(`${label} wrote state (${writes} writes)`);
+    }
+  }
+});
+
 console.log(`\n  github inbound events\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
