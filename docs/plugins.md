@@ -221,43 +221,87 @@ record cannot show.
 ## Events a service pushes
 
 A plugin can let a service wake the agent, without the agent polling, by
-implementing `receive`. `github` is the example: `issue_subscribe` records what
-the agent wants to hear about, and `receive` turns a webhook delivery into a
-message.
+implementing `receive`. Everything else in the plugin contract starts with the
+agent; this is the one way in from outside, so the plugin acts as a gate, not a
+pipe.
 
-How an event travels:
+`github` is the example. `issue_subscribe(repo, number?)` records what the
+agent wants to hear about (one issue or pull request, or a whole repository),
+and `receive` turns a webhook delivery into a short message. It delivers:
 
-1. An operator creates a hook for a mount. Until the console has a page for
-   this, that is `POST /admin/hooks` with the automation token. The answer is a
-   URL (`/hooks/<id>`) and a secret, shown once, which the operator gives to
-   the service.
-2. The service posts to that URL. The runtime finds the agent, checks the
-   mount the same way a tool call is checked (the mount exists, its plugin is
-   switched on, the version matches), and calls `receive` with the raw body
-   bytes, lowercase header names and the hook's secret.
-3. What `receive` returns decides what happens. `{ deliver: true, text }`
-   posts `text` into the agent's conversation, labelled as outside content.
-   `{ deliver: false, reason }` delivers nothing. Add `rejected: true` when
-   the request itself is bad, so the service's own delivery log shows a
-   failure. Every outcome is recorded with its reason.
+| GitHub event | Actions |
+|---|---|
+| `issues` | opened, edited, closed, reopened, deleted, transferred |
+| `issue_comment` | created, edited, deleted (this includes comments on a pull request's conversation) |
+| `pull_request` | opened, edited, closed or merged, reopened, ready for review, new commits |
+| `pull_request_review` | submitted, dismissed |
+| `pull_request_review_comment` | created, edited, deleted |
 
-What `receive` must do:
+### How an event travels
+
+1. **An operator creates a hook for a mount.** Until the console has a page
+   for this, that is `POST /admin/hooks` with the automation token. The answer
+   is a URL (`/hooks/<id>`, a random id) and a secret. The secret is shown once
+   and kept sealed in the agent's own store.
+2. **The operator gives both to the service.** For GitHub: the repository's
+   Settings, then Webhooks, content type `application/json`, and the five
+   events above. Creating a webhook needs admin rights on the repository.
+3. **The service posts to the URL.** The runtime looks up the agent, and an
+   unknown or revoked hook gets the same 404. The body may be at most 1 MB.
+4. **The mount is checked the way a tool call is.** It must exist, its plugin
+   must be able to receive, the plugin must be switched on for this agent, and
+   the mount's version must match. If any check fails, the event is ignored
+   and `receive` is not called. The mount's policy does not apply: the switch
+   is the control for pushed events.
+5. **The runtime calls `receive`** with the raw body bytes, lowercase header
+   names and the hook's secret.
+6. **The runtime acts on the answer:**
+   - it drops a delivery whose `dedupeKey` it has delivered in the last
+     24 hours;
+   - it drops deliveries past 30 a minute per hook;
+   - otherwise it posts `text` (cut at 4,000 characters) into the agent's
+     conversation, labelled as written outside the conversation and not by
+     the user.
+
+   It answers the service as soon as the message is posted. The model runs
+   afterwards: an idle agent starts a turn, and a busy one takes the message
+   into the turn it is already running.
+
+Every event leaves a row in the agent's event record (kept 7 days) with its
+outcome and reason. The service only sees the status code:
+
+| Outcome | Status | When |
+|---|---|---|
+| delivered | 202 | posted to the agent |
+| ignored | 202 | `deliver: false` without `rejected`, or the mount check failed |
+| duplicate | 202 | same `dedupeKey` delivered in the last 24 hours |
+| rejected | 401 | `deliver: false, rejected: true` |
+| too_large | 413 | body over 1 MB |
+| rate_limited | 429 | over 30 deliveries a minute for this hook |
+| failed | 503 | `receive` threw, or the hook has no secret |
+
+### What `receive` must do
 
 - **Check the signature first**, with the `secret` argument (not
-  `ctx.credential`), and refuse anything unsigned.
+  `ctx.credential`), and refuse anything unsigned. Set `rejected: true` for a
+  bad request, so the service's own delivery log shows the failure to the
+  person setting it up.
 - **Deliver only what the mount subscribed to**, as the plugin's own tools
   recorded it in `ctx.connection`.
-- **Drop what the mount's own account caused.** Otherwise the agent's own
-  comment wakes it, and it answers itself.
-- **Write the text itself:** one line saying what happened, and a short quote
-  with each line marked as quoted. Never pass the payload through, since
-  anyone can write an issue comment.
+- **Drop what the mount's own account caused.** An agent that replies on an
+  issue it is subscribed to would otherwise be woken by its own reply. `github`
+  records the account's login when the agent subscribes, and delivers nothing
+  if a credential was attached after that.
+- **Write the text itself:** one line saying what happened, on one line
+  whatever the title holds, then a short quote with every line marked as
+  quoted. Never pass the payload through, since anyone can comment on a public
+  issue.
 - **Return a `dedupeKey`** when the service marks redeliveries
   (`X-GitHub-Delivery` for GitHub).
 - **Make no network calls.** The service waits only a few seconds (ten for
-  GitHub), and the runtime answers it once the message is posted.
+  GitHub).
 
-The rules above are held by `test/github-inbound.ts` for the plugin side and
+These rules are held by `test/github-inbound.ts` for the plugin side, and by
 `test/inbound.ts` and `test/inbound-gateway.ts` for the runtime.
 
 ## Tests
