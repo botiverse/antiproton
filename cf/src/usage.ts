@@ -16,8 +16,10 @@
  *
  * `group` is the agent id, model or tool the rows were split by, "" when the
  * split does not apply to that resource (a container has no model), and
- * "total" when nothing was split. `cost` is credits, present only once a
- * price exists; a resource without a price is free, and the page says so.
+ * "total" when nothing was split. `cost` is credits: a number once a price
+ * applied, `null` when none exists for that row yet. The page keeps those
+ * apart — an unpriced amount reads "not priced yet", never "0 credits" — and
+ * says how much of the tally the headline leaves out.
  *
  * Why this shape on the page: the resources are measured in different units,
  * so there is no single axis they can share. Each resource gets its own
@@ -91,6 +93,24 @@ type Resource = {
 
 const sum = (rows: UsageRow[], unit: string, pred: (r: UsageRow) => boolean = () => true) =>
   rows.reduce((a, r) => a + (r.unit === unit && pred(r) ? Number(r.quantity) || 0 : 0), 0);
+
+/**
+ * Credits, and how much of the tally they leave out.
+ *
+ * A row's `cost` is a number only when a price applied to it; `null` means no
+ * price exists for that resource, key and unit yet. Summing with `?? 0` turns
+ * that absence into a value, and "not priced yet" then reads as "free" — the
+ * same mistake as an empty chart reading as "nothing was used". So every place
+ * that shows credits also knows how many rows had no price.
+ */
+const money = (rows: UsageRow[], pred: (r: UsageRow) => boolean = () => true) => {
+  let credits = 0, priced = 0, unpriced = 0;
+  for (const r of rows) {
+    if (!pred(r)) continue;
+    if (typeof r.cost === "number") { credits += r.cost; priced++; } else unpriced++;
+  }
+  return { credits, priced, unpriced };
+};
 const kind = (r: UsageRow) => r.key.slice(r.key.lastIndexOf(":") + 1);
 
 export const RESOURCES: Resource[] = [
@@ -201,7 +221,6 @@ function chart(d: UsageData, res: Resource, rows: UsageRow[], named: string[], t
 export function usagePanel(d: UsageData): string {
   const times = buckets(d);
   const named = namedGroups(d);
-  const cost = d.rows.reduce((a, r) => a + (Number(r.cost) || 0), 0);
   const opt = (v: string, cur: string, text = v) => `<option value="${v}"${v === cur ? " selected" : ""}>${text}</option>`;
 
   const controls = `<form class="u-controls" onchange="ap.usage(this, event.target)" onsubmit="return false">
@@ -215,8 +234,10 @@ export function usagePanel(d: UsageData): string {
       new Set(d.rows.map((r) => r.group).filter((g) => g !== "" && g !== "total")).size > named.length ? `<span><em class="k so"></em>other</span>` : ""}</div>`
     : "";
 
-  const money = d.priced
-    ? `<div class="u-credits"><span class="u-big">${credits(cost)}</span> credits in this window</div>`
+  const whole = money(d.rows);
+  const headline = d.priced
+    ? `<div class="u-credits"><span class="u-big">${credits(whole.credits)}</span> credits in this window${
+      whole.unpriced ? `, and ${whole.unpriced} amount${whole.unpriced === 1 ? " is" : "s are"} not priced yet, so ${whole.unpriced === 1 ? "it is" : "they are"} not in this number` : ""}</div>`
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
   const tiles = RESOURCES.map((res) => {
@@ -229,10 +250,13 @@ export function usagePanel(d: UsageData): string {
     }
     const rows = d.rows.filter((r) => r.resource === res.id);
     const total = sum(rows, res.unit);
-    const c = rows.reduce((a, r) => a + (Number(r.cost) || 0), 0);
+    const c = money(rows);
     return `<section class="u-tile">
   <h3>${res.title}</h3>
-  <div class="u-num">${res.fmt(total)}${d.priced ? `<span class="u-cost">${credits(c)} credits</span>` : ""}</div>
+  <div class="u-num">${res.fmt(total)}${d.priced ? `<span class="u-cost">${
+      c.unpriced === 0 ? `${credits(c.credits)} credits`
+        : c.priced === 0 ? "not priced yet"
+        : `${credits(c.credits)} credits, some not priced yet`}</span>` : ""}</div>
   <div class="u-detail">${esc(res.detail(rows)) || "&nbsp;"}</div>
   ${chart(d, res, rows, named, times)}
 </section>`;
@@ -255,13 +279,16 @@ export function usagePanel(d: UsageData): string {
   const table = groups.length
     ? `<div class="u-wrap"><table class="u-table"><thead><tr><th>${d.by === "total" ? "" : esc(d.by)}</th>${RESOURCES.map((r) => `<th class="num">${r.title}</th>`).join("")}${d.priced ? `<th class="num">credits</th>` : ""}</tr></thead>
 <tbody>${groups.map((g) => `<tr><td>${name(g)}</td>${RESOURCES.map((res) => cell(g, res)).join("")}${d.priced
-      ? `<td class="num">${credits(d.rows.reduce((a, r) => a + (r.group === g ? Number(r.cost) || 0 : 0), 0))}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
+      ? `<td class="num">${((m) => m.unpriced === 0
+        ? credits(m.credits)
+        : m.priced === 0 ? `<span class="faint">not priced</span>`
+        : `${credits(m.credits)}<span class="faint" title="some amounts here are not priced yet"> +</span>`)(money(d.rows, (r) => r.group === g))}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
     : "";
 
   if (!d.rows.length) {
     return `${controls}<div class="empty">nothing used in the last ${esc(d.window)}. Usage is recorded as each agent finishes a turn.</div>`;
   }
-  return `${controls}${money}${legend}<div class="u-grid">${tiles}</div>
+  return `${controls}${headline}${legend}<div class="u-grid">${tiles}</div>
 <h3 class="u-h">by ${d.by === "total" ? "resource" : esc(d.by)}</h3>${table}
 <div class="hint u-foot">Updated as each agent finishes a turn. Times are UTC.</div>`;
 }
