@@ -725,6 +725,7 @@ export class AgentRuntime {
     const names = stored.length ? tryOrder.map((v) => ({ v, name: hookSecretName(hookId, v) })) : [{ v: 0, name: hookSecretName(hookId) }];
     let answer: Awaited<ReturnType<ToolGateway["receive"]>> | null = null;
     let used = 0;
+    const refusals: string[] = [];
     for (const { v, name } of names) {
       const secret = await this.#secrets.resolve(agentRef(name), { tenantId, agentId });
       if (!secret) continue;
@@ -736,12 +737,19 @@ export class AgentRuntime {
       }
       used = v;
       if (!refusedBySecret(answer)) break;
+      if (!("skipped" in answer) && !answer.result.deliver) refusals.push(`${v ? `v${v}: ` : ""}${answer.result.reason}`);
     }
     if (!answer) return done("failed", "this hook has no secret in the agent's store");
-    // The newer version proved itself: the rotation is over.
-    if (!("skipped" in answer) && !refusedBySecret(answer) && used) {
+    // Only a delivery proves the newer version: "not refused" is not enough,
+    // since a plugin could ignore an event (a ping, say) before checking its
+    // signature, and ending the rotation on that would cut off a service
+    // still signing with the older one (Piper, #386).
+    if (!("skipped" in answer) && answer.result.deliver && used) {
       await this.#forgetVersions(tenantId, agentId, hookId, supersededBy(stored.filter((x) => tryOrder.includes(x.version)), used));
     }
+    // Every version refused: each one's reason, newest first, since the one
+    // the service actually signed with may not be the last one tried.
+    if (refusedBySecret(answer) && refusals.length > 1) return done("rejected", refusals.join("; "));
     // Switched off, gone, or pinned elsewhere: the request was fine and the
     // mount is not taking events, which the service should not report as broken.
     if ("skipped" in answer) return done("ignored", answer.skipped);

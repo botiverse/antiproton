@@ -24,6 +24,9 @@ const signed: Plugin = {
   async invoke() { return null; },
   async receive(event, secret) {
     heard.push(secret);
+    // A careless plugin: ignores pings before looking at the signature.
+    if (event.headers["x-kind"] === "ping") return { deliver: false, reason: "ping" };
+    if (event.headers["x-kind"] === "bad-body") return { deliver: false, reason: `bad body (${secret.slice(0, 1)})`, rejected: true };
     return event.headers["x-signed-with"] === secret
       ? { deliver: true, text: "ok" }
       : { deliver: false, reason: "bad signature", rejected: true };
@@ -128,6 +131,20 @@ await check("no secret is stored for a mount that is missing or switched off", a
   const off = await rt.putHookSecret("t", "a", "r", "h", 1, S1);
   must(!off.ok && /switched off/.test(off.error), JSON.stringify(off));
   must((await rt.hookSecretVersion("t", "a", "h")).current === 0, "a version was recorded");
+  host.dispose();
+});
+
+await check("only a delivery ends a rotation, and every version's refusal is recorded", async () => {
+  const { rt, host } = await runtime();
+  await rt.putHookSecret("t", "a", "r", "h", 1, S1);
+  await rt.putHookSecret("t", "a", "r", "h", 2, S2);
+  const ping = await rt.receiveHook("t", "a", "r", "h", { headers: { "x-kind": "ping" }, body: new Uint8Array([1]) });
+  must(ping.outcome === "ignored", `ping: ${JSON.stringify(ping)}`);
+  must((await receive(rt, S1)).outcome === "delivered", "an unsigned ping ended the rotation");
+  const bad = await rt.receiveHook("t", "a", "r", "h", { headers: { "x-kind": "bad-body" }, body: new Uint8Array([1]) });
+  must(bad.outcome === "rejected", JSON.stringify(bad));
+  const [last] = await rt.inboundLog(1);
+  must(last?.reason === "v2: bad body (2); v1: bad body (1)", `reason: ${JSON.stringify(last?.reason)}`);
   host.dispose();
 });
 
