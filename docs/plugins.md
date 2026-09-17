@@ -220,22 +220,89 @@ record cannot show.
 
 ## Events a service pushes
 
-A plugin can let a service wake the agent, without the agent polling, by
-implementing `receive`. Everything else in the plugin contract starts with the
-agent; this is the one way in from outside, so the plugin acts as a gate, not a
-pipe.
+A plugin can let an outside service wake the agent, so the agent never has to
+poll. Everything else in the plugin contract starts with the agent: a tool
+call, or work a tool call started. A pushed event is the one way in from
+outside, so the plugin acts as a gate, not a pipe.
 
-`github` is the example. `issue_subscribe(repo, number?)` records what the
-agent wants to hear about (one issue or pull request, or a whole repository),
-and `receive` turns a webhook delivery into a short message. It delivers:
+### What a plugin implements
 
-| GitHub event | Actions |
-|---|---|
-| `issues` | opened, edited, closed, reopened, deleted, transferred |
-| `issue_comment` | created, edited, deleted (this includes comments on a pull request's conversation) |
-| `pull_request` | opened, edited, closed or merged, reopened, ready for review, new commits |
-| `pull_request_review` | submitted, dismissed |
-| `pull_request_review_comment` | created, edited, deleted |
+Two parts, both in the plugin:
+
+1. **Tools that record what the agent wants to hear about**, kept in
+   `ctx.connection`. They are writes, so a mount's policy can hold them.
+2. **`receive(event, secret, ctx)`**, which the runtime calls for each request
+   the service sends. It gets the raw body bytes, lowercase header names and
+   the hook's secret, and answers either `{ deliver: true, text }` or
+   `{ deliver: false, reason }`.
+
+A service that reports status changes and signs its requests with an HMAC is
+enough to show both:
+
+```ts
+import type { Json } from "../core/types.ts";
+import type { Plugin } from "./types.ts";
+
+async function signedBy(body: Uint8Array, header: string | undefined, secret: string) {
+  const hex = /^sha256=([0-9a-f]{64})$/i.exec(header ?? "")?.[1];
+  if (!hex || !secret) return false;
+  const sig = Uint8Array.from(hex.match(/../g)!, (h) => parseInt(h, 16));
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  return crypto.subtle.verify("HMAC", key, sig, body); // constant-time
+}
+
+export const statusPlugin: Plugin = {
+  id: "status",
+  version: "1.0.0",
+  tools: [{
+    name: "watch",
+    summary: "Be told when a component's status changes. Changes arrive as messages.",
+    parameters: {
+      type: "object",
+      properties: { component: { type: "string" } },
+      required: ["component"],
+    },
+    sideEffects: "write",
+    idempotency: "native",
+  }],
+
+  async invoke(tool, args, ctx): Promise<Json> {
+    if (tool !== "watch") throw new Error(`unknown tool: ${tool}`);
+    const component = String((args as { component?: unknown })?.component ?? "");
+    if (!component) throw new Error("component is required");
+    const watched = ((await ctx.connection.get()) as string[] | null) ?? [];
+    if (!watched.includes(component)) await ctx.connection.set([...watched, component]);
+    return { watching: component };
+  },
+
+  async receive(event, secret, ctx) {
+    if (!(await signedBy(event.body, event.headers["x-signature"], secret))) {
+      return { deliver: false, rejected: true, reason: "missing or wrong signature" };
+    }
+    let p: { id?: string; component?: string; status?: string };
+    try {
+      p = JSON.parse(new TextDecoder().decode(event.body));
+    } catch {
+      return { deliver: false, rejected: true, reason: "the body is not JSON" };
+    }
+    const watched = ((await ctx.connection.get()) as string[] | null) ?? [];
+    if (!p.component || !watched.includes(p.component)) {
+      return { deliver: false, reason: `${p.component}: not watched` };
+    }
+    const status = String(p.status ?? "unknown").replace(/\s+/g, " ").slice(0, 40);
+    return {
+      deliver: true,
+      text: `Status page: ${p.component} is now ${status}`,
+      ...(p.id ? { dedupeKey: p.id } : {}),
+    };
+  },
+};
+```
+
+Nothing the agent does can change a component's status, so this plugin needs
+no check for events the agent caused itself. A service the agent can write to
+does need one; see the GitHub example below.
 
 ### How an event travels
 
@@ -243,18 +310,16 @@ and `receive` turns a webhook delivery into a short message. It delivers:
    for this, that is `POST /admin/hooks` with the automation token. The answer
    is a URL (`/hooks/<id>`, a random id) and a secret. The secret is shown once
    and kept sealed in the agent's own store.
-2. **The operator gives both to the service.** For GitHub: the repository's
-   Settings, then Webhooks, content type `application/json`, and the five
-   events above. Creating a webhook needs admin rights on the repository.
+2. **The operator gives both to the service**, in whatever place the service
+   takes a webhook URL and signing secret.
 3. **The service posts to the URL.** The runtime looks up the agent, and an
    unknown or revoked hook gets the same 404. The body may be at most 1 MB.
 4. **The mount is checked the way a tool call is.** It must exist, its plugin
-   must be able to receive, the plugin must be switched on for this agent, and
-   the mount's version must match. If any check fails, the event is ignored
-   and `receive` is not called. The mount's policy does not apply: the switch
-   is the control for pushed events.
-5. **The runtime calls `receive`** with the raw body bytes, lowercase header
-   names and the hook's secret.
+   must implement `receive`, the plugin must be switched on for this agent,
+   and the mount's version must match. If any check fails, the event is
+   ignored and `receive` is not called. The mount's policy does not apply:
+   the switch is the control for pushed events.
+5. **The runtime calls `receive`.**
 6. **The runtime acts on the answer:**
    - it drops a delivery whose `dedupeKey` it has delivered in the last
      24 hours;
@@ -267,13 +332,10 @@ and `receive` turns a webhook delivery into a short message. It delivers:
    afterwards: an idle agent starts a turn, and a busy one takes the message
    into the turn it is already running.
 
-Every event leaves a row in the agent's event record (kept 7 days) with its
-outcome and reason. The service only sees the status code. When an expected
-event never arrived, read the record with
-`GET /admin/hooks?tenantId=…&agentId=…`, which lists the agent's hooks and
-its recent events. `POST /admin/hooks` with `{ "revoke": "<hookId>" }`
-revokes a hook.
+### Outcomes
 
+Every event leaves a row in the agent's event record (kept 7 days) with its
+outcome and reason. The service only sees the status code:
 
 | Outcome | Status | When |
 |---|---|---|
@@ -285,29 +347,63 @@ revokes a hook.
 | rate_limited | 429 | over 30 deliveries a minute for this hook |
 | failed | 503 | `receive` threw, or the hook has no secret |
 
+When an expected event never arrived, read the record with
+`GET /admin/hooks?tenantId=…&agentId=…`, which lists the agent's hooks and
+its recent events. `POST /admin/hooks` with `{ "revoke": "<hookId>" }`
+revokes a hook.
+
 ### What `receive` must do
 
-- **Check the signature first**, with the `secret` argument (not
-  `ctx.credential`), and refuse anything unsigned. Set `rejected: true` for a
-  bad request, so the service's own delivery log shows the failure to the
-  person setting it up.
+- **Check the signature before anything else**, with the `secret` argument
+  (not `ctx.credential`), and refuse anything unsigned. Answer a bad request
+  with `rejected: true`, so the service's own delivery log shows the failure
+  to the person setting it up. Services sign differently, which is why this is
+  the plugin's job.
 - **Deliver only what the mount subscribed to**, as the plugin's own tools
   recorded it in `ctx.connection`.
-- **Drop what the mount's own account caused.** An agent that replies on an
-  issue it is subscribed to would otherwise be woken by its own reply. `github`
-  records the account's login when the agent subscribes, and delivers nothing
-  if a credential was attached after that.
-- **Write the text itself:** one line saying what happened, on one line
-  whatever the title holds, then a short quote with every line marked as
-  quoted. Never pass the payload through, since anyone can comment on a public
-  issue.
-- **Return a `dedupeKey`** when the service marks redeliveries
-  (`X-GitHub-Delivery` for GitHub).
-- **Make no network calls.** The service waits only a few seconds (ten for
-  GitHub).
+- **Drop what the mount's own account caused**, whenever the agent can act on
+  the service. Otherwise the agent is woken by its own reply and answers it.
+- **Write the text itself:** one line saying what happened, kept on one line
+  whatever the service put in its fields, then at most a short quote with
+  every line marked as quoted. Never pass the payload through: whoever
+  triggered the event wrote it.
+- **Return a `dedupeKey`** when the service marks redeliveries.
+- **Make no network calls.** Services wait only a few seconds for an answer
+  (ten for GitHub).
 
-These rules are held by `test/github-inbound.ts` for the plugin side, and by
-`test/inbound.ts` and `test/inbound-gateway.ts` for the runtime.
+The runtime side is held by `test/inbound.ts` and `test/inbound-gateway.ts`.
+
+### Example: GitHub
+
+The `github` plugin is the one that ships. `issue_subscribe(repo, number?)`
+subscribes to one issue or pull request (they share numbers), or to a whole
+repository; `issue_unsubscribe` and `issue_subscriptions` go with it. Its
+`receive` delivers:
+
+| GitHub event | Actions |
+|---|---|
+| `issues` | opened, edited, closed, reopened, deleted, transferred |
+| `issue_comment` | created, edited, deleted (this includes comments on a pull request's conversation) |
+| `pull_request` | opened, edited, closed or merged, reopened, ready for review, new commits |
+| `pull_request_review` | submitted, dismissed |
+| `pull_request_review_comment` | created, edited, deleted |
+
+What is specific to GitHub:
+
+- **Setup:** in the repository's Settings, then Webhooks, paste the hook's
+  URL and secret, choose content type `application/json`, and pick the five
+  events above. Creating a webhook needs admin rights on the repository.
+- **Signature:** `X-Hub-Signature-256`, an HMAC-SHA256 of the raw body. A
+  webhook saved without a secret sends no signature, and every delivery is
+  refused.
+- **Duplicates:** `X-GitHub-Delivery` is the `dedupeKey`; a redelivery keeps
+  it.
+- **The agent's own activity:** subscribing records the login of the mount's
+  account, and events sent by that login are dropped. If a credential is
+  attached after subscribing, nothing is delivered until the agent subscribes
+  again.
+
+`test/github-inbound.ts` holds these rules.
 
 ## Tests
 
