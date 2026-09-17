@@ -107,6 +107,41 @@ export interface ConfigField {
    * refuse a credential-shaped name that does not carry it.
    */
   references?: "credential";
+  /**
+   * What a `string` value has to look like, checked when the mount is written.
+   *
+   * `"origin"` is where a plugin sends its credential: an absolute `https:`
+   * origin — scheme, host and optional port, with no credentials, path, query
+   * or fragment — or `http:` to a loopback host, for a server on the same
+   * machine. Without it a setting like `https://api.example.com/x` was accepted
+   * at mount time and refused only when an agent called something, where no
+   * person is reading (cody, 2026-09-17, on the raft plugin's `serverUrl`).
+   *
+   * The plugin should read the value through the same `originProblem` at call
+   * time too, so the two checks cannot disagree.
+   */
+  format?: "origin";
+}
+
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Why `value` is not an origin in the sense of `ConfigField.format`, or null
+ * if it is. One function for the mount-time check and the plugin's own, so a
+ * value the console accepted is a value the plugin can use.
+ */
+export function originProblem(value: string): string | null {
+  let url: URL;
+  try { url = new URL(value); }
+  catch { return "must be an absolute URL such as https://api.example.com"; }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname))) {
+    return "must be https (http only for localhost)";
+  }
+  if (url.username || url.password) return "must not carry a user name or password";
+  if (url.pathname !== "/" || url.search || url.hash || /[?#]/.test(value)) {
+    return `must be an origin with no path, query or fragment, such as ${url.origin}`;
+  }
+  return null;
 }
 
 /**
