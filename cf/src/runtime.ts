@@ -45,8 +45,9 @@ import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
 import {
   ensureInboundTable, hookSecretName, inboundMessage, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
-  INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundEvent, type InboundOutcome, type InboundResult,
+  INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
 } from "../../src/runtime/inbound.ts";
+import type { InboundEvent } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
 
 /** The persona fields of an agent record, if it carries any. */
@@ -565,9 +566,8 @@ export class AgentRuntime {
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a hook secret" };
     if (!(await this.store.getMountByAlias(tenantId, agentId, alias))) return { ok: false, error: `no mount named ${alias}` };
-    if (!(await this.#gateway.canReceive(tenantId, agentId, alias))) {
-      return { ok: false, error: `the plugin on ${alias} cannot receive pushed events` };
-    }
+    const blocked = await this.#gateway.receiveBlocked(tenantId, agentId, alias);
+    if (blocked) return { ok: false, error: blocked };
     const secret = newHookSecret();
     const sealed = await seal(kek, secret);
     await this.store.putSecret(tenantId, agentId, hookSecretName(hookId), { ciphertext: sealed.ciphertext, iv: sealed.iv });
@@ -599,14 +599,17 @@ export class AgentRuntime {
     if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     const secret = await this.#secrets.resolve(agentRef(hookSecretName(hookId)), { tenantId, agentId });
     if (!secret) return done("failed", "this hook has no secret in the agent's store");
-    let result: InboundResult | null;
+    let answer;
     try {
-      result = await this.#gateway.receive(tenantId, agentId, alias, event, secret);
+      answer = await this.#gateway.receive(tenantId, agentId, alias, event, secret);
     } catch (e: any) {
       // The plugin's own words stay in the record; the service only hears 503.
       return done("failed", String(e?.message ?? e));
     }
-    if (!result) return done("failed", `no mount named ${alias} that can receive events`);
+    // Switched off, gone, or pinned elsewhere: the request was fine and the
+    // mount is not taking events, which the service should not report as broken.
+    if ("skipped" in answer) return done("ignored", answer.skipped);
+    const result = answer.result;
     if (!result.deliver) return done(result.rejected ? "rejected" : "ignored", result.reason);
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);

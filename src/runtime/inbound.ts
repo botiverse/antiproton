@@ -151,13 +151,3 @@ function base64url(bytes: Uint8Array): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/**
- * The plugin hook as agreed with Piper (#core, 2026-09-17). The declaration of
- * record is `Plugin.receive` in src/plugins/types.ts; this copy is what the
- * gateway calls until that lands, and goes when it does.
- */
-export type InboundEvent = { headers: Record<string, string>; body: Uint8Array };
-export type InboundResult =
-  | { deliver: false; reason: string; rejected?: boolean }
-  | { deliver: true; text: string; dedupeKey?: string };
-export type ReceiveHook = (event: InboundEvent, secret: string, ctx: import("../plugins/types.ts").PluginContext) => Promise<InboundResult>;
