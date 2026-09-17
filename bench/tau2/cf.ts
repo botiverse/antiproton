@@ -24,7 +24,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
-import { decideFromPoll } from "../poll-fallback.ts";
+import { decideFromPoll, stallCause } from "../poll-fallback.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -138,7 +138,7 @@ async function pollForAnswer(taskId: string): Promise<string | null> {
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const s = await api(`/bench/poll?taskId=${taskId}`);
-    if (s.status === "idle" && s.answer) return s.answer;
+    if (s.status === "idle" && s.answer) { count(taskId, "poll"); return s.answer; }
     await new Promise((r) => setTimeout(r, 1_500));
   }
   return null;
@@ -186,7 +186,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         if (!d) return;
         seen.set(taskId, d.seq);
         if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
-        else stop(d.text);
+        else { if (!done) count(taskId, "poll"); stop(d.text); }
       }).catch(() => { /* the socket or the next tick will do */ });
     }, 20_000);
     const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
@@ -206,6 +206,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
       }
       if (typeof e.id === "number") seen.set(taskId, e.id);
       if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) {
+        if (!done) count(taskId, "push");
         stop(String(e.payload.text));
       }
     };
@@ -215,6 +216,14 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
 /** How far each task's stream has been read, so a reconnect does not replay a
  *  previous turn's answer and end the conversation a turn early. */
 const seen = new Map<string, number>();
+
+/** Which path brought each turn's answer, so a record says whether the socket or the poll delivered. */
+const delivered = new Map<string, { push: number; poll: number }>();
+function count(taskId: string, path: "push" | "poll") {
+  const d = delivered.get(taskId) ?? { push: 0, poll: 0 };
+  d[path] += 1;
+  delivered.set(taskId, d);
+}
 
 /** Why a turn ended without an answer, when the object said why. */
 const failed = new Map<string, string>();
@@ -237,6 +246,7 @@ async function runTask(task: any) {
 
   let agentSaid = "Hi! How can I help you today?";
   let turns = 0, simCalls = 0, ended = "max_turns";
+  let stall: string | undefined;
 
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
@@ -251,7 +261,12 @@ async function runTask(task: any) {
 
     const answered = await waitForAnswer(taskId);
     if (!answered) {
-      ended = failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled";
+      if (failed.has(taskId)) ended = `model: ${failed.get(taskId)}`.slice(0, 60);
+      else {
+        ended = "agent_stalled";
+        const last = await api(`/bench/poll?taskId=${taskId}`).catch(() => null);
+        stall = stallCause(last, seen.get(taskId) ?? 0);
+      }
       break;
     }
     agentSaid = answered;
@@ -266,7 +281,8 @@ async function runTask(task: any) {
     writes.some((w: any) => w.name === e.name && canonArgs(w.args) === canonArgs(e.args)));
 
   return {
-    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended,
+    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall,
+    delivered: delivered.get(taskId) ?? { push: 0, poll: 0 },
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
     seconds: Math.round((Date.now() - t0) / 1000),
@@ -363,7 +379,10 @@ console.log(`  tools: ${Object.entries(toolTotals).sort((a: any, b: any) => b[1]
   .map(([n, c]) => `${n}×${c}`).join("  ") || "(none)"}`);
 
 const endings: Record<string, number> = {};
-for (const r of results.filter((x) => !x.reward)) endings[String(r.ended)] = (endings[String(r.ended)] ?? 0) + 1;
+for (const r of results.filter((x) => !x.reward)) {
+  const key = r.stall ? `${r.ended} (${r.stall})` : String(r.ended);
+  endings[key] = (endings[key] ?? 0) + 1;
+}
 if (Object.keys(endings).length) {
   console.log(`  failures by ending: ${Object.entries(endings)
     .sort((a: any, b: any) => b[1] - a[1]).map(([k, v]) => `${k}×${v}`).join("  ")}`);

@@ -1,7 +1,7 @@
 /**
  * The runners' poll fallback takes a turn's answer when the push was lost, and never a previous turn's answer.
  */
-import { decideFromPoll } from "../bench/poll-fallback.ts";
+import { decideFromPoll, stallCause } from "../bench/poll-fallback.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void) {
@@ -40,6 +40,18 @@ await check("a failed model call after the latest message ends the turn as faile
   const events = [{ sequence: 4, kind: "message" }, { sequence: 9, kind: "model.failed" }];
   const d = decideFromPoll({ status: "idle", answer: null, events }, 4);
   assert(d?.kind === "failed" && d.seq === 9, `decision: ${JSON.stringify(d)}`);
+});
+
+await check("a timed-out turn names what the object says: running, answered but undelivered, idle, or unknown", () => {
+  const cases: Array<[string, ReturnType<typeof stallCause>]> = [
+    [stallCause({ status: "running", answer: "old", events: turn }, 71), "still_running"],
+    [stallCause({ status: "idle", answer: "Your exchange has been submitted.", events: turn }, 71), "answer_undelivered"],
+    [stallCause({ status: "idle", answer: "Your exchange has been submitted.", events: [...turn, { sequence: 210, kind: "message" }] }, 193), "idle_without_answer"],
+    [stallCause({ status: "idle", answer: null, events: [{ sequence: 4, kind: "message" }] }, 4), "idle_without_answer"],
+    [stallCause(null, 71), "unknown"],
+    [stallCause({} as any, 71), "unknown"],
+  ];
+  cases.forEach(([got, want], i) => assert(got === want, `case ${i}: ${got}, expected ${want}`));
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

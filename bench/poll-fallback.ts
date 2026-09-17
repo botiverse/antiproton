@@ -31,3 +31,24 @@ export function decideFromPoll(
   if (!poll.answer || lastResponse <= lastMessage || lastResponse <= seenSeq) return null;
   return { kind: "answer", text: String(poll.answer), seq: lastResponse };
 }
+
+/**
+ * Why a turn that ran out of time had no answer, read from one last poll at the deadline (Vera, 2026-09-16).
+ *
+ * `agent_stalled` alone cannot tell an agent that stopped from a delivery that failed twice, and the record is
+ * all a later reader has. So the runner asks once more and names what the object says:
+ *   still_running        the object is still on the turn: the agent really is slow or stuck;
+ *   answer_undelivered   the object answered and neither the socket nor the poll brought it: a delivery fault;
+ *   idle_without_answer  the object is idle with no reply after the latest message;
+ *   unknown              the last poll itself failed, so nothing is claimed.
+ */
+export type StallCause = "still_running" | "answer_undelivered" | "idle_without_answer" | "unknown";
+
+export function stallCause(
+  poll: { status?: string; answer?: string | null; events?: Array<{ sequence: number; kind: string }> } | null,
+  seenSeq: number,
+): StallCause {
+  if (!poll || typeof poll.status !== "string") return "unknown";
+  if (poll.status !== "idle") return "still_running";
+  return decideFromPoll(poll, seenSeq)?.kind === "answer" ? "answer_undelivered" : "idle_without_answer";
+}
