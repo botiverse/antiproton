@@ -14,13 +14,13 @@
  * passing row does not raise.
  */
 
-export type EndedRow = { reward: number; ended?: string; stall?: string };
+export type EndedRow = { reward: number; ended: string; stall?: string };
 
 /** Every trial by how it ended, passing ones included. `stall` is not part of the key. */
 export function endingsAllRows(rows: readonly EndedRow[]): Record<string, number> {
   const out: Record<string, number> = {};
   for (const r of rows) {
-    const key = String(r.ended);
+    const key = r.ended;
     out[key] = (out[key] ?? 0) + 1;
   }
   return out;
@@ -31,7 +31,7 @@ export function failingRowsByEndingAndCause(rows: readonly EndedRow[]): Record<s
   const out: Record<string, number> = {};
   for (const r of rows) {
     if (r.reward) continue;
-    const key = r.stall ? `${r.ended} (${r.stall})` : String(r.ended);
+    const key = r.stall ? `${r.ended} (${r.stall})` : r.ended;
     out[key] = (out[key] ?? 0) + 1;
   }
   return out;
