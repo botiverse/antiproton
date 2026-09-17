@@ -116,12 +116,12 @@ await check("every run_js is counted, however it ends, and a counting failure do
     return { status: outcome.value, outputs: [], hostCalls: 2, error: outcome.value === "completed" ? undefined : "x" };
   } };
   const tool = runJsTool(sandbox as any, { invoke: async () => ({}) } as any, { onRun: (r) => { seen.push(r); throw new Error("counter broke"); } });
-  await tool.execute("c1", { source: "1" } as any, undefined as any, undefined as any, undefined as any);
+  await tool.execute("c1", { source: "1" } as any, undefined as any, undefined as any, undefined as any, undefined as any);
   outcome.value = "failed";
-  await tool.execute("c2", { source: "1" } as any, undefined as any, undefined as any, undefined as any).catch(() => {});
+  await tool.execute("c2", { source: "1" } as any, undefined as any, undefined as any, undefined as any, undefined as any).catch(() => {});
   outcome.value = "throw";
   let threw = "";
-  await tool.execute("c3", { source: "1" } as any, undefined as any, undefined as any, undefined as any).catch((e) => { threw = String(e.message); });
+  await tool.execute("c3", { source: "1" } as any, undefined as any, undefined as any, undefined as any, undefined as any).catch((e) => { threw = String(e.message); });
   must(threw === "executor down", `the run's own error was replaced: ${threw}`);
   must(seen.map((r) => `${r.ok}/${r.hostCalls}`).join(",") === "true/2,false/2,false/0", JSON.stringify(seen));
   must(describe(jsRunRows(base, "ok", 12.6, 2)) === "js.run/ok/13ms js.run/ok/1runs js.run/ok/2tool_calls", describe(jsRunRows(base, "ok", 12.6, 2)));
