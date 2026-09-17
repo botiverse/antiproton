@@ -752,13 +752,12 @@ export interface Plugin {
    *   once its signature has passed. The runtime reads anything but
    *   `rejected` as "this request came from the service", and an unsigned
    *   ping answered early would show a stranger's request as a working
-   *   webhook. With secret rotation (#386, in draft) a delivery counts for
-   *   more: proof that the secret it was checked with is the one in use.
+   *   webhook. A runtime that holds more than one secret for a hook may
+   *   also take a delivery as proof of which secret the service uses.
    * - **A refused request leaves no trace.** Nothing is written to
    *   `ctx.connection` before returning `rejected`: a stranger's request must
    *   not change what the mount remembers, and a runtime holding more than
-   *   one secret for a hook (planned in #386) may offer the same request
-   *   again with the other one.
+   *   one secret for a hook may offer the same request again with another.
    * - **Deliver only what this mount subscribed to**, as recorded in
    *   `ctx.connection` by the plugin's own tools.
    * - **Drop what the mount's own account caused.** An agent that comments on
