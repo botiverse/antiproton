@@ -9,7 +9,7 @@
  *
  *   resource            key                         units
  *   model.tokens        "<model>:<kind>"            tokens   (kind: input, output, cache_read, cache_write, reasoning)
- *   js.run              "run_js"                    runs, ms, tool_calls
+ *   js.run              "run_js"                    runs, failed, ms, tool_calls
  *   tool.call           "<plugin>.<tool>"           calls, failed, ms
  *   sandbox.container   "<plugin>"                  seconds, execs
  *   object.active       ""                          ms
@@ -99,8 +99,8 @@ export const RESOURCES: Resource[] = [
   {
     id: "js.run", title: "JS runs", unit: "runs", fmt: count, splits: ["agent", "tool"],
     detail: (rows) => {
-      const runs = sum(rows, "runs"), ms = sum(rows, "ms"), inner = sum(rows, "tool_calls");
-      return [runs ? `avg ${duration(ms / runs)}` : "", inner ? `${count(inner)} tool calls inside` : ""].filter(Boolean).join(" · ");
+      const runs = sum(rows, "runs"), failed = sum(rows, "failed"), ms = sum(rows, "ms"), inner = sum(rows, "tool_calls");
+      return [failed ? `${count(failed)} failed` : "", runs ? `avg ${duration(ms / runs)}` : "", inner ? `${count(inner)} tool calls inside` : ""].filter(Boolean).join(" · ");
     },
   },
   {

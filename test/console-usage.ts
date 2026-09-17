@@ -90,6 +90,13 @@ check("without prices the page says free; with prices it adds credits up", () =>
   must(/<th class="num">credits<\/th>/.test(paid), "the table gains a credits column");
 });
 
+check("failed runs and calls show in the tile's small print, only when there are any", () => {
+  const html = usagePanel(data([row("a1", "js.run", "run_js", "runs", 4), row("a1", "js.run", "run_js", "failed", 1), row("a1", "tool.call", "gh.x", "calls", 3)]));
+  must(/1 failed · avg/.test(html), "a failed run is counted");
+  must(/none failed/.test(html), "tool calls without failures say so");
+  must(count(html, / failed/g) === 2, "nothing else claims a failure");
+});
+
 check("the tooltip and the table name a bucket in UTC", () => {
   const html = usagePanel(data([row("a1", "js.run", "run_js", "runs", 3, 5)]));
   must(/<b>09-17 07:00Z<\/b>/.test(html), "hourly buckets carry date and hour");
