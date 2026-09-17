@@ -81,6 +81,12 @@ type Resource = {
   detail: (rows: UsageRow[]) => string;
   /** Which splits this resource has an answer for. */
   splits: string[];
+  /**
+   * Whether the ledger records this resource yet. A tile for one it does not
+   * says "not counted yet": an empty chart would read as "nothing was used".
+   * Flip it in the PR that starts recording it.
+   */
+  counted: boolean;
 };
 
 const sum = (rows: UsageRow[], unit: string, pred: (r: UsageRow) => boolean = () => true) =>
@@ -89,7 +95,7 @@ const kind = (r: UsageRow) => r.key.slice(r.key.lastIndexOf(":") + 1);
 
 export const RESOURCES: Resource[] = [
   {
-    id: "model.tokens", title: "model tokens", unit: "tokens", fmt: count, splits: ["agent", "model"],
+    id: "model.tokens", title: "model tokens", unit: "tokens", fmt: count, splits: ["agent", "model"], counted: true,
     detail: (rows) => {
       const k = (name: string) => sum(rows, "tokens", (r) => kind(r) === name);
       const parts = [["in", k("input")], ["out", k("output")], ["cache read", k("cache_read")], ["cache write", k("cache_write")]] as const;
@@ -97,25 +103,25 @@ export const RESOURCES: Resource[] = [
     },
   },
   {
-    id: "js.run", title: "JS runs", unit: "runs", fmt: count, splits: ["agent", "tool"],
+    id: "js.run", title: "JS runs", unit: "runs", fmt: count, splits: ["agent", "tool"], counted: true,
     detail: (rows) => {
       const runs = sum(rows, "runs"), failed = sum(rows, "failed"), ms = sum(rows, "ms"), inner = sum(rows, "tool_calls");
       return [failed ? `${count(failed)} failed` : "", runs ? `avg ${duration(ms / runs)}` : "", inner ? `${count(inner)} tool calls inside` : ""].filter(Boolean).join(" · ");
     },
   },
   {
-    id: "tool.call", title: "tool calls", unit: "calls", fmt: count, splits: ["agent", "tool"],
+    id: "tool.call", title: "tool calls", unit: "calls", fmt: count, splits: ["agent", "tool"], counted: true,
     detail: (rows) => {
       const calls = sum(rows, "calls"), failed = sum(rows, "failed"), ms = sum(rows, "ms");
       return [failed ? `${count(failed)} failed` : calls ? "none failed" : "", calls ? `avg ${duration(ms / calls)}` : ""].filter(Boolean).join(" · ");
     },
   },
   {
-    id: "sandbox.container", title: "container time", unit: "seconds", fmt: (s) => duration(s * 1000), splits: ["agent", "tool"],
+    id: "sandbox.container", title: "container time", unit: "seconds", fmt: (s) => duration(s * 1000), splits: ["agent", "tool"], counted: false,
     detail: (rows) => { const n = sum(rows, "execs"); return n ? `${count(n)} commands run` : ""; },
   },
   {
-    id: "object.active", title: "agent running time", unit: "ms", fmt: duration, splits: ["agent"],
+    id: "object.active", title: "agent running time", unit: "ms", fmt: duration, splits: ["agent"], counted: false,
     detail: () => "billed time of the agents themselves",
   },
 ];
@@ -214,6 +220,13 @@ export function usagePanel(d: UsageData): string {
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
   const tiles = RESOURCES.map((res) => {
+    if (!res.counted) {
+      return `<section class="u-tile off">
+  <h3>${res.title}</h3>
+  <div class="u-num">not counted yet</div>
+  <div class="u-detail">recording this is still being built</div>
+</section>`;
+    }
     const rows = d.rows.filter((r) => r.resource === res.id);
     const total = sum(rows, res.unit);
     const c = rows.reduce((a, r) => a + (Number(r.cost) || 0), 0);
@@ -231,6 +244,7 @@ export function usagePanel(d: UsageData): string {
     .filter((g) => d.by === "total" || g !== "total")
     .sort((a, b) => (a === "" ? 1 : b === "" ? -1 : label(d, a).localeCompare(label(d, b))));
   const cell = (g: string, res: Resource) => {
+    if (!res.counted) return `<td class="num"><span class="faint">not counted</span></td>`;
     const n = sum(d.rows, res.unit, (r) => r.group === g && r.resource === res.id);
     return `<td class="num">${n ? res.fmt(n) : `<span class="faint">·</span>`}</td>`;
   };
@@ -274,6 +288,7 @@ em.k{display:inline-block;width:10px;height:10px;border-radius:3px;flex:none}
 .u-tile{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--layer-card);min-width:0;overflow:visible}
 .u-tile h3{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);font-weight:500}
 .u-num{font-size:22px;font-weight:600;color:var(--strong);display:flex;align-items:baseline;gap:8px;margin-top:2px}
+.u-tile.off .u-num{font-size:14px;font-weight:500;color:var(--dim);margin-top:8px}
 .u-cost{font-size:11px;font-weight:400;color:var(--dim)}
 .u-detail{font-size:11px;color:var(--dim);min-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .u-plot{position:relative;margin-top:8px}

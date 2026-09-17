@@ -44,10 +44,18 @@ check("one chart per resource, each on its own scale", () => {
     row("a1", "model.tokens", "m:input", "tokens", 900000),
     row("a1", "sandbox.container", "sandbox", "seconds", 120),
   ]));
-  must(count(html, /<section class="u-tile">/g) === RESOURCES.length, "a tile per resource");
+  must(count(html, /<section class="u-tile( off)?">/g) === RESOURCES.length, "a tile per resource");
   must(/<div class="u-max">900k<\/div>/.test(html), "the token chart tops at its own maximum");
-  must(/<div class="u-max">2 min<\/div>/.test(html), "the container chart tops at its own maximum, in its own unit");
-  must(count(html, /nothing in this window/g) === RESOURCES.length - 2, "an idle resource says so instead of drawing an empty axis");
+  const counted = RESOURCES.filter((r) => r.counted).length;
+  must(count(html, /nothing in this window/g) === counted - 1, "an idle counted resource says so instead of drawing an empty axis");
+});
+
+check("a resource the ledger does not record yet says so, not \"nothing\"", () => {
+  const off = RESOURCES.filter((r) => !r.counted);
+  const html = usagePanel(data([row("a1", "js.run", "run_js", "runs", 1), row("a1", "sandbox.container", "sandbox", "seconds", 60)]));
+  must(count(html, /<section class="u-tile off">[\s\S]*?not counted yet/g) === off.length, "each uncounted tile says not counted yet");
+  must(!/<div class="u-max">1 min<\/div>/.test(html), "a stray row for an uncounted resource draws nothing");
+  must(count(html, /<span class="faint">not counted<\/span>/g) === off.length, "the table says so in the column too");
 });
 
 check("every bucket in the window is a column, idle ones included", () => {
