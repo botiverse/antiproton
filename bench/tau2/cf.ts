@@ -26,6 +26,7 @@ import { createHash } from "node:crypto";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallCause } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
+import { passLines, passRecord } from "./passk.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -321,17 +322,6 @@ function argDiff(expected: Array<{ name: string; args: any }>, performed: Array<
   return out;
 }
 
-function passAtK(rows: any[], k: number) {
-  const byTask = new Map<string, any[]>();
-  for (const r of rows) byTask.set(String(r.id), [...(byTask.get(String(r.id)) ?? []), r]);
-  let all = 0, counted = 0;
-  for (const [, rs] of byTask) {
-    if (rs.length < k) continue;
-    counted += 1;
-    if (rs.slice(0, k).every((r) => r.reward)) all += 1;
-  }
-  return { passed: all, of: counted };
-}
 
 // The base database has to be where the object can read it, and it is 2.8 MB,
 // so it is uploaded once rather than carried in every request.
@@ -373,16 +363,9 @@ for (let trial = 1; trial <= TRIALS; trial++) {
   }
 }
 
-const pass = results.filter((r) => r.reward).length;
 console.log(`  ${"─".repeat(84)}`);
-if (TRIALS > 1) {
-  for (let k = 1; k <= TRIALS; k++) {
-    const { passed, of } = passAtK(results, k);
-    console.log(`  pass^${k} = ${passed}/${of} = ${of ? (100 * passed / of).toFixed(1) : "0.0"}%`);
-  }
-}
-console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.length).toFixed(1)}%   ` +
-  `${results.reduce((a, r) => a + r.seconds, 0)}s wall`);
+for (const line of passLines(results, TRIALS)) console.log(line);
+console.log(`  ${results.reduce((a, r) => a + r.seconds, 0)}s wall`);
 
 // The same tally the in-process runner printed, so "did anything reach for
 // run_js" has an on-object answer rather than an in-process one.
@@ -422,7 +405,7 @@ if (act) {
 const recorded = recordRun("tau2", OBJ, {
   bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
   tasks: selected.map((t) => t.id), trials: TRIALS, startedAt: new Date(t0Run).toISOString(),
-  results, passAtK: TRIALS > 1 ? Object.fromEntries([...Array(TRIALS)].map((_, k) => [k + 1, passAtK(results, k + 1)])) : undefined,
+  results, ...passRecord(results, TRIALS),
   tools: toolTotals, endingsAllRows: allEndings, failingRowsByEndingAndCause: failEndings, activity: act,
 });
 console.log(`  recorded ${recorded}`);

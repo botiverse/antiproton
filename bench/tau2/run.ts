@@ -15,6 +15,7 @@
  */
 import { readFileSync } from "node:fs";
 import { failingRowsByEndingAndCause } from "./endings.ts";
+import { passLines } from "./passk.ts";
 import { homedir } from "node:os";
 import { SqliteStore } from "../../src/store/sqlite.ts";
 import { sqliteHost } from "../../src/store/sqlite-host.ts";
@@ -244,31 +245,6 @@ for (let trial = 1; trial <= TRIALS; trial++) {
   }
 }
 
-/**
- * pass^k, which is τ²-bench's own metric and the reason trials exist.
- *
- * pass^1 averages over every run and answers "how often does this work". pass^k
- * requires the same task to succeed in all k trials, and answers the question a
- * deployment actually has: is this reliable, or does it work often enough to
- * look reliable in a small sample. A loop that scores 100% at pass^1 and 33% at
- * pass^3 is not a loop anyone should ship.
- */
-function passAtK(rows: any[], k: number) {
-  const byTask = new Map<string, any[]>();
-  for (const r of rows) {
-    const key = String(r.id);
-    byTask.set(key, [...(byTask.get(key) ?? []), r]);
-  }
-  let all = 0, counted = 0;
-  for (const [, rs] of byTask) {
-    if (rs.length < k) continue;
-    counted += 1;
-    if (rs.slice(0, k).every((r) => r.reward)) all += 1;
-  }
-  return { passed: all, of: counted };
-}
-
-const pass = results.filter((r) => r.reward).length;
 const prompt = results.reduce((a, r) => a + (r.prompt ?? 0), 0);
 const cached = results.reduce((a, r) => a + (r.cached ?? 0), 0);
 const allTools: Record<string, number> = {};
@@ -276,15 +252,8 @@ for (const r of results) for (const [n, c] of Object.entries(r.byTool ?? {})) {
   allTools[n] = (allTools[n] ?? 0) + (c as number);
 }
 console.log(`  ${"─".repeat(84)}`);
-if (TRIALS > 1) {
-  for (let k = 1; k <= TRIALS; k++) {
-    const { passed, of } = passAtK(results, k);
-    console.log(`  pass^${k} = ${passed}/${of} = ${of ? (100 * passed / of).toFixed(1) : "0.0"}%` +
-      (k === 1 ? "   (averaged over every trial below)" : `   (the same task, ${k} trials in a row)`));
-  }
-}
-console.log(`  pass^1 = ${pass}/${results.length} = ${(100 * pass / results.length).toFixed(1)}%   ` +
-  `db-only ${results.filter((r) => r.dbMatch).length}   ` +
+for (const line of passLines(results, TRIALS)) console.log(line);
+console.log(`  db-only ${results.filter((r) => r.dbMatch).length}   ` +
   `action-only ${results.filter((r) => r.actionMatch).length}   ` +
   `${results.reduce((a, r) => a + r.seconds, 0)}s`);
 /**
