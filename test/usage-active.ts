@@ -123,6 +123,33 @@ check("against a real table: the pass appends one row an hour and never twice", 
   must(pendingUsage(host.sql, 0).length === 3, "three rows in total, none of them negative");
 });
 
+check("a span that started hours ago and ended now is counted, in every hour it crossed", () => {
+  // Rex, reviewing #400: `at` is when the handler STARTED. A two-hour handler
+  // that began three hours ago is entirely outside a bound on `at` and entirely
+  // inside the time it has to be counted for, so bounding by the start loses
+  // all of it and moves no watermark — nothing would reveal the omission.
+  const host = sqliteHost();
+  host.sql.exec("CREATE TABLE IF NOT EXISTS do_activity(at INTEGER, ms INTEGER, kind TEXT)");
+  const h = (n: number) => H0 + n * HOUR_MS;
+  const now = h(5) + 10 * 60_000;
+  host.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", h(3) + 5_000, 2 * HOUR_MS, "alarm");
+  const got = countActiveTime(host.sql, { tenantId: "t", agentId: "a" }, now);
+  eq(got, [
+    { hour: h(3), ms: HOUR_MS - 5_000 },
+    { hour: h(4), ms: HOUR_MS },
+    { hour: h(5), ms: 5_000 },
+  ], "every hour the span crossed, including the two before the read bound");
+  eq(got.reduce((a, r) => a + r.ms, 0), 2 * HOUR_MS, "and the parts are the whole span");
+
+  // The same span on a later pass: the hours it touched are older than the read
+  // bound, so their watermarks have to be loaded by the hours the spans reach,
+  // not by the bound — otherwise an unloaded watermark reads as zero and the
+  // hour is counted again in full.
+  eq(countActiveTime(host.sql, { tenantId: "t", agentId: "a" }, now), [], "a second pass counts none of it again");
+  const total = pendingUsage(host.sql, 0).reduce((a, r) => a + r.quantity, 0);
+  eq(total, 2 * HOUR_MS, "the outbox holds the span once");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

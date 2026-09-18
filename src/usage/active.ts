@@ -103,10 +103,23 @@ const WATERMARK = "CREATE TABLE IF NOT EXISTS usage_active(hour INTEGER PRIMARY 
  * Append what the object has been billed for since the last pass, and remember
  * it. Returns the rows appended, so a caller can say nothing happened.
  *
- * Only the current hour and the one before it are read: a span is written when
- * its handler ends, so no earlier hour can still change. The pass calling this
- * is not in `do_activity` yet — #busy writes its span in a `finally` — so each
- * pass counts the one before it.
+ * Three clocks get confused here, so each is named. A span is WRITTEN when its
+ * handler ends (#busy's `finally`), it STARTED at `at`, and it ENDED at
+ * `at + ms`. Only spans that reach into the last two hours are read, and the
+ * bound is on the END: a handler that began three hours ago and returned a
+ * minute ago is entirely inside the window it must be counted for and entirely
+ * outside a bound on `at` — it would be dropped without a trace, which is a
+ * missing number rather than a wrong one (Rex, reviewing #400). Provider waits
+ * of hundreds of seconds are ordinary here, so this is not a hypothetical.
+ *
+ * Because such a span can reach hours older than that bound, the watermarks are
+ * read from the oldest hour the spans actually touch, not from the bound: a
+ * watermark that was not loaded reads as zero, and the hour would be counted a
+ * second time in full.
+ *
+ * The pass calling this is not in `do_activity` yet, so each pass counts the one
+ * before it, and the last pass before an agent goes quiet leaves its own span
+ * for the next wake.
  */
 export function countActiveTime(
   sql: Sql, who: { tenantId: string; agentId: string }, now = Date.now(),
@@ -114,12 +127,15 @@ export function countActiveTime(
   sql.exec(WATERMARK);
   const since = Math.floor(now / HOUR_MS) * HOUR_MS - HOUR_MS;
   const spans: ActivitySpan[] = sql
-    .exec("SELECT at, ms, kind FROM do_activity WHERE at >= ?", since).toArray()
+    .exec("SELECT at, ms, kind FROM do_activity WHERE at + ms >= ?", since).toArray()
     .map((r: any) => ({ at: Number(r.at), ms: Number(r.ms), kind: String(r.kind) }));
+  const byHour = unionMsByHour(busySpans(spans));
+  if (!byHour.length) return [];
+  const oldest = byHour[0]!.hour;
   const counted = new Map<number, number>(sql
-    .exec("SELECT hour, ms FROM usage_active WHERE hour >= ?", since).toArray()
+    .exec("SELECT hour, ms FROM usage_active WHERE hour >= ?", oldest).toArray()
     .map((r: any) => [Number(r.hour), Number(r.ms)]));
-  const fresh = newActiveMs(unionMsByHour(busySpans(spans)), counted);
+  const fresh = newActiveMs(byHour, counted);
   if (!fresh.length) return [];
   // `at` is the hour itself: a row belongs to the hour it measures, not to the
   // pass that noticed it.
