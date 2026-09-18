@@ -322,8 +322,16 @@ export function usagePanel(d: UsageData): string {
         : `${credits(m.credits)}<span class="faint" title="some amounts here are not priced yet"> +</span>`)(money(d.rows, (r) => r.group === g))}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
     : "";
 
+  // An empty window is the whole page for everyone who opens it before the
+  // first turn finishes, so it carries the two things that are true with or
+  // without usage: what is not being recorded at all, and that nothing is
+  // charged. Without them a new account is told only that it used nothing,
+  // and would read the silence about container time as "none used".
   if (!d.rows.length) {
-    return `${controls}<div class="empty">nothing used in the last ${esc(d.window)}. Usage is recorded as each agent finishes a turn.</div>`;
+    const off = RESOURCES.filter((res) => !res.counted).map((res) => res.title);
+    return `${controls}<div class="empty">nothing used in the last ${esc(d.window)}. Usage is recorded as each agent finishes a turn.${
+      off.length ? `<div class="u-note">not counted yet, still being built: ${esc(off.join(", "))}</div>` : ""}${
+      d.priced ? "" : `<div class="u-note">no prices are set yet, so nothing here is charged</div>`}</div>`;
   }
   return `${controls}${headline}${legend}<div class="u-grid">${tiles}</div>
 <h3 class="u-h">by ${d.by === "total" ? "resource" : esc(d.by)}</h3>${table}
