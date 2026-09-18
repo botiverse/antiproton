@@ -162,6 +162,19 @@ check("nothing used says so, and keeps the controls", () => {
   must(/onchange="ap\.usage\(this, event\.target\)"/.test(html) && /name="window"/.test(html), "the controls stay");
 });
 
+check("an empty window still says what is not recorded, and that nothing is charged", () => {
+  // Everyone who opens the page before the first turn finishes sees only this
+  // branch: no tiles, so the only chance to say a resource is not recorded at
+  // all. Silence there reads as "none used", which is a different claim.
+  const html = usagePanel(data([]));
+  const off = RESOURCES.filter((r) => !r.counted).map((r) => r.title);
+  must(off.length, "this check is about resources not counted yet; there are none");
+  for (const title of off) must(html.includes(title), `the empty window names ${title}`);
+  must(/not counted yet, still being built:/.test(html), "and says why they are absent");
+  must(/no prices are set yet, so nothing here is charged/.test(html), "an unpriced account is told so before it has any usage");
+  must(!/no prices are set yet/.test(usagePanel(data([], { priced: true }))), "once a price exists the empty window drops that line");
+});
+
 check("row values never reach the markup unescaped", () => {
   const bad = `<img src=x onerror=1>`;
   const html = usagePanel(data([row(bad, "tool.call", bad, "calls", 1)], { by: "tool", labels: {} }));
