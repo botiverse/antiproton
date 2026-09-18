@@ -19,7 +19,15 @@
  * runs, and its name now says why.
  */
 
-/** One trial. `id` names the task, so a task's trials are the rows that share it. */
+/**
+ * One trial. `id` names the task, so a task's trials are the rows that share it.
+ *
+ * The union is the boundary saying what it does not know, not two runners
+ * disagreeing: both build their rows from `task.id` where the task came out of
+ * `JSON.parse` into `any[]` (bench/tau2/cf.ts:50, run.ts:43). The data's ids are
+ * strings today, and nothing in the types says so. Narrowing here would only
+ * move the unchecked step to the caller; the place to fix it is the parse.
+ */
 export type TrialRow = { id: string | number; reward: number };
 
 /** A task's trials in the order the run produced them, tasks in first-seen order. */
