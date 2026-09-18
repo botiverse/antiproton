@@ -58,6 +58,32 @@ commit `7685246` (2026-09-17 09:24Z) its keys never carry a cause, because the
 field that holds one did not exist yet; the last such run is the 06:53Z one of
 2026-09-17.
 
+## Reading a τ² record: pass^k, and which trials it counted
+
+A record carries two pass readings, because "pass^k" was two different numbers
+in the same output until 2026-09-18:
+
+- `passAllKTrials` — τ²-bench's pass^k: the chance that k of a task's trials,
+  drawn at random, all pass, averaged over tasks. `rate` is a share, not a
+  count. At k=1 it equals the share of trials that passed.
+- `passFirstKTrials` — the task's **first k trials in run order**. A within-run
+  reading: it moves with where the failures fell, so it cannot be compared
+  across runs.
+
+Records from a `driver` older than the split carry a single `passAtK` instead.
+That field is `passFirstKTrials` under the name of the other one, and the
+comment above the code that wrote it said it "averages over every run", which
+is what `passAllKTrials` does and what that code did not. Two runs on
+2026-09-18 show the distance: both had 24 trials, 22 passing, and two failures
+in two different tasks, and `passAtK[1]` read 7/8 for the 00:53Z run and 8/8
+for the 06:53Z one, purely because the failures landed on a first trial in the
+one and a third trial in the other. Under `passAllKTrials` the two runs are
+identical at every k (91.7% · 83.3% · 75.0%).
+
+So a figure that compares pass^k across that line is comparing two metrics. The
+old field can still be compared with `passFirstKTrials`, which reproduces it
+exactly.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working
