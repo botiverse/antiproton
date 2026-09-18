@@ -65,7 +65,9 @@ in the same output until 2026-09-18:
 
 - `passAllKTrials` — τ²-bench's pass^k: the chance that k of a task's trials,
   drawn at random, all pass, averaged over tasks. `rate` is a share, not a
-  count. At k=1 it equals the share of trials that passed.
+  count. At k=1 it equals the share of trials that passed **when every task ran
+  the same number of trials**, which a τ² run does: it is the mean of each
+  task's own share, so a run with a short task in it separates the two.
 - `passFirstKTrials` — the task's **first k trials in run order**. A within-run
   reading: it moves with where the failures fell, so it cannot be compared
   across runs.

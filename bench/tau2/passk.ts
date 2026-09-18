@@ -3,7 +3,9 @@
  *
  * τ²-bench's pass^k asks: if k of a task's trials were drawn at random, would
  * all k pass? Averaged over tasks, that is an order-free property of the run,
- * and at k=1 it is exactly the share of trials that passed.
+ * and at k=1 it is the share of trials that passed, as long as every task ran
+ * the same number of trials — it is the mean of each task's own share, so a run
+ * with a short task in it puts the two apart.
  *
  * What this runner computed until now was a different thing under that name:
  * the task's FIRST k trials in run order. The two agree only at k = trials.
@@ -100,7 +102,7 @@ export function passLines(rows: readonly TrialRow[], trials: number): string[] {
   if (trials > 1) {
     for (let k = 1; k <= trials; k++) {
       const { rate, tasks } = passAllKTrials(rows, k);
-      out.push(`  pass^${k} = ${pct(rate)}   (any ${k} of a task's trials, all passing; ${tasks} tasks)`);
+      out.push(`  pass^${k} = ${pct(rate)}   (any ${k} of a task's trials, all passing; ${tasks} task${tasks === 1 ? "" : "s"})`);
     }
     for (let k = 1; k <= trials; k++) {
       const { passed, tasks } = passFirstKTrials(rows, k);
@@ -108,8 +110,15 @@ export function passLines(rows: readonly TrialRow[], trials: number): string[] {
         `   (the task's first ${k} trials in run order — within this run only)`);
     }
   }
+  // Equal to pass^1 only when every task ran the same number of trials: this
+  // line is sum(passed)/sum(trials) over rows, pass^1 is the mean of each
+  // task's own share, and the two differ as soon as the counts do. A τ² run
+  // gives every task the same trials, so they agree there and the agreement is
+  // worth having as a cross-check — but the note has to say when it holds, or a
+  // short task in some later run makes the line a lie (Vera, 2026-09-18).
   const won = rows.filter((r) => r.reward).length;
+  const perTask = new Set(byTask(rows).map((t) => t.length));
   out.push(`  trials  = ${won}/${rows.length} = ${pct(rows.length ? won / rows.length : 0)}` +
-    `   (every trial; equals pass^1 above)`);
+    `   (every trial; ${perTask.size > 1 ? "not comparable to pass^1: tasks ran different trial counts" : "equals pass^1 above when every task has the same trial count"})`);
   return out;
 }

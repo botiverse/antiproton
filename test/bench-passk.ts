@@ -74,6 +74,22 @@ await check("the record carries both readings, keyed by k, and no `passAtK`", ()
   eq((rec.passFirstKTrials as any)["1"], { passed: 8, tasks: 8 }, "first 1 of the 06:53Z shape");
 });
 
+await check("pass^1 and the trial line agree only when the trial counts are equal", () => {
+  // One task with 2 of 3, one with 0 of 1: the rows say 2/4 = 50.0%, pass^1
+  // averages each task's own share and says 33.3%. The line's note has to hold
+  // this case, because nothing stops a run from having a short task.
+  const uneven = [
+    { id: 0, reward: 1 }, { id: 0, reward: 1 }, { id: 0, reward: 0 },
+    { id: 1, reward: 0 },
+  ];
+  near(passAllKTrials(uneven, 1).rate, 1 / 3, "pass^1 averages per task");
+  near(uneven.filter((r) => r.reward).length / uneven.length, 1 / 2, "the trial line is over rows");
+  const line = passLines(uneven, 3).find((l) => /^ {2}trials /.test(l));
+  assert(line !== undefined && /not comparable to pass\^1/.test(line), `uneven note: ${line}`);
+  const even = passLines(failedLastTrial, 3).find((l) => /^ {2}trials /.test(l));
+  assert(even !== undefined && /when every task has the same trial count/.test(even), `even note: ${even}`);
+});
+
 await check("every printed line says which trials it counted", () => {
   const lines = passLines(failedLastTrial, 3);
   assert(lines.some((l) => /pass\^1 = 91\.7%/.test(l)), `pass^1 line: ${lines.join(" | ")}`);
