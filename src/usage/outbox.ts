@@ -88,6 +88,23 @@ export interface HourlyRow {
   quantity: number;
 }
 
+/**
+ * One interval cut at hour boundaries: the part of it that falls in each hour,
+ * oldest first. Time an agent is charged for is measured as an interval and
+ * recorded by the hour, and every resource that does so cuts it the same way —
+ * the object's own busy spans (src/usage/active.ts) and a container's life
+ * (src/usage/container.ts). Empty when the interval is empty or backwards.
+ */
+export function msByHour(start: number, end: number): Array<{ hour: number; ms: number }> {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+  const out: Array<{ hour: number; ms: number }> = [];
+  for (let h = Math.floor(start / HOUR_MS) * HOUR_MS; h < end; h += HOUR_MS) {
+    const ms = Math.min(end, h + HOUR_MS) - Math.max(start, h);
+    if (ms > 0) out.push({ hour: h, ms });
+  }
+  return out;
+}
+
 /** Sum rows into (tenant, agent, hour, resource, key, unit). Order-independent. */
 export function toHourly(rows: readonly UsageRow[]): HourlyRow[] {
   const out = new Map<string, HourlyRow>();

@@ -64,6 +64,7 @@ import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
+import { countHeldTime } from "../../src/usage/container.ts";
 import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
@@ -526,6 +527,33 @@ export class AgentDO extends DurableObject<Env> {
     // Measuring must not break a pass, exactly as #note must not.
     try { countActiveTime(this.sql as any, { tenantId, agentId }); }
     catch (e: any) { console.warn(`active-time accounting skipped: ${String(e?.message ?? e).slice(0, 200)}`); }
+  }
+
+  /**
+   * What this agent's mounts have been holding, into the usage outbox.
+   *
+   * Asked of the mounts themselves, through the same report the console reads:
+   * a container is billed for existing rather than per call, and only the mount
+   * knows that. A watermark per box (src/usage/container.ts) makes a box that
+   * lives across ten passes count once.
+   *
+   * The cost is one activity and one usage read per mount per pass, both from
+   * this object's own storage. A mount that holds nothing yields no rows.
+   */
+  async #countHeldTime(rt: AgentRuntime, tenantId: string, agentId: string) {
+    try {
+      const mounts = await rt.store.listMounts(tenantId, agentId);
+      const reports = await this.#mountReports(rt, tenantId, agentId, LEGACY_TASK_ID, mounts);
+      const byAlias = new Map(mounts.map((m) => [m.alias, m.plugin]));
+      const named: Record<string, { plugin: string; report: unknown }> = {};
+      for (const [alias, report] of Object.entries(reports)) {
+        const plugin = byAlias.get(alias);
+        if (plugin) named[alias] = { plugin, report };
+      }
+      countHeldTime(this.sql as any, named, { tenantId, agentId });
+    } catch (e: any) {
+      console.warn(`held-time accounting skipped: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
   }
 
   /**
@@ -1598,10 +1626,13 @@ export class AgentDO extends DurableObject<Env> {
    */
   async #mountReports(
     rt: AgentRuntime, tenantId: string, agentId: string, taskId: string,
+    // The caller may already hold the list. The accounting pass does, and
+    // reading it twice would answer the same question twice (Rex, #402).
+    mounts?: Awaited<ReturnType<AgentRuntime["store"]["listMounts"]>>,
   ): Promise<MountReports> {
     const gw = rt.gateway();
     const out: MountReports = {};
-    for (const m of await rt.store.listMounts(tenantId, agentId)) {
+    for (const m of mounts ?? await rt.store.listMounts(tenantId, agentId)) {
       try {
         const [activity, usage] = await Promise.all([
           gw.mountActivity({ tenantId, agentId, taskId }, m.alias),
@@ -2004,6 +2035,7 @@ export class AgentDO extends DurableObject<Env> {
         let usagePending = false;
         try {
           this.#countActiveTime(who.tenantId, who.agentId);
+          await this.#countHeldTime(rt, who.tenantId, who.agentId);
           await flushUsage(this.env.CONTROL_DB, this.sql as any, who.tenantId, who.agentId);
         } catch (e: any) {
           usagePending = true;

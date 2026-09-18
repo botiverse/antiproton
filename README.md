@@ -627,14 +627,15 @@ them:
   hours into days past a cutoff is the intended fix and is not written yet. The
   care taken over the outbox's pruning has no counterpart on the side that can
   actually grow (Rex, reviewing #391).
-- **Container time is not counted.** Of the five resources the usage view names,
-  four are recorded: model tokens, JS runs, tool calls, and — since this change —
-  the billed time of the agents' own objects. `sandbox.container` still reads
-  "not counted yet" on the page, which is what a tile says when the ledger has
-  nothing rather than when nothing happened. A container's seconds are visible in
-  its mount's own bounded window (`usageOf`, the console's history), and that
-  window is not a ledger: it keeps the last few sessions per mount, so it cannot
-  answer "how much container time did this tenant use last week".
+- **A container's last seconds can go uncounted.** All five resources the usage
+  view names are recorded now. Container time is asked of the mounts themselves
+  once per pass, so a box alive across ten turns is counted in the hours it was
+  alive — but the final stretch, between the last pass and the moment the box
+  went away, is only counted if the agent wakes again while that session is still
+  in the mount's bounded window. An agent that holds a container, is released by
+  the idle reaper and never wakes again leaves that tail out of the ledger. The
+  same is true of the object's own last span, and for the same reason: both are
+  written down by the pass after them.
 - **A resource that starts being counted mid-window.** The read reports the first
   hour it holds anything for each resource, and a tile whose first hour falls
   inside the window says so instead of showing a part as a whole. What it cannot
