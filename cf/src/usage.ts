@@ -78,6 +78,15 @@ const duration = (ms: number) => {
   if (s < 3600) return `${+(s / 60).toFixed(1)} min`;
   return `${+(s / 3600).toFixed(1)} h`;
 };
+
+/**
+ * The average time of n events. A per-call `ms` is recorded whatever the
+ * outcome, already rounded to whole milliseconds, so a total of 0 over calls
+ * that did happen means "too short to measure", not "not measured" — and
+ * `avg 0ms` reads as the second. Same shape as `credits`' `<0.01`.
+ */
+const average = (ms: number, n: number) => (ms ? duration(ms / n) : "<1ms");
+
 const credits = (c: number) => (c === 0 ? "0" : c < 0.01 ? "<0.01" : c < 100 ? c.toFixed(2) : count(c));
 
 type Resource = {
@@ -134,14 +143,14 @@ export const RESOURCES: Resource[] = [
     id: "js.run", title: "JS runs", unit: "runs", fmt: count, splits: ["agent", "tool"], counted: true,
     detail: (rows) => {
       const runs = sum(rows, "runs"), failed = sum(rows, "failed"), ms = sum(rows, "ms"), inner = sum(rows, "tool_calls");
-      return [failed ? `${count(failed)} failed` : "", runs ? `avg ${duration(ms / runs)}` : "", inner ? `${count(inner)} tool calls inside` : ""].filter(Boolean).join(" · ");
+      return [failed ? `${count(failed)} failed` : "", runs ? `avg ${average(ms, runs)}` : "", inner ? `${count(inner)} tool calls inside` : ""].filter(Boolean).join(" · ");
     },
   },
   {
     id: "tool.call", title: "tool calls", unit: "calls", fmt: count, splits: ["agent", "tool"], counted: true,
     detail: (rows) => {
       const calls = sum(rows, "calls"), failed = sum(rows, "failed"), ms = sum(rows, "ms");
-      return [failed ? `${count(failed)} failed` : calls ? "none failed" : "", calls ? `avg ${duration(ms / calls)}` : ""].filter(Boolean).join(" · ");
+      return [failed ? `${count(failed)} failed` : calls ? "none failed" : "", calls ? `avg ${average(ms, calls)}` : ""].filter(Boolean).join(" · ");
     },
   },
   {
