@@ -145,7 +145,7 @@ export const RESOURCES: Resource[] = [
     },
   },
   {
-    id: "sandbox.container", title: "container time", unit: "seconds", fmt: (s) => duration(s * 1000), splits: ["agent", "tool"], counted: false,
+    id: "sandbox.container", title: "container time", unit: "seconds", fmt: (s) => duration(s * 1000), splits: ["agent", "tool"], counted: true,
     detail: (rows) => { const n = sum(rows, "execs"); return n ? `${count(n)} commands run` : ""; },
   },
   {

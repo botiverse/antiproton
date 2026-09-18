@@ -56,16 +56,29 @@ check("one chart per resource, each on its own scale", () => {
   ]));
   must(count(html, /<section class="u-tile( off)?">/g) === RESOURCES.length, "a tile per resource");
   must(/<div class="u-max">900k<\/div>/.test(html), "the token chart tops at its own maximum");
-  const counted = RESOURCES.filter((r) => r.counted).length;
-  must(count(html, /nothing in this window/g) === counted - 1, "an idle counted resource says so instead of drawing an empty axis");
+  // Derived from the fixture rather than from "all but one": container time is
+  // counted now, so these two rows cover two resources, and a hard-coded
+  // `counted - 1` was really a statement about how many rows the fixture had.
+  const drawn = new Set(["model.tokens", "sandbox.container"]);
+  const idle = RESOURCES.filter((r) => r.counted && !drawn.has(r.id)).length;
+  must(count(html, /nothing in this window/g) === idle, "an idle counted resource says so instead of drawing an empty axis");
 });
 
-check("a resource the ledger does not record yet says so, not \"nothing\"", () => {
+check("every resource is recorded now, so the page says \"not counted\" nowhere", () => {
+  // This check used to assert the opposite: that each uncounted resource said
+  // "not counted yet" in its tile, that a stray row for one drew nothing, and
+  // that the table's column said so too. Nothing is uncounted any more, and
+  // those assertions cannot be written without a resource to write them about —
+  // `usagePanel` reads the module's RESOURCES rather than taking them.
+  //
+  // So the sentinel is here: adding an uncounted resource fails this check, and
+  // the assertions to restore are named above. Meanwhile the claim that can
+  // still be made is made: the page says it about nothing.
   const off = RESOURCES.filter((r) => !r.counted);
+  must(off.length === 0, `restore this check's old assertions: ${off.map((r) => r.id).join(", ")} is not counted`);
   const html = usagePanel(data([row("a1", "js.run", "run_js", "runs", 1), row("a1", "sandbox.container", "sandbox", "seconds", 60)]));
-  must(count(html, /<section class="u-tile off">[\s\S]*?not counted yet/g) === off.length, "each uncounted tile says not counted yet");
-  must(!/<div class="u-max">1 min<\/div>/.test(html), "a stray row for an uncounted resource draws nothing");
-  must(count(html, /<span class="faint">not counted<\/span>/g) === off.length, "the table says so in the column too");
+  must(!/not counted/.test(html), "no tile and no table cell may say not counted");
+  must(/<div class="u-max">1 min<\/div>/.test(html), "and a container row now draws, which is what being counted means");
 });
 
 check("every bucket in the window is a column, idle ones included", () => {
@@ -201,15 +214,15 @@ check("nothing used says so, and keeps the controls", () => {
   must(/onchange="ap\.usage\(this, event\.target\)"/.test(html) && /name="window"/.test(html), "the controls stay");
 });
 
-check("an empty window still says what is not recorded, and that nothing is charged", () => {
+check("an empty window says that nothing is charged, and claims nothing about what is not recorded", () => {
   // Everyone who opens the page before the first turn finishes sees only this
-  // branch: no tiles, so the only chance to say a resource is not recorded at
-  // all. Silence there reads as "none used", which is a different claim.
+  // branch. It used to be the only place that could say a resource was not
+  // recorded at all; every resource is recorded now, so that sentence must be
+  // gone rather than left hanging about something that is no longer true
+  // (Nova's instruction, and her own test asked for this by failing).
   const html = usagePanel(data([]));
-  const off = RESOURCES.filter((r) => !r.counted).map((r) => r.title);
-  must(off.length, "this check is about resources not counted yet; there are none");
-  for (const title of off) must(html.includes(title), `the empty window names ${title}`);
-  must(/not counted yet, still being built:/.test(html), "and says why they are absent");
+  must(!RESOURCES.some((r) => !r.counted), "every resource is counted; if one is added uncounted, restore the naming check");
+  must(!/not counted yet/.test(html), "nothing is uncounted, so the empty window must not say anything is");
   must(/no prices are set yet, so nothing here is charged/.test(html), "an unpriced account is told so before it has any usage");
   must(!/no prices are set yet/.test(usagePanel(data([], { priced: true }))), "once a price exists the empty window drops that line");
 });

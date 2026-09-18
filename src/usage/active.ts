@@ -16,12 +16,12 @@
  * implementations.
  */
 
-import { appendUsage } from "./outbox.ts";
+import { appendUsage, msByHour, HOUR_MS } from "./outbox.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
 
 type Sql = SqlHost["sql"];
 
-export const HOUR_MS = 3_600_000;
+export { HOUR_MS };
 
 /** One measured span: when it started and how long the object was in it. */
 export interface ActivitySpan { at: number; ms: number; kind: string }
@@ -66,10 +66,7 @@ export function unionMs(spans: readonly ActivitySpan[]): number {
 export function unionMsByHour(spans: readonly ActivitySpan[]): Array<{ hour: number; ms: number }> {
   const out = new Map<number, number>();
   for (const [start, end] of merged(spans)) {
-    for (let h = Math.floor(start / HOUR_MS) * HOUR_MS; h < end; h += HOUR_MS) {
-      const ms = Math.min(end, h + HOUR_MS) - Math.max(start, h);
-      if (ms > 0) out.set(h, (out.get(h) ?? 0) + ms);
-    }
+    for (const { hour, ms } of msByHour(start, end)) out.set(hour, (out.get(hour) ?? 0) + ms);
   }
   return [...out.entries()].sort((a, b) => a[0] - b[0]).map(([hour, ms]) => ({ hour, ms }));
 }
