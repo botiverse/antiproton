@@ -542,8 +542,8 @@ export class AgentDO extends DurableObject<Env> {
    */
   async #countHeldTime(rt: AgentRuntime, tenantId: string, agentId: string) {
     try {
-      const reports = await this.#mountReports(rt, tenantId, agentId, LEGACY_TASK_ID);
       const mounts = await rt.store.listMounts(tenantId, agentId);
+      const reports = await this.#mountReports(rt, tenantId, agentId, LEGACY_TASK_ID, mounts);
       const byAlias = new Map(mounts.map((m) => [m.alias, m.plugin]));
       const named: Record<string, { plugin: string; report: unknown }> = {};
       for (const [alias, report] of Object.entries(reports)) {
@@ -1626,10 +1626,13 @@ export class AgentDO extends DurableObject<Env> {
    */
   async #mountReports(
     rt: AgentRuntime, tenantId: string, agentId: string, taskId: string,
+    // The caller may already hold the list. The accounting pass does, and
+    // reading it twice would answer the same question twice (Rex, #402).
+    mounts?: Awaited<ReturnType<AgentRuntime["store"]["listMounts"]>>,
   ): Promise<MountReports> {
     const gw = rt.gateway();
     const out: MountReports = {};
-    for (const m of await rt.store.listMounts(tenantId, agentId)) {
+    for (const m of mounts ?? await rt.store.listMounts(tenantId, agentId)) {
       try {
         const [activity, usage] = await Promise.all([
           gw.mountActivity({ tenantId, agentId, taskId }, m.alias),

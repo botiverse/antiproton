@@ -76,6 +76,17 @@ check("the box list comes from the mount's own report, and a finished record win
   eq(boxesOf(null), [], "and neither has a mount that did not report");
 });
 
+check("the pass where a box ends has nothing live, so the finished half is the half that closes it", () => {
+  // Rex, #402: a live-gated read would look like a saving and would lose the
+  // last hours of every box, because the ending pass is exactly the pass with
+  // `live === null`. Kept as a check so the saving cannot be made by mistake.
+  const report = { activity: { live: null }, usage: [{ id: "b1", startedAt: H0, endedAt: H0 + 2 * HOUR_MS, uses: 3 }] };
+  eq(boxesOf(report).map((b) => [b.id, b.endedAt]), [["b1", H0 + 2 * HOUR_MS]], "the box is in the report with its end");
+  const got = heldRows(base, "sandbox", boxesOf(report), marks({ b1: { through: H0 + HOUR_MS, uses: 1 } }), H0 + 3 * HOUR_MS);
+  eq(got.rows.filter((r) => r.unit === "seconds").map((r) => [(r.at - H0) / HOUR_MS, r.quantity]), [[1, 3600]],
+    "and its last hour is charged in the pass where nothing is live");
+});
+
 check("against a real table: two mounts, ten passes, each second charged once", () => {
   const host = sqliteHost();
   const reports = (live: boolean, now: number) => ({

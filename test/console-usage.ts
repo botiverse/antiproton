@@ -50,16 +50,17 @@ check("the rail has a usage item and the view is a lazy, tenant-wide panel", () 
 });
 
 check("one chart per resource, each on its own scale", () => {
-  const html = usagePanel(data([
+  const rows = [
     row("a1", "model.tokens", "m:input", "tokens", 900000),
     row("a1", "sandbox.container", "sandbox", "seconds", 120),
-  ]));
+  ];
+  const html = usagePanel(data(rows));
   must(count(html, /<section class="u-tile( off)?">/g) === RESOURCES.length, "a tile per resource");
   must(/<div class="u-max">900k<\/div>/.test(html), "the token chart tops at its own maximum");
-  // Derived from the fixture rather than from "all but one": container time is
-  // counted now, so these two rows cover two resources, and a hard-coded
-  // `counted - 1` was really a statement about how many rows the fixture had.
-  const drawn = new Set(["model.tokens", "sandbox.container"]);
+  // Which resources are drawn comes from the fixture itself: a hard-coded
+  // `counted - 1` was really a statement about how many rows the fixture had,
+  // and a hand-written list beside the rows is the same mistake one step later.
+  const drawn = new Set(rows.map((r) => r.resource));
   const idle = RESOURCES.filter((r) => r.counted && !drawn.has(r.id)).length;
   must(count(html, /nothing in this window/g) === idle, "an idle counted resource says so instead of drawing an empty axis");
 });
@@ -218,8 +219,8 @@ check("an empty window says that nothing is charged, and claims nothing about wh
   // Everyone who opens the page before the first turn finishes sees only this
   // branch. It used to be the only place that could say a resource was not
   // recorded at all; every resource is recorded now, so that sentence must be
-  // gone rather than left hanging about something that is no longer true
-  // (Nova's instruction, and her own test asked for this by failing).
+  // gone rather than left hanging about something that is no longer true.
+  // This rewrite is what the check itself demanded by failing.
   const html = usagePanel(data([]));
   must(!RESOURCES.some((r) => !r.counted), "every resource is counted; if one is added uncounted, restore the naming check");
   must(!/not counted yet/.test(html), "nothing is uncounted, so the empty window must not say anything is");
