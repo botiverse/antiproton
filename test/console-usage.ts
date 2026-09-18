@@ -19,6 +19,16 @@ function check(name: string, fn: () => void) {
 }
 const must = (cond: unknown, msg: string) => { if (!cond) throw new Error(msg); };
 const count = (s: string, re: RegExp) => (s.match(re) ?? []).length;
+/**
+ * One tile's markup, by the title a reader sees. A claim about a tile has to be
+ * made inside that tile: `/tool calls<\/h3>[\s\S]*?0 credits/` reads past the
+ * tile's end and can be satisfied by the next one.
+ */
+const tile = (html: string, title: string) => {
+  const found = html.split(/(?=<section class="u-tile)/).filter((t) => t.includes(`<h3>${title}</h3>`));
+  if (found.length !== 1) throw new Error(`${found.length} tiles titled ${title}`);
+  return found[0]!;
+};
 
 const H = 3_600_000;
 const to = Date.parse("2026-09-17T12:00:00Z");
@@ -109,8 +119,9 @@ check("an amount with no price reads 'not priced yet', never 0 credits", () => {
   ], { priced: true }));
   must(/<span class="u-big">1\.50<\/span> credits in this window/.test(html), "the headline counts only what has a price");
   must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "and names what it leaves out, by resource, not by row count");
-  must(/tool calls<\/h3>[\s\S]*?<span class="u-cost">not priced yet<\/span>/.test(html), "the unpriced tile says so instead of 0 credits");
-  must(!/tool calls<\/h3>[\s\S]*?<span class="u-cost">0 credits/.test(html), "the unpriced tile never claims a zero cost it cannot know");
+  const calls = tile(html, "tool calls");
+  must(/<span class="u-cost">not priced yet<\/span>/.test(calls), "the unpriced tile says so instead of 0 credits");
+  must(!/<span class="u-cost">0 credits/.test(calls), "the unpriced tile never claims a zero cost it cannot know");
   must(/1\.50<span class="faint" title="some amounts here are not priced yet"> \+<\/span>/.test(html), "the table marks a group whose sum leaves something out");
 });
 
@@ -132,6 +143,34 @@ check("many unpriced rows of one resource are named once, not counted", () => {
   const html = usagePanel(data(rows, { priced: true }));
   must(/Not priced yet, so not in this number: tool calls<\/div>/.test(html), "the resource is named once");
   must(!/\d+ amounts? (is|are) not priced/.test(html), "no row count leaks into the sentence");
+});
+
+check("a window that reaches further back than the record says so, per resource", () => {
+  // The day a resource starts being recorded, the window still asks for 24
+  // hours. What the ledger holds is the last part of it, and a tile that shows
+  // only a number reads as the whole window.
+  const rows = [row("a1", "object.active", "", "ms", 90_000, 2), row("a1", "model.tokens", "m:input", "tokens", 10, 20)];
+  const started = to - 3 * H;
+  const html = usagePanel(data(rows, { firstHours: { "object.active": started, "model.tokens": to - 30 * H } }));
+  const active = tile(html, "agent running time");
+  must(/nothing recorded before 09-17 09:00Z/.test(active), `the tile names the line: ${active}`);
+  must(/1\.5 min/.test(active), "and still shows what it does have");
+  must(!/nothing recorded before/.test(tile(html, "model tokens")),
+    "a resource recorded from before the window says nothing");
+  const all = usagePanel(data(rows, { firstHours: { "object.active": to - 24 * H } }));
+  must(!/nothing recorded before/.test(tile(all, "agent running time")),
+    "a first hour at the window's own start is not a gap");
+  must(!/nothing recorded before/.test(usagePanel(data(rows))),
+    "no firstHours at all: the page claims nothing about where the record begins");
+});
+
+check("the object's billed time is counted, and is a duration", () => {
+  const res = RESOURCES.find((r) => r.id === "object.active")!;
+  must(res.counted, "object.active is recorded now");
+  must(res.unit === "ms" && res.fmt(90_000) === "1.5 min", `a duration, not a count: ${res.fmt(90_000)}`);
+  const html = usagePanel(data([row("a1", "object.active", "", "ms", 3_600_000)]));
+  must(/agent running time<\/h3>[\s\S]*?1 h/.test(html), "the tile shows the time");
+  must(!/<span class="faint">not counted<\/span>[\s\S]*?agent running time/.test(html), "and the table no longer says not counted for it");
 });
 
 check("every amount priced: no hedge anywhere", () => {

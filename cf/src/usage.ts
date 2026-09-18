@@ -53,6 +53,14 @@ export type UsageData = {
   labels?: Record<string, string>;
   /** Whether any price exists yet. Until then every figure is free. */
   priced?: boolean;
+  /**
+   * The first hour the ledger has anything for a resource, by resource. When
+   * that hour falls inside the window, the part of the window before it holds
+   * no rows for that resource — either nothing happened or nothing was counted
+   * yet, and the ledger cannot tell those apart. The tile says so rather than
+   * showing a partial figure as a whole one.
+   */
+  firstHours?: Record<string, number>;
 };
 
 // No one-hour window: the ledger is hourly, so it would be a single bar. The
@@ -141,7 +149,10 @@ export const RESOURCES: Resource[] = [
     detail: (rows) => { const n = sum(rows, "execs"); return n ? `${count(n)} commands run` : ""; },
   },
   {
-    id: "object.active", title: "agent running time", unit: "ms", fmt: duration, splits: ["agent"], counted: false,
+    id: "object.active", title: "agent running time", unit: "ms", fmt: duration, splits: ["agent"], counted: true,
+    // The union of the object's busy spans, not their sum: handlers overlap at
+    // await points, so summing them reports more time than was billed
+    // (src/usage/active.ts).
     detail: () => "billed time of the agents themselves",
   },
 ];
@@ -252,6 +263,20 @@ export function usagePanel(d: UsageData): string {
       left.length ? `. Not priced yet, so not in this number: ${esc(left.join(", "))}` : ""}</div>`
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
+  // A resource whose first recorded hour is inside the window: the window
+  // reaches further back than the record does, so the figure is a part and must
+  // not be shown as a whole. Worded as what the ledger holds, because it cannot
+  // tell "nothing happened then" from "nothing was counted then". It sits under
+  // the chart, with the tile's other small print: above the chart it pushes one
+  // chart down, and small multiples only compare if they share a baseline.
+  const cut = (res: Resource) => {
+    const first = d.firstHours?.[res.id];
+    if (typeof first !== "number" || !(first > d.from)) return "";
+    const iso = new Date(first).toISOString();
+    return `<div class="u-note">nothing recorded before ${iso.slice(5, 10)} ${iso.slice(11, 16)}Z,` +
+      ` part-way into this window</div>`;
+  };
+
   const tiles = RESOURCES.map((res) => {
     if (!res.counted) {
       return `<section class="u-tile off">
@@ -270,7 +295,7 @@ export function usagePanel(d: UsageData): string {
         : c.priced === 0 ? "not priced yet"
         : `${credits(c.credits)} credits, some not priced yet`}</span>` : ""}</div>
   <div class="u-detail">${esc(res.detail(rows)) || "&nbsp;"}</div>
-  ${chart(d, res, rows, named, times)}
+  ${chart(d, res, rows, named, times)}${cut(res)}
 </section>`;
   }).join("");
 

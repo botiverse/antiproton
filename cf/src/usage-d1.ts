@@ -114,8 +114,24 @@ export function priceFor(prices: readonly UsagePrice[], row: { bucket: number; r
   return p ? p.creditsPerUnit : null;
 }
 
+/**
+ * The first hour the ledger has anything for each resource, over all time.
+ *
+ * A resource that started being recorded in the middle of a window would
+ * otherwise show a small number that reads as a complete one. This is the
+ * earliest hour the record can speak for; before it the ledger says nothing,
+ * whether because nothing happened or because nothing was counted yet — the
+ * page says which of those it is not able to tell.
+ */
+export async function usageFirstHours(db: D1Database, tenantId: string): Promise<Record<string, number>> {
+  const { results } = await db.prepare(
+    "SELECT resource, MIN(hour) AS first FROM usage_hourly WHERE tenant_id = ? GROUP BY resource",
+  ).bind(tenantId).all();
+  return Object.fromEntries((results as any[]).map((r) => [String(r.resource), Number(r.first)]));
+}
+
 export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery):
-  Promise<{ rows: UsageReadRow[]; priced: boolean }> {
+  Promise<{ rows: UsageReadRow[]; priced: boolean; firstHours: Record<string, number> }> {
   const size = q.bucket === "1d" ? DAY_MS : 3_600_000;
   const withAgent = q.by === "agent";
   const { results } = await db.prepare(
@@ -128,6 +144,7 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
   ).bind(size, size, tenantId, Math.floor(q.from / size) * size, q.to).all();
   const prices = await usagePrices(db);
   const priced = prices.length > 0;
+  const firstHours = await usageFirstHours(db, tenantId);
   const rows = (results as any[]).map((r) => {
     const row: UsageReadRow = {
       bucket: Number(r.bucket),
@@ -140,7 +157,7 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
     }
     return row;
   });
-  return { rows, priced };
+  return { rows, priced, firstHours };
 }
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS usage_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";
