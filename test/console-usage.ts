@@ -153,14 +153,14 @@ check("a window that reaches further back than the record says so, per resource"
   const started = to - 3 * H;
   const html = usagePanel(data(rows, { firstHours: { "object.active": started, "model.tokens": to - 30 * H } }));
   const active = tile(html, "agent running time");
-  must(/nothing recorded for this before 09-17 09:00Z/.test(active), `the tile names the line: ${active}`);
+  must(/nothing recorded before 09-17 09:00Z/.test(active), `the tile names the line: ${active}`);
   must(/1\.5 min/.test(active), "and still shows what it does have");
-  must(!/nothing recorded for this before/.test(tile(html, "model tokens")),
+  must(!/nothing recorded before/.test(tile(html, "model tokens")),
     "a resource recorded from before the window says nothing");
   const all = usagePanel(data(rows, { firstHours: { "object.active": to - 24 * H } }));
-  must(!/nothing recorded for this before/.test(tile(all, "agent running time")),
+  must(!/nothing recorded before/.test(tile(all, "agent running time")),
     "a first hour at the window's own start is not a gap");
-  must(!/nothing recorded for this before/.test(usagePanel(data(rows))),
+  must(!/nothing recorded before/.test(usagePanel(data(rows))),
     "no firstHours at all: the page claims nothing about where the record begins");
 });
 

@@ -266,13 +266,15 @@ export function usagePanel(d: UsageData): string {
   // A resource whose first recorded hour is inside the window: the window
   // reaches further back than the record does, so the figure is a part and must
   // not be shown as a whole. Worded as what the ledger holds, because it cannot
-  // tell "nothing happened then" from "nothing was counted then".
+  // tell "nothing happened then" from "nothing was counted then". It sits under
+  // the chart, with the tile's other small print: above the chart it pushes one
+  // chart down, and small multiples only compare if they share a baseline.
   const cut = (res: Resource) => {
     const first = d.firstHours?.[res.id];
     if (typeof first !== "number" || !(first > d.from)) return "";
     const iso = new Date(first).toISOString();
-    return `<div class="u-note">nothing recorded for this before ${iso.slice(5, 10)} ${iso.slice(11, 16)}Z,` +
-      ` which is later than this window starts</div>`;
+    return `<div class="u-note">nothing recorded before ${iso.slice(5, 10)} ${iso.slice(11, 16)}Z,` +
+      ` part-way into this window</div>`;
   };
 
   const tiles = RESOURCES.map((res) => {
@@ -293,8 +295,7 @@ export function usagePanel(d: UsageData): string {
         : c.priced === 0 ? "not priced yet"
         : `${credits(c.credits)} credits, some not priced yet`}</span>` : ""}</div>
   <div class="u-detail">${esc(res.detail(rows)) || "&nbsp;"}</div>
-  ${cut(res)}
-  ${chart(d, res, rows, named, times)}
+  ${chart(d, res, rows, named, times)}${cut(res)}
 </section>`;
   }).join("");
 
