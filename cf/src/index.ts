@@ -63,6 +63,7 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
+import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
@@ -512,6 +513,22 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
+   * The object's own billed time into the usage outbox, hour by hour.
+   *
+   * Every other resource is appended where the work happens. This one cannot
+   * be: its honest measure is the UNION of overlapping handler spans
+   * (src/usage/active.ts), and a union is not a running total — adding each
+   * span's duration would charge an overlap twice. So it is derived from this
+   * object's `do_activity` rows, once per pass, with a watermark per hour so a
+   * second pass adds only what grew.
+   */
+  #countActiveTime(tenantId: string, agentId: string) {
+    // Measuring must not break a pass, exactly as #note must not.
+    try { countActiveTime(this.sql as any, { tenantId, agentId }); }
+    catch (e: any) { console.warn(`active-time accounting skipped: ${String(e?.message ?? e).slice(0, 200)}`); }
+  }
+
+  /**
    * The transcript, as rows.
    *
    * pi has no task id — a run is an operation and the conversation is a lane —
@@ -541,15 +558,9 @@ export class AgentDO extends DurableObject<Env> {
       .toArray() as any[];
     // offload_rtt measures time spent OUTSIDE this object; counting it as busy
     // would report exactly the cost the change is meant to remove.
-    const rows = all.filter((r: any) => !String(r.kind).startsWith("offload_"));
-    let unionMs = 0, curStart = -1, curEnd = -1;
-    for (const r of rows) {
-      const a = Number(r.at), b = a + Number(r.ms);
-      if (curStart < 0) { curStart = a; curEnd = b; continue; }
-      if (a <= curEnd) curEnd = Math.max(curEnd, b);
-      else { unionMs += curEnd - curStart; curStart = a; curEnd = b; }
-    }
-    if (curStart >= 0) unionMs += curEnd - curStart;
+    const spans: ActivitySpan[] = all.map((r: any) => ({ at: Number(r.at), ms: Number(r.ms), kind: String(r.kind) }));
+    const rows = busySpans(spans);
+    const union = unionMs(rows);
 
     const byKind = new Map<string, { n: number; ms: number }>();
     for (const r of all) {
@@ -562,11 +573,12 @@ export class AgentDO extends DurableObject<Env> {
     // separately rather than folded into the agent's own cost.
     const pollMs = byKind.get("poll")?.ms ?? 0;
     return {
-      activeMs: unionMs,
+      activeMs: union,
       summedMs: rows.reduce((a, r) => a + Number(r.ms), 0),
       pollMs,
       invocations: rows.length,
-      spanMs: rows.length ? Number(rows.at(-1).at) + Number(rows.at(-1).ms) - Number(rows[0].at) : 0,
+      // Ordered by `at` in the query, so these are the ends of the window.
+      spanMs: ((first, last) => (first && last ? last.at + last.ms - first.at : 0))(rows[0], rows.at(-1)),
       byKind: [...byKind].map(([kind, v]) => ({ kind, n: v.n, ms: v.ms })),
     };
   }
@@ -1991,6 +2003,7 @@ export class AgentDO extends DurableObject<Env> {
         // for later rather than failing the pass: the rows stay in the outbox.
         let usagePending = false;
         try {
+          this.#countActiveTime(who.tenantId, who.agentId);
           await flushUsage(this.env.CONTROL_DB, this.sql as any, who.tenantId, who.agentId);
         } catch (e: any) {
           usagePending = true;
@@ -3200,13 +3213,13 @@ export default {
           if (gate instanceof Response) return gate;
           const q = parseUsageQuery(url.searchParams, Date.now());
           if (typeof q === "string") return Response.json({ error: q }, { status: 400 });
-          const { rows, priced } = await readUsage(env.CONTROL_DB, gate.tenantId, q);
+          const { rows, priced, firstHours } = await readUsage(env.CONTROL_DB, gate.tenantId, q);
           const labels: Record<string, string> = {};
           if (q.by === "agent" && rows.length) {
             const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, gate.agentId)));
             for (const a of await homeStub.uiListAgents(gate.tenantId, gate.agentId)) labels[a.agentId] = a.name;
           }
-          const data = { ...q, rows, labels, priced };
+          const data = { ...q, rows, labels, priced, firstHours };
           const headers = { "cache-control": "no-store" };
           return request.headers.get("hx-request")
             ? new Response(usagePanel(data), { headers: { ...headers, "content-type": "text/html; charset=utf-8" } })

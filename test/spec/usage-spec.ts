@@ -3,7 +3,7 @@
  * the agent's outbox (cf/src/usage-d1.ts, src/usage/outbox.ts). Run inside
  * workerd by cf/src/conformance.ts; see test/control-plane-d1.sh.
  */
-import { flushUsage, parseUsageQuery, priceFor, readUsage, sendUsage, usageCursor, usageGroup, DAY_MS, type UsageQuery } from "../../cf/src/usage-d1.ts";
+import { flushUsage, parseUsageQuery, priceFor, readUsage, sendUsage, usageCursor, usageFirstHours, usageGroup, DAY_MS, type UsageQuery } from "../../cf/src/usage-d1.ts";
 import { appendUsage, pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
 import type { SpecCase } from "./control-plane-spec.ts";
 
@@ -167,6 +167,26 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     assert(priced && c === "model.tokens=1 tool.call=null", `${priced} ${c}`);
     const call = rows.find((r) => r.resource === "tool.call")!;
     assert(call.cost === null && !(call.cost === 0), "an unpriced row is null, never 0");
+  });
+
+  add("the read says where each resource's record begins, so a window cannot look complete when it is not", async () => {
+    // object.active started being recorded halfway through this window. Its
+    // rows are real; the hours before them hold nothing, and nothing in the
+    // rows themselves says which of "idle" or "not counted yet" that was.
+    await sendUsage(db, "t", "a", 0, [
+      row(1, { at: T0 + 1 * H, quantity: 100 }),
+      row(2, { at: T0 + 5 * H, resource: "object.active", key: "", quantity: 30_000, unit: "ms" }),
+      row(3, { at: T0 + 6 * H, resource: "object.active", key: "", quantity: 60_000, unit: "ms" }),
+    ]);
+    const first = await usageFirstHours(db, "t");
+    assert(first["model.tokens"] === T0 + H && first["object.active"] === T0 + 5 * H, JSON.stringify(first));
+    const { firstHours } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + 12 * H, bucket: "1h", by: "total" });
+    assert(firstHours["object.active"] === T0 + 5 * H, `the read carries it: ${JSON.stringify(firstHours)}`);
+    assert(firstHours["object.active"] > T0, "and it is later than this window's start, which is what the page tells the reader");
+    // Another tenant's rows are not this tenant's first hour.
+    await sendUsage(db, "u", "b", 0, [row(1, { tenantId: "u", agentId: "b", at: T0, resource: "object.active", key: "", quantity: 5, unit: "ms" })]);
+    const mine = await usageFirstHours(db, "t");
+    assert(mine["object.active"] === T0 + 5 * H, `still mine: ${JSON.stringify(mine)}`);
   });
 
   add("the query string: windows, default buckets, and refusals", async () => {
