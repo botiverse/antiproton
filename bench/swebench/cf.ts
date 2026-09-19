@@ -28,7 +28,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
-import { decideFromPoll } from "../poll-fallback.ts";
+import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -204,10 +204,17 @@ async function runOne(inst: Instance) {
   // benchmark starts one per instance.
   let grade: any = { failToPass: false, passToPass: false, diff: "", failOut: "" };
   let agentSeconds = 0, answered: string | null = null;
+  // Why a turn ran out of time, and what that was read from. This runner used to record the word
+  // `agent_stalled` and nothing else: it held the evidence for one call and threw it away, so a stall here
+  // could not be told from a lost delivery afterwards (Vera, 2026-09-19).
+  let stall: string | undefined, stallWhy: StallEvidence | undefined;
   try {
     await post("/bench/say", { taskId,
       text: `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}` });
     answered = await waitForAnswer(taskId, t0 + BUDGET_MS);
+    if (answered === null && !failed.has(taskId)) {
+      ({ stall, stallWhy } = await stallAtDeadline(() => api(`/bench/poll?taskId=${taskId}`), seen.get(taskId) ?? 0));
+    }
     agentSeconds = Math.round((Date.now() - t0) / 1000);
     if (TRACE) console.log(`    agent > ${(answered ?? "(no answer)").replace(/\s+/g, " ").slice(0, 160)}`);
 
@@ -257,6 +264,7 @@ async function runOne(inst: Instance) {
     ...grade,
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds,
     ended: answered ? "answered" : failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled",
+    stall, stallWhy,
     network, modelTurns: stats.modelTurns, toolTurns: stats.toolTurns, toolErrors: stats.toolErrors ?? null, byTool: stats.byTool ?? {},
     calls: stats.usage?.calls ?? 0, prompt: stats.usage?.prompt ?? 0, out: stats.usage?.out ?? 0,
     cached: stats.usage?.cached ?? 0, meter: stats.meter as Meter | undefined,

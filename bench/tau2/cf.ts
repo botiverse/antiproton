@@ -24,7 +24,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
-import { causeFromEvidence, decideFromPoll, stallEvidence, type StallEvidence } from "../poll-fallback.ts";
+import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
 
@@ -282,9 +282,8 @@ async function runTask(task: any) {
       if (failed.has(taskId)) ended = `model: ${failed.get(taskId)}`.slice(0, 60);
       else {
         ended = "agent_stalled";
-        const last = await api(`/bench/poll?taskId=${taskId}`).catch(() => null);
-        stallWhy = stallEvidence(last, seen.get(taskId) ?? 0);
-        stall = causeFromEvidence(stallWhy);
+        ({ stall, stallWhy } = await stallAtDeadline(
+          () => api(`/bench/poll?taskId=${taskId}`), seen.get(taskId) ?? 0));
       }
       break;
     }
