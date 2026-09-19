@@ -100,8 +100,11 @@ one_history() {
   build=${out%% *}; driver=${out##* }
   if [ -z "$build" ] && [ -z "$driver" ]; then return 0; fi
   # Half a claim. No runner writes this — both fields come from the same place
-  # in each of them — and Vera found it 0 times in 17 records, local and from
-  # the bucket. So which refusal it belongs to is undecided on purpose: it is
+  # in each of them — and it appears 0 times in all 24 JSON records on the
+  # manifest (19 carry both, 5 carry neither; Vera and cody counted the whole
+  # manifest separately, 2026-09-19, after each of us first counted a smaller
+  # set we had to hand). So which refusal it belongs to is undecided on
+  # purpose: it is
   # not "fetch it" (nothing is missing here that fetching would bring) and it
   # is not "merge it" either (one field absent is no evidence about any tree).
   # It stops, and the message says only what is true of it.
