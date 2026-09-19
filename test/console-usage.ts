@@ -203,6 +203,33 @@ check("failed runs and calls show in the tile's small print, only when there are
   must(count(html, / failed/g) === 2, "nothing else claims a failure");
 });
 
+check("an average that rounds below a millisecond says so, while a zero total stays 0ms", () => {
+  // Every call records its own ms, already rounded to whole milliseconds, so a
+  // total of 0 over calls that did happen is "too short to measure". `avg 0ms`
+  // would read as "we did not time it" — which is what a reader concludes about
+  // a bare zero. The headline is a different number: an empty window has no
+  // calls at all, and there 0ms is exactly right.
+  const html = usagePanel(data([
+    row("a1", "tool.call", "gh.x", "calls", 2), row("a1", "tool.call", "gh.x", "ms", 0),
+    row("a1", "js.run", "run_js", "runs", 2), row("a1", "js.run", "run_js", "ms", 0),
+  ]));
+  // `&lt;` because the tile's small print is escaped like any other text.
+  must(/avg &lt;1ms/.test(tile(html, "tool calls")), "calls too short to time say under a millisecond");
+  must(/avg &lt;1ms/.test(tile(html, "JS runs")), "so do runs");
+  must(!/avg 0ms/.test(html), "and no tile averages to a bare zero");
+  must(/>0ms<\/div>/.test(tile(html, "container time")), "a resource with nothing in the window still totals 0ms");
+  // A positive total can still average below the resolution: three calls, one
+  // of them 1ms and two of them 0ms. No single call was sub-millisecond — their
+  // average is — so a guard on the total would print `avg 0ms` here.
+  const thin = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 3), row("a1", "tool.call", "gh.x", "ms", 1)]));
+  must(/avg &lt;1ms/.test(tile(thin, "tool calls")), "an average under half a millisecond says so, whatever the total");
+  must(!/avg 0ms/.test(thin), "and still no tile averages to a bare zero");
+  const timed = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 3), row("a1", "tool.call", "gh.x", "ms", 900)]));
+  must(/avg 300ms/.test(tile(timed, "tool calls")), "a measured average is unchanged");
+  const rounded = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 2), row("a1", "tool.call", "gh.x", "ms", 1)]));
+  must(/avg 1ms/.test(tile(rounded, "tool calls")), "half a millisecond rounds up and is printed");
+});
+
 check("the tooltip and the table name a bucket in UTC", () => {
   const html = usagePanel(data([row("a1", "js.run", "run_js", "runs", 3, 5)]));
   must(/<b>09-17 07:00Z<\/b>/.test(html), "hourly buckets carry date and hour");
