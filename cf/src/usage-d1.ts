@@ -75,6 +75,10 @@ export const KEEP_HOURLY_DAYS = 35;
  * `usage_hourly` as any row does, and the next fold adds it to the day that is
  * already there (`DO UPDATE SET quantity = quantity + excluded.quantity`).
  * Reads sum both tables in the meantime, so it counts before it is folded too.
+ * The two halves of that are one mechanism: the day list is whatever is still
+ * in `usage_hourly` below the cutoff, so a late row puts its own old day back
+ * on the list by existing — nothing has to notice that the day was reopened
+ * (Vera read this out of the code, 2026-09-19).
  *
  * `maxDays` bounds one run: the first fold of a long-lived ledger would
  * otherwise be one very long invocation. What it did, so a caller can log it
