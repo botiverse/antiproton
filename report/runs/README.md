@@ -86,6 +86,46 @@ So a figure that compares pass^k across that line is comparing two metrics. The
 old field can still be compared with `passFirstKTrials`, which reproduces it
 exactly.
 
+## Reading a τ² record: `delivered`, and what a zero counted
+
+Each trial carries `delivered`: how its turns' answers arrived. `push` is the
+object's socket, `poll` is the fallback that asks `/bench/poll` when a push
+seems lost, `pollAnswered` and `pollFailed` count the requests themselves, and
+`dropped` counts sockets that ended before the turn's answer.
+
+**In every record whose `build` predates commit `ea4c913` (2026-09-19), `poll`
+is 0 because the fallback could not decide, not because no push was ever
+lost.** The endpoint returned the transcript's length where the runner looked
+for its events, so the decision had nothing to compare and always came out
+empty. That zero is the claim to check, and it holds over a set that keeps
+growing; the counts behind it are an observation of a day. As of 2026-09-19
+the manifest lists 25 such records, 192 of their trials carry these counters,
+and over those: `pollAnswered` 43, `poll` 0. Forty-three polls came back, none
+of them could answer anything. (Only records that carry a `build` carry these
+counters at all — the five oldest records predate both fields.)
+
+Two consequences for reading those records:
+
+- A lost push in them can end the turn as `agent_stalled`, because the second
+  way of hearing the answer was not working — so a stall there is weaker
+  evidence about the agent than it looks. It is not a rule, and the one
+  instance shows why: the only row in any record with `dropped` above zero
+  (2026-09-18, `tau2-b_daily_92814-mu69hebi`, task 1, trial 2, build
+  `071fd6c`) ended in `transfer` with no stall at all, because a later turn
+  reached the agent anyway. What makes a stall is a lost answer with nothing
+  else bringing it, and until `ea4c913` whether anything else did was luck.
+- `agent_stalled (idle_without_answer)` in them means **no usable evidence**,
+  not an idle agent. The cause was decided from sequence numbers the record's
+  poll never carried; absent, they read as -1, which loses every comparison and
+  produces that name for any input. `model_failed` and `answer_undelivered`
+  could not be produced at all.
+
+From `ea4c913` on the body carries the order the decision reads, and a
+`stallWhy` on a stalled row shows what it was decided from. **So a later
+record with `poll` greater than zero is the fallback working, not an
+anomaly** — and a record with a `stallWhy` whose `last` is `null` is saying the
+deployment it ran against was older than this line.
+
 ## Publishing a run
 
 `bench/record.ts` writes each record under `report/runs/<day>/` in the working
