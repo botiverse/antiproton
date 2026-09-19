@@ -26,7 +26,7 @@ measures real bytes on binary via `byteLength`.
 
 To keep the repository sound, maintainable, and aligned with core principles:
 
-- **Open for direct pull requests:** Plugins located under `src/plugins/`. Community contributions adding new external tool connectors, data adapters, or plugin integrations are warmly welcomed with accompanying tests in `test/`.
+- **Open for direct pull requests:** Plugins located under `src/plugins/`. Read [`docs/plugins.md`](docs/plugins.md) for conventions, lifecycle hooks, and testing requirements. The one line that registers a new plugin in `cf/src/runtime.ts` is exempt from the "issue first" requirement. Community contributions adding new external tool connectors, data adapters, or plugin integrations are warmly welcomed with accompanying tests in `test/`.
 - **Require an issue first:** Core runtime, state management, and Durable Objects under `src/runtime/`, `src/core/`, `src/store/`, and `cf/`. Please open an issue to discuss invariants and architecture before writing code.
 - **Evidence over assertion:** Benchmarks, measurable telemetry, and positive control tests decide proposals. Every PR should verify its claims through testable entry points.
 - **Documentation standards:** All public documentation is in English, focused on external readability and factual fidelity. When code changes public behavior, keep `README.md` and related docs updated in the same PR.
@@ -112,6 +112,7 @@ reference:
 - The live `build` (`curl -s https://antiproton.ai/ui/whoami | jq .build`) answers *what is running*; the `master` HEAD answers *where the code is*. They are expected to differ. Read **what the commits between them changed**, not the numbers: a delta containing only `*.md` needs no deployment, and using a live build to check a code feature reads a deployed feature as absent when a doc commit has moved the head.
 
 - [`docs/philosophy.md`](docs/philosophy.md) — the engineering philosophy, architectural rationale, and verification principles.
+- [`docs/plugins.md`](docs/plugins.md) — how to write, configure, observe, and test plugins in Antiproton.
 - [`docs/pi-upstream.md`](docs/pi-upstream.md) — how to stay in sync with pi.
 - [`docs/server-plan-archive.md`](docs/server-plan-archive.md) and
   [`docs/self-hosted-plan-archive.md`](docs/self-hosted-plan-archive.md) —

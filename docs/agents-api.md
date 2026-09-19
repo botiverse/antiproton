@@ -3,9 +3,9 @@
 Antiproton provides an edge-native, multi-tenant implementation of the **OpenAI Agents API** (`v1`). It allows applications built with the official `openai` SDK (`client.beta.agents`) to run against Antiproton by changing only the base URL and API key.
 
 > **Status & Target Environment:**
-> - Available on the **preview deployment**: `https://preview.antiproton.ai/v1`
+> - Available on **production** (`https://antiproton.ai/v1`) and the **preview deployment** (`https://preview.antiproton.ai/v1`)
 > - Validated against the official OpenAI SDK: `openai 7.15.0` (pinned in `qa/sdk/package.json`)
-> - The agents API lives on a separate branch and runs strictly in the preview environment.
+> - Shipped and live on `master` with per-tenant D1 API key issuance (`/ui/api-keys`).
 
 ---
 

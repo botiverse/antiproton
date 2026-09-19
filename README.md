@@ -14,6 +14,7 @@ The agent loop itself is commodity — bring your own, or use the reference harn
 ## Table of Contents
 
 - [OpenAI Agents API Guide](docs/agents-api.md)
+- [Plugin Authoring Guide](docs/plugins.md)
 - [Philosophy & Design Principles](docs/philosophy.md)
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)
@@ -536,7 +537,7 @@ instances measure that the loop runs, not how good it is.
 
 We welcome contributions from the community. To keep antiproton reliable and maintainable:
 
-- **Plugins (`src/plugins/`):** Open for direct pull requests! If you want to add integrations, tool bindings, or data connectors, feel free to submit a PR with tests in `test/`.
+- **Plugins (`src/plugins/`):** Open for direct pull requests! Read the [Plugin Authoring Guide](docs/plugins.md) for conventions, lifecycle hooks, and testing guidelines. If you want to add integrations, tool bindings, or data connectors, feel free to submit a PR with tests in `test/`. The one line that registers a new plugin in `cf/src/runtime.ts` is exempt from the "issue first" requirement.
 - **Core Runtime & Durable Objects (`src/runtime/`, `src/core/`, `src/store/`, `cf/`):** Please **open an issue first** to discuss architecture, invariants, and design before writing code.
 - **Evidence-based verification:** Every PR must include tests that verify the exact mechanism or boundary introduced. We verify mechanism by callable entry points, not by assertions of absence.
 - **Documentation:** Documentation must be kept in sync with code reality. All documentation is in English.
