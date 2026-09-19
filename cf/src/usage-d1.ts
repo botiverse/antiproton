@@ -11,8 +11,11 @@
  * offers.
  */
 import { pendingUsage, pruneUsage, toHourly, type OutboxRow } from "../../src/usage/outbox.ts";
+import { DAY_MS, USAGE_WINDOWS } from "./usage-windows.ts";
 
-export const DAY_MS = 86_400_000;
+// Both live in usage-windows.ts so the page and this parser cannot hold
+// different lists; re-exported because this is where their readers look.
+export { DAY_MS, USAGE_WINDOWS };
 
 /**
  * Send one agent's pending rows. Every statement runs only while the agent's
@@ -126,9 +129,6 @@ export interface UsageReadRow {
   /** Credits, once any price exists; absent before. */
   cost?: number | null;
 }
-
-/** The windows the page offers (cf/src/usage.ts), and how long each is. */
-export const USAGE_WINDOWS: Record<string, number> = { "24h": DAY_MS, "7d": 7 * DAY_MS, "30d": 30 * DAY_MS };
 
 export interface UsageQuery { window: string; from: number; to: number; bucket: "1h" | "1d"; by: UsageGroupBy }
 

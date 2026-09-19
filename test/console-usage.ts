@@ -11,6 +11,7 @@
  */
 import { page } from "../cf/src/ui.ts";
 import { usagePanel, buckets, namedGroups, RESOURCES, type UsageData, type UsageRow } from "../cf/src/usage.ts";
+import { WINDOW_NAMES } from "../cf/src/usage-windows.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -228,6 +229,20 @@ check("an average that rounds below a millisecond says so, while a zero total st
   must(/avg 300ms/.test(tile(timed, "tool calls")), "a measured average is unchanged");
   const rounded = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 2), row("a1", "tool.call", "gh.x", "ms", 1)]));
   must(/avg 1ms/.test(tile(rounded, "tool calls")), "half a millisecond rounds up and is printed");
+});
+
+check("the window control offers exactly the windows the ledger accepts", () => {
+  // These were two hand-written lists in two files that do not import each
+  // other: this page's options, and the spans `parseUsageQuery` accepts. They
+  // could disagree in both directions — the page offering a window its own
+  // parser refuses, and a retention guard measured against a list the page no
+  // longer uses (Rex added a window here and the guard stayed green,
+  // 2026-09-19). One home now, and this fails if the page grows its own list
+  // again rather than reading the shared one.
+  const form = usagePanel(data([])).match(/<select name="window">[\s\S]*?<\/select>/)?.[0] ?? "";
+  const offered = [...form.matchAll(/value="([^"]+)"/g)].map((m) => m[1]);
+  must(offered.length > 1, `a single option would satisfy any list: ${offered.join(",")}`);
+  must(offered.join(",") === WINDOW_NAMES.join(","), `offered ${offered.join(",")}, the ledger accepts ${WINDOW_NAMES.join(",")}`);
 });
 
 check("the tooltip and the table name a bucket in UTC", () => {
