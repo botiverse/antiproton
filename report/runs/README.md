@@ -123,8 +123,34 @@ Two consequences for reading those records:
 From `ea4c913` on the body carries the order the decision reads, and a
 `stallWhy` on a stalled row shows what it was decided from. **So a later
 record with `poll` greater than zero is the fallback working, not an
-anomaly** — and a record with a `stallWhy` whose `last` is `null` is saying the
-deployment it ran against was older than this line.
+anomaly.**
+
+A stalled row therefore reads in one of three ways, and only the last of them
+is evidence. As of 2026-09-19, over the 26 records on this manifest:
+
+- **no `stallWhy` at all** — a τ² row from before the field (`5e5428a`,
+  2026-09-19). Its cause is a word with nothing behind it. Two τ² rows read
+  this way. A SWE-bench row also has no `stallWhy`, but for a different
+  reason: that runner marks a stall without a cause at all, so the field is
+  not missing from it, it was never part of its shape — three of the five
+  rows here are SWE-bench, and this section does not describe them.
+- **`stallWhy.last` is `{message: -1, response: -1, failed: -1}` with an empty
+  `tail`** — the field existed but the deployment it asked still answered
+  without sequences. The -1s are not observations, and they do not read as
+  their absence either: they take part in the comparisons, they are smaller
+  than any real sequence, so every comparison loses and the cause comes out
+  `idle_without_answer` whatever happened — which makes that branch look as
+  though it ran. Both stalled rows of the 12:53Z run of 2026-09-19
+  (`tau2-b_daily_22419-mu8f1fly`, build `0cffb25`) read this way, and that run
+  is the only one in the window between the field and the fix.
+- **`stallWhy.last` is `null`** — the runner asked a deployment older than
+  `ea4c913` and says so, so the cause is `unknown`, which is the honest name.
+  **No record reads this way yet**: it needs a run whose driver is `ea4c913`
+  or later, and no published record has one. The shape is what the code does,
+  not something a record has shown.
+
+**Real sequences, and a cause that means something, need a `build` of
+`ea4c913` or later.**
 
 ## Publishing a run
 
