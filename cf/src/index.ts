@@ -2853,9 +2853,16 @@ export default {
         case "/agent/events":
         // The same stream, addressed to the benchmark's object. A benchmark
         // that polls measures the poller: every poll is a request that wakes
-        // the object, and the deployed console does not poll — it is pushed to
-        // over a hibernatable socket, which costs the object nothing while it
-        // waits. Measuring the shipped path means using the shipped path.
+        // the object, while the agents API's event stream is pushed to over a
+        // hibernatable socket (agents-api/watch.ts), which costs the object
+        // nothing while it waits. Measuring the shipped path means using the
+        // shipped path.
+        //
+        // The debug console reads events too, over the other shipped path:
+        // /ui/events on a timer, version-checked, answering 304 while nothing
+        // changes. This comment used to name it as the pushed one, which sent
+        // the next reader looking for a socket that cf/src/ui.ts has never
+        // had — and the argument above never rested on it.
         case "/bench/events":
           return stub.fetch(request);
         case "/agent/state":
