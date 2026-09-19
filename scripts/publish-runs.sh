@@ -103,11 +103,12 @@ one_history() {
   # in each of them — and it appears 0 times in all 24 JSON records on the
   # manifest (19 carry both, 5 carry neither; Vera and cody counted the whole
   # manifest separately, 2026-09-19, after each of us first counted a smaller
-  # set we had to hand). So which refusal it belongs to is undecided on
-  # purpose: it is
-  # not "fetch it" (nothing is missing here that fetching would bring) and it
-  # is not "merge it" either (one field absent is no evidence about any tree).
-  # It stops, and the message says only what is true of it.
+  # set we had to hand).
+  #
+  # So which refusal it belongs to is undecided on purpose. It is not "fetch
+  # it": nothing is missing here that fetching would bring. It is not "merge
+  # it" either: one absent field is no evidence about any tree. It stops, and
+  # the message says only what is true of it.
   if [ -z "$build" ] || [ -z "$driver" ]; then
     echo "$f names only one of build/driver ('$out'), and a lone commit cannot be checked against anything" >&2
     return 2
