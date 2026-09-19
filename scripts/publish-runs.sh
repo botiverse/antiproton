@@ -99,6 +99,12 @@ one_history() {
   fi
   build=${out%% *}; driver=${out##* }
   if [ -z "$build" ] && [ -z "$driver" ]; then return 0; fi
+  # Half a claim. No runner writes this — both fields come from the same place
+  # in each of them — and Vera found it 0 times in 17 records, local and from
+  # the bucket. So which refusal it belongs to is undecided on purpose: it is
+  # not "fetch it" (nothing is missing here that fetching would bring) and it
+  # is not "merge it" either (one field absent is no evidence about any tree).
+  # It stops, and the message says only what is true of it.
   if [ -z "$build" ] || [ -z "$driver" ]; then
     echo "$f names only one of build/driver ('$out'), and a lone commit cannot be checked against anything" >&2
     return 2
