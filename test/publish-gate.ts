@@ -11,8 +11,16 @@
  * plugin whose looksLike regex throws would exit 1, which the caller reads as
  * clean (Ada, #354).
  *
- * Every case here stops before the upload branch, so the suite needs no
- * network and no bucket.
+ * The second half is about the other thing a record can be wrong in without
+ * being wrong in its bytes: `build` (the Worker that ran) and `driver` (the
+ * code that wrote the record) naming commits that are not on one history. That
+ * check has the same three answers, and its two refusals are different
+ * mistakes — "merge that tree" and "fetch that commit" — so they must not
+ * collapse into one message (Vera, 2026-09-19).
+ *
+ * The credential cases stop before the upload branch, so they need no network
+ * and no bucket; the provenance cases reach it with a stub `npx`, as the
+ * idempotence case below does.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, chmodSync, rmSync, readFileSync } from "node:fs";
@@ -162,6 +170,111 @@ check("publishing the same key twice leaves one row for it, not two", () => {
   if (rows.length !== distinct.size) {
     throw new Error(`${rows.length} rows for ${distinct.size} key(s) — publishing twice duplicated a row:\n${rows.join("\n")}`);
   }
+});
+
+/**
+ * A tree with a real history: `a`, its child `b`, and `side`, a second child of
+ * `a`. Ancestry is a fact about a repository, so these cases need one — the
+ * tree the credential cases use has no `.git` at all, and there "is it an
+ * ancestor" is unanswerable rather than false.
+ */
+function withHistory(): { dir: string; a: string; b: string; side: string } {
+  const dir = root("an ordinary line\n", WORKING);
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "publish-gate@example.invalid");
+  git("config", "user.name", "publish gate");
+  const commit = (name: string) => {
+    writeFileSync(join(dir, name), `${name}\n`);
+    git("add", "-A");
+    git("-c", "commit.gpgsign=false", "commit", "-qm", name);
+    return git("rev-parse", "HEAD");
+  };
+  const a = commit("a.txt");
+  const b = commit("b.txt");
+  git("checkout", "-q", "-b", "side", a);
+  const side = commit("side.txt");
+  git("checkout", "-q", "main");
+  return { dir, a, b, side };
+}
+
+/** Writes a run record beside the log one, with whatever provenance the case wants. */
+function record(dir: string, fields: Record<string, unknown>): void {
+  writeFileSync(join(dir, "report/runs/2026-01-01/record.json"), `${JSON.stringify({ bench: "t", results: [], ...fields })}\n`);
+}
+
+/** The upload branch without a bucket: a stub `npx`, and a base that answers nothing. */
+function offline(dir: string): NodeJS.ProcessEnv {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "npx"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(bin, "npx"), 0o755);
+  return { ...WITH_TOKEN, PATH: `${bin}:${process.env.PATH ?? ""}`, PUBLISH_RUNS_BASE: "http://127.0.0.1:9" };
+}
+
+const published = (dir: string) => {
+  try { return readFileSync(join(dir, "report/runs/manifest.tsv"), "utf8"); } catch { return ""; }
+};
+
+check("a record whose build is an ancestor of its driver is published", () => {
+  // The ordinary case, and the one a stricter check would break: production
+  // runs an older build than the tree the driver is on whenever a deploy lags
+  // a merge, which is most days. Equality is not the property.
+  const { dir, a, b } = withHistory();
+  record(dir, { build: a, driver: { commit: b, dirty: false } });
+  const { out } = run(dir, offline(dir));
+  const manifest = published(dir);
+  rmSync(dir, { recursive: true, force: true });
+  if (out.includes("REFUSED") || out.includes("STOPPED")) throw new Error(`a lagging build was not published: ${out}`);
+  if (!manifest.includes("runs/2026-01-01/record.json")) throw new Error(`the record never reached the manifest: ${out}\n${manifest}`);
+});
+
+check("a record with no build or driver at all is published", () => {
+  // Records written before 2026-09-12 carry neither field, and they are still
+  // republished from this repository's history. "No claim" must not read as
+  // "a claim I cannot check".
+  const { dir } = withHistory();
+  record(dir, {});
+  const { out } = run(dir, offline(dir));
+  const manifest = published(dir);
+  rmSync(dir, { recursive: true, force: true });
+  if (out.includes("REFUSED") || out.includes("STOPPED")) throw new Error(`a record from before the fields existed was held back: ${out}`);
+  if (!manifest.includes("runs/2026-01-01/record.json")) throw new Error(`the record never reached the manifest: ${out}\n${manifest}`);
+});
+
+check("a record whose build and driver are on neither's history is refused", () => {
+  const { dir, b, side } = withHistory();
+  record(dir, { build: b, driver: { commit: side, dirty: false } });
+  const { code, out } = run(dir, offline(dir));
+  const manifest = published(dir);
+  rmSync(dir, { recursive: true, force: true });
+  if (!out.includes("REFUSED")) throw new Error(`a run from an unmerged tree was not refused: ${out}`);
+  if (code === 0) throw new Error(`a run that refused a file reported success (${code}): ${out}`);
+  if (manifest.includes("runs/2026-01-01/record.json")) throw new Error(`the refused record was anchored anyway:\n${manifest}`);
+});
+
+check("a commit this checkout does not have stops the publish, and says so rather than calling them unrelated", () => {
+  // The distinction this whole check turns on: with one commit absent, both
+  // ancestor questions answer "no", which is indistinguishable from two
+  // unmerged trees — and the repairs are opposite ("fetch it" vs "merge it").
+  const { dir, b } = withHistory();
+  record(dir, { build: b, driver: { commit: "0".repeat(40), dirty: false } });
+  const { code, out } = run(dir, offline(dir));
+  rmSync(dir, { recursive: true, force: true });
+  if (code !== 2) throw new Error(`an unknown commit ended with ${code}, not 2: ${out}`);
+  if (!out.includes("STOPPED")) throw new Error(`nothing said the publish stopped: ${out}`);
+  if (!/fetch/.test(out)) throw new Error(`the refusal does not name the repair, so it reads as "unrelated": ${out}`);
+  if (/never merged/.test(out)) throw new Error(`it reported the other mistake: ${out}`);
+});
+
+check("a record naming only one of the two commits stops the publish", () => {
+  const { dir, b } = withHistory();
+  record(dir, { build: b });
+  const { code, out } = run(dir, offline(dir));
+  rmSync(dir, { recursive: true, force: true });
+  if (code !== 2) throw new Error(`a half-named record ended with ${code}, not 2: ${out}`);
+  if (!out.includes("STOPPED")) throw new Error(`nothing said the publish stopped: ${out}`);
 });
 
 console.log(`\n  Publish gate\n  ${"─".repeat(56)}`);
