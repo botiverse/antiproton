@@ -12,12 +12,20 @@
  * replied after the latest message, and after anything the socket already delivered.
  */
 
+import type { BenchPollBody } from "../src/bench/poll-body.ts";
+
 export type PollDecision =
   | { kind: "answer"; text: string; seq: number }
   | { kind: "failed"; seq: number }
   | null;
 
-export type Poll = { status?: string; answer?: string | null; events?: Array<{ sequence: number; kind: string }> };
+/**
+ * What the runner has in hand: the endpoint's body, with every field optional because a deployment older
+ * than src/bench/poll-body.ts answers without the sequences, and a request can fail outright. Typed from the
+ * Worker's own contract so that a change there has to be answered here rather than read as an absent field —
+ * an absent field is exactly what went unnoticed for four days.
+ */
+export type Poll = Partial<BenchPollBody>;
 
 /**
  * What the criterion below reads, and the only thing it reads (Vera, 2026-09-19).
@@ -29,12 +37,10 @@ export type Poll = { status?: string; answer?: string | null; events?: Array<{ s
  * whether an event came after the latest message and after what the socket had already delivered. Kinds
  * without their sequences would say what happened but not in which order, which is not enough to re-decide.
  *
- * `tail` is the last few events as they were, for the reader who wants to see what else was there; the
- * decision never looks at it. The answer's text is deliberately absent: the runner needs it, a record of why
+ * `tail` is the last few events as the endpoint sent them, for the reader who wants to see what else was
+ * there; the decision never looks at it. The answer's text is deliberately absent: the runner needs it, a record of why
  * a turn had no answer does not.
  */
-export const STALL_TAIL = 5;
-
 export interface StallEvidence {
   /** The poll's status, or null when the poll itself failed — the case that claims nothing. */
   status: string | null;
@@ -42,21 +48,24 @@ export interface StallEvidence {
   seen: number;
   /** Whether the poll carried an answer at all, without carrying the answer. */
   answer: boolean;
-  /** The highest sequence for each kind the criterion reads; -1 when that kind is not there. */
-  last: { message: number; response: number; failed: number };
+  /**
+   * The highest sequence for each kind the criterion reads, as the endpoint gave them — or null when it gave
+   * none. Null is not "nothing happened": it is "this deployment did not say", and the two must not share a
+   * value, because a missing sequence reads as -1 and -1 loses every comparison, which names a cause with
+   * confidence out of no data at all.
+   */
+  last: { message: number; response: number; failed: number } | null;
   tail: Array<{ seq: number; kind: string }>;
 }
 
 export function stallEvidence(poll: Poll | null, seenSeq: number): StallEvidence {
   const known = !!poll && typeof poll.status === "string";
-  const events = (known ? poll!.events : undefined) ?? [];
-  const last = (kind: string) => events.reduce((m, e) => (e.kind === kind && e.sequence > m ? e.sequence : m), -1);
   return {
     status: known ? String(poll!.status) : null,
     seen: seenSeq,
     answer: known ? !!poll!.answer : false,
-    last: { message: last("message"), response: last("model.response"), failed: last("model.failed") },
-    tail: events.slice(-STALL_TAIL).map((e) => ({ seq: e.sequence, kind: e.kind })),
+    last: known && poll!.last ? { ...poll!.last } : null,
+    tail: (known ? poll!.tail : undefined) ?? [],
   };
 }
 
@@ -68,7 +77,7 @@ export function stallEvidence(poll: Poll | null, seenSeq: number): StallEvidence
  * with the decision in the first place (#415). One implementation, and its input is the thing a record keeps.
  */
 export function verdictFromEvidence(ev: StallEvidence): { kind: "answer" | "failed"; seq: number } | null {
-  if (ev.status !== "idle") return null;
+  if (ev.status !== "idle" || !ev.last) return null;
   const { message, response, failed } = ev.last;
   if (failed > message && failed > ev.seen) return { kind: "failed", seq: failed };
   if (!ev.answer || response <= message || response <= ev.seen) return null;
@@ -112,6 +121,10 @@ export function stallCause(poll: Poll | null, seenSeq: number): StallCause {
 export function causeFromEvidence(ev: StallEvidence): StallCause {
   if (ev.status === null) return "unknown";
   if (ev.status !== "idle") return "still_running";
+  // A poll that did not carry the sequences cannot say which of the three happened, and saying
+  // `idle_without_answer` anyway is the shape this whole seam got wrong: a name that is right by arithmetic
+  // (-1 loses every comparison) rather than by evidence.
+  if (!ev.last) return "unknown";
   // Each of the criterion's kinds means something different about who stopped, so each gets its own name;
   // no verdict at all is the only one that reads as "idle with nothing to show".
   switch (verdictFromEvidence(ev)?.kind) {
