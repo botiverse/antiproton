@@ -65,6 +65,7 @@ import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents 
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { countHeldTime } from "../../src/usage/container.ts";
+import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
@@ -983,13 +984,9 @@ export class AgentDO extends DurableObject<Env> {
     const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
     const events = entriesToEvents(
       await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
-    const last = [...events].reverse()
-      .find((e) => e.kind === "model.response" && !(e.payload as any).toolCalls);
-    return {
-      status: running ? "running" : "idle",
-      entries: events.length,
-      answer: running ? null : ((last?.payload as any)?.text ?? null),
-    };
+    // One builder for the body, shared with the runner's tests: a fixture cannot then have a shape this
+    // endpoint never sends, which is how the poll fallback stayed inert for four days (src/bench/poll-body.ts).
+    return benchPollBody(events, running);
   }
 
   /** What the harness actually handed the provider. Guessing at this cost two
