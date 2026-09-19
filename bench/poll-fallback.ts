@@ -39,10 +39,18 @@ export function decideFromPoll(
  * all a later reader has. So the runner asks once more and names what the object says:
  *   still_running        the object is still on the turn: the agent really is slow or stuck;
  *   answer_undelivered   the object answered and neither the socket nor the poll brought it: a delivery fault;
+ *   model_failed         the model call failed and that event reached neither the socket nor a poll in time;
  *   idle_without_answer  the object is idle with no reply after the latest message;
  *   unknown              the last poll itself failed, so nothing is claimed.
+ *
+ * `model_failed` is here because the runner's own checks can miss it by up to one poll interval: the wait
+ * ends a turn as soon as the socket reports `model.failed` (bench/tau2/cf.ts:210) or a periodic poll decides
+ * `failed` (cf.ts:191), but a failure that lands between the last such poll and the deadline is seen only by
+ * this final poll. `decideFromPoll` names it, so reading only its `answer` case filed a failed model call
+ * under `idle_without_answer` — a cause that blames the agent for stopping when the model call is what
+ * broke, and the published record keeps no poll, so nobody can tell the two apart afterwards.
  */
-export type StallCause = "still_running" | "answer_undelivered" | "idle_without_answer" | "unknown";
+export type StallCause = "still_running" | "answer_undelivered" | "model_failed" | "idle_without_answer" | "unknown";
 
 export function stallCause(
   poll: { status?: string; answer?: string | null; events?: Array<{ sequence: number; kind: string }> } | null,
@@ -50,5 +58,11 @@ export function stallCause(
 ): StallCause {
   if (!poll || typeof poll.status !== "string") return "unknown";
   if (poll.status !== "idle") return "still_running";
-  return decideFromPoll(poll, seenSeq)?.kind === "answer" ? "answer_undelivered" : "idle_without_answer";
+  // Each of the decision's kinds means something different about who stopped, so each gets its own name;
+  // no decision at all is the only one that reads as "idle with nothing to show".
+  switch (decideFromPoll(poll, seenSeq)?.kind) {
+    case "answer": return "answer_undelivered";
+    case "failed": return "model_failed";
+    default: return "idle_without_answer";
+  }
 }

@@ -42,6 +42,23 @@ await check("a failed model call after the latest message ends the turn as faile
   assert(d?.kind === "failed" && d.seq === 9, `decision: ${JSON.stringify(d)}`);
 });
 
+await check("a model call that failed at the deadline is named as that, not as an agent that went idle", () => {
+  // The very poll the decision test above calls `failed`: the runner's earlier checks can miss it by up to
+  // one poll interval, so the deadline's poll is the only place it is seen, and naming it
+  // `idle_without_answer` there would blame the agent for what the model call did.
+  const events = [{ sequence: 4, kind: "message" }, { sequence: 9, kind: "model.failed" }];
+  const got = stallCause({ status: "idle", answer: null, events }, 4);
+  assert(got === "model_failed", `a failure at the deadline: ${got}`);
+});
+
+await check("a failure from the previous turn leaves this one an agent that went idle", () => {
+  // The new name must not swallow the old one: a `model.failed` older than the latest message belongs to
+  // the turn before this one, which says nothing about why this turn has no answer.
+  const events = [{ sequence: 9, kind: "model.failed" }, { sequence: 12, kind: "message" }];
+  const got = stallCause({ status: "idle", answer: null, events }, 4);
+  assert(got === "idle_without_answer", `a failure from the previous turn: ${got}`);
+});
+
 await check("a timed-out turn names what the object says: running, answered but undelivered, idle, or unknown", () => {
   const cases: Array<[string, ReturnType<typeof stallCause>]> = [
     [stallCause({ status: "running", answer: "old", events: turn }, 71), "still_running"],
