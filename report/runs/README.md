@@ -123,8 +123,25 @@ Two consequences for reading those records:
 From `ea4c913` on the body carries the order the decision reads, and a
 `stallWhy` on a stalled row shows what it was decided from. **So a later
 record with `poll` greater than zero is the fallback working, not an
-anomaly** — and a record with a `stallWhy` whose `last` is `null` is saying the
-deployment it ran against was older than this line.
+anomaly.**
+
+A stalled row therefore reads in one of three ways, and only the last of them
+is evidence:
+
+- **no `stallWhy` at all** — the row predates the field (`5e5428a`,
+  2026-09-19). Its cause is a word with nothing behind it.
+- **`stallWhy.last` is `{message: -1, response: -1, failed: -1}` with an empty
+  `tail`** — the field existed but the deployment it asked still answered
+  without sequences. The -1s are not observations: they are the absence of
+  them, and they lose every comparison, which is how the cause came out
+  `idle_without_answer` regardless of what happened. One record is in this
+  window, the 12:53Z run of 2026-09-19
+  (`tau2-b_daily_22419-mu8f1fly`, build `0cffb25`), and both of its stalled
+  rows read this way.
+- **`stallWhy.last` is `null`** — the runner asked a deployment older than
+  `ea4c913` and said so; the cause is `unknown`, which is the honest name.
+  **Real sequences, and a cause that means something, need a `build` of
+  `ea4c913` or later.**
 
 ## Publishing a run
 
