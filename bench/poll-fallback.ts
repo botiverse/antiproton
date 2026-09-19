@@ -17,19 +17,68 @@ export type PollDecision =
   | { kind: "failed"; seq: number }
   | null;
 
-export function decideFromPoll(
-  poll: { status?: string; answer?: string | null; events?: Array<{ sequence: number; kind: string }> },
-  seenSeq: number,
-): PollDecision {
-  if (poll?.status !== "idle") return null;
-  const events = poll.events ?? [];
+export type Poll = { status?: string; answer?: string | null; events?: Array<{ sequence: number; kind: string }> };
+
+/**
+ * What the criterion below reads, and the only thing it reads (Vera, 2026-09-19).
+ *
+ * A stalled row used to record its cause and nothing else, so the question "was this really an idle agent, or
+ * a model call that failed inside the runner's blind window?" could not be answered from a record at all —
+ * the poll that decided it was gone. This is that poll, reduced to the values the decision uses: a status, a
+ * boolean for whether there was an answer at all, and **the sequence numbers**, because the whole criterion is
+ * whether an event came after the latest message and after what the socket had already delivered. Kinds
+ * without their sequences would say what happened but not in which order, which is not enough to re-decide.
+ *
+ * `tail` is the last few events as they were, for the reader who wants to see what else was there; the
+ * decision never looks at it. The answer's text is deliberately absent: the runner needs it, a record of why
+ * a turn had no answer does not.
+ */
+export const STALL_TAIL = 5;
+
+export interface StallEvidence {
+  /** The poll's status, or null when the poll itself failed — the case that claims nothing. */
+  status: string | null;
+  /** What the socket had already delivered when the deadline came. */
+  seen: number;
+  /** Whether the poll carried an answer at all, without carrying the answer. */
+  answer: boolean;
+  /** The highest sequence for each kind the criterion reads; -1 when that kind is not there. */
+  last: { message: number; response: number; failed: number };
+  tail: Array<{ seq: number; kind: string }>;
+}
+
+export function stallEvidence(poll: Poll | null, seenSeq: number): StallEvidence {
+  const known = !!poll && typeof poll.status === "string";
+  const events = (known ? poll!.events : undefined) ?? [];
   const last = (kind: string) => events.reduce((m, e) => (e.kind === kind && e.sequence > m ? e.sequence : m), -1);
-  const lastMessage = last("message");
-  const lastFailed = last("model.failed");
-  if (lastFailed > lastMessage && lastFailed > seenSeq) return { kind: "failed", seq: lastFailed };
-  const lastResponse = last("model.response");
-  if (!poll.answer || lastResponse <= lastMessage || lastResponse <= seenSeq) return null;
-  return { kind: "answer", text: String(poll.answer), seq: lastResponse };
+  return {
+    status: known ? String(poll!.status) : null,
+    seen: seenSeq,
+    answer: known ? !!poll!.answer : false,
+    last: { message: last("message"), response: last("model.response"), failed: last("model.failed") },
+    tail: events.slice(-STALL_TAIL).map((e) => ({ seq: e.sequence, kind: e.kind })),
+  };
+}
+
+/**
+ * The one criterion, reading only the evidence.
+ *
+ * Both readers go through here — the runner, which needs the answer's text, and the record's cause, which
+ * needs a name — because a second hand-written copy of this rule is exactly how the cause came to disagree
+ * with the decision in the first place (#415). One implementation, and its input is the thing a record keeps.
+ */
+export function verdictFromEvidence(ev: StallEvidence): { kind: "answer" | "failed"; seq: number } | null {
+  if (ev.status !== "idle") return null;
+  const { message, response, failed } = ev.last;
+  if (failed > message && failed > ev.seen) return { kind: "failed", seq: failed };
+  if (!ev.answer || response <= message || response <= ev.seen) return null;
+  return { kind: "answer", seq: response };
+}
+
+export function decideFromPoll(poll: Poll, seenSeq: number): PollDecision {
+  const v = verdictFromEvidence(stallEvidence(poll, seenSeq));
+  if (!v) return null;
+  return v.kind === "failed" ? { kind: "failed", seq: v.seq } : { kind: "answer", text: String(poll.answer), seq: v.seq };
 }
 
 /**
@@ -52,15 +101,20 @@ export function decideFromPoll(
  */
 export type StallCause = "still_running" | "answer_undelivered" | "model_failed" | "idle_without_answer" | "unknown";
 
-export function stallCause(
-  poll: { status?: string; answer?: string | null; events?: Array<{ sequence: number; kind: string }> } | null,
-  seenSeq: number,
-): StallCause {
-  if (!poll || typeof poll.status !== "string") return "unknown";
-  if (poll.status !== "idle") return "still_running";
-  // Each of the decision's kinds means something different about who stopped, so each gets its own name;
-  // no decision at all is the only one that reads as "idle with nothing to show".
-  switch (decideFromPoll(poll, seenSeq)?.kind) {
+export function stallCause(poll: Poll | null, seenSeq: number): StallCause {
+  return causeFromEvidence(stallEvidence(poll, seenSeq));
+}
+
+/**
+ * The same name, from the evidence a record kept — so a reader months later re-decides rather than trusting
+ * the word that was written down.
+ */
+export function causeFromEvidence(ev: StallEvidence): StallCause {
+  if (ev.status === null) return "unknown";
+  if (ev.status !== "idle") return "still_running";
+  // Each of the criterion's kinds means something different about who stopped, so each gets its own name;
+  // no verdict at all is the only one that reads as "idle with nothing to show".
+  switch (verdictFromEvidence(ev)?.kind) {
     case "answer": return "answer_undelivered";
     case "failed": return "model_failed";
     default: return "idle_without_answer";

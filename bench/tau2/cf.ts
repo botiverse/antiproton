@@ -24,7 +24,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
 import { driverCommit, recordRun, workerBuild } from "../record.ts";
-import { decideFromPoll, stallCause } from "../poll-fallback.ts";
+import { causeFromEvidence, decideFromPoll, stallEvidence, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
 
@@ -263,6 +263,8 @@ async function runTask(task: any) {
   let agentSaid = "Hi! How can I help you today?";
   let turns = 0, simCalls = 0, ended = "max_turns";
   let stall: string | undefined;
+  // The values that cause was decided from, so a record can be re-decided rather than believed (Vera).
+  let stallWhy: StallEvidence | undefined;
 
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
@@ -281,7 +283,8 @@ async function runTask(task: any) {
       else {
         ended = "agent_stalled";
         const last = await api(`/bench/poll?taskId=${taskId}`).catch(() => null);
-        stall = stallCause(last, seen.get(taskId) ?? 0);
+        stallWhy = stallEvidence(last, seen.get(taskId) ?? 0);
+        stall = causeFromEvidence(stallWhy);
       }
       break;
     }
@@ -297,7 +300,7 @@ async function runTask(task: any) {
     writes.some((w: any) => w.name === e.name && canonArgs(w.args) === canonArgs(e.args)));
 
   return {
-    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall,
+    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
