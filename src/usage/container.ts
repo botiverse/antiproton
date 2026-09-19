@@ -19,6 +19,24 @@
  * and if that ever happens the id is the thing to rename (with a line in
  * report/runs' style saying when it changed, because a renamed resource is a
  * different series).
+ *
+ * The other side of this seam — that a real run9 box makes the contract look the
+ * way the tests assume — cannot be checked here: the tests feed `MountActivity`
+ * themselves, so they prove our reading of the contract and not run9's
+ * behaviour. `~/tmp/container-billing-probe.sh` drives one real box through a
+ * full worker under `wrangler dev --local` and prints what it saw, because a
+ * date and a build say the probe ran and only the values say it found what this
+ * file assumes.
+ *
+ * Last run 2026-09-18 on master 461ac02 (cf/ identical to prod ab951c9):
+ *   box       h-demo-u-automation-mu7ed0st-mu7ej2m9, the id run9 also lists
+ *   startedAt 1789762748957 (run9's own created_at is 0.5s earlier)
+ *   endedAt   1789762996360, reported in `usage[]` (length 1, uses 1) in the
+ *             pass after the release, with `activity.live` back to null
+ *   ledger    247.403 seconds = (endedAt - startedAt) / 1000, to the ms, plus a
+ *             separate `execs` row for the one command
+ * A later run that disagrees says WHICH side moved: a different shape means run9
+ * changed, a different total means this file did.
  */
 import { appendUsage, msByHour, type UsageRow } from "./outbox.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
@@ -74,7 +92,10 @@ export function heldRows(
     if (uses) {
       // Uses land in the hour the box was last seen in, which is where the
       // seconds that go with them are: the mount counts them, it does not date
-      // them.
+      // them. They share the resource id with the seconds and differ only by
+      // `unit`, so anything totalling this resource has to filter by unit — a
+      // sum over both is wrong by exactly the number of commands, which looks
+      // like a billing bug and is not one (it read 248.403 for a 247.403s box).
       const at = parts.at(-1)?.hour ?? Math.floor(to / 3_600_000) * 3_600_000;
       rows.push({ at, ...base, resource: "sandbox.container", key, quantity: uses, unit: "execs" });
     }
