@@ -7,11 +7,11 @@
  * not a fixture of anything.
  */
 import { benchPollBody, type PollEvent } from "../src/bench/poll-body.ts";
-import { causeFromEvidence, decideFromPoll, stallCause, stallEvidence, type Poll } from "../bench/poll-fallback.ts";
+import { causeFromEvidence, decideFromPoll, stallAtDeadline, stallCause, stallEvidence, type Poll } from "../bench/poll-fallback.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
-async function check(name: string, fn: () => void) {
-  try { fn(); results.push({ name, ok: true }); }
+async function check(name: string, fn: () => void | Promise<void>) {
+  try { await fn(); results.push({ name, ok: true }); }
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
@@ -114,6 +114,28 @@ await check("an answer the socket had already delivered is not an undelivered on
   const missedIt = recorded(wire(events), 0);
   assert(seenIt === "idle_without_answer", `the socket had it: ${seenIt}`);
   assert(missedIt === "answer_undelivered", `the socket missed it: ${missedIt}`);
+});
+
+await check("the deadline reading keeps what it decided from", () => {
+  // Both runners ask this the same way, so it is asked in one place: two copies of the three lines is how a
+  // cause and a decision came apart before (#415).
+  const body = wire([{ sequence: 4, kind: "message" }, { sequence: 9, kind: "model.failed" }]);
+  return stallAtDeadline(async () => body, 4).then((got) => {
+    assert(got.stall === "model_failed", `a poll that answered: ${got.stall}`);
+    assert(got.stallWhy.last?.failed === 9, "the cause came back without the evidence it was read from");
+  });
+});
+
+await check("a poll that fails, or none at all, claims nothing rather than an idle agent", () => {
+  // A request that failed and a deployment that said nothing both end as `unknown`, and the evidence says so
+  // with a null status — the row must not read as though the object was seen idle.
+  return Promise.all([
+    stallAtDeadline(async () => { throw new Error("the poll did not answer"); }, 4),
+    stallAtDeadline(async () => null, 4),
+  ]).then(([threw, empty]) => {
+    assert(threw.stall === "unknown" && threw.stallWhy.status === null, `a poll that threw: ${threw.stall}`);
+    assert(empty.stall === "unknown" && empty.stallWhy.status === null, `no poll at all: ${empty.stall}`);
+  });
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

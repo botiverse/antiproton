@@ -118,6 +118,22 @@ export function stallCause(poll: Poll | null, seenSeq: number): StallCause {
  * The same name, from the evidence a record kept — so a reader months later re-decides rather than trusting
  * the word that was written down.
  */
+/**
+ * The one deadline reading, for every runner that has one.
+ *
+ * Both runners reach this point with the same question and the same three lines, and two copies of three
+ * lines is how the cause and the decision came apart in the first place (#415). A poll that fails outright
+ * claims nothing: it is caught here so that "the request failed" cannot be told apart from "the deployment
+ * said nothing" by accident — both end as `unknown`, and the evidence says which by carrying a null status.
+ */
+export async function stallAtDeadline(
+  poll: () => Promise<Poll | null>, seenSeq: number,
+): Promise<{ stall: StallCause; stallWhy: StallEvidence }> {
+  const last = await poll().catch(() => null);
+  const stallWhy = stallEvidence(last, seenSeq);
+  return { stall: causeFromEvidence(stallWhy), stallWhy };
+}
+
 export function causeFromEvidence(ev: StallEvidence): StallCause {
   if (ev.status === null) return "unknown";
   if (ev.status !== "idle") return "still_running";
