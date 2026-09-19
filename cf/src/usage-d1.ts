@@ -3,14 +3,19 @@
  * dashboard reads (`readUsage`). The rows come from each agent's outbox
  * (src/usage/outbox.ts); migration 0005 made the tables.
  *
- * `usage_hourly` is never trimmed here. The outbox side is pruned on every
- * send, bounded by the cursor; this side has no retention at all, and that is
- * a gap rather than a decision — README's "What is not done" carries it, and
- * folding whole hours into days past a cutoff is the intended fix.
+ * `usage_hourly` keeps the last `KEEP_HOURLY_DAYS` days. Past that, whole days
+ * move into `usage_daily` (`foldUsage`, migration 0006) — the same quantities
+ * under a bucket that says it is a day. Both tables are read together, so the
+ * totals a page shows do not change when a day is folded; what is lost is the
+ * hour a thing happened in, and only for days older than any window the page
+ * offers.
  */
 import { pendingUsage, pruneUsage, toHourly, type OutboxRow } from "../../src/usage/outbox.ts";
+import { DAY_MS, USAGE_WINDOWS } from "./usage-windows.ts";
 
-export const DAY_MS = 86_400_000;
+// Both live in usage-windows.ts so the page and this parser cannot hold
+// different lists; re-exported because this is where their readers look.
+export { DAY_MS, USAGE_WINDOWS };
 
 /**
  * Send one agent's pending rows. Every statement runs only while the agent's
@@ -48,6 +53,68 @@ export async function usageCursor(db: D1Database, tenantId: string, agentId: str
   return r ? Number(r.last_seq) : 0;
 }
 
+/**
+ * How much of the ledger keeps its hours. Longer than the longest window the
+ * page offers, and a test pins that: inside a window, every bucket must be
+ * able to hold what it claims to hold, and a folded day placed in an hourly
+ * bucket would sit at 00:00Z as if it had happened at midnight. Shortening
+ * this below a window is therefore not a tuning change — it makes the hourly
+ * chart say something untrue, and the page would have to say so first.
+ */
+export const KEEP_HOURLY_DAYS = 35;
+
+/**
+ * Move whole days out of the hours and into the days, oldest first.
+ *
+ * Each day is one `db.batch`, so its insert and its delete are one
+ * transaction: after it, the hours it summed are gone. That is what makes a
+ * second run a no-op rather than a doubling — not a marker saying "already
+ * folded", which would have to be written somewhere and would be wrong the
+ * moment a row arrived late. **The fold is idempotent because it moves rows
+ * rather than copying them**, and a run that is interrupted between two days
+ * leaves the rest for the next one.
+ *
+ * A row that arrives for an already folded day is not lost: it lands in
+ * `usage_hourly` as any row does, and the next fold adds it to the day that is
+ * already there (`DO UPDATE SET quantity = quantity + excluded.quantity`).
+ * Reads sum both tables in the meantime, so it counts before it is folded too.
+ * The two halves of that are one mechanism: the day list is whatever is still
+ * in `usage_hourly` below the cutoff, so a late row puts its own old day back
+ * on the list by existing — nothing has to notice that the day was reopened
+ * (Vera read this out of the code, 2026-09-19).
+ *
+ * `maxDays` bounds one run: the first fold of a long-lived ledger would
+ * otherwise be one very long invocation. What it did, so a caller can log it
+ * and a test can see it.
+ */
+export async function foldUsage(
+  db: D1Database, now: number, keepDays = KEEP_HOURLY_DAYS, maxDays = 31,
+): Promise<{ days: number[]; hours: number }> {
+  const cutoff = Math.floor(now / DAY_MS) * DAY_MS - keepDays * DAY_MS;
+  // The day a row belongs to, by integer division: `hour` is INTEGER and so is
+  // the literal, where a bound JS number would arrive as REAL and not divide
+  // down to the bucket (the same trap readUsage's CAST is about).
+  const { results } = await db.prepare(
+    "SELECT DISTINCT (hour / 86400000) * 86400000 AS day FROM usage_hourly WHERE hour < ? ORDER BY day LIMIT ?",
+  ).bind(cutoff, maxDays).all();
+  const days = (results as any[]).map((r) => Number(r.day));
+  let hours = 0;
+  for (const day of days) {
+    const end = day + DAY_MS;
+    const done = await db.batch([
+      db.prepare(
+        "INSERT INTO usage_daily(tenant_id, day, agent_id, resource, key, unit, quantity) " +
+        "SELECT tenant_id, ?, agent_id, resource, key, unit, SUM(quantity) FROM usage_hourly " +
+        "WHERE hour >= ? AND hour < ? GROUP BY tenant_id, agent_id, resource, key, unit " +
+        "ON CONFLICT(tenant_id, day, agent_id, resource, key, unit) DO UPDATE SET quantity = quantity + excluded.quantity",
+      ).bind(day, day, end),
+      db.prepare("DELETE FROM usage_hourly WHERE hour >= ? AND hour < ?").bind(day, end),
+    ]);
+    hours += Number(done.at(-1)?.meta?.changes ?? 0);
+  }
+  return { days, hours };
+}
+
 export type UsageGroupBy = "total" | "agent" | "model" | "tool";
 
 export interface UsageReadRow {
@@ -62,9 +129,6 @@ export interface UsageReadRow {
   /** Credits, once any price exists; absent before. */
   cost?: number | null;
 }
-
-/** The windows the page offers (cf/src/usage.ts), and how long each is. */
-export const USAGE_WINDOWS: Record<string, number> = { "24h": DAY_MS, "7d": 7 * DAY_MS, "30d": 30 * DAY_MS };
 
 export interface UsageQuery { window: string; from: number; to: number; bucket: "1h" | "1d"; by: UsageGroupBy }
 
@@ -124,9 +188,17 @@ export function priceFor(prices: readonly UsagePrice[], row: { bucket: number; r
  * page says which of those it is not able to tell.
  */
 export async function usageFirstHours(db: D1Database, tenantId: string): Promise<Record<string, number>> {
+  // Both tables, because folding moves the oldest rows out of the hours first:
+  // asking usage_hourly alone would report a record that begins later every
+  // time a fold runs, and the page would tell a reader that a resource started
+  // being counted on a day it was in fact already counted.
   const { results } = await db.prepare(
-    "SELECT resource, MIN(hour) AS first FROM usage_hourly WHERE tenant_id = ? GROUP BY resource",
-  ).bind(tenantId).all();
+    `SELECT resource, MIN(first) AS first FROM (
+       SELECT resource, MIN(hour) AS first FROM usage_hourly WHERE tenant_id = ? GROUP BY resource
+       UNION ALL
+       SELECT resource, MIN(day) AS first FROM usage_daily WHERE tenant_id = ? GROUP BY resource
+     ) GROUP BY resource`,
+  ).bind(tenantId, tenantId).all();
   return Object.fromEntries((results as any[]).map((r) => [String(r.resource), Number(r.first)]));
 }
 
@@ -134,14 +206,25 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
   Promise<{ rows: UsageReadRow[]; priced: boolean; firstHours: Record<string, number> }> {
   const size = q.bucket === "1d" ? DAY_MS : 3_600_000;
   const withAgent = q.by === "agent";
+  const from = Math.floor(q.from / size) * size;
   const { results } = await db.prepare(
-    // D1 binds a JS number as REAL, and REAL division would not round down to the bucket.
-    `SELECT (hour / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, ${withAgent ? "agent_id" : "'' AS agent_id"},
-       resource, key, unit, SUM(quantity) AS quantity
-     FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ?
+    // Both tables: a folded day answers the same question its hours did, and a
+    // window that reaches past the fold must not lose them. Nothing is counted
+    // twice — a fold moves rows, so an hour is in one table or the other.
+    //
+    // D1 binds a JS number as REAL, and REAL division would not round down to
+    // the bucket, hence the CASTs.
+    `SELECT bucket, ${withAgent ? "agent_id" : "'' AS agent_id"}, resource, key, unit, SUM(quantity) AS quantity
+     FROM (
+       SELECT (hour / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, agent_id, resource, key, unit, quantity
+         FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ?
+       UNION ALL
+       SELECT (day / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, agent_id, resource, key, unit, quantity
+         FROM usage_daily WHERE tenant_id = ? AND day >= ? AND day < ?
+     )
      GROUP BY bucket, ${withAgent ? "agent_id, " : ""}resource, key, unit
      ORDER BY bucket, resource, key, unit`,
-  ).bind(size, size, tenantId, Math.floor(q.from / size) * size, q.to).all();
+  ).bind(size, size, tenantId, from, q.to, size, size, tenantId, from, q.to).all();
   const prices = await usagePrices(db);
   const priced = prices.length > 0;
   const firstHours = await usageFirstHours(db, tenantId);

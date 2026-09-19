@@ -27,6 +27,7 @@
  * colours mean the same thing in every chart. Credits are the one unit that
  * does add up across resources, so once prices exist they get the headline.
  */
+import { WINDOW_NAMES } from "./usage-windows.ts";
 
 const esc = (s: unknown) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -63,9 +64,6 @@ export type UsageData = {
   firstHours?: Record<string, number>;
 };
 
-// No one-hour window: the ledger is hourly, so it would be a single bar. The
-// last bar of the day view answers "the last hour".
-export const WINDOWS = ["24h", "7d", "30d"] as const;
 const BYS = ["total", "agent", "model", "tool"] as const;
 const HOUR = 3_600_000;
 
@@ -260,7 +258,7 @@ export function usagePanel(d: UsageData): string {
   const opt = (v: string, cur: string, text = v) => `<option value="${v}"${v === cur ? " selected" : ""}>${text}</option>`;
 
   const controls = `<form class="u-controls" onchange="ap.usage(this, event.target)" onsubmit="return false">
-  <label><span>window</span><select name="window">${WINDOWS.map((w) => opt(w, d.window, `last ${w}`)).join("")}</select></label>
+  <label><span>window</span><select name="window">${WINDOW_NAMES.map((w) => opt(w, d.window, `last ${w}`)).join("")}</select></label>
   <label><span>each bar</span><select name="bucket">${opt("1h", d.bucket, "1 hour")}${opt("1d", d.bucket, "1 day")}</select></label>
   <label><span>split by</span><select name="by">${BYS.map((b) => opt(b, d.by, b === "total" ? "nothing" : b)).join("")}</select></label>
 </form>`;
