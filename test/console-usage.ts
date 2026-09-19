@@ -218,8 +218,16 @@ check("an average that rounds below a millisecond says so, while a zero total st
   must(/avg &lt;1ms/.test(tile(html, "JS runs")), "so do runs");
   must(!/avg 0ms/.test(html), "and no tile averages to a bare zero");
   must(/>0ms<\/div>/.test(tile(html, "container time")), "a resource with nothing in the window still totals 0ms");
+  // A positive total can still average below the resolution: three calls, one
+  // of them 1ms and two of them 0ms. No single call was sub-millisecond — their
+  // average is — so a guard on the total would print `avg 0ms` here.
+  const thin = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 3), row("a1", "tool.call", "gh.x", "ms", 1)]));
+  must(/avg &lt;1ms/.test(tile(thin, "tool calls")), "an average under half a millisecond says so, whatever the total");
+  must(!/avg 0ms/.test(thin), "and still no tile averages to a bare zero");
   const timed = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 3), row("a1", "tool.call", "gh.x", "ms", 900)]));
   must(/avg 300ms/.test(tile(timed, "tool calls")), "a measured average is unchanged");
+  const rounded = usagePanel(data([row("a1", "tool.call", "gh.x", "calls", 2), row("a1", "tool.call", "gh.x", "ms", 1)]));
+  must(/avg 1ms/.test(tile(rounded, "tool calls")), "half a millisecond rounds up and is printed");
 });
 
 check("the tooltip and the table name a bucket in UTC", () => {
