@@ -1,7 +1,7 @@
 /**
  * The runners' poll fallback takes a turn's answer when the push was lost, and never a previous turn's answer.
  */
-import { decideFromPoll, stallCause } from "../bench/poll-fallback.ts";
+import { causeFromEvidence, decideFromPoll, stallCause, stallEvidence } from "../bench/poll-fallback.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void) {
@@ -69,6 +69,35 @@ await check("a timed-out turn names what the object says: running, answered but 
     [stallCause({} as any, 71), "unknown"],
   ];
   cases.forEach(([got, want], i) => assert(got === want, `case ${i}: ${got}, expected ${want}`));
+});
+
+// The record keeps the evidence, not the poll, so everything below re-decides from what a record would hold:
+// `JSON.parse(JSON.stringify(...))` is the trip the value actually makes on its way to a reader.
+const recorded = (poll: Parameters<typeof stallEvidence>[0], seen: number) =>
+  causeFromEvidence(JSON.parse(JSON.stringify(stallEvidence(poll, seen))));
+
+await check("a poll that never answered is kept as a claim about nothing, not as a status", () => {
+  assert(recorded(null, 71) === "unknown", "a failed poll");
+  assert(recorded({ status: "running", answer: "old", events: turn }, 71) === "still_running", "still on the turn");
+});
+
+await check("the evidence keeps the sequence numbers, because the order is the whole criterion", () => {
+  // Identical kinds, opposite order. A record that kept only kinds could not tell these apart, and they are
+  // the two cases the cause exists to separate.
+  const after = recorded({ status: "idle", answer: null, events: [{ sequence: 4, kind: "message" }, { sequence: 9, kind: "model.failed" }] }, 4);
+  const before = recorded({ status: "idle", answer: null, events: [{ sequence: 9, kind: "model.failed" }, { sequence: 12, kind: "message" }] }, 4);
+  assert(after === "model_failed", `a failure after the message: ${after}`);
+  assert(before === "idle_without_answer", `a failure before the message: ${before}`);
+});
+
+await check("an answer the socket had already delivered is not an undelivered one", () => {
+  // Same poll, two histories: what the runner had already seen is the only difference, so the evidence has to
+  // carry it or a delivered answer reads as a lost one.
+  const events = [{ sequence: 4, kind: "message" }, { sequence: 9, kind: "model.response" }];
+  const seenIt = recorded({ status: "idle", answer: "Your exchange has been submitted.", events }, 9);
+  const missedIt = recorded({ status: "idle", answer: "Your exchange has been submitted.", events }, 0);
+  assert(seenIt === "idle_without_answer", `the socket had it: ${seenIt}`);
+  assert(missedIt === "answer_undelivered", `the socket missed it: ${missedIt}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
