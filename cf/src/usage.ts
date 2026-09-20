@@ -275,19 +275,31 @@ export function usagePanel(d: UsageData): string {
       left.length ? `. Not priced yet, so not in this number: ${esc(left.join(", "))}` : ""}</div>`
     : `<div class="u-credits"><span class="u-big">free</span> no prices are set yet, so nothing here is charged. The amounts are real and kept for audit.</div>`;
 
-  // A resource whose first recorded hour is inside the window: the window
-  // reaches further back than the record does, so the figure is a part and must
-  // not be shown as a whole. Worded as what the ledger holds, because it cannot
-  // tell "nothing happened then" from "nothing was counted then". It sits under
-  // the chart, with the tile's other small print: above the chart it pushes one
-  // chart down, and small multiples only compare if they share a baseline.
-  const cut = (res: Resource) => {
+  // Where the record itself starts inside the window: the window reaches
+  // further back than the ledger does, so those figures are a part and must not
+  // read as a whole. Worded as what the ledger holds, because it cannot tell
+  // "nothing happened then" from "nothing was counted then".
+  //
+  // Said once, above the numbers it qualifies, and never in the tiles. A young
+  // account starts every resource in the same hour, and per tile that is one
+  // identical sentence four times over — on a phone, once per screenful, with
+  // nothing marking them as one fact. Naming the resources keeps it true when
+  // only some of them start late, which is the shape a real account is in: one
+  // box held since last week gives container time a record older than the
+  // window while everything else begins today.
+  const counted = RESOURCES.filter((res) => res.counted);
+  const late = new Map<number, string[]>();
+  for (const res of counted) {
     const first = d.firstHours?.[res.id];
-    if (typeof first !== "number" || !(first > d.from)) return "";
-    const iso = new Date(first).toISOString();
-    return `<div class="u-note">nothing recorded before ${iso.slice(5, 10)} ${iso.slice(11, 16)}Z,` +
-      ` part-way into this window</div>`;
-  };
+    if (typeof first !== "number" || !(first > d.from)) continue;
+    late.set(first, [...(late.get(first) ?? []), res.title]);
+  }
+  const lines = [...late.entries()].sort(([a], [b]) => a - b).map(([at, names]) => {
+    const iso = new Date(at).toISOString();
+    return `<div class="u-note">${names.length === counted.length ? "" : `${esc(names.join(", "))}: `}` +
+      `nothing recorded before ${iso.slice(5, 10)} ${iso.slice(11, 16)}Z, part-way into this window</div>`;
+  }).join("");
+  const cuts = lines ? `<div class="u-cuts">${lines}</div>` : "";
 
   const tiles = RESOURCES.map((res) => {
     if (!res.counted) {
@@ -307,7 +319,7 @@ export function usagePanel(d: UsageData): string {
         : c.priced === 0 ? "not priced yet"
         : `${credits(c.credits)} credits, some not priced yet`}</span>` : ""}</div>
   <div class="u-detail">${esc(res.detail(rows)) || "&nbsp;"}</div>
-  ${chart(d, res, rows, named, times)}${cut(res)}
+  ${chart(d, res, rows, named, times)}
 </section>`;
   }).join("");
 
@@ -345,7 +357,7 @@ export function usagePanel(d: UsageData): string {
       off.length ? `<div class="u-note">not counted yet, still being built: ${esc(off.join(", "))}</div>` : ""}${
       d.priced ? "" : `<div class="u-note">no prices are set yet, so nothing here is charged</div>`}</div>`;
   }
-  return `${controls}${headline}${legend}<div class="u-grid">${tiles}</div>
+  return `${controls}${headline}${cuts}${legend}<div class="u-grid">${tiles}</div>
 <h3 class="u-h">by ${d.by === "total" ? "resource" : esc(d.by)}</h3>${table}
 <div class="hint u-foot">Updated as each agent finishes a turn. Times are UTC.</div>`;
 }
@@ -404,6 +416,7 @@ table.u-table a{color:var(--strong);text-decoration:underline;text-decoration-co
 .faint{color:var(--faint)}
 .u-foot{margin-top:8px;padding:0}
 .u-note{font-size:11px;color:var(--faint);margin-top:2px}
+.u-cuts{margin:-6px 0 10px}
 [data-theme="brutal"] .u-tile{border-radius:0}
 [data-theme="brutal"] .u-stack i:last-child{border-radius:0}
 `;
