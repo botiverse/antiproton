@@ -732,7 +732,7 @@ export function credentialForm(credential: CredentialSpec | undefined | null): C
  * contain `background` would be read as a job that does not exist, silently
  * and rarely. `instanceof` cannot be produced by data, so the signal and the
  * data cannot be confused no matter what a tool returns (Piper, cody,
- * 2026-09-14).
+ * 2026-09-14, `83f0658d`).
  *
  * The handle is the plugin's own business and is stored as given: for a
  * container it is the box and the execution. It must never carry a
