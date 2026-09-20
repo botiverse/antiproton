@@ -114,8 +114,17 @@ export function validateMount(
 
   const cred = plugin.credential;
   // `secretRef` here is the NAME in the mount record, never the result of resolving it. That is what
-  // lets this sentence say "has no secret_ref" and be true: all five call sites pass the stored row
-  // (@Piper and @Vera enumerated them to closure, 2026-09-20). A reference that exists but cannot be
+  // lets this sentence say "has no secret_ref" and be true: EVERY caller passes the stored row rather
+  // than a resolved value. The callers live in `cf/src/index.ts` and `cf/src/runtime.ts`, plus the
+  // forward from `assertMountConfig` below, and the set is closed because neither name is re-exported
+  // or alias-bound.
+  //
+  // No count and no command here, and that is the third try. "Five call sites" was wrong (six, if the
+  // forward counts, which is itself the ambiguity). Then a `git grep` was offered as "the whole set" —
+  // but unscoped it returns 34 lines, mostly from a test; and once scoped, THE COMMENT ITSELF MATCHED
+  // THE PATTERN, so the sentence changed its own answer from eight to nine. A number invites a reader
+  // to doubt it; a command invites them to run it and hand back something that looks like an answer.
+  // A reference that exists but cannot be
   // read is a different situation with a different person to fetch, and `credentialState()` in
   // src/plugins/types.ts is what says that one — not this.
   if (cred?.required && !secretRef) {

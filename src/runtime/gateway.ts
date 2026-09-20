@@ -426,7 +426,7 @@ export class ToolGateway {
     // chosen on the old plugin's `exclusive` while dispatch used the new one.
     // Nothing re-points a mount at a different plugin mid-call, and if
     // something ever does, this is the note that says where to look
-    // (@Rex spotted the gap, 2026-09-12).
+    // (the gap was spotted in review, 2026-09-12).
     const r0 = await this.resolve(ctx, raw);
     if ("error" in r0) return { status: "rejected", error: r0.error };
     if (!this.#plugins.get(r0.mount.plugin)?.exclusive) return this.#invoke(ctx, raw, args, opts);
@@ -633,7 +633,8 @@ export class ToolGateway {
       // The same two fields go onto the RECORD, not only onto what this call returns. The returned
       // envelope stops at `pi-tools.ts`, which collapses it into a string; `operation.completed` is
       // what the console reads, so a page that wants to badge an anonymous failure needs them there
-      // (@Nova traced the two hops, @Vera withdrew the envelope as the criterion, 2026-09-20).
+      // -- the two hops are `pi-tools.ts`'s collapse and `tool.result`'s missing slot, either of which
+      // is enough on its own.
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
         ...facts(),
         ...(e.identity === undefined ? {} : { identity: e.identity }),

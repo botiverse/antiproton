@@ -88,9 +88,9 @@ export function heldRows(
     // ledger's first hour for sandbox.container can predate this code (on 2026-09-20 the production
     // tenant's was 09-13, three days before container accounting shipped). That is the reading being
     // right, not the meter being wrong: the hours are when the tenant was holding the box. It also means
-    // this resource's first recorded hour says nothing about when billing began (@Nova, who asked whether
-    // the page should explain it — it should not; a page answers questions its reader is asking, and this
-    // one belongs where the decision is made).
+    // this resource's first recorded hour says nothing about when billing began. The usage page does not
+    // explain that: nothing there claims when billing started, so a sentence about it would answer a
+    // question no reader has asked. It belongs where the decision is made, which is here.
     const parts = msByHour(from, to);
     const uses = Math.max(0, Math.floor(box.uses ?? 0) - (had?.uses ?? 0));
     if (!parts.length && !uses) continue;

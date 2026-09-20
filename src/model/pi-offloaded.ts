@@ -40,9 +40,9 @@ export interface OffloadPort {
    * comes back here was read out of storage by whoever answered the queue, and
    * a cancelled request simply has no answer to read.
    *
-   * Stated in the type rather than handled in a branch. @Vera established the
-   * unreachability from the records (task #1, 2026-09-12) and the choice is
-   * hers: a branch for it would assert that the value can arrive, which is
+   * Stated in the type rather than handled in a branch. The unreachability was
+   * established from the records (task #1, 2026-09-12), and the choice follows
+   * from it: a branch for it would assert that the value can arrive, which is
    * false, and would then be dead code that looks like caution. Narrowing
    * instead means a port that ever tries to return one does not compile — the
    * claim is checked at the boundary where it is made, not read out of a
@@ -106,8 +106,8 @@ function deferredMessage(model: Model<any>, handle: DeferredHandle): Answered {
  * `done` event below be checked instead of trusted: `reason` is the message's
  * own stop reason, and `aborted` is not a reason anything on this path can
  * report — it describes a stream that was cancelled while running, which by
- * definition is not this one (@Rex: the port side alone left these two lines
- * living on "upstream would not do that").
+ * definition is not this one: the port side alone left these two lines living
+ * on "upstream would not do that".
  */
 function settled(message: Answered): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
