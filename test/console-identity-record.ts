@@ -116,7 +116,11 @@ await check("the page joins on the producer's key, not on a name a test wrote do
  * two anonymous states want opposite actions from opposite people.
  */
 const ACTION: Record<string, { page: RegExp; note: RegExp }> = {
-  none: { page: /attaches an account/, note: /attach one/ },
+  // The page pattern matches the ACTION, not this page's phrasing of it: a
+  // pattern tied to today's wording would fail on a verbatim copy of the
+  // plugin's sentence, and the copy check below — the one written for that
+  // case — would never be reached to say so.
+  none: { page: /attach/, note: /attach one/ },
   "unreadable:agent": { page: /has to write it again/, note: /has to write it again/ },
   "unreadable:operator": { page: /whoever deploys/, note: /whoever deploys/ },
 };
