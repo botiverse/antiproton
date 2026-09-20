@@ -69,7 +69,9 @@ carries_secret() {
 # because a driver on a tree that was never merged leaves no trace in the
 # bytes: every figure in such a record looks ordinary (Vera, 2026-09-19).
 #
-# Three exits, because two of the refusals are different mistakes with
+# Five exits over two verdicts — publish (nothing to check, or one history) and
+# do-not-publish (a lone field, an absent object, two unrelated trees) —
+# because the refusals are different mistakes with
 # different repairs — and a check with two exits reports the wrong one: when a
 # commit is simply absent from the checkout, "is it an ancestor" fails in both
 # directions, which reads as "these two are unrelated" while the truth is "I
@@ -99,16 +101,29 @@ one_history() {
   fi
   build=${out%% *}; driver=${out##* }
   if [ -z "$build" ] && [ -z "$driver" ]; then return 0; fi
-  # Half a claim. No runner writes this — both fields come from the same place
-  # in each of them — and it appears 0 times in all 24 JSON records on the
-  # manifest (19 carry both, 5 carry neither; Vera and cody counted the whole
-  # manifest separately, 2026-09-19, after each of us first counted a smaller
-  # set we had to hand).
+  # Half a claim, and it STOPS. What is left undecided is only WHICH of the two
+  # refusals it would be — never whether to publish it.
   #
-  # So which refusal it belongs to is undecided on purpose. It is not "fetch
-  # it": nothing is missing here that fetching would bring. It is not "merge
-  # it" either: one absent field is no evidence about any tree. It stops, and
-  # the message says only what is true of it.
+  # The reason is a property of the shape, not a count: it is not "fetch it",
+  # because nothing here is missing that fetching would bring; and it is not
+  # "merge it" either, because one absent field is no evidence about any tree.
+  # Both known repairs are inapplicable, so the message says what is true of it
+  # and names no cure.
+  #
+  # That argument is what holds. The shape appears 0 times in the 24 JSON
+  # records on the manifest (19 carry both, 5 carry neither; Vera and cody
+  # counted the bucket separately, 2026-09-19 and 2026-09-20) — but a census is
+  # a fact about the past, and a runner written tomorrow could emit this shape
+  # by lunchtime (@Vera, 2026-09-20). The count says the branch is cold today;
+  # it does not say the branch is right.
+  #
+  # Which is the point of preferring the argument, and not only a matter of
+  # taste: the two REPAIRS DIFFER. A refusal resting on a count expires the
+  # moment a twenty-fifth record has the shape — and somebody would then have
+  # to notice and update it. A refusal resting on the argument does not expire
+  # when new data arrives, because nothing about it was a claim over the data
+  # (@Vera). So if you are here to update the count, you are editing context,
+  # not the reason.
   if [ -z "$build" ] || [ -z "$driver" ]; then
     echo "$f names only one of build/driver ('$out'), and a lone commit cannot be checked against anything" >&2
     return 2
