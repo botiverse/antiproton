@@ -21,6 +21,18 @@
  * This file is not in its own scope, because the defect appears here as a
  * fixture and would red the suite that quotes it. The cost is real: the three
  * names in this docblock are the ones nothing checks.
+ *
+ * **Adding a role is not the only repair, and often not the best one** (@Nova,
+ * who is named at both defect sites and argued the opposite direction in
+ * #plugins:770a1824): a check that only knows "bare" will push everyone toward
+ * inventing a role, which keeps a name that should have gone. The question this
+ * suite CANNOT ask is @Nova's — *what can a reader do with this name?* If it
+ * points at something checkable (a thread, a reproducible observation) the role
+ * is the other half of "where to look"; if it only records who thought of it,
+ * **delete the name and keep the reason** — `git blame` remembers people,
+ * comments should remember reasons. `#433` and `ac3fadd` were both repaired that
+ * way. So the third case below asserts that the no-name repair PASSES, rather
+ * than leaving it as advice in a comment nothing enforces.
  */
 import { readFileSync, readdirSync } from "node:fs";
 
@@ -69,7 +81,11 @@ function check(name: string, fn: () => void) {
 check("no attribution in this lane is a bare name", () => {
   const bare = FILES.flatMap((f) => bareIn(f, readFileSync(f, "utf8")));
   if (bare.length > 0) {
-    throw new Error(`a name with no role, so a reader cannot check it against the thread:\n      ${bare.join("\n      ")}`);
+    throw new Error(
+      `a name with no role, so a reader cannot check it against the thread — repair it EITHER way:\n` +
+      `      say what the person contributed, or delete the name and keep the reason (@Nova: git blame remembers people)\n      ` +
+      bare.join("\n      "),
+    );
   }
 });
 
@@ -104,6 +120,16 @@ check("the pattern reddens on the defect and passes its repair", () => {
   // ask everyone to explain what `@link` contributed.
   if (bareIn("x", " * the state a mount is in ({@link credentialState}).").length !== 0) {
     throw new Error("read a JSDoc tag as an attribution");
+  }
+});
+
+check("deleting the name is a repair too, not only naming the role", () => {
+  // @Nova's point, asserted rather than described: the cheapest correct form is
+  // often the reason with no name at all, and a suite that only knew "bare" would
+  // push people to invent a role instead — keeping a name that should have gone.
+  const noName = " * which is one rewording away from silently showing the wrong identity.";
+  if (bareIn("x", noName).length !== 0) {
+    throw new Error("the no-name repair does not pass, so this suite demands a name where none is needed");
   }
 });
 
