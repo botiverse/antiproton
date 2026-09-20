@@ -145,14 +145,21 @@ credential today, but its `allowedHosts` setting is already marked
 `requiredWithCredential` for the day it does.
 
 **Say which identity a call was made with.** `ctx.credential` being null has
-two causes that want opposite actions from a person: the mount names no
-credential, or it names one whose secret could not be read. They arrive as the
-same null, so a plugin that writes "this mount has no account" into a failure
-states a guess as a fact — and sends someone to attach an account to a mount
-that already has one. Read `credentialState(ctx)` instead, which is
-`credential` together with `credentialNamed`, and put `identityNote(ctx)` in the
-message: one wording per state, each ending in the action it implies, and
-`unreported` (a caller that did not say) names both rather than picking one.
+several causes, and different people fix them: the mount names no credential,
+so its owner attaches an account; it names `agent:<name>` and that row is gone,
+so whoever holds that credential writes it again; it names `operator:` or
+`env:` and this deployment does not hold it, so whoever deploys configures it.
+They arrive as the same null, so a plugin that writes "this mount has no
+account" into a failure states a guess as a fact, and the advice that follows
+the guess sends the wrong person. Read `credentialState(ctx)`, which is
+`credential` together with `credentialRefKind`, and put `identityNote(ctx)` in
+the message: one wording per state, each ending in the action it implies, and
+`unreported` (a caller that did not say) names the possibilities rather than
+picking one. The kind is *whose* credential, never which one and never its
+value — a reference has structure, and `src/store/refs.ts` exists because raw
+references named the bucket, the tenant and the agent in every result that
+carried one.
+
 Say it when a credential *did* arrive, too. A failure that does not record the
 identity behind it can only be attributed later by reading the source of the
 build that produced the message — which in the reading that prompted this meant

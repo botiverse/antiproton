@@ -20,7 +20,8 @@ import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
-import { credentialForm, originProblem } from "../src/plugins/types.ts";
+import { credentialForm, originProblem, credentialState, identityNote, type CredentialRefKind } from "../src/plugins/types.ts";
+import { secretRefKind } from "../src/runtime/secrets.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -2279,6 +2280,41 @@ await check("an origin the mount accepted is one a plugin can call: every path s
       if (!url.href.startsWith(`${origin}/`)) throw new Error(`${path} on ${v} became ${url.href}`);
     }
   }
+});
+
+/**
+ * The contract declares the kinds of credential reference a plugin may be told
+ * about; the runtime computes them. Two lists, one fact — so this fails if
+ * either side grows a kind the other does not have, rather than a plugin
+ * silently falling into its "not one I know" branch for a real kind.
+ */
+await check("every kind the runtime can report is one the contract declares, and no more", () => {
+  const declared: CredentialRefKind[] = ["none", "agent", "operator", "env", "other"];
+  const refs = [null, undefined, "", "agent:gh", "operator:run9", "env:GITHUB_TOKEN", "something-else"];
+  const produced = new Set(refs.map((r) => secretRefKind(r as any)));
+  for (const kind of produced) {
+    if (!declared.includes(kind as CredentialRefKind)) throw new Error(`the runtime reports ${kind}, which the contract does not declare`);
+  }
+  for (const kind of declared) {
+    if (!produced.has(kind as any)) throw new Error(`the contract declares ${kind}, which no reference in this list produces`);
+  }
+});
+
+await check("a null credential is a different state, and a different sentence, per kind", () => {
+  const base = { alias: "gh", credential: null };
+  const states = new Map<string, string>();
+  for (const kind of ["none", "agent", "operator", "env", "other"] as CredentialRefKind[]) {
+    const ctx = { ...base, credentialRefKind: kind };
+    states.set(kind, `${credentialState(ctx)}|${identityNote(ctx)}`);
+  }
+  // Not reported is its own state: it must not collapse into either answer.
+  const unreported = `${credentialState(base)}|${identityNote(base)}`;
+  if ([...states.values()].includes(unreported)) throw new Error("an unreported kind answers as one of the known ones");
+  if (states.get("none") === states.get("agent")) throw new Error("a mount with no account reads like one whose credential cannot be read");
+  // Who fixes it differs, so the two unreadable families must not share a
+  // sentence; the ones fixed by the same person may.
+  if (states.get("agent") === states.get("operator")) throw new Error("an agent credential and a deployment one send the same person");
+  if (states.get("operator") !== states.get("env")) throw new Error("two deployment-held kinds give two answers for one action");
 });
 
 await check("format is declared only on string settings", () => {

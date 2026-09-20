@@ -19,14 +19,15 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 
 /** A context with no credential, and a fetch that fails if anything calls out.
- *  `credentialNamed` is what the gateway reports about the mount: absent means
- *  it did not say, which is a third state and not a synonym for false. */
-function ctx(credential: string | null, credentialNamed?: boolean) {
+ *  `credentialRefKind` is what the gateway reports about the mount: absent
+ *  means it did not say, which is a state of its own and not a synonym for
+ *  "no credential is named". */
+function ctx(credential: string | null, credentialRefKind?: string) {
   return {
     caller: { tenantId: "t", agentId: "a", taskId: "k" },
     alias: "gh",
     credential,
-    credentialNamed,
+    credentialRefKind,
     publicConfig: {},
     fetch: () => { throw new Error("auth_status reached the network"); },
   } as any;
@@ -42,7 +43,7 @@ await check("it says who can change it, since the agent cannot", async () => {
   // The next move is a person's: an agent cannot attach a credential itself,
   // so a refusal it could act on does not exist — the truthful answer names
   // who can.
-  const r = await githubPlugin.invoke("auth_status", {}, ctx(null, false)) as Record<string, unknown>;
+  const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "none")) as Record<string, unknown>;
   const note = String(r.note ?? "");
   if (!/a person/.test(note) || !/attach/.test(note)) {
     throw new Error(`the state does not say who attaches an account: ${note}`);
@@ -62,16 +63,16 @@ await check("it says who can change it, since the agent cannot", async () => {
  * one (Vera, cody and Piper, 2026-09-20).
  */
 await check("a credential that cannot be read is a different state, with a different action", async () => {
-  const r = await githubPlugin.invoke("auth_status", {}, ctx(null, true)) as Record<string, unknown>;
+  const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "agent")) as Record<string, unknown>;
   const note = String(r.note ?? "");
   if (r.credential !== "unreadable") throw new Error(`reported the state as ${JSON.stringify(r.credential)}`);
-  if (!/written again/.test(note)) throw new Error(`does not say the credential has to be rewritten: ${note}`);
+  if (!/write it again/.test(note)) throw new Error(`does not say the credential has to be rewritten: ${note}`);
   if (/attach one/.test(note)) throw new Error(`sends a person to attach a second account: ${note}`);
 });
 
 await check("the two states do not answer with one wording", async () => {
-  const none = String((await githubPlugin.invoke("auth_status", {}, ctx(null, false)) as any).note);
-  const unreadable = String((await githubPlugin.invoke("auth_status", {}, ctx(null, true)) as any).note);
+  const none = String((await githubPlugin.invoke("auth_status", {}, ctx(null, "none")) as any).note);
+  const unreadable = String((await githubPlugin.invoke("auth_status", {}, ctx(null, "agent")) as any).note);
   if (none === unreadable) throw new Error(`one wording for both states: ${none}`);
 });
 

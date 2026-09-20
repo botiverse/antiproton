@@ -618,11 +618,13 @@ export const githubPlugin: Plugin = {
         if (!ctx.credential) {
           // The two anonymous states want opposite actions from a person, and
           // this is the tool whose whole subject is which one holds.
-          const state = credentialState(ctx);
           return {
             authenticated: false,
             account: null,
-            credential: state,
+            credential: credentialState(ctx),
+            // Which kind, so a page can say who fixes it without parsing the
+            // sentence; never which credential, and never its value.
+            credentialRef: ctx.credentialRefKind ?? null,
             note: `${identityNote(ctx)}; public data is still readable`,
           };
         }

@@ -32,22 +32,33 @@ export interface PluginContext {
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
   /**
-   * Whether this mount names a credential at all — which is a different
-   * question from whether one arrived, and the only way a plugin can tell its
-   * two reasons for `credential: null` apart.
+   * What kind of credential this mount names — never which one, and never its
+   * value. `"none"` means it names none.
    *
-   * A mount whose `secret_ref` cannot be read resolves to null exactly like a
-   * mount that names nothing: `agentSecrets` answers a missing row with
-   * `return null` (src/runtime/secrets.ts), and the gateway hands that on. So a
-   * plugin holding only `credential` and saying "this mount has no account"
-   * states something false half the time, and sends the person to attach a
-   * token that is already attached — when the action that fixes it is writing
-   * the mount's secret again. Read it through `credentialState`.
+   * The reason a plugin needs it: `credential` is null for several different
+   * reasons, and they are fixed by different people. The mount names nothing,
+   * so its owner attaches an account. It names `agent:<name>` and that row is
+   * gone (`agentSecrets` answers a missing row with `return null`), so whoever
+   * holds that credential writes it again. It names `operator:` or `env:` and
+   * this deployment does not hold it, so whoever deploys configures it — which
+   * is the state of every operator-referencing mount on a preview Worker today.
+   * All three arrive as the same null, so a plugin holding only `credential`
+   * that says "this mount has no account" is guessing, and the advice that
+   * follows the guess sends the wrong person to fix it (Vera and cody, both
+   * reading this, 2026-09-20).
+   *
+   * The kind rather than the reference, because the reference is a name with
+   * structure: `src/store/refs.ts` exists because raw references named the
+   * bucket, the tenant and the agent in every result that carried one. A plugin
+   * writes its state into messages a model reads, so it is handed the one part
+   * that changes what to do and nothing that identifies where the agent lives.
+   * `secretRefKind` in `src/runtime/secrets.ts` computes it and inspects only
+   * the prefix; `test/mount-config.ts` pins the two lists together.
    *
    * Optional because absent has to keep meaning "not reported": a caller that
    * does not supply it must not be read as saying no credential is named.
    */
-  credentialNamed?: boolean;
+  credentialRefKind?: CredentialRefKind;
   publicConfig: Record<string, Json>;
   /** Survives across calls and across executions; never reaches the model. */
   connection: ConnectionState;
@@ -80,9 +91,9 @@ export interface PluginContext {
    */
   sibling(alias: string): Promise<{
     credential: string | null;
-    /** As on this mount: whether that mount names a credential, so a null one
-     *  can be reported as unreadable rather than absent. */
-    credentialNamed?: boolean;
+    /** As on this mount: what kind of credential that mount names, so a null
+     *  one can be reported as unreadable rather than absent. */
+    credentialRefKind?: CredentialRefKind;
     connection: ConnectionState;
     /**
      * Which plugin that mount is. A credential is only meaningful to the service
@@ -122,12 +133,19 @@ export interface PluginContext {
  */
 export type CredentialState = "attached" | "none" | "unreadable" | "unreported";
 
+/**
+ * Whose credential a reference names, never which one. The same five values
+ * `secretRefKind` returns, declared here because the contract cannot depend on
+ * the runtime that fills it; `test/mount-config.ts` fails if the two drift.
+ */
+export type CredentialRefKind = "none" | "agent" | "operator" | "env" | "other";
+
 export function credentialState(
-  ctx: Pick<PluginContext, "credential" | "credentialNamed">,
+  ctx: Pick<PluginContext, "credential" | "credentialRefKind">,
 ): CredentialState {
   if (ctx.credential) return "attached";
-  if (ctx.credentialNamed === undefined) return "unreported";
-  return ctx.credentialNamed ? "unreadable" : "none";
+  if (ctx.credentialRefKind === undefined) return "unreported";
+  return ctx.credentialRefKind === "none" ? "none" : "unreadable";
 }
 
 /**
@@ -141,7 +159,7 @@ export function credentialState(
  * implies, and `none` and `unreadable` imply opposite ones — attach an account,
  * versus write the credential of the account already attached.
  */
-export function identityNote(ctx: Pick<PluginContext, "credential" | "credentialNamed" | "alias">): string {
+export function identityNote(ctx: Pick<PluginContext, "credential" | "credentialRefKind" | "alias">): string {
   const mount = `the \`${ctx.alias}\` mount`;
   switch (credentialState(ctx)) {
     case "attached":
@@ -151,8 +169,14 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
     case "none":
       return `${mount} has no account attached, and a person can attach one`;
     case "unreadable":
-      return `${mount} names an account whose credential could not be read, so that credential has to be` +
-        ` written again rather than another account attached`;
+      // Nothing is missing from the mount here, so "attach an account" is the
+      // one piece of advice that must not appear. Who to send instead depends
+      // on whose credential it is, which is what the kind says.
+      return ctx.credentialRefKind === "operator" || ctx.credentialRefKind === "env"
+        ? `${mount} names a credential this deployment holds for everyone, and this deployment does not` +
+          ` have it, so whoever deploys has to configure it there; attaching an account to the mount cannot`
+        : `${mount} names an account whose credential could not be read, so whoever holds that credential` +
+          ` has to write it again rather than another account being attached`;
     case "unreported":
       // Says both, and still names an action: a state nobody reported is not a
       // reason to leave the reader with nothing to do.
