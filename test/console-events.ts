@@ -9,7 +9,7 @@
  * These checks hold the pairing, the durations, the statuses, and that the
  * raw records are still there underneath.
  */
-import { eventList } from "../cf/src/ui.ts";
+import { eventList, trajectory } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -88,6 +88,89 @@ check("the raw records are still there, closed, and the empty state still reads"
   must(/<details class="raw"><summary>raw records · 11<\/summary>/.test(html), "raw section with the count");
   must(count(html, /<div class="ev">/g) === 11, "one raw row per record");
   must(eventList([]) === `<div class="empty">no events</div>`, "empty state");
+});
+
+/**
+ * The identity a failed call was made with, drawn on that call.
+ *
+ * It arrives on `operation.completed` rather than on the result, because the
+ * tool's envelope is a string by the time the transcript sees it. The two
+ * events share `callId` and nothing else, so these checks hold the join, the
+ * three states worth a badge, the one that is deliberately not drawn, and that
+ * the page never matches the plugin's wording.
+ */
+const anon = (callId: string, identity: string, credentialRef?: string) =>
+  ev(30, "operation.completed", 22500, { operationId: "op_x", status: "failed", resultRef: null, callId, identity, ...(credentialRef ? { credentialRef } : {}) });
+const withIdentity = (identity: string, credentialRef?: string) =>
+  eventList([...events, anon("call_c", identity, credentialRef)]);
+const rowOf = (h: string, id: string) => {
+  const from = h.indexOf(`id="call-${id}"`);
+  if (from < 0) throw new Error(`no row for ${id}`);
+  const next = h.indexOf('<div class="call ', from);
+  return h.slice(from, next < 0 ? h.length : next);
+};
+
+check("an anonymous failure says so on the call, and the title says who can fix it", () => {
+  const none = rowOf(withIdentity("none"), "call_c");
+  must(/<span class="badge" title="[^"]*attaches an account[^"]*">anonymous · no account<\/span>/.test(none),
+    `the badge names the state and the action: ${none.slice(0, 400)}`);
+
+  const deployed = rowOf(withIdentity("unreadable", "operator"), "call_c");
+  must(/>anonymous · credential unreadable</.test(deployed), "a credential that did not arrive is not a missing account");
+  must(/title="[^"]*whoever deploys[^"]*will not help[^"]*"/.test(deployed),
+    "an operator credential sends the reader to whoever deploys, and rules out the wrong fix");
+
+  const mine = rowOf(withIdentity("unreadable", "agent"), "call_c");
+  must(/title="[^"]*write it again[^"]*"/.test(mine), "an agent credential sends the reader to whoever holds it");
+  must(!/attaches an account/.test(mine), "and never says attach, which is the one action that cannot help here");
+});
+
+check("a call that did use an account says that too, without a warning", () => {
+  const row = rowOf(withIdentity("attached"), "call_c");
+  must(/<span class="badge" title="[^"]*was used[^"]*">account used<\/span>/.test(row), "plain badge: this is not a misconfiguration");
+  must(!/badge warn[^>]*>account used/.test(row), "an account that was used is not a warning");
+  must(!/badge warn[^>]*>anonymous/.test(withIdentity("none")), "nor is the identity itself an alarm: the status badge already carries that");
+});
+
+check("nothing reported draws nothing, and a trace with no identity is untouched", () => {
+  must(!/account used|anonymous ·/.test(withIdentity("unreported")),
+    "`unreported` means nobody said; a badge would claim the page found out");
+  must(!/account used|anonymous ·/.test(html), "a trace whose records carry no identity gains nothing");
+  must(!/account used|anonymous ·/.test(eventList([...events, ev(31, "operation.completed", 22500, { operationId: "op_x", status: "failed", resultRef: null, identity: "none" })])),
+    "an identity with no callId cannot be tied to a call, so it is not drawn on one");
+});
+
+check("one call id can cover several operations, so a badge needs them to agree", () => {
+  // A `run_js` script's host calls are all recorded under the id of the one
+  // tool call the model issued, and they can hit different mounts. An identity
+  // belongs to a mount, so one row may only claim one when they all say it.
+  const two = (a: any, b: any) => eventList([...events,
+    { sequence: 30, kind: "operation.completed", payload: { operationId: "op_1", status: "failed", resultRef: null, callId: "call_c", ...a }, createdAt: T + 22500 },
+    { sequence: 31, kind: "operation.completed", payload: { operationId: "op_2", status: "failed", resultRef: null, callId: "call_c", ...b }, createdAt: T + 22600 }]);
+
+  const agree = rowOf(two({ identity: "none" }, { identity: "none" }), "call_c");
+  must(/>anonymous · no account</.test(agree), "two operations saying the same thing is still one fact");
+  must(count(agree, /anonymous · no account/g) === 1, "and it is said once, not once per operation");
+
+  must(!/account used|anonymous ·/.test(two({ identity: "none" }, { identity: "attached" })),
+    "two mounts disagreeing is not something one badge can say truthfully");
+  must(!/account used|anonymous ·/.test(two({ identity: "unreadable", credentialRef: "agent" }, { identity: "unreadable", credentialRef: "operator" })),
+    "same state, different people to fix it: the badge would send half the readers to the wrong one");
+  must(!/account used|anonymous ·/.test(two({ identity: "none" }, { identity: "attached" }, )),
+    "and the last one to arrive does not win");
+  must(!/account used|anonymous ·/.test(eventList([...events,
+    { sequence: 30, kind: "operation.completed", payload: { operationId: "op_1", status: "failed", resultRef: null, callId: "call_c", identity: "none" }, createdAt: T + 22500 },
+    { sequence: 31, kind: "operation.completed", payload: { operationId: "op_2", status: "failed", resultRef: null, callId: "call_c", identity: "attached" }, createdAt: T + 22600 },
+    { sequence: 32, kind: "operation.completed", payload: { operationId: "op_3", status: "failed", resultRef: null, callId: "call_c", identity: "none" }, createdAt: T + 22700 }])),
+    "a third operation agreeing with the first does not revive a claim the second broke");
+});
+
+check("the identity is keyed on the call, not on the wording or the order", () => {
+  const other = rowOf(withIdentity("none"), "call_a");
+  must(!/account used|anonymous ·/.test(other), "the badge lands on the call the record names, not on its neighbours");
+  const t = trajectory([...events, anon("call_c", "none")], {});
+  must(/>anonymous · no account</.test(t), "the transcript view draws it too, where a person watches a run");
+  must(!/operation\.completed/.test(t), "and the completion itself is still not a step of its own");
 });
 
 const failed = results.filter((r) => !r.ok);
