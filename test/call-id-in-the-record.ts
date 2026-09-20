@@ -120,6 +120,28 @@ await check("absent stays absent in the builder, where a written `undefined` wou
     `the payload of a plain completion changed: ${JSON.stringify(Object.keys(bare))}`);
 });
 
+for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
+  await check(`what the builder made is what a reader gets back, key for key (${backend})`, async () => {
+    // The segment nobody was asking about (@Nova, 2026-09-20): my checks above read the STORE and the
+    // console's read the rendered list, so "written -> stored -> read back" was covered only field by
+    // field, for fields someone had thought to name. A store that dropped, renamed or reordered a key
+    // nobody asserted would pass all of them. So this compares the whole object against the builder's
+    // own output for the same inputs.
+    const { store } = await fixture(false, backend);
+    // Written directly, so the comparison is about the store and not about what the gateway chose to send.
+    await store.recordOperation({
+      operationId: "op_rt", tenantId: "t", agentId: "a", taskId: "k",
+      mountAlias: "svc", tool: "svc.go", toolVersion: "1.0.0",
+    });
+    const facts = { callId: "toolu_rt", identity: "unreadable", credentialRef: "agent" } as const;
+    await store.completeOperation("t", "op_rt", "failed", null, undefined, facts);
+    const [e] = await completed(store);
+    const want = completedPayload("op_rt", "failed", null, undefined, facts);
+    must(JSON.stringify(e.payload) === JSON.stringify(want),
+      `the row reads ${JSON.stringify(e.payload)}, the builder made ${JSON.stringify(want)}`);
+  });
+}
+
 console.log(`\n  the call the operation served\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
