@@ -57,7 +57,7 @@ esac
 NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
 run_suite() {  # name, command...
   local name="$1"; shift
-  printf "%-22s" "$name"
+  suite_name "$name"
   local out n
   if ! out=$("$@" 2>&1); then echo FAIL; exit 1; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
@@ -66,7 +66,7 @@ run_suite() {  # name, command...
 }
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
-  case "$NEEDS_SERVICE" in *" $t "*) printf "%-22sskipped (needs a live service)\n" "$t"; continue;; esac
+  case "$NEEDS_SERVICE" in *" $t "*) suite_name "$t"; echo "skipped (needs a live service)"; continue;; esac
   run_suite "$t" node "$f"
 done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).
@@ -84,6 +84,11 @@ run_suite control-plane-d1 bash test/control-plane-d1.sh
 tc=$(npm run typecheck 2>&1 | tail -1) || true
 echo "$tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
+# Which tree is about to become production, in the log that records the deploy.
+# The same reason as the branch gate's (cf/scripts/suite-verdict.sh): the green
+# above is a fact about one tree, and a deploy log that does not name it cannot
+# later answer "what was actually verified before this went out".
+gate_provenance
 echo "--- all green; deploying ---"
 set -a; . ~/.secrets/antiproton.env; set +a
 bash cf/scripts/deploy.sh "$@"

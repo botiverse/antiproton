@@ -39,3 +39,51 @@ suite_removals() {
     echo "suite removed: $name (it is in $where; name it in test/removed-suites.txt if that was meant)"
   done < "$previous"
 }
+
+# gate_provenance: prints the commit and tree the working copy is at, so the
+# numbers a gate prints carry the name of the thing they are about.
+#
+# Every verdict a gate produces is a fact about ONE TREE, and until now none of
+# them said which. That name then had to come from whoever copied the output
+# into a PR or a message — from memory, minutes later, while the branch moved
+# under them. On 2026-09-20 that cost two wrong readings in one afternoon: a
+# gate was posted for a PR whose head had already advanced twice while the run
+# was going (@Vera's diagnosis: not a discipline problem, the artifact never
+# says).
+#
+# The TREE, not only the commit, because after a squash merge no commit in
+# master is the reviewed one — its SHA covers the message, the author and the
+# parents as well as the content. "Is what I gated what landed" is a question
+# about content, and only the tree answers it.
+#
+# A dirty worktree is NAMED rather than given a hash. What actually ran is a
+# tree git has never stored, so any hash printed for it would denote something
+# else; and one could be synthesised through a temporary index, but then the
+# line's accuracy would rest on .gitignore and on staging rules, which is more
+# to get wrong than the case is worth. Saying "this run cannot be referred to
+# again" is the whole content of the warning.
+gate_provenance() {
+  local sha tree
+  sha=$(git rev-parse --verify --quiet HEAD) || { echo "gate: not a git worktree"; return; }
+  tree=$(git rev-parse --verify --quiet "HEAD^{tree}")
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    echo "gate: $sha + UNCOMMITTED CHANGES (so this run is of no stored tree; HEAD's is $tree)"
+  else
+    echo "gate: $sha (tree $tree)"
+  fi
+}
+
+# suite_name: the name column of a gate's output line.
+#
+# `printf "%-22s"` PADS but does not TRUNCATE, so a name of 22 characters or
+# more filled the field exactly and the verdict was printed hard against it:
+# `identity-in-the-recordok (5)`. Five suites are that long today, all of them
+# recent, so the lines had silently stopped being parseable — and @Vera, re-
+# running the gate after my pkill, nearly reported "the gate is missing four
+# suites" from `grep "^<name> "` finding nothing. A false accusation, produced
+# by a formatting choice.
+#
+# The trailing space is OUTSIDE the field width, so it cannot be eaten by a
+# long name: every line has at least one space between the two, whatever
+# anybody names a suite next.
+suite_name() { printf "%-22s " "$1"; }

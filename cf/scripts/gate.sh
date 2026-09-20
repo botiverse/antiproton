@@ -17,7 +17,10 @@
 #      non-zero exactly when it has something to say, and a broken program
 #      boundary prints deliberately WITHOUT ", 0 new" because the counts above
 #      it then mean nothing. So the line is captured, printed, and tested.
-#   4. The result leaves through the EXIT CODE. A gate that prints FAILS=2 and
+#   4. Every line above is a fact about ONE TREE, so the run says which
+#      (`gate_provenance`), first and last. A verdict copied into a PR without
+#      it is a claim whose subject the reader has to supply from memory.
+#   5. The result leaves through the EXIT CODE. A gate that prints FAILS=2 and
 #      exits 0 is, to anything that calls it, a gate that passed.
 #
 # ONE DIFFERENCE from the deploy gate, and it is deliberate: that one compares
@@ -35,6 +38,10 @@ NEEDS_SERVICE=" appworld live-e2e live-github "
 
 fails=0
 
+# Said before the suites and again beside the verdict: the header scrolls past
+# in a long run, and the tail is what gets copied.
+gate_provenance
+
 # (2) The removal guard. A base that cannot be resolved is refused rather than
 # skipped: a guard that quietly does not run is the thing this whole script is
 # about. `origin/master` is a local ref — no network, and no production read.
@@ -51,7 +58,7 @@ rm -f "$in_base"
 if [ -n "$removed" ]; then echo "$removed"; fails=$((fails+1)); fi
 
 run_suite() {
-  local name="$1"; shift; printf "%-22s" "$name"; local out n
+  local name="$1"; shift; suite_name "$name"; local out n
   if ! out=$("$@" 2>&1); then echo FAIL; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing)"; fails=$((fails+1)); return; fi
@@ -60,7 +67,7 @@ run_suite() {
 
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
-  case "$NEEDS_SERVICE" in *" $t "*) printf "%-22sskipped (needs a live service)\n" "$t"; continue;; esac
+  case "$NEEDS_SERVICE" in *" $t "*) suite_name "$t"; echo "skipped (needs a live service)"; continue;; esac
   run_suite "$t" node "$f"
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
@@ -72,5 +79,6 @@ tc=$(npm run typecheck 2>&1 | tail -1) || true
 echo "typecheck: $tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: NOT CLEAN"; fails=$((fails+1));; esac
 
+gate_provenance
 echo "FAILS=$fails"
 [ "$fails" -eq 0 ]
