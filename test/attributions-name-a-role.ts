@@ -183,6 +183,47 @@ check("every `.ts` in a scanned directory is actually scanned", () => {
   }
 });
 
+/** A commit cited in a comment, as `` `<sha>` ``. */
+const CITED_SHA = /`([0-9a-f]{7,40})`/g;
+
+check("every commit a comment cites is reachable from this history", () => {
+  // @Nova's second step, as an assertion rather than a command someone remembers
+  // to run: `git cat-file -e` says the object is in THIS clone, which is a
+  // reading about the machine. A commit that lives only on a branch passes it —
+  // and after a squash merge and a branch delete, nothing references it, so it
+  // is gone here and never existed in a fresh clone. Reachability from HEAD is
+  // what makes the address open for the next reader rather than for me.
+  const bad: string[] = [];
+  for (const f of FILES) {
+    readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+      if (!COMMENT.test(line)) return;
+      for (const m of line.matchAll(CITED_SHA)) {
+        const sha = m[1]!;
+        try {
+          execFileSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { stdio: "ignore" });
+        } catch {
+          bad.push(`${f}:${i + 1} — \`${sha}\` is not reachable from HEAD, so it opens for whoever wrote it and nobody else`);
+        }
+      }
+    });
+  }
+  if (bad.length > 0) throw new Error(`a dead address is worse than none:\n      ${bad.join("\n      ")}`);
+});
+
+check("the reachability check reddens on a commit that exists but is unreachable", () => {
+  // The two states have to be told apart, or the case above would pass anything
+  // this clone happens to hold. `commit-tree` makes exactly that object: a real
+  // commit, referenced by nothing.
+  const dangling = execFileSync("git", ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "control"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["cat-file", "-e", `${dangling}^{commit}`]); // it exists…
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", dangling, "HEAD"], { stdio: "ignore" });
+  } catch {
+    return; // …and it is not reachable, which is what the case above catches.
+  }
+  throw new Error("a commit referenced by nothing was called reachable, so the check above cannot fail");
+});
+
 check("a handle in DATA is not an attribution", () => {
   // `test/raft-plugin.ts:325` is the case: "Release Bot (@raft-bot)" is a GitHub
   // account in a string literal, and it matches the bare shape exactly. Asking
