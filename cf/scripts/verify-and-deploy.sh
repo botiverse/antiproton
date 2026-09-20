@@ -49,7 +49,7 @@ case " $* " in
     # A file of its own: several trees may run this gate at once (Piper).
     in_production=$(mktemp)
     git ls-tree --name-only "$live" test/ | sed -n 's#^test/\(.*\)\.ts$#\1#p' > "$in_production"
-    problems=$(suite_removals "$in_production" test/removed-suites.txt $(for f in test/*.ts; do basename "$f" .ts; done))
+    problems=$(suite_removals "$in_production" test/removed-suites.txt "the commit production runs ($live)" $(for f in test/*.ts; do basename "$f" .ts; done))
     rm -f "$in_production"
     if [ -n "$problems" ]; then echo "$problems"; exit 1; fi
     ;;

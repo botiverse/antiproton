@@ -57,7 +57,7 @@ check("a suite production is guarded by and that has gone is refused, by name", 
   const dir = mkdtempSync(join(tmpdir(), "suites-"));
   const previous = join(dir, "previous.txt");
   writeFileSync(previous, "alpha\nbeta\n");
-  const problems = sh('suite_removals "$@"', "", previous, join(dir, "none.txt"), "alpha");
+  const problems = sh('suite_removals "$@"', "", previous, join(dir, "none.txt"), "the base", "alpha");
   if (!problems.includes("suite removed: beta")) throw new Error(`a removal went unnamed: ${JSON.stringify(problems)}`);
   if (problems.includes("alpha")) throw new Error("a suite still present was reported");
 });
@@ -68,7 +68,7 @@ check("a removal named in the acknowledged list passes", () => {
   const acknowledged = join(dir, "removed.txt");
   writeFileSync(previous, "alpha\nbeta\n");
   writeFileSync(acknowledged, "# why it went\nbeta\n");
-  const problems = sh('suite_removals "$@"', "", previous, acknowledged, "alpha");
+  const problems = sh('suite_removals "$@"', "", previous, acknowledged, "the base", "alpha");
   if (problems !== "") throw new Error(`an acknowledged removal was refused: ${problems}`);
 });
 
@@ -78,7 +78,7 @@ check("a new suite costs nothing: only disappearance is refused", () => {
   const dir = mkdtempSync(join(tmpdir(), "suites-"));
   const previous = join(dir, "previous.txt");
   writeFileSync(previous, "alpha\n");
-  const problems = sh('suite_removals "$@"', "", previous, join(dir, "none.txt"), "alpha", "gamma");
+  const problems = sh('suite_removals "$@"', "", previous, join(dir, "none.txt"), "the base", "alpha", "gamma");
   if (problems !== "") throw new Error(`a new suite was refused: ${problems}`);
 });
 

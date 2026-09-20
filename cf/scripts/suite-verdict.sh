@@ -22,16 +22,20 @@ suite_passed_count() {
   sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^[[:space:]]*[0-9]+(/[0-9]+)? passed' | tail -1 | grep -oE '[0-9]+' | head -1 || true
 }
 
-# suite_removals PREVIOUS_NAMES_FILE ACKNOWLEDGED_FILE CURRENT_NAMES...
+# suite_removals PREVIOUS_NAMES_FILE ACKNOWLEDGED_FILE WHERE CURRENT_NAMES...
 # prints one line per suite in PREVIOUS that is not in CURRENT and not
 # acknowledged, nothing otherwise. Blank lines and "#" comments are ignored.
+# WHERE names the commit PREVIOUS was read from, because the two callers
+# compare against different things — the deploy gate against what production
+# runs, the branch gate against the base it would merge into — and a message
+# that named only one of them was wrong wherever it was read by the other.
 suite_removals() {
-  local previous="$1" acknowledged="$2"; shift 2
+  local previous="$1" acknowledged="$2" where="$3"; shift 3
   local name
   while IFS= read -r name; do
     case "$name" in ""|\#*) continue;; esac
     case " $* " in *" $name "*) continue;; esac
     if [ -f "$acknowledged" ] && grep -v '^#' "$acknowledged" | grep -qxF "$name"; then continue; fi
-    echo "suite removed: $name (it guards what production runs now; name it in test/removed-suites.txt if that was meant)"
+    echo "suite removed: $name (it is in $where; name it in test/removed-suites.txt if that was meant)"
   done < "$previous"
 }
