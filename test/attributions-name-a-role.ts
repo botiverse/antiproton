@@ -54,8 +54,10 @@
  * way. So the third case below asserts that the no-name repair PASSES, rather
  * than leaving it as advice in a comment nothing enforces.
  */
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** JSDoc tags and the like: an `@` in a comment that is not a person. */
 const NOT_A_PERSON = /^@(link|param|returns?|see|example|throws|deprecated|type|typedef|template|module|name|default|ts-[a-z-]+)$/;
@@ -211,17 +213,37 @@ check("every commit a comment cites is reachable from this history", () => {
 });
 
 check("the reachability check reddens on a commit that exists but is unreachable", () => {
-  // The two states have to be told apart, or the case above would pass anything
-  // this clone happens to hold. `commit-tree` makes exactly that object: a real
-  // commit, referenced by nothing.
-  const dangling = execFileSync("git", ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "control"], { encoding: "utf8" }).trim();
-  execFileSync("git", ["cat-file", "-e", `${dangling}^{commit}`]); // it exists…
+  // The two states have to be told apart, or the case above would accept
+  // whatever this clone happens to hold.
+  //
+  // Built in a throwaway repository rather than here: the first version made the
+  // object with `commit-tree` in this one, which would leave a dangling commit
+  // in every clone the gate runs in — mine, @Vera's, and the one
+  // `verify-and-deploy.sh` uses before a deploy. @cody refused it for the reason
+  // that matters more than the bytes: `gate.sh` says "Both are git reads;
+  // neither touches production", and once running a check can change the thing
+  // it checks, even slightly, that property does not come back. The property
+  // needed is "SOME repository has such a commit", not this one.
+  const dir = mkdtempSync(join(tmpdir(), "reachability-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
   try {
-    execFileSync("git", ["merge-base", "--is-ancestor", dangling, "HEAD"], { stdio: "ignore" });
-  } catch {
-    return; // …and it is not reachable, which is what the case above catches.
+    git("init", "-q", ".");
+    git("commit", "-q", "--allow-empty", "-m", "base");
+    git("checkout", "-q", "-b", "gone");
+    git("commit", "-q", "--allow-empty", "-m", "orphan");
+    const orphan = git("rev-parse", "HEAD");
+    git("checkout", "-q", "-");
+    git("branch", "-qD", "gone"); // the branch is gone; the object is not
+    git("cat-file", "-e", `${orphan}^{commit}`); // …so it still exists
+    let reachable = true;
+    try { git("merge-base", "--is-ancestor", orphan, "HEAD"); } catch { reachable = false; }
+    if (reachable) {
+      throw new Error("a commit no ref points at was called reachable, so the case above cannot fail");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
-  throw new Error("a commit referenced by nothing was called reachable, so the check above cannot fail");
 });
 
 check("a handle in DATA is not an attribution", () => {
