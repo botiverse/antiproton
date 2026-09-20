@@ -174,7 +174,7 @@ async function pushForAnswer(taskId: string): Promise<string | null> {
 function oneSocket(taskId: string, deadline: number): Promise<string | null> {
   // The token goes on the upgrade too: /bench/* is gated (task #15), and a
   // refused upgrade reaches a WebSocket client only as close 1006 with no body,
-  // which this runner then scored as a stalled agent (Vera, 2026-09-14).
+  // which this runner then scored as a stalled agent.
   const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
     `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
   return new Promise<string | null>((resolve) => {
@@ -245,7 +245,7 @@ const seen = new Map<string, number>();
 /**
  * Which path brought each turn's answer, and how often each path was given
  * the chance. `poll: 0` alone cannot tell "no push was lost" from "the
- * fallback never ran" (Vera, 2026-09-17). `pollAnswered` and `pollFailed`
+ * fallback never ran". `pollAnswered` and `pollFailed`
  * count the fallback's polls that came back and that failed, so both zero
  * means none was sent; `dropped` counts sockets that closed or failed before
  * an answer.
@@ -280,7 +280,7 @@ async function runTask(task: any) {
   let agentSaid = "Hi! How can I help you today?";
   let turns = 0, simCalls = 0, ended = "max_turns";
   let stall: string | undefined;
-  // The values that cause was decided from, so a record can be re-decided rather than believed (Vera).
+  // The values that cause was decided from, so a record can be re-decided rather than believed.
   let stallWhy: StallEvidence | undefined;
 
   while (turns++ < 14) {

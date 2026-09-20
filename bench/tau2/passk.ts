@@ -115,7 +115,7 @@ export function passLines(rows: readonly TrialRow[], trials: number): string[] {
   // task's own share, and the two differ as soon as the counts do. A τ² run
   // gives every task the same trials, so they agree there and the agreement is
   // worth having as a cross-check — but the note has to say when it holds, or a
-  // short task in some later run makes the line a lie (Vera, 2026-09-18).
+  // short task in some later run makes the line a lie.
   const won = rows.filter((r) => r.reward).length;
   const perTask = new Set(byTask(rows).map((t) => t.length));
   out.push(`  trials  = ${won}/${rows.length} = ${pct(rows.length ? won / rows.length : 0)}` +

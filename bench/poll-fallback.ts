@@ -1,5 +1,5 @@
 /**
- * A missed push must not become a stall (Vera, 2026-09-15).
+ * A missed push must not become a stall.
  *
  * The runners wait for a turn's answer on the object's event socket. In one trial of an 8x3 τ² run the
  * agent answered 19 seconds into the turn and the runner never received that push: it waited out its
@@ -28,7 +28,7 @@ export type PollDecision =
 export type Poll = Partial<BenchPollBody>;
 
 /**
- * What the criterion below reads, and the only thing it reads (Vera, 2026-09-19).
+ * What the criterion below reads, and the only thing it reads.
  *
  * A stalled row used to record its cause and nothing else, so the question "was this really an idle agent, or
  * a model call that failed inside the runner's blind window?" could not be answered from a record at all —
@@ -91,7 +91,7 @@ export function decideFromPoll(poll: Poll, seenSeq: number): PollDecision {
 }
 
 /**
- * Why a turn that ran out of time had no answer, read from one last poll at the deadline (Vera, 2026-09-16).
+ * Why a turn that ran out of time had no answer, read from one last poll at the deadline.
  *
  * `agent_stalled` alone cannot tell an agent that stopped from a delivery that failed twice, and the record is
  * all a later reader has. So the runner asks once more and names what the object says:
