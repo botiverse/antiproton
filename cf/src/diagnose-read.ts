@@ -28,6 +28,9 @@ export interface DiagnosisStore {
   listState(tenantId: string, agentId: string, prefix?: string, limit?: number): Promise<Array<{ key: string }>>;
   getState(tenantId: string, agentId: string, key: string): Promise<{ value: unknown; ref: string | null } | null>;
   stateUsage(tenantId: string, agentId: string): Promise<{ keys: number; bytes: number }>;
+  /** Times and state of one stored secret, never its value (src/core/store.ts). */
+  secretMeta(tenantId: string, agentId: string, name: string): Promise<
+    { account: string | null; verified: boolean; createdAt: number; updatedAt: number; lastUsedAt: number | null } | null>;
 }
 
 export interface DiagnosisDeps {
@@ -78,6 +81,21 @@ async function mountReports(
 }
 
 /** Null when the object holds no such agent, or the agent no such conversation. Writes nothing. */
+/**
+ * A mount's credential in time: first attached, last replaced, last used, and whether the check that runs
+ * at attach said it worked. Nothing that identifies the credential or its holder.
+ */
+async function secretTimes(
+  sql: Sql, store: DiagnosisStore, tenantId: string, agentId: string, ref: string | null, alias: string,
+): Promise<{ createdAt: number; updatedAt: number; lastUsedAt: number | null; verified: boolean } | null> {
+  if (!ref || secretRefKind(ref) !== "agent" || !hasTable(sql, "secrets")) return null;
+  const meta = await store.secretMeta(tenantId, agentId, alias);
+  if (!meta) return null;
+  return {
+    createdAt: meta.createdAt, updatedAt: meta.updatedAt, lastUsedAt: meta.lastUsedAt, verified: meta.verified,
+  };
+}
+
 export async function readDiagnosis(
   sql: Sql, tenantId: string, agentId: string, taskId: string, deps: DiagnosisDeps,
 ): Promise<Record<string, unknown> | null> {
@@ -121,6 +139,14 @@ export async function readDiagnosis(
       config: m.publicConfig,
       // Whose credential this is, never what it is.
       secret: secretRefKind(m.secretRef),
+      // WHEN it was attached, replaced and last dereferenced — because the question that costs an
+      // afternoon is "did this mount have a credential at the time of that call?", and until now the only
+      // way to ask it was to read the source of whatever build was live that day and reason backwards
+      // (2026-09-20: the whole of #plugins:770a1824). Times only: not the value, and not the account it
+      // names, which would put a person's login in an operator's report for no question anyone is asking.
+      // `createdAt` survives a replacement (the upsert leaves it alone), so it dates the FIRST attach while
+      // `updatedAt` dates the last one. Null for an operator ref: that secret is not in this agent's store.
+      secretTimes: await secretTimes(sql, store, tenantId, agentId, m.secretRef, m.alias),
       connection: hasTable(sql, "connections") && (await store.getConnection(tenantId, agentId, m.alias)) != null,
     }))),
     mountReports: await mountReports(sql, mounts, deps.plugins, owner, taskId, store),
