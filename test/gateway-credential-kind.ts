@@ -10,7 +10,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
-import { credentialState, type Plugin, type PluginContext } from "../src/plugins/types.ts";
+import { credentialState, markIdentity, type Plugin, type PluginContext } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -96,6 +96,56 @@ await check("a path that never resolved a credential reports nothing, rather tha
   assert(c, "activity was not called");
   assert(c.credentialRefKind === undefined, `kind: ${c.credentialRefKind}`);
   assert(credentialState(c) === "unreported", `state: ${credentialState(c)}`);
+});
+
+await check("a failed call carries the identity as fields, not only inside the sentence", () => {
+  // Vera's acceptance for this half: the complete error of a failed call contains `identity` and
+  // `credentialRef`. Until it did, a page that wanted to mark an anonymous failure could only match the
+  // plugin's prose — and matching a remembered half-sentence is how a reading goes wrong.
+  return (async () => {
+    const store = new SqliteStore(":memory:");
+    await store.init();
+    await store.createAgent("t", "a");
+    await store.addMount({
+      tenantId: "t", agentId: "a", alias: "work", plugin: "sulky", installationId: "i", connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: "agent:work", policy: null,
+    });
+    const sulky: Plugin = {
+      id: "sulky", version: "1.0.0", defaultForAllAgents: true,
+      tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+      async invoke(_t, _a, c) { throw markIdentity(new Error("github 403: rate limited"), c as PluginContext); },
+    };
+    const gw = new ToolGateway(store, [sulky], { async resolve() { return null; } });
+    const r: any = await gw.invoke(ctx, "work.run", {});
+    assert(r.status === "failed", `status: ${r.status}`);
+    assert(r.error.identity === "unreadable" && r.error.credentialRef === "agent",
+      `fields on the error: ${JSON.stringify(r.error)}`);
+    assert(typeof r.error.message === "string" && r.error.message.includes("403"),
+      "the sentence went missing while the fields were added");
+  })();
+});
+
+await check("a plugin that said nothing about identity still produces the error every reader handles", () => {
+  return (async () => {
+    const gw = await fixture({ work: null });
+    const silent: Plugin = {
+      id: "box", version: "1.0.0", defaultForAllAgents: true,
+      tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
+      async invoke() { throw new Error("plain failure"); },
+    };
+    const store = new SqliteStore(":memory:");
+    await store.init();
+    await store.createAgent("t", "a");
+    await store.addMount({
+      tenantId: "t", agentId: "a", alias: "work", plugin: "box", installationId: "i", connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+    });
+    void gw;
+    const g2 = new ToolGateway(store, [silent], { async resolve() { return null; } });
+    const r: any = await g2.invoke(ctx, "work.run", {});
+    assert(!("identity" in r.error) && !("credentialRef" in r.error),
+      `absent fields were invented: ${JSON.stringify(r.error)}`);
+  })();
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

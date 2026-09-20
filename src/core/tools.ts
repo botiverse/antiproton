@@ -15,6 +15,8 @@ export type ToolResult =
   | { status: "failed" | "cancelled" | "unknown"; operationId: string; error?: ToolError }
   | { status: "rejected"; error: ToolError };
 
+import type { CredentialRefKind, CredentialState } from "../plugins/types.ts";
+
 export interface ToolError {
   code: string;
   message: string;
@@ -23,6 +25,14 @@ export interface ToolError {
   candidates?: string[];
   /** For unauthorized/unmounted plugins: a link a human can act on. */
   authorizationUrl?: string;
+  /**
+   * Which identity the call was made with, and what kind of credential the mount names, as fields rather
+   * than only inside `message`. The sentence is for a person; a page that wanted to mark these had to match
+   * the wording, and matching a remembered half-sentence is how a reading goes wrong (Nova, 2026-09-20).
+   * Absent when the plugin did not say — which every reader already handles.
+   */
+  identity?: CredentialState;
+  credentialRef?: CredentialRefKind;
 }
 
 export interface ToolRef {

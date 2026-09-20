@@ -6,6 +6,7 @@ import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
+import type { ToolErrorFields } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 import { toolCallRows } from "../usage/outbox.ts";
 
@@ -599,12 +600,22 @@ export class ToolGateway {
       await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
-      const e = err as Error & { retryable?: boolean };
+      const e = err as Error & ToolErrorFields & { retryable?: boolean };
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
       await counted("failed");
-      return { status, operationId, error: { code: "tool_error", message: e.message } };
+      // The identity fields travel beside the sentence, not inside it: a page that marks an anonymous
+      // failure should read a field, not match the plugin's wording (#434). Spread only what is there, so
+      // a plugin that said nothing still produces the error every reader already handles.
+      return {
+        status, operationId,
+        error: {
+          code: "tool_error", message: e.message,
+          ...(e.identity === undefined ? {} : { identity: e.identity }),
+          ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
+        },
+      };
     }
   }
 
