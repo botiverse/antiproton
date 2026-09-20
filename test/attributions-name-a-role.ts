@@ -188,6 +188,27 @@ check("every `.ts` in a scanned directory is actually scanned", () => {
 /** A commit cited in a comment, as `` `<sha>` ``. */
 const CITED_SHA = /`([0-9a-f]{7,40})`/g;
 
+/**
+ * Where a cited commit stands relative to a tree: three answers, not two.
+ *
+ * `unreachable` is the defect — the address opens for whoever wrote it and for
+ * nobody else. `ahead` is not a defect in the comment at all: the checkout is
+ * behind the commit it names. @cody lost a reading to that shape minutes after
+ * #461 merged (`git fetch` moves `origin/master`, not the tree you stand in),
+ * and a red naming the wrong cause sends the next reader to edit a comment that
+ * is correct.
+ */
+function standing(sha: string, at: string, cwd?: string): "ok" | "ahead" | "unreachable" {
+  const ask = (a: string, b: string) => {
+    try {
+      execFileSync("git", [...(cwd ? ["-C", cwd] : []), "merge-base", "--is-ancestor", a, b], { stdio: "ignore" });
+      return true;
+    } catch { return false; }
+  };
+  if (ask(sha, at)) return "ok";
+  return ask(at, sha) ? "ahead" : "unreachable";
+}
+
 check("every commit a comment cites is reachable from this history", () => {
   // @Nova's second step, as an assertion rather than a command someone remembers
   // to run: `git cat-file -e` says the object is in THIS clone, which is a
@@ -201,9 +222,10 @@ check("every commit a comment cites is reachable from this history", () => {
       if (!COMMENT.test(line)) return;
       for (const m of line.matchAll(CITED_SHA)) {
         const sha = m[1]!;
-        try {
-          execFileSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { stdio: "ignore" });
-        } catch {
+        const where = standing(sha, "HEAD");
+        if (where === "ahead") {
+          bad.push(`${f}:${i + 1} — \`${sha}\` is AHEAD of this checkout: the comment is fine and this working tree is stale (\`git fetch\` moves \`origin/master\`, not the tree you are in)`);
+        } else if (where === "unreachable") {
           bad.push(`${f}:${i + 1} — \`${sha}\` is not reachable from HEAD, so it opens for whoever wrote it and nobody else`);
         }
       }
@@ -212,7 +234,7 @@ check("every commit a comment cites is reachable from this history", () => {
   if (bad.length > 0) throw new Error(`a dead address is worse than none:\n      ${bad.join("\n      ")}`);
 });
 
-check("the reachability check reddens on a commit that exists but is unreachable", () => {
+check("unreachable, reachable and ahead are told apart, each from a real commit", () => {
   // The two states have to be told apart, or the case above would accept
   // whatever this clone happens to hold.
   //
@@ -230,16 +252,29 @@ check("the reachability check reddens on a commit that exists but is unreachable
   try {
     git("init", "-q", ".");
     git("commit", "-q", "--allow-empty", "-m", "base");
-    git("checkout", "-q", "-b", "gone");
-    git("commit", "-q", "--allow-empty", "-m", "orphan");
-    const orphan = git("rev-parse", "HEAD");
-    git("checkout", "-q", "-");
-    git("branch", "-qD", "gone"); // the branch is gone; the object is not
-    git("cat-file", "-e", `${orphan}^{commit}`); // …so it still exists
-    let reachable = true;
-    try { git("merge-base", "--is-ancestor", orphan, "HEAD"); } catch { reachable = false; }
-    if (reachable) {
-      throw new Error("a commit no ref points at was called reachable, so the case above cannot fail");
+    const base = git("rev-parse", "HEAD");
+
+    // AHEAD: a child of where we stand. Not an ancestor of HEAD — which is why
+    // asking only that question is not enough, and it is the state @cody's
+    // stale worktree was in.
+    git("commit", "-q", "--allow-empty", "-m", "newer");
+    const newer = git("rev-parse", "HEAD");
+    git("checkout", "-q", base);
+
+    // UNREACHABLE: a root of its own, so neither commit can reach the other.
+    // A commit on a deleted branch does NOT serve here: it is a descendant of
+    // base, so it is `ahead`, and using it would prove only the weaker claim.
+    git("checkout", "-q", "--orphan", "elsewhere");
+    git("commit", "-q", "--allow-empty", "-m", "unrelated");
+    const unrelated = git("rev-parse", "HEAD");
+    git("checkout", "-q", base);
+    git("branch", "-qD", "elsewhere"); // nothing references it now
+    git("cat-file", "-e", `${unrelated}^{commit}`); // …and it still exists
+
+    if (standing(base, "HEAD", dir) !== "ok") throw new Error("the tree's own commit was not called reachable");
+    if (standing(newer, "HEAD", dir) !== "ahead") throw new Error("a commit this tree is behind was not called ahead");
+    if (standing(unrelated, "HEAD", dir) !== "unreachable") {
+      throw new Error("a commit on an unrelated root was not called unreachable, so the case above cannot fail");
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
