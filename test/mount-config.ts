@@ -20,7 +20,7 @@ import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
-import { credentialForm, originProblem, credentialState, identityNote, type CredentialRefKind } from "../src/plugins/types.ts";
+import { credentialForm, originProblem, credentialState, identityNote, identityNoteFor, type CredentialRefKind, type CredentialState } from "../src/plugins/types.ts";
 import { secretRefKind } from "../src/runtime/secrets.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
@@ -2297,6 +2297,39 @@ await check("every kind the runtime can report is one the contract declares, and
   }
   for (const kind of declared) {
     if (!produced.has(kind as any)) throw new Error(`the contract declares ${kind}, which no reference in this list produces`);
+  }
+});
+
+/**
+ * One wording, reachable from either layer.
+ *
+ * A plugin holds the inputs and a page holds the state, so the sentences are
+ * parameterised rather than copied: `identityNote` is `identityNoteFor` with the
+ * mount named. Without this pair pinned, the two entry points are a copy waiting
+ * to drift — which is what a console PR did while this was being written (#445),
+ * and there was nothing to fail because it imported none of this.
+ */
+await check("both entry points to a state's sentence give the same words", () => {
+  const kinds: Array<CredentialRefKind | undefined> = [undefined, "none", "agent", "operator", "env", "other"];
+  for (const kind of kinds) {
+    for (const credential of [null, "tok"]) {
+      const ctx = { alias: "gh", credential, credentialRefKind: kind };
+      const viaCtx = identityNote(ctx);
+      const viaState = identityNoteFor(credentialState(ctx), kind, "the `gh` mount");
+      if (viaCtx !== viaState) {
+        throw new Error(`the two entry points disagree for ${JSON.stringify({ kind, credential })}: ${viaCtx} / ${viaState}`);
+      }
+    }
+  }
+});
+
+await check("a surface that cannot name the mount still gets a sentence about one", () => {
+  // The page's case: it has the state and no alias, and inventing one would put
+  // a wrong mount name in front of a person.
+  for (const state of ["attached", "none", "unreadable", "unreported"] as CredentialState[]) {
+    const said = identityNoteFor(state);
+    if (!/^(this mount|either this mount)/.test(said)) throw new Error(`${state} reads: ${said}`);
+    if (/`/.test(said)) throw new Error(`${state} names a mount it was not given: ${said}`);
   }
 });
 

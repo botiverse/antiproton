@@ -174,8 +174,30 @@ export function credentialState(
  * versus write the credential of the account already attached.
  */
 export function identityNote(ctx: Pick<PluginContext, "credential" | "credentialRefKind" | "alias">): string {
-  const mount = `the \`${ctx.alias}\` mount`;
-  switch (credentialState(ctx)) {
+  return identityNoteFor(credentialState(ctx), ctx.credentialRefKind, `the \`${ctx.alias}\` mount`);
+}
+
+/**
+ * The same sentences, for a reader that holds the state rather than the inputs.
+ *
+ * A page is exactly that reader: it has the `identity` and `credentialRef` from
+ * a recorded failure and no context at all — it never has the credential, and it
+ * has no alias, because the payload does not carry the mount's name. Asking it
+ * to build a `ctx` to reach these sentences would mean inventing an alias, and
+ * an invented alias puts a wrong mount name in front of a person (@Nova, who
+ * chose to call this rather than restate it and then showed it could not be
+ * called, 2026-09-20).
+ *
+ * `mount` is the phrase these sentences are about, defaulting to "this mount"
+ * for a surface that cannot name it. `identityNote` passes `` the `alias` mount ``,
+ * which is why its wording is unchanged by this split.
+ */
+export function identityNoteFor(
+  state: CredentialState,
+  kind?: CredentialRefKind,
+  mount = "this mount",
+): string {
+  switch (state) {
     case "attached":
       // Passive, so the one clause reads inside a failure, a refusal and an
       // answer to "who am I here?" without three wordings of one fact.
@@ -186,7 +208,7 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
       // Nothing is missing from the mount here, so "attach an account" is the
       // one piece of advice that must not appear. Who to send instead depends
       // on whose credential it is, which is what the kind says.
-      return ctx.credentialRefKind === "operator" || ctx.credentialRefKind === "env"
+      return kind === "operator" || kind === "env"
         ? `${mount} names a credential this deployment holds for everyone, and this deployment does not` +
           ` have it, so whoever deploys has to configure it there, and attaching an account to the mount will not fix it`
         : `${mount} names an account whose credential could not be read, so whoever holds that credential` +
