@@ -62,6 +62,29 @@ export interface CallContext {
   taskId: string;
 }
 
+/**
+ * How one call is to be run — and one thing that is only written down.
+ *
+ * Declared once because `invoke` and `#invoke` had spelled the same four
+ * fields out separately, which is the shape that lets one of them quietly
+ * learn a field the other never gets.
+ */
+export interface InvokeOpts {
+  /** The identity of a REQUEST: a repeat under the same key reaches the same operation. */
+  idempotencyKey?: string;
+  approved?: boolean;
+  operationId?: string;
+  confirm?: boolean;
+  /**
+   * The identity of a CALL, and the only field here that changes nothing: the
+   * model's own id for the tool call this operation serves, recorded so the
+   * console can line an operation up with the `tool.result` it belongs to
+   * without matching prose. Not unique — one `run_js` call makes many host
+   * calls under one id. See `CompletedFacts` in src/core/store.ts.
+   */
+  callId?: string;
+}
+
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
 
 /**
@@ -388,7 +411,7 @@ export class ToolGateway {
     ctx: CallContext,
     raw: string,
     args: Json,
-    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string; confirm?: boolean } = {},
+    opts: InvokeOpts = {},
   ): Promise<ToolResult> {
     // Resolved before queueing, because which queue a call belongs in is a
     // property of the mount it names, and refusals should not wait behind
@@ -442,7 +465,7 @@ export class ToolGateway {
     ctx: CallContext,
     raw: string,
     args: Json,
-    opts: { idempotencyKey?: string; approved?: boolean; operationId?: string; confirm?: boolean } = {},
+    opts: InvokeOpts = {},
   ): Promise<ToolResult> {
     const r = await this.resolve(ctx, raw);
     if ("error" in r) return { status: "rejected", error: r.error };
@@ -569,6 +592,10 @@ export class ToolGateway {
       ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
       : null;
     const started = Date.now();
+    // What every completion of this call records, whichever way it ends. Built once rather than
+    // spelled at each `completeOperation`: a call that carries its id when it succeeds and drops it
+    // when it fails would leave the failures — the ones worth looking at — as the unlinkable ones.
+    const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
     // Counting is never the call's problem: a failure here must not turn a
     // call that succeeded into one reported as failed.
     const counted = async (outcome: "ok" | "failed") => {
@@ -585,7 +612,7 @@ export class ToolGateway {
       // (Piper, 2026-09-14). The work has started and outlives this call; the
       // runtime records the job and the operation stays running until it ends.
       if (result instanceof Backgrounded) {
-        await this.#store.completeOperation(ctx.tenantId, operationId, "running", null);
+        await this.#store.completeOperation(ctx.tenantId, operationId, "running", null, undefined, facts());
         // Counted as started; the time it runs in the background is the sandbox's to count.
         await counted("ok");
         return {
@@ -596,7 +623,7 @@ export class ToolGateway {
           },
         };
       }
-      await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null);
+      await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null, undefined, facts());
       await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
@@ -608,6 +635,7 @@ export class ToolGateway {
       // what the console reads, so a page that wants to badge an anonymous failure needs them there
       // (@Nova traced the two hops, @Vera withdrew the envelope as the criterion, 2026-09-20).
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
+        ...facts(),
         ...(e.identity === undefined ? {} : { identity: e.identity }),
         ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
       });

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice } from "../plugins/types.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
-import { completedPayload, type OperationIdentity } from "./operation-event.ts";
+import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
   AdvanceTxn,
   CommitResult,
@@ -662,7 +662,7 @@ export class SqliteStore implements StorageAdapter {
     status: OperationStatus,
     resultRef: string | null,
     result?: Json,
-    who?: OperationIdentity,
+    facts?: CompletedFacts,
   ) {
     this.#tx(() => {
       this.#db
@@ -685,7 +685,7 @@ export class SqliteStore implements StorageAdapter {
           agentId: op.agent_id,
           taskId: op.task_id,
           kind: "operation.completed",
-          payload: completedPayload(operationId, status, resultRef, result, who),
+          payload: completedPayload(operationId, status, resultRef, result, facts),
           dedupKey: `op:${operationId}:completed`,
         });
       }

@@ -1,7 +1,7 @@
 import type { Json, OperationStatus } from "../core/types.ts";
-import type { OperationIdentity } from "../core/store.ts";
+import type { CompletedFacts } from "../core/store.ts";
 
-export type { OperationIdentity };
+export type { CompletedFacts };
 
 /**
  * The payload of `operation.completed`, built ONCE for both backends.
@@ -27,14 +27,15 @@ export function completedPayload(
   status: OperationStatus,
   resultRef: string | null,
   result?: Json,
-  who?: OperationIdentity,
+  facts?: CompletedFacts,
 ): Json {
   return {
     operationId,
     status,
     resultRef,
     ...(result === undefined ? {} : { result }),
-    ...(who?.identity === undefined ? {} : { identity: who.identity }),
-    ...(who?.credentialRef === undefined ? {} : { credentialRef: who.credentialRef }),
+    ...(facts?.callId === undefined ? {} : { callId: facts.callId }),
+    ...(facts?.identity === undefined ? {} : { identity: facts.identity }),
+    ...(facts?.credentialRef === undefined ? {} : { credentialRef: facts.credentialRef }),
   };
 }

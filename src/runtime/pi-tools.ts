@@ -64,7 +64,9 @@ export interface ToolResult {
 }
 
 export interface ToolHost {
-  invoke(call: { tool: string; args: Json; opts?: unknown }): Promise<ToolResult>;
+  /** `callId` is the model's id for this tool call, passed to be RECORDED. It is
+   *  not `opts.idempotencyKey`: one call can make several requests. */
+  invoke(call: { tool: string; args: Json; opts?: unknown; callId?: string }): Promise<ToolResult>;
 }
 
 /**
@@ -199,13 +201,15 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
     // pi runs a turn's tool calls in parallel unless a tool says otherwise, and
     // a plugin whose mount owns one container cannot survive that.
     ...(t.exclusive ? { executionMode: "sequential" as const } : {}),
-    async execute(_toolCallId: string, params: Json) {
+    async execute(toolCallId: string, params: Json) {
       // A tool that declares `confirm` itself owns the word; only tools that
       // do not are eligible for the agent's hold. Today none declares it, so
       // this changes nothing — it keeps an appworld catalogue that grows a
       // `confirm` parameter tomorrow from losing it silently.
       const lifted = declaresConfirm(t.parameters) ? { args: params, confirm: false } : liftConfirm(params);
-      const res = await host.invoke({ tool: t.address, args: lifted.args, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
+      // The model's id for this call travels with it, so the operation it starts can be lined up
+      // with the `tool.result` the console already pairs by that same id (cf/src/ui.ts).
+      const res = await host.invoke({ tool: t.address, args: lifted.args, callId: toolCallId, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
       if (res.status !== "succeeded") {
         // pi asks tools to throw rather than encode failure in content, so the
         // harness can tell a refusal from an answer.
@@ -309,8 +313,12 @@ export function runJsTool(
   const unoffered = new Map((opts.unoffered ?? []).map((u) => [modelName(u.alias), u]));
   // Every alias as it appears in a model-facing name, offered or not: a name is
   // attributed to the LONGEST alias it starts with. Not by splitting at the
-  // first "__" — an alias may itself contain "__" (renameMount does not forbid
-  // it), which is the same inversion #255 refused for truncated names (Piper).
+  // first "__" — an alias may itself contain "__", which is the same inversion
+  // #255 refused for truncated names (Piper). The reason changed under this
+  // code and the code did not: `renameMount` used to forbid nothing, and since
+  // #444 it applies `MOUNT_ALIAS`, which has no `_` at all — but only to names
+  // set FROM THEN ON. Nothing rewrote the aliases already stored, so one of
+  // them can still contain "__" and this has to keep reading them.
   // Offered aliases take part so a typo on an offered mount (gh__eu) is not
   // mistaken for a switched-off mount whose alias is a shorter prefix (gh).
   const offeredAliases = new Set((opts.tools ?? []).map((t) => modelName(t.address.split(".")[0]!)));
@@ -405,6 +413,10 @@ export function runJsTool(
             ...call,
             tool: address(call.tool),
             args: lifted.args,
+            // Every host call a script makes serves this ONE model call, so they all name it --
+            // which is exactly why the id is not the idempotency key below: that one has to differ
+            // per request, and this one has to be the same for all of them.
+            callId: toolCallId,
             opts: { ...(call.opts ?? {}), ...(lifted.confirm ? { confirm: true } : {}), idempotencyKey: `${toolCallId}:${n++}` },
           });
         },
