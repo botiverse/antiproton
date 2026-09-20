@@ -16,8 +16,18 @@ import type {
 // The vocabulary belongs to the plugin contract; the store persists it rather
 // than defining a second copy of the same three words. Type-only, and
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
-import type { PluginChoice } from "../plugins/types.ts";
+import type { CredentialRefKind, CredentialState, PluginChoice } from "../plugins/types.ts";
 import type { UsageRow } from "../usage/outbox.ts";
+
+/**
+ * Who a finished call was made as. Declared here, beside `completeOperation`,
+ * because it is part of that call's contract; `src/store/operation-event.ts`
+ * puts it on the event both backends write.
+ */
+export interface OperationIdentity {
+  identity?: CredentialState;
+  credentialRef?: CredentialRefKind;
+}
 
 /** A stored value: inline when small, a reference to object storage when not. */
 export interface StateEntry {
@@ -129,6 +139,10 @@ export interface StorageAdapter {
     /** Carried on the wakeup event. An operation that finished long after the
      *  execution that started it still has to deliver what it produced. */
     result?: Json,
+    /** Which identity the call was made with, on the event rather than only on
+     *  the returned envelope — see src/store/operation-event.ts for why the
+     *  event is the channel that reaches a page. */
+    who?: OperationIdentity,
   ): Promise<void>;
 
   /** Registers a wait, resolving it immediately if the operation already finished. */

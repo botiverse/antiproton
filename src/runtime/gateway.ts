@@ -603,7 +603,14 @@ export class ToolGateway {
       const e = err as Error & PluginErrorFields & { retryable?: boolean };
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
-      await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
+      // The same two fields go onto the RECORD, not only onto what this call returns. The returned
+      // envelope stops at `pi-tools.ts`, which collapses it into a string; `operation.completed` is
+      // what the console reads, so a page that wants to badge an anonymous failure needs them there
+      // (@Nova traced the two hops, @Vera withdrew the envelope as the criterion, 2026-09-20).
+      await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
+        ...(e.identity === undefined ? {} : { identity: e.identity }),
+        ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
+      });
       await counted("failed");
       // The identity fields travel beside the sentence, not inside it: a page that marks an anonymous
       // failure should read a field, not match the plugin's wording (#434). Spread only what is there, so

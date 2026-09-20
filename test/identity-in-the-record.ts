@@ -13,6 +13,8 @@
  * mount that HAS a reference, read as a mount that has no account.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
+import { DurableObjectStore } from "../src/store/durable-object.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { markIdentity, type Plugin, type PluginContext } from "../src/plugins/types.ts";
 
@@ -47,10 +49,32 @@ function failingPlugin() {
   return { plugin, seen };
 }
 
-async function fixture(secretRef: string | null) {
+/**
+ * The two backends, built the same way.
+ *
+ * The event this file is about is written in TWO places — `src/store/sqlite.ts`
+ * and `src/store/durable-object.ts` — and the Durable Object is the one
+ * production runs. A payload proven on the node backend alone proves the
+ * backend no deployment uses, and the two files had spelled the payload out
+ * separately, so "the field is there" was a claim about whichever copy the
+ * test happened to reach (cody, 2026-09-20). They now share one builder
+ * (`src/store/operation-event.ts`); these run the assertion on both anyway,
+ * because a shared builder is a fact about today's code and the acceptance
+ * should outlive it.
+ */
+const BACKENDS = {
+  sqlite: async () => { const s = new SqliteStore(":memory:"); await s.init(); return s; },
+  "durable-object": async () => {
+    const host = sqliteHost();
+    const s = new DurableObjectStore({ storage: { sql: host.sql, transactionSync: host.transactionSync } } as any);
+    await s.init();
+    return s;
+  },
+} as const;
+
+async function fixture(secretRef: string | null, backend: keyof typeof BACKENDS = "sqlite") {
   const { plugin, seen } = failingPlugin();
-  const store = new SqliteStore(":memory:");
-  await store.init();
+  const store: any = await BACKENDS[backend]();
   await store.createAgent("t", "a");
   await store.addMount({
     tenantId: "t", agentId: "a", alias: "svc", plugin: "svc", installationId: "i", connectionId: null,
@@ -102,8 +126,9 @@ await check("the recorded failure carries the identity as fields, not only in it
  * carries verbatim — and the failing branch passes nothing today. So the
  * criterion is the event, not the return value.
  */
-await check("the event the console already reads carries the identity, not only the return value", async () => {
-  const { gw, store } = await fixture("agent:gh-token");
+for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
+await check(`the event the console already reads carries the identity, not only the return value (${backend})`, async () => {
+  const { gw, store } = await fixture("agent:gh-token", backend);
   await gw.invoke(caller, "svc.read", {});
   const events = await store.taskEvents("t", "k");
   const completed = events.filter((e: any) => e.kind === "operation.completed");
@@ -125,6 +150,7 @@ await check("the event the console already reads carries the identity, not only 
     throw new Error("the identity is inside `result`, where a failure's absent result takes it away");
   }
 });
+}
 
 console.log(`\n  the identity of a failed call, in the record\n  ${"─".repeat(56)}`);
 for (const r of results) {
