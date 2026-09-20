@@ -47,6 +47,7 @@
     "test/console-chat.ts",
     "test/console-choice.ts",
     "test/console-events.ts",
+    "test/console-identity-record.ts",
     "test/console-login.ts",
     "test/console-plugins.ts",
     "test/console-poll.ts",
