@@ -394,8 +394,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
 [data-theme="brutal"] .conv,[data-theme="brutal"] .view>.body{border:2px solid var(--line-strong);box-shadow:var(--theme-shadow-md)}
 [data-theme="brutal"] .card,[data-theme="brutal"] .mount,[data-theme="brutal"] .plug{border:1px solid var(--line-strong);margin:8px 0;box-shadow:none}
 /* A card inside a framed panel keeps a hairline, not the offset shadow:
-   stacked 2px borders + shadows read as black boxes overlapping each other
-   (tygg, 2026-09-13). */
+   stacked 2px borders + shadows read as black boxes overlapping each other. */
 [data-theme="brutal"] .card{border-left-width:2px}
 [data-theme="brutal"] .task,[data-theme="brutal"] .mount-link{border:2px solid var(--line-strong)}
 [data-theme="brutal"] .task.on,[data-theme="brutal"] .mount-link.on{background:var(--primary-soft)}
@@ -435,7 +434,7 @@ white-space:pre-wrap;word-break:break-word;font-size:12px;margin:4px 0 10px}
   .view-head h2{font-size:14px}
   .conv .body{max-height:none}
   /* The composer hint explains steer/after; on a phone that legend costs the
-     conversation real space it already is short of (tygg, 2026-09-13). */
+     conversation real space it already is short of. */
   .send-hint{display:none}
 }
 @media(max-width:760px){.sidebar .pane-close,.inspector .pane-close{display:inline-flex;margin:10px 12px 0}}
@@ -794,15 +793,15 @@ ${HEAD_ASSETS}
   // Poll without re-rendering. Each panel remembers the version it last drew;
   // the server answers 304 when nothing has moved. htmx 1.9 swaps any 2xx or
   // 3xx but 204, so a 304's empty body would empty the panel: the whole
-  // conversation went blank the moment polling went quiet (tygg, 2026-09-11).
+  // conversation went blank the moment polling went quiet.
   // The swap is refused here, explicitly, so a 304 leaves the DOM alone.
   //
   // The version lives on the element that made the request, not in a map
   // keyed by path: the path htmx reports before a request (the hx-get value)
   // and after it (with the query and the agentId it appended) are not the
   // same string, and a map keyed by one and read by the other never hit for
-  // a URL with a query, so ?part=mounts re-rendered every poll (cody,
-  // 2026-09-12). One panel, one URL, one version; a panel whose URL is
+  // a URL with a query, so ?part=mounts re-rendered every poll. One panel,
+  // one URL, one version; a panel whose URL is
   // reassigned forgets its version there.
   document.body.addEventListener('htmx:beforeSwap', (e) => {
     if (e.detail.xhr && e.detail.xhr.status === 304) e.detail.shouldSwap = false;

@@ -22,7 +22,7 @@ export const MARK_SVG = "<svg viewBox=\"0 0 100 104\" role=\"img\" aria-label=\"
  * The outlined cut, the logo as tygg chose it: ink outline, cream body, the
  * bar in Source Yellow, a hard offset shadow. Self-coloured, and the logo on
  * every surface: on a dark canvas the ink line merges into the background
- * and the cream letterforms carry it, which is intended (tygg, 2026-09-11).
+ * and the cream letterforms carry it, which is intended.
  * The flat forms above are for small sizes and one-colour contexts. The mask
  * id is suffixed so two copies on one page do not collide.
  */
