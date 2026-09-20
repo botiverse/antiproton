@@ -24,7 +24,7 @@
  *   N=1 node bench/swebench/cf.ts
  *   N=10 OBJ=swe2 node bench/swebench/cf.ts
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
 import { beginRun, driverCommit, recordRun, workerBuild } from "../record.ts";
@@ -278,7 +278,27 @@ await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
 // Before the first line of output: the log path has to exist while there is
 // still something to write to it.
+//
+// Tee this run's output into its log, so the record and its log cannot be
+// separated by where the caller happened to redirect. The path comes from
+// `beginRun`, and that is the point: the caller does not choose it.
+//
+// One patch point, not one per call site. There are eighteen `console.log` calls
+// here and no shared logger, so writing to the file at each of them would mean
+// eighteen places have to remember, and the nineteenth never would.
+//
+// `appendFileSync` flushes per line, which is what a run that dies mid-way needs:
+// it leaves what it printed, and that file is then the only evidence of that run.
+function teeTo(path: string): void {
+  const say = console.log.bind(console);
+  console.log = (...args: unknown[]) => {
+    say(...args);
+    appendFileSync(path, args.map(String).join(" ") + "\n");
+  };
+}
+
 const run = beginRun("swebench", OBJ);
+teeTo(run.log);
 console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object, container network ${process.env.NETWORK ?? "none"}` +
   `\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(80)}`);
 const out: any[] = [];

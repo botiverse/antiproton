@@ -18,7 +18,7 @@
  *
  *   N=8 TRIALS=3 node bench/tau2/cf.ts
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
@@ -357,7 +357,27 @@ await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 const selected = TASKS.slice(OFFSET, OFFSET + N);
 // Before the first line of output: the log path has to exist while there is
 // still something to write to it.
+//
+// Tee this run's output into its log, so the record and its log cannot be
+// separated by where the caller happened to redirect. The path comes from
+// `beginRun`, and that is the point: the caller does not choose it.
+//
+// One patch point, not one per call site. There are eighteen `console.log` calls
+// here and no shared logger, so writing to the file at each of them would mean
+// eighteen places have to remember, and the nineteenth never would.
+//
+// `appendFileSync` flushes per line, which is what a run that dies mid-way needs:
+// it leaves what it printed, and that file is then the only evidence of that run.
+function teeTo(path: string): void {
+  const say = console.log.bind(console);
+  console.log = (...args: unknown[]) => {
+    say(...args);
+    appendFileSync(path, args.map(String).join(" ") + "\n");
+  };
+}
+
 const run = beginRun("tau2", OBJ);
+teeTo(run.log);
 console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s) in ${ORDER} order, ` +
   `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
 
