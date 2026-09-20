@@ -108,12 +108,21 @@ await check("the event the console already reads carries the identity, not only 
   const events = await store.taskEvents("t", "k");
   const completed = events.filter((e: any) => e.kind === "operation.completed");
   if (completed.length !== 1) throw new Error(`expected one operation.completed, got ${completed.length}`);
-  const result = (completed[0] as any).payload?.result;
-  if (!result) {
-    throw new Error("the failure recorded no result, so the console has nothing structured to badge");
+  // Top level, beside `operationId` and `status` — not inside `result`, which
+  // the store spreads only when there is one (`sqlite.ts`). A failure has no
+  // result, so an identity living in there would vanish on exactly the calls
+  // that have an identity worth reading; and its absence would then mean "this
+  // call produced nothing" rather than "nobody reported the identity", which
+  // makes two different absences look alike (@Nova's shape, @Vera's reading).
+  const payload = (completed[0] as any).payload ?? {};
+  if (payload.identity === undefined) {
+    throw new Error(`the recorded event carries no identity, so the console has nothing structured to badge: ${JSON.stringify(payload)}`);
   }
-  if (result.identity !== "unreadable" || result.credentialRef !== "agent") {
-    throw new Error(`the recorded result says ${JSON.stringify(result)}`);
+  if (payload.identity !== "unreadable" || payload.credentialRef !== "agent") {
+    throw new Error(`the recorded event says ${JSON.stringify({ identity: payload.identity, credentialRef: payload.credentialRef })}`);
+  }
+  if (payload.result !== undefined && payload.result?.identity !== undefined) {
+    throw new Error("the identity is inside `result`, where a failure's absent result takes it away");
   }
 });
 
