@@ -1246,6 +1246,13 @@ function identityByCall(events: Ev[]): Map<string, Who> {
     // have already broken.
     if (!seen || seen.identity !== who.identity || seen.credentialRef !== who.credentialRef) by.set(id, null);
   }
+  // The map above holds three states in two: a `null` is only ever written by
+  // the clash branch, never as a first value, so it means "they disagreed" and
+  // not "nothing seen". The declared return type is honest because of this
+  // filter and nothing else — `who !== undefined` in its place would let a
+  // clash out as a `Who` whose `identity` reads `undefined`, which is the
+  // page saying "nobody reported one" about a row where two mounts did, and
+  // that is the lie this whole function exists to avoid (@Rex, 2026-09-20).
   const agreed = new Map<string, Who>();
   for (const [id, who] of by) if (who) agreed.set(id, who);
   return agreed;
