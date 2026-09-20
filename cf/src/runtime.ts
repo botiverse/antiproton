@@ -875,6 +875,14 @@ export class AgentRuntime {
     tenantId: string, agentId: string, from: string, to: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
+    // The same rule `addMount` applies, which this path was quietly exempt from (#439). It is not
+    // cosmetic: `:` is the character keeping a mount's credential row (named after the alias) apart
+    // from an inbound hook's `hook:<id>` in the ONE per-agent secrets namespace. A rename that
+    // skipped the charset could park a credential-less mount on a live hook's name, and the next
+    // `attachCredential` — an upsert with no existence check — would overwrite that hook's signing
+    // secret. The service keeps posting, the signature stops matching, and nothing says why.
+    // Checked before anything else the rename does: a refusal should not depend on a container poll.
+    if (!MOUNT_ALIAS.test(to)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
     const mount = await this.store.getMountByAlias(tenantId, agentId, from);
     if (!mount) return { ok: false, error: `no mount named ${from}` };
     const safety = renameSafety(

@@ -5,6 +5,7 @@
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { AgentRuntime, reconcileSeed } from "../cf/src/runtime.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
@@ -116,6 +117,60 @@ await check("the console's reconcile leaves another plugin's mount under a seed 
   // A credential and no allowlist is forbidden, so that seed is not applied under a key.
   const keyed = reconcileSeed({ plugin: "http", publicConfig: { account: "x" }, secretRef: "agent:web" }, seed, httpPlugin);
   must("refused" in keyed, `under a credential: ${JSON.stringify(keyed)}`);
+});
+
+/**
+ * Renaming obeys the rule adding obeys (#439).
+ *
+ * `MOUNT_ALIAS` had one caller — the add path — so a rename could reach a name
+ * the charset forbids. That is not cosmetic, because `:` is what separates a
+ * mount's credential row (named after its alias) from an inbound hook's
+ * `hook:<id>` inside the ONE per-agent secrets namespace: a credential-less
+ * mount renamed onto a live hook's name, then given a credential, replaces
+ * that hook's signing secret with an upsert that checks nothing. The service
+ * keeps posting and the signature stops matching, several steps from the cause
+ * (@Piper demonstrated the whole chain against a real store, 2026-09-20).
+ *
+ * On the Durable Object rather than the stub above: a rename that is ALLOWED
+ * runs through the gateway and the store, and the stub's runtime keeps a
+ * gateway pointing at a different store than the one the test injects — so it
+ * can only ever observe a refusal, and a guard checked only by refusals is one
+ * that "refuse everything" would also pass.
+ */
+async function realRuntime() {
+  const host = sqliteHost();
+  const rt: any = new AgentRuntime({
+    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
+    bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any, extraPlugins: [],
+  } as any);
+  await rt.store.init();
+  rt.ready = async () => {};
+  await rt.store.createAgent("t", "a");
+  await rt.addMount("t", "a", web);
+  return rt;
+}
+
+await check("a rename is held to the same alias rule as an add", async () => {
+  const rt = await realRuntime();
+  // The name an inbound hook's secret is filed under (src/runtime/inbound.ts).
+  const r = await rt.renameMount("t", "a", "web2", "hook:h-1");
+  must(!r.ok, `renaming onto a hook's secret name was allowed: ${JSON.stringify(r)}`);
+  must(/an alias is/.test(r.error ?? ""), `refused for some other reason: ${JSON.stringify(r)}`);
+  // And the mount is where it was: a refusal that half-moved it would be worse than the bug.
+  must(await rt.store.getMountByAlias("t", "a", "web2"), "the mount left its old name behind");
+  must(!(await rt.store.getMountByAlias("t", "a", "hook:h-1")), "the mount arrived under the forbidden name");
+});
+
+await check("what it refuses is the charset, and a legal rename still goes through", async () => {
+  const rt = await realRuntime();
+  // Nothing is stored under this name: the rule has to hold on an alias that
+  // collides with nothing, or it is only the uniqueness check wearing a new hat.
+  const bad = await rt.renameMount("t", "a", "web2", "Web2");
+  must(!bad.ok && /an alias is/.test(bad.error ?? ""), `an alias outside the charset was accepted: ${JSON.stringify(bad)}`);
+  // The other half, which a "refuse everything" guard would fail: the mount really moves.
+  const ok = await rt.renameMount("t", "a", "web2", "web-3");
+  must(ok.ok, `a legal rename was refused: ${JSON.stringify(ok)}`);
+  must(await rt.store.getMountByAlias("t", "a", "web-3"), "the legal rename answered ok without moving the mount");
 });
 
 console.log(`\n  Adding a mount by hand\n  ${"─".repeat(56)}`);
