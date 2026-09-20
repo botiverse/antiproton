@@ -165,7 +165,7 @@ interface BoxState {
   /**
    * The directory the last `shell` command ended in, so the next one starts
    * there. Each run9 exec is a fresh process: a `cd` does not carry over, and
-   * agents were writing `cd /testbed && …` into every call (tygg, 2026-09-15).
+   * agents were writing `cd /testbed && …` into every call.
    * Absent on a new box, where the first call starts in the working directory.
    */
   cwd?: string;
@@ -221,9 +221,9 @@ export function splitCwd(out: string): { output: string; cwd: string | null } {
  * in this turn — and it names what outlives the turn instead, which is a kept
  * filesystem.
  *
- * With the lease on (tygg, 2026-09-15: a container is destroyed by the agent's
- * own `release`, not by the end of a turn; the agent is told before an idle one
- * is taken and may postpone that) the runtime hands the plugin the lease and
+ * With the lease on — a container is destroyed by the agent's own `release`,
+ * not by the end of a turn; the agent is told before an idle one is taken and
+ * may postpone that — the runtime hands the plugin the lease and
  * the sentence names that lifetime instead. The numbers come from the lease,
  * never from here.
  */
@@ -1382,7 +1382,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // until the later of the two (idle-lease.ts `releaseAt`), and the page can
       // still tell "used" from "kept by request". Postponing is not using the
       // machine. There is no total cap: each postponement is a call the agent
-      // chose to make, within this mount's limit (tygg, 2026-09-15).
+      // chose to make, within this mount's limit.
       await ctx.connection.set({ ...prior, quietUntil } as unknown as Json);
       return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
     }
@@ -1603,7 +1603,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // ended, passed as run9's `workdir` rather than a `cd` glued in front (run9's
       // own advice for "run this from that directory"). A new box has no such
       // directory yet, so its first command makes and enters the working one.
-      // An explicit `workdir` (tygg, 2026-09-15) runs this one command there; a
+      // An explicit `workdir` runs this one command there; a
       // relative one is taken from where the shell is now.
       command = (askedDir ?? state.cwd) ? withCwdTrailer(a.command) : withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`);
     } else {

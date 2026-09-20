@@ -106,8 +106,8 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       if (a.from !== undefined) {
         let from = Math.max(0, Math.floor(Number(a.from)) || 0);
         // The note's `from` is always a whole-character boundary, but the model
-        // may compute its own; on the second half of a pair, start at the pair
-        // (Piper, 2026-09-13). The result's `from` says where it really began.
+        // may compute its own; on the second half of a pair, start at the
+        // pair. The result's `from` says where it really began.
         const first = raw.charCodeAt(from);
         if (from > 0 && from < raw.length && first >= 0xdc00 && first <= 0xdfff
           && (raw.charCodeAt(from - 1) & 0xfc00) === 0xd800) from--;

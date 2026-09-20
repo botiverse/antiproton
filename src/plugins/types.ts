@@ -309,7 +309,7 @@ export const INBOUND_HOOKS_PER_MOUNT = 3;
  * `Plugin.receive`). Offered only to a plugin that can receive, and only for
  * the mount being called, so a plugin can register its hook with the service
  * itself using the mount's own account, the way a GitHub webhook is set up
- * (Raft push: tygg and XX, 2026-09-17).
+ * (the case was Raft push).
  */
 export interface InboundHooks {
   /**
@@ -731,7 +731,8 @@ export function credentialForm(credential: CredentialSpec | undefined | null): C
  * and any agreed key can occur in real data — a result that happened to
  * contain `background` would be read as a job that does not exist, silently
  * and rarely. `instanceof` cannot be produced by data, so the signal and the
- * data cannot be confused no matter what a tool returns.
+ * data cannot be confused no matter what a tool returns (Piper, cody,
+ * 2026-09-14).
  *
  * The handle is the plugin's own business and is stored as given: for a
  * container it is the box and the execution. It must never carry a
