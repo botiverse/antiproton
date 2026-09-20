@@ -1,0 +1,39 @@
+/**
+ * The order a run visits its (task, trial) pairs — and why that is a switch rather than a constant.
+ *
+ * Every τ² record ever published walks trials on the outside: `[1×8, 2×8, 3×8]`, verified across all 25
+ * multi-trial records on the manifest. That makes a row's trial number and its position in the run the SAME
+ * NUMBER (`row = (trial - 1) * tasks + taskIndex`), so no quantity computed from those records can separate
+ * "the second attempt at a task" from "later in the run". More records in that order add no information
+ * about the difference; only a run in a different order does.
+ *
+ * So the plan is built here, once, and named in the record. `task-major` runs a task's trials back to back,
+ * which is what breaks the identity: trial 2 and 3 are no longer always in the run's second half.
+ * Randomising was considered and rejected — it turns both explanations into noise instead of separating
+ * them (Vera, 2026-09-20).
+ */
+
+export type RunOrder = "trial-major" | "task-major";
+
+export const RUN_ORDERS: RunOrder[] = ["trial-major", "task-major"];
+
+/**
+ * An unknown name is refused rather than defaulted: a run whose order silently fell back to the old one,
+ * and whose record then says the old one, is indistinguishable from a run that was never re-ordered.
+ */
+export function runOrder(name: string | undefined): RunOrder {
+  const value = name ?? "trial-major";
+  if ((RUN_ORDERS as string[]).includes(value)) return value as RunOrder;
+  throw new Error(`ORDER must be one of ${RUN_ORDERS.join(", ")} (got ${JSON.stringify(value)})`);
+}
+
+/** The pairs in the order they will be run. `trials` counts from 1. */
+export function runPlan<T>(tasks: readonly T[], trials: number, order: RunOrder): Array<{ task: T; trial: number }> {
+  const plan: Array<{ task: T; trial: number }> = [];
+  if (order === "task-major") {
+    for (const task of tasks) for (let trial = 1; trial <= trials; trial++) plan.push({ task, trial });
+  } else {
+    for (let trial = 1; trial <= trials; trial++) for (const task of tasks) plan.push({ task, trial });
+  }
+  return plan;
+}

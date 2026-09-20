@@ -27,6 +27,7 @@ import { driverCommit, recordRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
+import { runOrder, runPlan } from "./plan.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -44,6 +45,8 @@ const TRIALS = Number(process.env.TRIALS ?? 1);
 const N = Number(process.env.N ?? 5);
 const OFFSET = Number(process.env.OFFSET ?? 0);
 const VERBOSE = !!process.env.VERBOSE;
+// Which order the (task, trial) pairs are visited in; an unknown name throws (bench/tau2/plan.ts).
+const ORDER = runOrder(process.env.ORDER);
 
 const here = new URL("./data/", import.meta.url).pathname;
 const BASE_DB: RetailDB = JSON.parse(readFileSync(here + "db.json", "utf8"));
@@ -335,13 +338,13 @@ await api("/bench/basedb", {
 await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
 const selected = TASKS.slice(OFFSET, OFFSET + N);
-console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s), ` +
+console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s) in ${ORDER} order, ` +
   `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
 
 const results: any[] = [];
 const t0Run = Date.now();
-for (let trial = 1; trial <= TRIALS; trial++) {
-  for (const task of selected) {
+for (const { task, trial } of runPlan(selected, TRIALS, ORDER)) {
+  {
     if (VERBOSE) console.log(`\n  task ${task.id} (trial ${trial})`);
     let r;
     try { r = await runTask(task); }
@@ -406,7 +409,7 @@ if (act) {
 }
 const recorded = recordRun("tau2", OBJ, {
   bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
-  tasks: selected.map((t) => t.id), trials: TRIALS, startedAt: new Date(t0Run).toISOString(),
+  tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER, startedAt: new Date(t0Run).toISOString(),
   results, ...passRecord(results, TRIALS),
   tools: toolTotals, endingsAllRows: allEndings, failingRowsByEndingAndCause: failEndings, activity: act,
 });
