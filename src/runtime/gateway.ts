@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
+import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
@@ -353,6 +354,7 @@ export class ToolGateway {
           credential: mount.secretRef
             ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
             : null,
+          credentialRefKind: secretRefKind(mount.secretRef),
           publicConfig: mount.publicConfig,
           connection: {
             get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
@@ -624,6 +626,11 @@ export class ToolGateway {
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
       credential,
+      // What kind of credential the mount names, so a null `credential` can be read as "names none" or
+      // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference
+      // carries the bucket, the tenant and the agent (src/store/refs.ts), and a plugin writes what it
+      // holds into messages a model reads.
+      credentialRefKind: secretRefKind(mount.secretRef),
       publicConfig: mount.publicConfig,
       // Scoped to the mount, not the plugin: two accounts of the same service
       // must never see each other's session.
@@ -639,6 +646,8 @@ export class ToolGateway {
           credential: other.secretRef
             ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
             : null,
+          // The sibling's null is ambiguous in exactly the same three ways as this mount's.
+          credentialRefKind: secretRefKind(other.secretRef),
           connection: connectionFor(other.alias),
           plugin: other.plugin,
           policy: other.policy ?? null,
