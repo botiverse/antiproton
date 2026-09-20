@@ -150,8 +150,19 @@ export function credentialState(
 
 /**
  * The state as a clause a person can act on, so two plugins do not invent two
- * sentences for one state and a page has one string to key on (Nova asked for
- * the identity on the failed call rather than on the mount, 2026-09-20).
+ * sentences for one state (Nova asked for the identity on the failed call
+ * rather than on the mount, 2026-09-20).
+ *
+ * **Anything that renders these states calls this rather than restating it** —
+ * a page included. Two copies of one sentence are not a duplication a reader
+ * notices: each reads as complete, and there is no dependency between them for
+ * a test to fail, so one improves and the other keeps the old wording silently.
+ * That is not hypothetical: the console grew its own copies of all four (#445),
+ * already differing by a conjunction, and `cf/src/ui.ts` had no import of this
+ * function at all — so there was no edge that could have gone red (@Vera found
+ * the missing import). Where a surface genuinely needs different phrasing, say
+ * so and pin the pair with a test on the action each names, rather than leaving
+ * two sentences to drift.
  *
  * A clause about the mount rather than a whole sentence about the call: the
  * caller frames it, because "this call was anonymous" belongs in a failure and
