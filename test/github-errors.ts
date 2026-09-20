@@ -207,6 +207,43 @@ await check("a write refused for want of an account carries the state too", asyn
 });
 
 /**
+ * Which of the two questions a failure answers.
+ *
+ * One flag was answering both and the consumer read only one of them: this file
+ * set `retryable` for a refused quota (nothing happened) and for a 5xx (which
+ * may have happened), `appworld.ts` set it for a 5xx with the comment "5xx may
+ * have landed", and `raft.ts` set it for an uncertain delivery whose own comment
+ * says callers must not retry. A 5xx answers yes to both questions, which is
+ * exactly what one boolean could not say (@Vera's count, 2026-09-20).
+ */
+await check("an exhausted quota says a retry may work, and does not claim anything landed", async () => {
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const e = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok", "agent")));
+  if (e.transient !== true) throw new Error(`a resetting quota was not called transient: ${e.transient}`);
+  // Absent, not false: false is a claim, and a consumer reading
+  // `mayHaveLanded ?? retryable` would read a false as "nothing landed".
+  if ("mayHaveLanded" in e) throw new Error(`a refused call claims something about landing: ${e.mayHaveLanded}`);
+  if (e.retryable !== true) throw new Error(`the transitional flag moved: ${e.retryable}`);
+});
+
+await check("a 5xx answers both questions, because it may have done the thing and may clear", async () => {
+  answer(503, JSON.stringify({ message: "Service unavailable" }), { "content-type": "application/json" });
+  const e = await thrown(() => githubPlugin.invoke("api", { method: "POST", path: "/repos/o/r/issues", body: {} }, ctx("tok", "agent")));
+  if (e.transient !== true || e.mayHaveLanded !== true) {
+    throw new Error(`a 5xx answered ${JSON.stringify({ transient: e.transient, mayHaveLanded: e.mayHaveLanded })}`);
+  }
+  if (e.retryable !== true) throw new Error(`the transitional flag moved: ${e.retryable}`);
+});
+
+await check("a plain refusal answers neither, and still records no claim", async () => {
+  answer(422, JSON.stringify({ message: "Validation Failed" }), { "content-type": "application/json" });
+  const e = await thrown(() => githubPlugin.invoke("api", { method: "POST", path: "/repos/o/r/issues", body: {} }, ctx("tok", "agent")));
+  if (e.transient !== false) throw new Error(`a validation failure was called transient: ${e.transient}`);
+  if ("mayHaveLanded" in e) throw new Error(`claims something about landing: ${e.mayHaveLanded}`);
+  if (e.retryable !== false) throw new Error(`the transitional flag moved: ${e.retryable}`);
+});
+
+/**
  * A job's logs are a redirect to signed storage, and storage refuses our token.
  *
  * Measured on real GitHub (2026-09-15): /actions/jobs/{id}/logs answers 302 to

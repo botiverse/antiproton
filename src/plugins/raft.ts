@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { INBOUND_HOOKS_PER_MOUNT, originProblem, type Plugin, type PluginContext } from "./types.ts";
+import { INBOUND_HOOKS_PER_MOUNT, originProblem, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -91,9 +91,30 @@ function timeout(ctx: PluginContext): number {
     : DEFAULT_TIMEOUT_MS;
 }
 
+/**
+ * The two questions a failure answers, and the flag they replace.
+ *
+ * `retryable` alone could not say which of them was meant: this file set it for
+ * an uncertain delivery while its own comment said callers must not retry, and
+ * `github.ts` set the same flag for a refused quota where nothing happened at
+ * all. So each site now says which question it is answering, and `retryable`
+ * keeps being set exactly where it was until its consumer moves.
+ */
+function marked(
+  error: Error, marks: { transient?: boolean; mayHaveLanded?: boolean; retryable?: boolean },
+): Error {
+  const e = error as Error & PluginErrorFields;
+  if (marks.transient !== undefined) e.transient = marks.transient;
+  // Only ever true: absent has to keep meaning "not reported" (see the contract).
+  if (marks.mayHaveLanded) e.mayHaveLanded = true;
+  e.retryable = marks.retryable ?? true;
+  return e;
+}
+
 function retryable(error: Error, value = true): Error {
-  (error as Error & { retryable?: boolean }).retryable = value;
-  return error;
+  // A transport answer: a 429 or a 5xx may clear on its own. Whether it landed
+  // is not known from the status alone, and a 5xx may have.
+  return marked(error, { transient: value, mayHaveLanded: value, retryable: value });
 }
 
 const DELIVERY_UNCERTAIN =
@@ -103,7 +124,7 @@ function receiveFailure(message: string): Error {
   // `ToolGateway` uses this marker to persist an attempted write as `unknown`.
   // It does not mean callers may retry: receive_events drains/acks a batch, so
   // the message explicitly says the opposite.
-  return retryable(new Error(`${message}; ${DELIVERY_UNCERTAIN}`));
+  return marked(new Error(`${message}; ${DELIVERY_UNCERTAIN}`), { mayHaveLanded: true });
 }
 
 async function call(
@@ -140,7 +161,10 @@ async function call(
   } catch {
     throw options.deliveryMayHaveOccurred
       ? receiveFailure("raft event receive failed before a response was received")
-      : retryable(new Error("raft request failed before a response was received; the operation may already have landed"));
+      : marked(
+        new Error("raft request failed before a response was received; the operation may already have landed"),
+        { mayHaveLanded: true },
+      );
   }
   let data: unknown = null;
   if (response.status === 204) return { status: response.status, data: {} };
@@ -437,11 +461,16 @@ export const raftPlugin: Plugin = {
         current = { ...current, staleHookIds };
         await savePushState(ctx, current);
         if (staleHookIds.length > 0) {
-          throw retryable(new Error("superseded Raft push endpoints could not be cleaned up; try enable_push again"));
+          throw marked(
+            new Error("superseded Raft push endpoints could not be cleaned up; try enable_push again"),
+            { transient: true },
+          );
         }
       }
       if (hookIds(current).length >= INBOUND_HOOKS_PER_MOUNT) {
-        throw retryable(new Error("Raft push endpoint state is full; disable push before enabling it again"));
+        // Not transient and nothing landed: it clears when a person or the agent
+        // disables push, not by waiting.
+        throw marked(new Error("Raft push endpoint state is full; disable push before enabling it again"), {});
       }
       const created = await ctx.inbound.create();
       const replaced = hookIds(current);
