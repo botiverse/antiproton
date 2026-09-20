@@ -23,7 +23,7 @@ import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { createHash } from "node:crypto";
-import { driverCommit, recordRun, workerBuild } from "../record.ts";
+import { beginRun, driverCommit, recordRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
@@ -355,6 +355,9 @@ await api("/bench/basedb", {
 await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
 const selected = TASKS.slice(OFFSET, OFFSET + N);
+// Before the first line of output: the log path has to exist while there is
+// still something to write to it.
+const run = beginRun("tau2", OBJ);
 console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s) in ${ORDER} order, ` +
   `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
 
@@ -424,7 +427,7 @@ if (act) {
     `(${wall ? Math.round((act.activeMs / 1000 / wall) * 100) : 0}%)` +
     (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
 }
-const recorded = recordRun("tau2", OBJ, {
+const recorded = recordRun(run, {
   bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
   tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER,
   ...(DEAFNESS ? { ignoreAnswers: DEAFNESS } : {}),

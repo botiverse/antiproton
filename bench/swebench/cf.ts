@@ -27,7 +27,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
-import { driverCommit, recordRun, workerBuild } from "../record.ts";
+import { beginRun, driverCommit, recordRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
@@ -276,6 +276,9 @@ async function runOne(inst: Instance) {
 
 await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
+// Before the first line of output: the log path has to exist while there is
+// still something to write to it.
+const run = beginRun("swebench", OBJ);
 console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object, container network ${process.env.NETWORK ?? "none"}` +
   `\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(80)}`);
 const out: any[] = [];
@@ -332,7 +335,7 @@ if (act) {
     `(${wall ? Math.round((act.activeMs / 1000 / wall) * 100) : 0}%)` +
     (grading ? `, of which ${(grading / 1000).toFixed(1)}s is this runner grading` : ""));
 }
-const recorded = recordRun("swebench", OBJ, {
+const recorded = recordRun(run, {
   bench: "swebench-verified", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, offset: OFFSET, n: instances.length,
   network: out.map((r: any) => r.network).find(Boolean) ?? null,
   startedAt: new Date(t0Run).toISOString(), results: out, totals, activity: act,
