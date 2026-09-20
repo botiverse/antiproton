@@ -84,6 +84,11 @@ run_suite control-plane-d1 bash test/control-plane-d1.sh
 tc=$(npm run typecheck 2>&1 | tail -1) || true
 echo "$tc"
 case "$tc" in *", 0 new"*) ;; *) echo "typecheck: new errors"; exit 1;; esac
+# Which tree is about to become production, in the log that records the deploy.
+# The same reason as the branch gate's (cf/scripts/suite-verdict.sh): the green
+# above is a fact about one tree, and a deploy log that does not name it cannot
+# later answer "what was actually verified before this went out".
+gate_provenance
 echo "--- all green; deploying ---"
 set -a; . ~/.secrets/antiproton.env; set +a
 bash cf/scripts/deploy.sh "$@"

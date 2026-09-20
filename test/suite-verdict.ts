@@ -83,6 +83,46 @@ check("a new suite costs nothing: only disappearance is refused", () => {
 });
 
 console.log(`\n  Suite verdict\n  ${"─".repeat(56)}`);
+check("the gate's output names the tree it measured", () => {
+  // The verdicts are facts about one tree and used to name none, so the name
+  // had to come from whoever copied them out — from memory, while the branch
+  // moved (2026-09-20: two gate results posted for a PR whose head had already
+  // advanced). Asked here on a repository built for the purpose, so the test
+  // does not depend on the state of the one it runs in.
+  const repo = mkdtempSync(join(tmpdir(), "prov-"));
+  const git = (...a: string[]) => execFileSync("git", ["-C", repo, ...a], { encoding: "utf8" }).trim();
+  git("init", "-q");
+  git("config", "user.email", "t@t"); git("config", "user.name", "t");
+  writeFileSync(join(repo, "a.txt"), "one\n");
+  git("add", "-A"); git("commit", "-qm", "one");
+  const sha = git("rev-parse", "HEAD"), tree = git("rev-parse", "HEAD^{tree}");
+
+  const provenance = () => execFileSync("bash",
+    ["-c", `. "$1/cf/scripts/suite-verdict.sh"; cd "$2"; gate_provenance`, "p", process.cwd(), repo],
+    { encoding: "utf8" }).trim();
+
+  const clean = provenance();
+  if (clean !== `gate: ${sha} (tree ${tree})`) throw new Error(`a clean tree printed ${JSON.stringify(clean)}`);
+
+  // Dirty is the case that most needs saying: what ran is a tree git never
+  // stored, so the line must refuse to give it HEAD's name as if it were one.
+  writeFileSync(join(repo, "a.txt"), "two\n");
+  const dirty = provenance();
+  if (!/UNCOMMITTED CHANGES/.test(dirty)) throw new Error(`a dirty tree printed ${JSON.stringify(dirty)}`);
+  if (dirty === clean) throw new Error("a dirty tree reported exactly what the clean one did");
+  if (new RegExp(`\\(tree ${tree}\\)$`).test(dirty)) {
+    throw new Error(`a dirty run claimed to be tree ${tree}, which is a tree it is not`);
+  }
+});
+
+check("both gates say it, so neither can print numbers with no subject", () => {
+  // One of them is the only record of what was verified before a deploy.
+  for (const f of ["cf/scripts/gate.sh", "cf/scripts/verify-and-deploy.sh"]) {
+    const src = execFileSync("cat", [f], { encoding: "utf8" });
+    if (!/^\s*gate_provenance\s*$/m.test(src)) throw new Error(`${f} does not call gate_provenance`);
+  }
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
