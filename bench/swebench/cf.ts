@@ -308,12 +308,16 @@ function teeTo(path: string): void {
     };
   }
   // And the trace of an uncaught throw, which console.error does not see: Node
-  // writes it straight to fd 2. Patching the console is necessary but not enough
-  // for the case that matters most, which is why this is here rather than
-  // assumed — with only the loop above, a run that throws leaves a log that stops
-  // at its last ordinary line.
+  // writes it straight to fd 2. Patching the console is necessary but not enough,
+  // which is why this handler exists rather than being assumed.
+  //
+  // It goes through `console.error` on purpose. Installing a handler STOPS Node's
+  // own default action, so appending to the file directly would trade one loss for
+  // another: the file would hold the cause and whoever was watching the run would
+  // see the output stop at its last ordinary line and the process exit 1 in
+  // silence. Going through the patched console.error writes it to both.
   process.on("uncaughtException", (e) => {
-    appendFileSync(path, line([e?.stack ?? e]));
+    console.error(e?.stack ?? e);
     process.exit(1);
   });
 }
