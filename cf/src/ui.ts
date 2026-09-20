@@ -1212,6 +1212,12 @@ function pairCalls(events: Ev[]): { calls: Call[]; turns: Ev[] } {
  * a result becomes an event, only prose is left. `callId` is the one key the two
  * events share, which is why it is the join.
  *
+ * The two sides carry the same value because they carry the same id, not because
+ * anyone agreed to a name: it is the id pi hands to `execute(toolCallId, …)`,
+ * which is `model.response.toolCalls[].id` — the one `pairCalls` above already
+ * pairs a result to its call with. A convention could drift; a shared origin
+ * cannot (@cody, 2026-09-20).
+ *
  * Only failures carry an identity — the gateway sets it where a call threw — so a
  * badge appears exactly where knowing it changes what a person does next, and
  * never on the successful public reads that make up most of a trace.
