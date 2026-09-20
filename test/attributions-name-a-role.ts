@@ -7,7 +7,15 @@
  * 24 in `src/plugins`, 12 in `cf/src`, 32 in `test`, against 26 with the `@`.
  * This case used to be called "no attribution … is a bare name", which claimed
  * the wider set; it was reviewed, gated and merged under that name, because
- * every check asked what the name said it asked. Sweeping the older spelling is
+ * every check asked what the name said it asked. Worth keeping, because it is
+ * the part that generalises past this file (@cody's phrasing): **the name of an
+ * assertion travels further than its body.** A reader decides whether to read
+ * the body FROM the name, so an over-wide name hides its own body — @Nova, who
+ * approved the scope extension, measured the PATTERN (`\(@…\)` finds nothing in
+ * `cf/src`) and never had reason to question what the case's name claimed. It is
+ * the same position as an assertion that cannot reach its subject, from the
+ * other side: one promises less than it checks, the other promises more, and
+ * **both are green**. Sweeping the older spelling is
  * a judgement per site rather than an assertion (many of them point at a
  * reproducible observation and should stay), so it belongs in a cleanup someone
  * reads line by line — @Nova's call, and theirs is to leave the gate narrow.
