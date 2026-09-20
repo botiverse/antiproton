@@ -21,6 +21,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, basename } from "node:path";
 import { beginRun, recordRun, type Run } from "../bench/record.ts";
 
+/** A runs tree of this suite's own. Nothing here writes into report/runs: a
+ *  stray record there is one the publish script would send to the bucket. */
+function runsTree(): { runs: string; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "bench-record-"));
+  return { runs: join(dir, "report/runs/"), dir };
+}
+
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
   try { fn(); results.push({ name, ok: true }); }
@@ -28,7 +35,9 @@ function check(name: string, fn: () => void) {
 }
 
 check("the record and the log differ only in their extension", () => {
-  const run = beginRun("tau2", "h9");
+  const { runs, dir } = runsTree();
+  const run = beginRun("tau2", "h9", runs);
+  rmSync(dir, { recursive: true, force: true });
   if (dirname(run.json) !== dirname(run.log)) {
     throw new Error(`the two files are in different directories:\n  ${run.json}\n  ${run.log}`);
   }
@@ -41,7 +50,9 @@ check("the record and the log differ only in their extension", () => {
 });
 
 check("the paths carry the bench and the object, so a directory of them reads", () => {
-  const run = beginRun("swebench", "b_daily_1");
+  const { runs, dir } = runsTree();
+  const run = beginRun("swebench", "b_daily_1", runs);
+  rmSync(dir, { recursive: true, force: true });
   if (!basename(run.json).startsWith("swebench-b_daily_1-")) {
     throw new Error(`the file name does not name the bench and object: ${basename(run.json)}`);
   }
@@ -51,9 +62,17 @@ check("the directory exists when the paths are handed out, not when they are wri
   // A tee opens the log as the run starts. If the day's directory were made
   // by recordRun — where the mkdir used to live — the open would fail on the
   // first run of each day, which is the run nobody is watching.
-  const run = beginRun("tau2", "h9");
-  if (!existsSync(dirname(run.json))) throw new Error(`${dirname(run.json)} does not exist yet`);
-  if (existsSync(run.json)) throw new Error(`beginRun wrote the record; it is meant to only name it: ${run.json}`);
+  //
+  // The day directory must be one that did NOT already exist, which is why
+  // this runs against a tree of its own: in report/runs today's directory is
+  // there whatever the code does, and the check would pass either way.
+  const { runs, dir } = runsTree();
+  const run = beginRun("tau2", "h9", runs);
+  const made = existsSync(dirname(run.json));
+  const wrote = existsSync(run.json);
+  rmSync(dir, { recursive: true, force: true });
+  if (!made) throw new Error(`${dirname(run.json)} does not exist yet, so a tee opening the log now would fail`);
+  if (wrote) throw new Error(`beginRun wrote the record; it is meant to only name it: ${run.json}`);
 });
 
 check("recordRun writes where the handle says, and nowhere else", () => {

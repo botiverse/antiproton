@@ -66,10 +66,18 @@ export function driverCommit(): { commit: string; dirty: boolean } | null {
  */
 export type Run = { runId: string; json: string; log: string };
 
-export function beginRun(bench: string, obj: string): Run {
+/** The runs tree the report page reads, and the default every runner uses. */
+const RUNS = new URL("../report/runs/", import.meta.url).pathname;
+
+export function beginRun(bench: string, obj: string, runs = RUNS): Run {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);
-  const dir = new URL(`../report/runs/${day}/`, import.meta.url).pathname;
+  const dir = `${runs}${day}/`;
+  // Here and not in recordRun, which is hours later: a tee opens the log as
+  // the run starts, and on the first run of any day this directory is the one
+  // thing between it and an ENOENT. `runs` exists so a suite can watch that
+  // happen — against the repo's own tree the day directory is already there,
+  // and an assertion that the mkdir works would pass with the mkdir deleted.
   mkdirSync(dir, { recursive: true });
   const runId = `${bench}-${obj}-${now.getTime().toString(36)}`;
   return { runId, json: `${dir}${runId}.json`, log: `${dir}${runId}.log` };
