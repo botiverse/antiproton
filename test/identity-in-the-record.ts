@@ -140,14 +140,20 @@ await check(`the event the console already reads carries the identity, not only 
   // call produced nothing" rather than "nobody reported the identity", which
   // makes two different absences look alike (@Nova's shape, @Vera's reading).
   const payload = (completed[0] as any).payload ?? {};
+  // Asked BEFORE the presence check, or it can never be the one that speaks:
+  // an implementation that nests the identity instead of lifting it fails the
+  // presence check first, and the reader is told "no identity" for a payload
+  // that has one in the wrong place — a true message pointing at the wrong
+  // repair. Checked by planting exactly that (@cody's `callId: undefined`
+  // finding is the same shape: an assertion that cannot reach its subject).
+  if (payload.result !== undefined && (payload.result as any)?.identity !== undefined) {
+    throw new Error(`the identity is nested inside \`result\`, where a failure's absent result takes it away: ${JSON.stringify(payload)}`);
+  }
   if (payload.identity === undefined) {
     throw new Error(`the recorded event carries no identity, so the console has nothing structured to badge: ${JSON.stringify(payload)}`);
   }
   if (payload.identity !== "unreadable" || payload.credentialRef !== "agent") {
     throw new Error(`the recorded event says ${JSON.stringify({ identity: payload.identity, credentialRef: payload.credentialRef })}`);
-  }
-  if (payload.result !== undefined && payload.result?.identity !== undefined) {
-    throw new Error("the identity is inside `result`, where a failure's absent result takes it away");
   }
 });
 }
