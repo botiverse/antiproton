@@ -106,7 +106,9 @@ const limited = { "content-type": "application/json", "x-ratelimit-remaining": "
 await check("a credential that cannot be read is not reported as a missing account", async () => {
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
-  if (!/write it again/.test(why)) throw new Error(`does not name the action that fixes it: ${why}`);
+  if (!/(has to|must|needs to) write it again/.test(why)) {
+    throw new Error(`does not name the action that fixes it: ${why}`);
+  }
   if (/attach one|has no account attached/.test(why)) throw new Error(`reported as a mount with no account: ${why}`);
 });
 
@@ -149,7 +151,9 @@ await check("a deployment-level credential this deployment lacks sends the deplo
   // to attach (cody's counter-example, verified by Vera in cf/src/runtime.ts).
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
-  if (!/whoever deploys/.test(why)) throw new Error(`does not name who can fix it: ${why}`);
+  if (!/whoever deploys (has to|must|needs to) configure/.test(why)) {
+    throw new Error(`does not say the deployer has to configure it: ${why}`);
+  }
   if (!/attaching an account to the mount will not fix it/.test(why)) throw new Error(`does not rule out attaching one: ${why}`);
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const agentRef = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
@@ -158,7 +162,9 @@ await check("a deployment-level credential this deployment lacks sends the deplo
 
 await check("a write with no account says which of the two states it is in", async () => {
   const named = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "agent")));
-  if (!/write it again/.test(named)) throw new Error(`a mount naming a credential was told to attach one: ${named}`);
+  if (!/(has to|must|needs to) write it again/.test(named)) {
+    throw new Error(`a mount naming a credential was told to attach one: ${named}`);
+  }
   const bare = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "none")));
   // Matches the RECOMMENDATION, not the word: `/attach/` also accepts "should not
   // attach one", so this assertion used to pass a sentence giving the opposite
@@ -206,7 +212,7 @@ await check("the field and the sentence cannot disagree, because one call sets b
   // catch a drift is this: the sentence for the state the field names.
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const e = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
-  if (e.identity !== "unreadable" || !/whoever deploys/.test(e.message)) {
+  if (e.identity !== "unreadable" || !/whoever deploys (has to|must|needs to) configure/.test(e.message)) {
     throw new Error(`field says ${e.identity} and the sentence says: ${e.message}`);
   }
 });

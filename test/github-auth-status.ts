@@ -68,7 +68,11 @@ await check("a credential that cannot be read is a different state, with a diffe
   const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "agent")) as Record<string, unknown>;
   const note = String(r.note ?? "");
   if (r.credential !== "unreadable") throw new Error(`reported the state as ${JSON.stringify(r.credential)}`);
-  if (!/write it again/.test(note)) throw new Error(`does not say the credential has to be rewritten: ${note}`);
+  // The recommending form, not the words: "must NOT write it again" contains
+    // "write it again" (@Rex's shape; falsified by reversing the sentence).
+  if (!/(has to|must|needs to) write it again/.test(note)) {
+    throw new Error(`does not say the credential has to be rewritten: ${note}`);
+  }
   if (/attach one/.test(note)) throw new Error(`sends a person to attach a second account: ${note}`);
 });
 
