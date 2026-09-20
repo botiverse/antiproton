@@ -355,8 +355,8 @@ export class PiAgent {
    * that broke, and it says so loudly rather than travelling on as a message
    * the harness will treat as ordinary. Silence here is how the last two
    * offload failures stayed invisible: written, admitted, and wrong before the
-   * model call (@Vera established the unreachability; this is where the claim
-   * is checked).
+   * model call. The unreachability was established from the records; this is
+   * where that claim is checked rather than trusted.
    */
   #pollJob(id: string): Answered | null {
     const row = this.#sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", id).toArray()[0] as any;

@@ -426,7 +426,7 @@ export class ToolGateway {
     // chosen on the old plugin's `exclusive` while dispatch used the new one.
     // Nothing re-points a mount at a different plugin mid-call, and if
     // something ever does, this is the note that says where to look
-    // (@Rex spotted the gap, 2026-09-12).
+    // (the gap was spotted in review, 2026-09-12).
     const r0 = await this.resolve(ctx, raw);
     if ("error" in r0) return { status: "rejected", error: r0.error };
     if (!this.#plugins.get(r0.mount.plugin)?.exclusive) return this.#invoke(ctx, raw, args, opts);

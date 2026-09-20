@@ -3147,8 +3147,8 @@ export default {
         }
         case "/ui/plugin/choice": {
           // enable / disable / inherit for one plugin, then the page again.
-          // Which fragment to send back is @Nova's call; the whole panel is
-          // the safe default because turning a plugin off changes several
+          // Which fragment to send back is the console's design call; the whole
+          // panel is the safe default because turning a plugin off changes several
           // mounts' rows at once, not just one.
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
