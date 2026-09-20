@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
+import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
+import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 import { toolCallRows } from "../usage/outbox.ts";
 
@@ -353,6 +355,7 @@ export class ToolGateway {
           credential: mount.secretRef
             ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
             : null,
+          credentialRefKind: secretRefKind(mount.secretRef),
           publicConfig: mount.publicConfig,
           connection: {
             get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
@@ -597,12 +600,29 @@ export class ToolGateway {
       await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
-      const e = err as Error & { retryable?: boolean };
+      const e = err as Error & PluginErrorFields & { retryable?: boolean };
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
-      await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
+      // The same two fields go onto the RECORD, not only onto what this call returns. The returned
+      // envelope stops at `pi-tools.ts`, which collapses it into a string; `operation.completed` is
+      // what the console reads, so a page that wants to badge an anonymous failure needs them there
+      // (@Nova traced the two hops, @Vera withdrew the envelope as the criterion, 2026-09-20).
+      await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
+        ...(e.identity === undefined ? {} : { identity: e.identity }),
+        ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
+      });
       await counted("failed");
-      return { status, operationId, error: { code: "tool_error", message: e.message } };
+      // The identity fields travel beside the sentence, not inside it: a page that marks an anonymous
+      // failure should read a field, not match the plugin's wording (#434). Spread only what is there, so
+      // a plugin that said nothing still produces the error every reader already handles.
+      return {
+        status, operationId,
+        error: {
+          code: "tool_error", message: e.message,
+          ...(e.identity === undefined ? {} : { identity: e.identity }),
+          ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
+        },
+      };
     }
   }
 
@@ -624,6 +644,11 @@ export class ToolGateway {
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
       credential,
+      // What kind of credential the mount names, so a null `credential` can be read as "names none" or
+      // "names one that did not arrive" rather than guessed. The KIND, never the reference: a reference
+      // carries the bucket, the tenant and the agent (src/store/refs.ts), and a plugin writes what it
+      // holds into messages a model reads.
+      credentialRefKind: secretRefKind(mount.secretRef),
       publicConfig: mount.publicConfig,
       // Scoped to the mount, not the plugin: two accounts of the same service
       // must never see each other's session.
@@ -639,6 +664,8 @@ export class ToolGateway {
           credential: other.secretRef
             ? await secrets.resolve(other.secretRef, { tenantId: other.tenantId, agentId: other.agentId })
             : null,
+          // The sibling's null is ambiguous in exactly the same three ways as this mount's.
+          credentialRefKind: secretRefKind(other.secretRef),
           connection: connectionFor(other.alias),
           plugin: other.plugin,
           policy: other.policy ?? null,

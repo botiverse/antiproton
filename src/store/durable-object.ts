@@ -1,6 +1,7 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice } from "../plugins/types.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
+import { completedPayload, type OperationIdentity } from "./operation-event.ts";
 import type {
   AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
@@ -426,7 +427,7 @@ export class DurableObjectStore implements StorageAdapter {
 
   async completeOperation(
     tenantId: string, operationId: string, status: OperationStatus, resultRef: string | null,
-    result?: Json,
+    result?: Json, who?: OperationIdentity,
   ) {
     this.#tx(() => {
       this.#sql.exec(
@@ -439,7 +440,7 @@ export class DurableObjectStore implements StorageAdapter {
       if (op) {
         this.#insertEvent({
           tenantId, agentId: op.agent_id, taskId: op.task_id, kind: "operation.completed",
-          payload: { operationId, status, resultRef, ...(result === undefined ? {} : { result }) }, dedupKey: `op:${operationId}:completed`,
+          payload: completedPayload(operationId, status, resultRef, result, who), dedupKey: `op:${operationId}:completed`,
         });
       }
     });
