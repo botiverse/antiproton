@@ -43,3 +43,43 @@ export function deafnessBudget(setting: Deafness | undefined) {
     left() { return left; },
   };
 }
+
+/**
+ * What to do with one event, in one place, because the ORDER is the property.
+ *
+ * The runner used to decide inline, and the cursor moved before the deafness check — so an answer it was
+ * pretending not to hear still told the fallback the answer had been delivered. A test cannot pin that
+ * ordering from outside the module (@Vera: my first test asserted that `decideFromPoll` reacts to two
+ * hard-coded cursors, which is true and is not the runner's behaviour — reversing the fix left it green).
+ * So the decision is a function both the runner and its test call.
+ */
+export type Heard =
+  /** An answer we are deliberately not hearing: nothing happens, and the cursor does NOT move. */
+  | { kind: "ignored" }
+  /** An ordinary event: move the cursor if it carries a position. */
+  | { kind: "advance"; seen: number | null }
+  /** The turn's answer. */
+  | { kind: "answer"; seen: number | null; text: string };
+
+/** One event off the socket. `deaf` is `budget.deaf("socket")`. */
+export function hearSocketEvent(
+  e: { kind?: string; id?: unknown; payload?: { toolCalls?: unknown; text?: unknown } },
+  deaf: boolean,
+): Heard {
+  const text = e.kind === "model.response" && !e.payload?.toolCalls ? e.payload?.text : undefined;
+  const isAnswer = typeof text === "string" && text.length > 0;
+  // Before the cursor, deliberately: see the note above.
+  if (isAnswer && deaf) return { kind: "ignored" };
+  const seen = typeof e.id === "number" ? e.id : null;
+  return isAnswer ? { kind: "answer", seen, text: text as string } : { kind: "advance", seen };
+}
+
+/** One decision from the fallback's poll. `deaf` is `budget.deaf("poll")`. */
+export function hearPollDecision(
+  d: { kind: "answer"; text: string; seq: number } | { kind: "failed"; seq: number },
+  deaf: boolean,
+): Heard | { kind: "failed"; seen: number } {
+  if (d.kind === "failed") return { kind: "failed", seen: d.seq };
+  if (deaf) return { kind: "ignored" };
+  return { kind: "answer", seen: d.seq, text: d.text };
+}

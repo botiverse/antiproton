@@ -28,7 +28,7 @@ import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fal
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
 import { runOrder, runPlan } from "./plan.ts";
-import { deafnessBudget, readDeafness } from "./deafness.ts";
+import { deafnessBudget, hearPollDecision, hearSocketEvent, readDeafness } from "./deafness.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -195,14 +195,11 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         count(taskId, "pollAnswered");
         const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
         if (!d) return;
-        // Same as the socket: an answer we are pretending not to have read must not move the cursor.
-        if (d.kind === "answer" && deafness.deaf("poll")) {
-          if (VERBOSE) console.log("    (ignoring the poll's answer on purpose)");
-          return;
-        }
-        seen.set(taskId, d.seq);
-        if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
-        else { if (!done) count(taskId, "poll"); stop(d.text); }
+        const heard = hearPollDecision(d, deafness.deaf("poll"));
+        if (heard.kind === "ignored") { if (VERBOSE) console.log("    (ignoring the poll's answer on purpose)"); return; }
+        seen.set(taskId, heard.seen!);
+        if (heard.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
+        else { if (!done) count(taskId, "poll"); stop((heard as { text: string }).text); }
       }, () => {
         // Only the request failing counts here; the socket or the next tick will do.
         count(taskId, "pollFailed");
@@ -225,20 +222,17 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         stop(null);
         return;
       }
-      const isAnswer = e.kind === "model.response" && !e.payload?.toolCalls && !!e.payload?.text;
-      // Deliberately unheard, when asked for: the runner behaves as though the push never arrived, and
-      // that has to include the CURSOR. Advancing `seen` past an answer we are pretending not to have seen
-      // would tell the fallback the answer was already delivered (`response > seen` is how it decides), so
-      // the injection would defeat itself and the round would end in `idle_without_answer` — the very
-      // reading this switch exists to avoid producing by accident.
-      if (isAnswer && deafness.deaf("socket")) {
+      // What to do with it, including whether the cursor moves, lives in bench/tau2/deafness.ts so that
+      // the ordering is a function a test can call rather than a shape only this closure knows.
+      const heard = hearSocketEvent(e, deafness.deaf("socket"));
+      if (heard.kind === "ignored") {
         if (VERBOSE) console.log("    (ignoring the socket's answer on purpose)");
         return;
       }
-      if (typeof e.id === "number") seen.set(taskId, e.id);
-      if (isAnswer) {
+      if (heard.seen !== null) seen.set(taskId, heard.seen);
+      if (heard.kind === "answer") {
         if (!done) count(taskId, "push");
-        stop(String(e.payload.text));
+        stop(heard.text);
       }
     };
   });

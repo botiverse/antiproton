@@ -10,7 +10,7 @@ function check(name: string, fn: () => void) {
 }
 function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 
-import { deafnessBudget, readDeafness } from "../bench/tau2/deafness.ts";
+import { deafnessBudget, hearPollDecision, hearSocketEvent, readDeafness } from "../bench/tau2/deafness.ts";
 
 /** The runner's own reading, not a copy of it: one implementation, or the test drifts from the runner. */
 const deafness = (value: string | undefined) => deafnessBudget(readDeafness(value));
@@ -52,7 +52,7 @@ check("a value that is neither is refused, not read as off", () => {
 // answer but still advances `seen` past it tells the fallback the answer was already delivered — the
 // deadline then reads `idle_without_answer`, and the round produces the wrong name while looking fine.
 // Modelled here with the real decision function rather than a description of it.
-import { decideFromPoll, causeFromEvidence, stallEvidence } from "../bench/poll-fallback.ts";
+import { causeFromEvidence, stallEvidence } from "../bench/poll-fallback.ts";
 import { benchPollBody } from "../src/bench/poll-body.ts";
 
 const turn = [
@@ -60,20 +60,39 @@ const turn = [
   { sequence: 9, kind: "model.response", payload: { text: "the answer" } },
 ];
 
-check("an ignored answer must not move the cursor, or the fallback is told it was delivered", () => {
-  const body = benchPollBody(turn, false);
-  // What the runner does when it heard nothing: the cursor still points before the answer.
-  const deafSeen = 4;
-  const d = decideFromPoll(body, deafSeen);
-  assert(d?.kind === "answer", `with the cursor left alone the fallback still sees the answer: ${JSON.stringify(d)}`);
-  assert(causeFromEvidence(stallEvidence(body, deafSeen)) === "answer_undelivered",
-    "the deadline reading is not the name this injection exists to produce");
+check("an ignored answer must not move the cursor — asked of the runner's own decision", () => {
+  // @Vera reversed the fix and this case stayed green, because it used to assert that `decideFromPoll`
+  // reacts to two hard-coded cursors — true, and not the runner's behaviour. So the ordering is a
+  // function now, and the case calls it: with the runner deaf, the answer is ignored AND no cursor comes
+  // back; reverse the order inside `hearSocketEvent` and this goes red.
+  const answer = { kind: "model.response", id: 9, payload: { text: "the answer" } };
+  const deaf = hearSocketEvent(answer, true);
+  assert(deaf.kind === "ignored", `a deaf runner did something with the answer: ${JSON.stringify(deaf)}`);
+  assert(!("seen" in deaf), `the cursor travelled with an ignored answer: ${JSON.stringify(deaf)}`);
 
-  // And what a runner that ignored the answer but advanced the cursor anyway would produce:
-  const movedSeen = 9;
-  assert(decideFromPoll(body, movedSeen) === null, "the fixture does not model the defeat at all");
-  assert(causeFromEvidence(stallEvidence(body, movedSeen)) === "idle_without_answer",
-    "moving the cursor past an ignored answer should produce the wrong name — that is why it must not move");
+  const heard = hearSocketEvent(answer, false);
+  assert(heard.kind === "answer" && heard.seen === 9 && heard.text === "the answer", `hearing it: ${JSON.stringify(heard)}`);
+
+  // Other events still move it, deaf or not: a reconnect resumes from there.
+  const other = { kind: "tool.result", id: 7, payload: {} };
+  for (const d of [true, false]) {
+    const h = hearSocketEvent(other, d);
+    assert(h.kind === "advance" && h.seen === 7, `an ordinary event with deaf=${d}: ${JSON.stringify(h)}`);
+  }
+
+  // And the poll side, which had the same ordering.
+  const ignored = hearPollDecision({ kind: "answer", text: "x", seq: 9 }, true);
+  assert(ignored.kind === "ignored", `a deaf runner took the poll's answer: ${JSON.stringify(ignored)}`);
+  const failed = hearPollDecision({ kind: "failed", seq: 9 }, true);
+  assert(failed.kind === "failed" && failed.seen === 9, "a model failure was swallowed by deafness");
+});
+
+check("what the fallback then reads, with the real decision functions", () => {
+  // The consequence of the case above, end to end: cursor left alone => the deadline sees an answer
+  // nobody took; cursor moved => it reads as delivered and the name is wrong.
+  const body = benchPollBody(turn, false);
+  assert(causeFromEvidence(stallEvidence(body, 4)) === "answer_undelivered", "the name this injection exists for");
+  assert(causeFromEvidence(stallEvidence(body, 9)) === "idle_without_answer", "the defeat it must avoid");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
