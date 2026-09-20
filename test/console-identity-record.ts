@@ -21,6 +21,7 @@ import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { eventList } from "../cf/src/ui.ts";
+import { identityNote, type CredentialRefKind, type CredentialState } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -104,6 +105,49 @@ await check("the page joins on the producer's key, not on a name a test wrote do
   const op = await recorded("none", undefined, "sqlite");
   must(op.payload?.callId === CALL,
     `the record names the call as ${JSON.stringify(op.payload?.callId)}, and the card looks it up by callId`);
+});
+
+/**
+ * The page's words and the plugin's words are not the same string, on purpose:
+ * the identity crosses as fields (#434), a title is read at a glance and a
+ * failure's sentence is read when something broke. What may not diverge is the
+ * ACTION each names for a state — a badge that says "attach one" where the
+ * failure says "write it again" sends the reader to the wrong person, and the
+ * two anonymous states want opposite actions from opposite people.
+ */
+const ACTION: Record<string, { page: RegExp; note: RegExp }> = {
+  none: { page: /attaches an account/, note: /attach one/ },
+  "unreadable:agent": { page: /has to write it again/, note: /has to write it again/ },
+  "unreadable:operator": { page: /whoever deploys/, note: /whoever deploys/ },
+};
+
+await check("page and failure name the same action for a state, in their own words", async () => {
+  const ctxFor = (state: CredentialState, kind?: CredentialRefKind) => ({
+    alias: "svc",
+    credential: state === "attached" ? "x" : null,
+    credentialRefKind: state === "none" ? "none" as const : kind,
+  });
+  const cases: Array<[string, CredentialState, CredentialRefKind | undefined]> = [
+    ["none", "none", undefined],
+    ["unreadable:agent", "unreadable", "agent"],
+    ["unreadable:operator", "unreadable", "operator"],
+  ];
+  for (const [key, state, kind] of cases) {
+    const op = await recorded(state, kind, "sqlite");
+    const html = page(op);
+    const note = identityNote(ctxFor(state, kind));
+    const want = ACTION[key]!;
+    must(want.page.test(html), `the card does not name the action for ${key}`);
+    must(want.note.test(note), `identityNote no longer names it either — the pair moved together: ${note}`);
+  }
+
+  // And not by being the same string: a page that copies the sentence looks
+  // coupled without being it, and the copy is what drifts when one side is
+  // reworded for a place the other does not live in.
+  const noneHtml = page(await recorded("none", undefined, "sqlite"));
+  const noneNote = identityNote(ctxFor("none"));
+  must(!noneHtml.includes(noneNote.replace("the `svc` mount", "this mount")),
+    "the title is a verbatim copy of the failure's clause, which is the coupling this split avoids");
 });
 
 const failed = results.filter((r) => !r.ok);

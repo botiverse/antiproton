@@ -112,17 +112,17 @@ const rowOf = (h: string, id: string) => {
 
 check("an anonymous failure says so on the call, and the title says who can fix it", () => {
   const none = rowOf(withIdentity("none"), "call_c");
-  must(/<span class="badge" title="[^"]*attach[^"]*">anonymous · no account<\/span>/.test(none),
+  must(/<span class="badge" title="[^"]*attaches an account[^"]*">anonymous · no account<\/span>/.test(none),
     `the badge names the state and the action: ${none.slice(0, 400)}`);
 
   const deployed = rowOf(withIdentity("unreadable", "operator"), "call_c");
   must(/>anonymous · credential unreadable</.test(deployed), "a credential that did not arrive is not a missing account");
-  must(/title="[^"]*whoever deploys[^"]*will not fix it[^"]*"/.test(deployed),
+  must(/title="[^"]*whoever deploys[^"]*will not help[^"]*"/.test(deployed),
     "an operator credential sends the reader to whoever deploys, and rules out the wrong fix");
 
   const mine = rowOf(withIdentity("unreadable", "agent"), "call_c");
   must(/title="[^"]*write it again[^"]*"/.test(mine), "an agent credential sends the reader to whoever holds it");
-  must(!/attach one/.test(mine), "and never says attach, which is the one action that cannot help here");
+  must(!/attaches an account/.test(mine), "and never says attach, which is the one action that cannot help here");
 });
 
 check("a call that did use an account says that too, without a warning", () => {

@@ -1270,6 +1270,16 @@ function identityByCall(events: Ev[]): Map<string, Who> {
  * attach an account, versus write again the credential of the account already
  * attached — so the badge says which, and the title says who (`credentialRef`).
  *
+ * The wording is the page's own, deliberately. The identity crosses from the
+ * plugin as fields and not as words (`src/runtime/gateway.ts`, #434), and the
+ * two texts have different jobs: a title is read at a glance beside a label,
+ * while `identityNote`'s sentence is read inside a failure. A string serving
+ * both would be pulled toward one length or the other. What may not diverge is
+ * the ACTION each names for a state — a badge that says "attach one" where the
+ * failure says "write it again" sends the reader to the wrong person, and
+ * `test/console-identity-record.ts` pins that pair (@Rex argued the split,
+ * 2026-09-20).
+ *
  * None of them is coloured. The row's status badge already carries the alarm,
  * and a second red one beside it competes for the same glance while saying a
  * different kind of thing: `rejected` is what happened, the identity is why.
@@ -1282,13 +1292,13 @@ function identityBadge(who: Who | undefined): string {
     return ` <span class="badge" title="this mount's account was used, so the answer is about that account, not a missing one">account used</span>`;
   }
   if (who.identity === "none") {
-    return ` <span class="badge" title="this mount has no account attached, and a person can attach one">anonymous · no account</span>`;
+    return ` <span class="badge" title="nothing is attached here: a person attaches an account to this mount">anonymous · no account</span>`;
   }
   if (who.identity === "unreadable") {
     const deployed = who.credentialRef === "operator" || who.credentialRef === "env";
     const title = deployed
-      ? "this mount names a credential this deployment does not have, so whoever deploys has to configure it there; attaching an account to the mount will not fix it"
-      : "this mount names an account whose credential could not be read, so whoever holds that credential has to write it again";
+      ? "the credential named here belongs to the deployment, which does not hold it: whoever deploys configures it there, and attaching an account to the mount will not help"
+      : "a credential is named here but did not arrive: whoever holds it has to write it again, and attaching another account will not help";
     return ` <span class="badge" title="${esc(title)}">anonymous · credential unreadable</span>`;
   }
   return "";
