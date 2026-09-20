@@ -20,11 +20,22 @@ import type { CredentialRefKind, CredentialState, PluginChoice } from "../plugin
 import type { UsageRow } from "../usage/outbox.ts";
 
 /**
- * Who a finished call was made as. Declared here, beside `completeOperation`,
- * because it is part of that call's contract; `src/store/operation-event.ts`
- * puts it on the event both backends write.
+ * What a finished call records beyond its status. Declared here, beside
+ * `completeOperation`, because it is part of that call's contract;
+ * `src/store/operation-event.ts` puts it on the event both backends write.
  */
-export interface OperationIdentity {
+export interface CompletedFacts {
+  /**
+   * The MODEL's id for the tool call this operation served — the same string
+   * as the matching `tool.result`'s `callId`, because both come from
+   * `model.response.toolCalls[].id`. It is recorded, never acted on, and it is
+   * NOT `idempotencyKey`: one `run_js` call makes many host calls under one
+   * id (`${toolCallId}:${n}` in src/runtime/pi-tools.ts), so the key is the
+   * identity of a request and this is the identity of the call. Which also
+   * means it is not unique: several operations can name the same one.
+   */
+  callId?: string;
+  /** Who the call was made as, when the plugin said. */
   identity?: CredentialState;
   credentialRef?: CredentialRefKind;
 }
@@ -142,7 +153,7 @@ export interface StorageAdapter {
     /** Which identity the call was made with, on the event rather than only on
      *  the returned envelope — see src/store/operation-event.ts for why the
      *  event is the channel that reaches a page. */
-    who?: OperationIdentity,
+    facts?: CompletedFacts,
   ): Promise<void>;
 
   /** Registers a wait, resolving it immediately if the operation already finished. */

@@ -64,7 +64,9 @@ export interface ToolResult {
 }
 
 export interface ToolHost {
-  invoke(call: { tool: string; args: Json; opts?: unknown }): Promise<ToolResult>;
+  /** `callId` is the model's id for this tool call, passed to be RECORDED. It is
+   *  not `opts.idempotencyKey`: one call can make several requests. */
+  invoke(call: { tool: string; args: Json; opts?: unknown; callId?: string }): Promise<ToolResult>;
 }
 
 /**
@@ -199,13 +201,15 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
     // pi runs a turn's tool calls in parallel unless a tool says otherwise, and
     // a plugin whose mount owns one container cannot survive that.
     ...(t.exclusive ? { executionMode: "sequential" as const } : {}),
-    async execute(_toolCallId: string, params: Json) {
+    async execute(toolCallId: string, params: Json) {
       // A tool that declares `confirm` itself owns the word; only tools that
       // do not are eligible for the agent's hold. Today none declares it, so
       // this changes nothing — it keeps an appworld catalogue that grows a
       // `confirm` parameter tomorrow from losing it silently.
       const lifted = declaresConfirm(t.parameters) ? { args: params, confirm: false } : liftConfirm(params);
-      const res = await host.invoke({ tool: t.address, args: lifted.args, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
+      // The model's id for this call travels with it, so the operation it starts can be lined up
+      // with the `tool.result` the console already pairs by that same id (cf/src/ui.ts).
+      const res = await host.invoke({ tool: t.address, args: lifted.args, callId: toolCallId, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
       if (res.status !== "succeeded") {
         // pi asks tools to throw rather than encode failure in content, so the
         // harness can tell a refusal from an answer.
@@ -405,6 +409,10 @@ export function runJsTool(
             ...call,
             tool: address(call.tool),
             args: lifted.args,
+            // Every host call a script makes serves this ONE model call, so they all name it --
+            // which is exactly why the id is not the idempotency key below: that one has to differ
+            // per request, and this one has to be the same for all of them.
+            callId: toolCallId,
             opts: { ...(call.opts ?? {}), ...(lifted.confirm ? { confirm: true } : {}), idempotencyKey: `${toolCallId}:${n++}` },
           });
         },

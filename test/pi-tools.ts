@@ -515,6 +515,46 @@ await check("a plugin's presence is asked by plugin and answered from the offere
   }
 });
 
+await check("模型给这次调用的 id 跟着请求走,原样交给 host", async () => {
+  // pi hands `execute` the id it put on `model.response.toolCalls[]`, and the
+  // console pairs a `tool.result` with that same id. Passing it on is what lets
+  // the operation the call starts be lined up with the card the person is
+  // looking at, instead of being matched by wording.
+  const seen: any[] = [];
+  const [tool] = bridgeTools([named("get", "web.get")],
+    { async invoke(call: any) { seen.push(call); return { status: "succeeded", operationId: "op" }; } });
+  await (tool as any).execute("toolu_abc", {});
+  if (seen.length !== 1) throw new Error(`the host was called ${seen.length} times`);
+  if (seen[0].callId !== "toolu_abc") throw new Error(`the host was handed callId ${JSON.stringify(seen[0].callId)}`);
+  // And it is written down, not acted on: nothing about how the call runs changed.
+  if (seen[0].opts?.callId !== undefined) throw new Error("the id leaked into the options that decide how the call runs");
+});
+
+await check("一次 run_js 里的每个 host 调用同属一个 callId,而幂等键各不相同", async () => {
+  // The distinction the two fields exist for: `idempotencyKey` has to DIFFER
+  // per request or the second call would be refused as a repeat of the first,
+  // and `callId` has to be the SAME or the operations a script starts cannot be
+  // attributed to the one call the model made. Collapsing them loses one or the
+  // other, and the script case is where they visibly come apart.
+  const seen: any[] = [];
+  const host = { async invoke(call: any) { seen.push(call); return { status: "succeeded", operationId: "op" }; } };
+  const sandbox = {
+    async execute(_source: string, h: any) {
+      await h.invoke({ tool: "web.get", args: {} });
+      await h.invoke({ tool: "web.get", args: {} });
+      return { status: "completed", outputs: [], hostCalls: 2 };
+    },
+  };
+  const tool: any = runJsTool(sandbox as any, host as any, { tools: qualifyMountedTools([named("get", "web.get")]) });
+  await tool.execute("toolu_js", { source: "x" });
+  if (seen.length !== 2) throw new Error(`expected two host calls, got ${seen.length}`);
+  if (!seen.every((c) => c.callId === "toolu_js")) {
+    throw new Error(`the two calls name ${JSON.stringify(seen.map((c) => c.callId))}`);
+  }
+  const keys = seen.map((c) => c.opts?.idempotencyKey);
+  if (new Set(keys).size !== 2) throw new Error(`the idempotency keys did not differ: ${JSON.stringify(keys)}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

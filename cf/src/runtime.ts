@@ -956,8 +956,9 @@ export class AgentRuntime {
     const artifacts = this.#artifacts;
     const sql = this.#deps.ctx.storage.sql;
     return {
-      async invoke(call: { tool: string; args: any; opts?: any }): Promise<ToolResult> {
-        const res = await gw.invoke(ctx, call.tool, call.args, call.opts);
+      async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
+        const res = await gw.invoke(ctx, call.tool, call.args,
+          { ...(call.opts ?? {}), ...(call.callId === undefined ? {} : { callId: call.callId }) });
         // Work that has started and outlives this call (task #16). The model is
         // told at once that it may keep going; the job is checked on the alarm
         // and its result comes back as a message.
