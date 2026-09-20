@@ -13,6 +13,15 @@
  * them (Vera, 2026-09-20).
  */
 
+/**
+ * What the first task-major run (2026-09-20, `tau2-order_tm-mu9i1fxl`) showed about the DESIGN, which
+ * outlives what it showed about the question: `task-major` changes what a position in the run MEANS.
+ * Thirds of the run are now thirds of the TASK LIST, not trial 1 / 2 / 3, which is exactly the point — trial
+ * and position stop being one variable. The cost is that each cell gets smaller: a task's three trials sit
+ * together, so the run says more about within-task trends and less about a column mean. One round of it had
+ * a single informative pair (Vera). Choose `task-major` to separate the two variables, not to measure either
+ * one precisely, and expect to need several rounds for anything else.
+ */
 export type RunOrder = "trial-major" | "task-major";
 
 export const RUN_ORDERS: RunOrder[] = ["trial-major", "task-major"];
