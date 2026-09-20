@@ -163,14 +163,10 @@ export function credentialState(
  * and that was the defect — while its `attached` one carried a clause these
  * sentences do not, because a badge someone glances at and a sentence in a
  * failure are not the same job. Forcing one string on both would have cost the
- * badge that clause or stretched this one to fit a tooltip. That distinction is
- * @Nova's, from the console side, in #plugins:770a1824; the deeper reason is
- * @Rex's, which @Nova relayed in the same thread: identity crosses to a page as
- * a FIELD — `identity`, `credentialRef` — precisely so a page never has to read
- * or reproduce this prose. (Both names say where to check them, because a name
- * is the one claim in a comment a later reader cannot re-derive from this
- * repository — @Rex, same thread.) So what is pinned there is that both name
- * the same action (`attach` · `write it again` · `whoever deploys`), with
+ * badge that clause or stretched this one to fit a tooltip. The reason
+ * underneath: identity crosses to a page as a FIELD — `identity`,
+ * `credentialRef` — precisely so a page never has to read or reproduce this
+ * prose. So what is pinned there is that both name the same action (`attach` · `write it again` · `whoever deploys`), with
  * literal copying refused — which makes "just share the string" fail the check rather than pass
  * it. **The action pattern has to match the action, not either side's current
  * phrasing**, or the refusal never runs: @Nova first matched on their own
@@ -180,8 +176,9 @@ export function credentialState(
  * written for copies was never asked. **And "matches the action" means matches
  * the RECOMMENDATION of it**: `/attach/` was loose enough to pass
  * "attaching is not possible", so an assertion whose whole job is to say which
- * advice was given accepted the opposite advice (@Vera planted it, @Nova
- * narrowed the pattern to the recommending forms). A pattern wide enough to
+ * advice was given accepted the opposite advice — @Vera planted exactly that
+ * sentence and the suites stayed green, which is what sent the pattern to the
+ * recommending forms. A pattern wide enough to
  * survive a rewording is also wide enough to swallow its own negation — the
  * two pressures pull opposite ways, and only the second one fails quietly.
  *
