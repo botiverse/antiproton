@@ -83,6 +83,29 @@ check("a new suite costs nothing: only disappearance is refused", () => {
 });
 
 console.log(`\n  Suite verdict\n  ${"─".repeat(56)}`);
+check("a suite's name and its verdict never touch, whatever it is called", () => {
+  // `printf "%-22s"` pads but does not truncate, so a 22-character name filled
+  // the field exactly and the verdict was printed against it —
+  // `identity-in-the-recordok (5)`. Five suites are that long today, and
+  // @Vera's `grep "^<name> "` found none of them while re-running the gate,
+  // which nearly became "the gate is missing four suites" (2026-09-20).
+  // Asked of the LONGEST name in the repo plus one that is longer than any,
+  // so the rule holds for whatever is added next rather than for today's list.
+  const names = execFileSync("bash", ["-c", 'for f in test/*.ts; do basename "$f" .ts; done'],
+    { encoding: "utf8" }).trim().split("\n");
+  const longest = names.reduce((a, b) => (b.length > a.length ? b : a));
+  for (const n of [...names, "a-suite-name-far-longer-than-any-field-width"]) {
+    const line = sh(`suite_name "$1"; echo "ok (3)"`, "", n);
+    if (!new RegExp(`^${n} `).test(line)) {
+      throw new Error(`${n} (${n.length} chars) printed as ${JSON.stringify(line)}: nothing can find it by name`);
+    }
+  }
+  // And the padding is still doing its job for the ordinary case.
+  const short = sh(`suite_name "$1"; echo "ok (3)"`, "", "auth");
+  if (!/^auth {19}ok \(3\)$/.test(short)) throw new Error(`the column stopped aligning: ${JSON.stringify(short)}`);
+  if (longest.length < 22) throw new Error("no name is long enough to exercise the boundary any more; keep the synthetic one");
+});
+
 check("the gate's output names the tree it measured", () => {
   // The verdicts are facts about one tree and used to name none, so the name
   // had to come from whoever copied them out — from memory, while the branch

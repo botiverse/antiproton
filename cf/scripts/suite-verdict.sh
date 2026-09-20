@@ -72,3 +72,18 @@ gate_provenance() {
     echo "gate: $sha (tree $tree)"
   fi
 }
+
+# suite_name: the name column of a gate's output line.
+#
+# `printf "%-22s"` PADS but does not TRUNCATE, so a name of 22 characters or
+# more filled the field exactly and the verdict was printed hard against it:
+# `identity-in-the-recordok (5)`. Five suites are that long today, all of them
+# recent, so the lines had silently stopped being parseable — and @Vera, re-
+# running the gate after my pkill, nearly reported "the gate is missing four
+# suites" from `grep "^<name> "` finding nothing. A false accusation, produced
+# by a formatting choice.
+#
+# The trailing space is OUTSIDE the field width, so it cannot be eaten by a
+# long name: every line has at least one space between the two, whatever
+# anybody names a suite next.
+suite_name() { printf "%-22s " "$1"; }

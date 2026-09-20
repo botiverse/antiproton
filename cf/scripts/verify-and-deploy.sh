@@ -57,7 +57,7 @@ esac
 NEEDS_SERVICE=" appworld live-e2e live-github "  # a live AppWorld server; real GitHub
 run_suite() {  # name, command...
   local name="$1"; shift
-  printf "%-22s" "$name"
+  suite_name "$name"
   local out n
   if ! out=$("$@" 2>&1); then echo FAIL; exit 1; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
@@ -66,7 +66,7 @@ run_suite() {  # name, command...
 }
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
-  case "$NEEDS_SERVICE" in *" $t "*) printf "%-22sskipped (needs a live service)\n" "$t"; continue;; esac
+  case "$NEEDS_SERVICE" in *" $t "*) suite_name "$t"; echo "skipped (needs a live service)"; continue;; esac
   run_suite "$t" node "$f"
 done
 # The storage conformance suite on real Durable Object SQLite (local workerd, no network).

@@ -58,7 +58,7 @@ rm -f "$in_base"
 if [ -n "$removed" ]; then echo "$removed"; fails=$((fails+1)); fi
 
 run_suite() {
-  local name="$1"; shift; printf "%-22s" "$name"; local out n
+  local name="$1"; shift; suite_name "$name"; local out n
   if ! out=$("$@" 2>&1); then echo FAIL; printf '%s\n' "$out" | tail -15; fails=$((fails+1)); return; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing)"; fails=$((fails+1)); return; fi
@@ -67,7 +67,7 @@ run_suite() {
 
 for f in test/*.ts; do
   t=$(basename "$f" .ts)
-  case "$NEEDS_SERVICE" in *" $t "*) printf "%-22sskipped (needs a live service)\n" "$t"; continue;; esac
+  case "$NEEDS_SERVICE" in *" $t "*) suite_name "$t"; echo "skipped (needs a live service)"; continue;; esac
   run_suite "$t" node "$f"
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
