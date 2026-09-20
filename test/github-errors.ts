@@ -10,7 +10,7 @@
  * person had to work out for themselves that an account was missing.
  */
 import { githubPlugin } from "../src/plugins/github.ts";
-import type { ToolError } from "../src/plugins/types.ts";
+import type { PluginError } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -34,8 +34,8 @@ async function failure(fn: () => Promise<unknown>): Promise<string> {
 }
 
 /** The thrown error itself, for what it carries beside its message. */
-async function thrown(fn: () => Promise<unknown>): Promise<ToolError> {
-  try { await fn(); } catch (e) { return e as ToolError; }
+async function thrown(fn: () => Promise<unknown>): Promise<PluginError> {
+  try { await fn(); } catch (e) { return e as PluginError; }
   throw new Error("expected the call to fail, and it succeeded");
 }
 

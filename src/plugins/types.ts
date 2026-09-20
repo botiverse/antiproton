@@ -195,10 +195,11 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
  * the same morning this was written (Nova, 2026-09-20). So the state travels as
  * data beside the message, and the message stays the wording.
  *
- * The gateway copies these into the failure it records; a field it does not
- * copy is simply absent, and absent is a state readers already handle.
+ * The gateway copies these into the failure it records (`ToolError` in
+ * `src/core/tools.ts`, which has to declare them to receive them); a field it
+ * does not copy is simply absent, and absent is a state readers already handle.
  */
-export interface ToolErrorFields {
+export interface PluginErrorFields {
   /**
    * Which identity the call was made with. Same value as `credentialState`, so
    * a reader badging a failure does not derive it from the sentence.
@@ -217,8 +218,16 @@ export interface ToolErrorFields {
   retryable?: boolean;
 }
 
-/** An error carrying them, which is what every plugin throws. */
-export type ToolError = Error & ToolErrorFields;
+/**
+ * An error carrying them, which is what every plugin throws.
+ *
+ * Not `ToolError`: that name is taken by the *recorded* failure in
+ * `src/core/tools.ts` — `{ code, message, … }`, what the gateway hands back and
+ * a page reads. This is the thrown side. Naming both of them `ToolError` is the
+ * defect this whole line of work is about, one directory apart, and it cost a
+ * typecheck to notice.
+ */
+export type PluginError = Error & PluginErrorFields;
 
 /**
  * Stamp the identity a call was made with onto the error it failed with.
@@ -228,8 +237,8 @@ export type ToolError = Error & ToolErrorFields;
  */
 export function markIdentity<E extends Error>(
   error: E, ctx: Pick<PluginContext, "credential" | "credentialRefKind">,
-): E & ToolErrorFields {
-  const marked = error as E & ToolErrorFields;
+): E & PluginErrorFields {
+  const marked = error as E & PluginErrorFields;
   marked.identity = credentialState(ctx);
   if (ctx.credentialRefKind !== undefined) marked.credentialRef = ctx.credentialRefKind;
   return marked;
