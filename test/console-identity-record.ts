@@ -136,6 +136,19 @@ await check("page and failure name the same action for a state, in their own wor
     ["unreadable:agent", "unreadable", "agent"],
     ["unreadable:operator", "unreadable", "operator"],
   ];
+
+  // The copy check goes FIRST because it is the stronger claim: a copy names
+  // the same action by construction, so it can only ever fail where the action
+  // check also would, while the reverse is not true. A stronger assertion
+  // standing behind a weaker one is answered by the weaker one's failure and
+  // never speaks — which is how this pair failed an hour ago, when the action
+  // pattern was tied to this page's phrasing (@Vera's ordering rule, and the
+  // defence that survives someone tightening that pattern again).
+  const noneHtml = page(await recorded("none", undefined, "sqlite"));
+  const noneNote = identityNote(ctxFor("none"));
+  must(!noneHtml.includes(noneNote.replace("the `svc` mount", "this mount")),
+    "the title is a verbatim copy of the failure's clause, which is the coupling this split avoids");
+
   for (const [key, state, kind] of cases) {
     const op = await recorded(state, kind, "sqlite");
     const html = page(op);
@@ -145,13 +158,6 @@ await check("page and failure name the same action for a state, in their own wor
     must(want.note.test(note), `identityNote no longer names it either — the pair moved together: ${note}`);
   }
 
-  // And not by being the same string: a page that copies the sentence looks
-  // coupled without being it, and the copy is what drifts when one side is
-  // reworded for a place the other does not live in.
-  const noneHtml = page(await recorded("none", undefined, "sqlite"));
-  const noneNote = identityNote(ctxFor("none"));
-  must(!noneHtml.includes(noneNote.replace("the `svc` mount", "this mount")),
-    "the title is a verbatim copy of the failure's clause, which is the coupling this split avoids");
 });
 
 const failed = results.filter((r) => !r.ok);
