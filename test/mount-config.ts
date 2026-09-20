@@ -801,7 +801,7 @@ await check("without a lease, quiet answers that there is nothing to postpone an
  * The tool's summary used to promise a release without conditions, while the
  * call that only lists what is kept performs none — so a model reading
  * `{kept: [], note}` could not tell whether its container had just been taken
- * away (Vera, 2026-09-14). The field exists precisely so that nobody has to
+ * away. The field exists precisely so that nobody has to
  * infer it, which is a property worth a case of its own: removed, the plugin
  * still passes everything else (Vera checked, and it did).
  */
@@ -860,7 +860,7 @@ await check("start_from 的每一个结局都直说【释放了没有】,而且�
  * sentence green.** "Persists between calls" was never true of a deployment
  * with no idle lease — which is production: a settled turn hands its containers
  * back. Vera's probe found nine containers for one agent, `uses: 1` each, while
- * the model quoted the line (cody, 2026-09-14). So the assertions now name the
+ * the model quoted the line. So the assertions now name the
  * lifetime the runtime actually gives — this turn — and refuse the promise that
  * outlived it. Three agreeing statements are worth nothing if all three are
  * wrong, and only the wording can be checked here; what makes it true is
@@ -870,7 +870,7 @@ await check("run, shell and the per-execution reminder end the container the sam
   const run = run9.tools.find((t) => t.name === "run")!.summary;
   const shell = run9.tools.find((t) => t.name === "shell")!.summary;
   const reminder = boxReminder("box");
-  // With a lease (tygg, 2026-09-15) all three state the other lifetime, and none of them the turn's.
+  // With a lease all three state the other lifetime, and none of them the turn's.
   const lease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
   const leased = sandboxPlugin(null as any, "local", lease);
   const leasedReminder = boxReminder("box", lease);
@@ -885,7 +885,7 @@ await check("run, shell and the per-execution reminder end the container the sam
     if (!/after 30 idle minutes it is released/.test(text) || !/5 minutes before that you are told/.test(text)) {
       throw new Error(`${where} does not state the lease's own numbers: ${text.slice(0, 240)}`);
     }
-    // The agent can keep the box, and the text says with what (tygg, 2026-09-15).
+    // The agent can keep the box, and the text says with what.
     if (!/`quiet` postpones the release/.test(text)) {
       throw new Error(`${where} does not say the release can be postponed with quiet: ${text.slice(0, 240)}`);
     }
@@ -1462,7 +1462,7 @@ await check("an unreadable session or environment is dropped, and the container 
  * came from. Creation then wrote the new record without them, so the first
  * command in the next container erased the list — `start_from` answered
  * "nothing kept", and the snapshots stayed in run9, billed, with nothing here
- * naming them (Piper, 2026-09-15, found while recording images).
+ * naming them.
  */
 await check("starting a new container keeps the list of kept environments", async () => {
   const kept = globalThis.fetch;
@@ -1637,7 +1637,7 @@ await check("a mount reports how many entries of its record it could not read", 
  * The row itself, and not only what its lists hold.
  *
  * The count exists so that leniency which keeps a billed container does not
- * also hide a corrupt record (Rex, 2026-09-15), and the case it did not cover
+ * also hide a corrupt record, and the case it did not cover
  * is the one that costs the most: when the row does not read at all,
  * `asBoxState` answers "no container", the idle sweep skips a mount with no
  * `boxId` (cf/src/runtime.ts), and the console draws a clean idle mount. Those
@@ -2132,7 +2132,7 @@ await check("the catalogue offers a mount's label, and does not call it an accou
 await check("从盒子里存出来的文件,名字是【解析过的路径】,不是原样拼进去", async () => {
   // The key sanitised characters and kept segments, so a saved file could be
   // named `work/../etc/x` — which the reader refuses (#289), leaving a file an
-  // agent saved and could never open again (cody, 2026-09-13). The name is now
+  // agent saved and could never open again. The name is now
   // what the box itself would call the file.
   const cases: Array<[string, string]> = [
     ["/work/out.txt", "work/out.txt"],
@@ -2233,7 +2233,7 @@ const ILLEGAL_ORIGINS = [
   "https://api.example.com#top", "https://user:pw@api.example.com", "https://user@api.example.com",
   "http://api.example.com", "http://10.0.0.1", "ftp://api.example.com", "file:///etc/passwd",
   "api.example.com", "", "/internal",
-  // Parse to the right origin but are not written as one (cody, 2026-09-17).
+  // Parse to the right origin but are not written as one.
   "https:api.example.com", "https://api.example.com/.", "https://api.example.com/ ", " https://api.example.com",
   "https://api.example.com:443", "https://API.example.com", "http://LOCALHOST:8787",
 ];

@@ -54,7 +54,7 @@ await check("a path that moves or has an empty segment resolves to nothing", asy
 
 await check("each of the three kinds round-trips, and a shown reference is never raw", async () => {
   // The kind is where the object was written, so it survives the round trip
-  // without being named anywhere (Vera, 2026-09-14).
+  // without being named anywhere.
   for (const path of ["op_7f3a.json", "state/huge2.json", "sandbox/box-1/work/sub/out.txt"]) {
     const rawRef = `r2://antiproton-artifacts/t/t-me/u-me/${path}`;
     const shown = toAgentRef(rawRef, me);

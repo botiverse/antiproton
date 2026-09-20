@@ -8,7 +8,7 @@
  * the one test that would have noticed died the same day."
  *
  * The same two refusals are what a *stale* deploy produces, which is why they
- * are worth pinning now (Piper, 2026-09-13). Production state moves forward on
+ * are worth pinning now. Production state moves forward on
  * its own: `repinMounts` lifts every mount to the registry's version, and the
  * sandbox rename rewrote `mounts.plugin` from `run9` to `sandbox`. Ship code
  * older than either and the rows outlive it — a lower registry version makes
