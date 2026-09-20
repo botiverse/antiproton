@@ -18,7 +18,7 @@
  *
  *   N=8 TRIALS=3 node bench/tau2/cf.ts
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
@@ -357,7 +357,52 @@ await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 const selected = TASKS.slice(OFFSET, OFFSET + N);
 // Before the first line of output: the log path has to exist while there is
 // still something to write to it.
+//
+// Tee this run's output into its log, so the record and its log cannot be
+// separated by where the caller happened to redirect. The path comes from
+// `beginRun`, and that is the point: the caller does not choose it.
+//
+// One patch point, not one per call site. There are eighteen `console.log` calls
+// here and no shared logger, so writing to the file at each of them would mean
+// eighteen places have to remember, and the nineteenth never would.
+//
+// `appendFileSync` flushes per line, which is what a run that dies mid-way needs:
+// it leaves what it printed, and that file is then the only evidence of that run.
+//
+// `console.error` is teed too, because a run's diagnostics usually arrive there
+// rather than on the terminal's ordinary stream.
+//
+// `args.map(String)` is faithful *here*, because every argument passed in this
+// runner is already a string. It is not console.log's general behaviour — an
+// object would become `[object Object]` and `%s` would not be substituted — so a
+// call added later with anything else would read differently in the file than in
+// the terminal.
+function teeTo(path: string): void {
+  const line = (args: unknown[]) => args.map(String).join(" ") + "\n";
+  for (const which of ["log", "error"] as const) {
+    const say = console[which].bind(console);
+    console[which] = (...args: unknown[]) => {
+      say(...args);
+      appendFileSync(path, line(args));
+    };
+  }
+  // And the trace of an uncaught throw, which console.error does not see: Node
+  // writes it straight to fd 2. Patching the console is necessary but not enough,
+  // which is why this handler exists rather than being assumed.
+  //
+  // It goes through `console.error` on purpose. Installing a handler STOPS Node's
+  // own default action, so appending to the file directly would trade one loss for
+  // another: the file would hold the cause and whoever was watching the run would
+  // see the output stop at its last ordinary line and the process exit 1 in
+  // silence. Going through the patched console.error writes it to both.
+  process.on("uncaughtException", (e) => {
+    console.error(e?.stack ?? e);
+    process.exit(1);
+  });
+}
+
 const run = beginRun("tau2", OBJ);
+teeTo(run.log);
 console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s) in ${ORDER} order, ` +
   `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
 
