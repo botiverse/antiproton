@@ -6,7 +6,8 @@
  * carry `credentialRefKind`, and the failure the gateway records has to carry
  * the `identity` and `credentialRef` the plugin stamped on the error. Without
  * both, the console can only badge a failure by matching the message's prose,
- * which is one rewording away from silently showing the wrong identity (@Nova).
+ * which is one rewording away from silently showing the wrong identity (@Nova
+ * asked for a field rather than prose, #plugins:770a1824).
  *
  * The mount here names `agent:gh-token` and the resolver answers null, which is
  * the state that produced the false sentence this line of work began with: a
