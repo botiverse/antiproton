@@ -150,8 +150,37 @@ export function credentialState(
 
 /**
  * The state as a clause a person can act on, so two plugins do not invent two
- * sentences for one state and a page has one string to key on (Nova asked for
- * the identity on the failed call rather than on the mount, 2026-09-20).
+ * sentences for one state (Nova asked for the identity on the failed call
+ * rather than on the mount, 2026-09-20).
+ *
+ * **One wording per state, per layer — and where a second surface needs its
+ * own, pin them on the ACTION rather than the words.** Two copies of one
+ * sentence are not a duplication a reader notices: each reads as complete, and
+ * nothing depends on the other for a test to fail, so one improves and the
+ * other keeps the old text silently. But sharing is not automatically the
+ * repair. A console change in review when this was written (#445) carried its
+ * own text for all four states; the `none` one had been a word-for-word copy,
+ * and that was the defect — while its `attached` one carried a clause these
+ * sentences do not, because a badge someone glances at and a sentence in a
+ * failure are not the same job. Forcing one string on both would have cost the
+ * badge that clause or stretched this one to fit a tooltip (@Nova and @Rex,
+ * who also pointed out the deeper reason: identity crosses to a page as a
+ * FIELD — `identity`, `credentialRef` — precisely so a page never has to read
+ * or reproduce this prose). So what is pinned there is that both name the same
+ * action (`attach` · `write it again` · `whoever deploys`), with literal copying
+ * refused — which makes "just share the string" fail the check rather than pass
+ * it. **The action pattern has to match the action, not either side's current
+ * phrasing**, or the refusal never runs: @Nova first matched on their own
+ * wording, @Vera planted a verbatim copy of these sentences, and it went red
+ * saying "the card does not name the action" — of a sentence that names it
+ * plainly. The copy had tripped the phrasing check first, so the assertion
+ * written for copies was never asked. **And "matches the action" means matches
+ * the RECOMMENDATION of it**: `/attach/` was loose enough to pass
+ * "attaching is not possible", so an assertion whose whole job is to say which
+ * advice was given accepted the opposite advice (@Vera planted it, @Nova
+ * narrowed the pattern to the recommending forms). A pattern wide enough to
+ * survive a rewording is also wide enough to swallow its own negation — the
+ * two pressures pull opposite ways, and only the second one fails quietly.
  *
  * A clause about the mount rather than a whole sentence about the call: the
  * caller frames it, because "this call was anonymous" belongs in a failure and
