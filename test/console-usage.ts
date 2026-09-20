@@ -160,20 +160,53 @@ check("many unpriced rows of one resource are named once, not counted", () => {
   must(!/\d+ amounts? (is|are) not priced/.test(html), "no row count leaks into the sentence");
 });
 
-check("a window that reaches further back than the record says so, per resource", () => {
+check("a window that reaches further back than the record says so, once, above the tiles", () => {
   // The day a resource starts being recorded, the window still asks for 24
-  // hours. What the ledger holds is the last part of it, and a tile that shows
-  // only a number reads as the whole window.
-  const rows = [row("a1", "object.active", "", "ms", 90_000, 2), row("a1", "model.tokens", "m:input", "tokens", 10, 20)];
-  const started = to - 3 * H;
-  const html = usagePanel(data(rows, { firstHours: { "object.active": started, "model.tokens": to - 30 * H } }));
-  const active = tile(html, "agent running time");
-  must(/nothing recorded before 09-17 09:00Z/.test(active), `the tile names the line: ${active}`);
-  must(/1\.5 min/.test(active), "and still shows what it does have");
-  must(!/nothing recorded before/.test(tile(html, "model tokens")),
-    "a resource recorded from before the window says nothing");
-  const all = usagePanel(data(rows, { firstHours: { "object.active": to - 24 * H } }));
-  must(!/nothing recorded before/.test(tile(all, "agent running time")),
+  // hours. What the ledger holds is the last part of it, and a figure shown
+  // without that reads as the whole window. It is said above the numbers it
+  // qualifies rather than in the tiles: identical copies under four tiles are
+  // read as four facts, and on a phone they arrive one per screenful.
+  const rows = [
+    row("a1", "model.tokens", "m:input", "tokens", 10, 2),
+    row("a1", "js.run", "run_js", "runs", 3, 2),
+    row("a1", "tool.call", "gh.x", "calls", 5, 2),
+    row("a1", "object.active", "", "ms", 90_000, 2),
+  ];
+  const one = usagePanel(data(rows, { firstHours: { "object.active": to - 3 * H, "model.tokens": to - 30 * H } }));
+  must(count(one, /nothing recorded before/g) === 1, `one resource, one line: ${count(one, /nothing recorded before/g)}`);
+  must(/agent running time: nothing recorded before 09-17 09:00Z, part-way into this window<\/div>[\s\S]*<div class="u-grid"/.test(one),
+    `the line names the resource and sits above the tiles: ${one.slice(one.indexOf("u-cuts"), one.indexOf("u-grid"))}`);
+  must(!/nothing recorded before/.test(tile(one, "agent running time")), "the tile does not repeat it");
+  must(/1\.5 min/.test(tile(one, "agent running time")), "and still shows what it does have");
+
+  // The shape production is in: a young ledger starts everything today, while
+  // one box held since last week gives container time a record older than the
+  // window. The four that start late are one fact, so they are one line — and
+  // container time is not in it, because for container time it is not true.
+  const young = to - 9 * H;
+  const real = usagePanel(data(rows, {
+    firstHours: { "model.tokens": young, "js.run": young, "tool.call": young, "object.active": young, "sandbox.container": to - 7 * 24 * H },
+  }));
+  must(count(real, /nothing recorded before/g) === 1, `four resources, still one line: ${count(real, /nothing recorded before/g)}`);
+  must(/model tokens, JS runs, tool calls, agent running time: nothing recorded before 09-17 03:00Z/.test(real),
+    "the line names the four it is true of");
+  must(!/container time[^<]*nothing recorded/.test(real), "and not the one with an older record");
+
+  // Every counted resource: the list would be the whole page, so it is dropped
+  // and the sentence is about the record itself.
+  const all = usagePanel(data(rows, {
+    firstHours: Object.fromEntries(RESOURCES.filter((r) => r.counted).map((r) => [r.id, young])),
+  }));
+  must(/<div class="u-note">nothing recorded before 09-17 03:00Z/.test(all), "no list when it covers everything counted");
+
+  // Two starts are two facts, oldest first.
+  const two = usagePanel(data(rows, { firstHours: { "object.active": to - 3 * H, "tool.call": to - 9 * H } }));
+  must(count(two, /nothing recorded before/g) === 2, "one line per start");
+  must(two.indexOf("tool calls: nothing recorded before 09-17 03:00Z") < two.indexOf("agent running time: nothing recorded before 09-17 09:00Z"),
+    "oldest first");
+
+  // And nothing is claimed where nothing is known.
+  must(!/nothing recorded before/.test(usagePanel(data(rows, { firstHours: { "object.active": to - 24 * H } }))),
     "a first hour at the window's own start is not a gap");
   must(!/nothing recorded before/.test(usagePanel(data(rows))),
     "no firstHours at all: the page claims nothing about where the record begins");
