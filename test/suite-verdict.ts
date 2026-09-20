@@ -86,9 +86,10 @@ console.log(`\n  Suite verdict\n  ${"─".repeat(56)}`);
 check("a suite's name and its verdict never touch, whatever it is called", () => {
   // `printf "%-22s"` pads but does not truncate, so a 22-character name filled
   // the field exactly and the verdict was printed against it —
-  // `identity-in-the-recordok (5)`. Five suites are that long today, and
-  // A `grep "^<name> "` over a gate log finds none of them, and that nearly
-  // which nearly became "the gate is missing four suites" (2026-09-20).
+  // `identity-in-the-recordok (5)`. Five suites are that long today, and in a
+  // log printed before this was fixed, `grep "^<name> "` matched none of them
+  // — which nearly became the report "the gate is missing four suites". The
+  // grep finds them now; that is what this case is here to keep true.
   // Asked of the LONGEST name in the repo plus one that is longer than any,
   // so the rule holds for whatever is added next rather than for today's list.
   const names = execFileSync("bash", ["-c", 'for f in test/*.ts; do basename "$f" .ts; done'],
