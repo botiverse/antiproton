@@ -61,7 +61,7 @@ const turn = [
 ];
 
 check("an ignored answer must not move the cursor — asked of the runner's own decision", () => {
-  // @Vera reversed the fix and this case stayed green, because it used to assert that `decideFromPoll`
+  // Reversing the fix left this case GREEN, because it used to assert that `decideFromPoll`
   // reacts to two hard-coded cursors — true, and not the runner's behaviour. So the ordering is a
   // function now, and the case calls it: with the runner deaf, the answer is ignored AND no cursor comes
   // back; reverse the order inside `hearSocketEvent` and this goes red.

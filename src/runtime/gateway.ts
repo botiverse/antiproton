@@ -633,7 +633,8 @@ export class ToolGateway {
       // The same two fields go onto the RECORD, not only onto what this call returns. The returned
       // envelope stops at `pi-tools.ts`, which collapses it into a string; `operation.completed` is
       // what the console reads, so a page that wants to badge an anonymous failure needs them there
-      // (@Nova traced the two hops, @Vera withdrew the envelope as the criterion, 2026-09-20).
+      // -- the two hops are `pi-tools.ts`'s collapse and `tool.result`'s missing slot, either of which
+      // is enough on its own.
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null, undefined, {
         ...facts(),
         ...(e.identity === undefined ? {} : { identity: e.identity }),

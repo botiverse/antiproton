@@ -49,7 +49,7 @@ export function deafnessBudget(setting: Deafness | undefined) {
  *
  * The runner used to decide inline, and the cursor moved before the deafness check — so an answer it was
  * pretending not to hear still told the fallback the answer had been delivered. A test cannot pin that
- * ordering from outside the module (@Vera: my first test asserted that `decideFromPoll` reacts to two
+ * ordering from outside the module (the first version of that test asserted that `decideFromPoll` reacts to two
  * hard-coded cursors, which is true and is not the runner's behaviour — reversing the fix left it green).
  * So the decision is a function both the runner and its test call.
  */

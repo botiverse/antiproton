@@ -5,8 +5,9 @@
  * WHICH of the model's tool calls that operation served. The console pairs a
  * `tool.result` with a `model.response.toolCalls[].id` (cf/src/ui.ts), so the
  * operation — where the identity of a failure now lives — sat beside that pair
- * with nothing to join on. @Nova needs the join to put a badge on the card;
- * @Piper wanted it recorded rather than inferred.
+ * with nothing to join on. The console needs that join to put a badge on the
+ * card, and it has to be RECORDED rather than inferred, because inference is
+ * what reading the prose was.
  *
  * It is the model's id, passed to be written down and acted on nowhere. In
  * particular it is NOT `idempotencyKey`, which `run_js` derives per request
@@ -122,7 +123,7 @@ await check("absent stays absent in the builder, where a written `undefined` wou
 
 for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
   await check(`what the builder made is what a reader gets back, key for key (${backend})`, async () => {
-    // The segment nobody was asking about (@Nova, 2026-09-20): my checks above read the STORE and the
+    // The segment nobody was asking about: the checks above read the STORE and the
     // console's read the rendered list, so "written -> stored -> read back" was covered only field by
     // field, for fields someone had thought to name. A store that dropped, renamed or reordered a key
     // nobody asserted would pass all of them. So this compares the whole object against the builder's

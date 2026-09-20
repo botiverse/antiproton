@@ -115,7 +115,8 @@ export function validateMount(
   const cred = plugin.credential;
   // `secretRef` here is the NAME in the mount record, never the result of resolving it. That is what
   // lets this sentence say "has no secret_ref" and be true: all five call sites pass the stored row
-  // (@Piper and @Vera enumerated them to closure, 2026-09-20). A reference that exists but cannot be
+  // (five of them; `git grep -n 'validateMount\|assertMountConfig'` is the whole set, because neither
+  // name is re-exported or alias-bound). A reference that exists but cannot be
   // read is a different situation with a different person to fetch, and `credentialState()` in
   // src/plugins/types.ts is what says that one — not this.
   if (cred?.required && !secretRef) {

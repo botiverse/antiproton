@@ -129,7 +129,7 @@ await check("the console's reconcile leaves another plugin's mount under a seed 
  * mount renamed onto a live hook's name, then given a credential, replaces
  * that hook's signing secret with an upsert that checks nothing. The service
  * keeps posting and the signature stops matching, several steps from the cause
- * (@Piper demonstrated the whole chain against a real store, 2026-09-20).
+ * The whole chain has been demonstrated against a real store, not argued from the code.
  *
  * On the Durable Object rather than the stub above: a rename that is ALLOWED
  * runs through the gateway and the store, and the stub's runtime keeps a
