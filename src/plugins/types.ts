@@ -174,8 +174,13 @@ export function credentialState(
  * wording, @Vera planted a verbatim copy of these sentences, and it went red
  * saying "the card does not name the action" — of a sentence that names it
  * plainly. The copy had tripped the phrasing check first, so the assertion
- * written for copies was never asked. Matching `attach`, which both wordings
- * satisfy, lets a copy reach the check that knows what a copy is.
+ * written for copies was never asked. **And "matches the action" means matches
+ * the RECOMMENDATION of it**: `/attach/` was loose enough to pass
+ * "attaching is not possible", so an assertion whose whole job is to say which
+ * advice was given accepted the opposite advice (@Vera planted it, @Nova
+ * narrowed the pattern to the recommending forms). A pattern wide enough to
+ * survive a rewording is also wide enough to swallow its own negation — the
+ * two pressures pull opposite ways, and only the second one fails quietly.
  *
  * A clause about the mount rather than a whole sentence about the call: the
  * caller frames it, because "this call was anonymous" belongs in a failure and
