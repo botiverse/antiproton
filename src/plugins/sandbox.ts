@@ -138,7 +138,8 @@ interface BoxState {
    * So it is a meter for the console — "what has this agent been running
    * lately" — and it is not the record of what a tenant used. That record has
    * to be written where nothing can go around it, which is why it belongs to
-   * whatever holds the provider's key rather than here (cody, 2026-09-12).
+   * whatever holds the provider's key rather than here (cody, 2026-09-12,
+   * `85a5b0c7`).
    */
   sessions?: Session[];
   /**
@@ -945,7 +946,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   id: "sandbox",
   // Seeded despite being the only metered mount: a container the agent cannot
   // reach is a task it cannot finish, and it is meant to stay unused (tygg,
-  // 2026-09-12). The lease is what keeps an idle one from being free to forget.
+  // 2026-09-12, `a58832bf`). The lease keeps an idle one from being free to
+  // forget.
   defaultForAllAgents: true,
   // One container per mount, created on demand — two calls at once would
   // create two, and only one of them would ever be released.
@@ -1251,7 +1253,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Verifying a key by listing every box means the answer to "does this key
       // work" arrives with everyone else's containers attached — under a shared
       // account that is every other tenant's. Nothing here read that list, but
-      // the boundary was our filter rather than their refusal (cody, 2026-09-12),
+      // the boundary was our filter rather than their refusal (cody, 2026-09-12,
+      // `57b93840`),
       // and a broker in front of run9 would refuse this call outright, so the
       // narrow question is also the one that keeps working.
       //
@@ -1509,7 +1512,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // it leaves here in: `release` hands this list back, and `sessionOf`
       // reports it without a caller to convert it with. Storing the raw key
       // would put a conversion somewhere that has no owner to convert for
-      // (tygg, 2026-09-14).
+      // (tygg, 2026-09-14, `64c275ab`).
       const shown = toAgentRef(stored.ref, ctx.caller) ?? stored.ref;
       state = { ...state!, saved: [...(state!.saved ?? []), shown], lastUsedAt: Date.now() };
       await ctx.connection.set(state as unknown as Json);
@@ -1682,7 +1685,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         // Handed over rather than waited on: the turn is serialised while this
         // call is open (`exclusive`), so waiting here costs the agent every
         // other tool it might have run and every thought it might have had
-        // (cody measured three quarters of billed Worker time on SWE-bench).
+        // (cody measured three quarters of billed Worker time on SWE-bench;
+        // `83f0658d`).
         // The ceiling that used to live here is the runtime's now, and so is
         // the cancelling — `timeoutMs` no longer means "how long the Worker
         // holds".
@@ -1706,7 +1710,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // The box as it was when the work started: this runs outside the call, and
     // writing connection state from here would race a second job finishing at
     // the same moment — the read-modify-write `exclusive` exists to prevent,
-    // in a new place (Piper, 2026-09-14).
+    // in a new place (Piper, 2026-09-14, `83f0658d`).
     const state = asBoxState(await ctx.connection.get());
     return { done: true, result: finished(rec, cfg, state, ctx.alias, lease) as Json };
   },
