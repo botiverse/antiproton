@@ -6,7 +6,7 @@ import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
-import type { ToolErrorFields } from "../plugins/types.ts";
+import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
 import { toolCallRows } from "../usage/outbox.ts";
 
@@ -600,7 +600,7 @@ export class ToolGateway {
       await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
-      const e = err as Error & ToolErrorFields & { retryable?: boolean };
+      const e = err as Error & PluginErrorFields & { retryable?: boolean };
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
       await this.#store.completeOperation(ctx.tenantId, operationId, status, null);
