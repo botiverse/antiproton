@@ -16,10 +16,11 @@
  * let it write into report/runs would leave a file the publish script would
  * happily send to the public bucket.
  */
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, basename } from "node:path";
-import { beginRun, recordRun, type Run } from "../bench/record.ts";
+import { execFileSync } from "node:child_process";
+import { beginRun, recordRun, teeRun, type Run } from "../bench/record.ts";
 
 /** A runs tree of this suite's own. Nothing here writes into report/runs: a
  *  stray record there is one the publish script would send to the bucket. */
@@ -102,6 +103,97 @@ check("a day directory that went away between begin and record does not cost the
   rmSync(dir, { recursive: true, force: true });
   if (failed) throw new Error(`the record was lost to a missing directory: ${failed}`);
   if (!wrote) throw new Error(`recordRun reported success without writing anything`);
+});
+
+/**
+ * Runs `teeRun` and puts everything back: it patches two globals and adds a
+ * process listener, and a suite that left those in place would append its own
+ * later output to a deleted temp file and swallow the next throw in the run.
+ */
+function withTee<T>(run: Run, fn: () => T): T {
+  const log = console.log, error = console.error;
+  const before = new Set(process.listeners("uncaughtException"));
+  try {
+    teeRun(run);
+    return fn();
+  } finally {
+    console.log = log;
+    console.error = error;
+    for (const l of process.listeners("uncaughtException")) {
+      if (!before.has(l)) process.removeListener("uncaughtException", l);
+    }
+  }
+}
+
+check("the tee writes to the handle's log, which the caller never names", () => {
+  // The defect this whole file is about: the log's location was the caller's
+  // to choose, and one caller chose /tmp (#463). `teeRun` takes the handle,
+  // so there is no path argument to get wrong.
+  const { runs, dir } = runsTree();
+  const run = beginRun("tau2", "h9", runs);
+  const said: string[] = [];
+  withTee(run, () => {
+    const say = console.log;
+    console.log = (...a: unknown[]) => { said.push(a.map(String).join(" ")); (say as any)(...a); };
+    console.log("a line");
+    console.error("a diagnostic");
+  });
+  const written = existsSync(run.log) ? readFileSync(run.log, "utf8") : "";
+  rmSync(dir, { recursive: true, force: true });
+  if (!written.includes("a diagnostic")) {
+    throw new Error(`console.error is not in the log, so a run's diagnostics live only in the terminal: ${JSON.stringify(written)}`);
+  }
+});
+
+check("the tee still prints, so the file is a copy and not a diversion", () => {
+  // Cheap to get backwards: a tee that only writes the file leaves whoever is
+  // watching the run with nothing.
+  const { runs, dir } = runsTree();
+  const run = beginRun("tau2", "h9", runs);
+  const seen: string[] = [];
+  const say = console.log;
+  console.log = (...a: unknown[]) => { seen.push(a.map(String).join(" ")); };
+  try {
+    withTee(run, () => { console.log("on both"); });
+  } finally { console.log = say; }
+  const written = existsSync(run.log) ? readFileSync(run.log, "utf8") : "";
+  rmSync(dir, { recursive: true, force: true });
+  if (!seen.includes("on both")) throw new Error(`the terminal did not get the line: ${JSON.stringify(seen)}`);
+  if (!written.includes("on both")) throw new Error(`the file did not get the line: ${JSON.stringify(written)}`);
+});
+
+check("an uncaught throw leaves its trace in the log AND on the terminal", () => {
+  // Node stops printing the trace itself once a handler is installed, so a
+  // handler that writes only the file trades one loss for the other — that
+  // happened, and both halves are asserted here (#465).
+  //
+  // In a child process, because the case ends in `process.exit(1)`.
+  const dir = mkdtempSync(join(tmpdir(), "bench-record-"));
+  const day = join(dir, "report/runs/2026-01-01");
+  mkdirSync(day, { recursive: true });
+  const log = join(day, "t-x.log");
+  const script = join(dir, "throws.mjs");
+  writeFileSync(script, [
+    `import { teeRun } from ${JSON.stringify(new URL("../bench/record.ts", import.meta.url).pathname)};`,
+    `teeRun({ runId: "t-x", json: ${JSON.stringify(join(day, "t-x.json"))}, log: ${JSON.stringify(log)} });`,
+    `console.log("ordinary line");`,
+    `const api = async () => { throw new Error("THE CAUSE"); };`,
+    `await api();`,
+  ].join("\n"));
+  let code = 0, stderr = "";
+  try {
+    execFileSync(process.execPath, [script], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    const err = e as { status?: number; stderr?: string };
+    code = err.status ?? -1;
+    stderr = err.stderr ?? "";
+  }
+  const written = existsSync(log) ? readFileSync(log, "utf8") : "";
+  rmSync(dir, { recursive: true, force: true });
+  if (!written.includes("ordinary line")) throw new Error(`the log lost the output before the throw: ${JSON.stringify(written)}`);
+  if (!written.includes("THE CAUSE")) throw new Error(`the log ends at the last ordinary line, with no cause: ${JSON.stringify(written)}`);
+  if (!stderr.includes("THE CAUSE")) throw new Error(`the terminal saw the run stop in silence: ${JSON.stringify(stderr)}`);
+  if (code !== 1) throw new Error(`a run that died reported ${code}, not 1`);
 });
 
 console.log(`\n  Bench run records\n  ${"─".repeat(56)}`);
