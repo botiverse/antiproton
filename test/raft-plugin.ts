@@ -651,6 +651,33 @@ await check("an uncertain delivery says it may have landed, and does not say it 
   if (why.retryable !== true) throw new Error(`the transitional flag changed: retryable=${why.retryable}`);
 });
 
+/**
+ * A state holding as many ids as the cap still enables push, once they are gone.
+ *
+ * There used to be a cap check in `enable_push` between the cleanup and
+ * `create()`, and it could not fire: the cleanup either throws or empties the
+ * list. This pins the reason not to "fix" it by moving it earlier — the ids it
+ * would count are the ones the cleanup removes, so refusing first would leave a
+ * mount whose revokes had failed a few times unable to enable push ever again.
+ */
+await check("a mount carrying a cap's worth of superseded endpoints can still enable push once they are revoked", async () => {
+  const calls = many(
+    json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1" }),
+    json(200, { ok: true }),
+  );
+  const inbound = fakeInbound();
+  const m = mount(
+    { hookId: "hook-live", staleHookIds: ["hook-old-1", "hook-old-2"], registration: "active", lastReached: null },
+    inbound,
+  );
+  const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
+  if (out.enabled !== true) throw new Error(`refused a recoverable state: ${JSON.stringify(out)}`);
+  if (inbound.revoked.length !== 3) {
+    throw new Error(`expected the three old ids revoked, got ${JSON.stringify(inbound.revoked)}`);
+  }
+  if (calls.length !== 2) throw new Error(`unexpected requests: ${JSON.stringify(calls.map((c) => c.url))}`);
+});
+
 await check("a leftover endpoint that could not be revoked says a retry may work, and not that it landed", async () => {
   // The reachable half of enable_push's cleanup: the revoke failed, so nothing
   // was created and nothing landed, and the sentence invites another attempt.

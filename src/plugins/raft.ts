@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { INBOUND_HOOKS_PER_MOUNT, originProblem, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { originProblem, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -467,11 +467,19 @@ export const raftPlugin: Plugin = {
           );
         }
       }
-      if (hookIds(current).length >= INBOUND_HOOKS_PER_MOUNT) {
-        // Not transient and nothing landed: it clears when a person or the agent
-        // disables push, not by waiting.
-        throw marked(new Error("Raft push endpoint state is full; disable push before enabling it again"), {});
-      }
+      // No cap check of its own here. One stood here and could not fire: the
+      // block above either throws or leaves `staleHookIds` empty, so
+      // `hookIds(current)` is at most the one live id and `>= 3` never held. A
+      // reader who saw it would think this function checks the cap, when two
+      // other things do — the throw above, which stops a mount with leftovers
+      // from creating anything, and `create()` itself, which the runtime refuses
+      // past `INBOUND_HOOKS_PER_MOUNT` (#388).
+      //
+      // Moving it earlier would be worse than leaving it dead: the ids it would
+      // count are exactly the ones the block above clears, so refusing before
+      // that ran would leave a mount whose revokes had failed a few times unable
+      // to enable push ever again — the failure this ordering exists to prevent
+      // (my review of #379).
       const created = await ctx.inbound.create();
       const replaced = hookIds(current);
       try {
