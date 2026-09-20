@@ -160,6 +160,11 @@ value — a reference has structure, and `src/store/refs.ts` exists because raw
 references named the bucket, the tenant and the agent in every result that
 carried one.
 
+Put it on the error as a field as well, with `markIdentity(error, ctx)`
+(`ToolErrorFields`). The sentence is for a person; the console renders stored
+events and badges them, and a badge matched out of prose breaks silently the
+next time the prose changes. Data beside the message, wording in it.
+
 Say it when a credential *did* arrive, too. A failure that does not record the
 identity behind it can only be attributed later by reading the source of the
 build that produced the message — which in the reading that prompted this meant
