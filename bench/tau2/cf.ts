@@ -195,9 +195,13 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         count(taskId, "pollAnswered");
         const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
         if (!d) return;
+        // Same as the socket: an answer we are pretending not to have read must not move the cursor.
+        if (d.kind === "answer" && deafness.deaf("poll")) {
+          if (VERBOSE) console.log("    (ignoring the poll's answer on purpose)");
+          return;
+        }
         seen.set(taskId, d.seq);
         if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
-        else if (deafness.deaf("poll")) { if (VERBOSE) console.log("    (ignoring the poll's answer on purpose)"); }
         else { if (!done) count(taskId, "poll"); stop(d.text); }
       }, () => {
         // Only the request failing counts here; the socket or the next tick will do.
@@ -221,11 +225,18 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         stop(null);
         return;
       }
+      const isAnswer = e.kind === "model.response" && !e.payload?.toolCalls && !!e.payload?.text;
+      // Deliberately unheard, when asked for: the runner behaves as though the push never arrived, and
+      // that has to include the CURSOR. Advancing `seen` past an answer we are pretending not to have seen
+      // would tell the fallback the answer was already delivered (`response > seen` is how it decides), so
+      // the injection would defeat itself and the round would end in `idle_without_answer` — the very
+      // reading this switch exists to avoid producing by accident.
+      if (isAnswer && deafness.deaf("socket")) {
+        if (VERBOSE) console.log("    (ignoring the socket's answer on purpose)");
+        return;
+      }
       if (typeof e.id === "number") seen.set(taskId, e.id);
-      if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) {
-        // Deliberately unheard, when asked for: the object answered and this runner behaves as though the
-        // push never arrived (IGNORE_ANSWERS).
-        if (deafness.deaf("socket")) { if (VERBOSE) console.log("    (ignoring the socket's answer on purpose)"); return; }
+      if (isAnswer) {
         if (!done) count(taskId, "push");
         stop(String(e.payload.text));
       }

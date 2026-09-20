@@ -47,6 +47,35 @@ check("a value that is neither is refused, not read as off", () => {
   assert(threw.includes("drop_push"), `the message does not say what was given: ${threw}`);
 });
 
+// The property the whole injection rests on: pretending not to have heard an answer has to include the
+// CURSOR. `decideFromPoll`/`verdictFromEvidence` decide by `response > seen`, so a runner that ignores an
+// answer but still advances `seen` past it tells the fallback the answer was already delivered — the
+// deadline then reads `idle_without_answer`, and the round produces the wrong name while looking fine.
+// Modelled here with the real decision function rather than a description of it.
+import { decideFromPoll, causeFromEvidence, stallEvidence } from "../bench/poll-fallback.ts";
+import { benchPollBody } from "../src/bench/poll-body.ts";
+
+const turn = [
+  { sequence: 4, kind: "message" },
+  { sequence: 9, kind: "model.response", payload: { text: "the answer" } },
+];
+
+check("an ignored answer must not move the cursor, or the fallback is told it was delivered", () => {
+  const body = benchPollBody(turn, false);
+  // What the runner does when it heard nothing: the cursor still points before the answer.
+  const deafSeen = 4;
+  const d = decideFromPoll(body, deafSeen);
+  assert(d?.kind === "answer", `with the cursor left alone the fallback still sees the answer: ${JSON.stringify(d)}`);
+  assert(causeFromEvidence(stallEvidence(body, deafSeen)) === "answer_undelivered",
+    "the deadline reading is not the name this injection exists to produce");
+
+  // And what a runner that ignored the answer but advanced the cursor anyway would produce:
+  const movedSeen = 9;
+  assert(decideFromPoll(body, movedSeen) === null, "the fixture does not model the defeat at all");
+  assert(causeFromEvidence(stallEvidence(body, movedSeen)) === "idle_without_answer",
+    "moving the cursor past an ignored answer should produce the wrong name — that is why it must not move");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);
