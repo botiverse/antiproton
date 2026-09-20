@@ -208,12 +208,40 @@ export interface PluginErrorFields {
   /** Whose credential the mount names, which is who can fix an unreadable one. */
   credentialRef?: CredentialRefKind;
   /**
-   * Declared here because it is already carried and read (`gateway.ts` maps it
-   * onto an operation's status), not because its meaning is settled: plugins
-   * currently use it for two incompatible things — "this will fix itself" and
-   * "this may already have landed" — and its consumer reads the second. That
-   * split is a change of its own; this declaration only stops a third meaning
-   * from being invented in the meantime.
+   * Trying the same call again may succeed on its own: a 429, an exhausted rate
+   * limit that resets, a 5xx. A property of the error.
+   *
+   * Says nothing about whether the last attempt took effect — that is the other
+   * question, and a 5xx answers yes to both.
+   */
+  transient?: boolean;
+  /**
+   * The last attempt may already have taken effect, and nobody can say: a 5xx,
+   * a connection that failed before any response, an acknowledgement that was
+   * lost. A state of the world rather than a property of the error.
+   *
+   * What follows is not "do not retry" but "a blind retry can repeat a side
+   * effect", so what it needs is an idempotency key or a read that checks
+   * first. This is the question an operation's `unknown` status is about.
+   *
+   * **Set it only when it is true.** An explicit `false` is a claim that
+   * nothing landed, and it also defeats a consumer reading
+   * `mayHaveLanded ?? retryable` during the transition below: `false ?? x` is
+   * `false`, so a site that wrote `false` where it means "not reported" would
+   * silently change what the gateway records.
+   */
+  mayHaveLanded?: boolean;
+  /**
+   * The single flag the two above replace, kept because `gateway.ts` still
+   * reads it. Set it exactly where it was set before, so declaring the two
+   * changes nothing until its consumer moves.
+   *
+   * It could not keep both meanings: `github.ts` sets it for a 429 and for a
+   * 5xx, `appworld.ts` sets it for a 5xx with the comment "5xx may have
+   * landed", and `raft.ts` sets it for an uncertain delivery with the comment
+   * "It does not mean callers may retry". One boolean, three answers to two
+   * different questions, and the consumer reads only the second question
+   * (@Vera's count, 2026-09-20).
    */
   retryable?: boolean;
 }
