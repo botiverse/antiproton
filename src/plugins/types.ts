@@ -157,10 +157,13 @@ export function credentialState(
  * a page included. Two copies of one sentence are not a duplication a reader
  * notices: each reads as complete, and there is no dependency between them for
  * a test to fail, so one improves and the other keeps the old wording silently.
- * That is not hypothetical: the console grew its own copies of all four (#445),
- * already differing by a conjunction, and `cf/src/ui.ts` had no import of this
- * function at all — so there was no edge that could have gone red (@Vera found
- * the missing import). Where a surface genuinely needs different phrasing, say
+ * Not hypothetical when this was written: a console change then in review
+ * (#445) carried its own text for all four states, already differing from these
+ * by a conjunction, and `cf/src/ui.ts` imported nothing from this file — so no
+ * edge existed that could have gone red (@Vera found the missing import).
+ * Written as what was observed in an open branch rather than as a fact about
+ * the tree, because this file cannot see that branch: @Vera pointed out that
+ * the earlier wording described `master` + #445, which is not where it lives. Where a surface genuinely needs different phrasing, say
  * so and pin the pair with a test on the action each names, rather than leaving
  * two sentences to drift.
  *
