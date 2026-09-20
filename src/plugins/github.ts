@@ -61,11 +61,11 @@ function repoOf(args: Record<string, any>): string {
  * Two readings needed it. Without the anonymous half an agent read a private
  * repository's 404 as "the repository cannot be reached" and a shared anonymous
  * limit's 403 as a dead end, and the person had to work out that an account was
- * missing (trajectory read by cody, 2026-09-15). Without the other half — said
+ * missing (read from a trajectory, 2026-09-15). Without the other half — said
  * when a credential *did* arrive — a failure carries no record of the identity
  * it was made with, and reconstructing it later means reading the source of the
  * build that produced the message: three of them, in the case that prompted
- * this (Vera and cody, 2026-09-20). So a person is never asked to infer from a
+ * this. So a person is never asked to infer from a
  * silence: 401/403/404 each say which account was behind the request.
  *
  * `identityNote` is the contract's wording, shared so two plugins do not invent
@@ -150,7 +150,7 @@ async function call(
       : "";
     // The identity goes on the error as data as well as into the sentence: the
     // console badges a stored failure, and a badge matched out of prose breaks
-    // silently the next time the prose changes (Nova).
+    // silently the next time the prose changes.
     const err = markIdentity(new Error(
       `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status)}`,
     ), ctx);
@@ -623,8 +623,8 @@ export const githubPlugin: Plugin = {
         // an answer rather than a failure — `gh auth status`, which this names,
         // prints "not logged in" instead of refusing. Under `requireAccount` an
         // agent asking "who am I here?" was told its question was invalid, and
-        // could not tell that apart from a call it had got wrong (a fresh agent
-        // via Vera, 2026-09-13).
+        // could not tell that apart from a call it had got wrong — seen with
+        // a fresh agent, 2026-09-13.
         if (!ctx.credential) {
           // The two anonymous states want opposite actions from a person, and
           // this is the tool whose whole subject is which one holds.

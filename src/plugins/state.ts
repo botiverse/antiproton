@@ -265,7 +265,7 @@ export function statePlugin(
             // is there and cannot be fetched. Offering the read call anyway
             // hands the model an instruction that fails, and nothing in the
             // answer says the value is unreachable — it looks like a value it
-            // simply has not opened yet (Vera on 2d3de80). So no call is
+            // simply has not opened yet (the case behind 2d3de80). So no call is
             // offered, and the one move that helps is: it is `forget`.
             //
             // The reference itself is left out. Its only use here would be the
@@ -283,8 +283,8 @@ export function statePlugin(
             // that has to assemble one from a shape guesses the argument names,
             // and a value over the read-back line has to be paged rather than
             // read whole — which the old note never said, so a 60 KB value's
-            // only documented route parked again and stopped there (Vera's
-            // fresh agent on f0a3bcc, 2026-09-13).
+            // only documented route parked again and stopped there — a fresh
+            // agent, 2026-09-13, the case behind f0a3bcc.
             const whole = got.bytes <= READ_WHOLE_MAX;
             return {
               key, found: true, bytes: got.bytes, ref: shown,
@@ -311,8 +311,8 @@ export function statePlugin(
           // A key becomes part of the object's path once a value is large
           // enough to be parked, so a key that moves through the path names
           // somewhere else: one written this way produced a reference that left
-          // this agent's subtree while still beginning with it (Vera,
-          // 2026-09-13). `/` stays legal — `list { prefix }` exists so keys can
+          // this agent's subtree while still beginning with it. `/` stays
+          // legal — `list { prefix }` exists so keys can
           // be hierarchical — but a segment that is `.` or `..` is a move
           // rather than a name.
           //

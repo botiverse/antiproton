@@ -143,7 +143,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       // `{key, found, bytes, updatedAt, value}`. Reading only the top level
       // dropped all three arguments without a word, so an agent that asked for
       // five items projected to one field received three hundred whole, larger
-      // than what it had stored (Vera's fresh agent, 2026-09-13).
+      // than what it had stored — seen with a fresh agent, 2026-09-13.
       //
       // So the page comes from the one array inside, when there is exactly one,
       // and `at` names it. Exactly one, because two would be a guess; with none
@@ -166,8 +166,8 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       // inference about what they meant, and the arguments are the only signal
       // of it; without them, returning the array alone would drop the rest of
       // the envelope — a `state.get` reference read with no arguments came back
-      // as fifty items with its `key`, `bytes` and `updatedAt` gone (cody,
-      // 2026-09-13). A top-level array still pages by default, as it always
+      // as fifty items with its `key`, `bytes` and `updatedAt` gone. A
+      // top-level array still pages by default, as it always
       // has: there is nothing else in it to lose.
       const asked = !!a.fields?.length || a.offset !== undefined || a.limit !== undefined;
       if (!asked) return { kind: "value", value: parsed };
