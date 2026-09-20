@@ -8,6 +8,7 @@
  * file behind a row. Small JSON, committed by hand with the numbers it backs.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 
 /**
@@ -48,18 +49,51 @@ export function driverCommit(): { commit: string; dirty: boolean } | null {
   } catch { return null; }
 }
 
-export function recordRun(bench: string, obj: string, body: unknown): string {
+/**
+ * The two paths one run writes: its record and its console log.
+ *
+ * Both come from here, and they are handed out **before** the run's first line
+ * of output, because a tee has to know where it is writing at the moment it
+ * starts writing — the stem used to be minted at the end, inside `recordRun`,
+ * which is after every line it would have captured (Vera, 2026-09-20). A
+ * caller that only got the stem would still be choosing the log's directory,
+ * and one that chose `/tmp` is how a record reached the manifest with no log
+ * beside it (#463). So the caller receives the path rather than composing it.
+ *
+ * The day in the path is the day the run STARTED: one run that crosses
+ * midnight keeps its two files together, which matters more here than the
+ * date being the one the record was written on — `written.at` still says that.
+ */
+export type Run = { runId: string; json: string; log: string };
+
+/** The runs tree the report page reads, and the default every runner uses. */
+const RUNS = new URL("../report/runs/", import.meta.url).pathname;
+
+export function beginRun(bench: string, obj: string, runs = RUNS): Run {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);
-  const dir = new URL(`../report/runs/${day}/`, import.meta.url).pathname;
+  const dir = `${runs}${day}/`;
+  // Here and not in recordRun, which is hours later: a tee opens the log as
+  // the run starts, and on the first run of any day this directory is the one
+  // thing between it and an ENOENT. `runs` exists so a suite can watch that
+  // happen — against the repo's own tree the day directory is already there,
+  // and an assertion that the mkdir works would pass with the mkdir deleted.
   mkdirSync(dir, { recursive: true });
-  const file = `${dir}${bench}-${obj}-${Date.now().toString(36)}.json`;
-  const rel = file.replace(/^.*\/report\//, "report/");
+  const runId = `${bench}-${obj}-${now.getTime().toString(36)}`;
+  return { runId, json: `${dir}${runId}.json`, log: `${dir}${runId}.log` };
+}
+
+export function recordRun(run: Run, body: unknown): string {
+  // Made again rather than trusted from beginRun: hours pass between the two,
+  // and the write is the payoff of all of them — a directory that went away in
+  // between should cost a syscall, not the run.
+  mkdirSync(dirname(run.json), { recursive: true });
+  const rel = run.json.replace(/^.*\/report\//, "report/");
   // Where and when this file was written, inside the bytes: a record that is
   // copied elsewhere keeps the testimony that otherwise lives only in its
   // path and mtime (Dora, Vera, 2026-09-12). `file` is relative to the tree
   // the driver ran in; `driver` (from the callers) names that tree.
-  const written = { at: now.toISOString(), file: rel };
-  writeFileSync(file, JSON.stringify({ ...(body as object), written }, null, 1));
+  const written = { at: new Date().toISOString(), file: rel };
+  writeFileSync(run.json, JSON.stringify({ ...(body as object), written }, null, 1));
   return rel;
 }

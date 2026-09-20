@@ -145,6 +145,7 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 manifest_sha() { [ -f "$MANIFEST" ] && awk -F'\t' -v k="$1" '$1==k {print $2}' "$MANIFEST" | head -1; }
 
 uploaded=0 skipped=0 refused=0 changed=0
+unpaired=()
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md" ! -path "$ROOT/report/runs/manifest.tsv" | sort); do
@@ -209,6 +210,27 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
     mv "$MANIFEST.tmp" "$MANIFEST"
     echo "uploaded $BASE/$key"
     uploaded=$((uploaded+1))
+    # A record and its console log are written by one run and read together:
+    # the JSON says a task failed, the log says what it printed while failing.
+    # #463 published the JSON alone because the runner's tee pointed at /tmp,
+    # and nothing here noticed — the record was well-formed, provenance-clean,
+    # and half of itself (Vera, 2026-09-19).
+    #
+    # A warning, never a refusal, and the two reasons are different. Old
+    # records legitimately have no log: 2 of the 32 JSON keys on the manifest
+    # on 2026-09-20, from 09-11 and 09-15. The pair of stem lists says which:
+    #   comm -23 <(awk -F'\t' '$1~/\.json$/{sub(/\.json$/,"",$1);print $1}' \
+    #               report/runs/manifest.tsv | sort) \
+    #            <(awk -F'\t' '$1~/\.log$/{sub(/\.log$/,"",$1);print $1}' \
+    #               report/runs/manifest.tsv | sort)
+    # And a run that died mid-way leaves a record with no log, and that
+    # record is still the only evidence of what happened; refusing it would
+    # withhold exactly the run someone came looking for.
+    #
+    # Only what this invocation UPLOADED is counted. An already-published
+    # record takes the verified path above and says nothing, so the note
+    # names runs that are arriving now, when the tee can still be fixed.
+    case "$f" in *.json) [ -f "${f%.json}.log" ] || unpaired+=("$key");; esac
   else
     echo "FAILED   $key"
     refused=$((refused+1))
@@ -216,4 +238,9 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
 done
 
 echo "uploaded=$uploaded verified=$skipped refused=$refused changed=$changed"
+if [ ${#unpaired[@]} -gt 0 ]; then
+  echo "NOTE     ${#unpaired[@]} record(s) published with no log beside them:"
+  printf '           %s\n' "${unpaired[@]}"
+  echo "         the run's console output is not on the page; check where its tee wrote."
+fi
 [ "$refused" -eq 0 ] && [ "$changed" -eq 0 ]

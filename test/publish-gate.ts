@@ -268,6 +268,36 @@ check("a commit this checkout does not have stops the publish, and says so rathe
   if (/never merged/.test(out)) throw new Error(`it reported the other mistake: ${out}`);
 });
 
+check("a record published with no log beside it is still published, and said out loud", () => {
+  // #463 put a JSON on the manifest with its console log left in /tmp. Every
+  // check here passed it, because nothing it checks was wrong: the bytes were
+  // clean, the two commits were on one history, and the record was half of
+  // itself. The pairing is a property of the PAIR, so no check of one file
+  // could see it (Vera, 2026-09-19).
+  const { dir, a, b } = withHistory();
+  record(dir, { build: a, driver: { commit: b, dirty: false } });
+  rmSync(join(dir, "report/runs/2026-01-01/record.log"));
+  const { code, out } = run(dir, offline(dir));
+  const manifest = published(dir);
+  rmSync(dir, { recursive: true, force: true });
+  // Published: a record from a run that died before its log was flushed is
+  // still the only evidence of that run. This must never become a refusal.
+  if (!manifest.includes("runs/2026-01-01/record.json")) throw new Error(`a logless record was held back: ${out}\n${manifest}`);
+  if (code !== 0) throw new Error(`a logless record ended with ${code}, not 0 — it is a note, not a refusal: ${out}`);
+  if (!out.includes("NOTE")) throw new Error(`nothing mentioned the missing log, which is how #463 got through: ${out}`);
+  if (!out.includes("runs/2026-01-01/record.json")) throw new Error(`the note does not name the record, so nobody can act on it: ${out}`);
+});
+
+check("a record published beside its log says nothing about logs", () => {
+  // The other half: a note that fires on every run is a note nobody reads.
+  const { dir, a, b } = withHistory();
+  record(dir, { build: a, driver: { commit: b, dirty: false } });
+  const { code, out } = run(dir, offline(dir));
+  rmSync(dir, { recursive: true, force: true });
+  if (code !== 0) throw new Error(`a paired record ended with ${code}: ${out}`);
+  if (out.includes("NOTE")) throw new Error(`a record with its log beside it was still noted: ${out}`);
+});
+
 check("a record naming only one of the two commits stops the publish", () => {
   const { dir, b } = withHistory();
   record(dir, { build: b });
