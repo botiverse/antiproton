@@ -60,6 +60,12 @@ async function agentObject() {
   });
   await mount("sandbox", "reader", "operator:run9");
   await mount("scratch", "writer", null);
+  // A mount whose credential is the agent's own, so the report can be asked WHEN it was attached.
+  await mount("gh", "reader", "agent:gh");
+  await store.putSecret("demo", "u-a", "gh", { ciphertext: "x", iv: "y", account: "someone", verified: true });
+  // A row under the OPERATOR mount's alias too, so "an operator ref is not dated" is decided by the ref's
+  // kind rather than by there being nothing to find — without this the assertion passes either way.
+  await store.putSecret("demo", "u-a", "sandbox", { ciphertext: "z", iv: "w", account: null, verified: false });
   await store.putConnection("demo", "u-a", "sandbox", { boxId: "box-1" } as any);
   recordBackgroundJob(host.sql as any, { tenantId: "demo", agentId: "u-a" },
     { id: "op1", session: "main", mount: "sandbox", tool: "sandbox__shell", handle: {} }, 1_000);
@@ -77,6 +83,31 @@ await check("reading the report changes nothing, including through a plugin that
   assert(report !== null, "an agent the object holds read as null");
   assert(writerTried, "the writing plugin was never asked, so the read-only connection was not exercised");
   assert(dump(host) === before, "the database changed while the report was read");
+  host.dispose();
+});
+
+await check("a mount's credential is dated, so 'was it attached then?' is a read rather than an excavation", async () => {
+  const { host, store } = await agentObject();
+  const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  const gh = r.mounts.find((m: any) => m.alias === "gh");
+  assert(typeof gh?.secretTimes?.createdAt === "number" && gh.secretTimes.createdAt > 0,
+    `when it was attached: ${JSON.stringify(gh?.secretTimes)}`);
+  assert(gh.secretTimes.verified === true && gh.secretTimes.lastUsedAt === null, `state: ${JSON.stringify(gh.secretTimes)}`);
+  // Times, and nothing that says whose account it is or what the value was.
+  assert(!("account" in gh.secretTimes) && !JSON.stringify(gh.secretTimes).includes("someone"),
+    `the report named the account: ${JSON.stringify(gh.secretTimes)}`);
+  // A replacement moves `updatedAt` and leaves `createdAt` where it was — which is what makes the field
+  // answer "was there one at that time" rather than only "is there one now".
+  const first = gh.secretTimes;
+  await new Promise((r) => setTimeout(r, 5));
+  await store.putSecret("demo", "u-a", "gh", { ciphertext: "x2", iv: "y2", account: "someone", verified: true });
+  const again = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  const after = again.mounts.find((m: any) => m.alias === "gh").secretTimes;
+  assert(after.createdAt === first.createdAt && after.updatedAt > first.updatedAt,
+    `after a replacement: ${JSON.stringify({ first, after })}`);
+  // An operator's secret is not in this agent's store, so there is nothing to date.
+  assert(r.mounts.find((m: any) => m.alias === "sandbox").secretTimes === null,
+    "an operator ref was dated from a row that happens to share the alias");
   host.dispose();
 });
 

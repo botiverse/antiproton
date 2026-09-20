@@ -154,7 +154,14 @@ async function call(
     const err = markIdentity(new Error(
       `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status)}`,
     ), ctx);
-    err.retryable = res.status === 429 || (res.status === 403 && remaining === "0") || res.status >= 500;
+    const limited = res.status === 429 || (res.status === 403 && remaining === "0");
+    // Two questions, and a 5xx answers yes to both: it may clear on its own,
+    // and GitHub may have acted before failing to say so. A refused quota is
+    // only the first — nothing was done, so `mayHaveLanded` stays absent
+    // rather than false.
+    err.transient = limited || res.status >= 500;
+    if (res.status >= 500) err.mayHaveLanded = true;
+    err.retryable = limited || res.status >= 500;
     throw err;
   }
   if (text && !isJson) {

@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import { raftPlugin } from "../src/plugins/raft.ts";
+import type { PluginErrorFields } from "../src/plugins/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 
@@ -105,9 +106,9 @@ function many(...answers: Response[]) {
   return calls;
 }
 
-async function failure(fn: () => Promise<unknown>): Promise<Error & { retryable?: boolean }> {
+async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorFields> {
   try { await fn(); }
-  catch (e) { return e as Error & { retryable?: boolean }; }
+  catch (e) { return e as Error & PluginErrorFields; }
   throw new Error("expected failure");
 }
 
@@ -629,6 +630,70 @@ await check("push_status safely normalizes corrupt persisted connection state", 
       throw new Error(JSON.stringify(status));
     }
   }
+});
+
+/**
+ * Which question a failure answers, per site.
+ *
+ * One flag could not say. This file set `retryable` for an uncertain delivery
+ * while its own comment said callers must not retry; `github.ts` set the same
+ * flag for a refused quota where nothing happened; `appworld.ts` set it for a
+ * 5xx with the comment "5xx may have landed". Two questions — will this clear
+ * on its own, and may the last attempt have landed — and a 5xx answers yes to
+ * both (@Vera counted the three sites, 2026-09-20).
+ */
+await check("an uncertain delivery says it may have landed, and does not say it will clear", async () => {
+  globalThis.fetch = (async () => new Response("", { status: 500 })) as any;
+  const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
+  if (why.mayHaveLanded !== true) throw new Error(`uncertainty was lost: mayHaveLanded=${why.mayHaveLanded}`);
+  if (why.transient !== undefined) throw new Error(`a drained batch was called self-clearing: transient=${why.transient}`);
+  // The flag its consumer still reads must not move until that consumer does.
+  if (why.retryable !== true) throw new Error(`the transitional flag changed: retryable=${why.retryable}`);
+});
+
+/**
+ * A state holding as many ids as the cap still enables push, once they are gone.
+ *
+ * There used to be a cap check in `enable_push` between the cleanup and
+ * `create()`, and it could not fire: the cleanup either throws or empties the
+ * list. This pins the reason not to "fix" it by moving it earlier — the ids it
+ * would count are the ones the cleanup removes, so refusing first would leave a
+ * mount whose revokes had failed a few times unable to enable push ever again.
+ */
+await check("a mount carrying a cap's worth of superseded endpoints can still enable push once they are revoked", async () => {
+  const calls = many(
+    json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1" }),
+    json(200, { ok: true }),
+  );
+  const inbound = fakeInbound();
+  const m = mount(
+    { hookId: "hook-live", staleHookIds: ["hook-old-1", "hook-old-2"], registration: "active", lastReached: null },
+    inbound,
+  );
+  const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
+  if (out.enabled !== true) throw new Error(`refused a recoverable state: ${JSON.stringify(out)}`);
+  if (inbound.revoked.length !== 3) {
+    throw new Error(`expected the three old ids revoked, got ${JSON.stringify(inbound.revoked)}`);
+  }
+  if (calls.length !== 2) throw new Error(`unexpected requests: ${JSON.stringify(calls.map((c) => c.url))}`);
+});
+
+await check("a leftover endpoint that could not be revoked says a retry may work, and not that it landed", async () => {
+  // The reachable half of enable_push's cleanup: the revoke failed, so nothing
+  // was created and nothing landed, and the sentence invites another attempt.
+  one(json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: "Release Bot", serverId: "server-1" }));
+  const refuses = {
+    api: {
+      create: async () => ({ hookId: "hook-9", url: "https://hooks.example/hook-9", secret: "s" }),
+      revoke: async () => { throw new Error("revoke refused"); },
+    },
+    revoked: [] as string[],
+  };
+  const m = mount({ hookId: null, staleHookIds: ["hook-old"], registration: null, lastReached: null }, refuses);
+  const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
+  if (!/could not be cleaned up/.test(why.message)) throw new Error(`a different failure: ${why.message}`);
+  if (why.transient !== true) throw new Error(`does not invite the retry its sentence asks for: ${why.transient}`);
+  if (why.mayHaveLanded !== undefined) throw new Error(`claimed something may have landed: ${why.mayHaveLanded}`);
 });
 
 globalThis.fetch = originalFetch;

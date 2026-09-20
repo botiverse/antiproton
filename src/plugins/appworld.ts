@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext, ToolSchema } from "./types.ts";
+import type { Plugin, PluginContext, PluginErrorFields, ToolSchema } from "./types.ts";
 
 /**
  * AppWorld as ordinary mounts.
@@ -260,8 +260,14 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
         if (r.status >= 400) {
           const err = new Error(
             `${app}.${tool} -> ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`,
-          ) as Error & { retryable?: boolean };
-          // 5xx may have landed; the gateway reports that as `unknown`, not `failed`.
+          ) as Error & PluginErrorFields;
+          // 5xx may have landed; the gateway reports that as `unknown`, not
+          // `failed`. It may also clear on its own, so it answers both
+          // questions — which is why one flag could not say this.
+          if (r.status >= 500) {
+            err.transient = true;
+            err.mayHaveLanded = true;
+          }
           err.retryable = r.status >= 500;
           throw err;
         }
