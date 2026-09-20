@@ -289,12 +289,33 @@ await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 //
 // `appendFileSync` flushes per line, which is what a run that dies mid-way needs:
 // it leaves what it printed, and that file is then the only evidence of that run.
+//
+// `console.error` is teed too, because a run's diagnostics usually arrive there
+// rather than on the terminal's ordinary stream.
+//
+// `args.map(String)` is faithful *here*, because every argument passed in this
+// runner is already a string. It is not console.log's general behaviour — an
+// object would become `[object Object]` and `%s` would not be substituted — so a
+// call added later with anything else would read differently in the file than in
+// the terminal.
 function teeTo(path: string): void {
-  const say = console.log.bind(console);
-  console.log = (...args: unknown[]) => {
-    say(...args);
-    appendFileSync(path, args.map(String).join(" ") + "\n");
-  };
+  const line = (args: unknown[]) => args.map(String).join(" ") + "\n";
+  for (const which of ["log", "error"] as const) {
+    const say = console[which].bind(console);
+    console[which] = (...args: unknown[]) => {
+      say(...args);
+      appendFileSync(path, line(args));
+    };
+  }
+  // And the trace of an uncaught throw, which console.error does not see: Node
+  // writes it straight to fd 2. Patching the console is necessary but not enough
+  // for the case that matters most, which is why this is here rather than
+  // assumed — with only the loop above, a run that throws leaves a log that stops
+  // at its last ordinary line.
+  process.on("uncaughtException", (e) => {
+    appendFileSync(path, line([e?.stack ?? e]));
+    process.exit(1);
+  });
 }
 
 const run = beginRun("swebench", OBJ);
