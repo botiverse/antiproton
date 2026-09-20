@@ -83,6 +83,14 @@ export function heldRows(
     const had = counted.get(box.id);
     const from = Math.max(box.startedAt, had?.through ?? box.startedAt);
     const to = box.endedAt ?? now;
+    // Held time is booked to the hours the BOX EXISTED, not the hour we counted it. A box held since
+    // last week therefore writes rows for last week's hours the first time a pass sees it, and the
+    // ledger's first hour for sandbox.container can predate this code (on 2026-09-20 the production
+    // tenant's was 09-13, three days before container accounting shipped). That is the reading being
+    // right, not the meter being wrong: the hours are when the tenant was holding the box. It also means
+    // this resource's first recorded hour says nothing about when billing began (@Nova, who asked whether
+    // the page should explain it — it should not; a page answers questions its reader is asking, and this
+    // one belongs where the decision is made).
     const parts = msByHour(from, to);
     const uses = Math.max(0, Math.floor(box.uses ?? 0) - (had?.uses ?? 0));
     if (!parts.length && !uses) continue;
