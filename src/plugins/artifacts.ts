@@ -106,8 +106,8 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       if (a.from !== undefined) {
         let from = Math.max(0, Math.floor(Number(a.from)) || 0);
         // The note's `from` is always a whole-character boundary, but the model
-        // may compute its own; on the second half of a pair, start at the pair
-        // (Piper, 2026-09-13). The result's `from` says where it really began.
+        // may compute its own; on the second half of a pair, start at the
+        // pair. The result's `from` says where it really began.
         const first = raw.charCodeAt(from);
         if (from > 0 && from < raw.length && first >= 0xdc00 && first <= 0xdfff
           && (raw.charCodeAt(from - 1) & 0xfc00) === 0xd800) from--;
@@ -143,7 +143,7 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       // `{key, found, bytes, updatedAt, value}`. Reading only the top level
       // dropped all three arguments without a word, so an agent that asked for
       // five items projected to one field received three hundred whole, larger
-      // than what it had stored (Vera's fresh agent, 2026-09-13).
+      // than what it had stored — seen with a fresh agent, 2026-09-13.
       //
       // So the page comes from the one array inside, when there is exactly one,
       // and `at` names it. Exactly one, because two would be a guess; with none
@@ -166,8 +166,8 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
       // inference about what they meant, and the arguments are the only signal
       // of it; without them, returning the array alone would drop the rest of
       // the envelope — a `state.get` reference read with no arguments came back
-      // as fifty items with its `key`, `bytes` and `updatedAt` gone (cody,
-      // 2026-09-13). A top-level array still pages by default, as it always
+      // as fifty items with its `key`, `bytes` and `updatedAt` gone. A
+      // top-level array still pages by default, as it always
       // has: there is nothing else in it to lose.
       const asked = !!a.fields?.length || a.offset !== undefined || a.limit !== undefined;
       if (!asked) return { kind: "value", value: parsed };

@@ -44,8 +44,7 @@ export interface PluginContext {
    * is the state of every operator-referencing mount on a preview Worker today.
    * All three arrive as the same null, so a plugin holding only `credential`
    * that says "this mount has no account" is guessing, and the advice that
-   * follows the guess sends the wrong person to fix it (Vera and cody, both
-   * reading this, 2026-09-20).
+   * follows the guess sends the wrong person to fix it.
    *
    * The kind rather than the reference, because the reference is a name with
    * structure: `src/store/refs.ts` exists because raw references named the
@@ -66,7 +65,7 @@ export interface PluginContext {
    * This mount's inbound hooks. Present only for a plugin that implements
    * `receive`, on a deployment that can take pushed events.
    *
-   * Rules for a plugin using them (Piper, #388 review):
+   * Rules for a plugin using them (from the #388 review):
    * - **The secret and the URL never go into a tool result or an error**:
    *   what `invoke` returns lands in the transcript. The secret is handed to
    *   the service and nowhere else, `ctx.connection` included.
@@ -129,7 +128,7 @@ export interface PluginContext {
  * anonymous cases produce the same failure from the service, so a message that
  * names one of them guesses — and a guess written as a fact is how a person
  * spends an afternoon attaching a token to a mount that already has one
- * (Vera's reading of a production trajectory, 2026-09-20).
+ * (read from a production trajectory, 2026-09-20).
  */
 export type CredentialState = "attached" | "none" | "unreadable" | "unreported";
 
@@ -150,8 +149,9 @@ export function credentialState(
 
 /**
  * The state as a clause a person can act on, so two plugins do not invent two
- * sentences for one state (Nova asked for the identity on the failed call
- * rather than on the mount, 2026-09-20).
+ * sentences for one state — and the identity belongs on the failed CALL
+ * rather than on the mount, since that is what a reader of a failure is
+ * holding.
  *
  * **One wording per state, per layer — and where a second surface needs its
  * own, pin them on the ACTION rather than the words.** Two copies of one
@@ -221,7 +221,7 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
  * events, so a badge it draws by matching prose is one rewording away from
  * showing the wrong thing with no way for the reader to notice — the failure
  * mode of measuring a page with a remembered phrase, which cost a wrong reading
- * the same morning this was written (Nova, 2026-09-20). So the state travels as
+ * the same morning this was written. So the state travels as
  * data beside the message, and the message stays the wording.
  *
  * The gateway copies these into the failure it records (`ToolError` in
@@ -309,7 +309,7 @@ export const INBOUND_HOOKS_PER_MOUNT = 3;
  * `Plugin.receive`). Offered only to a plugin that can receive, and only for
  * the mount being called, so a plugin can register its hook with the service
  * itself using the mount's own account, the way a GitHub webhook is set up
- * (Raft push: tygg and XX, 2026-09-17).
+ * (the case was Raft push).
  */
 export interface InboundHooks {
   /**
@@ -376,7 +376,7 @@ export interface ConfigField {
    * or fragment — or `http:` to a loopback host, for a server on the same
    * machine. Without it a setting like `https://api.example.com/x` was accepted
    * at mount time and refused only when an agent called something, where no
-   * person is reading (cody, 2026-09-17, on the raft plugin's `serverUrl`).
+   * person is reading — seen on the raft plugin's `serverUrl`, 2026-09-17.
    *
    * The plugin should read the value through the same `originProblem` at call
    * time too, so the two checks cannot disagree.
@@ -404,8 +404,7 @@ export function originProblem(value: string): string | null {
   }
   // Written exactly as the origin, so a plugin that pastes the string into a
   // URL gets what one that parses it gets: `https:x.test`, a trailing space,
-  // `/.` or `:443` all parse to the right place and read as something else
-  // (cody, 2026-09-17).
+  // `/.` or `:443` all parse to the right place and read as something else.
   if (value !== url.origin && value !== `${url.origin}/`) return `must be written as ${url.origin}`;
   return null;
 }
@@ -608,7 +607,7 @@ export interface MountActivity {
    * read leniently so one bad entry cannot lose a running container, and this
    * keeps that leniency from being silent. The row counts too because a reader
    * that only asks about the fields inside a record can never report that the
-   * record was not a record (Rex, 2026-09-16) — and that is the case where a
+   * record was not a record — and that is the case where a
    * mount looks idle while whatever its id named goes unreleased.
    */
   unreadable?: number;
@@ -758,8 +757,7 @@ export class Backgrounded {
  * The body is bytes, not text, because services sign the bytes: GitHub's
  * signature is an HMAC of the raw body, and a body decoded and re-encoded on
  * the way in is only the same bytes when the service happened to send valid
- * UTF-8. A plugin checks the signature first and decodes after (Piper, cody,
- * 2026-09-17).
+ * UTF-8. A plugin checks the signature first and decodes after.
  *
  * Header names are lowercase, so every plugin looks one up the same way.
  */
@@ -785,7 +783,7 @@ export interface InboundEvent {
  * its own delivery log, which is where the person setting up the webhook is
  * looking. Without it the request was fine and simply not for this mount (not
  * subscribed, the mount's own doing, a ping), and the answer is a success, so
- * the service does not report a working webhook as broken (cody, 2026-09-17).
+ * the service does not report a working webhook as broken.
  */
 export type InboundResult =
   | { deliver: false; reason: string; rejected?: boolean }
@@ -817,9 +815,9 @@ export interface Plugin {
    * `agent-loop.js`, `toolCalls.some(...)` — so declaring this also stops
    * unrelated mounts from running alongside. The sentence above says what the
    * flag is for; this says what it costs, and the two were far enough apart
-   * that the cost read as "one mount waits" (cody measured it on SWE-bench:
-   * three quarters of billed Worker time is spent waiting on a container,
-   * against 3% for a task that uses none).
+   * that the cost read as "one mount waits". Measured on SWE-bench: three
+   * quarters of billed Worker time is spent waiting on a container, against
+   * 3% for a task that uses none.
    *
    * So it is worth declaring only where overlapping really does break
    * something, and it is a reason to want a call that can be left and returned
@@ -898,7 +896,7 @@ export interface Plugin {
    * try again. A plugin that swallows the failure here reports a cancellation
    * that did not happen, and the work keeps running with nothing left that can
    * name it: that is how a job refused by the cap ran to completion, unlisted
-   * and uncancellable (Vera, 2026-09-14).
+   * and uncancellable.
    */
   cancelBackground?(handle: Json, ctx: PluginContext): Promise<void>;
   /**

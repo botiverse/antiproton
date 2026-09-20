@@ -165,7 +165,7 @@ interface BoxState {
   /**
    * The directory the last `shell` command ended in, so the next one starts
    * there. Each run9 exec is a fresh process: a `cd` does not carry over, and
-   * agents were writing `cd /testbed && …` into every call (tygg, 2026-09-15).
+   * agents were writing `cd /testbed && …` into every call.
    * Absent on a new box, where the first call starts in the working directory.
    */
   cwd?: string;
@@ -213,7 +213,7 @@ export function splitCwd(out: string): { output: string; cwd: string | null } {
  * the next call starts a new one. Both `cf/src/runtime.ts` (`idle`) and
  * `src/runtime/idle-lease.ts` say so in as many words; I read neither, and
  * wrote the sentence from the half of the lifetime I had in mind. Measured by
- * Vera's probe: nine containers for one agent, `uses: 1` each, 3.3–9.5 s
+ * probe: nine containers for one agent, `uses: 1` each, 3.3–9.5 s
  * apiece, and the model quoted this line back while watching the box id change
  * under it.
  *
@@ -221,9 +221,9 @@ export function splitCwd(out: string): { output: string; cwd: string | null } {
  * in this turn — and it names what outlives the turn instead, which is a kept
  * filesystem.
  *
- * With the lease on (tygg, 2026-09-15: a container is destroyed by the agent's
- * own `release`, not by the end of a turn; the agent is told before an idle one
- * is taken and may postpone that) the runtime hands the plugin the lease and
+ * With the lease on — a container is destroyed by the agent's own `release`,
+ * not by the end of a turn; the agent is told before an idle one is taken and
+ * may postpone that — the runtime hands the plugin the lease and
  * the sentence names that lifetime instead. The numbers come from the lease,
  * never from here.
  */
@@ -239,14 +239,14 @@ const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 /**
  * What `keep` and `save` say about release, in their summaries and in what they hand back.
  *
- * "It survives release" was true and read as permission: in Vera's blind-use round 4 (2026-09-15) an agent told
+ * "It survives release" was true and read as permission: in blind-use round 4 (2026-09-15) an agent told
  * the user would come back kept the environment, saved an archive, and reasoned "since I've kept the environment
  * and saved the archive, I could release the container". The note it had just been handed was the last thing it
  * read before deciding, so the copy's survival is said together with what it is not.
  */
 export function notAReasonToRelease(lease: BoxLease | null): string {
   // "Leave it running" is only something an agent can do under a lease: without one the box is handed back
-  // when the turn ends whatever it decides, so that half would be a promise nothing keeps (cody, #327 review).
+  // when the turn ends whatever it decides, so that half would be a promise nothing keeps (from the #327 review).
   return lease
     ? "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
       "will come back to this machine, leave it running."
@@ -299,7 +299,7 @@ export function boxReminder(alias: string, lease: BoxLease | null = null): strin
  * was never a narrowing, it was an assertion the compiler cannot check, on
  * data that outlives the code that wrote it. The risk is not a mistyped call
  * site; it is this call site reading a row written by an older version, which
- * is exactly what a generic parameter would hide (Rex, 2026-09-12).
+ * is exactly what a generic parameter would hide.
  *
  * **Unrecognised is "nothing is running", not an error.** Every path here
  * starts by asking `state?.boxId`, so a shape we cannot read degrades to the
@@ -406,7 +406,7 @@ export function finished(
     // would have it reinstalling packages on every call.
     // In full on a container's first result only. It is over 400 characters with
     // the lease terms, and background-job notices carry the whole result, so on
-    // every result one conversation read it dozens of times (cody, task #19).
+    // every result one conversation read it dozens of times (task #19).
     reminder: (state?.execs ?? 0) === 0 ? boxReminder(alias, lease) : boxReminderShort(lease),
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
@@ -449,8 +449,8 @@ export function asBoxState(v: Json): BoxState | null {
   // naming them. That is one wasted setup against a second container nobody
   // releases, for a shape no version of this code writes. Unread, an element is worse
   // than a miss: `null` throws at `s.boxId` or `e.name`, and one missing a
-  // field ships `undefined` into the console's usage report (Rex, 2026-09-12
-  // for the lists, 2026-09-15 for what is in them).
+  // field ships `undefined` into the console's usage report (2026-09-12 for
+  // the lists, 2026-09-15 for what is in them).
   const { sessions, envs, ...rest } = o;
   return {
     ...(rest as unknown as BoxState),
@@ -480,10 +480,10 @@ function isEnv(v: unknown): v is Env {
  * How many entries `asBoxState` will drop from this record: unreadable elements,
  * a list that is not a list counts as one, and a record that is present but does
  * not read at all counts as one. Reported through `activity` so leniency that
- * keeps a billed container does not also hide a corrupt record (Rex, 2026-09-15).
+ * keeps a billed container does not also hide a corrupt record.
  *
  * The row was the case that leniency missed. Reading its fields without ever
- * asking whether the row is a row cannot report a broken row (Rex, 2026-09-16),
+ * asking whether the row is a row cannot report a broken row,
  * and the three ways `asBoxState` answers `null` are told apart by what is
  * present rather than by what parses: never written is clean, the record
  * `release` leaves behind is clean because `{boxId: ""}` reads, and present but
@@ -589,7 +589,7 @@ async function stopBox(
   // interleave with a command on this mount: the command finds no container,
   // creates one and records it, and clearing the record on top would leave that
   // container alive and billed with nothing naming it — the orphan `asBoxState`
-  // refuses to create. A lock in the gateway (cody, 2026-09-16) closes the
+  // refuses to create. A lock in the gateway closes the
   // window inside one object; this half does not depend on the caller.
   const now = asBoxState(await ctx.connection.get());
   const mine = !now?.boxId || now.boxId === state.boxId;
@@ -751,14 +751,14 @@ export function execArgv(
  * this repo can see, so it is kept as a dated measurement, and the suite fails
  * when the default image has no entry: changing the default stays red until
  * someone measures the new one. It cannot prove the measurement was honest; it
- * removes the case where nobody took one (Rex and Vera, 2026-09-15).
+ * removes the case where nobody took one.
  */
 export const MEASURED_IMAGES: Record<string, {
   measured: string; os: string; present: string[]; missing: string[]; install: string;
   /** What was run on the fresh box, so the next person can run it again and compare. */
   command: string;
 }> = {
-  // cody and Piper, separately, on fresh run9 boxes: Node v24.21.0, npm 11.19.0.
+  // Measured twice, separately, on fresh run9 boxes: Node v24.21.0, npm 11.19.0.
   "public.ecr.aws/docker/library/node:24-bookworm": {
     measured: "2026-09-15", os: "Debian",
     present: ["Node", "npm", "git", "curl", "make", "gcc/g++", "Python 3", "bash", "ssh", "apt-get"],
@@ -831,7 +831,7 @@ export function githubEnv(placeholder: string): Record<string, string> {
  * Policy is enforced at the gateway, and a container holding the mount's token
  * reaches GitHub without passing through it: `gh pr create` or `git push` in
  * the box would skip the approval the same call through the gh tools waits for
- * (cody, 2026-09-15). So the token goes in only when nothing on that mount is
+ * So the token goes in only when nothing on that mount is
  * held or denied, reads included, since the box reads GitHub directly too.
  */
 export function policyLetsContainerAct(policy: MountPolicy | null | undefined): boolean {
@@ -880,7 +880,7 @@ async function registerGithub(api: Run9Api, project: string, boxId: string, toke
  * command runs in it.
  *
  * Checked only at creation, a mount switched to approval kept its container
- * signed in until release, hours under a lease (cody, reviewing #339), and a
+ * signed in until release, hours under a lease (the #339 review), and a
  * token removed or replaced was the same gap. So the mount is read again here.
  * When what may be wired in has changed, the box's GitHub secrets are deleted,
  * which run9 honours on the very next request (measured 2026-09-15), and are
@@ -1231,7 +1231,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // and asking run9 about it proves nothing: the provider has never seen
       // it. Worse, passing the question through would make the service answer
       // whether an id the caller does not own exists, which is the thing it was
-      // put there to refuse (cody, 2026-09-12).
+      // put there to refuse.
       if (cfg.verifyWith === "endpoint") {
         const res = await fetch(`${cfg.endpoint}/credential`, {
           headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) },
@@ -1324,7 +1324,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         // `released: false` because the summary promised a release and this
         // call is the one that does not perform it — a model reading
         // `{kept: [], note}` alone cannot tell whether its container was just
-        // taken away (Vera, 2026-09-14). Every ending of this tool now says so
+        // taken away. Every ending of this tool now says so
         // outright rather than leaving it to be inferred from what is missing.
         return {
           kept: envs.map((e) => ({ name: e.name, note: e.note, savedAt: e.savedAt })),
@@ -1382,7 +1382,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // until the later of the two (idle-lease.ts `releaseAt`), and the page can
       // still tell "used" from "kept by request". Postponing is not using the
       // machine. There is no total cap: each postponement is a call the agent
-      // chose to make, within this mount's limit (tygg, 2026-09-15).
+      // chose to make, within this mount's limit.
       await ctx.connection.set({ ...prior, quietUntil } as unknown as Json);
       return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
     }
@@ -1498,7 +1498,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // artifact should be named for the file it is. Sanitising the characters
       // and stopping there kept `.`, `..` and empty segments in the key, which
       // the reader now refuses (#289) — so the box could save a file out and
-      // then never open it again (cody, 2026-09-13). `..` at the root stays at
+      // then never open it again. `..` at the root stays at
       // the root, as it does in a filesystem.
       const name = segmentsOf(path).map((seg) => seg.replace(/[^A-Za-z0-9._-]/g, "_")).join("/")
         + (archive ? ".tar" : "");
@@ -1603,7 +1603,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // ended, passed as run9's `workdir` rather than a `cd` glued in front (run9's
       // own advice for "run this from that directory"). A new box has no such
       // directory yet, so its first command makes and enters the working one.
-      // An explicit `workdir` (tygg, 2026-09-15) runs this one command there; a
+      // An explicit `workdir` runs this one command there; a
       // relative one is taken from where the shell is now.
       command = (askedDir ?? state.cwd) ? withCwdTrailer(a.command) : withCwdTrailer(`mkdir -p ${wd} && cd ${wd} || exit 1\n${a.command}`);
     } else {
@@ -1613,12 +1613,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // Started on run9's *background* route, not the plain one, because that is
     // the only kind of execution run9 will kill: `POST /execs/{id}/kill` on an
     // execution created here answers 400 `exec is not background mode`, and the
-    // command runs to completion regardless. Measured on a box of our own
-    // (Piper, 2026-09-14): a foreground `sleep 45 && echo … > /tmp/fg-probe`
+    // command runs to completion regardless. Measured on a box of our own,
+    // 2026-09-14: a foreground `sleep 45 && echo … > /tmp/fg-probe`
     // was killed, answered 400, finished `succeeded` and wrote its file; the
     // same command started here was killed with 200, went to `cancelled
     // (explicit_cancel)`, and its file never appeared. That is the whole of the
-    // defect Vera reproduced — a job refused by the cap kept running, unlisted
+    // defect as reproduced — a job refused by the cap kept running, unlisted
     // and uncancellable — and it also means the pre-#16 "exceeded timeoutMs and
     // was killed" path never killed anything.
     //
@@ -1718,7 +1718,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
    * that a failed kill did not matter. It did: with three jobs running, a
    * refused fourth was cancelled through this path, the kill did not take, and
    * the command ran to completion in the container — with no job id, so
-   * nothing could list it or cancel it (Vera, 2026-09-14). Both layers
+   * nothing could list it or cancel it. Both layers
    * swallowed the failure, so our ledger and the container were free to differ
    * with nobody able to notice.
    *
@@ -1726,13 +1726,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
    * gone" is the fact, and the bill follows the fact. Returning means the
    * execution is in a state that will not change again; anything else throws,
    * and the caller — which owns the ledger — decides what to record and
-   * whether to ask again (cody, 2026-09-14: no retry loop here, because the
+   * whether to ask again (no retry loop here, because the
    * runtime is what keeps a refused job tracked and calls back at its ceiling).
    *
    * **A terminal state is run9's record, not the process.** That the two agree
    * — that `cancelled` means the shell is gone — is something we measured (a
-   * `sleep && echo … > file` whose file never appeared: cody three times, Piper
-   * once) and not something the API defines, so it can change without telling
+   * `sleep && echo … > file` whose file never appeared: four runs, by two of
+   * us separately) and not something the API defines, so it can change without telling
    * us. Whoever edits this path or the one that starts an execution owes that
    * reading again; every cheaper check in the suites reads a record, and a
    * record is what was wrong the first time.
@@ -1766,7 +1766,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // here is a statement about the process: a refused kill leaves it running,
     // while an accepted kill with a state that has not settled says nothing
     // about it either way — and the caller, which reports this to the agent,
-    // would be passing on a claim we did not make (Vera, 2026-09-14). The two
+    // would be passing on a claim we did not make. The two
     // are told apart by what follows the colon: run9's own answer, or `kill
     // accepted`.
     throw new Error(`could not confirm exec ${h.execId} stopped: ${why}`);
