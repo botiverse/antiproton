@@ -174,7 +174,7 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
       // on whose credential it is, which is what the kind says.
       return ctx.credentialRefKind === "operator" || ctx.credentialRefKind === "env"
         ? `${mount} names a credential this deployment holds for everyone, and this deployment does not` +
-          ` have it, so whoever deploys has to configure it there; attaching an account to the mount cannot`
+          ` have it, so whoever deploys has to configure it there, and attaching an account to the mount will not fix it`
         : `${mount} names an account whose credential could not be read, so whoever holds that credential` +
           ` has to write it again rather than another account being attached`;
     case "unreported":
@@ -183,6 +183,56 @@ export function identityNote(ctx: Pick<PluginContext, "credential" | "credential
       return `either ${mount} has no account, or the credential it names could not be read, and a person` +
         ` has to look at the mount to tell which`;
   }
+}
+
+/**
+ * What a plugin may attach to an `Error` it throws, for the layers above it.
+ *
+ * A sentence is for a person; a field is for a page. The console renders stored
+ * events, so a badge it draws by matching prose is one rewording away from
+ * showing the wrong thing with no way for the reader to notice — the failure
+ * mode of measuring a page with a remembered phrase, which cost a wrong reading
+ * the same morning this was written (Nova, 2026-09-20). So the state travels as
+ * data beside the message, and the message stays the wording.
+ *
+ * The gateway copies these into the failure it records; a field it does not
+ * copy is simply absent, and absent is a state readers already handle.
+ */
+export interface ToolErrorFields {
+  /**
+   * Which identity the call was made with. Same value as `credentialState`, so
+   * a reader badging a failure does not derive it from the sentence.
+   */
+  identity?: CredentialState;
+  /** Whose credential the mount names, which is who can fix an unreadable one. */
+  credentialRef?: CredentialRefKind;
+  /**
+   * Declared here because it is already carried and read (`gateway.ts` maps it
+   * onto an operation's status), not because its meaning is settled: plugins
+   * currently use it for two incompatible things — "this will fix itself" and
+   * "this may already have landed" — and its consumer reads the second. That
+   * split is a change of its own; this declaration only stops a third meaning
+   * from being invented in the meantime.
+   */
+  retryable?: boolean;
+}
+
+/** An error carrying them, which is what every plugin throws. */
+export type ToolError = Error & ToolErrorFields;
+
+/**
+ * Stamp the identity a call was made with onto the error it failed with.
+ *
+ * Returns the same error, so it reads at the throw site: the fields and the
+ * sentence are set in one place and cannot describe different states.
+ */
+export function markIdentity<E extends Error>(
+  error: E, ctx: Pick<PluginContext, "credential" | "credentialRefKind">,
+): E & ToolErrorFields {
+  const marked = error as E & ToolErrorFields;
+  marked.identity = credentialState(ctx);
+  if (ctx.credentialRefKind !== undefined) marked.credentialRef = ctx.credentialRefKind;
+  return marked;
 }
 
 /** The most live hooks one mount may hold; see `InboundHooks`. */
