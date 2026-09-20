@@ -7,7 +7,7 @@
  * the object and date it ran on, so a reader who was not present can open the
  * file behind a row. Small JSON, committed by hand with the numbers it backs.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 
@@ -96,4 +96,57 @@ export function recordRun(run: Run, body: unknown): string {
   const written = { at: new Date().toISOString(), file: rel };
   writeFileSync(run.json, JSON.stringify({ ...(body as object), written }, null, 1));
   return rel;
+}
+
+/**
+ * Send this run's console output to its own log, so the record and the log
+ * cannot be separated by where the caller happened to redirect. The path is
+ * not a parameter: it comes from the handle, which is the whole point — a run
+ * whose log location is an argument is a run where someone can pass /tmp, and
+ * one did (#463).
+ *
+ * ONE PATCH POINT, not one per call site. The runners have eighteen and
+ * thirteen `console.log` calls and no shared logger between them, so writing
+ * to the file at each would mean thirty-one places have to remember, and the
+ * thirty-second never would.
+ *
+ * `appendFileSync` flushes per line, which is what a run that dies mid-way
+ * needs: it leaves what it printed, and that file is then the only evidence
+ * of that run.
+ *
+ * `args.map(String)` is faithful for the runners as they stand — every
+ * argument they pass is already a string (checked: the only non-string call
+ * is `console.log()` with no arguments, which is a blank line on both sides).
+ * It is NOT console.log's general behaviour: an object becomes
+ * `[object Object]` and `%s` is not substituted, so a call added later with
+ * anything else reads differently in the file than in the terminal.
+ *
+ * Lives here rather than in each runner because two verbatim copies are the
+ * same failure one level up — a third runner copies it, or copies it wrong
+ * (@Vera, 2026-09-20, #465).
+ */
+export function teeRun(run: Run): void {
+  const line = (args: unknown[]) => args.map(String).join(" ") + "\n";
+  for (const which of ["log", "error"] as const) {
+    const say = console[which].bind(console);
+    console[which] = (...args: unknown[]) => {
+      say(...args);
+      appendFileSync(run.log, line(args));
+    };
+  }
+  // And the trace of an uncaught throw, which console.error does not see: Node
+  // writes it straight to fd 2. Patching the console is necessary but not
+  // enough, which is why this handler exists rather than being assumed — it
+  // was measured, with only the loop above, that a run which throws leaves a
+  // log stopping at its last ordinary line.
+  //
+  // It goes through `console.error` on purpose. Installing a handler STOPS
+  // Node's own default action, so appending to the file directly would trade
+  // one loss for another: the file would hold the cause and whoever was
+  // watching the run would see the output stop and the process exit 1 in
+  // silence. Through the patched console.error, both get the same bytes.
+  process.on("uncaughtException", (e) => {
+    console.error((e as Error)?.stack ?? e);
+    process.exit(1);
+  });
 }
