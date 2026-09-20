@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Upload run records to the public bucket the report page links to.
 #
-# Two things this must not do: publish a credential, and let a published record
-# differ from the record a figure was computed from. Both are checked here, and
-# both fail closed — a check that cannot run stops the publish rather than
+# Three things this must not do: publish a credential, let a published record
+# differ from the record a figure was computed from, and anchor a figure to a
+# run whose own code was never merged. All three are checked here, and all
+# three fail closed — a check that cannot run stops the publish rather than
 # waving it through.
 set -uo pipefail
 
@@ -61,6 +62,84 @@ carries_secret() {
   ' "$ROOT" "$1"
 }
 
+# A record names two commits: `build` is the Worker that answered the run, and
+# `driver` is the code that wrote the record down. They are often different —
+# the deployment lags the repo most days — and that is not a fault: they answer
+# two questions. What must hold is that both are on THIS repository's history,
+# because a driver on a tree that was never merged leaves no trace in the
+# bytes: every figure in such a record looks ordinary (Vera, 2026-09-19).
+#
+# Five exits over two verdicts — publish (nothing to check, or one history) and
+# do-not-publish (a lone field, an absent object, two unrelated trees) —
+# because the refusals are different mistakes with
+# different repairs — and a check with two exits reports the wrong one: when a
+# commit is simply absent from the checkout, "is it an ancestor" fails in both
+# directions, which reads as "these two are unrelated" while the truth is "I
+# cannot see one of them" (Vera again).
+#   0 = one history, or the record predates the fields (records before
+#       2026-09-12 carry neither, and they are still republished from history)
+#   1 = both commits known, and neither reaches the other  ⇒ merge that tree
+#   2 = cannot judge                                        ⇒ fetch, then publish
+one_history() {
+  local f="$1" out build driver c
+  case "$f" in *.json) ;; *) return 0;; esac
+  if ! out=$(node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    const [file] = process.argv.slice(1);
+    // Unreadable, unparseable and "not an object" are all "cannot judge", so
+    // they are one throw rather than three silent empties: an empty pair is
+    // how a pre-2026-09-12 record says it has no claim to check.
+    const r = JSON.parse(readFileSync(file, "utf8"));
+    if (!r || typeof r !== "object") throw new TypeError("not a record object");
+    const d = r.driver;
+    const build = typeof r.build === "string" ? r.build : "";
+    const driver = typeof d === "string" ? d : d && typeof d.commit === "string" ? d.commit : "";
+    process.stdout.write(`${build} ${driver}`);
+  ' "$f" 2>&1); then
+    echo "the provenance check could not read $f: $out" >&2
+    return 2
+  fi
+  build=${out%% *}; driver=${out##* }
+  if [ -z "$build" ] && [ -z "$driver" ]; then return 0; fi
+  # Half a claim, and it STOPS. What is left undecided is only WHICH of the two
+  # refusals it would be — never whether to publish it.
+  #
+  # The reason is a property of the shape, not a count: it is not "fetch it",
+  # because nothing here is missing that fetching would bring; and it is not
+  # "merge it" either, because one absent field is no evidence about any tree.
+  # Both known repairs are inapplicable, so the message says what is true of it
+  # and names no cure.
+  #
+  # That argument is what holds. The shape appears 0 times in the 24 JSON
+  # records on the manifest (19 carry both, 5 carry neither; Vera and cody
+  # counted the bucket separately, 2026-09-19 and 2026-09-20) — but a census is
+  # a fact about the past, and a runner written tomorrow could emit this shape
+  # by lunchtime (@Vera, 2026-09-20). The count says the branch is cold today;
+  # it does not say the branch is right.
+  #
+  # Which is the point of preferring the argument, and not only a matter of
+  # taste: the two REPAIRS DIFFER. A refusal resting on a count expires the
+  # moment a twenty-fifth record has the shape — and somebody would then have
+  # to notice and update it. A refusal resting on the argument does not expire
+  # when new data arrives, because nothing about it was a claim over the data
+  # (@Vera). So if you are here to update the count, you are editing context,
+  # not the reason.
+  if [ -z "$build" ] || [ -z "$driver" ]; then
+    echo "$f names only one of build/driver ('$out'), and a lone commit cannot be checked against anything" >&2
+    return 2
+  fi
+  for c in "$build" "$driver"; do
+    if ! git -C "$ROOT" cat-file -e "${c}^{commit}" 2>/dev/null; then
+      echo "commit $c is not in this checkout, so build and driver cannot be compared — fetch it and publish again" >&2
+      return 2
+    fi
+  done
+  git -C "$ROOT" merge-base --is-ancestor "$build" "$driver" 2>/dev/null && return 0
+  git -C "$ROOT" merge-base --is-ancestor "$driver" "$build" 2>/dev/null && return 0
+  echo "build $build and driver $driver are on neither's history — the run used a tree that was never merged" >&2
+  return 1
+}
+
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
 manifest_sha() { [ -f "$MANIFEST" ] && awk -F'\t' -v k="$1" '$1==k {print $2}' "$MANIFEST" | head -1; }
@@ -85,6 +164,13 @@ for f in $(find "$ROOT/report/runs" -type f ! -path "$ROOT/report/runs/README.md
     0) echo "REFUSED  $key — looks like a ${kind}; it was not uploaded"; refused=$((refused+1)); continue;;
     1) ;;
     *) echo "STOPPED  the credential check failed on $key; nothing further was uploaded"; exit 2;;
+  esac
+
+  one_history "$f"; code=$?
+  case $code in
+    0) ;;
+    1) echo "REFUSED  $key — its build and driver are not on one history; it was not uploaded"; refused=$((refused+1)); continue;;
+    *) echo "STOPPED  the provenance check could not judge $key; nothing further was uploaded"; exit 2;;
   esac
 
   # Whether the bucket already has it is answered by the bytes, not by a 200:
