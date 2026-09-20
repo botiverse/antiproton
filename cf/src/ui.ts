@@ -1221,18 +1221,34 @@ function pairCalls(events: Ev[]): { calls: Call[]; turns: Ev[] } {
  * Only failures carry an identity — the gateway sets it where a call threw — so a
  * badge appears exactly where knowing it changes what a person does next, and
  * never on the successful public reads that make up most of a trace.
+ *
+ * `callId` is not unique: every host call a `run_js` script makes is recorded
+ * under the id of the one tool call the model issued (`CompletedFacts`,
+ * src/core/store.ts), so one id can carry several operations against several
+ * mounts. An identity belongs to a mount, so a row can only claim one when
+ * every operation under that id reports the same one — two mounts disagreeing
+ * is not a state a single badge can say truthfully, and saying the last one to
+ * arrive would be a lie the reader cannot see.
  */
 type Who = { identity?: string; credentialRef?: string };
 function identityByCall(events: Ev[]): Map<string, Who> {
-  const by = new Map<string, Who>();
+  const by = new Map<string, Who | null>();
   for (const e of events) {
     if (e.kind !== "operation.completed") continue;
     const p = e.payload ?? {};
     const id = typeof p.callId === "string" ? p.callId : "";
     if (!id || typeof p.identity !== "string") continue;
-    by.set(id, { identity: p.identity, ...(typeof p.credentialRef === "string" ? { credentialRef: p.credentialRef } : {}) });
+    const who: Who = { identity: p.identity, ...(typeof p.credentialRef === "string" ? { credentialRef: p.credentialRef } : {}) };
+    if (!by.has(id)) { by.set(id, who); continue; }
+    const seen = by.get(id);
+    // Disagreement is kept as a null rather than dropped, so a later operation
+    // that happens to agree with the first cannot revive a claim two others
+    // have already broken.
+    if (!seen || seen.identity !== who.identity || seen.credentialRef !== who.credentialRef) by.set(id, null);
   }
-  return by;
+  const agreed = new Map<string, Who>();
+  for (const [id, who] of by) if (who) agreed.set(id, who);
+  return agreed;
 }
 
 /**

@@ -140,6 +140,31 @@ check("nothing reported draws nothing, and a trace with no identity is untouched
     "an identity with no callId cannot be tied to a call, so it is not drawn on one");
 });
 
+check("one call id can cover several operations, so a badge needs them to agree", () => {
+  // A `run_js` script's host calls are all recorded under the id of the one
+  // tool call the model issued, and they can hit different mounts. An identity
+  // belongs to a mount, so one row may only claim one when they all say it.
+  const two = (a: any, b: any) => eventList([...events,
+    { sequence: 30, kind: "operation.completed", payload: { operationId: "op_1", status: "failed", resultRef: null, callId: "call_c", ...a }, createdAt: T + 22500 },
+    { sequence: 31, kind: "operation.completed", payload: { operationId: "op_2", status: "failed", resultRef: null, callId: "call_c", ...b }, createdAt: T + 22600 }]);
+
+  const agree = rowOf(two({ identity: "none" }, { identity: "none" }), "call_c");
+  must(/>anonymous · no account</.test(agree), "two operations saying the same thing is still one fact");
+  must(count(agree, /anonymous · no account/g) === 1, "and it is said once, not once per operation");
+
+  must(!/account used|anonymous ·/.test(two({ identity: "none" }, { identity: "attached" })),
+    "two mounts disagreeing is not something one badge can say truthfully");
+  must(!/account used|anonymous ·/.test(two({ identity: "unreadable", credentialRef: "agent" }, { identity: "unreadable", credentialRef: "operator" })),
+    "same state, different people to fix it: the badge would send half the readers to the wrong one");
+  must(!/account used|anonymous ·/.test(two({ identity: "none" }, { identity: "attached" }, )),
+    "and the last one to arrive does not win");
+  must(!/account used|anonymous ·/.test(eventList([...events,
+    { sequence: 30, kind: "operation.completed", payload: { operationId: "op_1", status: "failed", resultRef: null, callId: "call_c", identity: "none" }, createdAt: T + 22500 },
+    { sequence: 31, kind: "operation.completed", payload: { operationId: "op_2", status: "failed", resultRef: null, callId: "call_c", identity: "attached" }, createdAt: T + 22600 },
+    { sequence: 32, kind: "operation.completed", payload: { operationId: "op_3", status: "failed", resultRef: null, callId: "call_c", identity: "none" }, createdAt: T + 22700 }])),
+    "a third operation agreeing with the first does not revive a claim the second broke");
+});
+
 check("the identity is keyed on the call, not on the wording or the order", () => {
   const other = rowOf(withIdentity("none"), "call_a");
   must(!/account used|anonymous ·/.test(other), "the badge lands on the call the record names, not on its neighbours");
