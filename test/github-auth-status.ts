@@ -11,6 +11,7 @@
  * the state a new agent is actually in, not an edge case.
  */
 import { githubPlugin } from "../src/plugins/github.ts";
+import { RECOMMENDS_ATTACH, RECOMMENDS_REWRITE } from "./identity-wording.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -45,7 +46,9 @@ await check("it says who can change it, since the agent cannot", async () => {
   // who can.
   const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "none")) as Record<string, unknown>;
   const note = String(r.note ?? "");
-  if (!/a person/.test(note) || !/attach/.test(note)) {
+  // `/attach/` alone accepts "should not attach one" — the opposite advice — so
+  // this matches the recommending form (@Rex, 2026-09-20).
+  if (!/a person/.test(note) || !RECOMMENDS_ATTACH.test(note)) {
     throw new Error(`the state does not say who attaches an account: ${note}`);
   }
   if (!/public data/.test(note)) throw new Error(`the state does not say what it can still do: ${note}`);
@@ -66,7 +69,11 @@ await check("a credential that cannot be read is a different state, with a diffe
   const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "agent")) as Record<string, unknown>;
   const note = String(r.note ?? "");
   if (r.credential !== "unreadable") throw new Error(`reported the state as ${JSON.stringify(r.credential)}`);
-  if (!/write it again/.test(note)) throw new Error(`does not say the credential has to be rewritten: ${note}`);
+  // The recommending form, not the words: "must NOT write it again" contains
+    // "write it again" (@Rex's shape; falsified by reversing the sentence).
+  if (!RECOMMENDS_REWRITE.test(note)) {
+    throw new Error(`does not say the credential has to be rewritten: ${note}`);
+  }
   if (/attach one/.test(note)) throw new Error(`sends a person to attach a second account: ${note}`);
 });
 
