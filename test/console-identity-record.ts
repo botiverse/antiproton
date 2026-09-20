@@ -116,11 +116,13 @@ await check("the page joins on the producer's key, not on a name a test wrote do
  * two anonymous states want opposite actions from opposite people.
  */
 const ACTION: Record<string, { page: RegExp; note: RegExp }> = {
-  // The page pattern matches the ACTION, not this page's phrasing of it: a
-  // pattern tied to today's wording would fail on a verbatim copy of the
-  // plugin's sentence, and the copy check below — the one written for that
-  // case — would never be reached to say so.
-  none: { page: /attach/, note: /attach one/ },
+  // The page pattern has to name the action as a RECOMMENDATION, not contain
+  // its word root: `/attach/` also matches "attaching is not possible", which
+  // is the opposite advice (@Vera planted exactly that and it passed). So each
+  // pattern lists the forms that recommend, and it may be this specific only
+  // because the copy check runs first — tied to one phrasing, it would fail a
+  // copy before the check written for copies could speak.
+  none: { page: /attaches an account|can attach one/, note: /attach one/ },
   "unreadable:agent": { page: /has to write it again/, note: /has to write it again/ },
   "unreadable:operator": { page: /whoever deploys/, note: /whoever deploys/ },
 };
