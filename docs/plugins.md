@@ -144,6 +144,21 @@ chooses, the plugin must bound that host with a setting. `http` declares no
 credential today, but its `allowedHosts` setting is already marked
 `requiredWithCredential` for the day it does.
 
+**Say which identity a call was made with.** `ctx.credential` being null has
+two causes that want opposite actions from a person: the mount names no
+credential, or it names one whose secret could not be read. They arrive as the
+same null, so a plugin that writes "this mount has no account" into a failure
+states a guess as a fact — and sends someone to attach an account to a mount
+that already has one. Read `credentialState(ctx)` instead, which is
+`credential` together with `credentialNamed`, and put `identityNote(ctx)` in the
+message: one wording per state, each ending in the action it implies, and
+`unreported` (a caller that did not say) names both rather than picking one.
+Say it when a credential *did* arrive, too. A failure that does not record the
+identity behind it can only be attributed later by reading the source of the
+build that produced the message — which in the reading that prompted this meant
+three builds, because the sentence a conclusion rested on did not exist yet on
+the day of the call.
+
 **Keep per-mount state in `ctx.connection`.** It belongs to one mount, survives
 across calls and runs, and is never shown to the model. Two mounts of the same
 plugin never share it.

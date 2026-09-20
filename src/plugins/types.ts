@@ -31,6 +31,23 @@ export interface PluginContext {
   alias: string;
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
+  /**
+   * Whether this mount names a credential at all — which is a different
+   * question from whether one arrived, and the only way a plugin can tell its
+   * two reasons for `credential: null` apart.
+   *
+   * A mount whose `secret_ref` cannot be read resolves to null exactly like a
+   * mount that names nothing: `agentSecrets` answers a missing row with
+   * `return null` (src/runtime/secrets.ts), and the gateway hands that on. So a
+   * plugin holding only `credential` and saying "this mount has no account"
+   * states something false half the time, and sends the person to attach a
+   * token that is already attached — when the action that fixes it is writing
+   * the mount's secret again. Read it through `credentialState`.
+   *
+   * Optional because absent has to keep meaning "not reported": a caller that
+   * does not supply it must not be read as saying no credential is named.
+   */
+  credentialNamed?: boolean;
   publicConfig: Record<string, Json>;
   /** Survives across calls and across executions; never reaches the model. */
   connection: ConnectionState;
@@ -63,6 +80,9 @@ export interface PluginContext {
    */
   sibling(alias: string): Promise<{
     credential: string | null;
+    /** As on this mount: whether that mount names a credential, so a null one
+     *  can be reported as unreadable rather than absent. */
+    credentialNamed?: boolean;
     connection: ConnectionState;
     /**
      * Which plugin that mount is. A credential is only meaningful to the service
@@ -77,6 +97,68 @@ export interface PluginContext {
      */
     policy: MountPolicy | null;
   } | null>;
+}
+
+/**
+ * Which identity a call was made with, as the plugin is able to know it.
+ *
+ * - **`attached`** — a credential reached this call, so whatever the service
+ *   answered is about that account, not about a missing one.
+ * - **`none`** — the mount names no credential. Anonymous on purpose; a person
+ *   attaches one.
+ * - **`unreadable`** — the mount names a credential and it did not arrive. Also
+ *   anonymous, but nothing is missing from the mount: the secret behind the
+ *   reference has to be written again, and attaching a second token fixes
+ *   nothing.
+ * - **`unreported`** — the caller did not say whether one is named, so the two
+ *   anonymous cases cannot be told apart here. A plugin must not resolve this
+ *   to either one; say both are possible, or say nothing.
+ *
+ * Why a plugin should reach for this rather than `credential` alone: the two
+ * anonymous cases produce the same failure from the service, so a message that
+ * names one of them guesses — and a guess written as a fact is how a person
+ * spends an afternoon attaching a token to a mount that already has one
+ * (Vera's reading of a production trajectory, 2026-09-20).
+ */
+export type CredentialState = "attached" | "none" | "unreadable" | "unreported";
+
+export function credentialState(
+  ctx: Pick<PluginContext, "credential" | "credentialNamed">,
+): CredentialState {
+  if (ctx.credential) return "attached";
+  if (ctx.credentialNamed === undefined) return "unreported";
+  return ctx.credentialNamed ? "unreadable" : "none";
+}
+
+/**
+ * The state as a clause a person can act on, so two plugins do not invent two
+ * sentences for one state and a page has one string to key on (Nova asked for
+ * the identity on the failed call rather than on the mount, 2026-09-20).
+ *
+ * A clause about the mount rather than a whole sentence about the call: the
+ * caller frames it, because "this call was anonymous" belongs in a failure and
+ * not in the answer to "who am I here?". Each state ends with the action it
+ * implies, and `none` and `unreadable` imply opposite ones — attach an account,
+ * versus write the credential of the account already attached.
+ */
+export function identityNote(ctx: Pick<PluginContext, "credential" | "credentialNamed" | "alias">): string {
+  const mount = `the \`${ctx.alias}\` mount`;
+  switch (credentialState(ctx)) {
+    case "attached":
+      // Passive, so the one clause reads inside a failure, a refusal and an
+      // answer to "who am I here?" without three wordings of one fact.
+      return `${mount}'s account was used`;
+    case "none":
+      return `${mount} has no account attached, and a person can attach one`;
+    case "unreadable":
+      return `${mount} names an account whose credential could not be read, so that credential has to be` +
+        ` written again rather than another account attached`;
+    case "unreported":
+      // Says both, and still names an action: a state nobody reported is not a
+      // reason to leave the reader with nothing to do.
+      return `either ${mount} has no account, or the credential it names could not be read, and a person` +
+        ` has to look at the mount to tell which`;
+  }
 }
 
 /** The most live hooks one mount may hold; see `InboundHooks`. */

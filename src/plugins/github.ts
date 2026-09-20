@@ -32,6 +32,7 @@
  */
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext, ToolSchema } from "./types.ts";
+import { credentialState, identityNote } from "./types.ts";
 
 const API = "https://api.github.com";
 /** GitHub caps this itself; clamping makes the limit visible in the schema. */
@@ -55,22 +56,37 @@ function repoOf(args: Record<string, any>): string {
 }
 
 /**
- * What a mount with no account should say when GitHub's answer may be about the
- * account rather than the request. The seeded mount has none, and without this
- * an agent read a private repository's 404 as "the repository cannot be
- * reached" and a shared anonymous limit's 403 as a dead end, and the person had
- * to work out that an account was missing (trajectory read by cody, 2026-09-15).
+ * Which identity made this call, said on the answers that depend on one.
+ *
+ * Two readings needed it. Without the anonymous half an agent read a private
+ * repository's 404 as "the repository cannot be reached" and a shared anonymous
+ * limit's 403 as a dead end, and the person had to work out that an account was
+ * missing (trajectory read by cody, 2026-09-15). Without the other half — said
+ * when a credential *did* arrive — a failure carries no record of the identity
+ * it was made with, and reconstructing it later means reading the source of the
+ * build that produced the message: three of them, in the case that prompted
+ * this (Vera and cody, 2026-09-20). So a person is never asked to infer from a
+ * silence: 401/403/404 each say which account was behind the request.
+ *
+ * `identityNote` is the contract's wording, shared so two plugins do not invent
+ * two sentences for one state; what GitHub's status means for that identity is
+ * this plugin's to add.
  */
-function noAccountHint(status: number): string {
-  if (status === 404) {
-    return " — this mount has no account, so a private repository answers exactly like a missing one;" +
-      " a person can attach a token to the mount";
+function identityLine(ctx: PluginContext, status: number): string {
+  if (status !== 401 && status !== 403 && status !== 404) return "";
+  if (credentialState(ctx) === "attached") {
+    // A refused credential is the one case where holding an account is the
+    // problem rather than the answer, and attaching another does nothing.
+    return status === 401
+      ? ` — ${identityNote(ctx)}, and GitHub refused that credential itself, so it has to be replaced rather than added to`
+      : ` — ${identityNote(ctx)}, so this is about what that account may do or its own rate, not a missing account`;
   }
-  if (status === 403) {
-    return " — this mount has no account, so it shares GitHub's low anonymous rate limit with everything" +
-      " else calling from this server; a person can attach a token to the mount to raise it";
-  }
-  return "";
+  const consequence = status === 404
+    ? " and a private repository answers exactly like a missing one"
+    : status === 403
+    ? " and shares GitHub's low anonymous rate limit with everything else calling from this server"
+    : "";
+  return ` — this call was anonymous${consequence}: ${identityNote(ctx)}`;
 }
 
 async function call(
@@ -133,7 +149,7 @@ async function call(
       ? ` — rate limit exhausted, resets ${new Date(Number(reset) * 1000).toISOString()}`
       : "";
     const err = new Error(
-      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${ctx.credential ? "" : noAccountHint(res.status)}`,
+      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status)}`,
     ) as Error & { retryable?: boolean };
     err.retryable = res.status === 429 || (res.status === 403 && remaining === "0") || res.status >= 500;
     throw err;
@@ -151,13 +167,19 @@ async function call(
   return parsed;
 }
 
-/** A write without an account is a configuration mistake, not a 401 to retry. */
+/**
+ * A write without an account is a configuration mistake, not a 401 to retry.
+ *
+ * What kind of mistake is the part worth saying. This used to answer "this
+ * mount has no secret_ref", which is false for a mount that names one whose
+ * secret cannot be read — and it sent the person to attach a token to a mount
+ * that already had one, instead of writing the secret again.
+ */
 function requireAccount(ctx: PluginContext, tool: string) {
-  if (!ctx.credential) {
-    throw new Error(
-      `${tool} needs an account: this mount has no secret_ref, so it can only read public data`,
-    );
-  }
+  if (ctx.credential) return;
+  throw new Error(
+    `${tool} needs an account and this call had none, though reads still work without one — ${identityNote(ctx)}`,
+  );
 }
 
 /** A path, not a URL: the host is ours to decide, so no amount of creativity in
@@ -594,10 +616,14 @@ export const githubPlugin: Plugin = {
         // could not tell that apart from a call it had got wrong (a fresh agent
         // via Vera, 2026-09-13).
         if (!ctx.credential) {
+          // The two anonymous states want opposite actions from a person, and
+          // this is the tool whose whole subject is which one holds.
+          const state = credentialState(ctx);
           return {
             authenticated: false,
             account: null,
-            note: "no account is attached to this mount, so it reads public data only; a person attaches one",
+            credential: state,
+            note: `${identityNote(ctx)}; public data is still readable`,
           };
         }
         const u = await call("GET", "/user", ctx);
