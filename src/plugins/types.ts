@@ -31,6 +31,34 @@ export interface PluginContext {
   alias: string;
   /** Resolved server-side; the agent never sees the credential itself. */
   credential: string | null;
+  /**
+   * What kind of credential this mount names — never which one, and never its
+   * value. `"none"` means it names none.
+   *
+   * The reason a plugin needs it: `credential` is null for several different
+   * reasons, and they are fixed by different people. The mount names nothing,
+   * so its owner attaches an account. It names `agent:<name>` and that row is
+   * gone (`agentSecrets` answers a missing row with `return null`), so whoever
+   * holds that credential writes it again. It names `operator:` or `env:` and
+   * this deployment does not hold it, so whoever deploys configures it — which
+   * is the state of every operator-referencing mount on a preview Worker today.
+   * All three arrive as the same null, so a plugin holding only `credential`
+   * that says "this mount has no account" is guessing, and the advice that
+   * follows the guess sends the wrong person to fix it (Vera and cody, both
+   * reading this, 2026-09-20).
+   *
+   * The kind rather than the reference, because the reference is a name with
+   * structure: `src/store/refs.ts` exists because raw references named the
+   * bucket, the tenant and the agent in every result that carried one. A plugin
+   * writes its state into messages a model reads, so it is handed the one part
+   * that changes what to do and nothing that identifies where the agent lives.
+   * `secretRefKind` in `src/runtime/secrets.ts` computes it and inspects only
+   * the prefix; `test/mount-config.ts` pins the two lists together.
+   *
+   * Optional because absent has to keep meaning "not reported": a caller that
+   * does not supply it must not be read as saying no credential is named.
+   */
+  credentialRefKind?: CredentialRefKind;
   publicConfig: Record<string, Json>;
   /** Survives across calls and across executions; never reaches the model. */
   connection: ConnectionState;
@@ -63,6 +91,9 @@ export interface PluginContext {
    */
   sibling(alias: string): Promise<{
     credential: string | null;
+    /** As on this mount: what kind of credential that mount names, so a null
+     *  one can be reported as unreadable rather than absent. */
+    credentialRefKind?: CredentialRefKind;
     connection: ConnectionState;
     /**
      * Which plugin that mount is. A credential is only meaningful to the service
@@ -77,6 +108,81 @@ export interface PluginContext {
      */
     policy: MountPolicy | null;
   } | null>;
+}
+
+/**
+ * Which identity a call was made with, as the plugin is able to know it.
+ *
+ * - **`attached`** — a credential reached this call, so whatever the service
+ *   answered is about that account, not about a missing one.
+ * - **`none`** — the mount names no credential. Anonymous on purpose; a person
+ *   attaches one.
+ * - **`unreadable`** — the mount names a credential and it did not arrive. Also
+ *   anonymous, but nothing is missing from the mount: the secret behind the
+ *   reference has to be written again, and attaching a second token fixes
+ *   nothing.
+ * - **`unreported`** — the caller did not say whether one is named, so the two
+ *   anonymous cases cannot be told apart here. A plugin must not resolve this
+ *   to either one; say both are possible, or say nothing.
+ *
+ * Why a plugin should reach for this rather than `credential` alone: the two
+ * anonymous cases produce the same failure from the service, so a message that
+ * names one of them guesses — and a guess written as a fact is how a person
+ * spends an afternoon attaching a token to a mount that already has one
+ * (Vera's reading of a production trajectory, 2026-09-20).
+ */
+export type CredentialState = "attached" | "none" | "unreadable" | "unreported";
+
+/**
+ * Whose credential a reference names, never which one. The same five values
+ * `secretRefKind` returns, declared here because the contract cannot depend on
+ * the runtime that fills it; `test/mount-config.ts` fails if the two drift.
+ */
+export type CredentialRefKind = "none" | "agent" | "operator" | "env" | "other";
+
+export function credentialState(
+  ctx: Pick<PluginContext, "credential" | "credentialRefKind">,
+): CredentialState {
+  if (ctx.credential) return "attached";
+  if (ctx.credentialRefKind === undefined) return "unreported";
+  return ctx.credentialRefKind === "none" ? "none" : "unreadable";
+}
+
+/**
+ * The state as a clause a person can act on, so two plugins do not invent two
+ * sentences for one state and a page has one string to key on (Nova asked for
+ * the identity on the failed call rather than on the mount, 2026-09-20).
+ *
+ * A clause about the mount rather than a whole sentence about the call: the
+ * caller frames it, because "this call was anonymous" belongs in a failure and
+ * not in the answer to "who am I here?". Each state ends with the action it
+ * implies, and `none` and `unreadable` imply opposite ones — attach an account,
+ * versus write the credential of the account already attached.
+ */
+export function identityNote(ctx: Pick<PluginContext, "credential" | "credentialRefKind" | "alias">): string {
+  const mount = `the \`${ctx.alias}\` mount`;
+  switch (credentialState(ctx)) {
+    case "attached":
+      // Passive, so the one clause reads inside a failure, a refusal and an
+      // answer to "who am I here?" without three wordings of one fact.
+      return `${mount}'s account was used`;
+    case "none":
+      return `${mount} has no account attached, and a person can attach one`;
+    case "unreadable":
+      // Nothing is missing from the mount here, so "attach an account" is the
+      // one piece of advice that must not appear. Who to send instead depends
+      // on whose credential it is, which is what the kind says.
+      return ctx.credentialRefKind === "operator" || ctx.credentialRefKind === "env"
+        ? `${mount} names a credential this deployment holds for everyone, and this deployment does not` +
+          ` have it, so whoever deploys has to configure it there; attaching an account to the mount cannot`
+        : `${mount} names an account whose credential could not be read, so whoever holds that credential` +
+          ` has to write it again rather than another account being attached`;
+    case "unreported":
+      // Says both, and still names an action: a state nobody reported is not a
+      // reason to leave the reader with nothing to do.
+      return `either ${mount} has no account, or the credential it names could not be read, and a person` +
+        ` has to look at the mount to tell which`;
+  }
 }
 
 /** The most live hooks one mount may hold; see `InboundHooks`. */

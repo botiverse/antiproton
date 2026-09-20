@@ -17,8 +17,8 @@ async function check(name: string, fn: () => Promise<void>) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
-const ctx = (credential: string | null) => ({
-  caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "gh", credential, publicConfig: {},
+const ctx = (credential: string | null, credentialRefKind?: string) => ({
+  caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "gh", credential, credentialRefKind, publicConfig: {},
   connection: { get: async () => null, set: async () => {} }, sibling: async () => null,
 }) as any;
 
@@ -76,6 +76,84 @@ await check("with an account, the same answers carry no hint about attaching one
   const limited = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok")));
   for (const why of [notFound, limited]) {
     if (/person|attach/.test(why)) throw new Error(`a mount that has an account was told to attach one: ${why}`);
+  }
+});
+
+/**
+ * Which identity a failure was made with, said on the failure itself.
+ *
+ * Two mounts answer a 403 identically — one with no account, one naming an
+ * account whose credential cannot be read — and the actions they want are
+ * opposite: attach an account, versus write the credential of the account
+ * already attached. The plugin used to state the first as a fact ("this mount
+ * has no secret_ref"), which is false for the second and sends the person to
+ * attach a token to a mount that already has one.
+ *
+ * The other half is a credential that did arrive: without it a failure carries
+ * no record of the identity behind it, and reconstructing that later meant
+ * reading the source of the build that produced the message — three builds, in
+ * the reading that prompted this (Vera and cody, 2026-09-20).
+ */
+const limited = { "content-type": "application/json", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1789500000" };
+
+await check("a credential that cannot be read is not reported as a missing account", async () => {
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
+  if (!/write it again/.test(why)) throw new Error(`does not name the action that fixes it: ${why}`);
+  if (/attach one|has no account attached/.test(why)) throw new Error(`reported as a mount with no account: ${why}`);
+});
+
+await check("the two anonymous states do not produce one message", async () => {
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const none = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "none")));
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const unreadable = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
+  if (none === unreadable) throw new Error(`one message for both states: ${none}`);
+});
+
+await check("a state the gateway did not report names both, rather than picking one", async () => {
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null)));
+  if (!/either/.test(why)) throw new Error(`picked one of the two states: ${why}`);
+});
+
+await check("with an account, a failure says that account was used", async () => {
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok", "agent")));
+  if (!/account was used/.test(why)) throw new Error(`the identity behind the call is not in the failure: ${why}`);
+  if (/anonymous/.test(why)) throw new Error(`a call that carried a credential was reported as anonymous: ${why}`);
+});
+
+await check("a credential GitHub refuses says replace it, not attach another", async () => {
+  answer(401, JSON.stringify({ message: "Bad credentials" }), { "content-type": "application/json" });
+  const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok", "agent")));
+  if (!/replaced/.test(why)) throw new Error(`does not say the credential has to be replaced: ${why}`);
+  if (/attach/.test(why)) throw new Error(`a mount that has an account was told to attach one: ${why}`);
+});
+
+await check("a deployment-level credential this deployment lacks sends the deployer, not the mount's owner", async () => {
+  // Every `operator:` mount on a preview Worker is in this state today: the
+  // reference is right, the deployment does not hold the key. Telling its owner
+  // to attach an account sends the wrong person, and there is nothing for them
+  // to attach (cody's counter-example, verified by Vera in cf/src/runtime.ts).
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
+  if (!/whoever deploys/.test(why)) throw new Error(`does not name who can fix it: ${why}`);
+  if (!/attaching an account to the mount cannot/.test(why)) throw new Error(`does not rule out attaching one: ${why}`);
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const agentRef = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
+  if (why === agentRef) throw new Error(`one message for two different people to fix: ${why}`);
+});
+
+await check("a write with no account says which of the two states it is in", async () => {
+  const named = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "agent")));
+  if (!/write it again/.test(named)) throw new Error(`a mount naming a credential was told to attach one: ${named}`);
+  const bare = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "none")));
+  if (!/attach/.test(bare)) throw new Error(`a mount with no account was not told to attach one: ${bare}`);
+  // Neither may claim the mount has no `secret_ref`: only the gateway knows,
+  // and it says so through `credentialRefKind`.
+  for (const why of [named, bare]) {
+    if (/secret_ref/.test(why)) throw new Error(`states something the plugin cannot know: ${why}`);
   }
 });
 
