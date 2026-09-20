@@ -163,12 +163,15 @@ export function credentialState(
  * and that was the defect — while its `attached` one carried a clause these
  * sentences do not, because a badge someone glances at and a sentence in a
  * failure are not the same job. Forcing one string on both would have cost the
- * badge that clause or stretched this one to fit a tooltip (@Nova and @Rex,
- * who also pointed out the deeper reason: identity crosses to a page as a
- * FIELD — `identity`, `credentialRef` — precisely so a page never has to read
- * or reproduce this prose). So what is pinned there is that both name the same
- * action (`attach` · `write it again` · `whoever deploys`), with literal copying
- * refused — which makes "just share the string" fail the check rather than pass
+ * badge that clause or stretched this one to fit a tooltip. That distinction is
+ * @Nova's, from the console side, in #plugins:770a1824; the deeper reason is
+ * @Rex's, which @Nova relayed in the same thread: identity crosses to a page as
+ * a FIELD — `identity`, `credentialRef` — precisely so a page never has to read
+ * or reproduce this prose. (Both names say where to check them, because a name
+ * is the one claim in a comment a later reader cannot re-derive from this
+ * repository — @Rex, same thread.) So what is pinned there is that both name
+ * the same action (`attach` · `write it again` · `whoever deploys`), with
+ * literal copying refused — which makes "just share the string" fail the check rather than pass
  * it. **The action pattern has to match the action, not either side's current
  * phrasing**, or the refusal never runs: @Nova first matched on their own
  * wording, @Vera planted a verbatim copy of these sentences, and it went red
