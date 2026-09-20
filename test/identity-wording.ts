@@ -24,6 +24,8 @@
  * entry and exported by lookup: there is nowhere to put a pattern that has no
  * cases, and `Case` requires both fields, so a missing half is a compile error.
  */
+import { pathToFileURL } from "node:url";
+
 interface Case {
   readonly name: string;
   readonly pattern: RegExp;
@@ -89,4 +91,32 @@ export function rejectsItsOwnNegation(): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Also a suite, not only a module.
+ *
+ * `gate.sh` runs every `test/*.ts`, so a module that lives here and asserts
+ * nothing exits 0 with no output — and the gate's first rule is that "nothing
+ * ran" must not read as "all passed" (@cody's gate caught exactly that on this
+ * file, 2026-09-20). Moving it out of `test/` would silence the gate by making
+ * the table nobody's to check, which is worse.
+ *
+ * So running it directly asks the table's own question. The case in
+ * `github-errors.ts` stays as well: this keeps the invariant asked even if that
+ * file stops calling it, and that file keeps it asked in the suite a reader of
+ * the wording assertions is already looking at.
+ */
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const wrong = rejectsItsOwnNegation();
+  const cases = CASES.length;
+  console.log(`\n  the wording patterns reject their own negation\n  ${"─".repeat(56)}`);
+  if (wrong) {
+    console.log(`  \x1b[31m✗\x1b[0m every pattern accepts what recommends and rejects what opposes`);
+    console.log(`      \x1b[31m${wrong}\x1b[0m`);
+  } else {
+    console.log(`  \x1b[32m✓\x1b[0m every pattern accepts what recommends and rejects what opposes (${cases} patterns)`);
+  }
+  console.log(`  ${"─".repeat(56)}\n  ${wrong ? 0 : 1} passed, ${wrong ? 1 : 0} failed\n`);
+  process.exit(wrong ? 1 : 0);
 }
