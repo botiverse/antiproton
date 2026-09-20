@@ -313,8 +313,12 @@ export function runJsTool(
   const unoffered = new Map((opts.unoffered ?? []).map((u) => [modelName(u.alias), u]));
   // Every alias as it appears in a model-facing name, offered or not: a name is
   // attributed to the LONGEST alias it starts with. Not by splitting at the
-  // first "__" — an alias may itself contain "__" (renameMount does not forbid
-  // it), which is the same inversion #255 refused for truncated names (Piper).
+  // first "__" — an alias may itself contain "__", which is the same inversion
+  // #255 refused for truncated names (Piper). The reason changed under this
+  // code and the code did not: `renameMount` used to forbid nothing, and since
+  // #444 it applies `MOUNT_ALIAS`, which has no `_` at all — but only to names
+  // set FROM THEN ON. Nothing rewrote the aliases already stored, so one of
+  // them can still contain "__" and this has to keep reading them.
   // Offered aliases take part so a typo on an offered mount (gh__eu) is not
   // mistaken for a switched-off mount whose alias is a shorter prefix (gh).
   const offeredAliases = new Set((opts.tools ?? []).map((t) => modelName(t.address.split(".")[0]!)));
