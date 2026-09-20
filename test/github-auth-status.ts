@@ -47,7 +47,9 @@ await check("it says who can change it, since the agent cannot", async () => {
   const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "none")) as Record<string, unknown>;
   const note = String(r.note ?? "");
   // `/attach/` alone accepts "should not attach one" — the opposite advice — so
-  // this matches the recommending form (@Rex, 2026-09-20).
+  // this matches the recommending form (@Rex found the shape, 2026-09-20; the
+  // boundary cases were then measured against it, which is what chose this
+  // pattern — #plugins:770a1824 has the chain).
   if (!/a person/.test(note) || !RECOMMENDS_ATTACH.test(note)) {
     throw new Error(`the state does not say who attaches an account: ${note}`);
   }
