@@ -11,6 +11,7 @@
  */
 import { githubPlugin } from "../src/plugins/github.ts";
 import type { PluginError } from "../src/plugins/types.ts";
+import { RECOMMENDS_ATTACH, RECOMMENDS_DEPLOY_CONFIG, RECOMMENDS_REWRITE, rejectsItsOwnNegation } from "./identity-wording.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -106,7 +107,7 @@ const limited = { "content-type": "application/json", "x-ratelimit-remaining": "
 await check("a credential that cannot be read is not reported as a missing account", async () => {
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
-  if (!/(has to|must|needs to) write it again/.test(why)) {
+  if (!RECOMMENDS_REWRITE.test(why)) {
     throw new Error(`does not name the action that fixes it: ${why}`);
   }
   if (/attach one|has no account attached/.test(why)) throw new Error(`reported as a mount with no account: ${why}`);
@@ -151,7 +152,7 @@ await check("a deployment-level credential this deployment lacks sends the deplo
   // to attach (cody's counter-example, verified by Vera in cf/src/runtime.ts).
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
-  if (!/whoever deploys (has to|must|needs to) configure/.test(why)) {
+  if (!RECOMMENDS_DEPLOY_CONFIG.test(why)) {
     throw new Error(`does not say the deployer has to configure it: ${why}`);
   }
   if (!/attaching an account to the mount will not fix it/.test(why)) throw new Error(`does not rule out attaching one: ${why}`);
@@ -162,7 +163,7 @@ await check("a deployment-level credential this deployment lacks sends the deplo
 
 await check("a write with no account says which of the two states it is in", async () => {
   const named = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "agent")));
-  if (!/(has to|must|needs to) write it again/.test(named)) {
+  if (!RECOMMENDS_REWRITE.test(named)) {
     throw new Error(`a mount naming a credential was told to attach one: ${named}`);
   }
   const bare = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "none")));
@@ -170,7 +171,7 @@ await check("a write with no account says which of the two states it is in", asy
   // attach one", so this assertion used to pass a sentence giving the opposite
   // advice — checked by reversing it (@Rex found the shape, 2026-09-20). A
   // positive assertion has to narrow, because there the wide end fails silently.
-  if (!/can attach one|attaches an account/.test(bare)) {
+  if (!RECOMMENDS_ATTACH.test(bare)) {
     throw new Error(`a mount with no account was not told it can have one: ${bare}`);
   }
   // Neither may claim the mount has no `secret_ref`: only the gateway knows,
@@ -212,7 +213,7 @@ await check("the field and the sentence cannot disagree, because one call sets b
   // catch a drift is this: the sentence for the state the field names.
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const e = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
-  if (e.identity !== "unreadable" || !/whoever deploys (has to|must|needs to) configure/.test(e.message)) {
+  if (e.identity !== "unreadable" || !RECOMMENDS_DEPLOY_CONFIG.test(e.message)) {
     throw new Error(`field says ${e.identity} and the sentence says: ${e.message}`);
   }
 });
@@ -257,6 +258,14 @@ await check("a plain refusal answers neither, and still records no claim", async
   if (e.transient !== false) throw new Error(`a validation failure was called transient: ${e.transient}`);
   if ("mayHaveLanded" in e) throw new Error(`claims something about landing: ${e.mayHaveLanded}`);
   if (e.retryable !== false) throw new Error(`the transitional flag moved: ${e.retryable}`);
+});
+
+await check("the patterns that say which advice was given reject the opposite advice", async () => {
+  // The mechanical form of the rule, rather than a comment asking the next
+  // editor to remember it: widening an alternation for rewording tolerance is
+  // the reasonable next edit, and it is what lets a negated modal through.
+  const wrong = rejectsItsOwnNegation();
+  if (wrong) throw new Error(wrong);
 });
 
 /**
