@@ -1216,7 +1216,7 @@ function pairCalls(events: Ev[]): { calls: Call[]; turns: Ev[] } {
  * anyone agreed to a name: it is the id pi hands to `execute(toolCallId, …)`,
  * which is `model.response.toolCalls[].id` — the one `pairCalls` above already
  * pairs a result to its call with. A convention could drift; a shared origin
- * cannot (@cody, 2026-09-20).
+ * cannot.
  *
  * Only failures carry an identity — the gateway sets it where a call threw — so a
  * badge appears exactly where knowing it changes what a person does next, and
@@ -1252,7 +1252,10 @@ function identityByCall(events: Ev[]): Map<string, Who> {
   // filter and nothing else — `who !== undefined` in its place would let a
   // clash out as a `Who` whose `identity` reads `undefined`, which is the
   // page saying "nobody reported one" about a row where two mounts did, and
-  // that is the lie this whole function exists to avoid (@Rex, 2026-09-20).
+  // that is the lie this whole function exists to avoid. The guard is the type:
+  // `agreed.set` refuses a `Who | null`, so the filter is what makes the call
+  // compile (@Rex located it at the return rather than at the collapse where it
+  // was written, and broke it to show the error, #plugins:770a1824).
   const agreed = new Map<string, Who>();
   for (const [id, who] of by) if (who) agreed.set(id, who);
   return agreed;
