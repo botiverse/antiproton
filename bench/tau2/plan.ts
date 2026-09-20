@@ -9,14 +9,15 @@
  *
  * Said that way on purpose. It names what refutes it — a record whose `order` is `task-major` must NOT have
  * that shape — where the first version claimed something about every record ever published, which the first
- * task-major record made false the moment it was anchored, and that record is the one this switch produced
- * (Vera, 2026-09-20). The number of such records is deliberately left out: it grows, and nothing in the
+ * task-major record made false the moment it was anchored, and that record is the one this switch produced.
+ *
+ * The number of such records is deliberately left out: it grows, and nothing in the
  * sentence depends on it.
  *
  * So the plan is built here, once, and named in the record. `task-major` runs a task's trials back to back,
  * which is what breaks the identity: trial 2 and 3 are no longer always in the run's second half.
  * Randomising was considered and rejected — it turns both explanations into noise instead of separating
- * them (Vera, 2026-09-20).
+ * them.
  */
 
 /**
@@ -25,7 +26,7 @@
  * Thirds of the run are now thirds of the TASK LIST, not trial 1 / 2 / 3, which is exactly the point — trial
  * and position stop being one variable. The cost is that each cell gets smaller: a task's three trials sit
  * together, so the run says more about within-task trends and less about a column mean. One round of it had
- * a single informative pair (Vera). Choose `task-major` to separate the two variables, not to measure either
+ * a single informative pair. Choose `task-major` to separate the two variables, not to measure either
  * one precisely, and expect to need several rounds for anything else.
  */
 export type RunOrder = "trial-major" | "task-major";

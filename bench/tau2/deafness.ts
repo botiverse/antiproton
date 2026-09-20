@@ -3,8 +3,9 @@
  *
  * Three rounds and 72 trials produced no stall at all, and `answer_undelivered` cannot be waited for: the
  * runner polls every 20 seconds, so every lost push has about fifteen chances to be picked up before the
- * deadline. The only way that name ever appears in a record is if a round is made deaf on purpose
- * (Vera, 2026-09-20). `model_failed` is the opposite case and is NOT injected anywhere: it needs a real
+ * deadline. The only way that name ever appears in a record is if a round is made deaf on purpose.
+ *
+ * `model_failed` is the opposite case and is NOT injected anywhere: it needs a real
  * model call to fail after the last message, and that arrives on its own.
  *
  *   socket   the socket's answer is ignored; the polls still run, so the fallback should recover the turn.
