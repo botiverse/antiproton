@@ -12,11 +12,12 @@
  * two hops further". One credits a person for a contribution a reader cannot
  * check against the thread; the others name the contribution, so a reader can.
  *
- * **Scope is this lane deliberately.** The same shape exists in three places
- * outside it (`cf/src/ui.ts:1219` and `:1255`, `test/call-id-in-the-record.ts:125`),
- * and those comments belong to @Nova and @cody — widening this scan is theirs to
- * accept, not mine to impose through a gate they did not agree to. Raised in the
- * thread above instead.
+ * **Scope grows only where it was invited.** It began as this lane; `cf/src` was
+ * added after @Nova repaired both sites there (#453) and said the extension was
+ * mine to make. `test/` is still out: `test/call-id-in-the-record.ts:125` is
+ * @cody's, and he is removing it in #433 — adding the directory now would write
+ * an assertion that is FALSE today, which would drag the true one red beside it
+ * (@Vera's correction of my weaker reason, "a cross-PR dependency in a gate").
  *
  * This file is not in its own scope, because the defect appears here as a
  * fixture and would red the suite that quotes it. The cost is real: the three
@@ -35,35 +36,78 @@
  * than leaving it as advice in a comment nothing enforces.
  */
 import { readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 /** JSDoc tags and the like: an `@` in a comment that is not a person. */
 const NOT_A_PERSON = /^@(link|param|returns?|see|example|throws|deprecated|type|typedef|template|module|name|default|ts-[a-z-]+)$/;
+
+/**
+ * An attribution is a claim in a COMMENT, so only comment lines are read.
+ *
+ * `test/raft-plugin.ts:325` is the case that settles it: `"Release Bot
+ * (@raft-bot)"` is a GitHub account inside a string literal, and it matches the
+ * bare-name shape exactly. Asking its author what `@raft-bot` contributed is the
+ * ritual @Nova warned about, arrived at by a scan that could not tell a comment
+ * from data.
+ */
+const COMMENT = /^\s*(\/\/|\*|\/\*)/;
 
 /**
  * A name with nothing after it but a date.
  *
  * The date is not a role: it says when, which the git record already says, and
  * not what — which only the thread says.
+ *
+ * The `@` may not follow a word character, or `git@github.com` and `user@host)`
+ * in `cf/src/secret-shape.ts:41` read as people — an address is not a handle,
+ * and that comment is about credentials rather than about anyone.
  */
-const BARE = /(@[A-Za-z][A-Za-z0-9_-]*)(?:\)|, 20[0-9]{2}-[0-9]{2}-[0-9]{2}\))/g;
+const BARE = /(?<![A-Za-z0-9_.\-])(@[A-Za-z][A-Za-z0-9_-]*)(?:\)|, 20[0-9]{2}-[0-9]{2}-[0-9]{2}\))/g;
 
-const FILES = [
-  ...readdirSync("src/plugins").filter((f) => f.endsWith(".ts")).map((f) => `src/plugins/${f}`),
+/**
+ * Directories are read, never globbed.
+ *
+ * `git ls-files 'test/**\/*.ts'` finds 3 of 95 and `'cf/src/**\/*.ts'` 10 of 47,
+ * because `**` requires a directory level (@cody hit it on #433's scope and @Rex
+ * reproduced it on this one before it reached here). **A glob's blind spot
+ * answers with a small clean number rather than an error** (@Nova).
+ *
+ * The walk is recursive because the opposite assumption is just as wrong: I read
+ * "`cf/src` is flat" from those two numbers and wrote a flat `readdirSync`, and
+ * the completeness case below caught it on its first run — 27 files read of 37
+ * tracked, the other 10 in `agents-api/` and `vendor/`. **Both errors came from
+ * believing a claim about the shape of the tree instead of asking it.**
+ */
+const DIRS = ["src/plugins", "cf/src"];
+const NAMED = [
   "test/identity-wording.ts",
   "test/identity-in-the-record.ts",
   "test/github-errors.ts",
   "test/github-auth-status.ts",
 ];
 
+/** Vendored copies: not ours to edit, so a rule about our comments does not reach them. */
+const NOT_OURS = ["cf/src/vendor"];
+
+function tsIn(dir: string): string[] {
+  if (NOT_OURS.includes(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? tsIn(`${dir}/${e.name}`) : e.name.endsWith(".ts") ? [`${dir}/${e.name}`] : [],
+  );
+}
+
+const FILES = [...DIRS.flatMap(tsIn), ...NAMED];
+
 /** Every `@handle` in these files, bare or not, so the scan can prove it has a subject. */
 function namesIn(text: string): string[] {
-  return (text.match(/@[A-Za-z][A-Za-z0-9_-]*/g) ?? []).filter((n) => !NOT_A_PERSON.test(n));
+  return (text.match(/(?<![A-Za-z0-9_.\-])@[A-Za-z][A-Za-z0-9_-]*/g) ?? []).filter((n) => !NOT_A_PERSON.test(n));
 }
 
 /** The bare ones, as `file:line — the text that carries them`. */
 function bareIn(file: string, text: string): string[] {
   const out: string[] = [];
   text.split("\n").forEach((line, i) => {
+    if (!COMMENT.test(line)) return;
     for (const m of line.matchAll(BARE)) {
       if (NOT_A_PERSON.test(m[1]!)) continue;
       out.push(`${file}:${i + 1} — ${line.trim()}`);
@@ -96,6 +140,43 @@ check("the scan can still reach its subject", () => {
   const found = FILES.flatMap((f) => namesIn(readFileSync(f, "utf8")));
   if (found.length === 0) {
     throw new Error("no attribution anywhere in scope, so this suite is no longer asking anything");
+  }
+});
+
+check("every `.ts` in a scanned directory is actually scanned", () => {
+  // The guard above stops an EMPTY scope; it cannot see a PARTIAL one, and 10
+  // files of 47 would pass green (@Rex, who checked this suite's scope against
+  // @cody's glob before the extension reached it). So a second instrument counts
+  // the same directories: `git ls-files`, which knows nothing about `readdirSync`.
+  for (const dir of DIRS) {
+    const tracked = execFileSync("git", ["ls-files", `${dir}/*.ts`], { encoding: "utf8" })
+      .split("\n").filter(Boolean)
+      .filter((f) => !NOT_OURS.some((skip) => f.startsWith(`${skip}/`)));
+    const scanned = tsIn(dir);
+    if (tracked.length !== scanned.length) {
+      const missing = tracked.filter((f) => !scanned.includes(f));
+      throw new Error(
+        `${dir}: git tracks ${tracked.length} \`.ts\` files and this suite reads ${scanned.length}` +
+        (missing.length ? ` — unread: ${missing.join(", ")}` : "") +
+        ` (a subdirectory appearing here is the likely cause, and it is a decision rather than a bug)`,
+      );
+    }
+  }
+});
+
+check("a handle in DATA is not an attribution", () => {
+  // `test/raft-plugin.ts:325` is the case: "Release Bot (@raft-bot)" is a GitHub
+  // account in a string literal, and it matches the bare shape exactly. Asking
+  // its author what @raft-bot contributed is the ritual @Nova warned about.
+  const data = `  if (checked.account !== "Release Bot (@raft-bot)") throw new Error("x");`;
+  if (bareIn("x", data).length !== 0) throw new Error("read a string literal as an attribution");
+  // And an address is not a handle, or `cf/src/secret-shape.ts:41` names a person.
+  const url = " // scheme://user:password@host — a user alone (git@github.com, https://user@host) is not a credential.";
+  if (bareIn("x", url).length !== 0) throw new Error("read a URL as an attribution");
+  // But the same shape IN a comment is still one, or the two tests above would
+  // have bought their green by turning the scan off.
+  if (bareIn("x", "  // the release account was wrong (@raft-bot)").length !== 1) {
+    throw new Error("stopped reading comments while excluding data");
   }
 });
 

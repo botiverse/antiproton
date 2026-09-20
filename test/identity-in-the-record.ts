@@ -6,8 +6,7 @@
  * carry `credentialRefKind`, and the failure the gateway records has to carry
  * the `identity` and `credentialRef` the plugin stamped on the error. Without
  * both, the console can only badge a failure by matching the message's prose,
- * which is one rewording away from silently showing the wrong identity (@Nova
- * asked for a field rather than prose, #plugins:770a1824).
+ * which is one rewording away from silently showing the wrong identity.
  *
  * The mount here names `agent:gh-token` and the resolver answers null, which is
  * the state that produced the false sentence this line of work began with: a
@@ -139,7 +138,7 @@ await check(`the event the console already reads carries the identity, not only 
   // result, so an identity living in there would vanish on exactly the calls
   // that have an identity worth reading; and its absence would then mean "this
   // call produced nothing" rather than "nobody reported the identity", which
-  // makes two different absences look alike (@Nova's shape, @Vera's reading).
+  // makes two different absences look alike.
   const payload = (completed[0] as any).payload ?? {};
   // Asked BEFORE the presence check, or it can never be the one that speaks:
   // an implementation that nests the identity instead of lifting it fails the
