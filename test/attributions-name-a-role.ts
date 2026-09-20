@@ -54,8 +54,10 @@
  * way. So the third case below asserts that the no-name repair PASSES, rather
  * than leaving it as advice in a comment nothing enforces.
  */
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** JSDoc tags and the like: an `@` in a comment that is not a person. */
 const NOT_A_PERSON = /^@(link|param|returns?|see|example|throws|deprecated|type|typedef|template|module|name|default|ts-[a-z-]+)$/;
@@ -180,6 +182,67 @@ check("every `.ts` in a scanned directory is actually scanned", () => {
         ` (a subdirectory appearing here is the likely cause, and it is a decision rather than a bug)`,
       );
     }
+  }
+});
+
+/** A commit cited in a comment, as `` `<sha>` ``. */
+const CITED_SHA = /`([0-9a-f]{7,40})`/g;
+
+check("every commit a comment cites is reachable from this history", () => {
+  // @Nova's second step, as an assertion rather than a command someone remembers
+  // to run: `git cat-file -e` says the object is in THIS clone, which is a
+  // reading about the machine. A commit that lives only on a branch passes it —
+  // and after a squash merge and a branch delete, nothing references it, so it
+  // is gone here and never existed in a fresh clone. Reachability from HEAD is
+  // what makes the address open for the next reader rather than for me.
+  const bad: string[] = [];
+  for (const f of FILES) {
+    readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+      if (!COMMENT.test(line)) return;
+      for (const m of line.matchAll(CITED_SHA)) {
+        const sha = m[1]!;
+        try {
+          execFileSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { stdio: "ignore" });
+        } catch {
+          bad.push(`${f}:${i + 1} — \`${sha}\` is not reachable from HEAD, so it opens for whoever wrote it and nobody else`);
+        }
+      }
+    });
+  }
+  if (bad.length > 0) throw new Error(`a dead address is worse than none:\n      ${bad.join("\n      ")}`);
+});
+
+check("the reachability check reddens on a commit that exists but is unreachable", () => {
+  // The two states have to be told apart, or the case above would accept
+  // whatever this clone happens to hold.
+  //
+  // Built in a throwaway repository rather than here: the first version made the
+  // object with `commit-tree` in this one, which would leave a dangling commit
+  // in every clone the gate runs in — mine, @Vera's, and the one
+  // `verify-and-deploy.sh` uses before a deploy. @cody refused it for the reason
+  // that matters more than the bytes: `gate.sh` says "Both are git reads;
+  // neither touches production", and once running a check can change the thing
+  // it checks, even slightly, that property does not come back. The property
+  // needed is "SOME repository has such a commit", not this one.
+  const dir = mkdtempSync(join(tmpdir(), "reachability-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
+  try {
+    git("init", "-q", ".");
+    git("commit", "-q", "--allow-empty", "-m", "base");
+    git("checkout", "-q", "-b", "gone");
+    git("commit", "-q", "--allow-empty", "-m", "orphan");
+    const orphan = git("rev-parse", "HEAD");
+    git("checkout", "-q", "-");
+    git("branch", "-qD", "gone"); // the branch is gone; the object is not
+    git("cat-file", "-e", `${orphan}^{commit}`); // …so it still exists
+    let reachable = true;
+    try { git("merge-base", "--is-ancestor", orphan, "HEAD"); } catch { reachable = false; }
+    if (reachable) {
+      throw new Error("a commit no ref points at was called reachable, so the case above cannot fail");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
