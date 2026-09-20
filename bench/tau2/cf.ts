@@ -28,6 +28,7 @@ import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fal
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
 import { runOrder, runPlan } from "./plan.ts";
+import { deafnessBudget, readDeafness } from "./deafness.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -45,6 +46,10 @@ const TRIALS = Number(process.env.TRIALS ?? 1);
 const N = Number(process.env.N ?? 5);
 const OFFSET = Number(process.env.OFFSET ?? 0);
 const VERBOSE = !!process.env.VERBOSE;
+// Deliberate deafness for ONE turn of one round, so the recovery path can be observed rather than waited
+// for: bench/tau2/deafness.ts says what the settings mean and why they are named that way.
+const DEAFNESS = readDeafness(process.env.IGNORE_ANSWERS);
+const deafness = deafnessBudget(DEAFNESS);
 // Which order the (task, trial) pairs are visited in; an unknown name throws (bench/tau2/plan.ts).
 const ORDER = runOrder(process.env.ORDER);
 
@@ -192,6 +197,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         if (!d) return;
         seen.set(taskId, d.seq);
         if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
+        else if (deafness.deaf("poll")) { if (VERBOSE) console.log("    (ignoring the poll's answer on purpose)"); }
         else { if (!done) count(taskId, "poll"); stop(d.text); }
       }, () => {
         // Only the request failing counts here; the socket or the next tick will do.
@@ -217,6 +223,9 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
       }
       if (typeof e.id === "number") seen.set(taskId, e.id);
       if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) {
+        // Deliberately unheard, when asked for: the object answered and this runner behaves as though the
+        // push never arrived (IGNORE_ANSWERS).
+        if (deafness.deaf("socket")) { if (VERBOSE) console.log("    (ignoring the socket's answer on purpose)"); return; }
         if (!done) count(taskId, "push");
         stop(String(e.payload.text));
       }
@@ -287,9 +296,12 @@ async function runTask(task: any) {
         ended = "agent_stalled";
         ({ stall, stallWhy } = await stallAtDeadline(
           () => api(`/bench/poll?taskId=${taskId}`), seen.get(taskId) ?? 0));
+        // The hole is spent whether or not it produced the stall, so a round injects exactly one.
+        deafness.spend();
       }
       break;
     }
+    if (DEAFNESS === "socket") deafness.spend();
     agentSaid = answered;
     if (VERBOSE) console.log(`    agent > ${answered.replace(/\s+/g, " ").slice(0, 130)}`);
   }
@@ -409,7 +421,9 @@ if (act) {
 }
 const recorded = recordRun("tau2", OBJ, {
   bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
-  tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER, startedAt: new Date(t0Run).toISOString(),
+  tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER,
+  ...(DEAFNESS ? { ignoreAnswers: DEAFNESS } : {}),
+  startedAt: new Date(t0Run).toISOString(),
   results, ...passRecord(results, TRIALS),
   tools: toolTotals, endingsAllRows: allEndings, failingRowsByEndingAndCause: failEndings, activity: act,
 });
