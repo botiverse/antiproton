@@ -169,7 +169,13 @@ export function credentialState(
  * or reproduce this prose). So what is pinned there is that both name the same
  * action (`attach` · `write it again` · `whoever deploys`), with literal copying
  * refused — which makes "just share the string" fail the check rather than pass
- * it.
+ * it. **The action pattern has to match the action, not either side's current
+ * phrasing**, or the refusal never runs: @Nova first matched on their own
+ * wording, @Vera planted a verbatim copy of these sentences, and it went red
+ * saying "the card does not name the action" — of a sentence that names it
+ * plainly. The copy had tripped the phrasing check first, so the assertion
+ * written for copies was never asked. Matching `attach`, which both wordings
+ * satisfy, lets a copy reach the check that knows what a copy is.
  *
  * A clause about the mount rather than a whole sentence about the call: the
  * caller frames it, because "this call was anonymous" belongs in a failure and
