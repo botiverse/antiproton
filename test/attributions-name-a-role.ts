@@ -1,5 +1,16 @@
 /**
- * An attribution in a comment says WHAT the person contributed, not only who.
+ * An `@handle` in a comment says WHAT the person contributed, not only who.
+ *
+ * **It reads `@handle` only, and that is the narrower half.** The same
+ * attribution written without the `@` — `(cody, 2026-09-12)` — is invisible
+ * here, and that spelling is the repository's older and far more common one:
+ * 24 in `src/plugins`, 12 in `cf/src`, 32 in `test`, against 26 with the `@`.
+ * This case used to be called "no attribution … is a bare name", which claimed
+ * the wider set; it was reviewed, gated and merged under that name, because
+ * every check asked what the name said it asked. Sweeping the older spelling is
+ * a judgement per site rather than an assertion (many of them point at a
+ * reproducible observation and should stay), so it belongs in a cleanup someone
+ * reads line by line — @Nova's call, and theirs is to leave the gate narrow.
  *
  * A name is the one claim in a comment a later reader cannot re-derive from
  * this repository, and no check can say whether it is the RIGHT name — that is
@@ -122,7 +133,7 @@ function check(name: string, fn: () => void) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
-check("no attribution in this lane is a bare name", () => {
+check("no `@handle` in this lane is a bare name", () => {
   const bare = FILES.flatMap((f) => bareIn(f, readFileSync(f, "utf8")));
   if (bare.length > 0) {
     throw new Error(
