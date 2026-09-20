@@ -45,7 +45,9 @@ await check("it says who can change it, since the agent cannot", async () => {
   // who can.
   const r = await githubPlugin.invoke("auth_status", {}, ctx(null, "none")) as Record<string, unknown>;
   const note = String(r.note ?? "");
-  if (!/a person/.test(note) || !/attach/.test(note)) {
+  // `/attach/` alone accepts "should not attach one" — the opposite advice — so
+  // this matches the recommending form (@Rex, 2026-09-20).
+  if (!/a person/.test(note) || !/can attach one|attaches an account/.test(note)) {
     throw new Error(`the state does not say who attaches an account: ${note}`);
   }
   if (!/public data/.test(note)) throw new Error(`the state does not say what it can still do: ${note}`);

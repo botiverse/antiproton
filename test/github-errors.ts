@@ -135,6 +135,10 @@ await check("a credential GitHub refuses says replace it, not attach another", a
   answer(401, JSON.stringify({ message: "Bad credentials" }), { "content-type": "application/json" });
   const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok", "agent")));
   if (!/replaced/.test(why)) throw new Error(`does not say the credential has to be replaced: ${why}`);
+    // Deliberately the WIDE pattern, unlike the positive check below: here the
+    // wide end fails noisily (a sentence merely mentioning attaching reddens a
+    // correct page, and someone fixes it), while narrowing it would let
+    // "attach another account" through unseen.
   if (/attach/.test(why)) throw new Error(`a mount that has an account was told to attach one: ${why}`);
 });
 
@@ -156,7 +160,13 @@ await check("a write with no account says which of the two states it is in", asy
   const named = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "agent")));
   if (!/write it again/.test(named)) throw new Error(`a mount naming a credential was told to attach one: ${named}`);
   const bare = await failure(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "none")));
-  if (!/attach/.test(bare)) throw new Error(`a mount with no account was not told to attach one: ${bare}`);
+  // Matches the RECOMMENDATION, not the word: `/attach/` also accepts "should not
+  // attach one", so this assertion used to pass a sentence giving the opposite
+  // advice — checked by reversing it (@Rex found the shape, 2026-09-20). A
+  // positive assertion has to narrow, because there the wide end fails silently.
+  if (!/can attach one|attaches an account/.test(bare)) {
+    throw new Error(`a mount with no account was not told it can have one: ${bare}`);
+  }
   // Neither may claim the mount has no `secret_ref`: only the gateway knows,
   // and it says so through `credentialRefKind`.
   for (const why of [named, bare]) {
