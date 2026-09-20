@@ -905,6 +905,7 @@ export function trajectory(
    *  the same from the outside, and a turn here can take minutes. */
   busy: "thinking" | "waiting-for-approval" | null = null,
 ): string {
+  const who = identityByCall(events);
   const steps: Step[] = events
     .filter((e) => ["message", "model.response", "model.failed", "tool.result", "js.result", "operation.completed"].includes(e.kind))
     .map((e) => ({ at: e.createdAt, sequence: e.sequence, kind: e.kind, payload: e.payload ?? {} }));
@@ -989,7 +990,8 @@ export function trajectory(
       const heldRec = approvalsByOp[String(p.operationId ?? "")];
       const heldWhy = heldRec?.request?.heldBy === "agent" ? "the agent asked you to confirm" : "held for approval";
       out.push(`<div class="step ${held ? "held" : bad ? "fail" : "run"}">
-        <div class="lbl">${esc(label)} ${rel}${held ? ` <span class="badge warn">${heldWhy}</span>` : ""}</div>
+        <div class="lbl">${esc(label)} ${rel}${held ? ` <span class="badge warn">${heldWhy}</span>` : ""}${
+        identityBadge(who.get(String(p.callId ?? "")))}</div>
         ${p.source
           ? `<details><summary>what ran</summary><pre class="code">${esc(String(p.source))}</pre></details>`
           : ""}
@@ -1001,7 +1003,11 @@ export function trajectory(
 
     if (s.kind === "operation.completed") {
       const a = approvalsByOp[String(p.operationId)];
-      if (!a) continue; // ordinary completions are already visible as results
+      // Still skipped without an approval, and the reason has to keep up with
+      // what these carry: a completion now also holds the identity its call was
+      // made with, which is news nowhere else — so it is read above and drawn on
+      // that call's own row. What is left here is the decision a person made.
+      if (!a) continue;
       out.push(`<div class="step decided">
         <div class="lbl">${esc(a.tool)} ${rel}
           <span class="badge ${a.state === "approved" ? "ok" : "bad"}">${esc(a.state)}</span>
@@ -1197,6 +1203,68 @@ function pairCalls(events: Ev[]): { calls: Call[]; turns: Ev[] } {
   return { calls, turns };
 }
 
+/**
+ * Which identity each failed call was made with, by call id.
+ *
+ * The gateway records it on `operation.completed` (`src/store/operation-event.ts`)
+ * and not on the result, because the envelope a tool returns is collapsed into a
+ * string before it reaches the transcript (`src/runtime/pi-tools.ts`): by the time
+ * a result becomes an event, only prose is left. `callId` is the one key the two
+ * events share, which is why it is the join.
+ *
+ * Only failures carry an identity — the gateway sets it where a call threw — so a
+ * badge appears exactly where knowing it changes what a person does next, and
+ * never on the successful public reads that make up most of a trace.
+ */
+type Who = { identity?: string; credentialRef?: string };
+function identityByCall(events: Ev[]): Map<string, Who> {
+  const by = new Map<string, Who>();
+  for (const e of events) {
+    if (e.kind !== "operation.completed") continue;
+    const p = e.payload ?? {};
+    const id = typeof p.callId === "string" ? p.callId : "";
+    if (!id || typeof p.identity !== "string") continue;
+    by.set(id, { identity: p.identity, ...(typeof p.credentialRef === "string" ? { credentialRef: p.credentialRef } : {}) });
+  }
+  return by;
+}
+
+/**
+ * The identity as a badge, and who can fix it on the hover.
+ *
+ * `unreported` gets no badge: it means nobody said, and a badge reading
+ * "unknown" would claim the page looked into it. That state is already answered
+ * in the failure's own words ("either this mount has no account, or the
+ * credential it names could not be read"), which names an action a badge cannot.
+ *
+ * The two anonymous states are one word apart and want opposite actions —
+ * attach an account, versus write again the credential of the account already
+ * attached — so the badge says which, and the title says who (`credentialRef`).
+ *
+ * None of them is coloured. The row's status badge already carries the alarm,
+ * and a second red one beside it competes for the same glance while saying a
+ * different kind of thing: `rejected` is what happened, the identity is why.
+ * Colour would also have to lie about `account used`, which is the same kind of
+ * fact and no warning at all.
+ */
+function identityBadge(who: Who | undefined): string {
+  if (!who) return "";
+  if (who.identity === "attached") {
+    return ` <span class="badge" title="this mount's account was used, so the answer is about that account, not a missing one">account used</span>`;
+  }
+  if (who.identity === "none") {
+    return ` <span class="badge" title="this mount has no account attached, and a person can attach one">anonymous · no account</span>`;
+  }
+  if (who.identity === "unreadable") {
+    const deployed = who.credentialRef === "operator" || who.credentialRef === "env";
+    const title = deployed
+      ? "this mount names a credential this deployment does not have, so whoever deploys has to configure it there; attaching an account to the mount will not fix it"
+      : "this mount names an account whose credential could not be read, so whoever holds that credential has to write it again";
+    return ` <span class="badge" title="${esc(title)}">anonymous · credential unreadable</span>`;
+  }
+  return "";
+}
+
 const callStatus = (c: Call): { cls: string; word: string } => {
   if (!c.result) return { cls: "warn", word: "no result" };
   const p = c.result.payload ?? {};
@@ -1205,7 +1273,7 @@ const callStatus = (c: Call): { cls: string; word: string } => {
 };
 
 /** One call, as a row: what, how long, how it ended, and the two things worth opening. */
-function callRow(c: Call, t0: number): string {
+function callRow(c: Call, t0: number, who?: Who): string {
   const st = callStatus(c);
   const dur = c.result ? secs(c.result.createdAt - c.issuedAt) : "";
   const src = c.js ? (c.args as any)?.source : undefined;
@@ -1220,7 +1288,7 @@ function callRow(c: Call, t0: number): string {
         <pre>${esc(typeof body === "string" ? body.slice(0, 6000) : pretty(body, 6000))}</pre></details>`;
   return `<div class="call ${c.js ? "js" : "tool"}" id="call-${esc(c.id)}">
       <div class="k"><span class="kind">${c.js ? "js" : "tool"}</span> <b>${esc(c.js ? "run_js" : c.name)}</b>
-        <span class="badge ${st.cls}">${esc(st.word)}</span>
+        <span class="badge ${st.cls}">${esc(st.word)}</span>${identityBadge(who)}
         <span class="t" title="issued ${esc(clock(c.issuedAt))}">+${esc(secs(c.issuedAt - t0))}${dur ? ` · ${esc(dur)}` : ""}</span></div>
       ${argsBlock}${resultBlock}</div>`;
 }
@@ -1273,6 +1341,7 @@ export function eventList(events: Ev[]): string {
   if (!events.length) return `<div class="empty">no events</div>`;
   const t0 = events[0]!.createdAt;
   const { calls, turns } = pairCalls(events);
+  const who = identityByCall(events);
   const js = calls.filter((c) => c.js), tools = calls.filter((c) => !c.js);
   const failed = events.filter((e) => e.kind === "model.failed").length + calls.filter((c) => callStatus(c).cls === "bad").length;
   const usage = turns.reduce((a, t) => {
@@ -1307,11 +1376,11 @@ export function eventList(events: Ev[]): string {
           ${p.finishReason && p.finishReason !== "stop" && p.finishReason !== "toolUse" ? `<span class="badge warn">${esc(String(p.finishReason))}</span>` : ""}</div>
         ${p.reasoning ? `<details class="think"><summary>thinking</summary><div class="msg">${esc(String(p.reasoning)).slice(0, 4000)}</div></details>` : ""}
         ${p.text ? `<div class="msg">${esc(String(p.text)).slice(0, 4000)}</div>` : ""}
-        ${mine.map((c) => callRow(c, t0)).join("")}
+        ${mine.map((c) => callRow(c, t0, who.get(c.id))).join("")}
       </div>`);
     } else if (e.kind === "tool.result" || e.kind === "js.result") {
       const orphan = calls.find((c) => c.result === e && c.args === undefined);
-      if (orphan) cards.push(callRow(orphan, t0));
+      if (orphan) cards.push(callRow(orphan, t0, who.get(orphan.id)));
     } else if (e.kind === "model.failed") {
       cards.push(`<div class="step fail"><div class="lbl">model failed ${rel}</div><div class="msg">${esc(String(p.error ?? ""))}</div></div>`);
     } else if (e.kind === "compaction") {
