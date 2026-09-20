@@ -10,6 +10,7 @@
  * person had to work out for themselves that an account was missing.
  */
 import { githubPlugin } from "../src/plugins/github.ts";
+import type { ToolError } from "../src/plugins/types.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -29,6 +30,12 @@ function answer(status: number, body: string | Uint8Array, headers: Record<strin
 
 async function failure(fn: () => Promise<unknown>): Promise<string> {
   try { await fn(); } catch (e) { return String((e as Error)?.message ?? e); }
+  throw new Error("expected the call to fail, and it succeeded");
+}
+
+/** The thrown error itself, for what it carries beside its message. */
+async function thrown(fn: () => Promise<unknown>): Promise<ToolError> {
+  try { await fn(); } catch (e) { return e as ToolError; }
   throw new Error("expected the call to fail, and it succeeded");
 }
 
@@ -139,7 +146,7 @@ await check("a deployment-level credential this deployment lacks sends the deplo
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const why = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
   if (!/whoever deploys/.test(why)) throw new Error(`does not name who can fix it: ${why}`);
-  if (!/attaching an account to the mount cannot/.test(why)) throw new Error(`does not rule out attaching one: ${why}`);
+  if (!/attaching an account to the mount will not fix it/.test(why)) throw new Error(`does not rule out attaching one: ${why}`);
   answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
   const agentRef = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "agent")));
   if (why === agentRef) throw new Error(`one message for two different people to fix: ${why}`);
@@ -155,6 +162,48 @@ await check("a write with no account says which of the two states it is in", asy
   for (const why of [named, bare]) {
     if (/secret_ref/.test(why)) throw new Error(`states something the plugin cannot know: ${why}`);
   }
+});
+
+/**
+ * The state as a field, not only inside the sentence.
+ *
+ * The console renders stored events, so badging a failed call from prose means
+ * matching a remembered phrase — which is how a correct page got measured as
+ * wrong the morning this was written. A reworded sentence must break nothing
+ * that a page draws (Nova, 2026-09-20).
+ */
+await check("a failure carries the identity as a field, for a reader that does not parse prose", async () => {
+  for (const [kind, identity] of [["none", "none"], ["agent", "unreadable"], ["operator", "unreadable"]] as Array<[string, string]>) {
+    answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+    const e = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, kind)));
+    if (e.identity !== identity) throw new Error(`${kind} reported identity ${JSON.stringify(e.identity)}`);
+    if (e.credentialRef !== kind) throw new Error(`${kind} reported credentialRef ${JSON.stringify(e.credentialRef)}`);
+  }
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const used = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx("tok", "agent")));
+  if (used.identity !== "attached") throw new Error(`a call that carried a credential reported ${JSON.stringify(used.identity)}`);
+});
+
+await check("a state the gateway did not report is absent as a kind, not guessed", async () => {
+  answer(404, JSON.stringify({ message: "Not Found" }), { "content-type": "application/json" });
+  const e = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null)));
+  if (e.identity !== "unreported") throw new Error(`reported identity ${JSON.stringify(e.identity)}`);
+  if ("credentialRef" in e) throw new Error(`invented a kind nobody reported: ${JSON.stringify(e.credentialRef)}`);
+});
+
+await check("the field and the sentence cannot disagree, because one call sets both", async () => {
+  // Both are set at the throw site from the same context. The check that would
+  // catch a drift is this: the sentence for the state the field names.
+  answer(403, JSON.stringify({ message: "API rate limit exceeded" }), limited);
+  const e = await thrown(() => githubPlugin.invoke("repo_view", { repo: "o/r" }, ctx(null, "operator")));
+  if (e.identity !== "unreadable" || !/whoever deploys/.test(e.message)) {
+    throw new Error(`field says ${e.identity} and the sentence says: ${e.message}`);
+  }
+});
+
+await check("a write refused for want of an account carries the state too", async () => {
+  const e = await thrown(() => githubPlugin.invoke("issue_create", { repo: "o/r", title: "t" }, ctx(null, "none")));
+  if (e.identity !== "none") throw new Error(`reported identity ${JSON.stringify(e.identity)}`);
 });
 
 /**

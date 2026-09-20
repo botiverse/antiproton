@@ -32,7 +32,7 @@
  */
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext, ToolSchema } from "./types.ts";
-import { credentialState, identityNote } from "./types.ts";
+import { credentialState, identityNote, markIdentity } from "./types.ts";
 
 const API = "https://api.github.com";
 /** GitHub caps this itself; clamping makes the limit visible in the schema. */
@@ -148,9 +148,12 @@ async function call(
     const rate = remaining === "0" && reset
       ? ` — rate limit exhausted, resets ${new Date(Number(reset) * 1000).toISOString()}`
       : "";
-    const err = new Error(
+    // The identity goes on the error as data as well as into the sentence: the
+    // console badges a stored failure, and a badge matched out of prose breaks
+    // silently the next time the prose changes (Nova).
+    const err = markIdentity(new Error(
       `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status)}`,
-    ) as Error & { retryable?: boolean };
+    ), ctx);
     err.retryable = res.status === 429 || (res.status === 403 && remaining === "0") || res.status >= 500;
     throw err;
   }
@@ -177,9 +180,9 @@ async function call(
  */
 function requireAccount(ctx: PluginContext, tool: string) {
   if (ctx.credential) return;
-  throw new Error(
+  throw markIdentity(new Error(
     `${tool} needs an account and this call had none, though reads still work without one — ${identityNote(ctx)}`,
-  );
+  ), ctx);
 }
 
 /** A path, not a URL: the host is ours to decide, so no amount of creativity in
