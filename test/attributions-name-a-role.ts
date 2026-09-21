@@ -283,6 +283,118 @@ check("unreachable, reachable and ahead are told apart, each from a real commit"
   }
 });
 
+/**
+ * A comment that points into another file points by NAME, not by line number.
+ *
+ * Four of us hand-swept eleven such addresses to zero on 2026-09-21, and two of
+ * the eleven were already wrong: `src/runtime/gateway.ts` cited a line that had
+ * become `})(),`, and `bench/tau2/passk.ts` cited one that had moved eight
+ * lines. Nothing had reported either, because a coordinate cannot fail — it
+ * silently starts naming something else, and the reader who follows it lands
+ * on real code and has no reason to doubt it.
+ *
+ * Hand-sweeping does not hold: @cody's own citation in `bench/record.ts` rotted
+ * **four hours** after he wrote it, because #475 moved 28 lines above it. So the
+ * rule needs something that reddens rather than someone who remembers.
+ *
+ * **Scope is this lane plus the named files, not the whole scan.** `cf/src` is
+ * in the scan above because @Nova invited it for the NAME rule (#453); a rule
+ * about coordinates is a different standard, and putting it on someone's
+ * directory uninvited is what the scope paragraph at the top refuses to do.
+ * Every one of those directories measures zero today, so extending this is a
+ * question of consent rather than of cleanup.
+ */
+const COORDINATE = /(?<![a-z0-9_./-])[a-z0-9_./-]+\.(?:ts|tsx|mjs|cjs|js|sh|md):[0-9]+/i;
+/**
+ * A port is not a line number — but the exemption is cut out of the line, not
+ * applied to it.
+ *
+ * Skipping the whole line was the first shape and it was wrong (@cody, 2026-09-21):
+ * a comment may carry a URL and a real citation at once, and exempting the line
+ * exempted the citation too. An exclusion that quietly widens itself is the kind
+ * nobody notices, because it only ever removes findings.
+ *
+ * The extension list is wider than `.ts` on purpose. It catches nothing extra
+ * today — measured on `6c03668`, `912460d` and `a8e5b2e`, the counts are
+ * identical either way (1 / 0 / 11) — so this is prevention, not a defect being
+ * repaired: the next `scripts/*.sh:12` will be caught the first time it is
+ * written rather than the first time someone widens the pattern.
+ */
+const URL_IN_LINE = /\b(?:https?:\/\/|localhost:)[^\s)"'`]*/gi;
+
+function coordinatesIn(file: string, text: string): string[] {
+  const out: string[] = [];
+  text.split("\n").forEach((line, i) => {
+    if (!COMMENT.test(line)) return;
+    const m = COORDINATE.exec(line.replace(URL_IN_LINE, " "));
+    if (m) out.push(`${file}:${i + 1} — ${m[0]}`);
+  });
+  return out;
+}
+
+check("a comment points into another file by name, not by line number", () => {
+  // Deliberately NOT `FILES`, and collected the way ownership is held.
+  //
+  // The scan above takes directories, but this repository's ownership is by
+  // file (@Nova, 2026-09-21): `cf/src` holds her console files beside @cody's,
+  // and reading the directory as one person's is the mistake @Rex and I each
+  // made today, in opposite directions. So each owner named their own, and a
+  // directory appears only where one person holds all of it:
+  //
+  //   src/plugins          mine
+  //   test/**              @Rex — after his citation in `test/exclusive.ts`
+  //                        rotted: `:377` is `})(),` today, and nothing said so
+  //   bench, src/core,     @cody — `src/runtime/gateway.ts` was one of the two
+  //   src/runtime,         already rotted, and `bench/record.ts` was his own,
+  //   src/store, src/model four hours old when #475 moved 28 lines above it
+  //   6 cf/src files       @Nova, named individually
+  //   5 cf/src files       @cody, named individually
+  //
+  // What is NOT here is not dirty — every one of these measured zero before it
+  // was added, and so does the rest of the repository. It is absent for want of
+  // an owner who asked to live under the rule: a few `cf/src` files belong to
+  // nobody either of them would speak for, and they stay out until someone does.
+  //
+  // Reading `test/**` puts this file inside its own scan, which the name rule
+  // above refuses for itself. It is safe HERE for a structural reason rather
+  // than by luck: `coordinatesIn` reads comment lines only, and the control
+  // fixture below sits in a string on an `if (` line. A fixture that ever moves
+  // into a comment reds this, and that is correct — a specimen of the defect is
+  // the defect once a scanner reads it.
+  const INVITED_DIRS = ["src/plugins", "test", "bench", "src/core", "src/runtime", "src/store", "src/model"];
+  const INVITED_FILES = [
+    "cf/src/ui.ts", "cf/src/usage.ts", "cf/src/usage-d1.ts",
+    "cf/src/usage-windows.ts", "cf/src/md.ts", "cf/src/brand.ts",
+    "cf/src/index.ts", "cf/src/runtime.ts", "cf/src/secret-shape.ts",
+    "cf/src/bench.ts", "cf/src/pi-view.ts",
+  ];
+  const mine = [...new Set([...INVITED_DIRS.flatMap(tsIn), ...NAMED, ...INVITED_FILES])];
+  const found = mine.flatMap((f) => coordinatesIn(f, readFileSync(f, "utf8")));
+  if (found.length) {
+    throw new Error(
+      `a comment cites a line number in another file, which rots without saying so:\n  ${found.join("\n  ")}\n` +
+      `Point by name instead — a symbol survives line drift, a squash, and a reader who fetched at another moment.`,
+    );
+  }
+  // The scan is only worth its green if it can go red, and the two shapes it
+  // must tell apart are a citation and a URL carrying a port.
+  if (coordinatesIn("x", "  // see src/core/canon-json.ts:45 for the reason").length !== 1) {
+    throw new Error("stopped recognising a cross-file coordinate");
+  }
+  if (coordinatesIn("x", "  // the bench runner posts to http://localhost:8800/run").length !== 0) {
+    throw new Error("read a port as a line number");
+  }
+  // The input that separates cutting the URL out from skipping the line. Both
+  // pass every other case here, and only this one tells them apart.
+  if (coordinatesIn("x", "  // posts to http://localhost:8800/run, built at cf/src/index.ts:377").length !== 1) {
+    throw new Error("a URL on the line hid a real citation beside it");
+  }
+  // Not only `.ts`: the rot is in the coordinate, not in the language.
+  if (coordinatesIn("x", "  // see scripts/publish-runs.sh:191").length !== 1) {
+    throw new Error("stopped recognising a coordinate outside .ts");
+  }
+});
+
 check("a handle in DATA is not an attribution", () => {
   // The case is `test/raft-plugin.ts`'s "Release Bot (@raft-bot)" assertion: a GitHub
   // account in a string literal, and it matches the bare shape exactly. Asking
