@@ -22,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
+import { canonJson as canon, canonArgs, actionMatch as grade } from "./grade.ts";
 import { createHash } from "node:crypto";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
@@ -81,35 +82,7 @@ async function api(path: string, init: RequestInit = {}): Promise<any> {
 const post = (path: string, body: unknown) =>
   api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
-/** Stable serialisation so two databases compare by value, not key order. */
-const canon = (v: unknown): string => {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
-  return `{${Object.keys(v as object).sort()
-    .map((k) => `${JSON.stringify(k)}:${canon((v as any)[k])}`).join(",")}}`;
-};
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
-
-/**
- * How two write actions compare: by name and by arguments, where an array of
- * primitives is a set.
- *
- * `canon` keeps array order because the database hash must — a list in the
- * domain is a list. A request's `item_ids` is not: `return_delivered_order_items`
- * over the same three items in a different order is the same action, and the
- * database agreed (db=ok) on every trial the positional comparison failed. The
- * grader was asserting something the task does not require, three times in one
- * matrix. Arrays of objects keep their order; only primitive arrays are sorted.
- */
-const canonArgs = (v: unknown): string => {
-  if (Array.isArray(v) && v.every((x) => x === null || typeof x !== "object")) {
-    return `[${[...v].map((x) => JSON.stringify(x)).sort().join(",")}]`;
-  }
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(canonArgs).join(",")}]`;
-  return `{${Object.keys(v as object).sort()
-    .map((k) => `${JSON.stringify(k)}:${canonArgs((v as any)[k])}`).join(",")}}`;
-};
 
 /** The database the annotated solution leaves behind, hashed the same way the
  *  object hashes its own — the comparison is a hash because the database is
@@ -315,8 +288,7 @@ async function runTask(task: any) {
   const { hash, expected } = gold(task);
   const writes = (res.writes ?? []).filter((w: any) => WRITE_TOOLS.has(w.name));
   const dbMatch = res.dbHash === hash;
-  const actionMatch = expected.every((e) =>
-    writes.some((w: any) => w.name === e.name && canonArgs(w.args) === canonArgs(e.args)));
+  const actionMatch = grade(expected, writes);
 
   return {
     id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,

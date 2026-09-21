@@ -28,6 +28,7 @@ import type { MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import { retailPlugin, applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
+import { canonJson as canon, actionMatch as grade } from "./grade.ts";
 import { nodeWorker, runToRest } from "../node-worker.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -51,13 +52,6 @@ const model = new OpenAiCompatibleModel({
 });
 
 /** Stable serialisation so two databases compare by value, not key order. */
-const canon = (v: unknown): string => {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
-  return `{${Object.keys(v as object).sort()
-    .map((k) => `${JSON.stringify(k)}:${canon((v as any)[k])}`).join(",")}}`;
-};
-
 function goldDb(task: any) {
   const db = structuredClone(BASE_DB);
   const applied: Array<{ name: string; args: any }> = [];
@@ -150,8 +144,10 @@ async function runTask(task: any, verbose: boolean) {
   const { db: expectedDb, expected } = goldDb(task);
   const writes = performed.filter((p) => WRITE_TOOLS.has(p.name));
   const dbMatch = canon(db) === canon(expectedDb);
-  const actionMatch = expected.every((e) =>
-    writes.some((x) => x.name === e.name && canon(x.args) === canon(e.args)));
+  // Graded by the same function the on-object runner uses. This side used to
+  // compare arguments positionally, so one trial could score actionMatch two
+  // ways depending on which runner ran it.
+  const actionMatch = grade(expected, writes);
 
   const entries = await agent.storage.scanEntries({ order: "asc" }, CTX);
   const usage = entries.reduce((a: any, e: any) => {
