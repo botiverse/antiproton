@@ -2,12 +2,19 @@
  * Stable serialisation, so two values compare by content rather than by the
  * order their keys happened to be written in.
  *
- * It lives here because three call sites need the SAME answer and one of them
- * is in another process. `bench/tau2/cf.ts` hashes the database it expects and
- * compares that hash to `dbHash`, which the Worker computed with its own copy
+ * TWO call sites MUST agree, and they are not in the same process.
+ * `bench/tau2/cf.ts` hashes the database it expects and compares that hash at
+ * `:290` to `dbHash`, which the Worker computed with its own copy
  * (`cf/src/index.ts`): `dbMatch` is an equality between two serialisations
  * made by two implementations on two machines. Every published τ² reading has
  * rested on that agreement, with nothing checking it.
+ *
+ * A THIRD call site uses it for a different reason. `bench/tau2/run.ts`
+ * computes both sides itself, so it only needs to agree with ITSELF — but two
+ * runners whose scores are compared have to grade alike, and that half had
+ * already drifted (see `bench/tau2/grade.ts`). Saying "three must agree" would
+ * flatten those two reasons into one, and flattening is how the note this
+ * replaces came to name the wrong pair.
  *
  * There were three line-for-line copies. One carried a note saying the copies
  * had to agree, and it named the wrong pair — `bench/tau2/run.ts`, which never
