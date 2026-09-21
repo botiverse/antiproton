@@ -304,24 +304,63 @@ check("unreachable, reachable and ahead are told apart, each from a real commit"
  * Every one of those directories measures zero today, so extending this is a
  * question of consent rather than of cleanup.
  */
-const COORDINATE = /(?<![a-z0-9_./-])[a-z0-9_./-]+\.ts:[0-9]+/i;
-/** A port is not a line number: `http://localhost:8800` and `https://host:443`. */
-const NOT_A_COORDINATE = /https?:\/\/|localhost/;
+const COORDINATE = /(?<![a-z0-9_./-])[a-z0-9_./-]+\.(?:ts|tsx|mjs|cjs|js|sh|md):[0-9]+/i;
+/**
+ * A port is not a line number — but the exemption is cut out of the line, not
+ * applied to it.
+ *
+ * Skipping the whole line was the first shape and it was wrong (@cody, 2026-09-21):
+ * a comment may carry a URL and a real citation at once, and exempting the line
+ * exempted the citation too. An exclusion that quietly widens itself is the kind
+ * nobody notices, because it only ever removes findings.
+ *
+ * The extension list is wider than `.ts` on purpose. It catches nothing extra
+ * today — measured on `6c03668`, `912460d` and `a8e5b2e`, the counts are
+ * identical either way (1 / 0 / 11) — so this is prevention, not a defect being
+ * repaired: the next `scripts/*.sh:12` will be caught the first time it is
+ * written rather than the first time someone widens the pattern.
+ */
+const URL_IN_LINE = /\b(?:https?:\/\/|localhost:)[^\s)"'`]*/gi;
 
 function coordinatesIn(file: string, text: string): string[] {
   const out: string[] = [];
   text.split("\n").forEach((line, i) => {
     if (!COMMENT.test(line)) return;
-    if (NOT_A_COORDINATE.test(line)) return;
-    const m = COORDINATE.exec(line);
+    const m = COORDINATE.exec(line.replace(URL_IN_LINE, " "));
     if (m) out.push(`${file}:${i + 1} — ${m[0]}`);
   });
   return out;
 }
 
 check("a comment points into another file by name, not by line number", () => {
-  // Deliberately narrower than FILES: see the paragraph above.
-  const mine = [...tsIn("src/plugins"), ...NAMED, "test/attributions-name-a-role.ts"];
+  // Deliberately NOT `FILES`, and expressed by FILE rather than by directory.
+  //
+  // The scan above takes directories, but this repository's ownership is by
+  // file (@Nova, 2026-09-21) — `cf/src` holds her console files and @cody's
+  // `index.ts` and `secret-shape.ts`, and reading the directory as one person's
+  // is the mistake @Rex and I both made today. So consent is collected the same
+  // way it is held:
+  //
+  //   `src/plugins`  mine
+  //   `test/**`      @Rex, after his own citation in `test/exclusive.ts` rotted
+  //                  — `:377` is `})(),` today, and nothing said so
+  //   six files      @Nova's, named by her; the rest of `cf/src` is not hers to
+  //                  give and is not here
+  //
+  // `bench/` and @cody's `cf/src` files are absent because nobody has invited
+  // them, not because they are dirty: every directory measures zero today.
+  //
+  // Reading `test/**` puts this file inside its own scan, which the name rule
+  // above refuses for itself. It is safe HERE and the reason is structural, not
+  // luck: `coordinatesIn` reads comment lines only, and the control fixture
+  // below sits in a string on an `if (` line. A fixture that ever moves into a
+  // comment reds this, and that is correct — a specimen of the defect is the
+  // defect once a scanner reads it.
+  const INVITED = [
+    "cf/src/ui.ts", "cf/src/usage.ts", "cf/src/usage-d1.ts",
+    "cf/src/usage-windows.ts", "cf/src/md.ts", "cf/src/brand.ts",
+  ];
+  const mine = [...new Set([...tsIn("src/plugins"), ...tsIn("test"), ...NAMED, ...INVITED])];
   const found = mine.flatMap((f) => coordinatesIn(f, readFileSync(f, "utf8")));
   if (found.length) {
     throw new Error(
@@ -336,6 +375,15 @@ check("a comment points into another file by name, not by line number", () => {
   }
   if (coordinatesIn("x", "  // the bench runner posts to http://localhost:8800/run").length !== 0) {
     throw new Error("read a port as a line number");
+  }
+  // The input that separates cutting the URL out from skipping the line. Both
+  // pass every other case here, and only this one tells them apart.
+  if (coordinatesIn("x", "  // posts to http://localhost:8800/run, built at cf/src/index.ts:377").length !== 1) {
+    throw new Error("a URL on the line hid a real citation beside it");
+  }
+  // Not only `.ts`: the rot is in the coordinate, not in the language.
+  if (coordinatesIn("x", "  // see scripts/publish-runs.sh:191").length !== 1) {
+    throw new Error("stopped recognising a coordinate outside .ts");
   }
 });
 
