@@ -41,6 +41,24 @@ const GENERIC_SHAPES: ReadonlyArray<readonly [string, RegExp]> = [
   // scheme://user:password@host — a user alone (git@github.com, https://user@host) is not a credential.
   ["url-with-password", /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]{8,}@[^\s/@]+/i],
   ["neon-password", /\bnpg_[A-Za-z0-9]{12,}/],
+  // A key recognised by the LABEL beside it rather than by its own shape:
+  // `x-api-key: <value>`, `EXA_API_KEY=<value>`. Exa's key is a bare UUID —
+  // the shape of every id this system prints (Raft message ids, agent ids,
+  // task ids, request ids) — so `exa` declares no `looksLike`, and a shape
+  // that could recognise the value alone would fire on ordinary text. What is
+  // recognisable is the pair: nobody writes `api_key=` in front of a task id.
+  //
+  // `url-with-password` above is the same idea and predates this one: it does
+  // not match a password, it matches a URL carrying one. Context is what makes
+  // an unremarkable value readable as a credential (@Piper, 2026-09-21, #481).
+  //
+  // What it does NOT do, said plainly because the gap is the point: a bare
+  // UUID with nothing beside it stays invisible, and no pattern can change
+  // that. This narrows "no machine check at all" to "no machine check for the
+  // context-free form". The value is `[A-Za-z0-9_-]{16,}` rather than a UUID
+  // so it holds for the next provider's key too, and it stops at whitespace,
+  // so `api_key: ask Piper for it` is prose and does not match.
+  ["labelled-api-key", /(?:x-api-key|api[_-]?key)["']?\s*[:=]\s*["']?[A-Za-z0-9_-]{16,}/i],
 ];
 
 /**

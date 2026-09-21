@@ -17,6 +17,8 @@ function check(name: string, fn: () => void) {
 function assert(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 
 const r = (c: string, n: number) => c.repeat(n);
+/** A bare UUID: what an Exa key looks like, and what every id this system prints looks like. */
+const UUID = "3f2a1b4c-5d6e-7f80-9a1b-2c3d4e5f6071";
 
 check("each credential shape is recognised by kind, wherever it sits in a message", () => {
   const cases: Array<[string, string]> = [
@@ -30,6 +32,12 @@ check("each credential shape is recognised by kind, wherever it sits in a messag
     ["slack-token", `${"xo" + "xb-" + r("1", 20)}`],
     ["url-with-password", `read replica ${"postgresql://owner:" + r("p", 12) + "@db.example.com/app?sslmode=require"}`],
     ["neon-password", `password ${"np" + "g_" + r("Z", 16)}`],
+    // Recognised by the label beside it, because the value alone is a UUID —
+    // the shape of every id this system prints. See the comment on the shape.
+    ["labelled-api-key", `"x-api-key": "${UUID}"`],
+    ["labelled-api-key", `EXA_${"API_KEY"}=${UUID}`],
+    ["labelled-api-key", `export EXA_${"API_KEY"}="${UUID}"`],
+    ["labelled-api-key", `apiKey: ${"sk" + "-live-" + r("m", 20)}`],
   ];
   for (const [kind, text] of cases) {
     assert(secretShape(text) === kind, `expected ${kind}, got ${secretShape(text)} for a ${kind} case`);
@@ -48,6 +56,16 @@ check("ordinary text that only resembles part of a shape is not refused", () => 
     "BEGIN PUBLIC KEY is not a private key",
     "postgres://localhost:5432/app has a port, not a password",
     "a long hash 3f9a1c2b7e4d8f60a1b2c3d4e5f60718293a4b5c is not refused",
+    // The other half of the labelled shape: the same UUID, with every label
+    // this system actually prints beside its ids. If these were refused, the
+    // check would fire on ordinary traffic and teach people to send anyway.
+    `msg=${UUID}`,
+    `agent ${UUID} started`,
+    `tenant ${UUID} was migrated`,
+    `{"requestId":"${UUID}"}`,
+    "the api key is in the Exa dashboard",
+    "api_key: ask whoever set the mount up",
+    "the x-api-key header carries it",
   ];
   for (const text of plain) assert(secretShape(text) === null, `ordinary text was refused as ${secretShape(text)}: ${JSON.stringify(text.slice(0, 40))}`);
 });
