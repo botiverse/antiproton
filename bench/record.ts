@@ -129,11 +129,22 @@ export function recordRun(run: Run, body: unknown): string {
  * Colour codes are for a terminal, and the log file is not one.
  *
  * `\x1b[32m✓\x1b[0m` costs nine bytes and occupies no columns, so a reader
- * outside a terminal — the report page serves these as `text/plain` — sees
- * `^[[32m✓^[[0m task 0    db=ok` and every column after the mark pushed nine
- * bytes right. These files are TABLES whose alignment is byte counts, so the
- * escapes do not make them ugly, they make them wrong, and exactly on the
- * column a reader runs their eye down (@Vera, 2026-09-21).
+ * outside a terminal sees `^[[32m✓^[[0m task 0    db=ok` with every column
+ * after the mark pushed nine bytes right. These files are TABLES whose
+ * alignment is byte counts, so the escapes do not make them ugly, they make
+ * them wrong, and exactly on the column a reader runs their eye down
+ * (@Vera, 2026-09-21).
+ *
+ * Who that reader is, stated correctly because the first version of this
+ * comment got it wrong: the logs are published to the public bucket as
+ * `text/plain; charset=utf-8` (`scripts/publish-runs.sh`), and opened by hand
+ * at `<bucket>/runs/<day>/<stem>.log`. The report page does NOT link them —
+ * `report/public/index.html` cites the bucket three times, for two `.json`
+ * records and one `.md`:
+ *   grep -o 'runs/[^"]*\.[a-z]*' report/public/index.html | sed 's/.*\.//' |
+ *     sort | uniq -c
+ * So nothing renders a log today, and the reader-side strip for the records
+ * already published belongs to whoever first displays one.
  *
  * Stripped HERE rather than at each `mark`, because the two consumers want
  * different bytes from the same call: the terminal keeps its colour, the file
@@ -143,9 +154,8 @@ export function recordRun(run: Run, body: unknown): string {
  * not one place: four sites across the two teed runners emit colour
  * (`bench/tau2/cf.ts:378`, `bench/swebench/cf.ts:247,297,311`).
  *
- * Only what is written from here on. The records already published keep their
- * escapes and cannot be rewritten, so a reader-side strip on the report page
- * is a separate and still-needed fix (@Nova's surface).
+ * And only what is written from here on: a published key is immutable, so the
+ * records already in the bucket keep their escapes.
  */
 const SGR = /\x1b\[[0-9;]*m/g;
 
