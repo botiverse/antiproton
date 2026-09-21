@@ -33,10 +33,13 @@
  *
  * **Scope grows only where it was invited.** It began as this lane; `cf/src` was
  * added after @Nova repaired both sites there (#453) and said the extension was
- * mine to make. `test/` is still out: `test/call-id-in-the-record.ts:125` is
- * @cody's, and he is removing it in #433 — adding the directory now would write
- * an assertion that is FALSE today, which would drag the true one red beside it
- * (@Vera's correction of my weaker reason, "a cross-PR dependency in a gate").
+ * mine to make. `test/` is still out, though no longer for the reason that stood
+ * here: that one named a bare handle in `test/call-id-in-the-record.ts`, which
+ * @cody removed in #433 — the file now holds no `@` at all. The hazard was real
+ * (extending then would have landed an assertion FALSE on arrival, dragging the
+ * true one red beside it — @Vera's correction of my weaker "a cross-PR dependency
+ * in a gate"), but it has expired. What keeps `test/` out today is the paragraph
+ * below: the fixtures in this file.
  *
  * This file is not in its own scope, because the defect appears here as a
  * fixture and would red the suite that quotes it. The cost is real: the three
@@ -64,9 +67,9 @@ const NOT_A_PERSON = /^@(link|param|returns?|see|example|throws|deprecated|type|
 /**
  * An attribution is a claim in a COMMENT, so only comment lines are read.
  *
- * `test/raft-plugin.ts:325` is the case that settles it: `"Release Bot
- * (@raft-bot)"` is a GitHub account inside a string literal, and it matches the
- * bare-name shape exactly. Asking its author what `@raft-bot` contributed is the
+ * The case that settles it is `test/raft-plugin.ts`'s `"Release Bot
+ * (@raft-bot)"` assertion: that handle is a GitHub account inside a string
+ * literal, and it matches the bare-name shape exactly. Asking its author what `@raft-bot` contributed is the
  * ritual @Nova warned about, arrived at by a scan that could not tell a comment
  * from data.
  */
@@ -79,8 +82,8 @@ const COMMENT = /^\s*(\/\/|\*|\/\*)/;
  * not what — which only the thread says.
  *
  * The `@` may not follow a word character, or `git@github.com` and `user@host)`
- * in `cf/src/secret-shape.ts:41` read as people — an address is not a handle,
- * and that comment is about credentials rather than about anyone.
+ * in `cf/src/secret-shape.ts`'s `url-with-password` shape read as people — an
+ * address is not a handle, and that comment is about credentials, not anyone.
  */
 const BARE = /(?<![A-Za-z0-9_.\-])(@[A-Za-z][A-Za-z0-9_-]*)(?:\)|, 20[0-9]{2}-[0-9]{2}-[0-9]{2}\))/g;
 
@@ -281,12 +284,12 @@ check("unreachable, reachable and ahead are told apart, each from a real commit"
 });
 
 check("a handle in DATA is not an attribution", () => {
-  // `test/raft-plugin.ts:325` is the case: "Release Bot (@raft-bot)" is a GitHub
+  // The case is `test/raft-plugin.ts`'s "Release Bot (@raft-bot)" assertion: a GitHub
   // account in a string literal, and it matches the bare shape exactly. Asking
   // its author what @raft-bot contributed is the ritual @Nova warned about.
   const data = `  if (checked.account !== "Release Bot (@raft-bot)") throw new Error("x");`;
   if (bareIn("x", data).length !== 0) throw new Error("read a string literal as an attribution");
-  // And an address is not a handle, or `cf/src/secret-shape.ts:41` names a person.
+  // And an address is not a handle, or secret-shape.ts's `url-with-password` names a person.
   const url = " // scheme://user:password@host — a user alone (git@github.com, https://user@host) is not a credential.";
   if (bareIn("x", url).length !== 0) throw new Error("read a URL as an attribution");
   // But the same shape IN a comment is still one, or the two tests above would
