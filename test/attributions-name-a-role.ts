@@ -93,7 +93,7 @@ const BARE = /(?<![A-Za-z0-9_.\-])(@[A-Za-z][A-Za-z0-9_-]*)(?:\)|, 20[0-9]{2}-[0
  * `git ls-files 'test/**\/*.ts'` finds 3 of 95 and `'cf/src/**\/*.ts'` 10 of 47,
  * because `**` requires a directory level (@cody hit it on #433's scope and @Rex
  * reproduced it on this one before it reached here). **A glob's blind spot
- * answers with a small clean number rather than an error** (@Nova).
+ * answers with a small clean number rather than an error**.
  *
  * The walk is recursive because the opposite assumption is just as wrong: I read
  * "`cf/src` is flat" from those two numbers and wrote a flat `readdirSync`, and
