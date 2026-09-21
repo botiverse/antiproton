@@ -151,8 +151,13 @@ export function recordRun(run: Run, body: unknown): string {
  * does not get it. Asking `process.stdout.isTTY` at the producer cannot serve
  * both — in a watched run the file would still get the escapes, and in a
  * redirected one the terminal would lose its colour. And the producers are
- * not one place: four sites across the two teed runners emit colour
- * (`bench/tau2/cf.ts:378`, `bench/swebench/cf.ts:247,297,311`).
+ * not one place: four sites across the two teed runners emit colour — the
+ * per-trial `mark` in `bench/tau2/cf.ts`, and in `bench/swebench/cf.ts` its
+ * per-instance `mark`, the `release failed:` line and the one that prints
+ * `r.failOut`. All four in any tree, and the count is checkable rather than
+ * asserted:
+ *   git grep -nF '\x1b' bench/tau2/cf.ts bench/swebench/cf.ts
+ * The line numbers this sentence used to carry went stale within hours.
  *
  * And only what is written from here on: a published key is immutable, so the
  * records already in the bucket keep their escapes.
