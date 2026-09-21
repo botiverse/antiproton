@@ -86,8 +86,8 @@ check("recordRun writes where the handle says, and nowhere else", () => {
   rmSync(dir, { recursive: true, force: true });
   if (rel !== "report/runs/2026-01-01/tau2-h9-abc.json") throw new Error(`it reported a path the report page cannot resolve: ${rel}`);
   if (body.bench !== "tau2-retail") throw new Error(`the body did not survive the write: ${JSON.stringify(body)}`);
-  // The record says where it was written, because a copy of it elsewhere
-  // keeps nothing else (Dora, Vera, 2026-09-12).
+  // The record says where it was written, because a copy of it elsewhere keeps
+  // nothing else.
   if (body.written?.file !== rel) throw new Error(`written.file disagrees with the returned path: ${JSON.stringify(body.written)}`);
   if (!body.written?.at) throw new Error(`the record does not say when it was written: ${JSON.stringify(body.written)}`);
 });
@@ -163,10 +163,15 @@ check("the tee still prints, so the file is a copy and not a diversion", () => {
 });
 
 check("the log gets the text without the colour, and the terminal keeps it", () => {
-  // The escapes cost nine bytes and no columns, so in a plain-text reader —
-  // which is what the report page serves these as — they push every column
-  // after the mark nine bytes right. A log is a table; that is a wrong table,
-  // not an ugly one (@Vera, 2026-09-21).
+  // The escapes cost nine bytes and no columns, so in a plain-text reader they
+  // push every column after the mark nine bytes right. A log is a table; that
+  // is a wrong table, not an ugly one (@Vera, 2026-09-21, who is the person to
+  // argue the framing with — the nine bytes themselves are measurable).
+  //
+  // The reader is whoever opens the object in the bucket by hand: the logs are
+  // published there as text/plain, and nothing renders one today. An earlier
+  // version of this comment said "the report page serves these", which is
+  // false twice over and is corrected in bench/record.ts (#469).
   const { runs, dir } = runsTree();
   const run = beginRun("tau2", "h9", runs);
   const seen: string[] = [];
