@@ -101,11 +101,12 @@ export function decideFromPoll(poll: Poll, seenSeq: number): PollDecision {
  *   idle_without_answer  the object is idle with no reply after the latest message;
  *   unknown              the last poll itself failed, so nothing is claimed.
  *
- * `model_failed` is here because the runner's own checks can miss it by up to one poll interval: the wait
- * ends a turn as soon as the socket reports `model.failed` (bench/tau2/cf.ts:210) or a periodic poll decides
- * `failed` (cf.ts:191), but a failure that lands between the last such poll and the deadline is seen only by
- * this final poll. `decideFromPoll` names it, so reading only its `answer` case filed a failed model call
- * under `idle_without_answer` — a cause that blames the agent for stopping when the model call is what
+ * `model_failed` is here because the runner's own checks can miss it by up to one poll interval: in
+ * `bench/tau2/cf.ts` the wait ends a turn as soon as the socket branch matches `e.kind === "model.failed"`,
+ * or a poll's `decideFromPoll` comes back `failed`, but a failure that lands between the last such poll and
+ * the deadline is seen only by this final poll. `decideFromPoll` names it, so reading only its `answer`
+ * case filed a failed model call under `idle_without_answer` — a cause that blames the agent for
+ * stopping when the model call is what
  * broke, and the published record keeps no poll, so nobody can tell the two apart afterwards.
  */
 export type StallCause = "still_running" | "answer_undelivered" | "model_failed" | "idle_without_answer" | "unknown";
