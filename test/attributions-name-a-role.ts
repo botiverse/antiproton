@@ -49,9 +49,8 @@
  * suite CANNOT ask is @Nova's — *what can a reader do with this name?* If it
  * points at something checkable (a thread, a reproducible observation) the role
  * is the other half of "where to look"; if it only records who thought of it,
- * **delete the name and keep the reason** — `git blame` remembers people,
- * comments should remember reasons. `#433` and `ac3fadd` were both repaired that
- * way. So the third case below asserts that the no-name repair PASSES, rather
+ * **delete the name and keep the reason** — `#433` and `ac3fadd` were both repaired
+ * that way. So the third case below asserts that the no-name repair PASSES, rather
  * than leaving it as advice in a comment nothing enforces.
  */
 import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -148,7 +147,7 @@ check("no `@handle` in this lane is a bare name", () => {
   if (bare.length > 0) {
     throw new Error(
       `a name with no role, so a reader cannot check it against the thread — repair it EITHER way:\n` +
-      `      say what the person contributed, or delete the name and keep the reason (@Nova: git blame remembers people)\n      ` +
+      `      say what the person contributed, or delete the name and keep the reason\n      ` +
       bare.join("\n      "),
     );
   }
