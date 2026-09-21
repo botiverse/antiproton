@@ -283,6 +283,62 @@ check("unreachable, reachable and ahead are told apart, each from a real commit"
   }
 });
 
+/**
+ * A comment that points into another file points by NAME, not by line number.
+ *
+ * Four of us hand-swept eleven such addresses to zero on 2026-09-21, and two of
+ * the eleven were already wrong: `src/runtime/gateway.ts` cited a line that had
+ * become `})(),`, and `bench/tau2/passk.ts` cited one that had moved eight
+ * lines. Nothing had reported either, because a coordinate cannot fail — it
+ * silently starts naming something else, and the reader who follows it lands
+ * on real code and has no reason to doubt it.
+ *
+ * Hand-sweeping does not hold: @cody's own citation in `bench/record.ts` rotted
+ * **four hours** after he wrote it, because #475 moved 28 lines above it. So the
+ * rule needs something that reddens rather than someone who remembers.
+ *
+ * **Scope is this lane plus the named files, not the whole scan.** `cf/src` is
+ * in the scan above because @Nova invited it for the NAME rule (#453); a rule
+ * about coordinates is a different standard, and putting it on someone's
+ * directory uninvited is what the scope paragraph at the top refuses to do.
+ * Every one of those directories measures zero today, so extending this is a
+ * question of consent rather than of cleanup.
+ */
+const COORDINATE = /(?<![a-z0-9_./-])[a-z0-9_./-]+\.ts:[0-9]+/i;
+/** A port is not a line number: `http://localhost:8800` and `https://host:443`. */
+const NOT_A_COORDINATE = /https?:\/\/|localhost/;
+
+function coordinatesIn(file: string, text: string): string[] {
+  const out: string[] = [];
+  text.split("\n").forEach((line, i) => {
+    if (!COMMENT.test(line)) return;
+    if (NOT_A_COORDINATE.test(line)) return;
+    const m = COORDINATE.exec(line);
+    if (m) out.push(`${file}:${i + 1} — ${m[0]}`);
+  });
+  return out;
+}
+
+check("a comment points into another file by name, not by line number", () => {
+  // Deliberately narrower than FILES: see the paragraph above.
+  const mine = [...tsIn("src/plugins"), ...NAMED, "test/attributions-name-a-role.ts"];
+  const found = mine.flatMap((f) => coordinatesIn(f, readFileSync(f, "utf8")));
+  if (found.length) {
+    throw new Error(
+      `a comment cites a line number in another file, which rots without saying so:\n  ${found.join("\n  ")}\n` +
+      `Point by name instead — a symbol survives line drift, a squash, and a reader who fetched at another moment.`,
+    );
+  }
+  // The scan is only worth its green if it can go red, and the two shapes it
+  // must tell apart are a citation and a URL carrying a port.
+  if (coordinatesIn("x", "  // see src/core/canon-json.ts:45 for the reason").length !== 1) {
+    throw new Error("stopped recognising a cross-file coordinate");
+  }
+  if (coordinatesIn("x", "  // the bench runner posts to http://localhost:8800/run").length !== 0) {
+    throw new Error("read a port as a line number");
+  }
+});
+
 check("a handle in DATA is not an attribution", () => {
   // The case is `test/raft-plugin.ts`'s "Release Bot (@raft-bot)" assertion: a GitHub
   // account in a string literal, and it matches the bare shape exactly. Asking
