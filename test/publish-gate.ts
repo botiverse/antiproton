@@ -273,7 +273,7 @@ check("a record published with no log beside it is still published, and said out
   // check here passed it, because nothing it checks was wrong: the bytes were
   // clean, the two commits were on one history, and the record was half of
   // itself. The pairing is a property of the PAIR, so no check of one file
-  // could see it (Vera, 2026-09-19).
+  // could see it.
   const { dir, a, b } = withHistory();
   record(dir, { build: a, driver: { commit: b, dirty: false } });
   rmSync(join(dir, "report/runs/2026-01-01/record.log"));
