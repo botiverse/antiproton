@@ -2674,8 +2674,6 @@ async function guardSpending(request: Request, env: Env): Promise<Response | nul
   );
 }
 
-/** Stable serialisation so two databases compare by value, not key order.
- *  Must match bench/tau2/run.ts's `canon`, or the two runners disagree. */
 async function sha256(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
