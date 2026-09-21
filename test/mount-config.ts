@@ -14,6 +14,7 @@ import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
+import { exaPlugin } from "../src/plugins/exa.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
@@ -182,7 +183,7 @@ const CREDENTIAL_SHAPED = /token|secret|key|password|credential|auth|bearer/i;
 // deliberately absent: it declares no settings, credential or hooks, so no
 // check below has anything to read. Add it when it gains any of them.
 const everyPlugin: Plugin[] = [
-  githubPlugin, httpPlugin, demoPlugin, run9,
+  githubPlugin, httpPlugin, exaPlugin, demoPlugin, run9,
   statePlugin(null as any, null, "local"),
   artifactsPlugin(null as any, "local"),
   raftPlugin,
@@ -484,8 +485,10 @@ await check("a verification refuses a malformed credential in words, without cal
 await check("the plugins that take a credential are the plugins that can verify one", () => {
   // An account is what makes a verified state useful — "acting as X" is
   // checkable against what the person typed, where a bare "verified" is not.
-  // The contract allows a check to succeed without naming anything; none of
-  // ours does, so the page can rely on an account being there.
+  // The contract allows a check to succeed without naming anything, and `exa`
+  // is the one that does: Exa's API exposes no identity endpoint, so there is
+  // nothing to name. A page cannot rely on an account being there any more —
+  // it has to render a verified mount that names nobody.
   for (const plugin of everyPlugin) {
     const takesOne = credentialForm(plugin.credential).kind !== "none";
     const canCheck = typeof plugin.checkCredential === "function";
