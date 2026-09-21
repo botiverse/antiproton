@@ -1,7 +1,7 @@
 /**
  * The deliberate deafness switch: `IGNORE_ANSWERS` exists so the recovery path can be OBSERVED, and the
  * thing worth pinning is that its name matches what it does — `socket` shuts one ear, `all` shuts both,
- * and anything else is refused rather than quietly treated as off (Vera, 2026-09-20).
+ * and anything else is refused rather than quietly treated as off.
  */
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {

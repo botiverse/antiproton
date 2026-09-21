@@ -2,7 +2,7 @@
  * "Depends on:" notes name the version they were checked against. For a package
  * this repo installs, that version must be the installed one: upgrading the
  * package fails here until each note — and the code it guards — is re-checked
- * and moved to the new version (tygg, 2026-09-14).
+ * and moved to the new version.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";

@@ -99,7 +99,7 @@ await check("no credential is resolved to write a paragraph", async () => {
 });
 
 await check("a parked result keeps its summary and gives the exact call that reads all of it", async () => {
-  // Summary kept (tygg, 2026-09-13); the note is the next call, pi-style, named
+  // Summary kept; the note is the next call, pi-style, named
   // as the model was offered it. A whole read fits under the reader's line.
   const value = { full_name: "cloudflare/workerd", stargazers_count: 7000, description: "x".repeat(9_000) };
   const body = JSON.stringify(value);
@@ -228,7 +228,7 @@ await check("run_js' missing fetch is stated as run_js' own, not as true of ever
 
 await check("the model is told the size at which its results are parked", async () => {
   // A behaviour the model has to adapt to is stated where the model reads
-  // (tygg, 2026-09-13), and the number in that sentence is the one that parks.
+  // and the number in that sentence is the one that parks.
   const said = await artifactsPlugin(null as any, "b").promptContribution!({ alias: "artifacts" } as any);
   must(String(said).includes(`over ${offloadLimit("artifacts__read") / 1024} KB`), `the prompt must state the parking size: ${said}`);
   must(String(said).includes("over 4 KB"), `tygg's number is 4K: ${said}`);

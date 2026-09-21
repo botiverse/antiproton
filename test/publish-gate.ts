@@ -16,7 +16,7 @@
  * code that wrote the record) naming commits that are not on one history. That
  * check has the same three answers, and its two refusals are different
  * mistakes — "merge that tree" and "fetch that commit" — so they must not
- * collapse into one message (Vera, 2026-09-19).
+ * collapse into one message.
  *
  * The credential cases stop before the upload branch, so they need no network
  * and no bucket; the provenance cases reach it with a stub `npx`, as the
@@ -104,7 +104,7 @@ check("a credential the matcher recognises is refused, not published", () => {
 check("with no token at all, it stops before reading or fetching anything", () => {
   // wrangler reads CLOUDFLARE_API_TOKEN and the credential file calls it
   // CF_API_TOKEN, so the first run of this script failed at the upload with
-  // every check already passed (Vera, 2026-09-16). It must say so at the top.
+  // every check already passed. It must say so at the top.
   const { CF_API_TOKEN, CLOUDFLARE_API_TOKEN, ...bare } = process.env;
   const dir = root(`token gho_${"A".repeat(36)}\n`, WORKING);
   const { code, out } = run(dir, bare);
@@ -138,7 +138,7 @@ check("publishing the same key twice leaves one row for it, not two", () => {
   // The manifest must already list something else. With only the key being
   // published in it, "one row per key" is satisfied by a manifest holding a
   // single row — so a script that threw the existing rows away would read
-  // green, and truncation is the worse failure of the two (Vera, 2026-09-16).
+  // green, and truncation is the worse failure of the two.
   const untouched = "runs/2026-01-01/other.log";
   writeFileSync(join(dir, "report/runs/manifest.tsv"), `${untouched}\tdeadbeef\t7\n`);
   const bin = join(dir, "bin");

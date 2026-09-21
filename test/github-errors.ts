@@ -187,7 +187,7 @@ await check("a write with no account says which of the two states it is in", asy
  * The console renders stored events, so badging a failed call from prose means
  * matching a remembered phrase — which is how a correct page got measured as
  * wrong the morning this was written. A reworded sentence must break nothing
- * that a page draws (Nova, 2026-09-20).
+ * that a page draws.
  */
 await check("a failure carries the identity as a field, for a reader that does not parse prose", async () => {
   for (const [kind, identity] of [["none", "none"], ["agent", "unreadable"], ["operator", "unreadable"]] as Array<[string, string]>) {

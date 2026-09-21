@@ -214,7 +214,7 @@ check("a hostile alias or summary cannot break out of the markup", () => {
 });
 
 // The inbox was a second copy of the held calls: the conversation's panel
-// (below) is the one that decides them, so the page is gone (tygg, 2026-09-13).
+// (below) is the one that decides them, so the page is gone.
 
 
 

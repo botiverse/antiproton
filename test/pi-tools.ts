@@ -333,8 +333,8 @@ await check("Worker 执行器把脚本写的名字原样交给 host", async () =
 
 await check("run_js 里写错模型自己那套名字,答'没有这个工具'并给出候选,而不是'名字不合法'", async () => {
   // #255 made `alias__tool` the shape a script uses; a typo in it then reached
-  // the gateway and came back as "not a tool name", contradicting that rule
-  // (Piper, 2026-09-13). Through the real executor, as the model hits it.
+  // the gateway and came back as "not a tool name", contradicting that rule.
+  // Through the real executor, as the model hits it.
   const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
   const seen: string[] = [];
   const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: "op", result: {} }; } };
@@ -353,8 +353,7 @@ await check("run_js 里写错模型自己那套名字,答'没有这个工具'并
   if (typo.seen.length !== 0) throw new Error(`an unknown offered-form name reached the host: ${typo.seen}`);
   if (typo.code !== "unknown_tool") throw new Error(`a typo was answered with ${typo.code}, not unknown_tool`);
   // Checked before the ranking below, so a switch to the address table is caught
-  // here by name rather than by whichever ranking check happens to throw first
-  // (Piper, 2026-09-13).
+  // here by name rather than by whichever ranking check happens to throw first.
   // Names offered to the model only, never a dispatch address: candidates come
   // from the offered-name table, and that is the whole reason this message may
   // name tools at all (the refusal rule pinned in test/plugin-enable.ts). A

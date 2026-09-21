@@ -100,7 +100,7 @@ await check("释放与调用不重叠 —— 释放走的是同一把锁", async
   // it used to run outside the per-mount chain: the command reads "no
   // container", starts box B and records it, while the release writes back the
   // empty state it read first. Box B is then alive, billing, and named by
-  // nothing (Piper, 2026-09-16). Overlap is the property; the racer watches it.
+  // nothing. Overlap is the property; the racer watches it.
   const r = racer("node", true);
   const { gw } = await fixture(r.plugin);
   await Promise.all([

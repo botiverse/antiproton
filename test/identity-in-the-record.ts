@@ -57,7 +57,7 @@ function failingPlugin() {
  * production runs. A payload proven on the node backend alone proves the
  * backend no deployment uses, and the two files had spelled the payload out
  * separately, so "the field is there" was a claim about whichever copy the
- * test happened to reach (cody, 2026-09-20). They now share one builder
+ * test happened to reach. They now share one builder
  * (`src/store/operation-event.ts`); these run the assertion on both anyway,
  * because a shared builder is a fact about today's code and the acceptance
  * should outlive it.

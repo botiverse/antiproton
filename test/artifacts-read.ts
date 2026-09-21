@@ -6,7 +6,7 @@
  * `{key, found, bytes, updatedAt, value}` — and reading only the top level
  * dropped all three without a word: a fresh agent asked for five items
  * projected to one field and received three hundred whole, larger than what it
- * had stored (Vera, 2026-09-13). Two model-facing sentences promise this works:
+ * had stored. Two model-facing sentences promise this works:
  * this tool's summary, and `state.get`'s, which sends the model here.
  *
  * So the cases below are the shapes a reference can point at, and the property
@@ -75,7 +75,7 @@ await check("asking for nothing gets the value whole, with no note about argumen
 await check("asking for nothing keeps the whole envelope, not its list alone", async () => {
   // The case the one above did not reach: its value held no array, so it never
   // exercised the descent. With an array inside, descending unasked returned
-  // fifty items and dropped `key`, `bytes` and `updatedAt` (cody, 2026-09-13).
+  // fifty items and dropped `key`, `bytes` and `updatedAt`.
   // Descending is an inference about intent, and the arguments are its only
   // signal — so with none, nothing is inferred.
   const r = await reader({ key: "k", found: true, bytes: 19_093, updatedAt: 1, value: items })({});
@@ -98,7 +98,7 @@ await check("以自己的前缀开头,不等于停在里面", async () => {
   // the prefix test reads the front of the string, and nothing read the rest.
   // What kept it from escaping was R2 treating a key as opaque — true, and
   // written down nowhere, so the guard could not see the dependency it had
-  // (Vera, 2026-09-13). Refused here now, so it no longer rests on the store.
+  // Refused here now, so it no longer rests on the store.
   const r = reader({ any: "thing" });
   const escapes = `r2://${BUCKET}/t/t/a/state/aa/../../../../othertenant/u-else/state/pwn.json`;
   let refused = false;

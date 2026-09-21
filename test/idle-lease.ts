@@ -3,7 +3,7 @@
  *
  * The properties that cost money or trust if they are wrong: a box in use is
  * never taken, the agent is told once before its box goes, `quiet` postpones
- * the release itself (tygg, 2026-09-15), and a postponed agent is not bothered
+ * the release itself, and a postponed agent is not bothered
  * again until its new release time is near.
  */
 import { idleDecision, releaseAt, warningText } from "../src/runtime/idle-lease.ts";

@@ -4,7 +4,7 @@
  * Waiting cost the whole turn: pi serialises every tool call in a turn when
  * one of them asks for it, so an agent waiting on a container ran nothing else
  * and thought nothing else — three quarters of billed Worker time on a
- * SWE-bench task (cody, 2026-09-14). So the call waits a short grace and then
+ * SWE-bench task. So the call waits a short grace and then
  * hands back a job.
  *
  * The property these cases exist for is that **both endings agree**: a command
@@ -102,7 +102,7 @@ await check("两种结局给出【同一个结果】—— 这是这组用例真
 await check("还在跑时 poll 说没完,而且【一个字节都不写连接状态】", async () => {
   // Writing state from a poll would race a second job finishing at the same
   // moment — the read-modify-write `exclusive` exists to prevent, in a place
-  // `exclusive` does not reach (Piper, 2026-09-14).
+  // `exclusive` does not reach.
   const { ctx, written } = run9(["running"]);
   const r: any = await plugin.pollBackground!({ boxId: "b1", execId: "e1" }, ctx);
   if (r.done !== false) throw new Error(`a running execution was reported done: ${JSON.stringify(r)}`);
@@ -152,7 +152,7 @@ await check("杀不掉就【说出来】,不能咽下去", async () => {
   // The defect this case exists for: with three jobs running, a refused fourth
   // was cancelled through this path, the kill did not take, and the command
   // ran to completion in the container — with no job id, so nothing could list
-  // it or cancel it (Vera, 2026-09-14). A swallowed failure is a cancellation
+  // it or cancel it. A swallowed failure is a cancellation
   // that did not happen, still billing, with nothing left that can name it.
   const { ctx } = killing([404], ["running"]);
   let threw: string | null = null;
@@ -208,7 +208,7 @@ await check("只杀一次、只确认一次 —— 重试归运行时,不在插�
   // The kill most likely to be refused is the one sent the instant an exec
   // starts, which is when the cap fires. Retrying here would look like the fix
   // and would instead hide the state the runtime needs: it is what keeps a
-  // refused job tracked and asks again at its ceiling (cody, 2026-09-14).
+  // refused job tracked and asks again at its ceiling.
   const { ctx, calls } = killing([409], ["running"]);
   await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch(() => {});
   const kills = calls.filter((c) => c.endsWith("/kill")).length;
