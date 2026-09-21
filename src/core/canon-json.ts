@@ -14,6 +14,22 @@
  * talks to the Worker — so the one sentence written to prevent this pointed
  * away from the place it mattered.
  *
+ * WHY ONLY THIS FUNCTION LIVES HERE. The file is compiled by BOTH typecheck
+ * programs — `tsconfig.node.json` reaches it through `src/**`, and the worker
+ * program reaches it through `cf/src/index.ts`'s import (measured with
+ * `npx tsc -p tsconfig.<node|worker>.json --listFiles | grep canon-json`: one
+ * hit each). So it may use nothing that exists in only one of the two
+ * runtimes, and it uses nothing at all beyond `JSON.stringify` and
+ * `Object.keys`.
+ *
+ * That is why the HASH stayed behind on both sides even though
+ * `sha256(canonJson(db))` now reads the same in both places: the Worker hashes
+ * with `crypto.subtle.digest` (async) and the runner with node's `createHash`
+ * (sync). Sharing the whole phrase would require this module to know both
+ * runtimes, which it cannot (@Nova, 2026-09-21 — and that change would look
+ * exactly like the one this file is). Move the serialiser here; leave the
+ * hash where its API lives.
+ *
  * Arrays keep their order here on purpose: a list in the domain is a list, and
  * a database whose rows moved is a different database. Where order is NOT part
  * of the claim — a write action's arguments — the τ² grader uses its own
