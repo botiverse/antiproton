@@ -125,8 +125,32 @@ export function recordRun(run: Run, body: unknown): string {
  * same failure one level up — a third runner copies it, or copies it wrong
  * (@Vera, 2026-09-20, #465).
  */
+/**
+ * Colour codes are for a terminal, and the log file is not one.
+ *
+ * `\x1b[32m✓\x1b[0m` costs nine bytes and occupies no columns, so a reader
+ * outside a terminal — the report page serves these as `text/plain` — sees
+ * `^[[32m✓^[[0m task 0    db=ok` and every column after the mark pushed nine
+ * bytes right. These files are TABLES whose alignment is byte counts, so the
+ * escapes do not make them ugly, they make them wrong, and exactly on the
+ * column a reader runs their eye down (@Vera, 2026-09-21).
+ *
+ * Stripped HERE rather than at each `mark`, because the two consumers want
+ * different bytes from the same call: the terminal keeps its colour, the file
+ * does not get it. Asking `process.stdout.isTTY` at the producer cannot serve
+ * both — in a watched run the file would still get the escapes, and in a
+ * redirected one the terminal would lose its colour. And the producers are
+ * not one place: four sites across the two teed runners emit colour
+ * (`bench/tau2/cf.ts:378`, `bench/swebench/cf.ts:247,297,311`).
+ *
+ * Only what is written from here on. The records already published keep their
+ * escapes and cannot be rewritten, so a reader-side strip on the report page
+ * is a separate and still-needed fix (@Nova's surface).
+ */
+const SGR = /\x1b\[[0-9;]*m/g;
+
 export function teeRun(run: Run): void {
-  const line = (args: unknown[]) => args.map(String).join(" ") + "\n";
+  const line = (args: unknown[]) => args.map(String).join(" ").replace(SGR, "") + "\n";
   for (const which of ["log", "error"] as const) {
     const say = console[which].bind(console);
     console[which] = (...args: unknown[]) => {

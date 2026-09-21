@@ -162,6 +162,34 @@ check("the tee still prints, so the file is a copy and not a diversion", () => {
   if (!written.includes("on both")) throw new Error(`the file did not get the line: ${JSON.stringify(written)}`);
 });
 
+check("the log gets the text without the colour, and the terminal keeps it", () => {
+  // The escapes cost nine bytes and no columns, so in a plain-text reader —
+  // which is what the report page serves these as — they push every column
+  // after the mark nine bytes right. A log is a table; that is a wrong table,
+  // not an ugly one (@Vera, 2026-09-21).
+  const { runs, dir } = runsTree();
+  const run = beginRun("tau2", "h9", runs);
+  const seen: string[] = [];
+  const say = console.log;
+  console.log = (...a: unknown[]) => { seen.push(a.map(String).join(" ")); };
+  try {
+    withTee(run, () => {
+      console.log(`  \x1b[32m✓\x1b[0m task 0    db=ok`);
+      console.log(`  \x1b[31m✗\x1b[0m task 1    db=NO`);
+    });
+  } finally { console.log = say; }
+  const written = readFileSync(run.log, "utf8");
+  rmSync(dir, { recursive: true, force: true });
+  if (written.includes("\x1b")) throw new Error(`the log kept an escape sequence: ${JSON.stringify(written)}`);
+  if (!written.includes("✓ task 0")) throw new Error(`stripping took the mark with it: ${JSON.stringify(written)}`);
+  if (!seen.some((l) => l.includes("\x1b"))) throw new Error(`the terminal lost its colour, which nobody asked for: ${JSON.stringify(seen)}`);
+  // The point of the strip, stated as the property a reader depends on.
+  const [a, b] = written.split("\n");
+  if (Buffer.byteLength(a) !== Buffer.byteLength(b)) {
+    throw new Error(`two rows of the same table differ in byte length (${Buffer.byteLength(a)} vs ${Buffer.byteLength(b)}), so the columns do not line up`);
+  }
+});
+
 check("an uncaught throw leaves its trace in the log AND on the terminal", () => {
   // Node stops printing the trace itself once a handler is installed, so a
   // handler that writes only the file trades one loss for the other — that
