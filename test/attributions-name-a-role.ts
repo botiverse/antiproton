@@ -333,34 +333,42 @@ function coordinatesIn(file: string, text: string): string[] {
 }
 
 check("a comment points into another file by name, not by line number", () => {
-  // Deliberately NOT `FILES`, and expressed by FILE rather than by directory.
+  // Deliberately NOT `FILES`, and collected the way ownership is held.
   //
   // The scan above takes directories, but this repository's ownership is by
-  // file (@Nova, 2026-09-21) — `cf/src` holds her console files and @cody's
-  // `index.ts` and `secret-shape.ts`, and reading the directory as one person's
-  // is the mistake @Rex and I both made today. So consent is collected the same
-  // way it is held:
+  // file (@Nova, 2026-09-21): `cf/src` holds her console files beside @cody's,
+  // and reading the directory as one person's is the mistake @Rex and I each
+  // made today, in opposite directions. So each owner named their own, and a
+  // directory appears only where one person holds all of it:
   //
-  //   `src/plugins`  mine
-  //   `test/**`      @Rex, after his own citation in `test/exclusive.ts` rotted
-  //                  — `:377` is `})(),` today, and nothing said so
-  //   six files      @Nova's, named by her; the rest of `cf/src` is not hers to
-  //                  give and is not here
+  //   src/plugins          mine
+  //   test/**              @Rex — after his citation in `test/exclusive.ts`
+  //                        rotted: `:377` is `})(),` today, and nothing said so
+  //   bench, src/core,     @cody — `src/runtime/gateway.ts` was one of the two
+  //   src/runtime,         already rotted, and `bench/record.ts` was his own,
+  //   src/store, src/model four hours old when #475 moved 28 lines above it
+  //   6 cf/src files       @Nova, named individually
+  //   5 cf/src files       @cody, named individually
   //
-  // `bench/` and @cody's `cf/src` files are absent because nobody has invited
-  // them, not because they are dirty: every directory measures zero today.
+  // What is NOT here is not dirty — every one of these measured zero before it
+  // was added, and so does the rest of the repository. It is absent for want of
+  // an owner who asked to live under the rule: a few `cf/src` files belong to
+  // nobody either of them would speak for, and they stay out until someone does.
   //
   // Reading `test/**` puts this file inside its own scan, which the name rule
-  // above refuses for itself. It is safe HERE and the reason is structural, not
-  // luck: `coordinatesIn` reads comment lines only, and the control fixture
-  // below sits in a string on an `if (` line. A fixture that ever moves into a
-  // comment reds this, and that is correct — a specimen of the defect is the
-  // defect once a scanner reads it.
-  const INVITED = [
+  // above refuses for itself. It is safe HERE for a structural reason rather
+  // than by luck: `coordinatesIn` reads comment lines only, and the control
+  // fixture below sits in a string on an `if (` line. A fixture that ever moves
+  // into a comment reds this, and that is correct — a specimen of the defect is
+  // the defect once a scanner reads it.
+  const INVITED_DIRS = ["src/plugins", "test", "bench", "src/core", "src/runtime", "src/store", "src/model"];
+  const INVITED_FILES = [
     "cf/src/ui.ts", "cf/src/usage.ts", "cf/src/usage-d1.ts",
     "cf/src/usage-windows.ts", "cf/src/md.ts", "cf/src/brand.ts",
+    "cf/src/index.ts", "cf/src/runtime.ts", "cf/src/secret-shape.ts",
+    "cf/src/bench.ts", "cf/src/pi-view.ts",
   ];
-  const mine = [...new Set([...tsIn("src/plugins"), ...tsIn("test"), ...NAMED, ...INVITED])];
+  const mine = [...new Set([...INVITED_DIRS.flatMap(tsIn), ...NAMED, ...INVITED_FILES])];
   const found = mine.flatMap((f) => coordinatesIn(f, readFileSync(f, "utf8")));
   if (found.length) {
     throw new Error(
