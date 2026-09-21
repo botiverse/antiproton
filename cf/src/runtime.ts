@@ -102,6 +102,7 @@ import { credentialForm, pluginEnabled, renameSafety } from "../../src/plugins/t
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
+import { exaPlugin } from "../../src/plugins/exa.ts";
 import { statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
@@ -582,6 +583,9 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
+      // Mounted only where an operator attaches a key; `http.search`'s keyless
+      // path stays for everyone else.
+      exaPlugin,
       // The lease reaches the plugin so its tools state the lifetime this deployment gives a box.
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
       statePlugin(this.store, this.#artifacts as any, deps.bucketName),
