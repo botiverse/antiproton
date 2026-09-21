@@ -3,10 +3,10 @@
  * order their keys happened to be written in.
  *
  * TWO call sites MUST agree, and they are not in the same process.
- * `bench/tau2/cf.ts` hashes the database it expects and compares that hash at
- * `:290` to `dbHash`, which the Worker computed with its own copy
- * (`cf/src/index.ts`): `dbMatch` is an equality between two serialisations
- * made by two implementations on two machines. Every published τ² reading has
+ * `bench/tau2/cf.ts` hashes the database it expects and compares that hash to
+ * the `dbHash` the Worker computed with its own copy (`cf/src/index.ts`):
+ * `dbMatch` is an equality between two serialisations made by two
+ * implementations on two machines. Every published τ² reading has
  * rested on that agreement, with nothing checking it.
  *
  * A THIRD call site uses it for a different reason. `bench/tau2/run.ts`
