@@ -6,8 +6,7 @@
  * with the set-aware serialiser below; `bench/tau2/run.ts` still compared them
  * positionally, which is the behaviour the comment below was written to
  * correct. The same trial could therefore score `actionMatch` differently
- * depending on which runner ran it, silently (@Rex found the duplication,
- * 2026-09-21; the drift was in the half he had not opened).
+ * depending on which runner ran it, silently.
  */
 import { canonJson } from "../../src/core/canon-json.ts";
 

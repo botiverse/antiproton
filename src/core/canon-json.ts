@@ -3,11 +3,16 @@
  * order their keys happened to be written in.
  *
  * It lives here because three call sites need the SAME answer and one of them
- * is in the Worker: the object hashes a benchmark database with it
- * (`cf/src/index.ts`) and the two τ² runners compare databases with it. They
- * used to hold three line-for-line copies, and only one carried a note saying
- * the copies had to agree — on the side nobody edits. The copy that had been
- * changed three times did not know it was a copy (@Rex, 2026-09-21).
+ * is in another process. `bench/tau2/cf.ts` hashes the database it expects and
+ * compares that hash to `dbHash`, which the Worker computed with its own copy
+ * (`cf/src/index.ts`): `dbMatch` is an equality between two serialisations
+ * made by two implementations on two machines. Every published τ² reading has
+ * rested on that agreement, with nothing checking it.
+ *
+ * There were three line-for-line copies. One carried a note saying the copies
+ * had to agree, and it named the wrong pair — `bench/tau2/run.ts`, which never
+ * talks to the Worker — so the one sentence written to prevent this pointed
+ * away from the place it mattered.
  *
  * Arrays keep their order here on purpose: a list in the domain is a list, and
  * a database whose rows moved is a different database. Where order is NOT part
