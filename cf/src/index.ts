@@ -13,6 +13,7 @@
  */
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
+import { canonJson } from "../../src/core/canon-json.ts";
 import { bearerKey, hashApiKey, newApiKey } from "./agents-api/keys.ts";
 import { handleAgentsApi, type AgentsApiDeps } from "./agents-api/handlers.ts";
 import { apiAgentSeeds } from "./agents-api/provisioning.ts";
@@ -2675,12 +2676,6 @@ async function guardSpending(request: Request, env: Env): Promise<Response | nul
 
 /** Stable serialisation so two databases compare by value, not key order.
  *  Must match bench/tau2/run.ts's `canon`, or the two runners disagree. */
-function canonJson(v: unknown): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(canonJson).join(",")}]`;
-  return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canonJson((v as any)[k])}`).join(",")}}`;
-}
-
 async function sha256(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
