@@ -570,8 +570,9 @@ await check("reading through the escape hatch does not wait for a person, writin
  * `validateMount` exists to catch a mount carrying `timeout_ms` where the
  * plugin reads `timeoutMs`, and the console runs it — but only to *show* the
  * problem on the plugins page, to a person who happens to open it
- * (`cf/src/index.ts:1370`). Nothing runs it over `DEFAULT_MOUNTS`, which is the
- * one config every agent gets, written by hand, and seeded by both paths since
+ * (`cf/src/index.ts` calls `validateMount` only there). Nothing runs it over
+ * `DEFAULT_MOUNTS`, which is the one config every agent gets, written by hand,
+ * and seeded by both paths since
  * #103. A typo there would reach every agent, be used as the plugin's default
  * for ever, and say so only to whoever opened that page.
  */

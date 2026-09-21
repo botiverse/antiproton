@@ -157,7 +157,8 @@ await check("不同 agent 的同名挂载互不排队", async () => {
 });
 
 await check("队列住在实例上 —— 所以【一个 agent 一个 gateway】是它的前提,不是巧合", async () => {
-  // The guarantee lives in another file: cf/src/index.ts:377 builds the runtime
+  // The guarantee lives in another file: `cf/src/index.ts`'s
+  // `this.#runtime ??= new AgentRuntime(...)` builds the runtime
   // once per Durable Object, and a Durable Object is one single-threaded
   // instance per (tenant, agent). This case does not test that line; it makes
   // the *consequence* of losing it visible, so a future "new AgentRuntime per
