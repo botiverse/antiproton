@@ -128,9 +128,11 @@ await check("the record of drops has a horizon: a put that keeps failing does no
   bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => t0));
   bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => t0 + 1000));
   must(drops(host.sql).length === 2, "two passes, two lines expected");
-  bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => t0 + TRACE_DROPS_KEEP_MS + 1));
+  // A pass beyond the horizon of BOTH earlier lines keeps only its own.
+  const late = t0 + 1000 + TRACE_DROPS_KEEP_MS + 1;
+  bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => late));
   const d = drops(host.sql);
-  must(d.length === 1 && Number(d[0].at) === t0 + TRACE_DROPS_KEEP_MS + 1, `lines older than the horizon survived: ${JSON.stringify(d)}`);
+  must(d.length === 1 && Number(d[0].at) === late, `lines older than the horizon survived: ${JSON.stringify(d)}`);
 });
 
 await check("a trace key is not an artifact reference and never sits in an agent's artifact scope", async () => {
