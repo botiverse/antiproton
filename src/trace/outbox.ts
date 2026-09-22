@@ -107,9 +107,13 @@ function attrsOf(attrs: Record<string, unknown>): string {
 export function appendTrace(sql: Sql, rows: readonly TraceRow[]) {
   ensureTraceOutbox(sql);
   for (const row of rows) {
-    // A row without its join key or its time is an orphan by definition; the
-    // seam has a bug and the test at that seam is the place it shows.
+    // A row without its join key or its time is an orphan by definition; so
+    // is a row whose vocabulary is not the contract's — the drain dispatches
+    // on kind and verdict, and a wrong value would not redden there, it
+    // would just take the wrong branch. The seam has a bug and the test at
+    // that seam is the place it shows.
     if (!Number.isFinite(row.at) || !row.kind || !row.spanId) continue;
+    if (!isKind(row.kind) || !isVerdict(row.verdict)) continue;
     sql.exec(
       "INSERT INTO trace_outbox(at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) " +
       "VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -120,28 +124,51 @@ export function appendTrace(sql: Sql, rows: readonly TraceRow[]) {
   }
 }
 
+export interface PendingTrace {
+  rows: TraceOutboxRow[];
+  /** Rows read but left out because kind or verdict was not the contract's vocabulary. */
+  dropped: number;
+}
+
+const isMember = <T extends string>(table: readonly T[], s: string): s is T =>
+  (table as readonly string[]).includes(s);
+const isKind = (s: string): s is TraceKind => isMember(TRACE_KINDS, s);
+const isVerdict = (s: string): s is TraceVerdict => isMember(TRACE_VERDICTS, s);
+
 /** Rows after `afterSeq`, oldest first, at most `limit`. */
-export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): TraceOutboxRow[] {
+export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingTrace {
   ensureTraceOutbox(sql);
-  return sql.exec(
+  let dropped = 0;
+  const rows = sql.exec(
     "SELECT seq, at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs " +
     "FROM trace_outbox WHERE seq > ? ORDER BY seq LIMIT ?",
     afterSeq, limit,
-  ).toArray().map((r: any) => ({
-    seq: Number(r.seq),
-    at: Number(r.at),
-    tenantId: String(r.tenant_id),
-    agentId: String(r.agent_id),
-    kind: String(r.kind) as TraceKind,
-    spanId: String(r.span_id),
-    parentId: r.parent_id === null ? undefined : String(r.parent_id),
-    status: String(r.status),
-    verdict: String(r.verdict) as TraceVerdict,
-    ms: r.ms === null ? undefined : Number(r.ms),
-    // Written only by appendTrace, so unparseable means storage damage: keep
-    // the row, mark it, and let the drain's reader see the mark.
-    attrs: (() => { try { return JSON.parse(String(r.attrs)); } catch { return { unparseable: true }; } })(),
-  }));
+  ).toArray().flatMap((r: any) => {
+    // No `as` on the way back: the type is the contract, and the contract is
+    // checked against the stored string, or a wrong value rides into the
+    // drain's dispatch as a "valid" one.
+    const kind = String(r.kind);
+    const verdict = String(r.verdict);
+    if (!isKind(kind) || !isVerdict(verdict)) { dropped++; return []; }
+    const parsed = (() => { try { return JSON.parse(String(r.attrs)); } catch { return undefined; } })();
+    return [{
+      seq: Number(r.seq),
+      at: Number(r.at),
+      tenantId: String(r.tenant_id),
+      agentId: String(r.agent_id),
+      kind,
+      spanId: String(r.span_id),
+      parentId: r.parent_id === null ? undefined : String(r.parent_id),
+      status: String(r.status),
+      verdict,
+      ms: r.ms === null ? undefined : Number(r.ms),
+      // Written only by appendTrace, so a wrong shape means storage damage.
+      // One shape catches the class — unparsable or not-an-object — so a
+      // damaged row is visible without inventing a second taxonomy for it.
+      attrs: (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : { unparseable: true },
+    }];
+  });
+  return { rows, dropped };
 }
 
 /** Forget rows the drain already took. */
