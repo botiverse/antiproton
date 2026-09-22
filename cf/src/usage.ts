@@ -62,6 +62,13 @@ export type UsageData = {
    * showing a partial figure as a whole one.
    */
   firstHours?: Record<string, number>;
+  /**
+   * True when some mount's record would not read at some point inside this
+   * window: whatever those passes could not count was never written, so the
+   * figures are not guaranteed complete. Window-level, like firstHours — said
+   * once above the numbers, never per tile.
+   */
+  partial?: true;
 };
 
 const BYS = ["total", "agent", "model", "tool"] as const;
@@ -299,7 +306,15 @@ export function usagePanel(d: UsageData): string {
     return `<div class="u-note">${names.length === counted.length ? "" : `${esc(names.join(", "))}: `}` +
       `nothing recorded before ${iso.slice(5, 10)} ${iso.slice(11, 16)}Z, part-way into this window</div>`;
   }).join("");
-  const cuts = lines ? `<div class="u-cuts">${lines}</div>` : "";
+  // A window the record could not fully read is not a whole: the seconds those
+  // passes missed were never written. Said once, above the numbers, for the
+  // same reason the firstHours lines are — one fact, one line, never per tile.
+  // A possibility, not a count: the marker does not say which entries, so the
+  // page does not either.
+  const partialLine = d.partial
+    ? `<div class="u-note">part of the record would not read during this window — the figures below may be incomplete</div>`
+    : "";
+  const cuts = lines || partialLine ? `<div class="u-cuts">${partialLine}${lines}</div>` : "";
 
   const tiles = RESOURCES.map((res) => {
     if (!res.counted) {
