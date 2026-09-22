@@ -20,7 +20,7 @@ import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { appworldPlugins } from "../src/plugins/appworld.ts";
-import { credentialForm } from "../src/plugins/types.ts";
+import { backgroundOf, credentialForm, holdingOf, isExclusive } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 
 const read = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url).pathname, "utf8");
@@ -96,8 +96,37 @@ const md = (s: string) => s.split(/\n\n+/).map((p) =>
 /** Declarations are written as sentences or as fragments; only one needs a stop. */
 const dot = (s: string) => (/[.!?]$/.test(s.trim()) ? s.trim() : `${s.trim()}.`);
 
-const OPTIONAL = ["exclusive", "config", "credential", "checkCredential", "release", "promptContribution"] as const;
+const OPTIONAL = ["config", "credential", "checkCredential", "promptContribution"] as const;
 const has = (p: Plugin, k: string) => (p as any)[k] !== undefined && (p as any)[k] !== false;
+
+/**
+ * The capability groups, asked through their adapters rather than by name.
+ *
+ * This column list used to say `"exclusive"` and `"release"`, and `has()` looks
+ * a member up by STRING — so when the 2026-09 refactor moved both inside
+ * `holds`, every mark and both tags went blank and the page began saying that
+ * nothing in the registry holds anything. Nothing broke, because a string key
+ * cannot be wrong at compile time. Measured on 2026-09-22: zero "one call at a
+ * time" and zero "holds something releasable" over a registry whose sandbox
+ * plugin holds a container.
+ *
+ * A function per column fixes the class, not the instance: rename or regroup a
+ * capability again and this file stops compiling instead of quietly emptying a
+ * column. Same reason the runtime reads through these adapters and not through
+ * the members.
+ */
+const CAPABILITIES: ReadonlyArray<{ label: string | null; tag: string | null; of: (p: Plugin) => boolean }> = [
+  { label: "holds", tag: "holds something releasable", of: (p) => !!holdingOf(p) },
+  { label: "background", tag: "can work in the background", of: (p) => !!backgroundOf(p) },
+  { label: "provides", tag: null, of: (p) => !!(p.provides?.length) },
+  // A tag and no column: serialisation is DERIVED from `holds` (`isExclusive`
+  // is `!!p.holds`), so a column for it would be the `holds` column drawn
+  // twice, and two identical columns invite a reader to look for the case
+  // where they differ. The tag stays, because "one call at a time" is a
+  // consequence worth naming where a reader is looking at one plugin.
+  { label: null, tag: "one call at a time", of: isExclusive },
+];
+const COLUMNS = CAPABILITIES.filter((c) => c.label);
 
 const credCell = (p: Plugin) => {
   const form = credentialForm((p as any).credential);
@@ -113,6 +142,7 @@ const overview = plugins.map((p) => `<tr>
     <td class="num">${p.tools.length}</td>
     <td>${credCell(p)}</td>
     ${OPTIONAL.map((k) => `<td class="mark ${has(p, k) ? "yes" : "no"}">${has(p, k) ? "●" : "·"}</td>`).join("")}
+    ${COLUMNS.map((c) => `<td class="mark ${c.of(p) ? "yes" : "no"}">${c.of(p) ? "●" : "·"}</td>`).join("")}
   </tr>`).join("\n");
 
 const detail = plugins.map((p) => {
@@ -121,8 +151,7 @@ const detail = plugins.map((p) => {
   return `
   <section class="plugin">
     <h3><code>${esc(p.id)}</code><span class="v">${esc(p.version)}</span>
-      ${has(p, "exclusive") ? '<span class="tag">one call at a time</span>' : ""}
-      ${has(p, "release") ? '<span class="tag">holds something releasable</span>' : ""}
+      ${CAPABILITIES.filter((c) => c.tag && c.of(p)).map((c) => `<span class="tag">${esc(c.tag!)}</span>`).join("\n      ")}
       ${has(p, "promptContribution") ? '<span class="tag">adds a prompt paragraph</span>' : ""}
       ${has(p, "checkCredential") ? '<span class="tag">can test its credential</span>' : ""}</h3>
     <table>
@@ -222,13 +251,15 @@ ${memberList(TYPES, "Plugin")}
 <h2>${plugins.length} registered, and one family, at a glance</h2>
 <table>
   <thead><tr><th>plugin</th><th class="num">tools</th><th>credential</th>
-    ${OPTIONAL.map((k) => `<th class="mark"><span class="rot">${esc(k)}</span></th>`).join("")}</tr></thead>
+    ${OPTIONAL.map((k) => `<th class="mark"><span class="rot">${esc(k)}</span></th>`).join("")}
+    ${COLUMNS.map((c) => `<th class="mark"><span class="rot">${esc(c.label!)}</span></th>`).join("")}</tr></thead>
   <tbody>${overview}
     <tr class="family">
       <th scope="row"><code>appworld</code><span class="v">id is the app's name</span></th>
       <td class="num">per app</td>
       <td>${credCell(family)}</td>
       ${OPTIONAL.map((k) => `<td class="mark ${has(family, k) ? "yes" : "no"}">${has(family, k) ? "●" : "·"}</td>`).join("")}
+      ${COLUMNS.map((c) => `<td class="mark ${c.of(family) ? "yes" : "no"}">${c.of(family) ? "●" : "·"}</td>`).join("")}
     </tr>
   </tbody>
 </table>
