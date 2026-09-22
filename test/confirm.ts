@@ -26,7 +26,7 @@ async function fixture() {
     // `defaultForAllAgents` because since the three-state switch (#216) a plugin
     // that does not say so is off for every agent, and the gateway refuses the
     // call before confirm is ever read. This file is about confirm.
-    id: "p", version: "1.0.0", defaultForAllAgents: true,
+    id: "p", version: "1.0.0", 
     tools: [{ name: "zap", description: "", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" } as any],
     async invoke(_tool, args) { seen.push(args); return { zapped: true }; },
   };

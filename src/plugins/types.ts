@@ -313,39 +313,27 @@ export function markIdentity<E extends Error>(
 }
 
 /**
- * Reading the capability groups while the flat members still exist.
+ * Reading the capability groups.
  *
- * Step 1 of the contract refactor adds the groups without removing what they
- * replace, so every consumer reads through these three and nowhere else — then
- * step 6 deletes the second half of each expression in one place instead of
- * hunting nine call sites. A plugin that declares both is not a conflict during
- * the migration: the group wins, because that is the form being migrated to.
+ * Kept as three functions after the flat members are gone, rather than every
+ * consumer writing `plugin.holds` itself, for the reason they existed in the
+ * first place: they are the one place the question is asked, so the next change
+ * to what "holds something" means has one edit and not nine.
  *
- * `isExclusive` is the one that changes meaning rather than location: holding
- * something IS the reason to serialise, so the answer is derived from `holds`
- * rather than asserted beside it. Until the flag is gone it is still honoured,
- * so a plugin that has not moved yet keeps its queue.
+ * `isExclusive` is the one that is a derivation rather than an accessor:
+ * holding something IS the reason to serialise calls on a mount, so the answer
+ * comes from `holds` and there is no second field that could disagree with it.
  */
-export function holdingOf(p: Pick<Plugin, "holds" | "activity" | "usage" | "release">): Holding | null {
-  if (p.holds) return p.holds;
-  if (!p.activity && !p.release) return null;
-  return {
-    activity: p.activity!,
-    ...(p.usage ? { usage: p.usage } : {}),
-    release: p.release!,
-  };
+export function holdingOf(p: Pick<Plugin, "holds">): Holding | null {
+  return p.holds ?? null;
 }
 
-export function backgroundOf(
-  p: Pick<Plugin, "background" | "pollBackground" | "cancelBackground">,
-): Backgrounding | null {
-  if (p.background) return p.background;
-  if (!p.pollBackground || !p.cancelBackground) return null;
-  return { poll: p.pollBackground, cancel: p.cancelBackground };
+export function backgroundOf(p: Pick<Plugin, "background">): Backgrounding | null {
+  return p.background ?? null;
 }
 
-export function isExclusive(p: Pick<Plugin, "holds" | "exclusive">): boolean {
-  return !!p.holds || p.exclusive === true;
+export function isExclusive(p: Pick<Plugin, "holds">): boolean {
+  return !!p.holds;
 }
 
 /** The most live hooks one mount may hold; see `InboundHooks`. */
@@ -920,48 +908,6 @@ export interface Plugin {
    * silent behaviour change.
    */
   provides?: readonly ("container")[];
-  /**
-   * Whether two calls to this plugin may overlap for one mount.
-   *
-   * Most plugins are fine concurrently — two HTTP fetches do not interfere.
-   * A plugin whose mount owns a shared resource is not: run9 keeps one
-   * container per mount and creates it if absent, so two calls arriving
-   * together both find nothing and both create one. Only the last write to the
-   * connection state survives; the rest become containers nobody will ever
-   * release, billed by the second for as long as they exist.
-   *
-   * Fifteen of them accumulated before the meter made it visible.
-   *
-   * **It costs the whole turn, not this mount.** pi serialises every tool call
-   * in a turn when *any* of them asks for it — `hasSequentialToolCall` in
-   * `agent-loop.js`, `toolCalls.some(...)` — so declaring this also stops
-   * unrelated mounts from running alongside. The sentence above says what the
-   * flag is for; this says what it costs, and the two were far enough apart
-   * that the cost read as "one mount waits". Measured on SWE-bench: three
-   * quarters of billed Worker time is spent waiting on a container, against
-   * 3% for a task that uses none.
-   *
-   * So it is worth declaring only where overlapping really does break
-   * something, and it is a reason to want a call that can be left and returned
-   * to rather than waited on.
-   */
-  exclusive?: boolean;
-  /**
-   * Does a new agent get this plugin without anyone asking for it?
-   *
-   * The first of two layers: this is the plugin's own answer for every agent,
-   * and an agent may override it (see `pluginEnabled`). Absent means no — a
-   * plugin has to say it belongs to everyone, because the cost of the wrong
-   * default runs one way. A plugin nobody wanted appears in every new agent's
-   * tool list, spending context on every turn and, if it writes anywhere,
-   * offering an action the person never asked for; a plugin somebody wanted is
-   * one switch away.
-   *
-   * `demo` is the case that named this: a deliberately fake operations domain
-   * with `deploy` and `restart`, seeded to every agent since before strangers
-   * could sign up.
-   */
-  defaultForAllAgents?: boolean;
 
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
@@ -990,66 +936,7 @@ export interface Plugin {
    */
   invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json | Backgrounded>;
 
-  /**
-   * Has the backgrounded work finished, and what did it produce?
-   *
-   * Asked with the same `PluginContext` the call had, inside the agent's own
-   * object, so a credential never travels to a queue. `progress` is for the
-   * model to see while it waits; `result` is what the tool would have returned
-   * had it finished in the call, so nothing downstream needs to know which of
-   * the two paths a result came by.
-   *
-   * A plugin that never backgrounds anything does not implement this.
-   */
-  pollBackground?(handle: Json, ctx: PluginContext): Promise<
-    { done: false; progress?: Json } | { done: true; result: Json }
-  >;
 
-  /**
-   * Stop it, and let go of whatever it was holding.
-   *
-   * Called when a person or the agent cancels, and when the runtime's ceiling
-   * runs out — a job that cannot end would otherwise hold one of the agent's
-   * few concurrent slots and keep billing for as long as it exists.
-   *
-   * **Returning means the work has actually stopped, not that a stop was
-   * requested.** If the plugin cannot confirm that, it rejects, and the
-   * caller — which owns the ledger — decides what to record and whether to
-   * try again. A plugin that swallows the failure here reports a cancellation
-   * that did not happen, and the work keeps running with nothing left that can
-   * name it: that is how a job refused by the cap ran to completion, unlisted
-   * and uncancellable.
-   */
-  cancelBackground?(handle: Json, ctx: PluginContext): Promise<void>;
-  /**
-   * Let go of anything this mount is holding, once the agent has nothing left
-   * open.
-   *
-   * Some mounts reserve something real and metered — a container, a session, a
-   * lease — and without a point to hand it back, it is held until something
-   * else notices. Must be safe to call twice.
-   *
-   * **The scope is the agent, not a task**, and this is worth stating because
-   * every name around it suggests otherwise: the gateway's entry point is
-   * called `releaseTask` and takes a `taskId`, but it iterates the mounts of
-   * `(tenantId, agentId)` and filters by nothing. `ctx.caller.taskId` is
-   * context for the audit record, not a selector — a plugin that released only
-   * "this task's" resources would be writing against a distinction the caller
-   * does not make.
-   *
-   * That mattered the moment an agent could hold more than one conversation:
-   * the previous wording here said "once the task is over", which read as
-   * per-conversation and never was. What the runtime guarantees is that this
-   * fires when nothing of the agent's is open — so a mount is never released
-   * out from under a conversation that is still working.
-   *
-   * It may throw, and should, when it could not let go of something that is
-   * still being billed. What must not happen is a finished run failing over
-   * tidying up, and that is the gateway's job rather than this one's: it
-   * records the failure and carries on. Returning `false` means there was
-   * nothing to release, which is not a failure.
-   */
-  release?(ctx: PluginContext): Promise<boolean | void>;
 
   /**
    * A paragraph this mount adds to the agent's system prompt, or null.
@@ -1077,42 +964,7 @@ export interface Plugin {
    */
   promptContribution?(ctx: PluginContext): Promise<string | null>;
 
-  /**
-   * Is this mount keeping something alive right now?
-   *
-   * Declared so that nothing outside has to know how a plugin stores it. Three
-   * callers want this one fact — renaming a mount must not move it while a
-   * container is running, the console draws a panel from it, and the idle sweep
-   * decides whether to ask — and each of them used to read `boxId` and
-   * `lastUsedAt` out of the sandbox plugin's own connection state. That is the
-   * coupling that made "the sandbox" findable only under the alias `node`.
-   *
-   * A plugin that keeps nothing does not implement it, and "not implemented"
-   * is the same answer as `{ live: null }`: nothing is running, so nothing is
-   * in the way.
-   *
-   * **It must not need a credential and must not call anything remote.** It is
-   * asked when nobody is using the mount — which is exactly when a credential
-   * may have been removed — and by a sweep that runs on a timer, where a
-   * network call per mount is a cost nobody asked for. Read your own connection
-   * state and answer.
-   */
-  activity?(ctx: PluginContext): Promise<MountActivity>;
 
-  /**
-   * What this mount has finished with, newest first — the console's history.
-   *
-   * Separate from `activity` because their callers are different: the idle
-   * sweep and a rename ask on a timer and want one fact, while a person opening
-   * a page wants the list. A single call with a flag would make both of them
-   * pay for whichever they did not ask for, and would give a reader a shape
-   * that depends on an argument.
-   *
-   * A mount may keep less than it has done — a rolling window is a legitimate
-   * answer — so this is what the mount can still show, not a ledger. Anything
-   * that has to be complete has to be written where it happens.
-   */
-  usage?(ctx: PluginContext): Promise<MountUsage[]>;
 
   /**
    * A service telling this mount that something happened, without the agent

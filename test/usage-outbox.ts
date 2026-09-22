@@ -85,7 +85,7 @@ await check("a tool call through a mount is counted once, as ok or failed, with 
   await store.init();
   await store.createAgent("t", "a");
   const p: Plugin = {
-    id: "p", version: "1.0.0", defaultForAllAgents: true,
+    id: "p", version: "1.0.0", 
     tools: [
       { name: "fine", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" },
       { name: "boom", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" },

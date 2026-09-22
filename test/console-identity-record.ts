@@ -36,7 +36,7 @@ const CALL = "toolu_page";
 
 /** A plugin that fails the way `github.ts` does: the sentence for a person, the fields for a page. */
 const refusing = (identity: string, credentialRef?: string): Plugin => ({
-  id: "svc", version: "1.0.0", defaultForAllAgents: true,
+  id: "svc", version: "1.0.0", 
   tools: [{ name: "go", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke() {
     const e: Error & { identity?: string; credentialRef?: string } =
