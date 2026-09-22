@@ -78,8 +78,16 @@ export function approvalRow(a: {
  * any poll entries carry "deferred"/"pending" and are not ends.
  */
 export function answerEnded(stopReason: AssistantMessage["stopReason"]): boolean {
-  return stopReason === "stop" || stopReason === "length" || stopReason === "toolUse"
-    || stopReason === "error" || stopReason === "aborted";
+  // Unlike operationEnded, this union is pi-ai's, not ours: a switch here would
+  // still compile clean when pi adds a reason, so exhaustiveness cannot be had
+  // from the compiler and is had by reading instead — every member is named,
+  // the two that are not ends included, so a reader can see all seven were
+  // decided rather than two being absent.
+  switch (stopReason) {
+    case "stop": case "length": case "toolUse": case "error": case "aborted": return true;
+    case "pending": case "deferred": return false;
+    default: return false;
+  }
 }
 
 /**
