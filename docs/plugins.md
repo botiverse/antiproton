@@ -233,6 +233,26 @@ each one offers rather than by looking for the id `sandbox`, so a second
 plugin that can run a container is chosen without the kernel learning its
 name.
 
+**Reading a plugin's name is not always wrong; here is the test.** Naming a
+plugin is exactly what the deployment catalogue and a test fixture do, and they
+are right to: they are saying *which one to mount*. It becomes a defect when the
+code is *picking* one out of a set a third party can join. The question that
+separates them: **if someone adds a second plugin that does this same thing
+tomorrow, does this line pick the wrong one?**
+
+The console's container panel filtered mounts by `m.plugin === "sandbox"`, over
+the agent's whole mount list — which anyone's plugin can enter — so the second
+container-providing plugin would have silently vanished from the panel. It asks
+`provides` now (#501). `AgentRuntime.DEFAULT_MOUNTS` names `sandbox` and is
+right to, because a catalogue's whole job is to say which one. A bench harness
+that mounts a plugin and then meters that same alias is naming its own fixture:
+nothing can enter a set of one it built itself a few lines earlier in the same
+harness (`benchSweStart` mounts it, `benchSweStats` meters it).
+
+Note what the test is *not*: "is this in the kernel". `cf/src/` is production
+code too, and the bench line is fine there for a reason that has nothing to do
+with where it lives.
+
 **Declare `reads: "parked-result"` on a tool that can read a parked result
 back.** A result too large for the conversation is stored and replaced with a
 reference, and the runtime finds the tool that opens one by this declaration —
@@ -621,7 +641,16 @@ A new plugin comes with cases for at least:
   one.
 
 Before trusting a new case, break the code it guards and watch the suite report
-one failure; then restore it. A case that cannot go red guards nothing. Run
+one failure; then restore it. A case that cannot go red guards nothing.
+
+**And never name a fixture after the thing under test.** A case for "the panel
+picks the container mount by what it provides" is green before *and* after the
+fix if its fixture mounts the `sandbox` plugin — because only the sandbox
+declares `provides` today, so asking the name and asking the capability return
+the same answer. The case that can go red mounts a container-providing plugin
+called something else, next to a plugin called `sandbox` that declares nothing.
+The same trap makes a guard over the real registry useless whenever every value
+it distinguishes comes from a single plugin (`test/mount-config.ts`). Run
 `npm run typecheck` too: it must print `0 new` and exit 0.
 
 ## Where things are
