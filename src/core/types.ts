@@ -18,7 +18,9 @@ export type OperationStatus =
   | "succeeded"
   | "failed"
   | "cancelled"
-  | "unknown";
+  | "unknown"
+  /** Refused before it ran — by policy — so nothing landed and nothing will. An end, not a failure. */
+  | "rejected";
 
 export interface RuntimeEvent {
   eventId: string;

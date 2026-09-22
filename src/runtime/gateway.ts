@@ -629,8 +629,16 @@ export class ToolGateway {
       toolVersion: r.mount.toolVersion,
     });
 
+    const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
     const verdict = opts.approved ? "allow" : confirm ? "approval" : policyFor(r.mount.policy, r.tool, schema.sideEffects);
     if (verdict === "deny") {
+      // The operation was recorded above, before the policy was asked, so a
+      // refusal has to end it or the row stays "pending" for ever — an attempt
+      // that never started, kept on the books as one still under way. Ended as
+      // "rejected": nothing ran, nothing landed. Not counted in the usage
+      // ledger, which meters calls that ran; the trace row (src/trace/seams.ts)
+      // says the road was closed.
+      await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
       return {
         status: "rejected",
         // The one the model must act on: it says the road is closed, so the
@@ -665,7 +673,6 @@ export class ToolGateway {
     // What every completion of this call records, whichever way it ends. Built once rather than
     // spelled at each `completeOperation`: a call that carries its id when it succeeds and drops it
     // when it fails would leave the failures — the ones worth looking at — as the unlinkable ones.
-    const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
     // Counting is never the call's problem: a failure here must not turn a
     // call that succeeded into one reported as failed.
     const counted = async (outcome: "ok" | "failed") => {

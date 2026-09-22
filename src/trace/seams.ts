@@ -26,7 +26,7 @@ export function operationEnded(status: OperationStatus): boolean {
   // gateway's deny path (and any new status) has to answer, and a chain would
   // answer it silently with false.
   switch (status) {
-    case "succeeded": case "failed": case "cancelled": case "unknown": return true;
+    case "succeeded": case "failed": case "cancelled": case "unknown": case "rejected": return true;
     case "pending": case "running": return false;
   }
 }
@@ -36,6 +36,11 @@ export function operationVerdict(status: OperationStatus): TraceVerdict {
     case "succeeded": return "ok";
     case "cancelled": return "cancelled";
     case "failed": case "unknown": return "failed";
+    // Refused by policy before it ran: the road was closed, which is neither a
+    // failure of the call nor a cancellation of it. The usage ledger does not
+    // count rejections (src/usage/outbox.ts, tool.call rows are for calls that
+    // ran); the trace does, because "why did it stop" is what it exists for.
+    case "rejected": return "blocked";
     // Not an end; callers ask operationEnded first. Named so the switch stays
     // exhaustive when a status is added.
     case "pending": case "running": return "failed";
