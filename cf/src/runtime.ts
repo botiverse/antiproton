@@ -713,7 +713,7 @@ export class AgentRuntime {
     ensureInboundTable(sql);
     const now = Date.now();
     const done = (outcome: InboundOutcome, reason?: string | null, dedupeKey?: string | null) => {
-      recordInbound(sql, { hookId, alias, outcome, reason, dedupeKey, now });
+      recordInbound(sql, { tenantId, agentId, hookId, alias, outcome, reason, dedupeKey, now });
       return { outcome };
     };
     if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);

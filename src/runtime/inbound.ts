@@ -12,6 +12,7 @@
  * delivery cf/src/runtime.ts, the hook's contract src/plugins/types.ts.
  */
 import type { SqlHost } from "../store/pi-storage.ts";
+import { appendTrace, type TraceVerdict } from "../trace/outbox.ts";
 
 /** GitHub sends up to 25 MB; an issue body alone can pass 256 KB (Piper). */
 export const INBOUND_MAX_BYTES = 1_000_000;
@@ -112,14 +113,50 @@ export function seenBefore(sql: SqlHost["sql"], hookId: string, key: string, now
   return !!row;
 }
 
+/**
+ * How an inbound outcome reads as a trace verdict. The outcome itself is
+ * stored verbatim as the row's `status`; this is the normalized reading, decided
+ * here at the write and stored beside it (the rawStopReason/stopReason
+ * precedent), so a reader never has to know these seven words.
+ *
+ * An event the agent chose not to act on (`ignored`, `duplicate`) went nowhere
+ * by design, not by failure; one the door turned away (`rejected`,
+ * `rate_limited`, `too_large`) was blocked; `failed` failed.
+ */
+export function inboundVerdict(outcome: InboundOutcome): TraceVerdict {
+  switch (outcome) {
+    case "delivered": case "ignored": case "duplicate": return "ok";
+    case "rejected": case "rate_limited": case "too_large": return "blocked";
+    case "failed": return "failed";
+  }
+}
+
+/**
+ * Every event leaves two records in one place: the per-hook row the operator
+ * reads and the dedupe/rate logic reads, and a trace row that says the same
+ * thing in the shape an export carries. They are written together so neither
+ * can exist without the other; the trace row joins back by `hook_id` and
+ * `received_at`, which is the only identity an inbound event has (a hook
+ * receives many events, so the hook id alone names the door, not the knock).
+ * The tenant and agent are on the trace row only: the inbound table lives
+ * inside one agent's object and never needed them.
+ */
 export function recordInbound(sql: SqlHost["sql"], row: {
+  tenantId: string; agentId: string;
   hookId: string; alias: string; outcome: InboundOutcome; reason?: string | null; dedupeKey?: string | null; now: number;
 }) {
   sql.exec("DELETE FROM inbound_events WHERE received_at < ?", row.now - INBOUND_KEEP_MS);
+  const reason = (row.reason ?? "").slice(0, 500) || null;
   sql.exec(
     "INSERT INTO inbound_events(hook_id, received_at, alias, outcome, reason, dedupe_key) VALUES (?, ?, ?, ?, ?, ?)",
-    row.hookId, row.now, row.alias, row.outcome, (row.reason ?? "").slice(0, 500) || null, row.dedupeKey ?? null,
+    row.hookId, row.now, row.alias, row.outcome, reason, row.dedupeKey ?? null,
   );
+  appendTrace(sql, [{
+    at: row.now, tenantId: row.tenantId, agentId: row.agentId,
+    kind: "inbound", spanId: row.hookId,
+    status: row.outcome, verdict: inboundVerdict(row.outcome),
+    attrs: { alias: row.alias, ...(reason ? { reason } : {}) },
+  }]);
 }
 
 export function recentInbound(sql: SqlHost["sql"], limit = 50) {
