@@ -55,6 +55,15 @@ await check("attaching a key to a mount that uses the operator's account is refu
   must((await ref()) === OPERATOR_RUN9_REF, `the operator's reference was overwritten: ${await ref()}`);
 });
 
+await check("a reference of a kind no mount carries today is refused by the same test, not by its name", async () => {
+  // The judgement is "not ours", not "the operator's": a deployment-set
+  // reference (env:) is protected the day something writes one onto a mount.
+  const { rt, ref } = await runtime("env:SOMETHING");
+  const r = await rt.attachCredential("t", "a", "m", { token: "mine" });
+  must(!r.ok && /did not attach \(env\)/.test(r.error ?? ""), `env reference was not refused as not ours: ${r.error}`);
+  must((await ref()) === "env:SOMETHING", `the reference was overwritten: ${await ref()}`);
+});
+
 await check("attaching a key to a mount with no account points the mount at the agent's own secret", async () => {
   const { rt, ref } = await runtime(null);
   const r = await rt.attachCredential("t", "a", "m", { token: "mine" });

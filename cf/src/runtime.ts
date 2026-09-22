@@ -762,20 +762,23 @@ export class AgentRuntime {
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
-    // The operator's reference is not this agent's to overwrite. Nothing puts
-    // it back today: removeCredential clears to null, provision seeds a mount
-    // only when it is created, and reconcileSeed never writes the reference —
-    // so replacing it would lose the operator's account for this agent for
-    // good. The failure branch below already treats a non-agent `previous` as
-    // something to keep; this is the same judgement on the success branch,
-    // made before anything is written. The rule used to live only in the page
-    // that hid the control (#531). Reverting instead of refusing is the
-    // feature that follows, once the catalogue is what says what to revert to.
-    if (secretRefKind(mount.secretRef) === "operator") {
+    // A reference this agent did not attach is not this agent's to overwrite.
+    // Nothing puts it back today: removeCredential clears to null, provision
+    // seeds a mount only when it is created, and reconcileSeed never writes
+    // the reference — so replacing the operator's account would lose it for
+    // this agent for good. The failure branch below already keeps a non-agent
+    // `previous`; this is the same judgement on the success branch, made
+    // before anything is written, and by the same test — not "is it the
+    // operator's" but "is it not ours" — so a kind of reference that does not
+    // exist on a mount today is covered the day one does. The rule used to
+    // live only in the page that hid the control (#531). Reverting instead of
+    // refusing is the feature that follows, once the catalogue is what says
+    // what to revert to.
+    if (mount.secretRef && !isAgentRef(mount.secretRef)) {
       return {
         ok: false,
-        error: `the ${alias} mount uses the operator's ${mount.plugin} account, which cannot yet be given back once ` +
-          `replaced; a key of your own goes on a mount of your own`,
+        error: `the ${alias} mount uses an account this agent did not attach (${secretRefKind(mount.secretRef)}), ` +
+          `which cannot yet be given back once replaced; a key of your own goes on a mount of your own`,
       };
     }
     const plugin = this.#plugins.find((p) => p.id === mount.plugin);
