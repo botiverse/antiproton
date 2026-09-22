@@ -257,6 +257,21 @@ export async function parkResult(
  * does not own. The reader's own description is left alone: its pages are
  * held to a different line and its summary already says how to continue.
  */
+/**
+ * Which offered tool, if any, can hand a parked result back.
+ *
+ * A function rather than an expression inside the builder, because the builder
+ * needs a live object to run and a rule that can only be exercised through one
+ * is a rule nothing tests. It asks the tool what it does; the previous form
+ * rebuilt the string `artifacts` + `.read`, which made the reader that plugin
+ * under that name — rename either and the runtime silently had no reader, and
+ * every parked result became a dead end.
+ */
+export function parkedReader(tools: MountedTool[]): { name: string; address: string } | null {
+  const t = tools.find((x) => x.reads === "parked-result");
+  return t ? { name: t.name, address: t.address } : null;
+}
+
 export function withLimitNote<T extends { description: string; address: string }>(
   tools: T[],
   reader: { name: string; address: string } | null,
@@ -1232,6 +1247,7 @@ export class AgentRuntime {
           // Carried through so replay policy and exclusivity are decided by the
           // plugin that knows, not guessed at the point of use.
           sideEffects: t.sideEffects, idempotency: t.idempotency,
+          reads: t.reads,
           exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
         })),
       ), this.#deps.withholdTools ?? [])),
@@ -1271,11 +1287,12 @@ export class AgentRuntime {
     // The call context's task is the conversation, so held calls and audit
     // rows say which conversation asked. The first session's id is the same
     // string the single-conversation object always used.
-    // Which tool, if any, can read a parked result back — by plugin, and named
-    // the way the model was offered it.
-    const readTool = (tools as MountedTool[]).find((t) =>
-      offersPlugin(records, [t], "artifacts") && t.address.endsWith(".read"));
-    const reader = readTool ? { name: readTool.name, address: readTool.address } : null;
+    // Which tool, if any, can read a parked result back — asked of the tool's
+    // own declaration, and named the way the model was offered it. It used to
+    // be found by taking the plugin id `artifacts` and appending `.read`,
+    // which made the reader that plugin under that tool name: renaming either
+    // left the runtime with no reader and nothing saying so.
+    const reader = parkedReader(tools as MountedTool[]);
     const offered = withLimitNote(tools as MountedTool[], reader);
     const host = this.#host(
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered);
