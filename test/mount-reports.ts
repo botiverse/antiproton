@@ -2,7 +2,7 @@
  * The check the console's mount reports pass on the way in (cf/src/mount-reports.ts): what reads is kept exactly,
  * what does not is left out, and nothing the contract types do not declare gets through.
  */
-import { asMountReports } from "../cf/src/mount-reports.ts";
+import { asMountReports, worthReporting } from "../cf/src/mount-reports.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -73,6 +73,16 @@ check("a count of unreadable entries reaches the page, and a mount whose count i
   must(r?.box?.activity.unreadable === 3, `the count was lost: ${JSON.stringify(r)}`);
   const bad = asMountReports({ box: { activity: { live: null, unreadable: "3" }, usage: [] }, ok: { activity: { live: null }, usage: [] } });
   must(Object.keys(bad ?? {}).join(",") === "ok", `a string count was accepted: ${JSON.stringify(bad)}`);
+});
+
+check("worthReporting keeps a report that says something — and 'I could not tell' says something", () => {
+  const live = { id: "b", startedAt: 1, lastUsedAt: 2 };
+  must(worthReporting({ live, unreadable: 2 }, []) === true, "a live container is a report");
+  must(worthReporting({ live: null, unreadable: 3 }, []) === true,
+    "unreadable alone was dropped: unknown is not none");
+  must(worthReporting({ live: null }, [{ id: "b0" }]) === true, "a finished stretch is a report");
+  must(worthReporting({ live: null }, []) === false, "all three absent is not a report");
+  must(worthReporting(null, []) === false, "no activity at all is not a report");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

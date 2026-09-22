@@ -1605,9 +1605,21 @@ export function sandboxPanel(d: any): string {
   const live = rep?.activity.live ?? null;
   const quietUntil = rep?.activity.quietUntil ?? null;
   const billing = rep?.activity.billing ?? null;
+  const unreadable = rep?.activity.unreadable ?? 0;
   const sessions = rep?.usage ?? [];
 
+  // The third case is not "nothing": when part of the mount's own record would
+  // not read, whether anything is still running — and still billing — is
+  // unknown, and this panel does not guess. The notice says neither "idle" nor
+  // "running"; it says the record cannot say.
+  const unknownNotice = (n: number) =>
+    `<div class="empty">whether anything is still running cannot be determined from this mount's record</div>
+     <div class="hint" style="padding:8px 0">${n} of the <span class="chip">${esc(name)}</span> mount's own
+     record${n === 1 ? "" : "s"} would not read, so anything it was keeping alive may still be running —
+     and still billing. Do not read this mount as idle.</div>`;
+
   if (!live && !sessions.length) {
+    if (unreadable > 0) return unknownNotice(unreadable);
     return `<div class="empty">no container has ever been started for this agent</div>
       <div class="hint" style="padding:8px 0">${aliases.size
         ? `The <span class="chip">${esc(name)}</span> mount is a real machine and the
@@ -1654,7 +1666,9 @@ ${live
          ${quietUntil ? `<div>kept until</div><div>${esc(when(Number(quietUntil)))} — the agent postponed its release</div>` : ""}
        </div>
        <div class="hint" style="padding:8px 0 0">${billing ? esc(billing) + "." : "It costs the same whether or not anything is running inside it."} If the agent has finished with the machine and not released it, that is the bug to look at.</div></div>`
-    : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
+    : unreadable > 0
+      ? unknownNotice(unreadable)
+      : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
 
 <h3>sessions — ${esc(secs(total))} of container time across ${sessions.length + (live ? 1 : 0)}</h3>
 <div class="bars">

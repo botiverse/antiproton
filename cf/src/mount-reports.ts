@@ -65,3 +65,20 @@ export function asMountReports(d: unknown): MountReports | null {
   }
   return out;
 }
+
+/**
+ * Whether a mount's report says anything worth handing on. The three cases are
+ * different questions with one shared property: each is a fact a reader can act
+ * on — something is live, something finished, or part of the record would not
+ * read. None of them is "nothing": a mount that reports only `unreadable` stays
+ * in, because filtering it out would read "I could not tell" as "there is
+ * nothing", and a page that reads an unknown mount as idle is guessing.
+ * Shared by the console's dashboard and /admin/diagnose so the two surfaces
+ * cannot drift on the keep/drop question.
+ */
+export function worthReporting(
+  activity: MountActivity | null | undefined,
+  usage: readonly unknown[] | null | undefined,
+): boolean {
+  return !!activity?.live || !!activity?.unreadable || (usage?.length ?? 0) > 0;
+}
