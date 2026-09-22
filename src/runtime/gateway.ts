@@ -162,12 +162,20 @@ export class ToolGateway {
    * `inherit`: a person can put a plugin back to "follow the default", so
    * whether a call is refused cannot be answered from explicit choices alone.
    *
-   * A `ReadonlySet` rather than an `Iterable`, and third rather than last: a
-   * bare string satisfies `Iterable<string>`, so the looser type would take a
-   * typo for a catalogue of one plugin whose id is a letter. Third because a
-   * required parameter cannot follow the optional ones, and moving it there is
-   * checked — a resolver passed in its place is not a set, so the compiler
-   * refuses rather than silently reinterpreting an existing call.
+   * A `ReadonlySet` rather than an `Iterable`, and third rather than last.
+   *
+   * The set type is not tidiness: it stops a silent failure at compile time.
+   * Measured — `const x: Iterable<string> = "sandbox"` compiles, while
+   * `ReadonlySet<string>` rejects it (TS2322); and `new Set("sandbox")` holds
+   * seven members, `s,a,n,d,b,o,x`, so `has("sandbox")` is false. With the
+   * looser type, passing a plugin id where a catalogue belongs would compile,
+   * refuse every call on that plugin, and give as its reason "it is not in the
+   * catalogue" — which is exactly what a genuinely absent row says. The
+   * mistake and the truth would be indistinguishable (@Rex, 2026-09-22).
+   *
+   * Third because a required parameter cannot follow the optional ones, and
+   * moving it there is checked: a resolver passed in its place is not a set, so
+   * the compiler refuses rather than silently reinterpreting an existing call.
    */
   constructor(
     store: StorageAdapter, plugins: Plugin[], seeded: ReadonlySet<string>,
