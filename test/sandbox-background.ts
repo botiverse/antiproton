@@ -9,7 +9,7 @@
  *
  * The property these cases exist for is that **both endings agree**: a command
  * that finishes inside the grace and the same command finished later through
- * `pollBackground` must produce the same result, because the model cannot tell
+ * `background.poll` must produce the same result, because the model cannot tell
  * which way its work came back and nothing downstream should have to.
  */
 import { sandboxPlugin } from "../src/plugins/sandbox.ts";
@@ -91,7 +91,7 @@ await check("两种结局给出【同一个结果】—— 这是这组用例真
   const inline: any = await plugin.invoke("shell", { command: "echo hi" }, a.ctx);
 
   const b = run9(["succeeded"]);
-  const later: any = await plugin.pollBackground!({ boxId: "b1", execId: "e1" }, b.ctx);
+  const later: any = await plugin.background!.poll({ boxId: "b1", execId: "e1" }, b.ctx);
   if (later.done !== true) throw new Error("a terminal execution was reported unfinished");
 
   if (JSON.stringify(later.result) !== JSON.stringify(inline)) {
@@ -104,7 +104,7 @@ await check("还在跑时 poll 说没完,而且【一个字节都不写连接状
   // moment — the read-modify-write `exclusive` exists to prevent, in a place
   // `exclusive` does not reach.
   const { ctx, written } = run9(["running"]);
-  const r: any = await plugin.pollBackground!({ boxId: "b1", execId: "e1" }, ctx);
+  const r: any = await plugin.background!.poll({ boxId: "b1", execId: "e1" }, ctx);
   if (r.done !== false) throw new Error(`a running execution was reported done: ${JSON.stringify(r)}`);
   if (written() !== null) throw new Error(`poll wrote connection state: ${JSON.stringify(written())}`);
 });
@@ -139,7 +139,7 @@ function killing(kills: number[], states: string[]) {
 
 await check("取消就是去把它杀掉,而且要【确认它真的停了】", async () => {
   const { ctx, calls } = killing([200], ["killed"]);
-  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx);
+  await plugin.background!.cancel({ boxId: "b1", execId: "e1" }, ctx);
   if (!calls.some((c) => c === "POST /projects/default/workspace/execs/e1/kill")) {
     throw new Error(`cancelling did not kill the execution: ${JSON.stringify(calls)}`);
   }
@@ -156,7 +156,7 @@ await check("杀不掉就【说出来】,不能咽下去", async () => {
   // that did not happen, still billing, with nothing left that can name it.
   const { ctx } = killing([404], ["running"]);
   let threw: string | null = null;
-  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx)
+  await plugin.background!.cancel({ boxId: "b1", execId: "e1" }, ctx)
     .catch((e) => { threw = String((e as Error).message); });
   if (threw === null) throw new Error("a kill that never took was reported as a successful cancel");
   if (!String(threw).includes("e1")) throw new Error(`the failure does not say which execution: ${threw}`);
@@ -172,7 +172,7 @@ await check("两种失败【说的不是一回事】,调用方要能分开它们
   const said = async (kills: number[]) => {
     const { ctx } = killing(kills, ["running"]);
     let msg = "";
-    await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch((e) => { msg = String((e as Error).message); });
+    await plugin.background!.cancel({ boxId: "b1", execId: "e1" }, ctx).catch((e) => { msg = String((e as Error).message); });
     return msg;
   };
   const a = await said([400]);
@@ -193,7 +193,7 @@ await check("杀请求成功、但进程还在跑 —— 这也是【没停】",
   // and the bill follows the fact.
   const { ctx } = killing([200], ["running"]);
   let threw = false;
-  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch(() => { threw = true; });
+  await plugin.background!.cancel({ boxId: "b1", execId: "e1" }, ctx).catch(() => { threw = true; });
   if (!threw) throw new Error("an execution still running after an accepted kill was reported as stopped");
 });
 
@@ -201,7 +201,7 @@ await check("杀请求被拒、但它其实早就结束了 —— 不算失败",
   // A kill refused for an execution that has already ended is not a failure to
   // report: the state, not the kill's answer, is what is asked.
   const { ctx } = killing([404], ["succeeded"]);
-  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx);
+  await plugin.background!.cancel({ boxId: "b1", execId: "e1" }, ctx);
 });
 
 await check("只杀一次、只确认一次 —— 重试归运行时,不在插件里绕圈", async () => {
@@ -210,7 +210,7 @@ await check("只杀一次、只确认一次 —— 重试归运行时,不在插�
   // and would instead hide the state the runtime needs: it is what keeps a
   // refused job tracked and asks again at its ceiling.
   const { ctx, calls } = killing([409], ["running"]);
-  await plugin.cancelBackground!({ boxId: "b1", execId: "e1" }, ctx).catch(() => {});
+  await plugin.background!.cancel({ boxId: "b1", execId: "e1" }, ctx).catch(() => {});
   const kills = calls.filter((c) => c.endsWith("/kill")).length;
   const gets = calls.filter((c) => !c.endsWith("/kill")).length;
   if (kills !== 1 || gets !== 1) throw new Error(`one kill and one check, not ${kills} and ${gets}: ${JSON.stringify(calls)}`);

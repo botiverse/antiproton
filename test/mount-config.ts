@@ -8,7 +8,7 @@
 import { readFile } from "node:fs/promises";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
-import { pluginEnabled, renameSafety, type PluginChoice } from "../src/plugins/types.ts";
+import { pluginEnabled, renameSafety, type PluginChoice, isExclusive } from "../src/plugins/types.ts";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
@@ -434,23 +434,42 @@ await check("the resolver reads the declaration rather than overriding it", () =
  * Neither declaration was pinned by anything until now: deleting `exclusive`
  * from run9 broke no test, and the symptom is a bill rather than a failure.
  */
-await check("a plugin with something to release is exclusive, because holding is what exclusive is for", () => {
-  const holders = everyPlugin.filter((p) => typeof p.release === "function");
-  const unguarded = holders.filter((p) => !p.exclusive).map((p) => p.id);
-  if (unguarded.length) {
-    throw new Error(`${unguarded.join(", ")} release something per mount but allow concurrent calls`);
-  }
-  // Without this the rule above passes by having no holders at all.
+await check("declaring `holds` is what serialises a mount, and it is the only thing that does", () => {
+  // Both directions used to be assertions that two independent fields agreed.
+  // They are now one fact: `isExclusive` is DERIVED from `holds`, so the two
+  // can no longer disagree and the pair of rules collapses into their meaning.
+  // Asked of the derivation with fixtures, not of the nine plugins: over the
+  // real list "every holder is exclusive" cannot fail, because `isExclusive`
+  // reads `holds`. An assertion that cannot fail is decoration — what is worth
+  // pinning is that the derivation still reads that field at all.
+  const holdingFixture = { holds: { async activity() { return { live: null }; }, async release() {} } } as any;
+  if (!isExclusive(holdingFixture)) throw new Error("declaring holds no longer serialises the mount");
+  if (isExclusive({} as any)) throw new Error("a plugin that declares nothing is being serialised");
+  const holders = everyPlugin.filter((p) => !!p.holds);
+  // Two http fetches do not interfere; serialising everything would cost every
+  // other mount in the turn, so the reverse direction is a rule of its own.
+  const idle = everyPlugin.filter((p) => isExclusive(p) && !p.holds).map((p) => p.id);
+  if (idle.length) throw new Error(`${idle.join(", ")} serialise calls but hold nothing to release`);
+  // Without this the two rules above both pass by there being no holders at all.
   if (!holders.some((p) => p.id === "sandbox")) {
-    throw new Error("the sandbox keeps one container per mount and must declare release; the rule is vacuous without it");
+    throw new Error("the sandbox keeps one container per mount and must declare holds; the rules are vacuous without it");
   }
 });
 
-await check("a plugin that holds nothing is not needlessly serialised", () => {
-  // The reverse is not the same rule: two http fetches do not interfere, and
-  // making everything exclusive would serialise calls that have no reason to be.
-  const idle = everyPlugin.filter((p) => p.exclusive && typeof p.release !== "function").map((p) => p.id);
-  if (idle.length) throw new Error(`${idle.join(", ")} serialise calls but hold nothing to release`);
+await check("a group is all of it or none of it", () => {
+  // The reason to group them: a mount that can be started but not stopped
+  // leaves the runtime holding a job it cannot end, and one that reports
+  // activity but cannot release leaves a container nobody collects. Neither
+  // half is useful alone, so the type demands both and this says so out loud.
+  for (const p of everyPlugin) {
+    if (p.holds && typeof p.holds.release !== "function") throw new Error(`${p.id} holds but cannot release`);
+    if (p.holds && typeof p.holds.activity !== "function") throw new Error(`${p.id} holds but cannot say what`);
+    if (p.background && typeof p.background.cancel !== "function") throw new Error(`${p.id} starts work it cannot stop`);
+    if (p.background && typeof p.background.poll !== "function") throw new Error(`${p.id} starts work it cannot report on`);
+  }
+  if (!everyPlugin.some((p) => p.background)) {
+    throw new Error("no plugin declares background work; the rule above is vacuous");
+  }
 });
 
 /**
@@ -1111,12 +1130,12 @@ await check("a mount reports what it is holding, with no credential and no call 
     connection: { get: async () => state, set: async () => {} },
     sibling: async () => null,
   });
-  if (typeof run9.activity !== "function") throw new Error("the sandbox no longer reports its activity");
+  if (typeof run9.holds?.activity !== "function") throw new Error("the sandbox no longer reports its activity");
 
-  const empty = await run9.activity!(ctx(null));
+  const empty = await run9.holds!.activity(ctx(null));
   if (empty.live !== null) throw new Error(`an empty mount reported ${JSON.stringify(empty)}`);
 
-  const busy = await run9.activity!(ctx({ boxId: "b-7", createdAt: 1_000, lastUsedAt: 5_000 }));
+  const busy = await run9.holds!.activity(ctx({ boxId: "b-7", createdAt: 1_000, lastUsedAt: 5_000 }));
   if (busy.live?.id !== "b-7" || busy.live?.lastUsedAt !== 5_000) {
     throw new Error(`a running container was not reported: ${JSON.stringify(busy)}`);
   }
@@ -1379,8 +1398,8 @@ await check("a mount answers what it is running and what it has finished", async
       credential: null, publicConfig: {},
       connection: { get: async () => state, set: async () => {} }, sibling: async () => null,
     });
-    await run9.activity!(ctx());
-    await run9.usage!(ctx());
+    await run9.holds!.activity(ctx());
+    await run9.holds!.usage!(ctx());
     if (reached.length) throw new Error(`answering cost a network call: ${reached.join(", ")}`);
   } finally {
     globalThis.fetch = original;
@@ -1622,7 +1641,7 @@ await check("the default image has a dated measurement, and the description says
  */
 await check("a mount reports how many entries of its record it could not read", async () => {
   const plugin = sandboxPlugin(null as any, "local");
-  const activity = (raw: unknown) => plugin.activity!({
+  const activity = (raw: unknown) => plugin.holds!.activity({
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox", credential: null, publicConfig: {},
     connection: { get: async () => raw, set: async () => {} }, sibling: async () => null,
   } as any);
@@ -1656,7 +1675,7 @@ await check("a mount reports how many entries of its record it could not read", 
  */
 await check("a record that is present but does not read at all is reported, and an absent one is not", async () => {
   const plugin = sandboxPlugin(null as any, "local");
-  const activity = (raw: unknown) => plugin.activity!({
+  const activity = (raw: unknown) => plugin.holds!.activity({
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox", credential: null, publicConfig: {},
     connection: { get: async () => raw, set: async () => {} }, sibling: async () => null,
   } as any);

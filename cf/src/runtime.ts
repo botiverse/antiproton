@@ -98,7 +98,7 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm, pluginEnabled, renameSafety } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled, renameSafety, isExclusive } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -1232,7 +1232,7 @@ export class AgentRuntime {
           // Carried through so replay policy and exclusivity are decided by the
           // plugin that knows, not guessed at the point of use.
           sideEffects: t.sideEffects, idempotency: t.idempotency,
-          exclusive: byId.get(m.plugin)?.exclusive,
+          exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
         })),
       ), this.#deps.withholdTools ?? [])),
     };

@@ -5,6 +5,7 @@ import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
+import { holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled } from "../plugins/types.ts";
@@ -308,8 +309,9 @@ export class ToolGateway {
     // A mount that keeps nothing, a plugin that is not installed, and a plugin
     // that does not implement this all answer the same thing, and it is the
     // true one: nothing of this mount's is running.
-    if (!mount || !plugin?.activity) return { live: null };
-    return plugin.activity({
+    const holding = plugin ? holdingOf(plugin) : null;
+    if (!mount || !holding) return { live: null };
+    return holding.activity({
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
       credential: null,
@@ -343,8 +345,9 @@ export class ToolGateway {
   ): Promise<MountUsage[]> {
     const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
     const plugin = mount ? this.#plugins.get(mount.plugin) : null;
-    if (!mount || !plugin?.usage) return [];
-    return plugin.usage({
+    const holdingU = plugin ? holdingOf(plugin) : null;
+    if (!mount || !holdingU?.usage) return [];
+    return holdingU.usage({
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
       credential: null,
@@ -371,9 +374,10 @@ export class ToolGateway {
     for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
       if (opts?.alias && mount.alias !== opts.alias) continue;
       const plugin = this.#plugins.get(mount.plugin);
-      if (!plugin?.release) continue;
+      const holding = plugin ? holdingOf(plugin) : null;
+      if (!plugin || !holding) continue;
       try {
-        const release = async () => plugin.release!({
+        const release = async () => holding.release({
           caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
           alias: mount.alias,
           credential: mount.secretRef
@@ -392,7 +396,7 @@ export class ToolGateway {
         // plugin: a release reads the state, destroys the box and writes the
         // state back, and a `shell` landing between those steps leaves a live
         // container nothing refers to.
-        const did = plugin.exclusive
+        const did = isExclusive(plugin)
           ? await this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, release)
           : await release();
         // Only report what was actually holding something: a release log that
@@ -430,7 +434,8 @@ export class ToolGateway {
     // (the gap was spotted in review, 2026-09-12).
     const r0 = await this.resolve(ctx, raw);
     if ("error" in r0) return { status: "rejected", error: r0.error };
-    if (!this.#plugins.get(r0.mount.plugin)?.exclusive) return this.#invoke(ctx, raw, args, opts);
+    const p0 = this.#plugins.get(r0.mount.plugin);
+    if (!p0 || !isExclusive(p0)) return this.#invoke(ctx, raw, args, opts);
 
     return this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${r0.mount.alias}`, () => this.#invoke(ctx, raw, args, opts));
   }
@@ -719,15 +724,17 @@ export class ToolGateway {
   /** Has backgrounded work on this mount finished? Asked with the context the call had. */
   async pollBackground(ctx: CallContext, alias: string, handle: Json) {
     const { plugin, context } = await this.#backgroundTarget(ctx, alias);
-    if (!plugin.pollBackground) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot report on it`);
-    return plugin.pollBackground(handle, context);
+    const bg = backgroundOf(plugin);
+    if (!bg) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot report on it`);
+    return bg.poll(handle, context);
   }
 
   /** Stop backgrounded work on this mount. */
   async cancelBackground(ctx: CallContext, alias: string, handle: Json) {
     const { plugin, context } = await this.#backgroundTarget(ctx, alias);
-    if (!plugin.cancelBackground) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot stop it`);
-    await plugin.cancelBackground(handle, context);
+    const bg = backgroundOf(plugin);
+    if (!bg) throw new Error(`background work on ${alias}: plugin ${plugin.id} cannot stop it`);
+    await bg.cancel(handle, context);
   }
 
   /**

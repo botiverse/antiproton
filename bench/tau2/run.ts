@@ -21,6 +21,7 @@ import { SqliteStore } from "../../src/store/sqlite.ts";
 import { sqliteHost } from "../../src/store/sqlite-host.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
+import { isExclusive } from "../../src/plugins/types.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -94,7 +95,7 @@ async function runTask(task: any, verbose: boolean) {
       name: t.name, description: t.summary, parameters: t.parameters,
       address: `${m.alias}.${t.name}`,
       sideEffects: t.sideEffects, idempotency: t.idempotency,
-      exclusive: byId.get(m.plugin)?.exclusive,
+      exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
     })));
 
   const holder: { agent?: PiAgent } = {};
