@@ -10,6 +10,7 @@
 import { AgentHarness } from "@earendil-works/pi-agent-core";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
+import { pendingTrace } from "../src/trace/outbox.ts";
 import { fromResponse } from "../src/model/pi-bridge.ts";
 import type { MountedTool } from "../src/runtime/pi-tools.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -49,13 +50,13 @@ function worker(agent: PiAgent) {
   };
 }
 
-async function fixture(invoke?: (c: any) => Promise<any>) {
+async function fixture(invoke?: (c: any) => Promise<any>, owner?: { tenantId: string; agentId: string }) {
   const host = sqliteHost();
   const dispatched: string[] = [];
   const calls: any[] = [];
   const agent = await PiAgent.open({
     host, sessionId: "s", systemPrompt: "be brief", model: MODEL,
-    tools: TOOLS,
+    tools: TOOLS, ...(owner ? { usageOwner: owner } : {}),
     toolHost: { async invoke(c) { calls.push(c); return invoke ? invoke(c) : { status: "succeeded", result: { ok: true } }; } },
     async dispatch(id) { dispatched.push(id); },
   });
@@ -299,6 +300,51 @@ await check("落库的最终条目写着是哪个 job 答的它", async () => {
   }
   const placeholders = bodies.filter((b) => b?.message?.stopReason === "deferred");
   if (!placeholders.length) throw new Error("no placeholder entry was recorded for the call");
+  await f.agent.close();
+});
+
+await check("an answered call leaves a model.call row that joins back to its job and its entry", async () => {
+  // The seam: the answer commits as an entry carrying its job id, and the
+  // trace row is written in that same commit — span = the job id read from
+  // the entry body, instants from the job row. Red if the append is removed,
+  // and red if the row's ms is not the job's own arithmetic.
+  const f = await fixture(undefined, { tenantId: "t1", agentId: "a1" });
+  await f.agent.say("hello");
+  await f.agent.step();
+  const [job] = f.w.pending(f.host);
+  if (!job) throw new Error("no job was queued");
+  f.w.answer(job.id, { text: "done" });
+  for (let i = 0; i < 5 && (await f.agent.step()).open !== 0; i++) { /* settle */ }
+  const { rows, dropped } = pendingTrace(f.host.sql, 0);
+  const calls = rows.filter((r) => r.kind === "model.call");
+  if (dropped !== 0) throw new Error(`the read dropped ${dropped} rows`);
+  if (calls.length !== 1) throw new Error(`expected one model.call row, found ${calls.length}`);
+  const row = calls[0]!;
+  const stored = (f.host.sql.exec("SELECT body FROM pi_entries ORDER BY seq").toArray() as any[])
+    .map((r) => JSON.parse(String(r.body)))
+    .find((b) => b?.message?.role === "assistant" && b.message.stopReason !== "deferred");
+  if (row.spanId !== job.id || stored?.message?.jobId !== job.id) {
+    throw new Error(`span ${row.spanId}, entry says ${stored?.message?.jobId}, job is ${job.id}`);
+  }
+  const j = f.host.sql.exec("SELECT created_at, answered_at FROM pi_model_jobs WHERE id = ?", job.id).toArray()[0] as any;
+  if (row.ms !== Number(j.answered_at) - Number(j.created_at)) {
+    throw new Error(`ms ${row.ms} is not the job's own ${j.answered_at} - ${j.created_at}`);
+  }
+  if (row.status !== "stop" || row.verdict !== "ok") throw new Error(`status ${row.status} verdict ${row.verdict}`);
+  if (row.tenantId !== "t1" || row.agentId !== "a1") throw new Error("the row lost its owner");
+  if (row.attrs.model !== MODEL.id) throw new Error(`attrs ${JSON.stringify(row.attrs)}`);
+  await f.agent.close();
+});
+
+await check("a storage that does not know its owner writes no model.call row, like the usage outbox", async () => {
+  const f = await fixture();
+  await f.agent.say("hello");
+  await f.agent.step();
+  const [job] = f.w.pending(f.host);
+  f.w.answer(job!.id, { text: "done" });
+  for (let i = 0; i < 5 && (await f.agent.step()).open !== 0; i++) { /* settle */ }
+  const { rows } = pendingTrace(f.host.sql, 0);
+  if (rows.some((r) => r.kind === "model.call")) throw new Error("a row was written without an owner to charge it to");
   await f.agent.close();
 });
 

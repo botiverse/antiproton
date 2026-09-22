@@ -13,7 +13,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { pendingTrace } from "../src/trace/outbox.ts";
-import { operationEnded, operationVerdict } from "../src/trace/seams.ts";
+import { answerEnded, answerVerdict, operationEnded, operationVerdict } from "../src/trace/seams.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -57,6 +57,7 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     must(pendingTrace(sql, 0).rows.length === 0, "a 'running' update wrote a trace row");
     await store.completeOperation("t", "op_1", "succeeded", null, undefined, { callId: "toolu_9" });
     const fact = sql.exec("SELECT operation_id, agent_id, task_id, status, created_at, updated_at FROM operations").toArray()[0];
+    must(fact, "the operation record itself is missing");
     const { rows, dropped } = pendingTrace(sql, 0);
     must(dropped === 0, "a well-formed row was dropped on read");
     must(rows.length === 1, `one trace row, found ${rows.length}`);
@@ -80,6 +81,7 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     const r = await store.decideApproval("t", "op_1", "denied", "alice");
     must(r.ok, "the decision was refused");
     const fact = sql.exec("SELECT operation_id, agent_id, state, created_at, decided_at FROM approvals").toArray()[0];
+    must(fact, "the approval record itself is missing");
     const { rows } = pendingTrace(sql, 0);
     const waits = rows.filter((x) => x.kind === "approval.wait");
     must(waits.length === 1, `one approval.wait row, found ${waits.length}`);
@@ -105,6 +107,20 @@ await check("every operation status is either an end with a verdict the outbox a
     must(operationVerdict(s as any) === v, `${s} → ${operationVerdict(s as any)}, want ${v}`);
   }
   for (const s of ["pending", "running"]) must(!operationEnded(s as any), `${s} must not end the span`);
+});
+
+await check("every stop reason pi can return is either an end with a verdict, or not an end", () => {
+  // The semantic pin behind the type pin in seams.ts: the record there makes an
+  // added or removed reason a type error; this says what each existing one
+  // MEANS, so a reason that keeps its name and changes its sense is caught by
+  // a reader here rather than by nobody (docs/pi-upstream.md, "Behavioural
+  // contracts").
+  const ends: Record<string, string> = { stop: "ok", length: "ok", toolUse: "ok", error: "failed", aborted: "cancelled" };
+  for (const [s, v] of Object.entries(ends)) {
+    must(answerEnded(s as any), `${s} should end the span`);
+    must(answerVerdict(s as any) === v, `${s} → ${answerVerdict(s as any)}, want ${v}`);
+  }
+  for (const s of ["pending", "deferred"]) must(!answerEnded(s as any), `${s} is the placeholder's or a poll's, not an end`);
 });
 
 for (const r of results) {

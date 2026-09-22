@@ -44,6 +44,8 @@ import {
 } from "@earendil-works/pi-agent-core/harness/session";
 import type { Context } from "@earendil-works/pi-agent-core/harness/context";
 import { appendUsage, modelTokenRows } from "../usage/outbox.ts";
+import { appendTrace } from "../trace/outbox.ts";
+import { answerEnded, modelCallRow } from "../trace/seams.ts";
 
 type Usage = SessionStats["usage"];
 
@@ -244,6 +246,28 @@ export class PiSqliteStorage implements Storage {
             entry.id, entry.parentId, entry.seq, entry.timestamp, entry.type,
             entry.customType ?? null, JSON.stringify(entry));
           if (entry.type === "message") messageCount += 1;
+          // The trace row for the model call this answer closes, in the same
+          // transaction as the entry it joins back to. The job id is read from
+          // the entry body being written — the one source — never rebuilt; the
+          // span's instants are the job row's own (src/trace/seams.ts). Like the
+          // usage outbox, written only when this storage knows its owner.
+          if (this.#usageOwner && entry.type === "message") {
+            const m: any = (entry as any).message;
+            if (m?.role === "assistant" && typeof m.jobId === "string" && answerEnded(m.stopReason)) {
+              // The jobs table is the agent's, not this storage's: absent in a
+              // storage-only test, present wherever an answer can arrive.
+              const hasJobs = this.#one("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'");
+              const job = hasJobs
+                ? this.#one("SELECT created_at, answered_at FROM pi_model_jobs WHERE id = ?", m.jobId) as any
+                : null;
+              appendTrace(this.#host.sql, [modelCallRow({
+                ...this.#usageOwner, jobId: m.jobId, stopReason: m.stopReason,
+                model: typeof m.model === "string" ? m.model : "unknown", at: this.#now(),
+                createdAt: job ? Number(job.created_at) : null,
+                answeredAt: job && job.answered_at !== null ? Number(job.answered_at) : null,
+              })]);
+            }
+          }
           break;
         }
         case "usage": {
