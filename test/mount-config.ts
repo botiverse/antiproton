@@ -208,6 +208,24 @@ await check("every plugin the runtime registers is in everyPlugin", () => {
   if (missing.length) {
     throw new Error(`registered but not in everyPlugin, so no check below covers them: ${missing.join(", ")}`);
   }
+  // And the other direction, which this case did not have (@Rex, 2026-09-22):
+  // an entry in the list that the runtime does not register makes every check
+  // below assert something about a plugin production never loads. The one
+  // direction reads like completeness and is only half of it.
+  //
+  // Not a plain subset either way: the appworld plugins are in the list on
+  // purpose and are deliberately NOT registered in the Worker — they are the
+  // benchmark's. So the reverse holds against the union, and the exception is
+  // named rather than the assertion being weakened to let anything through.
+  const benchOnly = new Set(appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }).map((p) => p.id));
+  const stray = [...listed].filter((id) => !registered.includes(id) && !benchOnly.has(id));
+  if (stray.length) {
+    throw new Error(
+      `in everyPlugin but not registered by the runtime, so the checks below describe something production does `
+      + `not load: ${stray.join(", ")}. If it is bench-only, say so where benchOnly is built.`,
+    );
+  }
+  if (benchOnly.size === 0) throw new Error("the exception list is empty, so the reverse rule is unconstrained");
 });
 
 await check("no plugin takes a credential as a setting", () => {
