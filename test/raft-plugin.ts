@@ -233,7 +233,7 @@ await check("the gateway persists every post-dispatch receive failure as unknown
   });
   const gateway = new ToolGateway(
     store,
-    [{ ...raftPlugin, defaultForAllAgents: true }], new Set(([{ ...raftPlugin, defaultForAllAgents: true }]).map((p: any) => p.id)),
+    [raftPlugin], new Set([raftPlugin.id]),
     { async resolve() { return "sk_agent_test_1234567890"; } },
   );
   const invoke = () => gateway.invoke(

@@ -1057,6 +1057,55 @@ await check("an agent's own answer beats the plugin default, in both directions"
  * an exception while it was leaving the seed list (#213); it has left, and with
  * one source there is nothing for it to disagree with.
  */
+/**
+ * The shape the refactor removed cannot come back, at either level.
+ *
+ * Two guards, because the two failures are different. A member returning to the
+ * INTERFACE is a design regression — someone adds `exclusive?: boolean` back
+ * and the contract has two ways to say one thing again; that is caught at
+ * compile time, because a type cannot be caught any other way. A member
+ * returning to an OBJECT is a plugin written against the old shape: it
+ * typechecks nowhere, but a fixture or a plugin cast through `as any` would sail
+ * past, and then it declares something nothing reads — the quietest kind of
+ * dead code, because it looks like a working declaration.
+ *
+ * `OLD_MEMBERS` is the list, so both guards and the message read from one place.
+ */
+const OLD_MEMBERS = [
+  "exclusive", "defaultForAllAgents",
+  "release", "activity", "usage", "pollBackground", "cancelBackground",
+] as const;
+
+/** Compile-time half: `true` per member while it is absent from `Plugin`, and
+ *  `never` the moment one is declared again, which makes the array unassignable. */
+type Gone<K extends string> = K extends keyof Plugin ? never : true;
+const _theOldShapeIsGone: [
+  Gone<"exclusive">, Gone<"defaultForAllAgents">, Gone<"release">,
+  Gone<"activity">, Gone<"usage">, Gone<"pollBackground">, Gone<"cancelBackground">,
+] = [true, true, true, true, true, true, true];
+void _theOldShapeIsGone;
+
+await check("no plugin carries the members the capability groups replaced", () => {
+  const offenders: string[] = [];
+  for (const plugin of everyPlugin) {
+    for (const key of OLD_MEMBERS) {
+      if (key in (plugin as unknown as Record<string, unknown>)) offenders.push(`${plugin.id}.${key}`);
+    }
+  }
+  if (offenders.length) {
+    throw new Error(
+      `written against the shape this refactor removed, so nothing reads it: ${offenders.join(", ")}. `
+      + `Holding something goes in \`holds\`, background work in \`background\`, and who gets a plugin in `
+      + `AgentRuntime.DEFAULT_MOUNTS.`,
+    );
+  }
+  // The groups have to be reachable, or this passes on a registry of plugins
+  // that declare nothing at all and the rule above says nothing.
+  if (!everyPlugin.some((p) => p.holds) || !everyPlugin.some((p) => p.background)) {
+    throw new Error("no plugin declares holds or background, so the rule above is vacuous");
+  }
+});
+
 await check("every plugin the catalogue seeds is installed", async () => {
   const installed = new Set(everyPlugin.map((p) => p.id));
   const missing = [...SEEDED_PLUGINS].filter((id) => !installed.has(id));
@@ -1883,13 +1932,13 @@ await check("the gateway's sibling names the plugin of the mount it found", asyn
   const { SqliteStore } = await import("../src/store/sqlite.ts");
   const { ToolGateway } = await import("../src/runtime/gateway.ts");
   const probe: any = {
-    id: "probe", version: "1.0.0", defaultForAllAgents: true,
+    id: "probe", version: "1.0.0", 
     tools: [{ name: "peek", summary: "x", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "safe" }],
     invoke: async (_t: string, _a: unknown, ctx: any) => ({
       found: await ctx.sibling("gh"), held: await ctx.sibling("held"), missing: await ctx.sibling("nope"),
     }),
   };
-  const github: any = { id: "github", version: "1.0.0", defaultForAllAgents: true, tools: [], invoke: async () => null };
+  const github: any = { id: "github", version: "1.0.0",  tools: [], invoke: async () => null };
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");

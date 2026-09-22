@@ -39,7 +39,7 @@ function failingPlugin() {
   const plugin: Plugin = {
     // On for this agent without a per-agent switch, so the call reaches the
     // plugin rather than being refused as a mount that is off.
-    id: "svc", version: "1.0.0", defaultForAllAgents: true,
+    id: "svc", version: "1.0.0", 
     tools: [{ name: "read", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
     async invoke(_tool, _args, ctx) {
       seen.ctx = ctx;

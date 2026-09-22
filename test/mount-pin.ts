@@ -48,7 +48,7 @@ function refusal(r: ToolResult): ToolError {
 /** A plugin that records whether it was reached, so a refusal can be shown to refuse. */
 function spy(version: string): Plugin & { calls: number } {
   const p = {
-    id: "boxes", version, defaultForAllAgents: true,
+    id: "boxes", version, 
     tools: [{ name: "ping", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
     calls: 0,
     async invoke() { p.calls += 1; return { ok: true }; },

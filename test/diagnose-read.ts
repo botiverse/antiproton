@@ -36,13 +36,19 @@ const message = (id: string, parentId: string | null, text: string) =>
 /** A plugin whose report reads its mount's state, and one whose report tries to change it. */
 const reader = {
   id: "reader",
-  async activity(ctx: any) { const s = await ctx.connection.get(); return { live: s ? { id: String(s.boxId), startedAt: 1, lastUsedAt: 2 } : null }; },
-  async usage() { return []; },
+  holds: {
+    async activity(ctx: any) { const s = await ctx.connection.get(); return { live: s ? { id: String(s.boxId), startedAt: 1, lastUsedAt: 2 } : null }; },
+    async usage() { return []; },
+    async release() { return false; },
+  },
 } as any;
 let writerTried = false;
 const writer = {
   id: "writer",
-  async activity(ctx: any) { writerTried = true; await ctx.connection.set({ touched: true }); return { live: { id: "w", startedAt: 1, lastUsedAt: 1 } }; },
+  holds: {
+    async activity(ctx: any) { writerTried = true; await ctx.connection.set({ touched: true }); return { live: { id: "w", startedAt: 1, lastUsedAt: 1 } }; },
+    async release() { return false; },
+  },
 } as any;
 
 async function agentObject() {

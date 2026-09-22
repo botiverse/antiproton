@@ -26,10 +26,13 @@ const invoked: PluginContext[] = [];
 const askedActivity: PluginContext[] = [];
 
 const box: Plugin = {
-  id: "box", version: "1.0.0", defaultForAllAgents: true,
+  id: "box", version: "1.0.0", 
   tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke(_t, _a, c) { invoked.push(c as PluginContext); return { ok: true }; },
-  async activity(c) { askedActivity.push(c as PluginContext); return { live: null }; },
+  holds: {
+    async activity(c: PluginContext) { askedActivity.push(c); return { live: null }; },
+    async release() { return false; },
+  },
 };
 
 /** `refs` maps a mount alias to its secretRef; `held` is what the resolver can answer. */
@@ -111,7 +114,7 @@ await check("a failed call carries the identity as fields, not only inside the s
       toolVersion: "1.0.0", publicConfig: {}, secretRef: "agent:work", policy: null,
     });
     const sulky: Plugin = {
-      id: "sulky", version: "1.0.0", defaultForAllAgents: true,
+      id: "sulky", version: "1.0.0", 
       tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
       async invoke(_t, _a, c) { throw markIdentity(new Error("github 403: rate limited"), c as PluginContext); },
     };
@@ -129,7 +132,7 @@ await check("a plugin that said nothing about identity still produces the error 
   return (async () => {
     const gw = await fixture({ work: null });
     const silent: Plugin = {
-      id: "box", version: "1.0.0", defaultForAllAgents: true,
+      id: "box", version: "1.0.0", 
       tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
       async invoke() { throw new Error("plain failure"); },
     };

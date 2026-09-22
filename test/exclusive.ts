@@ -34,8 +34,8 @@ function racer(id: string, exclusive: boolean) {
   const plugin: Plugin = {
     // `defaultForAllAgents` because the gateway refuses a mount whose plugin is
     // not enabled for this agent, and these fixtures are about a different rule.
-    id, version: "1.0.0", tools: [tool], defaultForAllAgents: true,
-    ...(exclusive ? { exclusive: true } : {}),
+    id, version: "1.0.0", tools: [tool], 
+
     async invoke(_t: string, args: any) {
       inside += 1;
       if (inside > 1) overlapped = true;
@@ -46,19 +46,26 @@ function racer(id: string, exclusive: boolean) {
       inside -= 1;
       return { ok: true };
     },
-    // Read, pause, write — the same shape as the real release: it reads the
-    // connection state, destroys the box, and writes the emptied state back.
-    async release(c: any) {
-      inside += 1;
-      if (inside > 1) overlapped = true;
-      await c.connection.get();
-      await new Promise((r) => setTimeout(r, 5));
-      await c.connection.set({});
-      seen.push("release");
-      inside -= 1;
-      return true;
-    },
   } as any;
+  // Read, pause, write — the same shape as the real release: it reads the
+  // connection state, destroys the box, and writes the emptied state back.
+  // Attached to the group rather than the top level, and only when this racer
+  // is the serialised one: `holds` is now what says both things at once.
+  if (exclusive) {
+    plugin.holds = {
+      async activity() { return { live: null }; },
+      async release(c: any) {
+        inside += 1;
+        if (inside > 1) overlapped = true;
+        await c.connection.get();
+        await new Promise((r) => setTimeout(r, 5));
+        await c.connection.set({});
+        seen.push("release");
+        inside -= 1;
+        return true;
+      },
+    };
+  }
   return { plugin, seen, overlapped: () => overlapped };
 }
 

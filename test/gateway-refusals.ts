@@ -18,7 +18,7 @@ async function check(name: string, fn: () => Promise<void>) {
 
 const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
 const box: Plugin = {
-  id: "box", version: "1.0.0", defaultForAllAgents: true,
+  id: "box", version: "1.0.0", 
   tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke() { return { ok: true }; },
 };

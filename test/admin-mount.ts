@@ -17,7 +17,7 @@ async function check(name: string, fn: () => Promise<void>) {
 function must(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 
 const NEEDS_ACCOUNT: Plugin = {
-  id: "needs-account", version: "1.0.0", defaultForAllAgents: true,
+  id: "needs-account", version: "1.0.0", 
   config: [
     { name: "origin", type: "string", required: true, summary: "Where it calls." },
     { name: "scope", type: "string", requiredWithCredential: true, summary: "What the account may do." },

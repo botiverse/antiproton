@@ -266,7 +266,6 @@ export function retailPlugin(db: RetailDB, log: Array<{ name: string; args: any 
     // Everyone gets it, because a bench task is the reason this plugin exists:
     // the object arm mounts it in `benchStart`, and the alternative to saying so
     // is a run whose agent never sees the domain it is being asked about.
-    defaultForAllAgents: true,
     tools: SCHEMAS.map(({ write, ...s }) => s),
     async invoke(tool, args) {
       log.push({ name: tool, args });

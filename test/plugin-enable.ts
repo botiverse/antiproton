@@ -39,7 +39,7 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 
 const OFFERED: Plugin = {
-  id: "offered", version: "1.0.0", defaultForAllAgents: true,
+  id: "offered", version: "1.0.0", 
   tools: [{ name: "ping", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke() { return { ok: true }; },
 };

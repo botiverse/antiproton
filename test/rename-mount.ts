@@ -143,11 +143,14 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
   const holding: Plugin = {
     id: "run9", version: "1.0.0", tools: [],
     async invoke() { return {}; },
-    async activity(ctx) {
-      const st: any = await ctx.connection.get();
-      // Deliberately not the plugin's own field name: whatever it keeps, the
-      // shape it answers in is the contract's.
-      return { live: st?.boxId ? { id: st.boxId, startedAt: st.createdAt ?? 0, lastUsedAt: st.createdAt ?? 0 } : null };
+    holds: {
+      async activity(ctx) {
+        const st: any = await ctx.connection.get();
+        // Deliberately not the plugin's own field name: whatever it keeps, the
+        // shape it answers in is the contract's.
+        return { live: st?.boxId ? { id: st.boxId, startedAt: st.createdAt ?? 0, lastUsedAt: st.createdAt ?? 0 } : null };
+      },
+      async release() { return false; },
     },
   };
   const gw = new ToolGateway(store, [holding], new Set(([holding]).map((p: any) => p.id)), { async resolve() { return null; } });

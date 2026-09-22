@@ -31,7 +31,7 @@ function must(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 const caller = { tenantId: "t", agentId: "a", taskId: "k" };
 
 const plugin = (id: string, fail: boolean): Plugin => ({
-  id, version: "1.0.0", defaultForAllAgents: true,
+  id, version: "1.0.0", 
   tools: [{ name: "go", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke() { if (fail) throw new Error("the service refused"); return { ok: true }; },
 });

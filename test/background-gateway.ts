@@ -5,6 +5,8 @@
  * Through the real gateway and store.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
+import type { PluginContext } from "../src/plugins/types.ts";
+import type { Json } from "../src/core/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { backgrounded, type Plugin } from "../src/plugins/types.ts";
 
@@ -19,17 +21,19 @@ const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
 const seen: Array<{ what: string; alias: string; credential: string | null; handle: unknown }> = [];
 const tool = (name: string) => ({ name, summary: "", parameters: {}, sideEffects: "read" as const, idempotency: "native" as const });
 const box: Plugin = {
-  id: "box", version: "1.0.0", defaultForAllAgents: true,
+  id: "box", version: "1.0.0", 
   tools: [tool("long"), tool("shapey")],
   async invoke(t) {
     if (t === "long") return backgrounded({ boxId: "b1", execId: "e1" }, "npm test is still running");
     // Real data that happens to look like the signal.
     return { handle: { execId: "not-a-job" }, note: "just data" };
   },
-  async pollBackground(handle, c) { seen.push({ what: "poll", alias: c.alias, credential: c.credential, handle }); return { done: true, result: { exitCode: 0 } }; },
-  async cancelBackground(handle, c) { seen.push({ what: "cancel", alias: c.alias, credential: c.credential, handle }); },
+  background: {
+    async poll(handle: Json, c: PluginContext) { seen.push({ what: "poll", alias: c.alias, credential: c.credential, handle }); return { done: true as const, result: { exitCode: 0 } }; },
+    async cancel(handle: Json, c: PluginContext) { seen.push({ what: "cancel", alias: c.alias, credential: c.credential, handle }); },
+  },
 };
-const plain: Plugin = { id: "plain", version: "1.0.0", defaultForAllAgents: true, tools: [tool("x")], async invoke() { return 1; } };
+const plain: Plugin = { id: "plain", version: "1.0.0",  tools: [tool("x")], async invoke() { return 1; } };
 
 async function fixture() {
   const store = new SqliteStore(":memory:");

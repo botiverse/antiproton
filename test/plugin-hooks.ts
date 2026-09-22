@@ -20,7 +20,7 @@ function must(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 // The plugin under test hands its `inbound` out through a tool, so the test can drive it.
 const handed: Record<string, InboundHooks | undefined> = {};
 const pushy: Plugin = {
-  id: "pushy", version: "1.0.0", defaultForAllAgents: true,
+  id: "pushy", version: "1.0.0", 
   tools: [{ name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke(_t, _a, ctx) { handed[ctx.alias] = ctx.inbound; return { has: !!ctx.inbound }; },
   async receive(event, secret) {

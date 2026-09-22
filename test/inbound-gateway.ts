@@ -16,14 +16,14 @@ function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new
 
 const asked: Array<{ alias: string; secret: string; credential: string | null; bytes: number }> = [];
 const hook: Plugin = {
-  id: "hook", version: "1.0.0", defaultForAllAgents: true, tools: [],
+  id: "hook", version: "1.0.0",  tools: [],
   async invoke() { return null; },
   async receive(event, secret, ctx) {
     asked.push({ alias: ctx.alias, secret, credential: ctx.credential, bytes: event.body.length });
     return { deliver: true, text: "something happened", dedupeKey: "d1" };
   },
 };
-const deaf: Plugin = { id: "deaf", version: "1.0.0", defaultForAllAgents: true, tools: [], async invoke() { return null; } };
+const deaf: Plugin = { id: "deaf", version: "1.0.0",  tools: [], async invoke() { return null; } };
 const event = { headers: { "x-sig": "s" }, body: new Uint8Array([1, 2, 3]) };
 
 async function fixture(pinned = "1.0.0") {
