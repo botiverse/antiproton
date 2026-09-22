@@ -173,6 +173,33 @@ check("the identity is keyed on the call, not on the wording or the order", () =
   must(!/operation\.completed/.test(t), "and the completion itself is still not a step of its own");
 });
 
+/** The tool step of the transcript view, by the label the view gives it. */
+const toolStep = (html: string, tool: string) =>
+  html.split('<div class="step').map((s) => `<div class="step${s}`)
+    .find((s) => s.includes(`tool ${tool}`)) ?? "";
+
+check("the transcript view shows what a tool returned, and never the word undefined", () => {
+  // `tool.result` carries the return under `result`. This reader asked for
+  // `content` — the name the payload had before the loop became pi's — so every
+  // tool step drew `<pre>undefined</pre>`. Nothing failed: the element was
+  // there, with a word in it.
+  const step = toolStep(trajectory(events, {}), "gh.issues.create");
+  must(step, "the tool call has no step in the transcript view at all");
+  must(/<pre>[\s\S]*?&quot;number&quot;: 42[\s\S]*?<\/pre>/.test(step),
+    `the result body does not carry what the tool returned: ${step.slice(0, 200)}`);
+  must(!/undefined/.test(step), `the step prints the word undefined: ${step.slice(0, 200)}`);
+});
+
+check("a call waiting on approval is drawn as held in the transcript view too", () => {
+  // The held check reads the same body, so the missing field cost the badge as
+  // well as the text — and this is the one a person is watching for.
+  const held = ev(12, "tool.result", 26000, { tool: "gh.issues.close", callId: "call_h",
+    isError: false, status: "succeeded", result: { status: "awaiting_approval" }, at: T + 26000 });
+  const step = toolStep(trajectory([...events, held], {}), "gh.issues.close");
+  must(/class="step held"/.test(step), `a held call is not drawn as held: ${step.slice(0, 160)}`);
+  must(/held for approval/.test(step), "the badge must say why it is waiting");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 console.log(`${results.length - failed.length}/${results.length} passed`);
