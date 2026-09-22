@@ -869,6 +869,66 @@ export function backgrounded(handle: Json, note?: string): Backgrounded {
  * Every sentence below is carried over unchanged from the methods this
  * replaces; the wording is the contract, not decoration.
  */
+/**
+ * What a release just ended, in the words of the plugin that ended it.
+ *
+ * The framework records finished spans (`trace_outbox`), and it cannot derive
+ * this one for itself: a container's start and end are known only inside the
+ * release, and re-reading the mount afterwards can land on a DIFFERENT
+ * container. Releases are not serialised against calls — `releaseTask` does not
+ * take the per-mount lock `invoke` takes — so a command that finds no container
+ * may create and record one in between, and a span built from a later read
+ * would report that box's id against this box's lifetime — the same
+ * interleaving `stopBox` already guards its own session against.
+ *
+ * **So every field here comes from the one read the release itself made.** A
+ * plugin that fills these in from a fresh read of its own state has reproduced
+ * the defect this shape exists to avoid.
+ *
+ * `startedAt`/`endedAt` rather than a duration, because the recorder asserts
+ * that the duration it stores equals `endedAt - startedAt` from this same fact
+ * — a span whose ms came from somewhere else joins correctly and is still
+ * wrong, which no "does this row join?" check can see.
+ */
+export interface Released {
+  /** The thing that ended, by the id the plugin's own records name it with. */
+  id: string;
+  /** Both instants from the release's own read; never re-read to fill these. */
+  startedAt: number;
+  endedAt: number;
+  /** Whether the thing is actually gone. `error` carries why it is not. */
+  status: "freed" | "error";
+  error?: string;
+}
+
+/**
+ * The key a tool result reports a `Released` under.
+ *
+ * Two of the sandbox's ending paths are tool calls (`release`, `start_from`)
+ * and do not pass through `holds.release`, so the fact crosses the boundary in
+ * two shapes: a return value, and a declared key on a result.
+ * Declared as a constant because the kernel finds it by this name — the same
+ * arrangement as `HELD_KEY`, and for the same reason: a name rebuilt at the
+ * reading end is right only until someone renames one of the two.
+ */
+export const LEASE_KEY = "lease";
+
+/**
+ * Attach a `Released` to a failure, so a release that did NOT release is still
+ * a recordable fact.
+ *
+ * `Holding.release` must throw rather than return when something billed
+ * survives, which would otherwise make the most important case — the box still
+ * alive and still charging — the one case that leaves no span. The thrown error
+ * carries it instead, the way `markIdentity` carries the identity of a failed
+ * call.
+ */
+export function markReleased<E extends Error>(error: E, fact: Released): E & { released: Released } {
+  const marked = error as E & { released: Released };
+  marked.released = fact;
+  return marked;
+}
+
 export interface Holding {
   /**
    * Which of this plugin's tools lets go of the thing, and which postpones.
@@ -911,7 +971,7 @@ export interface Holding {
    * again, and it must throw rather than return if something billed could not
    * be released — a silent failure here is a resource nobody will collect.
    */
-  release(ctx: PluginContext): Promise<boolean | void>;
+  release(ctx: PluginContext): Promise<Released | boolean | void>;
 }
 
 /**
