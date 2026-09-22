@@ -1665,3 +1665,42 @@ export const SEEDED_PLUGINS: ReadonlySet<string> = new Set(
   AgentRuntime.DEFAULT_MOUNTS.map((m) => m.plugin),
 );
 
+/**
+ * The console's plugin rows, as a function of what is installed, what this
+ * agent has answered, and the operator's catalogue.
+ *
+ * Extracted from `uiPlugins` because that method needs a live object and a
+ * transcript to run, and nothing could reach this part of it: `uiPlugins`
+ * appears in one file and no test mentions it, so the whole producer of the
+ * catalogue payload was untested while two suites fed hand-written `installed`
+ * arrays to the page. The rule from `SEEDED_PLUGINS` to the words "default for
+ * all agents" had no test between its ends (@cody and @Rex traced it,
+ * 2026-09-22).
+ *
+ * Pure on purpose: the same inputs, no I/O, so one case can compute rows from
+ * the real registry and the real catalogue and hand them to the page.
+ */
+export function installedRows(
+  installed: readonly Plugin[],
+  choices: Record<string, PluginChoice>,
+  seeded: ReadonlySet<string>,
+) {
+  return installed.map((p) => ({
+    id: p.id,
+    version: p.version,
+    // The operator's catalogue, not a flag on the plugin: one source.
+    defaultForAllAgents: seeded.has(p.id),
+    choice: choices[p.id] ?? "inherit",
+    // Resolved here rather than in the page, so the rule stays in the one
+    // function that states it. A page that recomputes it is a second copy that
+    // can disagree with what the gateway does.
+    enabled: pluginEnabled(seeded.has(p.id), choices[p.id]),
+    credential: p.credential ?? null,
+    config: p.config ?? [],
+    tools: p.tools.map((t) => ({
+      name: t.name, summary: t.summary,
+      sideEffects: t.sideEffects, idempotency: t.idempotency,
+    })),
+  }));
+}
+
