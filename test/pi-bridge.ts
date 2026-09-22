@@ -104,6 +104,35 @@ check("推理痕迹被记下来,但不会当成回答文本", () => {
   eq(messages[0], { role: "assistant", content: "the answer" }, "reasoning is not sent back");
 });
 
+check("答案带上产生它的 job id,不带时没有这个键", () => {
+  const base = {
+    text: "answer", finishReason: "stop", truncated: false,
+    usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 },
+  };
+  const model = { api: "offloaded", provider: "p", id: "m" };
+  const tagged = fromResponse(base as any, model, "mj_1");
+  if (tagged.jobId !== "mj_1") throw new Error(`jobId not carried: ${JSON.stringify(tagged)}`);
+  // A given-up call is still an answer, and still names its job.
+  const cut = fromResponse({ ...base, truncated: true, text: "", toolCalls: [] } as any, model, "mj_2");
+  if (cut.jobId !== "mj_2") throw new Error("the given-up answer lost its job id");
+  const plain = fromResponse(base as any, model);
+  if ("jobId" in plain) throw new Error("an untagged answer grew a jobId key");
+});
+
+check("job id 留在条目里,不会随历史发给 provider", () => {
+  // The spine link rides on the stored message; the request builder must not
+  // copy it, or every later turn would ship an internal id to the model.
+  const model = { api: "offloaded", provider: "p", id: "m" };
+  const m = fromResponse({
+    text: "earlier", finishReason: "tool_calls", truncated: false,
+    toolCalls: [{ id: "c1", name: "read", arguments: { url: "u" } }],
+    usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 },
+  } as any, model, "mj_9");
+  const req = toRequest({ messages: [{ role: "user", content: "hi", timestamp: 1 } as any, m as any] });
+  const wire = JSON.stringify(req);
+  if (wire.includes("jobId") || wire.includes("mj_9")) throw new Error(`job id leaked into the request: ${wire}`);
+});
+
 console.log(`\n  pi request bridge\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

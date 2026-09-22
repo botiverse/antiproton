@@ -247,7 +247,7 @@ async function runQueuedModelCall(m: QueuedModelCall, env: Env) {
     provider: String(job.model?.provider ?? "openai-compatible"),
     id: String(job.model?.id ?? env.HARNESS_MODEL),
   };
-  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, fromResponse(res, identity), Date.now() - t0);
+  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, fromResponse(res, identity, m.jobId), Date.now() - t0);
 }
 
 /** Out of retries. The agent has to hear about it, or it waits for ever. */
@@ -255,9 +255,14 @@ async function failLoudly(m: QueuedModelCall, env: Env) {
   const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
   const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId) as any;
   if (!job) return;
-  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, errorMessage(
-    "the model call failed repeatedly and was given up on",
-    { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }), 0);
+  // A given-up call is still this job's answer, so the entry it becomes names
+  // the job like any other (see `jobId` on fromResponse).
+  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, {
+    ...errorMessage(
+      "the model call failed repeatedly and was given up on",
+      { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }),
+    jobId: m.jobId,
+  }, 0);
 }
 
 export { agentObjectName };
