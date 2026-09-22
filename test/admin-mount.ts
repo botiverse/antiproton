@@ -36,6 +36,14 @@ async function runtime() {
   } as any);
   (rt as any).store = store;
   (rt as any).ready = async () => {};
+  // `needs-account` is installed in this deployment but is not in its
+  // catalogue, and the catalogue is now what "on by default" means. So mounting
+  // it goes the way it goes for a person: switch the plugin on for this agent
+  // first, which is exactly what `addMount` refuses and tells them to do.
+  // Before this step a fixture earned it by declaring `defaultForAllAgents` on
+  // itself — the product decision a plugin should never have been making.
+  await store.createAgent("t", "a");
+  await store.setPluginChoice("t", "a", "needs-account", "enable");
   return { store, rt };
 }
 
