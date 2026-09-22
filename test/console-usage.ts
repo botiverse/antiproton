@@ -212,6 +212,22 @@ check("a window that reaches further back than the record says so, once, above t
     "no firstHours at all: the page claims nothing about where the record begins");
 });
 
+check("a window whose record partly refused to read says the figures may be incomplete", () => {
+  const rows = [row("a1", "sandbox.container", "sandbox", "seconds", 300, 2)];
+  const damaged = usagePanel(data(rows, { partial: true }));
+  must(/<div class="u-note">part of the record would not read during this window — the figures below may be incomplete<\/div>/.test(damaged),
+    "the lower-bound line did not render");
+  must(damaged.indexOf("would not read during this window") < damaged.indexOf("u-grid"),
+    "the line sits above the tiles, with the other window facts");
+  const withFirst = usagePanel(data(rows, { partial: true,
+    firstHours: { "sandbox.container": to - 3 * H } }));
+  must(count(withFirst, /u-note/g) === 2, `the partial line and the firstHours line are two facts: ${count(withFirst, /u-note/g)}`);
+  must(!/would not read during this window/.test(usagePanel(data(rows))),
+    "a clean window carries the caveat anyway");
+  must(!/would not read during this window/.test(usagePanel(data(rows, { firstHours: { "sandbox.container": to - 3 * H } }))),
+    "the caveat is not dragged in by an unrelated firstHours fact");
+});
+
 check("the object's billed time is counted, and is a duration", () => {
   const res = RESOURCES.find((r) => r.id === "object.active")!;
   must(res.counted, "object.active is recorded now");

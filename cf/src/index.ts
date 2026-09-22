@@ -3232,13 +3232,13 @@ export default {
           if (gate instanceof Response) return gate;
           const q = parseUsageQuery(url.searchParams, Date.now());
           if (typeof q === "string") return Response.json({ error: q }, { status: 400 });
-          const { rows, priced, firstHours } = await readUsage(env.CONTROL_DB, gate.tenantId, q);
+          const { rows, priced, firstHours, partial } = await readUsage(env.CONTROL_DB, gate.tenantId, q);
           const labels: Record<string, string> = {};
           if (q.by === "agent" && rows.length) {
             const homeStub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(gate.tenantId, gate.agentId)));
             for (const a of await homeStub.uiListAgents(gate.tenantId, gate.agentId)) labels[a.agentId] = a.name;
           }
-          const data = { ...q, rows, labels, priced, firstHours };
+          const data = { ...q, rows, labels, priced, firstHours, partial };
           const headers = { "cache-control": "no-store" };
           return request.headers.get("hx-request")
             ? new Response(usagePanel(data), { headers: { ...headers, "content-type": "text/html; charset=utf-8" } })
