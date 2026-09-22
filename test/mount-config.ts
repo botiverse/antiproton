@@ -1053,8 +1053,8 @@ await check("an agent's own answer beats the plugin default, in both directions"
 /**
  * The shape the refactor removed cannot come back, at either level.
  *
- * Two guards, because the two failures are different. A member returning to the
- * INTERFACE is a design regression — someone adds `exclusive?: boolean` back
+ * Three guards, because the three failures are different. A member returning to
+ * the INTERFACE is a design regression — someone adds `exclusive?: boolean` back
  * and the contract has two ways to say one thing again; that is caught at
  * compile time, because a type cannot be caught any other way. A member
  * returning to an OBJECT is a plugin written against the old shape: it
@@ -1062,7 +1062,19 @@ await check("an agent's own answer beats the plugin default, in both directions"
  * past, and then it declares something nothing reads — the quietest kind of
  * dead code, because it looks like a working declaration.
  *
- * `OLD_MEMBERS` is the list, so both guards and the message read from one place.
+ * The third was found the hard way (@Rex, @cody, 2026-09-22), two commits after
+ * the deletion: a READER that takes the member BY STRING. `scripts/plugin-map.ts`
+ * asked `has(p, "exclusive")` and `has(p, "release")`, and when both moved inside
+ * `holds` those lookups became permanently `undefined` — so the page
+ * `docs/plugins.md` calls "the contract as one page" said that nothing in the
+ * registry holds anything, with nothing going red. **"Gone from the types" and
+ * "nobody uses the name" are two different facts**, and between them sit every
+ * string-keyed reader: scripts, doc generators, fixtures, templates. A string
+ * key cannot be wrong at compile time, so the first two guards cannot see it and
+ * everyone reading the deletion diff concludes it was clean.
+ *
+ * `OLD_MEMBERS` is the list, so all three guards and the message read from one
+ * place.
  */
 const OLD_MEMBERS = [
   "exclusive", "defaultForAllAgents",
@@ -1077,6 +1089,65 @@ const _theOldShapeIsGone: [
   Gone<"activity">, Gone<"usage">, Gone<"pollBackground">, Gone<"cancelBackground">,
 ] = [true, true, true, true, true, true, true];
 void _theOldShapeIsGone;
+
+/**
+ * Only the four names that mean nothing else.
+ *
+ * Chosen by measurement, not by taste: on this tree `release` occurs as a string
+ * literal 31 times and `usage` 25, because both are ordinary words here — tool
+ * names, usage rows, `Holding`'s own members. Forbidding those would make the
+ * guard something to argue with, and a guard that is argued with gets an
+ * exception rather than a fix. These four exist *only* as members this refactor
+ * removed, so any quoted occurrence is a reader reaching for something that is
+ * not there.
+ */
+const NEVER_A_STRING = ["exclusive", "defaultForAllAgents", "pollBackground", "cancelBackground"] as const;
+
+await check("nothing reads a removed member by string, where the compiler cannot help", async () => {
+  const { readdir, readFile: read } = await import("node:fs/promises");
+  const root = new URL("../", import.meta.url);
+  const walk = async (dir: string): Promise<string[]> => {
+    const out: string[] = [];
+    for (const e of await readdir(new URL(dir, root), { withFileTypes: true })) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const at = `${dir}${e.name}${e.isDirectory() ? "/" : ""}`;
+      if (e.isDirectory()) out.push(...await walk(at));
+      else if (/\.(ts|mjs|cjs)$/.test(e.name)) out.push(at);
+    }
+    return out;
+  };
+  const files = (await Promise.all(["src/", "cf/src/", "scripts/", "test/", "bench/"].map(walk))).flat();
+  // Without this the walk could quietly find nothing and the case would pass on
+  // an empty set — the same empty solution a positive control exists to remove.
+  if (files.length < 50) throw new Error(`the walk found only ${files.length} source files, so it read almost nothing`);
+
+  const offenders: string[] = [];
+  for (const file of files) {
+    // This file holds the list itself, and the prose explaining why each name is
+    // forbidden. A guard cannot be enforced against its own statement of itself.
+    if (file.endsWith("test/mount-config.ts")) continue;
+    const text = await read(new URL(file, root), "utf8");
+    text.split("\n").forEach((line, i) => {
+      // Comment lines dropped, because the record of what a name used to be is
+      // the sentence most worth keeping and the one a text guard goes red on
+      // (same lesson as the idle-pass guard, `test/held.ts`).
+      const code = line.trim().startsWith("//") || line.trim().startsWith("*") || line.trim().startsWith("/*")
+        ? "" : line;
+      for (const name of NEVER_A_STRING) {
+        if (code.includes(`"${name}"`) || code.includes(`'${name}'`)) offenders.push(`${file}:${i + 1}  ${line.trim()}`);
+      }
+    });
+  }
+  if (offenders.length) {
+    throw new Error(
+      `a removed member is read by string, which typechecks and returns undefined forever:\n  `
+      + `${offenders.join("\n  ")}\n`
+      + `Holding something is \`holds\`, background work is \`background\`, and who gets a plugin is `
+      + `AgentRuntime.DEFAULT_MOUNTS. Ask through the adapters (holdingOf/backgroundOf/isExclusive) so the `
+      + `next regrouping stops the build instead of emptying a column.`,
+    );
+  }
+});
 
 await check("no plugin carries the members the capability groups replaced", () => {
   const offenders: string[] = [];
