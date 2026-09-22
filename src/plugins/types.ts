@@ -7,6 +7,17 @@ export interface ToolSchema {
   sideEffects: "read" | "write";
   /** Whether the plugin can make this call idempotent (§8.3). */
   idempotency: "native" | "key" | "none";
+  /**
+   * This tool can hand back a result the runtime parked because it was too big.
+   *
+   * Declared on the TOOL rather than on the plugin, because that is what it is
+   * about: one tool reads a parked value, the rest of the mount does not. The
+   * runtime used to find it by taking the plugin id `artifacts` and appending
+   * `.read`, which meant the reader had to be that plugin and had to keep that
+   * tool name; with this, an operator may mount it under any alias and a second
+   * plugin may offer the same service.
+   */
+  reads?: "parked-result";
 }
 
 /** Where a plugin keeps what it derived from a credential. Scoped to one mount,
@@ -299,6 +310,42 @@ export function markIdentity<E extends Error>(
   marked.identity = credentialState(ctx);
   if (ctx.credentialRefKind !== undefined) marked.credentialRef = ctx.credentialRefKind;
   return marked;
+}
+
+/**
+ * Reading the capability groups while the flat members still exist.
+ *
+ * Step 1 of the contract refactor adds the groups without removing what they
+ * replace, so every consumer reads through these three and nowhere else — then
+ * step 6 deletes the second half of each expression in one place instead of
+ * hunting nine call sites. A plugin that declares both is not a conflict during
+ * the migration: the group wins, because that is the form being migrated to.
+ *
+ * `isExclusive` is the one that changes meaning rather than location: holding
+ * something IS the reason to serialise, so the answer is derived from `holds`
+ * rather than asserted beside it. Until the flag is gone it is still honoured,
+ * so a plugin that has not moved yet keeps its queue.
+ */
+export function holdingOf(p: Pick<Plugin, "holds" | "activity" | "usage" | "release">): Holding | null {
+  if (p.holds) return p.holds;
+  if (!p.activity && !p.release) return null;
+  return {
+    activity: p.activity!,
+    ...(p.usage ? { usage: p.usage } : {}),
+    release: p.release!,
+  };
+}
+
+export function backgroundOf(
+  p: Pick<Plugin, "background" | "pollBackground" | "cancelBackground">,
+): Backgrounding | null {
+  if (p.background) return p.background;
+  if (!p.pollBackground || !p.cancelBackground) return null;
+  return { poll: p.pollBackground, cancel: p.cancelBackground };
+}
+
+export function isExclusive(p: Pick<Plugin, "holds" | "exclusive">): boolean {
+  return !!p.holds || p.exclusive === true;
 }
 
 /** The most live hooks one mount may hold; see `InboundHooks`. */
@@ -794,10 +841,73 @@ export function backgrounded(handle: Json, note?: string): Backgrounded {
   return new Backgrounded(handle, note);
 }
 
+/**
+ * What a mount that HOLDS something real has to be able to do.
+ *
+ * Grouped rather than left as three optional methods on every plugin, because
+ * they are one decision and not three: a mount either owns a resource that is
+ * billed while it exists, or it does not. Declaring the group is what says so —
+ * `exclusive` is derived from it rather than asserted beside it, which is why
+ * there is no longer a way for the two to disagree.
+ *
+ * Every sentence below is carried over unchanged from the methods this
+ * replaces; the wording is the contract, not decoration.
+ */
+export interface Holding {
+  /**
+   * What this mount is holding right now, without a credential and without
+   * calling the far end: it is asked when nobody is using the mount and by a
+   * timer, so it must be answerable from what the runtime already has.
+   */
+  activity(ctx: PluginContext): Promise<MountActivity>;
+  /**
+   * What it has cost, as far as this mount can still say. A rolling window is a
+   * legitimate answer: this is not a ledger, and anything that has to be
+   * complete is written where it happens.
+   */
+  usage?(ctx: PluginContext): Promise<MountUsage[]>;
+  /**
+   * Let go of it. Scoped to the AGENT rather than to one task, safe to call
+   * again, and it must throw rather than return if something billed could not
+   * be released — a silent failure here is a resource nobody will collect.
+   */
+  release(ctx: PluginContext): Promise<boolean | void>;
+}
+
+/**
+ * What a plugin whose `invoke` may only have STARTED the work has to be able to do.
+ *
+ * The pair is one capability: something that can be started must be pollable
+ * and stoppable, and a plugin offering one without the other leaves the runtime
+ * holding a job it cannot finish or cannot end.
+ */
+export interface Backgrounding {
+  /** Has it finished, and what did it produce? Asked with the context the call had. */
+  poll(handle: Json, ctx: PluginContext): Promise<
+    { done: false; progress?: Json } | { done: true; result: Json }
+  >;
+  /** Returning means it has actually stopped, not that a stop was requested. */
+  cancel(handle: Json, ctx: PluginContext): Promise<void>;
+}
+
 export interface Plugin {
   id: string;
   version: string;
   tools: ToolSchema[];
+  /** This mount holds something real; see {@link Holding}. Declaring it is what
+   *  makes the mount exclusive — ask {@link isExclusive}, never the two separately. */
+  holds?: Holding;
+  /** `invoke` may return {@link Backgrounded}; see {@link Backgrounding}. */
+  background?: Backgrounding;
+  /**
+   * What environment this plugin can give a session.
+   *
+   * Exists so the agents API can pick the mount that provides a container by
+   * asking what a plugin offers rather than by matching the alias `sandbox` —
+   * an alias is the operator's to choose, so matching on it makes a rename a
+   * silent behaviour change.
+   */
+  provides?: readonly ("container")[];
   /**
    * Whether two calls to this plugin may overlap for one mount.
    *

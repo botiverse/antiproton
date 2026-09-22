@@ -949,9 +949,125 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   // 2026-09-12, `a58832bf`). The lease keeps an idle one from being free to
   // forget.
   defaultForAllAgents: true,
-  // One container per mount, created on demand — two calls at once would
-  // create two, and only one of them would ever be released.
-  exclusive: true,
+  /** This mount holds a container: something real, billed while it exists.
+   *  The three below are one decision, not three — see `Holding`. */
+  holds: {
+    /** What this mount is keeping alive, read from its own state and nothing
+     *  else: no credential, no call to run9. */
+    async activity(ctx: PluginContext): Promise<MountActivity> {
+      const raw = await ctx.connection.get();
+      return activityOf(asBoxState(raw), unreadableEntries(raw));
+    },
+    /** The window this mount still holds. Bounded on purpose, which is why it is
+     *  the console's history and not anybody's ledger. */
+    async usage(ctx: PluginContext): Promise<MountUsage[]> {
+      return usageOf(asBoxState(await ctx.connection.get()));
+    },
+    /** Hands this mount's box back, so an idle one is not left running on the
+     *  tenant's quota because nobody thought to stop it. Safe to call when there
+     *  is no box: it reports that nothing was released rather than failing.
+     *
+     *  **When** it is called is the framework's decision and deliberately not
+     *  described here. It was, twice: the comment said "when the task ends" while
+     *  the body twenty lines down was already mount-scoped, and then it said "when
+     *  the agent has nothing open", which was true only while the gateway released
+     *  at exactly that step. Both sentences were correct when written, went stale
+     *  in a file nobody had reason to reread, and cost nothing until someone
+     *  relied on them. The trigger lives at the call site — today
+     *  `cf/src/runtime.ts` — so that is where it is stated and where it changes.
+     *
+     *  Not per task, despite what the gateway's `releaseTask` is called: the body
+     *  below reads the mount's connection state and never looks at the caller's
+     *  task. */
+    async release(ctx: PluginContext): Promise<boolean> {
+      const r = await stopBox(ctx);
+      if (r === null) return false;
+      // A container is the one thing here billed for merely existing, so a
+      // release that did not release has to say so. stopBox has reported this
+      // since the day thirteen boxes were found alive; nothing was listening.
+      if (!r.freed) throw new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
+      return true;
+    },
+  },
+  /** `run_js` and `shell` may only have STARTED the work; see `Backgrounding`. */
+  background: {
+    /** One look at the execution, with no waiting and nothing written. */
+    async poll(handle, ctx) {
+      const cfg = cfgOf(ctx);
+      const h = handle as { boxId?: string; execId?: string };
+      if (!h?.execId) throw new Error("not an execution handle");
+      const api = apiFor(cfg, ctx);
+      const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${h.execId}`);
+      if (!TERMINAL.includes(rec.state)) return { done: false, progress: { state: rec.state } };
+      // The box as it was when the work started: this runs outside the call, and
+      // writing connection state from here would race a second job finishing at
+      // the same moment — the read-modify-write `exclusive` exists to prevent,
+      // in a new place (Piper, 2026-09-14, `83f0658d`).
+      const state = asBoxState(await ctx.connection.get());
+      return { done: true, result: finished(rec, cfg, state, ctx.alias, lease) as Json };
+    },
+    /**
+     * Stop it and stop paying for it — and say so when it did not stop.
+     *
+     * The `.catch(() => {})` that used to be here decided, inside the plugin,
+     * that a failed kill did not matter. It did: with three jobs running, a
+     * refused fourth was cancelled through this path, the kill did not take, and
+     * the command ran to completion in the container — with no job id, so
+     * nothing could list it or cancel it. Both layers
+     * swallowed the failure, so our ledger and the container were free to differ
+     * with nobody able to notice.
+     *
+     * So: kill, then *confirm*. "I sent a kill" is our record; "the process is
+     * gone" is the fact, and the bill follows the fact. Returning means the
+     * execution is in a state that will not change again; anything else throws,
+     * and the caller — which owns the ledger — decides what to record and
+     * whether to ask again (no retry loop here, because the
+     * runtime is what keeps a refused job tracked and calls back at its ceiling).
+     *
+     * **A terminal state is run9's record, not the process.** That the two agree
+     * — that `cancelled` means the shell is gone — is something we measured (a
+     * `sleep && echo … > file` whose file never appeared: four runs, by two of
+     * us separately) and not something the API defines, so it can change without telling
+     * us. Whoever edits this path or the one that starts an execution owes that
+     * reading again; every cheaper check in the suites reads a record, and a
+     * record is what was wrong the first time.
+     */
+    async cancel(handle, ctx) {
+      const cfg = cfgOf(ctx);
+      const h = handle as { execId?: string };
+      if (!h?.execId) return;
+      const api = apiFor(cfg, ctx);
+      const path = `/projects/${cfg.project}/workspace/execs/${h.execId}`;
+      let why: string;
+      try {
+        await api("POST", `${path}/kill`);
+        why = "kill accepted";
+      } catch (e) {
+        why = e instanceof Error ? e.message : String(e);
+      }
+      // The kill's own answer is not the evidence either way: a refusal may mean
+      // only that the execution had already ended, and an acceptance does not
+      // make it stop. Its state is the single authority, so it is asked whether
+      // the kill succeeded or failed.
+      let state: string | null = null;
+      try {
+        state = String((await api("GET", path)).state);
+      } catch (e) {
+        why += `; state unreadable: ${e instanceof Error ? e.message : String(e)}`;
+      }
+      if (state !== null && TERMINAL.includes(state)) return;
+      if (state !== null) why += `; state ${state}`;
+      // "Could not confirm", not "did not stop". Only one of the two ways to get
+      // here is a statement about the process: a refused kill leaves it running,
+      // while an accepted kill with a state that has not settled says nothing
+      // about it either way — and the caller, which reports this to the agent,
+      // would be passing on a claim we did not make. The two
+      // are told apart by what follows the colon: run9's own answer, or `kill
+      // accepted`.
+      throw new Error(`could not confirm exec ${h.execId} stopped: ${why}`);
+    },
+  },
+
   credential: {
     required: true,
     summary: "run9 access and secret keys, as JSON.",
@@ -1174,31 +1290,6 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     },
   ],
 
-  /** Hands this mount's box back, so an idle one is not left running on the
-   *  tenant's quota because nobody thought to stop it. Safe to call when there
-   *  is no box: it reports that nothing was released rather than failing.
-   *
-   *  **When** it is called is the framework's decision and deliberately not
-   *  described here. It was, twice: the comment said "when the task ends" while
-   *  the body twenty lines down was already mount-scoped, and then it said "when
-   *  the agent has nothing open", which was true only while the gateway released
-   *  at exactly that step. Both sentences were correct when written, went stale
-   *  in a file nobody had reason to reread, and cost nothing until someone
-   *  relied on them. The trigger lives at the call site — today
-   *  `cf/src/runtime.ts` — so that is where it is stated and where it changes.
-   *
-   *  Not per task, despite what the gateway's `releaseTask` is called: the body
-   *  below reads the mount's connection state and never looks at the caller's
-   *  task. */
-  async release(ctx: PluginContext): Promise<boolean> {
-    const r = await stopBox(ctx);
-    if (r === null) return false;
-    // A container is the one thing here billed for merely existing, so a
-    // release that did not release has to say so. stopBox has reported this
-    // since the day thirteen boxes were found alive; nothing was listening.
-    if (!r.freed) throw new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
-    return true;
-  },
 
   /**
    * Does this key work, asked when a person pastes it rather than when an
@@ -1299,18 +1390,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
   },
 
-  /** What this mount is keeping alive, read from its own state and nothing
-   *  else: no credential, no call to run9. */
-  async activity(ctx: PluginContext): Promise<MountActivity> {
-    const raw = await ctx.connection.get();
-    return activityOf(asBoxState(raw), unreadableEntries(raw));
-  },
 
-  /** The window this mount still holds. Bounded on purpose, which is why it is
-   *  the console's history and not anybody's ledger. */
-  async usage(ctx: PluginContext): Promise<MountUsage[]> {
-    return usageOf(asBoxState(await ctx.connection.get()));
-  },
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
     // Checked before anything else: neither releasing nor choosing an
@@ -1699,82 +1779,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     }
   },
 
-  /** One look at the execution, with no waiting and nothing written. */
-  async pollBackground(handle, ctx) {
-    const cfg = cfgOf(ctx);
-    const h = handle as { boxId?: string; execId?: string };
-    if (!h?.execId) throw new Error("not an execution handle");
-    const api = apiFor(cfg, ctx);
-    const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${h.execId}`);
-    if (!TERMINAL.includes(rec.state)) return { done: false, progress: { state: rec.state } };
-    // The box as it was when the work started: this runs outside the call, and
-    // writing connection state from here would race a second job finishing at
-    // the same moment — the read-modify-write `exclusive` exists to prevent,
-    // in a new place (Piper, 2026-09-14, `83f0658d`).
-    const state = asBoxState(await ctx.connection.get());
-    return { done: true, result: finished(rec, cfg, state, ctx.alias, lease) as Json };
-  },
 
-  /**
-   * Stop it and stop paying for it — and say so when it did not stop.
-   *
-   * The `.catch(() => {})` that used to be here decided, inside the plugin,
-   * that a failed kill did not matter. It did: with three jobs running, a
-   * refused fourth was cancelled through this path, the kill did not take, and
-   * the command ran to completion in the container — with no job id, so
-   * nothing could list it or cancel it. Both layers
-   * swallowed the failure, so our ledger and the container were free to differ
-   * with nobody able to notice.
-   *
-   * So: kill, then *confirm*. "I sent a kill" is our record; "the process is
-   * gone" is the fact, and the bill follows the fact. Returning means the
-   * execution is in a state that will not change again; anything else throws,
-   * and the caller — which owns the ledger — decides what to record and
-   * whether to ask again (no retry loop here, because the
-   * runtime is what keeps a refused job tracked and calls back at its ceiling).
-   *
-   * **A terminal state is run9's record, not the process.** That the two agree
-   * — that `cancelled` means the shell is gone — is something we measured (a
-   * `sleep && echo … > file` whose file never appeared: four runs, by two of
-   * us separately) and not something the API defines, so it can change without telling
-   * us. Whoever edits this path or the one that starts an execution owes that
-   * reading again; every cheaper check in the suites reads a record, and a
-   * record is what was wrong the first time.
-   */
-  async cancelBackground(handle, ctx) {
-    const cfg = cfgOf(ctx);
-    const h = handle as { execId?: string };
-    if (!h?.execId) return;
-    const api = apiFor(cfg, ctx);
-    const path = `/projects/${cfg.project}/workspace/execs/${h.execId}`;
-    let why: string;
-    try {
-      await api("POST", `${path}/kill`);
-      why = "kill accepted";
-    } catch (e) {
-      why = e instanceof Error ? e.message : String(e);
-    }
-    // The kill's own answer is not the evidence either way: a refusal may mean
-    // only that the execution had already ended, and an acceptance does not
-    // make it stop. Its state is the single authority, so it is asked whether
-    // the kill succeeded or failed.
-    let state: string | null = null;
-    try {
-      state = String((await api("GET", path)).state);
-    } catch (e) {
-      why += `; state unreadable: ${e instanceof Error ? e.message : String(e)}`;
-    }
-    if (state !== null && TERMINAL.includes(state)) return;
-    if (state !== null) why += `; state ${state}`;
-    // "Could not confirm", not "did not stop". Only one of the two ways to get
-    // here is a statement about the process: a refused kill leaves it running,
-    // while an accepted kill with a state that has not settled says nothing
-    // about it either way — and the caller, which reports this to the agent,
-    // would be passing on a claim we did not make. The two
-    // are told apart by what follows the colon: run9's own answer, or `kill
-    // accepted`.
-    throw new Error(`could not confirm exec ${h.execId} stopped: ${why}`);
-  },
 
   };
 }

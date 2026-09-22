@@ -36,6 +36,7 @@ import { runJsTool, bridgeTools, type MountedTool } from "../../src/runtime/pi-t
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
+import { isExclusive } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -196,7 +197,10 @@ async function runOne(inst: Instance) {
       name: t.name, description: t.summary, parameters: t.parameters,
       address: `${m.alias}.${t.name}`,
       sideEffects: t.sideEffects, idempotency: t.idempotency,
-      exclusive: byId.get(m.plugin)?.exclusive,
+      // Through the derivation, not the flag: the sandbox declares `holds`
+      // now, and a runner reading the old field would stop serialising it —
+      // which is how duplicate containers are made, billed by the second.
+      exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
     }))).filter((t) => !OWNED_BY_THE_RUNNER.has(t.address));
 
   const holder: { agent?: PiAgent } = {};

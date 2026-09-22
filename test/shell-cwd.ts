@@ -161,7 +161,7 @@ await check("an exec run9 could not start is a finished result, not a job that n
 await check("a command finished later through the poll reports its directory but does not move the shell", async () => {
   const later = run9({ ...BOX, cwd: "/work" }, { e1: [{ state: "succeeded", exit_code: 0, output_summary: "done\n__AP_CWD__/srv\n" }] });
   const writesBefore = later.writes.length;
-  const polled: any = await plugin.pollBackground!({ boxId: "b1", execId: "e1" } as any, later.ctx);
+  const polled: any = await plugin.background!.poll({ boxId: "b1", execId: "e1" } as any, later.ctx);
   assert(polled.done && polled.result.output === "done" && polled.result.cwd === "/srv", `polled: ${JSON.stringify(polled).slice(0, 160)}`);
   assert(later.writes.length === writesBefore, "the poll wrote connection state");
 });

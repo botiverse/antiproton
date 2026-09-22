@@ -9,6 +9,7 @@
  * flight is reported instead: model calls with no answer yet, and background jobs.
  */
 import type { Plugin, PluginContext } from "../../src/plugins/types.ts";
+import { holdingOf } from "../../src/plugins/types.ts";
 import type { Json, ModelBinding, MountRecord } from "../../src/core/types.ts";
 import type { SqlHost } from "../../src/store/pi-storage.ts";
 import { secretRefKind } from "../../src/runtime/secrets.ts";
@@ -57,7 +58,7 @@ async function mountReports(
   const out: MountReports = {};
   for (const m of mounts) {
     const plugin = plugins.find((p) => p.id === m.plugin);
-    if (!plugin?.activity && !plugin?.usage) continue;
+    if (!plugin || !holdingOf(plugin)) continue;
     const ctx: PluginContext = {
       caller: { ...owner, taskId },
       alias: m.alias,
@@ -70,8 +71,9 @@ async function mountReports(
       async sibling() { return null; },
     };
     try {
-      const activity = plugin.activity ? await plugin.activity(ctx) : { live: null };
-      const usage = plugin.usage ? await plugin.usage(ctx) : [];
+      const holding = holdingOf(plugin);
+      const activity = holding ? await holding.activity(ctx) : { live: null };
+      const usage = holding?.usage ? await holding.usage(ctx) : [];
       if (activity?.live || usage.length) out[m.alias] = { activity, usage };
     } catch {
       // One mount that cannot answer read-only must not blank the report for the rest.
