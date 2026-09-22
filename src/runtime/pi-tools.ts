@@ -162,6 +162,26 @@ export function offersPlugin(
   return tools.some((t) => pluginOf.get(t.address.split(".")[0]!) === plugin);
 }
 
+/**
+ * The same question as {@link offersPlugin}, asked of a capability instead of a name.
+ *
+ * A name answers "is this particular plugin here"; the kernel almost never
+ * wants that — it wants "can anything here do X". Asking by name means the
+ * answer stops being true the moment a second plugin can do the same thing,
+ * and nothing fails when it does: the feature just silently is not offered.
+ */
+export function offersCapability(
+  records: Array<{ alias: string; plugin: string }>,
+  tools: MountedTool[],
+  can: (plugin: string) => boolean,
+): boolean {
+  const pluginOf = new Map(records.map((m) => [m.alias, m.plugin]));
+  return tools.some((t) => {
+    const id = pluginOf.get(t.address.split(".")[0]!);
+    return id !== undefined && can(id);
+  });
+}
+
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   const used = new Set<string>();
   return tools.map((t) => {
