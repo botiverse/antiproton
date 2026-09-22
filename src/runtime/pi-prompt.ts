@@ -85,6 +85,16 @@ export interface PromptParts {
    *  gateway decided (registry order). They come last: the prompt before them
    *  is the part that does not move, and a provider caches by prefix. */
   contributions?: string[];
+  /**
+   * What this agent is already holding when the session opens (held.ts), or
+   * null when nothing.
+   *
+   * Last, after the contributions: it is the only part of the prompt that
+   * differs between two sessions of the same agent, so everything a provider
+   * can cache sits in front of it. Session-stable facts only — a number that
+   * ticks here would throw the cached prefix away once per `open`.
+   */
+  held?: string | null;
   policy?: string;
   /** Whether `run_js` is actually offered. A page about a sandbox the agent
    *  does not have is noise competing with the instructions that matter. */
@@ -98,6 +108,7 @@ export function systemPrompt(parts: PromptParts = {}): string {
   if (parts.sandbox) out.push(SANDBOX);
   if (parts.policy?.trim()) out.push(parts.policy.trim());
   for (const c of parts.contributions ?? []) if (c.trim()) out.push(c.trim());
+  if (parts.held?.trim()) out.push(parts.held.trim());
   return out.join("\n\n");
 }
 

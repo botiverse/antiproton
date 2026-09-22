@@ -30,6 +30,7 @@ const box: Plugin = {
   tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke(_t, _a, c) { invoked.push(c as PluginContext); return { ok: true }; },
   holds: {
+    tools: { release: "release" },
     async activity(c: PluginContext) { askedActivity.push(c); return { live: null }; },
     async release() { return false; },
   },

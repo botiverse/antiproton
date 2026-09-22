@@ -23,7 +23,7 @@ const plugin = (id: string, release: () => Promise<boolean | void>): Plugin => (
   async invoke() { return {}; },
   // A releasing fixture declares the group: holding something is what makes a
   // mount exclusive, and the two can no longer be stated separately.
-  holds: { release, async activity() { return { live: null }; } },
+  holds: { tools: { release: "release" }, release, async activity() { return { live: null }; } },
 });
 
 async function fixture(plugins: Plugin[]) {

@@ -53,6 +53,7 @@ function racer(id: string, exclusive: boolean) {
   // is the serialised one: `holds` is now what says both things at once.
   if (exclusive) {
     plugin.holds = {
+      tools: { release: "release" },
       async activity() { return { live: null }; },
       async release(c: any) {
         inside += 1;
