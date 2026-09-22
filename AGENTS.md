@@ -128,6 +128,17 @@ rather than at the setup:
   is the directory that has no `node_modules`, and the symlink would point at
   itself.
 
+  After that link there is one `node_modules` for every worktree of this
+  repository — yours and everyone else's — so "never edited in place" above
+  now means: never edited at all, from anywhere. A change made to probe a
+  dependency (a type added to see what breaks, say) is made for every gate
+  running at that moment, and a restore that is off by one character is the
+  same. To try a dependency change, copy the package to `/tmp` and point a
+  scratch program at it, or write a standalone probe that declares only the
+  type in question; both prove the direction without touching the shared copy.
+  To check the copy is pristine: `npm pack <pkg>@<version>` into `/tmp` and
+  diff, and `find node_modules -type f -newer package-lock.json`.
+
 If you report a branch as green, **name the set you ran**. The suites nearest a
 change answer "is this change sound"; only the whole set — every file in `test/`
 except the ones that need a live service — answers "is this branch sound", and the
