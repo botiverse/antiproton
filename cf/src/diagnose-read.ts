@@ -165,6 +165,10 @@ export async function readDiagnosis(
       .map((r) => ({ at: r.at, alias: r.alias, message: r.message })),
     alarmErrors: rows(sql, "alarm_errors", "SELECT at, message FROM alarm_errors ORDER BY at DESC LIMIT 3")
       .map((r) => r.message),
+    // Trace rows the drain refused (cf/src/trace-r2.ts): the number's place to
+    // be seen, beside what else this object has had go wrong.
+    traceDrops: rows(sql, "trace_drops", "SELECT at, dropped FROM trace_drops ORDER BY at DESC LIMIT 3")
+      .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
     modelJobs: rows(sql, "pi_model_jobs", "SELECT id, created_at FROM pi_model_jobs WHERE answer IS NULL ORDER BY created_at DESC LIMIT 10")
       .map((r) => ({ id: r.id, ageMs: now - Number(r.created_at) })),
     // What the console's trajectory tab would draw, from the same read, with no busy state to show.
