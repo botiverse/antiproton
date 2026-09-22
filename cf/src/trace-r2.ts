@@ -49,6 +49,13 @@ export type TraceSink = { put(key: string, body: Uint8Array): Promise<unknown> }
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS trace_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";
 const DROPS = "CREATE TABLE IF NOT EXISTS trace_drops (at INTEGER NOT NULL, dropped INTEGER NOT NULL)";
+/**
+ * How long a drop stays on record. A put that keeps failing refuses the same
+ * batch on every pass and writes a line each time — honest, and unbounded
+ * without this: the table only ever grew. Seven days is the inbound log's
+ * horizon too (src/runtime/inbound.ts), and diagnose shows the last three.
+ */
+export const TRACE_DROPS_KEEP_MS = 7 * 24 * 60 * 60_000;
 
 /** Where a batch lands: the owner and the seq range, so a replay is the same key. */
 export function traceKey(tenantId: string, agentId: string, fromSeq: number, toSeq: number): string {
@@ -71,7 +78,9 @@ export async function flushTrace(
   if (dropped > 0) {
     console.warn(`trace outbox for ${tenantId}/${agentId}: ${dropped} row(s) outside the contract's vocabulary were dropped`);
     sql.exec(DROPS);
-    sql.exec("INSERT INTO trace_drops(at, dropped) VALUES (?, ?)", now(), dropped);
+    const at = now();
+    sql.exec("DELETE FROM trace_drops WHERE at < ?", at - TRACE_DROPS_KEEP_MS);
+    sql.exec("INSERT INTO trace_drops(at, dropped) VALUES (?, ?)", at, dropped);
   }
   let key: string | null = null;
   if (rows.length) {
