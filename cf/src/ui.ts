@@ -1593,7 +1593,10 @@ export function sandboxPanel(d: any): string {
   // plugin's name, and a mount with nothing to report is simply absent.
   const aliases = new Set(
     (d.mounts ?? []).filter((m: any) => (m.provides ?? []).includes("container")).map((m: any) => m.alias));
-  const name = [...aliases][0] ?? "sandbox";
+  // `name` is only read where a container mount exists, so no fallback is
+  // needed: an agent with no container-providing mount renders the empty state,
+  // which names nothing.
+  const name = [...aliases][0];
   // Checked on the way in (mount-reports.ts): the payload crossed a Durable Object boundary as JSON, so it is
   // parsed into the contract types once, here, and what does not read is left out rather than drawn wrong.
   const reports: MountReports = asMountReports(d.mountReports) ?? {};
