@@ -1,5 +1,15 @@
 # Working in this repository
 
+Before starting a piece of work, and again whenever a reading does not match
+what you expected, read **section 5 of
+[`docs/philosophy.md`](docs/philosophy.md)** — the four verification invariants.
+It is listed at the bottom of this file as reference, and a reference list is
+what you consult once you already know you need it: a night has been spent
+independently rediscovering invariant ④, which was then found in under a minute
+once someone looked. The second trigger matters more than the first, because ④
+is the one that fires exactly when you have just explained a surprising reading
+away.
+
 ## The agent loop is pi's
 
 `src/runtime/`, `src/store/pi-storage.ts` and `src/model/pi-offloaded.ts` are
@@ -21,6 +31,35 @@ Anything named `…Bytes` counts `String.length` — UTF-16 code units — where
 what it bounds is a string, which is everywhere except binary payloads. They are
 coherent because they all count the same unit, and `src/store/artifacts.ts`
 measures real bytes on binary via `byteLength`.
+
+### A comment carries the reason, not who supplied it
+
+**What faces forward stays; what records who did what in the past goes** — that
+part is a `git log` question, and a comment answering it is a second copy that
+drifts. "It happened once" is the case people trip on: offered as *evidence that
+the rule is needed*, it faces forward and stays. An origin someone can follow —
+a PR number, a filename — stays too, being a pointer rather than a credit.
+
+Four worked cases:
+
+| | |
+|---|---|
+| Deleted | *"The note lived above the per-result `reminder` field until step 7 … and I deleted the reason along with it (Piper, 2026-09-22)."* Names a step, a person and a date: a past event, and `git log -S '"container", never "sandbox"'` finds those commits anyway. |
+| Kept | *"It sits where the convention is applied rather than beside one of its instances … which is how it was lost once already."* Says that it happened, not who or when. Without that clause the placement rule reads as taste, and the next person with different taste moves it back. |
+| Kept | *"It asks `provides` now (#501)."* A number anyone can open. |
+| Kept | *"work left there is gone after an idle spell (tmpfs, measured 2026-09-15)."* The date belongs to the **measurement**, not to a person: it is the reading's condition, which the first verification invariant requires. Strip it and an observation becomes an assertion. |
+
+The last row is the one to get right, because the rule is easy to over-apply: a
+date attached to an **action** is provenance and goes; a date attached to a
+**reading** is part of the reading and stays. `test/attributions-name-a-role.ts`
+records the same judgement from the other side — many older attributions "point
+at a reproducible observation and should stay", which is why that gate is
+deliberately narrow and sweeping the rest is a per-site decision rather than a
+sweep.
+
+The line to hold: **git records that a commit deleted a passage; it does not
+record that the passage therefore belongs above the whole convention.** Only the
+comment can say that, so that is the half worth writing.
 
 ## Contribution Guidelines
 
