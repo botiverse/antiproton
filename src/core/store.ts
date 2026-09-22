@@ -18,6 +18,7 @@ import type {
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
 import type { CredentialRefKind, CredentialState, PluginChoice } from "../plugins/types.ts";
 import type { UsageRow } from "../usage/outbox.ts";
+import type { TraceRow } from "../trace/outbox.ts";
 
 /**
  * What a finished call records beyond its status. Declared here, beside
@@ -139,6 +140,14 @@ export interface StorageAdapter {
    * store without it counts nothing, which is right for a test double.
    */
   recordUsage?(rows: readonly UsageRow[]): Promise<void>;
+
+  /**
+   * Append to this object's trace outbox (src/trace/outbox.ts), for the seams
+   * that live outside the store — the gateway sees a container's lease end and
+   * has no table of its own to write it beside. Optional on the same terms as
+   * `recordUsage`: a double that lacks it records nothing.
+   */
+  recordTrace?(rows: readonly TraceRow[]): Promise<void>;
 
   recordOperation(op: Omit<OperationRecord, "status" | "resultRef">): Promise<void>;
   getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null>;

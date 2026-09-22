@@ -11,6 +11,7 @@
  */
 import type { OperationStatus } from "../core/types.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { Released } from "../plugins/types.ts";
 import type { TraceRow, TraceVerdict } from "./outbox.ts";
 
 /**
@@ -121,5 +122,35 @@ export function modelCallRow(m: {
     status: m.stopReason, verdict: answerVerdict(m.stopReason),
     ...(ms === undefined ? {} : { ms }),
     attrs: { model: m.model },
+  };
+}
+
+/**
+ * A `Released` as the plugin reported it, or not one. The gateway finds these
+ * by a declared key on a result and on a thrown error, so the shape is checked
+ * rather than trusted: a plugin that put something else under the key has
+ * reported nothing, and the key is then left where it was for the reader to see.
+ */
+export function isReleased(x: unknown): x is Released {
+  if (!x || typeof x !== "object") return false;
+  const r = x as Record<string, unknown>;
+  return typeof r.id === "string" && r.id.length > 0
+    && typeof r.startedAt === "number" && typeof r.endedAt === "number"
+    && (r.status === "freed" || r.status === "error");
+}
+
+/**
+ * The container.lease row for a release the plugin just reported. Every
+ * number comes from the fact itself — the release's own read — never from a
+ * later look at the mount, which can land on a different box (the contract
+ * on `Released` says why).
+ */
+export function leaseRow(o: { tenantId: string; agentId: string; alias: string }, fact: Released): TraceRow {
+  return {
+    at: fact.endedAt, tenantId: o.tenantId, agentId: o.agentId,
+    kind: "container.lease", spanId: fact.id,
+    status: fact.status, verdict: fact.status === "freed" ? "ok" : "failed",
+    ms: Math.max(0, fact.endedAt - fact.startedAt),
+    attrs: { mount: o.alias, ...(fact.error ? { error: fact.error } : {}) },
   };
 }
