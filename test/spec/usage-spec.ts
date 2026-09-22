@@ -198,6 +198,24 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     assert(mine["object.active"] === T0 + 5 * H, `still mine: ${JSON.stringify(mine)}`);
   });
 
+  add("a window whose record was damaged reads as a lower bound, and a whole one carries no flag", async () => {
+    await sendUsage(db, "t", "a", 0, [
+      row(1, { at: T0, resource: "sandbox.container", key: "sandbox", quantity: 60, unit: "seconds" }),
+      row(2, { at: T0 + H, resource: "sandbox.container", key: "sandbox", quantity: 1, unit: "unreadable" }),
+      row(3, { at: T0 + 2 * H, resource: "sandbox.container", key: "sandbox", quantity: 30, unit: "seconds" }),
+    ]);
+    const damaged = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + 2 * H, bucket: "1h", by: "total" });
+    assert(damaged.partial === true, "the window containing the marker says it is a lower bound");
+    const whole = await readUsage(db, "t", { window: "custom", from: T0 + 2 * H, to: T0 + 4 * H, bucket: "1h", by: "total" });
+    assert(whole.rows.some((r) => r.resource === "sandbox.container"), "the clean window is not empty — it holds real seconds");
+    assert(!("partial" in whole), "a clean window carries no flag, rather than a false one");
+    await sendUsage(db, "u", "b", 0, [row(1, { tenantId: "u", agentId: "b", at: T0 + 3 * H, resource: "sandbox.container", key: "sandbox", quantity: 1, unit: "unreadable" })]);
+    const mine = await readUsage(db, "t", { window: "custom", from: T0 + 2 * H, to: T0 + 4 * H, bucket: "1h", by: "total" });
+    assert(!("partial" in mine), "another tenant's damage is not this tenant's flag");
+    const theirs = await readUsage(db, "u", { window: "custom", from: T0 + 2 * H, to: T0 + 4 * H, bucket: "1h", by: "total" });
+    assert(theirs.partial === true, "and it is theirs");
+  });
+
   // A day old enough to fold, a day that is not, and a `now` that sits between
   // them: 40 days of ledger, of which the last 35 keep their hours.
   const OLD = T0, OLDER_STILL = T0 - DAY_MS, YOUNG = T0 + 39 * DAY_MS, NOW = T0 + 40 * DAY_MS;

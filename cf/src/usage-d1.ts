@@ -203,7 +203,7 @@ export async function usageFirstHours(db: D1Database, tenantId: string): Promise
 }
 
 export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery):
-  Promise<{ rows: UsageReadRow[]; priced: boolean; firstHours: Record<string, number> }> {
+  Promise<{ rows: UsageReadRow[]; priced: boolean; firstHours: Record<string, number>; partial?: true }> {
   const size = q.bucket === "1d" ? DAY_MS : 3_600_000;
   const withAgent = q.by === "agent";
   const from = Math.floor(q.from / size) * size;
@@ -228,6 +228,19 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
   const prices = await usagePrices(db);
   const priced = prices.length > 0;
   const firstHours = await usageFirstHours(db, tenantId);
+  // A window the record could not fully read is a lower bound, and says so.
+  // The flag is computed from the same tables and bounds as the rows, because
+  // damage is recorded where the seconds are recorded (unit "unreadable",
+  // written by the pass that could not read): a flag describing "now" would
+  // certify historical windows it knows nothing about — a window that was
+  // damaged and later healed would read as complete. Absent means no marker
+  // in the window, which is the only honest shape a true/false has here.
+  const damaged = await db.prepare(
+    `SELECT 1 AS x FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ? AND unit = 'unreadable'
+     UNION ALL
+     SELECT 1 FROM usage_daily WHERE tenant_id = ? AND day >= ? AND day < ? AND unit = 'unreadable' LIMIT 1`,
+  ).bind(tenantId, from, q.to, tenantId, from, q.to).all();
+  const partial = (damaged.results as any[]).length ? true : undefined;
   const rows = (results as any[]).map((r) => {
     const row: UsageReadRow = {
       bucket: Number(r.bucket),
@@ -240,7 +253,7 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
     }
     return row;
   });
-  return { rows, priced, firstHours };
+  return { rows, priced, firstHours, ...(partial ? { partial } : {}) };
 }
 
 const LOCAL = "CREATE TABLE IF NOT EXISTS usage_sent (id INTEGER PRIMARY KEY CHECK (id = 1), through_seq INTEGER NOT NULL)";

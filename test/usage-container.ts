@@ -5,7 +5,7 @@
  * must not be charged twice), a box that ends between two passes (its tail is
  * the part after the watermark), and the hour a long-lived box crosses.
  */
-import { boxesOf, countHeldTime, heldRows, type HeldMark } from "../src/usage/container.ts";
+import { boxesOf, countHeldTime, heldRows, heldUnreadableRows, type HeldMark } from "../src/usage/container.ts";
 import { pendingUsage, HOUR_MS } from "../src/usage/outbox.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -115,6 +115,30 @@ check("a watermark for a box nobody mentions is dropped only when it is a week o
   eq(left(), 1, "six days on, the row stays");
   countHeldTime(host.sql, none, base, H0 + 8 * 86_400_000);
   eq(left(), 0, "eight days on, it is gone");
+});
+
+check("a mount whose records do not read is marked with a predicate, not a count", () => {
+  // The scalar mixes rows, sessions and environments, and the three are not
+  // commensurable with the seconds a reader would stand next to them: a
+  // corrupt environment contributes no missing seconds, a corrupt session
+  // that session's, one corrupt row possibly a whole live box. So the field
+  // is never printed as a number; presence is the signal, one row per pass.
+  eq(heldUnreadableRows(base, "sandbox", { unreadable: 3 }, H0 + 60_000).map((r) => [r.at, r.resource, r.key, r.quantity, r.unit]),
+    [[H0, "sandbox.container", "sandbox", 1, "unreadable"]], "one marker, quantity 1, whatever the scalar said");
+  eq(heldUnreadableRows(base, "sandbox", { unreadable: 0 }, H0), [], "zero is nothing");
+  eq(heldUnreadableRows(base, "sandbox", undefined, H0), [], "and so is the field's absence");
+  eq(heldUnreadableRows(base, "sandbox", null, H0), [], "in both spellings");
+});
+
+check("against a real table: the marker is written where the seconds are not, and beside them where they are", () => {
+  const host = sqliteHost();
+  countHeldTime(host.sql, { m: { plugin: "sandbox", report: { activity: { live: null, unreadable: 3 }, usage: [] } } }, base, H0 + 60_000);
+  eq(pendingUsage(host.sql, 0).map((r) => [r.unit, r.quantity]), [["unreadable", 1]], "no boxes, so no seconds, but the damage is on record");
+  countHeldTime(host.sql, { m: { plugin: "sandbox", report: { activity: { live: { id: "b1", startedAt: H0 }, unreadable: 2 }, usage: [] } } }, base, H0 + 120_000);
+  const rows = pendingUsage(host.sql, 0);
+  eq(rows.filter((r) => r.unit === "seconds").map((r) => r.quantity), [120], "the live box is counted as usual");
+  eq(rows.filter((r) => r.unit === "unreadable").map((r) => [r.at, r.quantity]),
+    [[H0, 1], [H0, 1]], "one marker per pass, not per unreadable record");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
