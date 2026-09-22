@@ -111,6 +111,26 @@ check("unreadable history with a finished session still leaves 'is it running' o
   must(html.includes("1 call(s)"), "the finished session that did read was not rendered");
 });
 
+check("a live container with dropped records says the total is a lower bound", () => {
+  // unreadable mixes rows, sessions and environments, and environments never
+  // reach this panel — so the wording states a bound, never a count of what
+  // is missing. And the live branch must not be swallowed by the idle-unknown
+  // notice.
+  const html = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
+    mountReports: { box: { activity: { live: { id: "b1", startedAt: 1_749_999_000_000, lastUsedAt: 1_749_999_800_000 },
+      unreadable: 2 }, usage: [
+      { id: "b0", startedAt: 1, endedAt: 2, lastUsedAt: 2, uses: 1, kept: [] },
+    ] } },
+  });
+  must(html.includes("a container is running"), "the live container did not render");
+  must(html.includes("may be incomplete"), "the dropped records were not disclosed next to the total");
+  must(!html.includes("2 of this mount's own records"),
+    "the page stated a count the scalar cannot support");
+  must(!html.includes("Do not read this mount as idle"),
+    "a live container was hidden in the idle-unknown notice");
+});
+
 check("a mount with no report is not a container, whatever its connection says", () => {
   // A report is written only when something runs or ran; a stale connection row
   // in the old shape must not reach the panel at all.

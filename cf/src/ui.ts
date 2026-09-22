@@ -1671,6 +1671,10 @@ ${live
       : `<div class="empty">nothing is running — this costs nothing until the next box starts</div>`}
 
 <h3>sessions — ${esc(secs(total))} of container time across ${sessions.length + (live ? 1 : 0)}</h3>
+${live && unreadable > 0
+  ? `<div class="hint" style="padding:0 0 6px">some of this mount's own record would not read —
+     what is shown below may be incomplete.</div>`
+  : ""}
 <div class="bars">
   ${live ? bar(liveMs, `<span class="tag bad">live</span>`, "var(--bad)") : ""}
   ${sessions.map((x: any) => bar(x.endedAt - x.startedAt,
