@@ -762,23 +762,30 @@ export class AgentRuntime {
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
-    // A reference this agent did not attach is not this agent's to overwrite.
-    // Nothing puts it back today: removeCredential clears to null, provision
-    // seeds a mount only when it is created, and reconcileSeed never writes
-    // the reference — so replacing the operator's account would lose it for
-    // this agent for good. The failure branch below already keeps a non-agent
-    // `previous`; this is the same judgement on the success branch, made
-    // before anything is written, and by the same test — not "is it the
+    // A reference this agent did not attach is not this agent's to overwrite —
+    // unless it can be given back. The failure branch below already keeps a
+    // non-agent `previous`; this is the same judgement on the success branch,
+    // made before anything is written, and by the same test — not "is it the
     // operator's" but "is it not ours" — so a kind of reference that does not
     // exist on a mount today is covered the day one does. The rule used to
-    // live only in the page that hid the control (#531). Reverting instead of
-    // refusing is the feature that follows, once the catalogue is what says
-    // what to revert to.
-    if (mount.secretRef && !isAgentRef(mount.secretRef)) {
+    // live only in the page that hid the control (#531).
+    //
+    // The exception is the catalogue's, never the kind's: what lets an
+    // overwrite through is that `removeCredential` can put this exact
+    // reference back, and the catalogue is what knows. Reading the kind would
+    // be asking the name again, which is what the seeded/`operator:` spelling
+    // was moved away from.
+    //
+    // Equality, not presence: the catalogue must name the reference that is on
+    // the mount right now. A mount carrying some other non-agent reference is
+    // still refused, because "revert" would then hand back an account that was
+    // never there — a different far end, silently.
+    if (mount.secretRef && !isAgentRef(mount.secretRef)
+        && mount.secretRef !== AgentRuntime.seededSecretRef(mount)) {
       return {
         ok: false,
         error: `the ${alias} mount uses an account this agent did not attach (${secretRefKind(mount.secretRef)}), ` +
-          `which cannot yet be given back once replaced; a key of your own goes on a mount of your own`,
+          `which cannot be given back once replaced; a key of your own goes on a mount of your own`,
       };
     }
     const plugin = this.#plugins.find((p) => p.id === mount.plugin);
@@ -828,12 +835,21 @@ export class AgentRuntime {
     return { ok: true, verified: !!check?.ok, account: check?.ok ? (check.account ?? null) : null, error: unreachable };
   }
 
+  /**
+   * Take back the key this agent attached, and give the mount whatever the
+   * catalogue says it had — the shared account for a seeded mount, nothing for
+   * one that was never seeded with a reference.
+   *
+   * Only an agent's own reference is removable, so this cannot be a way to
+   * clear the shared account: on a mount already using it, there is nothing of
+   * this agent's to take back and the answer is `false`.
+   */
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount || !isAgentRef(mount.secretRef)) return false;
     await this.store.removeSecret(tenantId, agentId, alias);
-    await this.store.setMountSecretRef(tenantId, agentId, alias, null);
+    await this.store.setMountSecretRef(tenantId, agentId, alias, AgentRuntime.seededSecretRef(mount));
     return true;
   }
 
@@ -946,14 +962,23 @@ export class AgentRuntime {
 
   /** What a page may show for a mount's credential. Never the value, and
    *  nothing derived from it: an account name is the far end's label. */
-  async credentialMeta(tenantId: string, agentId: string, mount: { alias: string; secretRef: string | null }) {
+  async credentialMeta(
+    tenantId: string, agentId: string, mount: { alias: string; plugin: string; secretRef: string | null },
+  ) {
     const attached = !!mount.secretRef;
     const meta = isAgentRef(mount.secretRef) ? await this.store.secretMeta(tenantId, agentId, mount.alias) : null;
     return {
       attached,
       // A reference the operator configured at deploy time, not one entered
-      // on the page: attached, and not something the page can replace.
+      // on the page.
       operator: attached && !isAgentRef(mount.secretRef),
+      // What taking the agent's own key back would leave the mount using: the
+      // shared account, or nothing. A property of the mount rather than of its
+      // current state, so it is the same answer before and after an attach —
+      // which is what lets a page offer "use your own key" and "go back to the
+      // shared one" as two views of one fact. Derived from the catalogue at
+      // read time and not stored, for the reason `seededSecretRef` gives.
+      revertsTo: AgentRuntime.seededSecretRef(mount) ? "operator" as const : "none" as const,
       verified: meta?.verified ?? false,
       account: meta?.account ?? null,
       setAt: meta?.updatedAt ?? null,
@@ -1143,6 +1168,28 @@ export class AgentRuntime {
       secretRef: null, policy: null },
 
   ];
+
+  /**
+   * The reference the catalogue seeds this mount with, or null when it seeds
+   * none — which is also the answer to "what would this mount go back to".
+   *
+   * Derived rather than stored. The catalogue is already the one place that
+   * says which mounts an agent gets and what each is seeded with, and a copy
+   * kept beside the mount would be a second answer that can disagree with it
+   * (#531). `provision` applies these at creation only, so this says what the
+   * deployed catalogue holds now, not what this agent was seeded from; where
+   * those differ, the revert points at today's answer, which is the same rule
+   * a new agent gets.
+   *
+   * Matched on alias AND plugin. `addMount` already refuses to put a different
+   * plugin on a seeded alias, so the two agree wherever a mount was made
+   * through the runtime; asking for both means this does not depend on that
+   * being true somewhere else.
+   */
+  static seededSecretRef(mount: { alias: string; plugin: string }): string | null {
+    return AgentRuntime.DEFAULT_MOUNTS
+      .find((d) => d.alias === mount.alias && d.plugin === mount.plugin)?.secretRef ?? null;
+  }
 
   /** What is installed, for a console that wants to show settings rather than
    *  guess them from whichever mounts happen to exist. */
