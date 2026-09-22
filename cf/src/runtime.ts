@@ -18,7 +18,7 @@ import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, offersPlugin, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offersPlugin, offersCapability, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -98,7 +98,7 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm, pluginEnabled, renameSafety, isExclusive } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -1306,7 +1306,10 @@ export class AgentRuntime {
     // (agents-api/provisioning.ts).
     const extras = harnessExtras({
       apiAgent: !!apiConfig, sandbox,
-      hasSandboxMount: (offered as MountedTool[]).some((t) => offersPlugin(records, [t], "sandbox")),
+      hasBackgroundMount: offersCapability(
+        records, offered as MountedTool[],
+        (id) => !!backgroundOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
+      ),
     });
     const taken = new Set([...offered.map((t) => t.name), "run_js", "jobs"]);
     const callerTools = Array.isArray(apiTools)

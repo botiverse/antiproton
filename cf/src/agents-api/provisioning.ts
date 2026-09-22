@@ -16,10 +16,14 @@ export function apiAgentSeeds<T extends { alias: string }>(defaults: readonly T[
 }
 
 /** Which of the harness's own tools the model is offered. */
-export function harnessExtras(o: { apiAgent: boolean; sandbox: boolean; hasSandboxMount: boolean }): { runJs: boolean; jobs: boolean } {
+export function harnessExtras(o: { apiAgent: boolean; sandbox: boolean; hasBackgroundMount: boolean }): { runJs: boolean; jobs: boolean } {
   return {
     runJs: o.sandbox && !o.apiAgent,
-    // Background jobs come only from the sandbox, so an API agent without one has nothing to list or stop.
-    jobs: !o.apiAgent || o.hasSandboxMount,
+    // `jobs` lists and stops work that a call left running, so it is worth
+    // offering exactly when something offered can leave work running. That was
+    // the sandbox and only the sandbox, which is why this used to ask for it by
+    // name; asked as a capability, the second plugin to declare `background`
+    // gets the tool without anyone remembering to come back here.
+    jobs: !o.apiAgent || o.hasBackgroundMount,
   };
 }
