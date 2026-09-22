@@ -43,7 +43,7 @@ import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, seal } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentRef, importKek, isAgentRef, seal, secretRefKind } from "../../src/runtime/secrets.ts";
 import {
   ensureInboundTable, hookSecretName, inboundMessage, newHookId, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
   INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
@@ -762,6 +762,25 @@ export class AgentRuntime {
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
+    // A reference this agent did not attach is not this agent's to overwrite.
+    // Nothing puts it back today: removeCredential clears to null, provision
+    // seeds a mount only when it is created, and reconcileSeed never writes
+    // the reference — so replacing the operator's account would lose it for
+    // this agent for good. The failure branch below already keeps a non-agent
+    // `previous`; this is the same judgement on the success branch, made
+    // before anything is written, and by the same test — not "is it the
+    // operator's" but "is it not ours" — so a kind of reference that does not
+    // exist on a mount today is covered the day one does. The rule used to
+    // live only in the page that hid the control (#531). Reverting instead of
+    // refusing is the feature that follows, once the catalogue is what says
+    // what to revert to.
+    if (mount.secretRef && !isAgentRef(mount.secretRef)) {
+      return {
+        ok: false,
+        error: `the ${alias} mount uses an account this agent did not attach (${secretRefKind(mount.secretRef)}), ` +
+          `which cannot yet be given back once replaced; a key of your own goes on a mount of your own`,
+      };
+    }
     const plugin = this.#plugins.find((p) => p.id === mount.plugin);
     if (!plugin?.credential) return { ok: false, error: `${mount.plugin} takes no credential` };
     const form = credentialForm(plugin.credential);
