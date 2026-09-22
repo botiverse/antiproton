@@ -103,9 +103,15 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     const release = hold();
     const second = gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY });
     await new Promise((r) => setTimeout(r, 5));
-    const third: any = await gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY });
-    must(third.error?.code === "already_attempted", `the key was free twice: ${JSON.stringify(third)}`);
+    // Asked before anything is released: a third call the guard lets through
+    // reaches the plugin and waits on the same hold, so awaiting it first would
+    // turn the defect into a hang instead of a red.
+    const third = gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY });
+    await new Promise((r) => setTimeout(r, 5));
+    must(calls.length === 1, `the key was free twice: the third call reached the plugin (${calls.length} runs)`);
     release(); await second;
+    const r3: any = await third;
+    must(r3.error?.code === "already_attempted", `the key was free twice: ${JSON.stringify(r3)}`);
     must(calls.length === 1, `the plugin ran ${calls.length} times`);
   });
 
