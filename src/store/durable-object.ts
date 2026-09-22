@@ -6,6 +6,8 @@ import type {
   AdvanceTxn, ApprovalRecord, CommitResult, Json, Lease, ModelBinding, MountPolicy, MountRecord,
   OperationRecord, OperationStatus, RuntimeEvent, TaskRecord, WaitSpec,
 } from "../core/types.ts";
+import { appendTrace } from "../trace/outbox.ts";
+import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
 
 /**
  * Durable Object SQLite backend. Same schema and same guards as the sqlite
@@ -430,18 +432,29 @@ export class DurableObjectStore implements StorageAdapter {
     result?: Json, facts?: CompletedFacts,
   ) {
     this.#tx(() => {
+      const endedAt = this.#now();
       this.#sql.exec(
         "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
-        status, resultRef, this.#now(), tenantId, operationId);
+        status, resultRef, endedAt, tenantId, operationId);
       this.#sql.exec("UPDATE waits SET resolved=1 WHERE tenant_id=? AND operation_id=? AND resolved=0",
         tenantId, operationId);
-      const op = this.#one("SELECT agent_id, task_id FROM operations WHERE tenant_id=? AND operation_id=?",
+      const op = this.#one(
+        "SELECT agent_id, task_id, mount_alias, tool, created_at FROM operations WHERE tenant_id=? AND operation_id=?",
         tenantId, operationId);
       if (op) {
         this.#insertEvent({
           tenantId, agentId: op.agent_id, taskId: op.task_id, kind: "operation.completed",
           payload: completedPayload(operationId, status, resultRef, result, facts), dedupKey: `op:${operationId}:completed`,
         });
+        // The trace row, in the same transaction as the fact it joins back to
+        // (src/trace/seams.ts). "running" is not an end and writes none.
+        if (operationEnded(status)) {
+          appendTrace(this.#sql, [toolCallRow({
+            tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
+            mountAlias: op.mount_alias, tool: op.tool, status,
+            createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
+          })]);
+        }
       }
     });
   }
@@ -682,6 +695,12 @@ export class DurableObjectStore implements StorageAdapter {
       this.#sql.exec(
         "UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?",
         decision, approver, at, tenantId, operationId);
+      // The wait is over either way; the row says how long and which way.
+      appendTrace(this.#sql, [approvalRow({
+        tenantId, agentId: r.agent_id, taskId: r.task_id, operationId,
+        mountAlias: r.mount_alias, tool: r.tool, decision, approver,
+        createdAt: Number(r.created_at), decidedAt: at,
+      })]);
       return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at }) };
     });
   }
