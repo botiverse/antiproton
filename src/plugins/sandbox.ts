@@ -1,6 +1,6 @@
 import type { Json, MountPolicy } from "../core/types.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage } from "./types.ts";
-import { backgrounded } from "./types.ts";
+import type { Plugin, PluginContext, MountActivity, MountUsage, Released } from "./types.ts";
+import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
 
@@ -536,7 +536,7 @@ const DEFAULTS = {
  */
 async function stopBox(
   ctx: PluginContext,
-): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number } | null> {
+): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number; lease: Released } | null> {
   const state = asBoxState(await ctx.connection.get());
   if (!state?.boxId || !ctx.credential) return null;
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
@@ -585,7 +585,16 @@ async function stopBox(
     // Somebody else's container is in the record. Leave it named, and add only
     // what this release knows: the session the released box just finished.
     : { ...now, sessions: keepSessions(now.sessions, session) } as unknown as Json);
-  return { boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt };
+  // Both instants travel, not just their difference: the recorder checks that
+  // the duration it stores is this fact's own `endedAt - startedAt`, and they
+  // all come from `session`, which was built from the state THIS call read.
+  return {
+    boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt,
+    lease: {
+      id: state.boxId, startedAt: session.startedAt, endedAt: session.endedAt,
+      status: error ? "error" : "freed", ...(error ? { error } : {}),
+    },
+  };
 }
 
 /**
@@ -973,14 +982,21 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  Not per task, despite what the gateway's `releaseTask` is called: the body
      *  below reads the mount's connection state and never looks at the caller's
      *  task. */
-    async release(ctx: PluginContext): Promise<boolean> {
+    async release(ctx: PluginContext): Promise<Released | false> {
       const r = await stopBox(ctx);
       if (r === null) return false;
       // A container is the one thing here billed for merely existing, so a
       // release that did not release has to say so. stopBox has reported this
       // since the day thirteen boxes were found alive; nothing was listening.
-      if (!r.freed) throw new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`);
-      return true;
+      //
+      // The throw stays — a survivor must not read as a success — but the fact
+      // rides on it, so the case that matters most (still alive, still
+      // charging) is the one case that does not go unrecorded.
+      if (!r.freed) {
+        throw markReleased(
+          new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`), r.lease);
+      }
+      return r.lease;
     },
   },
   /** `run_js` and `shell` may only have STARTED the work; see `Backgrounding`. */
@@ -1422,6 +1438,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       return {
         startingFrom: env.name, note: "the next run or shell starts from this environment",
         released: !!released,
+        // The kernel reads this by name; `released` above is the model's
+        // boolean and stays what it was.
+        ...(released ? { [LEASE_KEY]: released.lease } : {}),
         ...(released ? { releasedPrevious: released.boxId } : {}),
       };
     }
@@ -1641,10 +1660,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       }
       const r = await stopBox(ctx);
       if (!r) return { released: false, note: "nothing was running", saved: kept };
+      // Both outcomes report the lease: a release that failed is the case the
+      // recorder most needs, because that box is still alive and still billing.
       return r.freed
-        ? { released: true, box: r.boxId, liveMs: r.liveMs, saved: kept,
+        ? { released: true, box: r.boxId, liveMs: r.liveMs, saved: kept, [LEASE_KEY]: r.lease,
             note: "the container and its files are gone; anything saved above is not" }
-        : { released: false, box: r.boxId, error: r.error, saved: kept };
+        : { released: false, box: r.boxId, error: r.error, saved: kept, [LEASE_KEY]: r.lease };
     }
 
     const wd = cfg.workdir;
