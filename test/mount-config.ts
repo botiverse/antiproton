@@ -1099,6 +1099,49 @@ await check("no plugin carries the members the capability groups replaced", () =
   }
 });
 
+/**
+ * The contract page says a capability is there exactly when a plugin declares it.
+ *
+ * The case above guards the PLUGINS — none of them still carries a member the
+ * capability groups replaced. Nothing guarded the READERS of those members, and
+ * one was wrong for two commits: `scripts/plugin-map.ts` asked
+ * `has(p, "exclusive")` and `has(p, "release")`, which look a member up by
+ * STRING. When both moved inside `holds` the lookups became permanently
+ * `undefined`, so the page — the one `docs/plugins.md` calls "the contract as
+ * one page" — said that nothing in the registry holds anything. Measured on
+ * 2026-09-22: zero of each tag over a registry whose sandbox plugin holds a
+ * container. A string key cannot be wrong at compile time, which is why the
+ * generator now asks through the adapters and why this is a case.
+ *
+ * Both directions, because each catches a different defect: a tag missing while
+ * a plugin declares the capability is a reader that stopped asking, and a tag
+ * present while nothing declares it is a page describing a registry we do not
+ * ship.
+ */
+await check("the contract page shows a capability exactly when some plugin declares it", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const page = execFileSync("node", ["scripts/plugin-map.ts"], { encoding: "utf8", timeout: 120_000 });
+  for (const [tag, declared] of [
+    ["holds something releasable", everyPlugin.some((p) => !!p.holds)],
+    ["can work in the background", everyPlugin.some((p) => !!p.background)],
+    ["one call at a time", everyPlugin.some((p) => isExclusive(p))],
+  ] as const) {
+    const shown = page.includes(`class="tag">${tag}</span>`);
+    if (shown !== declared) {
+      throw new Error(shown
+        ? `the page shows "${tag}" but no installed plugin declares it — it describes a registry we do not ship`
+        : `an installed plugin declares "${tag}" and the page does not show it — the generator stopped asking`);
+    }
+  }
+  // The columns too, since a tag and a mark are rendered from the same list and
+  // only the tags would be missed if that list were split again.
+  for (const column of ["holds", "background", "provides"]) {
+    if (!page.includes(`class="rot">${column}</span>`)) {
+      throw new Error(`the overview has no \`${column}\` column, so the page cannot be read for it at a glance`);
+    }
+  }
+});
+
 await check("every plugin the catalogue seeds is installed", async () => {
   const installed = new Set(everyPlugin.map((p) => p.id));
   const missing = [...SEEDED_PLUGINS].filter((id) => !installed.has(id));

@@ -175,30 +175,76 @@ the day of the call.
 across calls and runs, and is never shown to the model. Two mounts of the same
 plugin never share it.
 
-**Use `exclusive` only when overlapping calls break something.** It stops
-every tool call in the turn from running in parallel, not only this mount's.
-
-**`defaultForAllAgents` stays off** unless every new agent should have the
-plugin. A plugin nobody asked for costs context on every turn.
-
 **The version is a pin.** Mounts record the registry's `version`, and the
 gateway refuses a call when a mount's pin and the registry disagree. Only raise
 the version, never lower it. Removing a plugin id makes every existing mount of
 it refuse every call (`test/mount-pin.ts`).
 
-**Work that outlives one call is backgrounded.** Return
-`backgrounded(handle, note)` from `invoke`, and implement `pollBackground` and
-`cancelBackground`. The handle is stored as given, so it must never carry a
-credential. `pollBackground` runs with the same context as the call. When
-`cancelBackground` returns, the work must actually have stopped; if the plugin
-cannot confirm that, it throws. Swallowing that failure reports a cancellation
-that did not happen.
+**Declare `holds` if the plugin reserves something billed** — a container, a
+session, a seat, a lease. It is one group, because the four parts are one
+decision:
 
-**Hand back what you hold.** A plugin that reserves something billed (a
-container, a session, a lease) implements `release`. It must be safe to call
-twice. It releases everything the mount holds for the agent, not only what one
-conversation used, because it runs only when nothing of the agent's is open.
-It throws when it could not let go of something that is still being billed.
+```ts
+holds: {
+  tools: { release: "release", postpone: "quiet" },
+  activity(ctx),        // what is alive right now
+  usage?(ctx),          // what it has cost, as far as this mount can say
+  release(ctx),         // let go of it
+}
+```
+
+`activity` must not need the credential and must not call anything remote: it
+is asked on a timer, and often when the credential has been removed. Read
+`ctx.connection` and answer. `release` must be safe to call twice, it releases
+everything the mount holds *for the agent* rather than what one conversation
+used, and it throws when it could not let go of something still being billed.
+
+`tools` names the plugin's own tools for the two things the framework has to be
+able to tell an agent to do. `release` is required; `postpone` is for a
+resource with a lease. **Give the key, not a sentence.** The framework resolves
+each name against what the model was actually offered, because qualification
+sanitises the alias and breaks ties at the length cap — a name rebuilt as
+`<alias>__release` resolves, and on a collision it is another mount's tool.
+
+**The framework does the reminding, and the plugin does not.** From `holds`
+alone it writes three sentences: what the agent is already holding when a
+session opens, a line after each of that mount's results, and a warning shortly
+before an idle resource is taken. So do not put any of that in a tool result.
+What *is* the plugin's — how to release it, what survives a release, the lease's
+own terms — belongs in its tool descriptions, where the model reads it every
+turn instead of on one result (`src/runtime/held.ts`, `test/held.ts`).
+
+**Serialisation follows from `holds`; there is no separate flag.** A plugin
+that holds something has its calls serialised for the whole turn, not only its
+own mount's. This used to be a member named `exclusive` that a plugin set
+itself, and it could disagree with `holds` — one of the two was then wrong with
+nothing saying which. `isExclusive` derives it, so the two cannot part.
+
+**Whether new agents get the plugin is not the plugin's to say.** There is no
+field for it. The deployment catalogue, `AgentRuntime.DEFAULT_MOUNTS` in
+`cf/src/runtime.ts`, is the only source: a plugin listed there is seeded for
+every agent, and one that is not has to be switched on and mounted. To change
+the default, change the catalogue — an agent's own answer still overrides it
+either way (`pluginEnabled`).
+
+**Declare `provides` for what the plugin can give a session.** Today the one
+value is `"container"`. The agents API picks a plugin to seed by asking what
+each one offers rather than by looking for the id `sandbox`, so a second
+plugin that can run a container is chosen without the kernel learning its
+name.
+
+**Declare `reads: "parked-result"` on a tool that can read a parked result
+back.** A result too large for the conversation is stored and replaced with a
+reference, and the runtime finds the tool that opens one by this declaration —
+not by the plugin id plus a tool name. Without it, a large result is truncated
+instead of parked, and nothing says why.
+
+**Work that outlives one call is backgrounded.** Return
+`backgrounded(handle, note)` from `invoke`, and declare `background: { poll,
+cancel }`. The handle is stored as given, so it must never carry a credential.
+`poll` runs with the same context as the call. When `cancel` returns, the work
+must actually have stopped; if the plugin cannot confirm that, it throws.
+Swallowing that failure reports a cancellation that did not happen.
 
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.
@@ -214,11 +260,15 @@ harness opens. Use it for something the
 agent should know before its first call (the `state` plugin lists the agent's
 saved notes). Return `null` when there is nothing to say. Something that
 changes often costs a re-read of everything after it on the next turn, so keep
-the paragraph stable.
+the paragraph stable — and in particular **write instants, not durations**. "in
+use since 12:03" does not move when the reader does; "idle for 7 minutes" is
+different on every rebuild, and the prompt is rebuilt on every `open`. Anything
+that has to count is a message, not a paragraph
+(`test/prompt-contributions.ts`).
 
 **The operator in the console** sees three things:
 
-- `activity(ctx)` returns a `MountActivity`: what the mount is keeping alive
+- `holds.activity(ctx)` returns a `MountActivity`: what the mount is keeping alive
   right now (`live`), how it is billed (`billing`, as a sentence) and how many
   entries of its own record it could not read (`unreadable`). The console
   panel, the idle sweep and mount renaming all read it. It must not need the
@@ -227,23 +277,24 @@ the paragraph stable.
   `unreadable` means "I could not read this", not "there is nothing". A record
   read leniently must still count what it skipped, or a broken record looks
   like an idle mount.
-- `usage(ctx)` returns the finished stretches (`MountUsage`), newest first,
+- `holds.usage(ctx)` returns the finished stretches (`MountUsage`), newest first,
   for the console's history. It may keep a rolling window. Anything that must
   be complete has to be recorded where it happens, not here.
 - `checkCredential(ctx)` returns `account`, a name a person recognises (a
   login, a project), so the console shows which account is attached rather
   than the last characters of a key.
 
-A plugin that keeps nothing alive does not implement `activity`; that reads the
-same as `{ live: null }`.
+A plugin that keeps nothing alive declares no `holds` at all, and is never
+asked: not holding anything is the whole of what it has to say. A plugin that
+holds things but has nothing alive at this moment answers `{ live: null }`.
 
 **The audit record** is written by the gateway, not the plugin. A call that
 resolves to a mount and tool is recorded as an operation (agent, mount, tool,
 version) before the policy is applied; a call held for approval is recorded
 as waiting, and a call that runs has its outcome written when it ends. The
 plugin writes nothing there, so work done by any route other than the
-plugin's own hooks (`invoke`, the background hooks, `release`) is work the
-record cannot show.
+plugin's own hooks (`invoke`, `background.poll`/`background.cancel`,
+`holds.release`) is work the record cannot show.
 
 ## Events a service pushes
 
@@ -334,9 +385,9 @@ export const statusPlugin: Plugin = {
 };
 ```
 
-The plugin does not set `defaultForAllAgents`, so it has to be switched on for
-an agent; until it is, every event is ignored at the mount check below, with
-the reason "switched off".
+This plugin is not in the deployment catalogue, so it has to be switched on
+and mounted before it does anything; until it is, every event is ignored at the
+mount check below, with the reason "switched off".
 
 Nothing the agent does can change a component's status, so this plugin needs
 no check for events the agent caused itself. A service the agent can write to
@@ -566,7 +617,8 @@ A new plugin comes with cases for at least:
 - for a structured setting, a legal value that the plugin's own code can
   actually use. Checking the declaration against the validator only compares
   the schema with itself.
-- `activity` on a missing record, on a well-formed one, and on a corrupt one.
+- `holds.activity` on a missing record, on a well-formed one, and on a corrupt
+  one.
 
 Before trusting a new case, break the code it guards and watch the suite report
 one failure; then restore it. A case that cannot go red guards nothing. Run
@@ -579,9 +631,12 @@ one failure; then restore it. A case that cannot go red guards nothing. Run
 | The contract | `src/plugins/types.ts` |
 | The contract as one page | `node scripts/plugin-map.ts` |
 | Registration | `cf/src/runtime.ts`, `AgentRuntime` constructor |
+| Which plugins new agents get | `cf/src/runtime.ts`, `AgentRuntime.DEFAULT_MOUNTS` |
 | Settings validation | `src/runtime/mount-config.ts` |
 | Policy, credentials, pins, operations | `src/runtime/gateway.ts` |
-| Model-facing tool names | `src/runtime/pi-tools.ts` |
+| Model-facing tool names | `src/runtime/pi-tools.ts` (`offeredToolName`) |
+| What an agent is holding, and the three sentences saying so | `src/runtime/held.ts`, `test/held.ts` |
+| When an idle resource is taken, and the warning | `src/runtime/idle-lease.ts`, `test/idle-lease.ts` |
 | Examples | `src/plugins/demo.ts`, `http.ts`, `github.ts` |
 | Settings and activity tests | `test/mount-config.ts` |
 | Version and plugin-id refusals | `test/mount-pin.ts` |
