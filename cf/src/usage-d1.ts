@@ -235,6 +235,15 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
   // certify historical windows it knows nothing about — a window that was
   // damaged and later healed would read as complete. Absent means no marker
   // in the window, which is the only honest shape a true/false has here.
+  //
+  // The predicate is not filtered by resource: a marker from any resource in
+  // the window sets it. That scope decides how strong a sentence may read it.
+  // As long as it is window-wide, the page may only say the figures may be
+  // incomplete, once for the whole page, never beside one number — a single
+  // figure may be whole while another resource's record was the damaged one.
+  // Narrowing this query by resource is what would allow a definite "lower
+  // bound" beside that resource's figure; the two must move together, and the
+  // page's sentence points here rather than restating this.
   const damaged = await db.prepare(
     `SELECT 1 AS x FROM usage_hourly WHERE tenant_id = ? AND hour >= ? AND hour < ? AND unit = 'unreadable'
      UNION ALL
