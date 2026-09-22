@@ -68,6 +68,7 @@ import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../sr
 import { countHeldTime } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
+import { flushTrace } from "./trace-r2.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
@@ -2033,6 +2034,14 @@ export class AgentDO extends DurableObject<Env> {
         } catch (e: any) {
           usagePending = true;
           console.warn(`usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
+        }
+        // This pass's trace rows, to R2 (cf/src/trace-r2.ts). Same terms as
+        // usage: a failure keeps the rows and asks for another pass.
+        try {
+          await flushTrace(this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+        } catch (e: any) {
+          usagePending = true;
+          console.warn(`trace flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
         }
         if (out.wakeInMs === null && usagePending) {
           await this.ctx.storage.setAlarm(Date.now() + 60_000);

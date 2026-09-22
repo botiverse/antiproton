@@ -128,6 +128,13 @@ export interface PendingTrace {
   rows: TraceOutboxRow[];
   /** Rows read but left out because kind or verdict was not the contract's vocabulary. */
   dropped: number;
+  /**
+   * The last seq this read examined (`afterSeq` when it examined none), so a
+   * drain can move its cursor past rows that were dropped: a batch made only
+   * of damaged rows would otherwise be read, dropped and warned about on every
+   * pass for ever.
+   */
+  through: number;
 }
 
 const isMember = <T extends string>(table: readonly T[], s: string): s is T =>
@@ -139,6 +146,7 @@ const isVerdict = (s: string): s is TraceVerdict => isMember(TRACE_VERDICTS, s);
 export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingTrace {
   ensureTraceOutbox(sql);
   let dropped = 0;
+  let through = afterSeq;
   const rows = sql.exec(
     "SELECT seq, at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs " +
     "FROM trace_outbox WHERE seq > ? ORDER BY seq LIMIT ?",
@@ -147,6 +155,7 @@ export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingT
     // No `as` on the way back: the type is the contract, and the contract is
     // checked against the stored string, or a wrong value rides into the
     // drain's dispatch as a "valid" one.
+    through = Math.max(through, Number(r.seq));
     const kind = String(r.kind);
     const verdict = String(r.verdict);
     if (!isKind(kind) || !isVerdict(verdict)) { dropped++; return []; }
@@ -168,7 +177,7 @@ export function pendingTrace(sql: Sql, afterSeq: number, limit = 1000): PendingT
       attrs: (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : { unparseable: true },
     }];
   });
-  return { rows, dropped };
+  return { rows, dropped, through };
 }
 
 /** Forget rows the drain already took. */
