@@ -39,11 +39,12 @@ function worker(agent: PiAgent) {
       const request = agent.takeJob(id);
       if (!request) throw new Error(`job ${id} was not available`);
       seen.push(request);
+      // Like the worker: the answer names the job that produced it.
       agent.deliver(id, fromResponse({
         text: res.text ?? "", finishReason: res.toolCalls ? "tool_calls" : "stop",
         truncated: false, toolCalls: res.toolCalls,
         usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 },
-      } as any, { api: "offloaded", provider: MODEL.provider, id: MODEL.id }));
+      } as any, { api: "offloaded", provider: MODEL.provider, id: MODEL.id }, id));
     },
   };
 }
@@ -275,6 +276,30 @@ await check("取消标记若被投射,下一轮模型请求里就有那句说明
     throw new Error(`the note is not between the cancelled request and the new one: ${JSON.stringify(texts)}`);
   }
   await agent.close();
+});
+
+await check("落库的最终条目写着是哪个 job 答的它", async () => {
+  // The spine's first link, measured on the real commit path: the answer is
+  // delivered with the job id, pi assembles and commits the final entry from
+  // it, and the stored body must still say the id. Red if the field is
+  // dropped anywhere between deliver and the entry table.
+  const f = await fixture();
+  await f.agent.say("hello");
+  await f.agent.step();
+  const [job] = f.w.pending(f.host);
+  if (!job) throw new Error("no job was queued");
+  f.w.answer(job.id, { text: "done" });
+  for (let i = 0; i < 5 && (await f.agent.step()).open !== 0; i++) { /* settle */ }
+  const bodies = (f.host.sql.exec("SELECT body FROM pi_entries ORDER BY seq").toArray() as any[])
+    .map((r) => JSON.parse(String(r.body)));
+  const answered = bodies.filter((b) => b?.message?.role === "assistant" && b.message.stopReason !== "deferred");
+  if (answered.length !== 1) throw new Error(`expected one answered entry, found ${answered.length}`);
+  if (answered[0].message.jobId !== job.id) {
+    throw new Error(`the stored answer names ${JSON.stringify(answered[0].message.jobId)}, not job ${job.id}`);
+  }
+  const placeholders = bodies.filter((b) => b?.message?.stopReason === "deferred");
+  if (!placeholders.length) throw new Error("no placeholder entry was recorded for the call");
+  await f.agent.close();
 });
 
 for (const r of results) {
