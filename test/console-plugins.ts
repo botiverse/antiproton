@@ -281,12 +281,37 @@ check("the real catalogue reaches the page: six rows say default, three say opt-
     }),
   );
   must(blocks.size === rows.length, `the page rendered ${blocks.size} blocks for ${rows.length} rows`);
+  // The two sentences are asserted word for word, and the reason is measured
+  // rather than assumed. Against a looser rule — "the two groups render
+  // differently" — the three ways this can break come out:
+  //
+  //   producer stops setting the field   distinction: RED    words: RED
+  //   the two labels are swapped         distinction: green  words: RED
+  //   wording changed, logic fine        distinction: green  words: RED
+  //
+  // The first row is why the loose rule is tempting: it does catch the bug
+  // @Rex measured (with the field `undefined` both groups render "opt-in", so
+  // they stop differing). The SECOND row is what decides it — swap the two
+  // labels and every seeded plugin reads "opt-in" while the two groups still
+  // differ, so only the word-for-word form notices. The third is the cost, and
+  // it is deliberate: a copy change has to come here.
+  //
+  // So if you are here because you changed the wording: change these two
+  // strings, do not delete the case. It is what keeps `SEEDED_PLUGINS` from
+  // silently stopping at the page.
+  const why = (id: string) => `${id} is seeded in AgentRuntime.DEFAULT_MOUNTS`;
   for (const id of seeded) {
-    must(blocks.get(id)?.includes("default for all agents"), `${id} did not render as a default`);
+    must(blocks.get(id)?.includes("default for all agents"),
+      `${why(id)}, but its row does not say "default for all agents". If the wording changed, update this `
+      + `assertion; if it now says opt-in, the producer has stopped reading the catalogue.`);
   }
   for (const id of optIn) {
-    must(blocks.get(id)?.includes("opt-in"), `${id} did not render as opt-in`);
-    must(!blocks.get(id)?.includes("default for all agents"), `${id} rendered as a default as well`);
+    must(blocks.get(id)?.includes("opt-in"),
+      `${id} is NOT in AgentRuntime.DEFAULT_MOUNTS, so its row must say "opt-in". If the wording changed, `
+      + `update this assertion.`);
+    must(!blocks.get(id)?.includes("default for all agents"),
+      `${id} is not in the catalogue yet renders as a default — the catalogue has widened, or the producer is `
+      + `no longer reading it.`);
   }
 });
 
