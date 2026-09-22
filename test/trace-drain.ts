@@ -7,7 +7,7 @@
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { appendTrace, ensureTraceOutbox, type TraceRow } from "../src/trace/outbox.ts";
-import { flushTrace, traceKey } from "../cf/src/trace-r2.ts";
+import { flushTrace, traceKey, TRACE_DROPS_KEEP_MS } from "../cf/src/trace-r2.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -118,6 +118,21 @@ await check("a pass takes at most the limit; the rest wait for the next", async 
   must(r1.rows === 5 && r1.key === "trace/t1/a1/1-5.ndjson" && cursor(host.sql) === 5 && left(host.sql) === 2, `first pass ${JSON.stringify(r1)}`);
   const r2 = await flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 5);
   must(r2.rows === 2 && r2.key === "trace/t1/a1/6-7.ndjson" && cursor(host.sql) === 7 && left(host.sql) === 0, `second pass ${JSON.stringify(r2)}`);
+});
+
+await check("the record of drops has a horizon: a put that keeps failing does not grow it for ever", async () => {
+  const host = sqliteHost(); const b = bucket(); ensureTraceOutbox(host.sql);
+  const bad = () => host.sql.exec("INSERT INTO trace_outbox(at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) VALUES (?,?,?,?,?,?,?,?,?,?)",
+    1, "t1", "a1", "not.a.kind", "x", null, "s", "ok", null, "{}");
+  const t0 = 1_700_000_000_000;
+  bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => t0));
+  bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => t0 + 1000));
+  must(drops(host.sql).length === 2, "two passes, two lines expected");
+  // A pass beyond the horizon of BOTH earlier lines keeps only its own.
+  const late = t0 + 1000 + TRACE_DROPS_KEEP_MS + 1;
+  bad(); await quiet(() => flushTrace(b, host.sql, OWNER.tenantId, OWNER.agentId, 500, () => late));
+  const d = drops(host.sql);
+  must(d.length === 1 && Number(d[0].at) === late, `lines older than the horizon survived: ${JSON.stringify(d)}`);
 });
 
 await check("a trace key is not an artifact reference and never sits in an agent's artifact scope", async () => {
