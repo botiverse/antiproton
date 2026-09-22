@@ -385,9 +385,9 @@ export function finished(
     // second such plugin said nothing at all. The framework writes it now
     // (src/runtime/held.ts, attached as `holding`), from what `holds` declares.
     // What is genuinely this plugin's — that the container is NOT the
-    // per-execution JavaScript sandbox, what /tmp does, the lease's terms, what
-    // `keep` saves — stays in the run and shell descriptions, where the model is
-    // told every turn rather than on one result.
+    // per-execution JavaScript sandbox (see the naming note on `sandboxPlugin`),
+    // what /tmp does, the lease's terms, what `keep` saves — stays in the run and
+    // shell descriptions, where the model is told every turn rather than once.
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
     // So the agent learns the environment from a result it already has,
@@ -902,7 +902,17 @@ async function reconcileGithub(
 }
 
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
-  // `run`, `shell` and every result state the same lifetime (boxReminder): with a lease, the box stays until
+  // **"container", never "sandbox"**, in every sentence below that the model
+  // reads. The harness already calls the per-execution JavaScript isolate a
+  // sandbox, and an agent told that "the sandbox keeps nothing between
+  // executions" concluded this box was volatile too — which would have it
+  // reinstalling packages on every call.
+  //
+  // It sits where the convention is applied rather than beside one of its
+  // instances, so that a change about something else cannot delete it — which
+  // is how it was lost once already.
+  //
+  // `run` and `shell` state the same lifetime: with a lease, the box stays until
   // the agent releases it or the idle ceiling takes it; without one, a settled turn hands it back.
   const runLifetime = lease
     ? "The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later " +
