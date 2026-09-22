@@ -118,13 +118,15 @@ check("an account without verified is not promoted to verified", () => {
   must(/as <code>someone<\/code>/.test(html), "the name still shows");
 });
 
-check("a reference the operator configured is included by the deployment, with no controls", () => {
+check("a reference the operator configured is included by the deployment, overridable by your own key", () => {
   const html = render(mount("node", "sandbox", { connected: true, credential: { attached: true, operator: true, verified: false, account: null } }));
   must(/included/.test(html), "must say the deployment covers it");
   must(/configured at deploy time/.test(html), "must say when");
   must(!/acting as/.test(html), "an included credential is not an account to act as");
   must(!/unverified|not yet tried/.test(html), "an operator reference is not an untried paste");
-  must(!/<input|<form|<details/.test(html), "nothing on the page can replace or remove an operator reference");
+  must(/<details><summary>use your own key<\/summary>/.test(html), "the override is offered, folded away");
+  must(/hx-post="\/ui\/credential"/.test(html), "the override posts to the attach route");
+  must(!/hx-post="\/ui\/credential\/remove"/.test(html), "there is no remove: the deployment's reference is not this page's to delete");
   must(!/undefined|null/.test(html), "nothing may render as undefined");
 });
 
@@ -141,7 +143,47 @@ check("a paste rejected over an operator reference still says why", () => {
   must(/included/.test(html), "the operator reference stays included");
   must(html.includes("&lt;b&gt;the provider rejected these keys&lt;/b&gt;"), "the reason must show, escaped");
   must(!html.includes(hostile), "the reason must not render as markup");
-  must(!/<input|<form/.test(html), "still no controls on an operator reference");
+  must(/<details><summary>use your own key<\/summary>/.test(html), "the override stays offered");
+  must(!/hx-post="\/ui\/credential\/remove"/.test(html), "still no remove on an operator reference");
+});
+
+check("your own key over a shared default: the remove is a revert, and it says where the mount ends up", () => {
+  // revertsTo is a property of the mount: it names what removing your own key
+  // returns to, and it answers the same before and after the attach.
+  const html = render(mount("gh", "github", { connected: true,
+    credential: { attached: true, verified: true, account: "botiverse", revertsTo: "operator",
+      setAt: "2026-09-11T04:00:00Z", lastUsedAt: null } }));
+  must(/acting as <code>botiverse<\/code>/.test(html), "the account still shows");
+  must(/>go back to the shared key</.test(html), "remove reads as a revert");
+  must(/Return gh to the deployment's shared account\? Your own key is dropped and the operator's comes back\./.test(html.replace(/\n/g, " ")),
+    "the confirm says the shared account comes back, not that the mount loses it");
+  must(!/>remove</.test(html), "the plain-remove button is not also there");
+  must(!/<summary>use your own key<\/summary>/.test(html), "the override control belongs to the included state, not this one");
+  must(/<details><summary>replace<\/summary>/.test(html), "replace stays available");
+});
+
+check("your own key where the catalogue names nothing: remove is a plain remove", () => {
+  // The five seeded aliases whose catalogue row has no reference, and every
+  // unseeded mount: removing deletes, the confirm says the account is lost.
+  const html = render(mount("gh", "github", { connected: true,
+    credential: { attached: true, verified: true, account: "botiverse", revertsTo: "none" } }));
+  must(/>remove</.test(html), "the button still says remove");
+  must(/Remove the credential from gh\? The agent keeps the mount but loses the account\./.test(html.replace(/\n/g, " ")),
+    "the confirm still says the account is lost");
+  must(!/go back to the shared key/.test(html), "a revert is not offered where nothing is named");
+});
+
+check("the three states are disjoint: one block renders exactly one set of controls", () => {
+  // Derived from operator and revertsTo, disjoint by the operator flag: if
+  // state two were read from revertsTo alone, the override and the revert
+  // would render at once (Rex's review of #533).
+  const included = render(mount("gh", "github", { connected: true, credential: { attached: true, operator: true, verified: false, account: null } }));
+  const overridden = render(mount("gh", "github", { connected: true, credential: { attached: true, verified: true, account: "botiverse", revertsTo: "operator" } }));
+  const own = render(mount("gh", "github", { connected: true, credential: { attached: true, verified: true, account: "botiverse", revertsTo: "none" } }));
+  const controls = /<summary>use your own key<\/summary>|>go back to the shared key<|>remove</g;
+  must(count(included, controls) === 1 && /<summary>use your own key<\/summary>/.test(included), "included: exactly the override");
+  must(count(overridden, controls) === 1 && />go back to the shared key</.test(overridden), "overridden: exactly the revert");
+  must(count(own, controls) === 1 && />remove</.test(own), "own: exactly the plain remove");
 });
 
 check("attached and unverified: says so, shows no fragment of the key, and never the word undefined", () => {

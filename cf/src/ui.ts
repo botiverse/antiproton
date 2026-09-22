@@ -1835,9 +1835,10 @@ const when = (v: unknown): string | null => {
  * and not judged — and the page keeps them apart. Unverified says why when
  * the store knows: a key kept during an outage reads "kept, could not be
  * checked", not "not yet tried", so the person knows the key is not the
- * suspect. A reference the operator
- * configured at deploy time is a third case: attached, but not by this page
- * and not changeable from it.
+ * suspect. A reference the operator configured at deploy time is a third
+ * case: attached, but not by this page. It can be overridden by your own key
+ * — a detour, not a one-way door, because the catalogue still names the
+ * deployment's reference and removing your own key returns to it (#531).
  */
 function credentialRegion(m: any, spec: CredentialSpec | null | undefined): string {
   const form = credentialForm(spec);
@@ -1860,10 +1861,10 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
       <label><span>${esc(f.summary)}${f.required ? "" : " <i>(optional)</i>"}</span>
         <input type="${f.secret ? "password" : "text"}" name="${esc(f.name)}"${f.required ? " required" : ""}
                autocomplete="off" spellcheck="false"></label>`).join("");
-  const paste = (verb: string) => `
+  const paste = (verb: string, showError = true) => `
     <form hx-post="/ui/credential" ${target}>
       <input type="hidden" name="alias" value="${esc(m.alias)}">${inputs}
-      ${error ? `<div class="err">${esc(error)}</div>` : ""}
+      ${showError && error ? `<div class="err">${esc(error)}</div>` : ""}
       <div class="row"><button type="submit">${verb}</button></div>
     </form>`;
 
@@ -1887,30 +1888,43 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   const times = [setAt ? `set ${setAt}` : "", usedAt ? `last used ${usedAt}` : ""].filter(Boolean).join(" · ");
 
   // A reference the operator configured at deploy time is attached, but it is
-  // not in this agent's store: nothing here set it, and nothing here can
-  // replace or remove it. Say it is included by the deployment and offer no
-  // controls. A paste rejected on top of it still reports its reason, or the
-  // person who pasted wrong keys over the operator's is shown no change at all.
+  // not in this agent's store. Overriding it is a detour, not a one-way door
+  // (#531): the deployment's reference is still named by the catalogue, so
+  // removing your own key gives the shared account back. Offer the override
+  // folded away, and no remove — there is nothing here to remove, the
+  // deployment's reference is not this page's to delete. A paste rejected on
+  // top of it still reports its reason outside the fold.
   if (c.operator === true) {
     // "Included": an operator-attached credential means the deployment covers
-    // this mount — there is nothing to configure, and nothing acting "as" an
-    // account. "Limited Free" names the deployment's plan; it lives here and
-    // nowhere else, because it is presentation, not a field.
+    // this mount — nothing acting "as" an account. "Limited Free" names the
+    // deployment's plan; it lives here and nowhere else, because it is
+    // presentation, not a field.
     return `<div class="cred">
       <div class="state"><b>included</b><span class="tag">Limited Free</span><span class="when">configured at deploy time${times ? ` · ${times}` : ""}</span></div>
       ${error ? `<div class="err">${esc(error)}</div>` : ""}
+      <details><summary>use your own key</summary>${paste("use your own key", false)}</details>
     </div>`;
   }
 
+  // `revertsTo` is a property of the mount, not of what is attached now: it
+  // says what removing your own key would return to, and it answers the same
+  // before and after an attach. "operator" means the catalogue names a shared
+  // account for this alias, so remove is a revert, not a deletion — the
+  // button and its warning say where the mount ends up. "none" (the five
+  // seeded aliases whose catalogue row has no reference, and every unseeded
+  // mount) is today's plain remove.
+  const shared = c.revertsTo === "operator";
   const state = verified
     ? `<b>attached · verified</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}`
     : `<b class="unverified">attached · unverified</b>${account ? `<span>as <code>${esc(account)}</code></span>` : ""}<span class="when">${error ? esc(error) : "stored, not yet tried"}</span>`;
   return `<div class="cred">
       <div class="state">${state}${times ? `<span class="when">${times}</span>` : ""}
         <form class="inline" hx-post="/ui/credential/remove" ${target}
-              hx-confirm="Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.">
+              hx-confirm="${shared
+                ? `Return ${esc(m.alias)} to the deployment's shared account? Your own key is dropped and the operator's comes back.`
+                : `Remove the credential from ${esc(m.alias)}? The agent keeps the mount but loses the account.`}">
           <input type="hidden" name="alias" value="${esc(m.alias)}">
-          <button type="submit" class="ghost">remove</button>
+          <button type="submit" class="ghost">${shared ? "go back to the shared key" : "remove"}</button>
         </form></div>
       <details><summary>replace</summary>${paste("replace")}</details>
     </div>`;
