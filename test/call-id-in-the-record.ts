@@ -54,7 +54,7 @@ async function fixture(fail: boolean, backend: keyof typeof BACKENDS = "sqlite")
     tenantId: "t", agentId: "a", alias: "svc", plugin: "svc", installationId: "i", connectionId: null,
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
   });
-  return { store, gw: new ToolGateway(store, [{ ...plugin("svc", fail) }], { async resolve() { return null; } }) };
+  return { store, gw: new ToolGateway(store, [{ ...plugin("svc", fail) }], new Set(([{ ...plugin("svc", fail) }]).map((p: any) => p.id)), { async resolve() { return null; } }) };
 }
 
 const completed = async (store: any) =>

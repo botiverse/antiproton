@@ -38,8 +38,6 @@ export const READ_WHOLE_MAX = 32 * 1024;
 export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin {
   return {
     id: "artifacts",
-    // Without it a parked result is a reference the agent cannot open.
-    defaultForAllAgents: true,
     version: "1.0.0",
 
     /**

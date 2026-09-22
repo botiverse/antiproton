@@ -80,7 +80,7 @@ await check("the gateway hands the value to the plugin's call context and to not
   } as any;
   await store.addMount({ tenantId: "t", agentId: "a", alias: "gh", plugin: "echo", installationId: "i",
     connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: agentRef("gh") });
-  const gw = new ToolGateway(store, [plugin], agentSecrets(store, k, { resolve: async () => null }));
+  const gw = new ToolGateway(store, [plugin], new Set(([plugin]).map((p: any) => p.id)), agentSecrets(store, k, { resolve: async () => null }));
   const r = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "task1" }, "gh.ping", {});
   if (r.status !== "succeeded") throw new Error(`call failed: ${JSON.stringify(r)}`);
   if (seen !== VALUE) throw new Error("plugin did not receive the value");
@@ -119,7 +119,7 @@ await check("checkMount reports a refused key and an unanswered one as different
   const unreachable = mk("unr", { ok: false, kind: "unreachable", reason: "fetch failed" });
   await store.addMount({ tenantId: "t", agentId: "a", alias: "p", plugin: "rej", installationId: "i", connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: agentRef("p") });
   await store.addMount({ tenantId: "t", agentId: "a", alias: "q", plugin: "unr", installationId: "i", connectionId: null, toolVersion: "1", publicConfig: {}, secretRef: agentRef("p") });
-  const gw = new ToolGateway(store, [rejected, unreachable], agentSecrets(store, k, { resolve: async () => null }));
+  const gw = new ToolGateway(store, [rejected, unreachable], new Set(([rejected, unreachable]).map((p: any) => p.id)), agentSecrets(store, k, { resolve: async () => null }));
   const r1: any = await gw.checkMount("t", "a", "p"); const r2: any = await gw.checkMount("t", "a", "q");
   if (!r1 || r1.ok || r1.kind !== "rejected") throw new Error(`rejected not reported: ${JSON.stringify(r1)}`);
   if (!r2 || r2.ok || r2.kind !== "unreachable") throw new Error(`unreachable not reported: ${JSON.stringify(r2)}`);

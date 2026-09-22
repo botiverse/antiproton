@@ -718,14 +718,26 @@ export type PluginChoice = "enable" | "disable" | "inherit";
  * differently. The order matters and is the whole design: **an agent's own
  * answer wins, and only silence inherits.** A plugin whose default flips must
  * not move an agent that has already chosen.
+ *
+ * `seeded` is "is this plugin in the operator's catalogue", and it arrives as a
+ * value rather than being read off the plugin. Who should have a plugin is a
+ * product decision, and it used to be declared by the plugin itself — two
+ * places for one fact, kept in step by a test. The catalogue
+ * (`AgentRuntime.DEFAULT_MOUNTS`) is now the only one.
+ *
+ * A boolean rather than the plugin, deliberately: the parameter changing type
+ * makes the compiler name every caller. Had this kept taking the plugin and
+ * merely read a different field, every call site would have stayed legal and
+ * finding them would have been a search — which is how three readers of
+ * `exclusive` were nearly missed in step 1 of this refactor.
  */
 export function pluginEnabled(
-  plugin: Pick<Plugin, "defaultForAllAgents">,
+  seeded: boolean,
   choice: PluginChoice | null | undefined,
 ): boolean {
   if (choice === "enable") return true;
   if (choice === "disable") return false;
-  return plugin.defaultForAllAgents === true;
+  return seeded;
 }
 
 /**

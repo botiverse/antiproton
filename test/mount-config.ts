@@ -9,7 +9,7 @@ import { readFile } from "node:fs/promises";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { pluginEnabled, renameSafety, type PluginChoice, isExclusive } from "../src/plugins/types.ts";
-import { AgentRuntime } from "../cf/src/runtime.ts";
+import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
@@ -207,6 +207,32 @@ await check("every plugin the runtime registers is in everyPlugin", () => {
   const missing = registered.filter((id) => !listed.has(id));
   if (missing.length) {
     throw new Error(`registered but not in everyPlugin, so no check below covers them: ${missing.join(", ")}`);
+  }
+  // And the other direction, which this case did not have (@Rex, 2026-09-22):
+  // an entry in the list that the runtime does not register makes every check
+  // below assert something about a plugin production never loads. The one
+  // direction reads like completeness and is only half of it.
+  //
+  // Not a plain subset either way, so the exception is NAMED rather than the
+  // assertion loosened: the appworld plugins are in the list on purpose and are
+  // deliberately not registered in the Worker. Their users are
+  // `scripts/plugin-map.ts`, `test/appworld.ts` and this file — measured, not
+  // assumed: `bench/` does not mention them at all, which is why calling them
+  // "the benchmark's" was wrong (@Rex corrected his own suggestion and mine,
+  // 2026-09-22). So the reverse holds against the union with this set, and a
+  // future plugin that lives outside the Worker has one place to say so.
+  const outsideTheWorker = new Set(
+    appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }).map((p) => p.id),
+  );
+  const stray = [...listed].filter((id) => !registered.includes(id) && !outsideTheWorker.has(id));
+  if (stray.length) {
+    throw new Error(
+      `in everyPlugin but not registered by the runtime, so the checks below describe something production does `
+      + `not load: ${stray.join(", ")}. If it belongs outside the Worker, say so where outsideTheWorker is built.`,
+    );
+  }
+  if (outsideTheWorker.size === 0) {
+    throw new Error("the exception set is empty, so the reverse rule is unconstrained");
   }
 });
 
@@ -1001,55 +1027,58 @@ await check("the artifacts paragraph names the mount it came from, whatever it i
  * silently re-arms it for the people who turned it off.
  */
 await check("an agent's own answer beats the plugin default, in both directions", async () => {
-  const onByDefault = { defaultForAllAgents: true };
-  const optIn = { defaultForAllAgents: false };
-  const undeclared = {};
-
-  const cases: Array<[typeof optIn | Record<string, never>, PluginChoice | null | undefined, boolean, string]> = [
-    [onByDefault, "inherit", true, "inherit follows a default of on"],
-    [onByDefault, null, true, "no record is the same as inherit"],
-    [onByDefault, undefined, true, "an absent record is the same as inherit"],
-    [onByDefault, "disable", false, "an agent may refuse what everyone else gets"],
-    [optIn, "inherit", false, "inherit follows a default of off"],
-    [optIn, "enable", true, "an agent may ask for what nobody else gets"],
-    [undeclared, "inherit", false, "a plugin that did not declare belongs to nobody by default"],
-    [undeclared, "enable", true, "and can still be asked for"],
+  // The default now arrives as `seeded` — "is this plugin in the operator's
+  // catalogue" — rather than being read off the plugin. Same rule, one source.
+  const cases: Array<[boolean, PluginChoice | null | undefined, boolean, string]> = [
+    [true, "inherit", true, "inherit follows a seeded plugin"],
+    [true, null, true, "no record is the same as inherit"],
+    [true, undefined, true, "an absent record is the same as inherit"],
+    [true, "disable", false, "an agent may refuse what everyone else gets"],
+    [false, "inherit", false, "inherit follows an unseeded plugin"],
+    [false, "enable", true, "an agent may ask for what nobody else gets"],
+    [false, "disable", false, "and may refuse what it was never given"],
   ];
-  for (const [plugin, choice, want, why] of cases) {
-    const got = pluginEnabled(plugin as any, choice);
-    if (got !== want) throw new Error(`${why}: pluginEnabled(${JSON.stringify(plugin)}, ${JSON.stringify(choice)}) = ${got}`);
+  for (const [seeded, choice, want, why] of cases) {
+    const got = pluginEnabled(seeded, choice);
+    if (got !== want) throw new Error(`${why}: pluginEnabled(${seeded}, ${JSON.stringify(choice)}) = ${got}`);
   }
 });
 
 /**
- * What the declarations say today, held against what is actually seeded.
+ * Every row of the catalogue names a plugin that is actually installed.
  *
- * The flag is only worth having if it means the same thing the seed list means,
- * and the two live in different files — one in each plugin, one in
- * `cf/src/runtime.ts`. This is the test that notices when they drift: a plugin
- * that starts claiming every agent without being seeded, or a seed for a plugin
- * that says it belongs to nobody.
+ * This case used to hold two lists against each other — `defaultForAllAgents`
+ * on each plugin, against `DEFAULT_MOUNTS` in `cf/src/runtime.ts` — and it
+ * existed because either could drift from the other. There is one list now, so
+ * there is no drift to catch; what is left to go wrong is a row naming a plugin
+ * nobody installs, which would seed a mount whose tools can never be offered.
  *
- * `demo` needed an exception while it was leaving the seed list (#213). It has
- * left, so the exception is gone: it now passes the same way every other opt-in
- * plugin does — declared by nobody, seeded by nobody — and if anyone puts it
- * back in either place without the other, this fails.
+ * So the rule inverts: from "the two agree" to "the one exists". `demo` needed
+ * an exception while it was leaving the seed list (#213); it has left, and with
+ * one source there is nothing for it to disagree with.
  */
-await check("the plugins that claim every agent are the ones actually seeded", async () => {
-  const declared = new Set(
-    [statePlugin({} as any, null, "b"), httpPlugin, githubPlugin, run9, demoPlugin]
-      .filter((p) => (p as any).defaultForAllAgents === true)
-      .map((p) => p.id),
-  );
-  // The two builtin ones are constructed with runtime handles this suite does
-  // not have; their ids are checked against the seed list instead.
-  const seeded = new Set(AgentRuntime.DEFAULT_MOUNTS.map((m) => m.plugin));
-  for (const id of declared) {
-    if (!seeded.has(id)) throw new Error(`${id} claims every agent but nothing seeds it`);
+await check("every plugin the catalogue seeds is installed", async () => {
+  const installed = new Set(everyPlugin.map((p) => p.id));
+  const missing = [...SEEDED_PLUGINS].filter((id) => !installed.has(id));
+  if (missing.length) {
+    throw new Error(`the catalogue seeds ${missing.join(", ")}, which nothing installs — those mounts can never be offered`);
   }
-  for (const id of seeded) {
-    if (id === "tools" || id === "artifacts") continue;
-    if (!declared.has(id)) throw new Error(`${id} is seeded to every agent but does not declare it`);
+  // Without this the rule passes on an empty catalogue, which is the one state
+  // that would make every agent start with nothing and say nothing about it.
+  if (SEEDED_PLUGINS.size !== 6) {
+    throw new Error(`expected six seeded plugins, found ${SEEDED_PLUGINS.size}: ${[...SEEDED_PLUGINS].join(", ")}`);
+  }
+  // The sandbox in particular, and for a reason that is not about mounts.
+  //
+  // The idle scan tells the agent to "call `<alias>.release`" — and it does not
+  // build that name, it looks it up in the list the model was actually offered
+  // (`offeredName` → `#catalogueFor` → `enabledMounts`). So this set decides
+  // whether that sentence appears at all: unseed the sandbox and the warning
+  // silently stops naming the way out, while nothing else changes. @Rex traced
+  // the coupling to the tool name; the dependency runs through the offered
+  // list, which is why no search for `enabledMounts` finds it (2026-09-22).
+  if (!SEEDED_PLUGINS.has("sandbox")) {
+    throw new Error("the sandbox is not seeded, so the idle warning can no longer name `release` or `quiet`");
   }
 });
 
@@ -1872,7 +1901,7 @@ await check("the gateway's sibling names the plugin of the mount it found", asyn
   await mount("p", "probe", null);
   await mount("gh", "github", "ref:gh");
   await mount("held", "github", "ref:gh", { write: "approval" });
-  const gw = new ToolGateway(store, [probe, github], { async resolve(ref: string) { return ref === "ref:gh" ? "tok" : null; } } as any);
+  const gw = new ToolGateway(store, [probe, github], new Set(([probe, github]).map((p: any) => p.id)), { async resolve(ref: string) { return ref === "ref:gh" ? "tok" : null; } } as any);
   const r: any = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "p.peek", {});
   if (r.status !== "succeeded") throw new Error(`the probe did not run: ${JSON.stringify(r)}`);
   if (r.result.found?.plugin !== "github" || r.result.found.credential !== "tok") throw new Error(`sibling answered ${JSON.stringify(r.result.found)}`);

@@ -63,7 +63,7 @@ for (const p of plugins) {
 const secrets: SecretResolver = {
   async resolve(ref) { return credentialFor(ref.replace(/^aw:/, "")); },
 };
-const gw = new ToolGateway(store, plugins, secrets);
+const gw = new ToolGateway(store, plugins, new Set((plugins).map((p: any) => p.id)), secrets);
 const ctx = { tenantId: T, agentId: AGENT, taskId: TASK_ID };
 
 // ---------------------------------------------------------------- cases

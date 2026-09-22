@@ -47,6 +47,10 @@ async function runtime(opts: { hooks?: boolean } = {}) {
   await rt.ready();
   for (const agentId of ["a", "b"]) {
     await rt.store.createAgent("t", agentId);
+    // Installed here, absent from the deployment's catalogue: switched on per
+    // agent, the same way a person would. These plugins used to enable
+    // themselves with `defaultForAllAgents`.
+    for (const id of ["pushy", "quiet"]) await rt.store.setPluginChoice("t", agentId, id, "enable");
     for (const [alias, plugin] of [["p", "pushy"], ["p2", "pushy"], ["q", "quiet"]]) {
       await rt.store.addMount({ tenantId: "t", agentId, alias, plugin, installationId: "i", connectionId: null,
         toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });

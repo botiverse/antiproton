@@ -26,7 +26,7 @@ await store.addMount({
   publicConfig: { account: "unauthenticated" }, secretRef: null,
 });
 
-const gw = new ToolGateway(store, [githubPlugin]);
+const gw = new ToolGateway(store, [githubPlugin], new Set(([githubPlugin]).map((p: any) => p.id)));
 const ctx = { tenantId: T, agentId: "agent-1", taskId: "task-1" };
 
 const t0 = performance.now();

@@ -82,7 +82,7 @@ async function fixture(secretRef: string | null, backend: keyof typeof BACKENDS 
   });
   // A reference that names a credential nobody can read: exactly what
   // `agentSecrets` answers for a missing row.
-  return { gw: new ToolGateway(store, [plugin], { async resolve() { return null; } }), seen, store };
+  return { gw: new ToolGateway(store, [plugin], new Set(([plugin]).map((p: any) => p.id)), { async resolve() { return null; } }), seen, store };
 }
 
 await check("the context says what kind of credential the mount names", async () => {

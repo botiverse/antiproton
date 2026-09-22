@@ -10,6 +10,7 @@
  * ever reaches the markup.
  */
 import { page, plugins, mountFragment, mountBlockId, mountList, bareTool, catalogue, approvals, agentList, avatarSvg, AVATAR_JS } from "../cf/src/ui.ts";
+import { AgentRuntime, SEEDED_PLUGINS, installedRows } from "../cf/src/runtime.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -233,6 +234,60 @@ check("the mount list names each mount, its plugin and its credential state, and
   must(/<details class="plug">/.test(cat) && /somewhere/.test(cat), "the catalogue lists the installed plugins");
   must(/Mounting one is a separate, deliberate act/.test(cat), "and says mounting is separate");
   must(plugins(d).includes(cat.slice(0, 60)), "the whole page still composes the catalogue");
+});
+
+/**
+ * The producer and the page, in one case, with no fixture between them.
+ *
+ * Every other case here hands `catalogue()` a hand-written `installed` array,
+ * so the rule that turns the operator's catalogue into the words "default for
+ * all agents" had no test between its ends: `uiPlugins` is named in one file
+ * and no test mentions it, and deleting the line that reads `SEEDED_PLUGINS`
+ * left every existing case green while the page told every reader that the six
+ * seeded plugins are opt-in (@Rex measured it; @Nova wrote a case that missed
+ * it for exactly this reason and withdrew it, #492).
+ *
+ * So this one starts at the real registry and the real catalogue and ends at
+ * the rendered string. **Both groups are asserted**, not just the seeded six:
+ * a case that only checks "these six say default" stays green when the
+ * catalogue widens to everything, because the six are still in it. The three
+ * opt-in rows are what notice that direction.
+ */
+check("the real catalogue reaches the page: six rows say default, three say opt-in", () => {
+  const rt = new AgentRuntime({
+    ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b",
+    models: { resolve: () => null } as any,
+  } as any);
+  const rows = installedRows(rt.plugins(), {}, SEEDED_PLUGINS);
+  if (rows.length < 9) throw new Error(`the registry produced ${rows.length} rows, so this compares almost nothing`);
+
+  const seeded = rows.filter((r) => r.defaultForAllAgents).map((r) => r.id).sort();
+  const optIn = rows.filter((r) => !r.defaultForAllAgents).map((r) => r.id).sort();
+  must(seeded.join() === "artifacts,github,http,sandbox,state,tools",
+    `the seeded rows are ${seeded.join()}`);
+  must(optIn.join() === "demo,exa,raft", `the opt-in rows are ${optIn.join()}`);
+
+  // And the words, read out of the rendered page rather than the payload.
+  //
+  // Split on the block boundary rather than taking N characters after the id:
+  // a fixed window is a truncation, and a truncated read that finds nothing
+  // cannot be told from a row that says nothing (this is how the first version
+  // of this case failed on `artifacts`, whose chip sits past 400 characters).
+  const html = catalogue({ installed: rows, mounts: [], used: {} });
+  const blocks = new Map(
+    html.split('<details class="plug">').slice(1).map((b) => {
+      const id = /<b>([^<]+)<\/b>/.exec(b)?.[1] ?? "";
+      return [id, b] as const;
+    }),
+  );
+  must(blocks.size === rows.length, `the page rendered ${blocks.size} blocks for ${rows.length} rows`);
+  for (const id of seeded) {
+    must(blocks.get(id)?.includes("default for all agents"), `${id} did not render as a default`);
+  }
+  for (const id of optIn) {
+    must(blocks.get(id)?.includes("opt-in"), `${id} did not render as opt-in`);
+    must(!blocks.get(id)?.includes("default for all agents"), `${id} rendered as a default as well`);
+  }
 });
 
 check("an unknown mount alias is said back, escaped", () => {

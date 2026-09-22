@@ -43,7 +43,7 @@ async function fixture(refs: Record<string, string | null>, held: Record<string,
       toolVersion: "1.0.0", publicConfig: {}, secretRef, policy: null,
     });
   }
-  return new ToolGateway(store, [box], { async resolve(ref: string) { return held[ref] ?? null; } });
+  return new ToolGateway(store, [box], new Set(([box]).map((p: any) => p.id)), { async resolve(ref: string) { return held[ref] ?? null; } });
 }
 
 await check("a mount that names nothing reads as none, not as a credential that failed to arrive", async () => {
@@ -115,7 +115,7 @@ await check("a failed call carries the identity as fields, not only inside the s
       tools: [{ name: "run", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
       async invoke(_t, _a, c) { throw markIdentity(new Error("github 403: rate limited"), c as PluginContext); },
     };
-    const gw = new ToolGateway(store, [sulky], { async resolve() { return null; } });
+    const gw = new ToolGateway(store, [sulky], new Set(([sulky]).map((p: any) => p.id)), { async resolve() { return null; } });
     const r: any = await gw.invoke(ctx, "work.run", {});
     assert(r.status === "failed", `status: ${r.status}`);
     assert(r.error.identity === "unreadable" && r.error.credentialRef === "agent",
@@ -141,7 +141,7 @@ await check("a plugin that said nothing about identity still produces the error 
       toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
     });
     void gw;
-    const g2 = new ToolGateway(store, [silent], { async resolve() { return null; } });
+    const g2 = new ToolGateway(store, [silent], new Set(([silent]).map((p: any) => p.id)), { async resolve() { return null; } });
     const r: any = await g2.invoke(ctx, "work.run", {});
     assert(!("identity" in r.error) && !("credentialRef" in r.error),
       `absent fields were invented: ${JSON.stringify(r.error)}`);

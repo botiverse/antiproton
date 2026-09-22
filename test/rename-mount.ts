@@ -150,7 +150,7 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
       return { live: st?.boxId ? { id: st.boxId, startedAt: st.createdAt ?? 0, lastUsedAt: st.createdAt ?? 0 } : null };
     },
   };
-  const gw = new ToolGateway(store, [holding], { async resolve() { return null; } });
+  const gw = new ToolGateway(store, [holding], new Set(([holding]).map((p: any) => p.id)), { async resolve() { return null; } });
   const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
 
   const busy = await gw.mountActivity(ctx, "node");
@@ -171,7 +171,7 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
 
   // A plugin that never heard of containers, and a mount of a plugin that is
   // not installed at all: both answer the true thing rather than throwing.
-  const quiet = new ToolGateway(store, [{ id: "run9", version: "1.0.0", tools: [], async invoke() { return {}; } }], { async resolve() { return null; } });
+  const quiet = new ToolGateway(store, [{ id: "run9", version: "1.0.0", tools: [], async invoke() { return {}; } }], new Set(([{ id: "run9", version: "1.0.0", tools: [], async invoke() { return {}; } }]).map((p: any) => p.id)), { async resolve() { return null; } });
   if ((await quiet.mountActivity(ctx, "node")).live) throw new Error("a plugin with no activity() was read as busy");
   if ((await gw.mountActivity(ctx, "ghost")).live) throw new Error("a mount that does not exist was read as busy");
 });

@@ -84,7 +84,9 @@ async function runTask(task: any, verbose: boolean) {
       publicConfig: { account: "benchmark" }, secretRef: null, policy: null,
     });
   }
-  const gw = new ToolGateway(store, plugins);
+  // As in the swebench runner: what this run mounts (retail + tools) is its
+  // whole catalogue, so the registry's ids are the set.
+  const gw = new ToolGateway(store, plugins, new Set(plugins.map((p) => p.id)));
   const ctx = { tenantId: T, agentId: AGENT, taskId: "main" };
   const host = { invoke: (c: any): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
 

@@ -94,7 +94,7 @@ await check("a tool call through a mount is counted once, as ok or failed, with 
   };
   await store.addMount({ tenantId: "t", agentId: "a", alias: "m", plugin: "p", installationId: "i", connectionId: null,
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
-  const gw = new ToolGateway(store, [p]);
+  const gw = new ToolGateway(store, [p], new Set(([p]).map((p: any) => p.id)));
   const ctx = { tenantId: "t", agentId: "a", taskId: "k" };
   await gw.invoke(ctx, "m.fine", {});
   await gw.invoke(ctx, "m.boom", {});

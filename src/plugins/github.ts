@@ -422,9 +422,6 @@ const PAGE_ARGS = {
 
 export const githubPlugin: Plugin = {
   id: "github",
-  // Useful with no credential at all — public repositories are most of what
-  // an agent is asked to look at.
-  defaultForAllAgents: true,
   version: "2.0.0",
   credential: {
     // Optional, not absent: without a token this mount still reads public
