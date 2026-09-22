@@ -951,6 +951,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   defaultForAllAgents: true,
   /** This mount holds a container: something real, billed while it exists.
    *  The three below are one decision, not three — see `Holding`. */
+  // What this plugin can give a session. Declared so the agents API can pick
+  // the mount that provides a container by asking what a plugin offers
+  // rather than by matching the alias `sandbox` — an alias is the operator's
+  // to choose, so matching on it makes a rename a silent behaviour change.
+  provides: ["container"],
   holds: {
     /** What this mount is keeping alive, read from its own state and nothing
      *  else: no credential, no call to run9. */

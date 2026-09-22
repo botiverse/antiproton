@@ -10,9 +10,24 @@
  * a session with `environment: { type: "openai_hosted" }` gets the sandbox mount.
  */
 
-/** The seed mounts for an API agent's first input in a session with this environment. */
-export function apiAgentSeeds<T extends { alias: string }>(defaults: readonly T[], environment: "none" | "container"): T[] {
-  return environment === "container" ? defaults.filter((m) => m.alias === "sandbox") : [];
+/**
+ * The seed mounts for an API agent's first input in a session with this environment.
+ *
+ * Picked by what the plugin says it provides, not by the alias `sandbox`. The
+ * alias belongs to the operator: renaming that row used to mean a session
+ * asking for a container silently got none, with `environment: "container"`
+ * honoured by giving it nothing.
+ *
+ * `provides` is asked of the plugin, so the caller passes the lookup — the
+ * catalogue rows carry a plugin id and this module does not hold a registry.
+ */
+export function apiAgentSeeds<T extends { alias: string; plugin: string }>(
+  defaults: readonly T[],
+  environment: "none" | "container",
+  provides: (plugin: string) => readonly string[] | undefined,
+): T[] {
+  if (environment !== "container") return [];
+  return defaults.filter((m) => provides(m.plugin)?.includes("container"));
 }
 
 /** Which of the harness's own tools the model is offered. */
