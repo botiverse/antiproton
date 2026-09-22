@@ -10,6 +10,7 @@
  * joins correctly and is still wrong; the recorder asserts the arithmetic).
  */
 import type { OperationStatus } from "../core/types.ts";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { TraceRow, TraceVerdict } from "./outbox.ts";
 
 /**
@@ -67,5 +68,48 @@ export function approvalRow(a: {
     status: a.decision, verdict: a.decision === "approved" ? "ok" : "blocked",
     ms: Math.max(0, a.decidedAt - a.createdAt),
     attrs: { tool: a.tool, mount: a.mountAlias, task: a.taskId, approver: a.approver },
+  };
+}
+
+/**
+ * A model call's span closes when its answer is committed as an entry. The
+ * answer carries the job id it came from (src/model/pi-bridge.ts, `jobId`),
+ * so the row joins back to `pi_model_jobs` by that id; the placeholder and
+ * any poll entries carry "deferred"/"pending" and are not ends.
+ */
+export function answerEnded(stopReason: AssistantMessage["stopReason"]): boolean {
+  return stopReason === "stop" || stopReason === "length" || stopReason === "toolUse"
+    || stopReason === "error" || stopReason === "aborted";
+}
+
+/**
+ * `length` is a reply that was cut off but said something — usable, and the
+ * harness tells the model so — so it reads as ok with the raw reason kept in
+ * `status`; a reply that was cut off and said nothing arrives as `error`.
+ */
+export function answerVerdict(stopReason: AssistantMessage["stopReason"]): TraceVerdict {
+  switch (stopReason) {
+    case "stop": case "length": case "toolUse": return "ok";
+    case "error": return "failed";
+    case "aborted": return "cancelled";
+    // Not ends; callers ask answerEnded first. Named so the switch stays
+    // exhaustive when pi adds a reason.
+    case "pending": case "deferred": return "failed";
+  }
+}
+
+/** The model.call row for an answer that just landed as an entry. */
+export function modelCallRow(m: {
+  tenantId: string; agentId: string; jobId: string; stopReason: AssistantMessage["stopReason"];
+  model: string; at: number; createdAt?: number | null; answeredAt?: number | null;
+}): TraceRow {
+  const ms = typeof m.createdAt === "number" && typeof m.answeredAt === "number"
+    ? Math.max(0, m.answeredAt - m.createdAt) : undefined;
+  return {
+    at: m.at, tenantId: m.tenantId, agentId: m.agentId,
+    kind: "model.call", spanId: m.jobId,
+    status: m.stopReason, verdict: answerVerdict(m.stopReason),
+    ...(ms === undefined ? {} : { ms }),
+    attrs: { model: m.model },
   };
 }
