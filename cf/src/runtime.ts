@@ -960,8 +960,18 @@ export class AgentRuntime {
     return this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
   }
 
-  /** What a page may show for a mount's credential. Never the value, and
-   *  nothing derived from it: an account name is the far end's label. */
+  /**
+   * What a page may show for a mount's credential. Never the value, and
+   * nothing derived from it: an account name is the far end's label.
+   *
+   * Two of these answer different kinds of question, and a page reading one
+   * for the other would offer "use your own key" and "go back to the shared
+   * one" at the same time. `attached`, `operator`, `verified`, `account` and
+   * the dates are **state**: what is on this mount now, and each changes when
+   * a key is attached or taken back. `revertsTo` is a **property**: what this
+   * mount would fall back to, which is the same answer before and after an
+   * attach because it is the catalogue's and not the mount's.
+   */
   async credentialMeta(
     tenantId: string, agentId: string, mount: { alias: string; plugin: string; secretRef: string | null },
   ) {
@@ -970,7 +980,7 @@ export class AgentRuntime {
     return {
       attached,
       // A reference the operator configured at deploy time, not one entered
-      // on the page.
+      // on the page. State: true only while the shared account is the one in use.
       operator: attached && !isAgentRef(mount.secretRef),
       // What taking the agent's own key back would leave the mount using: the
       // shared account, or nothing. A property of the mount rather than of its
