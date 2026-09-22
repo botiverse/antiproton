@@ -979,7 +979,12 @@ export function trajectory(
 
     if (s.kind === "js.result" || s.kind === "tool.result") {
       const label = s.kind === "js.result" ? "sandbox" : `tool ${p.tool ?? ""}`;
-      const body = s.kind === "js.result" ? p.outputs : p.content;
+      // `tool.result` carries the call's return under `result`, not `content`:
+      // the field was renamed when the loop became pi's, and this reader kept
+      // the old name, so every tool step here printed `undefined`. It also fed
+      // the held check below, so a call waiting on approval drew no badge.
+      // `callRow` has always read `result`; the two now agree.
+      const body = s.kind === "js.result" ? p.outputs : p.result;
       const bad = s.kind === "js.result" && p.status !== "completed";
       // A held call surfaces here as a pending result; show it as the gate it is.
       const heldText = typeof body === "string" ? body : JSON.stringify(body ?? "");
