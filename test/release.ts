@@ -35,7 +35,7 @@ async function fixture(plugins: Plugin[]) {
       publicConfig: {}, secretRef: null, policy: null,
     });
   }
-  const gw = new ToolGateway(store, plugins, { async resolve() { return null; } });
+  const gw = new ToolGateway(store, plugins, new Set((plugins).map((p: any) => p.id)), { async resolve() { return null; } });
   return { store, gw, ctx: { tenantId: "t", agentId: "a", taskId: "k" } };
 }
 

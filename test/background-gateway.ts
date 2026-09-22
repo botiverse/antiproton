@@ -41,7 +41,7 @@ async function fixture() {
       toolVersion: "1.0.0", publicConfig: {}, secretRef: alias === "work" ? "ref:work" : null, policy: null,
     });
   }
-  const gw = new ToolGateway(store, [box, plain], { async resolve() { return "SECRET"; } });
+  const gw = new ToolGateway(store, [box, plain], new Set(([box, plain]).map((p: any) => p.id)), { async resolve() { return "SECRET"; } });
   return { store, gw };
 }
 

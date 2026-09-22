@@ -462,13 +462,12 @@ export interface RuntimeDeps {
  */
 export function enabledMounts<T extends { plugin: string }>(
   mounts: T[],
-  installed: Map<string, Pick<Plugin, "defaultForAllAgents">>,
+  installed: ReadonlySet<string>,
+  seeded: ReadonlySet<string>,
   choices: Record<string, PluginChoice>,
 ): T[] {
-  return mounts.filter((m) => {
-    const plugin = installed.get(m.plugin);
-    return !plugin || pluginEnabled(plugin, choices[m.plugin]);
-  });
+  return mounts.filter((m) =>
+    !installed.has(m.plugin) || pluginEnabled(seeded.has(m.plugin), choices[m.plugin]));
 }
 
 /**
@@ -483,14 +482,14 @@ export function enabledMounts<T extends { plugin: string }>(
  */
 export function unofferedMounts<T extends { plugin: string }>(
   mounts: T[],
-  installed: Map<string, Pick<Plugin, "defaultForAllAgents">>,
+  installed: ReadonlySet<string>,
+  seeded: ReadonlySet<string>,
   choices: Record<string, PluginChoice>,
 ): Array<{ mount: T; reason: "switched_off" | "plugin_unavailable" }> {
   const out: Array<{ mount: T; reason: "switched_off" | "plugin_unavailable" }> = [];
   for (const m of mounts) {
-    const plugin = installed.get(m.plugin);
-    if (!plugin) out.push({ mount: m, reason: "plugin_unavailable" });
-    else if (!pluginEnabled(plugin, choices[m.plugin])) out.push({ mount: m, reason: "switched_off" });
+    if (!installed.has(m.plugin)) out.push({ mount: m, reason: "plugin_unavailable" });
+    else if (!pluginEnabled(seeded.has(m.plugin), choices[m.plugin])) out.push({ mount: m, reason: "switched_off" });
   }
   return out;
 }
@@ -625,7 +624,8 @@ export class AgentRuntime {
     this.#secrets = {
       resolve: async (ref, scope) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope),
     };
-    this.#gateway = new ToolGateway(this.store, plugins, this.#secrets,
+    // The operator's catalogue, told to the kernel rather than read by it.
+    this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,
       deps.hooks ? (tenantId, agentId, alias) => this.#inboundFor(tenantId, agentId, alias) : undefined);
     this.#executor = new DynamicWorkerExecutor({
       loader: deps.loader,
@@ -1137,7 +1137,7 @@ export class AgentRuntime {
       // connection state behind it — the gateway and the catalogue withhold
       // it instead, and switching it back on returns what was there.
       const declared = this.#plugins.find((p) => p.id === m.plugin);
-      if (declared && !pluginEnabled(declared, choices[m.plugin])) continue;
+      if (declared && !pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) continue;
       // The seed is hand-written and reaches every agent, and the console's
       // validator only shows problems to whoever opens the plugins page. The
       // throwing one had no caller at all. A misspelt setting is refused here,
@@ -1183,7 +1183,7 @@ export class AgentRuntime {
       return { ok: false, error: `${seed.alias} is already a different mount` };
     }
     const choices = await this.store.pluginChoices(tenantId, agentId);
-    if (!pluginEnabled(plugin, choices[plugin.id])) {
+    if (!pluginEnabled(SEEDED_PLUGINS.has(plugin.id), choices[plugin.id])) {
       return { ok: false, error: `${plugin.id} is switched off for this agent; switch it on first` };
     }
     // Judged as a mount with no account yet, minus the one rule that says it
@@ -1232,10 +1232,10 @@ export class AgentRuntime {
     const byId = new Map(this.#plugins.map((pl) => [pl.id, pl]));
     const all = await this.store.listMounts(tenantId, agentId);
     const choices = await this.store.pluginChoices(tenantId, agentId);
-    const records = enabledMounts(all, byId, choices);
+    const records = enabledMounts(all, new Set(byId.keys()), SEEDED_PLUGINS, choices);
     return {
       records,
-      unoffered: unofferedMounts(all, byId, choices)
+      unoffered: unofferedMounts(all, new Set(byId.keys()), SEEDED_PLUGINS, choices)
         .map(({ mount, reason }) => ({ alias: mount.alias, plugin: mount.plugin, reason })),
       mounts: records.map((m) => ({
         alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
@@ -1647,3 +1647,21 @@ export class AgentRuntime {
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
   }
 }
+
+/**
+ * Which plugins the operator seeds for every agent, by id.
+ *
+ * Derived from the catalogue rather than written twice: the rows ARE the
+ * decision, and a second list is a second thing to forget. This replaces
+ * `defaultForAllAgents` on the plugin objects — "who should have me" was a
+ * product decision living inside the plugin, kept in step with the catalogue by
+ * a test. There is one source now, so there is nothing to keep in step.
+ *
+ * Declared after the class because it reads a static of it; exported because
+ * the gateway is given it at construction (the kernel does not own the
+ * operator's catalogue) and because the console renders the same answer.
+ */
+export const SEEDED_PLUGINS: ReadonlySet<string> = new Set(
+  AgentRuntime.DEFAULT_MOUNTS.map((m) => m.plugin),
+);
+

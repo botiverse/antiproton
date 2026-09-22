@@ -31,8 +31,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice,
-} from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
@@ -1558,12 +1557,13 @@ export class AgentDO extends DurableObject<Env> {
       installed: installed.map((p) => ({
         id: p.id,
         version: p.version,
-        defaultForAllAgents: p.defaultForAllAgents === true,
+        // The operator's catalogue, not a flag on the plugin: one source.
+        defaultForAllAgents: SEEDED_PLUGINS.has(p.id),
         choice: choices[p.id] ?? "inherit",
         // Resolved here rather than in the page, so the rule stays in the one
         // function that states it. A page that recomputes it is a second copy
         // that can disagree with what the gateway does.
-        enabled: pluginEnabled(p, choices[p.id]),
+        enabled: pluginEnabled(SEEDED_PLUGINS.has(p.id), choices[p.id]),
         credential: p.credential ?? null,
         config: p.config ?? [],
         tools: p.tools.map((t) => ({
@@ -1593,7 +1593,7 @@ export class AgentDO extends DurableObject<Env> {
           // switching back on returns everything. So the page marks it rather
           // than dropping it — a row that vanishes reads as a bug, and this
           // one is deliberately not a deletion.
-          enabled: plugin ? pluginEnabled(plugin, choices[m.plugin]) : true,
+          enabled: plugin ? pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin]) : true,
           config: m.publicConfig ?? {},
           session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
           // Attached, verified, account, last four, dates. Never a value.

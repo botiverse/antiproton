@@ -73,7 +73,7 @@ async function fixture(plugin: Plugin) {
   });
   // The plugin needs its own context to read and write state, which the
   // gateway builds; this hands it back the way `invoke` receives it.
-  const gw = new ToolGateway(store, [plugin], { async resolve() { return null; } });
+  const gw = new ToolGateway(store, [plugin], new Set(([plugin]).map((p: any) => p.id)), { async resolve() { return null; } });
   const original = plugin.invoke.bind(plugin);
   (plugin as any).invoke = function (t: string, args: any, c: any) {
     (this as any).__ctx = c;
@@ -166,7 +166,7 @@ await check("队列住在实例上 —— 所以【一个 agent 一个 gateway�
   // release six weeks later.
   const r = racer("node", true);
   const { store, gw } = await fixture(r.plugin);
-  const second = new ToolGateway(store, [r.plugin], { async resolve() { return null; } });
+  const second = new ToolGateway(store, [r.plugin], new Set(([r.plugin]).map((p: any) => p.id)), { async resolve() { return null; } });
 
   await Promise.all([
     gw.invoke(ctx, "node.touch", { mark: "one" } as any),

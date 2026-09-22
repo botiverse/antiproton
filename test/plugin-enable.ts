@@ -55,7 +55,7 @@ async function fixture(plugins: Plugin[] = [OFFERED]) {
       publicConfig: {}, secretRef: `secret-of-${p.id}`, policy: null,
     });
   }
-  const gw = new ToolGateway(store, plugins, { async resolve() { return "value"; } });
+  const gw = new ToolGateway(store, plugins, new Set((plugins).map((p: any) => p.id)), { async resolve() { return "value"; } });
   return { store, gw, ctx: { tenantId: "t", agentId: "a", taskId: "k" } };
 }
 
@@ -74,18 +74,20 @@ await check("inherit 是【没有行】,不是存下来的第三个值", async (
 });
 
 await check("agent 自己的答案压过插件默认,两个方向都是", async () => {
-  const on = { defaultForAllAgents: true }, off = { defaultForAllAgents: false };
-  const cases: Array<[typeof on, any, boolean]> = [
-    [on, "disable", false],   // the one that matters: turning a plugin on for
-    [off, "enable", true],    // everyone must not re-arm it for someone who said no
-    [on, "inherit", true],
-    [off, "inherit", false],
-    [on, undefined, true],
-    [off, null, false],
+  // `seeded` is "is this plugin in the operator's catalogue" — a value passed
+  // in, not a flag read off the plugin. The rule it feeds is unchanged: the
+  // agent's own answer wins and only silence inherits.
+  const cases: Array<[boolean, any, boolean]> = [
+    [true, "disable", false],   // the one that matters: seeding a plugin for
+    [false, "enable", true],    // everyone must not re-arm it for someone who said no
+    [true, "inherit", true],
+    [false, "inherit", false],
+    [true, undefined, true],
+    [false, null, false],
   ];
-  for (const [plugin, choice, want] of cases) {
-    if (pluginEnabled(plugin, choice) !== want) {
-      throw new Error(`${JSON.stringify(plugin)} + ${JSON.stringify(choice)} resolved to ${!want}`);
+  for (const [seeded, choice, want] of cases) {
+    if (pluginEnabled(seeded, choice) !== want) {
+      throw new Error(`seeded=${seeded} + ${JSON.stringify(choice)} resolved to ${!want}`);
     }
   }
 });
@@ -153,15 +155,15 @@ await check("关掉的挂载不出现在目录里,但装不出来的插件仍然
   // them. A mount naming a plugin nobody installed is kept, because it has its
   // own refusal and its own line in the console — dropping it would turn "this
   // mount is broken" into "this mount is gone".
-  const installed = new Map<string, { defaultForAllAgents?: boolean }>([
-    ["on", { defaultForAllAgents: true }],
-    ["off", { defaultForAllAgents: false }],
-  ]);
+  // Installed and seeded are two sets now: a plugin can be installed in the
+  // deployment without the operator seeding it for every agent.
+  const installed = new Set(["on", "off"]);
+  const seeded = new Set(["on"]);
   const mounts = [
     { alias: "a", plugin: "on" }, { alias: "b", plugin: "off" },
     { alias: "c", plugin: "on" }, { alias: "d", plugin: "gone" },
   ];
-  const kept = (choices: any) => enabledMounts(mounts, installed as any, choices).map((m) => m.alias).join("");
+  const kept = (choices: any) => enabledMounts(mounts, installed, seeded, choices).map((m) => m.alias).join("");
 
   if (kept({}) !== "acd") throw new Error(`by default: ${kept({})}`);
   if (kept({ on: "disable" }) !== "d") throw new Error(`switching a plugin off left its mounts in: ${kept({ on: "disable" })}`);
@@ -212,20 +214,18 @@ await check("unofferedMounts: 关了的算 switched_off · 没装的算 plugin_u
   // run_js answers a stale name with the reason in this list. The two reasons
   // need different sentences — a person can switch one back on, the other needs
   // an operator — so a mount must never land in the wrong one.
-  const installed = new Map<string, { defaultForAllAgents?: boolean }>([
-    ["github", { defaultForAllAgents: false }],
-    ["http", { defaultForAllAgents: true }],
-  ]);
+  const installed = new Set(["github", "http"]);
+  const seeded = new Set(["http"]);
   const mounts = [{ alias: "gh", plugin: "github" }, { alias: "web", plugin: "http" }, { alias: "ghost", plugin: "nope" }];
   const read = (choices: Record<string, any>) =>
-    unofferedMounts(mounts, installed as any, choices).map((u) => `${u.mount.alias}:${u.reason}`).sort().join();
+    unofferedMounts(mounts, installed, seeded, choices).map((u) => `${u.mount.alias}:${u.reason}`).sort().join();
   const byDefault = read({});
   if (byDefault !== "gh:switched_off,ghost:plugin_unavailable") throw new Error(`with no answers read ${byDefault}`);
   const flipped = read({ github: "enable", http: "disable" });
   if (flipped !== "ghost:plugin_unavailable,web:switched_off") throw new Error(`after flipping both answers read ${flipped}`);
   // Offered and unoffered partition every mount: nothing in both, nothing in neither.
-  const offered = mounts.filter((m) => installed.has(m.plugin) && enabledMounts([m], installed as any, {}).length).map((m) => m.alias);
-  const not = unofferedMounts(mounts, installed as any, {}).map((u) => u.mount.alias);
+  const offered = mounts.filter((m) => installed.has(m.plugin) && enabledMounts([m], installed, seeded, {}).length).map((m) => m.alias);
+  const not = unofferedMounts(mounts, installed, seeded, {}).map((u) => u.mount.alias);
   if (offered.some((a) => not.includes(a)) || offered.length + not.length !== mounts.length) {
     throw new Error(`offered ${JSON.stringify(offered)} and unoffered ${JSON.stringify(not)} do not partition the mounts`);
   }

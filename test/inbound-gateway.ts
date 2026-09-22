@@ -37,7 +37,7 @@ async function fixture(pinned = "1.0.0") {
       toolVersion: alias === "gh" ? pinned : "1.0.0", publicConfig: {}, secretRef: alias === "gh" ? "ref:gh" : null, policy: null,
     });
   }
-  const gw = new ToolGateway(store, [hook, deaf], { async resolve() { return "CRED"; } });
+  const gw = new ToolGateway(store, [hook, deaf], new Set(([hook, deaf]).map((p: any) => p.id)), { async resolve() { return "CRED"; } });
   return { store, gw };
 }
 

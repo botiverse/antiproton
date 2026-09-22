@@ -94,7 +94,7 @@ export class BenchState {
       // so every τ² task spent its turns searching for a tool it could not be
       // given. The fact belongs to `retailPlugin`, which is where it now lives;
       // writing it a second time here is how the two got out of step.
-      defaultForAllAgents: shape.defaultForAllAgents,
+
       tools: shape.tools,
       invoke: async (tool, args, ctx) => {
         const st = await this.state(ctx.caller.agentId);

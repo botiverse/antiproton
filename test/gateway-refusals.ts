@@ -31,7 +31,7 @@ async function fixture(mountPlugin: string) {
     tenantId: "t", agentId: "a", alias: "work", plugin: mountPlugin, installationId: "i", connectionId: null,
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
   });
-  return new ToolGateway(store, [box], { async resolve() { return null; } });
+  return new ToolGateway(store, [box], new Set(([box]).map((p: any) => p.id)), { async resolve() { return null; } });
 }
 
 await check("插件没装的挂载: 说出挂载和插件,并说明要运维来修,不带派发地址", async () => {

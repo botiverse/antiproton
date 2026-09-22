@@ -165,7 +165,11 @@ async function runOne(inst: Instance) {
     publicConfig: {}, secretRef: null, policy: null,
   });
 
-  const gw = new ToolGateway(store, plugins, {
+  // What this runner mounts, not the console catalogue: the bench seeds a
+  // deliberate subset (sandbox + tools), so its registry IS its catalogue.
+  // Telling the kernel anything wider would default plugins on that this run
+  // never mounts.
+  const gw = new ToolGateway(store, plugins, new Set(plugins.map((p) => p.id)), {
     async resolve(ref) {
       return ref === "env:RUN9"
         ? JSON.stringify({ ak: process.env.SYS9_AK, sk: process.env.SYS9_SK })

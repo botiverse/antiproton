@@ -38,7 +38,7 @@ async function fixture(plugins: Plugin[], mounts: Array<[string, string]>) {
       plugin, toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
     } as any);
   }
-  const gw = new ToolGateway(store, plugins, { async resolve() { return "SECRET"; } } as any);
+  const gw = new ToolGateway(store, plugins, new Set((plugins).map((p: any) => p.id)), { async resolve() { return "SECRET"; } } as any);
   return { store, gw };
 }
 
@@ -92,7 +92,7 @@ await check("no credential is resolved to write a paragraph", async () => {
   let sawCredential: unknown = "unset";
   const plugin = says("p", () => "TEXT");
   (plugin as any).promptContribution = async (ctx: any) => { sawCredential = ctx.credential; return "TEXT"; };
-  const gw = new ToolGateway(store, [plugin], { async resolve() { asked++; return "SECRET"; } } as any);
+  const gw = new ToolGateway(store, [plugin], new Set(([plugin]).map((p: any) => p.id)), { async resolve() { asked++; return "SECRET"; } } as any);
   await gw.promptContributions({ tenantId: "t", agentId: "a", taskId: "k" } as any);
   must(asked === 0, "a paragraph must not make the gateway resolve a secret");
   must(sawCredential === null, `the plugin must see no credential, saw ${JSON.stringify(sawCredential)}`);

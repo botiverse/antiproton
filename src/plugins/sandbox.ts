@@ -944,11 +944,6 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       "the container is handed back when the turn ends.";
   return {
   id: "sandbox",
-  // Seeded despite being the only metered mount: a container the agent cannot
-  // reach is a task it cannot finish, and it is meant to stay unused (tygg,
-  // 2026-09-12, `a58832bf`). The lease keeps an idle one from being free to
-  // forget.
-  defaultForAllAgents: true,
   /** This mount holds a container: something real, billed while it exists.
    *  The three below are one decision, not three — see `Holding`. */
   // What this plugin can give a session. Declared so the agents API can pick

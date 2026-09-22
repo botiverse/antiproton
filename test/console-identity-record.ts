@@ -65,7 +65,7 @@ async function recorded(identity: string, credentialRef: string | undefined, bac
     tenantId: "t", agentId: "a", alias: "svc", plugin: "svc", installationId: "i", connectionId: null,
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
   });
-  const gw = new ToolGateway(store, [refusing(identity, credentialRef)], { async resolve() { return null; } });
+  const gw = new ToolGateway(store, [refusing(identity, credentialRef)], new Set(([refusing(identity, credentialRef)]).map((p: any) => p.id)), { async resolve() { return null; } });
   const r: any = await gw.invoke(caller, "svc.go", {}, { callId: CALL });
   must(r.status !== "succeeded", "the call was supposed to fail");
   const [op] = (await store.taskEvents("t", "k")).filter((e: any) => e.kind === "operation.completed");

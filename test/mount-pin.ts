@@ -66,7 +66,7 @@ async function fixture(stored: { plugin: string; toolVersion: string }, register
     installationId: "i-box", connectionId: null, toolVersion: stored.toolVersion,
     publicConfig: {}, secretRef: null, policy: null,
   });
-  const gw = new ToolGateway(store, registered, { async resolve() { return "value"; } });
+  const gw = new ToolGateway(store, registered, new Set((registered).map((p: any) => p.id)), { async resolve() { return "value"; } });
   return { store, gw, ctx: { tenantId: "t", agentId: "a", taskId: "k" } };
 }
 

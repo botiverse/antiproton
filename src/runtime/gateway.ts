@@ -140,15 +140,48 @@ export class ToolGateway {
    */
   #queues = new Map<string, Promise<unknown>>();
 
+  /**
+   * `seeded` is the operator's catalogue, by plugin id.
+   *
+   * The gateway decides whether a call is refused because its plugin is
+   * switched off for this agent, and "switched off" has two layers: the agent's
+   * own choice, and what the operator seeds for everyone. The second used to be
+   * read off the plugin object (`defaultForAllAgents`), which put a product
+   * decision inside the plugin. It now comes from the catalogue — and the
+   * catalogue belongs to the deployment, not to this layer, so it is injected
+   * rather than imported.
+   *
+   * **Required, with no default** (@cody's call, 2026-09-22). It feeds two paths
+   * that only ever refuse, so any default would be the kernel deciding an
+   * operator's policy: an empty set means "refuse everything I was not told
+   * about", a full one means "allow everything I was not told about", and
+   * neither belongs here. Requiring it makes the compiler name every
+   * construction point, and each one states its own set.
+   *
+   * The kernel has to know the default at all because `PluginChoice` has
+   * `inherit`: a person can put a plugin back to "follow the default", so
+   * whether a call is refused cannot be answered from explicit choices alone.
+   *
+   * A `ReadonlySet` rather than an `Iterable`, and third rather than last: a
+   * bare string satisfies `Iterable<string>`, so the looser type would take a
+   * typo for a catalogue of one plugin whose id is a letter. Third because a
+   * required parameter cannot follow the optional ones, and moving it there is
+   * checked — a resolver passed in its place is not a set, so the compiler
+   * refuses rather than silently reinterpreting an existing call.
+   */
   constructor(
-    store: StorageAdapter, plugins: Plugin[], secrets: SecretResolver = envSecrets,
+    store: StorageAdapter, plugins: Plugin[], seeded: ReadonlySet<string>,
+    secrets: SecretResolver = envSecrets,
     inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks,
   ) {
     this.#store = store;
     this.#plugins = new Map(plugins.map((p) => [p.id, p]));
     this.#secrets = secrets;
     this.#inbound = inbound;
+    this.#seeded = seeded;
   }
+
+  readonly #seeded: ReadonlySet<string>;
 
   #inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks;
 
@@ -500,7 +533,7 @@ export class ToolGateway {
     // this note exists so the cost reads as a decision rather than as an
     // oversight nobody dares remove (Piper asked, 2026-09-12).
     const choices = await this.#store.pluginChoices(ctx.tenantId, ctx.agentId);
-    if (!pluginEnabled(plugin, choices[r.mount.plugin])) {
+    if (!pluginEnabled(this.#seeded.has(r.mount.plugin), choices[r.mount.plugin])) {
       return {
         status: "rejected",
         // Addressed to the model, which must do something else now: it says
@@ -773,7 +806,7 @@ export class ToolGateway {
     const plugin = this.#plugins.get(mount.plugin);
     if (!plugin?.receive) return { skipped: `the plugin on ${alias} cannot receive pushed events` };
     const choices = await this.#store.pluginChoices(tenantId, agentId);
-    if (!pluginEnabled(plugin, choices[mount.plugin])) return { skipped: `${mount.plugin} is switched off for this agent` };
+    if (!pluginEnabled(this.#seeded.has(mount.plugin), choices[mount.plugin])) return { skipped: `${mount.plugin} is switched off for this agent` };
     if (plugin.version !== mount.toolVersion) {
       return { skipped: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` };
     }
