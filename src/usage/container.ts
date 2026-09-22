@@ -132,6 +132,40 @@ export function boxesOf(
 }
 
 /**
+ * Rows marking a pass whose mount records could not be fully read.
+ *
+ * `MountActivity.unreadable` is a predicate, not a quantity: the scalar mixes
+ * rows, sessions and environments, and the three are not commensurable with
+ * the seconds a reader would stand next to them — a corrupt environment
+ * contributes no missing seconds at all, a corrupt session that session's,
+ * and one corrupt top-level row can hide a live box's entire history. The
+ * number is therefore never printed; presence is the signal, one row per
+ * pass per mount, whatever the scalar said.
+ *
+ * The marker is written at record time, into the same table the seconds go
+ * to, because a flag computed at read time would describe "now" while
+ * certifying historical windows it knows nothing about — a window that was
+ * damaged and later healed would read as complete, which is worse than
+ * unread. `at` is the pass's own hour: the marker has no interval of its
+ * own, it says this hour's record is the damaged one.
+ *
+ * The key is the plugin, like every other row this resource writes: the
+ * alias is not in scope where rows are written, and a second keying scheme
+ * in the same column would split one mount-kind in two under GROUP BY.
+ * Which mount was damaged is diagnose's question — its mountReports are
+ * alias-keyed and read the live field.
+ */
+export function heldUnreadableRows(
+  base: { tenantId: string; agentId: string },
+  key: string,
+  activity: { unreadable?: number } | null | undefined,
+  now: number,
+): UsageRow[] {
+  if (!activity?.unreadable) return [];
+  return [{ at: Math.floor(now / 3_600_000) * 3_600_000, ...base, resource: "sandbox.container", key, quantity: 1, unit: "unreadable" }];
+}
+
+/**
  * Append what every mount has held since the last pass, and remember it.
  * Returns one line per mount that contributed, for a caller that wants to say
  * what happened.
@@ -139,6 +173,9 @@ export function boxesOf(
  * `reports` is what the console is handed (`MountReports`): the mount's own
  * answer about what it is holding and what it has finished. A mount that
  * reports nothing is not asked to explain itself — it simply has no rows.
+ * A mount whose records partly do not read writes no boxes either, and is
+ * represented by the marker rows (heldUnreadableRows): seconds it cannot
+ * see are seconds it cannot count.
  *
  * Watermarks for boxes this report no longer mentions are dropped once they are
  * a week old. A box that has left the mount's bounded session window cannot
@@ -161,14 +198,15 @@ export function countHeldTime(
     const boxes = boxesOf(report as any);
     for (const b of boxes) seen.add(b.id);
     const { rows, marks } = heldRows(base, plugin, boxes, counted, now);
-    if (rows.length) appendUsage(sql, rows);
+    const marker = heldUnreadableRows(base, plugin, (report as any)?.activity ?? null, now);
+    if (rows.length || marker.length) appendUsage(sql, [...rows, ...marker]);
     for (const { id, mark } of marks) {
       sql.exec(
         "INSERT INTO usage_held(box_id, through, uses) VALUES (?, ?, ?) " +
         "ON CONFLICT(box_id) DO UPDATE SET through = excluded.through, uses = excluded.uses",
         id, Math.round(mark.through), Math.round(mark.uses));
     }
-    if (rows.length) out.push({ key: plugin, rows: rows.length });
+    if (rows.length || marker.length) out.push({ key: plugin, rows: rows.length + marker.length });
   }
   for (const [id, mark] of counted) {
     if (!seen.has(id) && mark.through < now - KEEP_MARKS_MS) sql.exec("DELETE FROM usage_held WHERE box_id = ?", id);
