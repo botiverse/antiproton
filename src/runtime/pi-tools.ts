@@ -168,6 +168,26 @@ export function offersPlugin(
 }
 
 /**
+ * What the model was told to call this mount's tool, or null if it was not offered.
+ *
+ * The third form of the same question. It is a function, and it lives beside
+ * the qualifier that decides the name, because every caller that rebuilt the
+ * string instead was wrong in a way nothing catches: qualification sanitises
+ * the alias and a collision takes a numeric suffix, so `${alias}__release` can
+ * be another mount's tool — which resolves, and calls it (Piper, Dora,
+ * 2026-09-12). A withheld tool has no address in the catalogue at all, so null
+ * here is the fact that the model cannot call it, and a message built from this
+ * does not tell it to.
+ *
+ * `address` is the join, not `name`: the address is `alias.tool` and never
+ * shown, and it is the only thing on a mounted tool that survives qualification
+ * unchanged.
+ */
+export function offeredToolName(tools: readonly MountedTool[], alias: string, tool: string): string | null {
+  return tools.find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
+}
+
+/**
  * The same question as {@link offersPlugin}, asked of a capability instead of a name.
  *
  * A name answers "is this particular plugin here"; the kernel almost never

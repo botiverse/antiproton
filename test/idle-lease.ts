@@ -90,20 +90,36 @@ check("with no warning configured the box is simply released at its time", () =>
 check("the warning carries the names it was given, the time left, and the postponement limit", () => {
   // Deliberately NOT `alias__tool`: a collision takes a numeric suffix, and a warning that rebuilt the
   // string would name another mount's tool.
-  const t = warningText("node", { release: "node__release2", quiet: "node__quiet2" }, 25 * MIN, 5 * MIN, 60);
+  const t = warningText("node", { release: "node__release2", postpone: "node__quiet2" },
+    "billed for every second it exists, not per call", 25 * MIN, 5 * MIN, 60);
   must(t.includes("`node__release2`") && t.includes("`node__quiet2`"), `the given names must be the ones printed: ${t}`);
   must(!/node__release`/.test(t), "it must not print a name it derived itself");
   must(/idle for 25 minutes/.test(t) && /released in 5 minutes/.test(t), `both durations must be stated: ${t}`);
   must(/at most 60/.test(t), `the postponement limit must be stated: ${t}`);
   must(/not be told again/.test(t), `it must say the agent will be left alone: ${t}`);
-  must(/not saved/.test(t), "it must say what is lost");
+  must(/billed for every second it exists/.test(t), `the plugin's own sentence about the cost must be in it: ${t}`);
   must(t.startsWith("[a notice from the harness, not a message from the user]"), `it must say whose message it is: ${t.slice(0, 80)}`);
 });
 
+check("the warning says nothing about containers", () => {
+  // The schedule is the framework's and the noun is the plugin's (tygg, 2026-09-22). This is the assertion
+  // that keeps it that way: a mount holding a seat, an index or a lease is warned in this same sentence, and
+  // the only description of what is held is the plugin's `billing`.
+  const t = warningText("node", { release: "node__release", postpone: null }, "billed per hour of the seat",
+    25 * MIN, 5 * MIN, null);
+  must(!/container|box|sandbox|machine|files/i.test(t), `the framework must not name one plugin's thing: ${t}`);
+  must(/billed per hour of the seat/.test(t), "the plugin's sentence is what describes it");
+});
+
 check("a mount that offers no tools still gets a warning that is true", () => {
-  const t = warningText("node", { release: null, quiet: null }, 25 * MIN, 5 * MIN, null);
+  const t = warningText("node", { release: null, postpone: null }, null, 25 * MIN, 5 * MIN, null);
   must(!/call `/.test(t), `nothing to call, so it must not say to call anything: ${t}`);
   must(/released in 5 minutes/.test(t), "the consequence still holds");
+  // No `billing`: the sentence has to read as a sentence without it. Both ways of getting that wrong, because
+  // the first draft of this case asserted only the dangling dash and stayed green when the clause was made
+  // unconditional — the hole reads ` — null.`, which no punctuation check sees.
+  must(!/null|undefined/.test(t), `an absent billing sentence must not be printed: ${t}`);
+  must(!/— \./.test(t) && !/ \. /.test(t), `a mount with no billing sentence must not leave a dangling separator: ${t}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

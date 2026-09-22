@@ -14,11 +14,12 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { idleDecision, warningText } from "../../src/runtime/idle-lease.ts";
+import { heldLine, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, offersPlugin, offersCapability, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -847,15 +848,18 @@ export class AgentRuntime {
       return { ok: false, error: `${alias} is running a background job; releasing it now would discard that work` };
     }
 
-    const state = (await this.store.getConnection(tenantId, agentId, alias)) as any;
-    const boxId = typeof state?.boxId === "string" ? state.boxId : "";
+    // Read before the release, because after it there is nothing to ask: the id
+    // is what the warning row is keyed by. Through `activity` rather than the
+    // connection state, which is the plugin's own and named `boxId` in exactly
+    // one plugin.
+    const live = (await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias)).live;
     const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias });
     const failed = r.failed.find((f) => f.alias === alias);
     if (failed) return { ok: false, error: `${alias} was not released: ${failed.error}` };
 
-    // The warning row is keyed by the box that is now gone. Left behind, the
-    // next box under this alias inherits a release time it was never told.
-    if (boxId) sql.exec("DELETE FROM box_warnings WHERE alias = ? AND box_id = ?", alias, boxId);
+    // The warning row is keyed by the thing that is now gone. Left behind, the
+    // next one under this alias inherits a release time it was never told.
+    if (live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, live.id);
     return { ok: true, released: r.released.includes(alias) };
   }
 
@@ -968,14 +972,20 @@ export class AgentRuntime {
     reader: { name: string; address: string } | null,
     /** What the model was offered, so a job is named the way the model can name it back. */
     offered: MountedTool[] = [],
+    /**
+     * The "you are still holding this" line for a mount, or null when it is
+     * holding nothing (held.ts). A ready-made line rather than the plugins and
+     * the mount rows, so this stays the place that dispatches a call and not a
+     * second place that knows what holding means.
+     */
+    heldOn: (alias: string) => Promise<string | null> = async () => null,
   ) {
     const readBack = reader?.name ?? null;
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
     const sql = this.#deps.ctx.storage.sql;
-    return {
-      async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
+    const dispatch = async (call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> => {
         const res = await gw.invoke(ctx, call.tool, call.args,
           { ...(call.opts ?? {}), ...(call.callId === undefined ? {} : { callId: call.callId }) });
         // Work that has started and outlives this call (task #16). The model is
@@ -1031,6 +1041,30 @@ export class AgentRuntime {
             shownRef: (ref) => toAgentRef(ref, ctx)!,
           }),
         };
+    };
+    return {
+      /**
+       * A mounted call, plus the one sentence a call on a holding mount has to
+       * carry: that the thing is still held, and what lets it go.
+       *
+       * Appended here, after the size decision, and not by the plugin. The
+       * sandbox used to write it into its own results (`reminder`), which made
+       * one plugin the author of a sentence that is true of anything holding a
+       * metered resource — and meant a second such plugin said nothing. What is
+       * genuinely the plugin's (what survives a release, what /tmp does, the
+       * lease's terms) stays in its tool descriptions, where the model is told
+       * every turn rather than once.
+       *
+       * After the size decision because both large-result paths replace the
+       * result with a wrapper of their own: attached before, the line would be
+       * parked into storage along with the body the model cannot see.
+       */
+      async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
+        const out = await dispatch(call);
+        if (out.status !== "succeeded") return out;
+        const line = await heldOn(call.tool.split(".")[0] ?? "");
+        if (!line) return out;
+        return { ...out, result: withHeldNote(out.result, line) as Json };
       },
     };
   }
@@ -1294,8 +1328,18 @@ export class AgentRuntime {
     // left the runtime with no reader and nothing saying so.
     const reader = parkedReader(tools as MountedTool[]);
     const offered = withLimitNote(tools as MountedTool[], reader);
+    // Asked per call, and only of a mount whose plugin declares `holds`: a
+    // mount that holds nothing is filtered out before any state is read, so
+    // the common call pays nothing for this.
+    const activityOf = (alias: string) =>
+      this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias);
+    const nameOf = (alias: string, tool: string) => offeredToolName(offered as MountedTool[], alias, tool);
+    const heldOn = async (alias: string) => {
+      const [h] = await heldResources(records.filter((m) => m.alias === alias), this.#plugins, activityOf);
+      return h ? heldLine(h, nameOf, Date.now()) : null;
+    };
     const host = this.#host(
-      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered);
+      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn);
     const store = this.store;
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
@@ -1375,6 +1419,12 @@ export class AgentRuntime {
         // framework no longer reaches into any one plugin for this (Piper,
         // tygg, 2026-09-12).
         contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
+        // `release` is scoped to the agent, not to a task, so a new session
+        // inherits whatever the last one left alive — and until now nothing
+        // told it, which is how a container billed overnight for a
+        // conversation that had ended (tygg, 2026-09-22). Session-stable facts
+        // only; the durations are in the two message-side sentences.
+        held: heldPrompt(await heldResources(records, this.#plugins, activityOf), nameOf),
         policy: this.#deps.policy,
         // Each paragraph appears only where the thing it describes is really
         // there — telling an agent to read a result back with a tool it has not
@@ -1563,12 +1613,19 @@ export class AgentRuntime {
   }
 
   /**
-   * One look at every metered mount: remind, take, or come back later.
+   * One look at every mount that is holding something: remind, take, or come
+   * back later.
    *
-   * The state is the plugin's (run9 writes `boxId`, `lastUsedAt`, and the
-   * agent's `quietUntil`); the schedule is the framework's, which is why this
-   * reads that state rather than the plugin reading a clock. A mount with no
-   * live box says nothing and costs nothing.
+   * What is held is the plugin's (`holds.activity` reports it); the schedule is
+   * the framework's, which is why this reads that report rather than the plugin
+   * reading a clock. Until 2026-09-22 this loop read `boxId`, `lastUsedAt` and
+   * `quietUntil` out of one plugin's connection state and named its tools with
+   * the literals `release` and `quiet` — so it was the sandbox's idle pass
+   * wearing the framework's name, and a second plugin that held something got
+   * no warning and no reclaim. Now every mount whose plugin declares `holds`
+   * gets both, and this file names nothing of theirs.
+   *
+   * A mount holding nothing says nothing and costs nothing.
    */
   async #idlePass(tenantId: string, agentId: string): Promise<{
     wakeInMs: number | null; releaseFailed: Array<{ alias: string; error: string }>;
@@ -1576,11 +1633,21 @@ export class AgentRuntime {
     const { warnMs, maxMs } = this.#deps.idle!;
     const now = Date.now();
     const sql = this.#deps.ctx.storage.sql;
-    // Which release time each box's agent was already told about (idle-lease.ts): one warning per release
-    // time. The old `box_reminders` counted escalating reminders and is no longer read.
-    sql.exec(`CREATE TABLE IF NOT EXISTS box_warnings(
-      alias TEXT NOT NULL, box_id TEXT NOT NULL, release_at INTEGER NOT NULL,
-      PRIMARY KEY (alias, box_id))`);
+    // Which release time each held thing's agent was already told about
+    // (idle-lease.ts): one warning per release time. Keyed by the live id from
+    // `activity`, so a second thing under the same alias cannot inherit a
+    // release time it was never told. The old `box_warnings` was the same table
+    // under a name only a container fits, and `box_reminders` before it counted
+    // escalating reminders and is no longer read.
+    sql.exec(`CREATE TABLE IF NOT EXISTS held_warnings(
+      alias TEXT NOT NULL, live_id TEXT NOT NULL, release_at INTEGER NOT NULL,
+      PRIMARY KEY (alias, live_id))`);
+    // Not carried over. Its rows say "this agent was already warned about a
+    // release time", so the whole cost of dropping them is that an agent
+    // holding something at the moment this deploys is told once more than it
+    // needed to be — and the alternative, a copy step, keeps a table nothing
+    // reads for the sake of one duplicate message.
+    sql.exec("DROP TABLE IF EXISTS box_warnings");
     let wakeInMs: number | null = null;
     let releaseFailed: Array<{ alias: string; error: string }> = [];
     const soon = (ms: number) => { wakeInMs = wakeInMs === null ? ms : Math.min(wakeInMs, ms); };
@@ -1588,47 +1655,41 @@ export class AgentRuntime {
     // offered them from: qualification sanitises the alias and breaks ties, so
     // a name rebuilt here would be a copy that is right only until it is not.
     const { tools } = await this.#catalogueFor(tenantId, agentId);
-    const offeredName = (alias: string, tool: string) =>
-      (tools as MountedTool[]).find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
+    const nameOf = (alias: string, tool: string) => offeredToolName(tools as MountedTool[], alias, tool);
 
-    // A background exec does not touch lastUsedAt, so a box running one looks
+    // A background exec does not touch lastUsedAt, so a mount running one looks
     // idle for as long as the command runs; reclaim would take the machine out
-    // from under it (Piper, 2026-09-14). The job table knows; the box does not.
+    // from under it (Piper, 2026-09-14). The job table knows; the plugin does not.
     const busy = mountsWithRunningJobs(sql, { tenantId, agentId });
-    for (const mount of await this.store.listMounts(tenantId, agentId)) {
-      if (busy.has(mount.alias)) continue;
-      const state = (await this.store.getConnection(tenantId, agentId, mount.alias)) as any;
-      const boxId = typeof state?.boxId === "string" ? state.boxId : "";
-      const lastUsedAt = Number(state?.lastUsedAt) || 0;
-      // No box, or a state that cannot say when it was last used: nothing to
-      // schedule from, and inventing a clock here is how a box in use gets
-      // taken mid-task.
-      if (!boxId || !lastUsedAt) continue;
-      const row = sql.exec("SELECT release_at FROM box_warnings WHERE alias = ? AND box_id = ?", mount.alias, boxId)
+    const mounts = (await this.store.listMounts(tenantId, agentId)).filter((m) => !busy.has(m.alias));
+    const held = await heldResources(mounts, this.#plugins,
+      (alias) => this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias));
+    for (const h of held) {
+      const row = sql.exec("SELECT release_at FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id)
         .toArray()[0] as any;
       const warnedFor = Number(row?.release_at) || 0;
-      // `quietUntil` is the agent's postponement, written by the plugin's `quiet` and capped there.
-      const d = idleDecision({ lastUsedAt, postponedUntil: Number(state?.quietUntil) || 0, warnedFor, now, warnMs, maxMs });
+      const d = idleDecision({ lastUsedAt: h.live.lastUsedAt, postponedUntil: h.quietUntil ?? 0, warnedFor, now, warnMs, maxMs });
       if (d.do === "wait") { soon(d.wakeInMs); continue; }
       if (d.do === "warn") {
         // The warning is a turn the agent takes, so it is a message rather
         // than a signal: the model has to be able to answer it with a call.
-        const limit = Number((mount.publicConfig as any)?.maxQuietMinutes) || null;
+        const mount = mounts.find((m) => m.alias === h.alias);
+        const limit = Number((mount?.publicConfig as any)?.maxQuietMinutes) || null;
         await this.postMessage(tenantId, agentId,
-          warningText(mount.alias,
-            { release: offeredName(mount.alias, "release"), quiet: offeredName(mount.alias, "quiet") },
-            d.idleMs, d.untilReleaseMs, limit), "prompt");
-        sql.exec("INSERT INTO box_warnings(alias, box_id, release_at) VALUES (?,?,?) " +
-          "ON CONFLICT(alias, box_id) DO UPDATE SET release_at = excluded.release_at", mount.alias, boxId, d.releaseAt);
+          warningText(h.alias,
+            { release: nameOf(h.alias, h.tools.release), postpone: h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null },
+            h.billing, d.idleMs, d.untilReleaseMs, limit), "prompt");
+        sql.exec("INSERT INTO held_warnings(alias, live_id, release_at) VALUES (?,?,?) " +
+          "ON CONFLICT(alias, live_id) DO UPDATE SET release_at = excluded.release_at", h.alias, h.live.id, d.releaseAt);
         // 0: postMessage only marks the session, so this wake is what runs the warning's turn (idle-lease.ts).
         soon(d.wakeInMs);
         continue;
       }
-      // Past its release time. This box only: each mount has its own idle clock,
+      // Past its release time. This mount only: each has its own idle clock,
       // so one reaching its time says nothing about another's.
-      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: mount.alias });
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias });
       releaseFailed = [...releaseFailed, ...r.failed];
-      sql.exec("DELETE FROM box_warnings WHERE alias = ? AND box_id = ?", mount.alias, boxId);
+      sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
     }
     return { wakeInMs, releaseFailed };
   }

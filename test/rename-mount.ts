@@ -144,6 +144,7 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
     id: "run9", version: "1.0.0", tools: [],
     async invoke() { return {}; },
     holds: {
+      tools: { release: "release" },
       async activity(ctx) {
         const st: any = await ctx.connection.get();
         // Deliberately not the plugin's own field name: whatever it keeps, the

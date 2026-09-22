@@ -12,7 +12,7 @@ import { pluginEnabled, renameSafety, type PluginChoice, isExclusive } from "../
 import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
-import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, boxReminder, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
+import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
 import { exaPlugin } from "../src/plugins/exa.ts";
 import { demoPlugin } from "../src/plugins/demo.ts";
@@ -897,13 +897,17 @@ await check("start_from 的每一个结局都直说【释放了没有】,而且�
 });
 
 /**
- * The three places that tell the model how the box ends must end it the same way.
+ * The two places that tell the model how the box ends must end it the same way.
  *
- * `run` and `shell` describe the container before it exists; the per-execution
- * reminder describes it while it does. An agent reads whichever it happens to
- * be looking at, and it cannot tell which is stale — so a promise mended in one
- * and left in another is worse than the original wrong sentence: it is wrong
- * only sometimes.
+ * `run` and `shell` both describe the container before it exists. An agent
+ * reads whichever it happens to be looking at, and it cannot tell which is
+ * stale — so a promise mended in one and left in another is worse than the
+ * original wrong sentence: it is wrong only sometimes.
+ *
+ * There were three until 2026-09-22: the per-execution reminder said it too.
+ * That sentence is the framework's now, and it deliberately says nothing about
+ * the lifetime — it says what is held and what releases it — so there is one
+ * source of lifetime wording again, and these two are built from `leaseTerms`.
  *
  * **Consistency was all this case checked, so it held three copies of a false
  * sentence green.** "Persists between calls" was never true of a deployment
@@ -915,18 +919,15 @@ await check("start_from 的每一个结局都直说【释放了没有】,而且�
  * wrong, and only the wording can be checked here; what makes it true is
  * `cf/src/runtime.ts` releasing on a settled turn while `idle` is unset.
  */
-await check("run, shell and the per-execution reminder end the container the same way", async () => {
+await check("run and shell end the container the same way", async () => {
   const run = run9.tools.find((t) => t.name === "run")!.summary;
   const shell = run9.tools.find((t) => t.name === "shell")!.summary;
-  const reminder = boxReminder("box");
-  // With a lease all three state the other lifetime, and none of them the turn's.
+  // With a lease both state the other lifetime, and neither the turn's.
   const lease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
   const leased = sandboxPlugin(null as any, "local", lease);
-  const leasedReminder = boxReminder("box", lease);
   for (const [where, text] of [
     ["leased run", leased.tools.find((t) => t.name === "run")!.summary],
     ["leased shell", leased.tools.find((t) => t.name === "shell")!.summary],
-    ["the leased reminder", leasedReminder],
   ] as const) {
     if (!/until you release it/.test(text) || !/later ones/.test(text)) {
       throw new Error(`${where} does not say the container stays, in later turns, until the agent releases it: ${text.slice(0, 200)}`);
@@ -947,11 +948,7 @@ await check("run, shell and the per-execution reminder end the container the sam
       throw new Error(`${where} still ends the container with the turn under a lease: ${text.slice(0, 200)}`);
     }
   }
-  // Silence has a consequence under a lease, and the reminder is the one an agent holds when it matters.
-  if (!/\bkeep\b/.test(leasedReminder) || !leasedReminder.includes("box")) {
-    throw new Error(`the leased reminder does not name what survives it, or the mount: ${leasedReminder}`);
-  }
-  for (const [where, text] of [["run", run], ["shell", shell], ["the reminder", reminder]] as const) {
+  for (const [where, text] of [["run", run], ["shell", shell]] as const) {
     // Each says how far the container reaches: every call in this turn, which
     // is the part an agent can plan against.
     if (!/every call in this turn|same one for every call in this turn|this turn uses the same one/.test(text)) {
@@ -973,18 +970,14 @@ await check("run, shell and the per-execution reminder end the container the sam
       throw new Error(`${where} promises the idle question while the lease is off: ${text.slice(0, 160)}`);
     }
   }
-  // What outlives a turn is a kept filesystem, and the reminder is the one an
-  // agent is holding at the moment it matters — when its container is about to
-  // go and it has not saved anything.
-  if (!/\bkeep\b/.test(reminder)) {
-    throw new Error(`the reminder ends the container without naming what survives it: ${reminder}`);
+  // What outlives a turn is a kept filesystem, and both descriptions have to
+  // name it: an agent that reads only one must not come away thinking the turn
+  // ending is the end of its work.
+  for (const [where, text] of [["run", run], ["shell", shell]] as const) {
+    if (!/\b(keep|sav)/i.test(text)) {
+      throw new Error(`${where} ends the container without naming what survives it: ${text}`);
+    }
   }
-  // When the lease is switched on, the reminder is also the one that has to say
-  // silence has a consequence — the other two describe a box that may not exist
-  // yet. That assertion belongs to the change that sets the numbers.
-  // And it names the mount, because an agent with two of them cannot act on
-  // "the container".
-  if (!reminder.includes("box")) throw new Error(`the reminder does not name the mount: ${reminder}`);
 });
 
 /**
@@ -1296,7 +1289,6 @@ await check("the container's wording and the lease switch say the same thing", a
   const says = [
     ["run", deployed.tools.find((t) => t.name === "run")!.summary, true],
     ["shell", deployed.tools.find((t) => t.name === "shell")!.summary, true],
-    ["the reminder", boxReminder("box", lease), true],
     ["release", deployed.tools.find((t) => t.name === "release")!.summary, false],
     ["quiet", deployed.tools.find((t) => t.name === "quiet")!.summary, false],
     // `keep` and `save` say what a copy does not license, and "leave it running" is a lease promise too; they
@@ -2091,38 +2083,9 @@ await check("a running container's GitHub access follows the mount: held, remove
   }
 });
 
-/**
- * The full reminder once per container, a short line after.
- *
- * It went on every result when it was 132 bytes (2026-09-13). With the lease
- * terms it grew past 400, and background-job notices carry the whole result, so
- * one conversation repeated it dozens of times (cody, reading the task #19
- * trajectory). The reason it was on every result still holds, since an agent
- * that thought the box was volatile reinstalled on every call, so the short line
- * keeps that fact, and the full terms stay where they are always present: the
- * run and shell descriptions, sent every turn, and the first result of each box.
- */
-await check("a container's first result carries the full reminder, and later ones a short line that agrees with it", async () => {
-  const sb: any = await import("../src/plugins/sandbox.ts");
-  const lease = { warnMs: 5 * 60_000, maxMs: 30 * 60_000 };
-  const cfg = { maxOutputBytes: 24_000 } as any;
-  const rec = { state: "succeeded", exit_code: 0, output_summary: "ok" };
-  for (const [label, l] of [["leased", lease], ["no lease", null]] as const) {
-    const first = sb.finished(rec, cfg, { boxId: "b", createdAt: 1, lastUsedAt: 1, execs: 0 }, "box", l);
-    const later = sb.finished(rec, cfg, { boxId: "b", createdAt: 1, lastUsedAt: 1, execs: 3 }, "box", l);
-    if (first.reminder !== boxReminder("box", l as any)) throw new Error(`${label}: the first result lost the full reminder`);
-    const short = String(later.reminder ?? "");
-    if (!short || short.length >= 140) throw new Error(`${label}: a later result's reminder is ${short.length} characters: ${short}`);
-    if (!/same container/.test(short)) throw new Error(`${label}: the short line no longer says it is the same container: ${short}`);
-    if (l) {
-      if (!/until you release it/.test(short) || !/30 idle minutes/.test(short) || /turn ends/.test(short)) {
-        throw new Error(`leased: the short line disagrees with the lease: ${short}`);
-      }
-    } else if (!/turn ends/.test(short) || /release it or/.test(short)) {
-      throw new Error(`no lease: the short line disagrees with the turn's lifetime: ${short}`);
-    }
-  }
-});
+// The per-result reminder is no longer this plugin's to write: the case that
+// pinned its two lengths moved to test/held.ts with the sentence itself
+// (src/runtime/held.ts). What stayed here is the run/shell wording below.
 
 /**
  * Releasing writes over its own record, not over somebody else's.

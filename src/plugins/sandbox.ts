@@ -273,27 +273,6 @@ export function leaseTerms(lease: BoxLease): string {
 }
 
 /**
- * The reminder after a container's first result: the fact the full one exists
- * for, that this is the same container as before, and its lifetime in a
- * clause. The full terms stay in the run and shell descriptions, sent every
- * turn, and in the first result of each container.
- */
-export function boxReminderShort(lease: BoxLease | null = null): string {
-  return lease
-    ? `same container as your earlier calls; it stays until you release it or it sits ${Math.round(lease.maxMs / 60_000)} idle minutes`
-    : "same container as your earlier calls in this turn; handed back when the turn ends";
-}
-
-export function boxReminder(alias: string, lease: BoxLease | null = null): string {
-  if (lease) {
-    return `every call uses this same container, in this turn and later ones, until you release it; ${leaseTerms(lease)}`
-      + `; \`keep\` on \`${alias}\` saves its filesystem beyond that, and \`release\` destroys it now`;
-  }
-  return `every call in this turn uses this same container, and it is handed back when the turn ends`
-    + `; \`keep\` on \`${alias}\` saves its filesystem for a later turn, and \`release\` destroys it now`;
-}
-
-/**
  * The stored state, or null when what came back is not it.
  *
  * `ConnectionState` hands back `Json`, which is `unknown` — so `as BoxState`
@@ -386,8 +365,6 @@ export function finished(
   rec: any,
   cfg: ReturnType<typeof cfgOf>,
   state: BoxState | null,
-  alias: string,
-  lease: BoxLease | null = null,
 ): Record<string, unknown> {
   // A `shell` command reports where it ended; the report is ours, not the command's output.
   const { output: out, cwd } = splitCwd(String(rec.output_summary ?? ""));
@@ -401,14 +378,16 @@ export function finished(
       ? { cwdNote: "files under /tmp do not survive while the container sits idle; keep work in the working directory" }
       : {}),
     ...(rec.state === "error" && rec.reason ? { error: String(rec.reason) } : {}),
-    // "container", never "sandbox": the harness already calls the per-execution
-    // JavaScript isolate a sandbox, and an agent told that "the sandbox keeps
-    // nothing between executions" concluded this box was volatile too — which
-    // would have it reinstalling packages on every call.
-    // In full on a container's first result only. It is over 400 characters with
-    // the lease terms, and background-job notices carry the whole result, so on
-    // every result one conversation read it dozens of times (task #19).
-    reminder: (state?.execs ?? 0) === 0 ? boxReminder(alias, lease) : boxReminderShort(lease),
+    // No `reminder` here. This plugin used to write one into every result —
+    // "same container as your earlier calls; it stays until you release it or
+    // it sits 30 idle minutes" — and that sentence is true of anything holding
+    // a metered resource, so one plugin was the author of a general fact and a
+    // second such plugin said nothing at all. The framework writes it now
+    // (src/runtime/held.ts, attached as `holding`), from what `holds` declares.
+    // What is genuinely this plugin's — that the container is NOT the
+    // per-execution JavaScript sandbox, what /tmp does, the lease's terms, what
+    // `keep` saves — stays in the run and shell descriptions, where the model is
+    // told every turn rather than on one result.
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
     // So the agent learns the environment from a result it already has,
@@ -952,6 +931,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   // to choose, so matching on it makes a rename a silent behaviour change.
   provides: ["container"],
   holds: {
+    // Which tool lets the container go, and which buys it more time. The
+    // runtime names these to the agent; before this they were the literals
+    // "release" and "quiet" in the idle scan, so renaming either would have
+    // left it telling the agent to call something that does not exist.
+    tools: { release: "release", postpone: "quiet" },
     /** What this mount is keeping alive, read from its own state and nothing
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {
@@ -1004,7 +988,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // the same moment — the read-modify-write `exclusive` exists to prevent,
       // in a new place (Piper, 2026-09-14, `83f0658d`).
       const state = asBoxState(await ctx.connection.get());
-      return { done: true, result: finished(rec, cfg, state, ctx.alias, lease) as Json };
+      return { done: true, result: finished(rec, cfg, state) as Json };
     },
     /**
      * Stop it and stop paying for it — and say so when it did not stop.
@@ -1737,7 +1721,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // rather than run the command somewhere it did not ask for.
       if (rec.state === "error" && askedDir && /failed to start/i.test(String(rec.reason ?? ""))) {
         return {
-          ...finished(rec, cfg, state, ctx.alias, lease),
+          ...finished(rec, cfg, state),
           note: `${askedDir} does not exist in the container; create it first, or leave workdir out`,
         };
       }
@@ -1748,7 +1732,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         continue;
       }
       if (TERMINAL.includes(rec.state)) {
-        const result = finished(rec, cfg, state, ctx.alias, lease);
+        const result = finished(rec, cfg, state);
         // Only the call that ran the command writes the directory: a job finished
         // later through the poll must not write connection state (see pollBackground),
         // so a command handed over does not move the shell, as `&` would not.

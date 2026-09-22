@@ -855,6 +855,30 @@ export function backgrounded(handle: Json, note?: string): Backgrounded {
  */
 export interface Holding {
   /**
+   * Which of this plugin's tools lets go of the thing, and which postpones.
+   *
+   * A declaration, not a sentence. The runtime tells the agent how to release
+   * what it is holding, and it used to build those names from the literals
+   * `"release"` and `"quiet"` — so the reminder only ever worked for a plugin
+   * that happened to use those words, and renaming either left the runtime
+   * telling the agent to call something that does not exist. With this, a
+   * releasing tool called anything at all is named correctly.
+   *
+   * The names are the plugin's own tool names; the runtime resolves them
+   * against what the model was actually offered, because qualification
+   * sanitises an alias and breaks ties at the length cap.
+   *
+   * `release` is required: something that can be held and never let go is not
+   * what this interface describes. `postpone` is optional because a resource
+   * with no lease has nothing to postpone.
+   *
+   * A plugin that declares this returns JSON **objects** from its tools: the
+   * framework attaches the per-result "you are still holding this" line as a
+   * key on the result (`withHeldNote`, src/runtime/held.ts), and an array or a
+   * bare string has nowhere to put it.
+   */
+  tools: { release: string; postpone?: string };
+  /**
    * What this mount is holding right now, without a credential and without
    * calling the far end: it is asked when nobody is using the mount and by a
    * timer, so it must be answerable from what the runtime already has.
