@@ -621,10 +621,13 @@ export class SqliteStore implements StorageAdapter {
 
   async startOperation(tenantId: string, operationId: string) {
     // From pending or rejected only; a terminal row is never revived. No event:
-    // the moment is a start, not also a completion (src/core/store.ts).
-    this.#db
+    // the moment is a start, not also a completion (src/core/store.ts). The
+    // `WHERE` was already choosing one winner among concurrent callers; asking
+    // whether it matched is what turns that choice into an answer (#528).
+    const r = this.#db
       .prepare("UPDATE operations SET status='running', updated_at=? WHERE tenant_id=? AND operation_id=? AND status IN ('pending','rejected')")
       .run(now(), tenantId, operationId);
+    return Number(r.changes) > 0;
   }
 
   async getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null> {

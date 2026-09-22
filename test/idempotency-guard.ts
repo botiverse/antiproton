@@ -147,6 +147,46 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
       `an unknown row: ${JSON.stringify(u.error)}`);
     must(calls.length === 0, "the plugin ran");
   });
+
+  await check(`two calls racing for one key: one takes it, the other is refused (${backend})`, async () => {
+    // The guard reads the row and the start mark writes it; between the two a
+    // second caller under the same key reads what the first has not yet
+    // written. What decides is the store's condition, and only because the
+    // answer is read: a marker records that someone began, a claim decides who.
+    const store = await BACKENDS[backend]();
+    await mount(store, null);
+    const { gw, calls } = fixture(store);
+    const rs: any[] = await Promise.all([
+      gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY }),
+      gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY }),
+    ]);
+    must(calls.length === 1, `the key was taken twice: the plugin ran ${calls.length} times`);
+    must(rs.filter((r) => r.status === "succeeded").length === 1, `expected one run: ${JSON.stringify(rs)}`);
+    const refused = rs.filter((r) => r.error?.code === "already_attempted");
+    must(refused.length === 1, `expected one refusal: ${JSON.stringify(rs)}`);
+    // The loser is told by the row, which reads `running` or the end it reached:
+    // either way that row began, so it is not told the attempt is undetermined.
+    must(/it ran and may have landed/.test(refused[0].error.message), `wrong sentence: ${refused[0].error.message}`);
+  });
+
+  await check(`a refused key, then two retries racing: one takes it, the other is refused (${backend})`, async () => {
+    // The same window, one row-value along: a refusal leaves `rejected`, which
+    // the guard lets through, so both retries pass the guard and the claim is
+    // what separates them.
+    const store = await BACKENDS[backend]();
+    await mount(store, { tools: { go: "deny" } });
+    const { gw, calls } = fixture(store);
+    const first: any = await gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY });
+    must(first.status === "rejected", `the first call was not refused: ${JSON.stringify(first)}`);
+    await store.updateMountPolicy("t", "a", "svc", null);
+    const rs: any[] = await Promise.all([
+      gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY }),
+      gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY }),
+    ]);
+    must(calls.length === 1, `the key was taken twice: the plugin ran ${calls.length} times`);
+    must(rs.filter((r) => r.status === "succeeded").length === 1, `expected one run: ${JSON.stringify(rs)}`);
+    must(rs.filter((r) => r.error?.code === "already_attempted").length === 1, `expected one refusal: ${JSON.stringify(rs)}`);
+  });
 }
 
 for (const r of results) {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
-import type { Json, MountPolicy, MountRecord, PolicyDecision } from "../core/types.ts";
+import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
 import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
@@ -44,6 +44,50 @@ export function pluginUnavailableMessage(alias: string, plugin: string): string 
  */
 export function unknownToolMessage(alias: string, tool: string): string {
   return `the \`${alias}\` mount has no tool named "${tool}"; call one of the tools it does offer`;
+}
+
+/**
+ * What a write is told when its idempotency key is already taken, decided by
+ * the row's own value.
+ *
+ * `running`, and the ends a run can reach — `succeeded`, `failed`, and
+ * `unknown`, which only the catch after the plugin threw ever writes ("a
+ * request that may have landed") — began, and may have landed. `pending` (a
+ * row that never reached the start mark) and `cancelled` (which a denied
+ * approval writes as well as a stopped background job) cannot be told to have
+ * begun, and are not told they did.
+ *
+ * One function because two callers say this: the guard, which found the row
+ * before the call, and a caller whose claim lost a race for the same key
+ * (#528). They are the same sentence about the same row, and writing it twice
+ * is how the two would come to disagree.
+ *
+ * The message reaches the model, so it must not name the dispatch address:
+ * `alias.tool` is how the gateway routes, while the model was offered
+ * `alias__tool`, and the qualifier is not a rule this file could apply anyway
+ * (it truncates and breaks ties over the whole catalogue). The call it just
+ * made is the subject; it does not need to be named back (Piper, Vera, Dora,
+ * #113's class, 2026-09-12).
+ */
+export function alreadyAttempted(operationId: string, status: OperationStatus | null): ToolResult {
+  const began = status === "running" || status === "succeeded"
+    || status === "failed" || status === "unknown";
+  // `null` is a row that is not there at all. Nothing deletes from `operations`,
+  // so it is not expected; said as what it is rather than guessed at, it lands
+  // on the side that claims nothing.
+  const said = status === null ? "no record" : `status ${status}`;
+  return {
+    status: "unknown",
+    operationId,
+    error: {
+      code: "already_attempted",
+      message: began
+        ? `this call was already attempted under this key (${said}); ` +
+          `it ran and may have landed, so it is not repeated`
+        : `this call was already attempted under this key (${said}); ` +
+          `whether it began cannot be told from the record, so it is not repeated`,
+    },
+  };
 }
 
 export interface SecretResolver {
@@ -605,34 +649,7 @@ export class ToolGateway {
       // did not: `pending` is a row written before the start mark (an older
       // version, or a crash between the two), and is refused the same way.
       if (prior && schema.sideEffects === "write" && prior.status !== "rejected") {
-        // Said as the guard knows it, by the row's value. `running`, and the
-        // ends a run can reach — `succeeded`, `failed`, and `unknown`, which
-        // only the catch after the plugin threw ever writes ("a request that
-        // may have landed") — began, and may have landed. `pending` (a row
-        // that never reached the start mark) and `cancelled` (which a denied
-        // approval writes as well as a stopped background job) cannot be told
-        // to have begun, and are not told they did.
-        const began = prior.status === "running" || prior.status === "succeeded"
-          || prior.status === "failed" || prior.status === "unknown";
-        return {
-          status: "unknown",
-          operationId,
-          error: {
-            code: "already_attempted",
-            // These three messages reach the model, so they must not name the
-            // dispatch address: `alias.tool` is how the gateway routes, while
-            // the model was offered `alias__tool`, and the qualifier is not a
-            // rule this file could apply anyway (it truncates and breaks ties
-            // over the whole catalogue). The call it just made is the subject;
-            // it does not need to be named back (Piper, Vera, Dora, #113's
-            // class, 2026-09-12).
-            message: began
-              ? `this call was already attempted under this key (status ${prior.status}); ` +
-                `it ran and may have landed, so it is not repeated`
-              : `this call was already attempted under this key (status ${prior.status}); ` +
-                `whether it began cannot be told from the record, so it is not repeated`,
-          },
-        };
+        return alreadyAttempted(operationId, prior.status);
       }
       // A read is safe to redo; recordOperation below is a no-op on conflict.
     }
@@ -705,7 +722,17 @@ export class ToolGateway {
       // asked: from now on a repeat under this key is refused as one that may
       // have landed. (The row can still read `rejected` from an earlier refusal
       // under the same key; this moves it on, so the key is not free twice.)
-      await this.#store.startOperation(ctx.tenantId, operationId);
+      //
+      // Taking it is also how a key is claimed, not merely marked. The guard
+      // above reads the row and this writes it, and between the two a second
+      // caller under the same key can read what the first has not yet written;
+      // the store's condition picks one of them, and the one it did not pick
+      // stops here rather than entering the plugin (#528). The row it is told
+      // about is re-read, so the sentence is the row's and not this line's.
+      if (!(await this.#store.startOperation(ctx.tenantId, operationId))) {
+        return alreadyAttempted(
+          operationId, (await this.#store.getOperation(ctx.tenantId, operationId))?.status ?? null);
+      }
       const raw = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
       // A tool that ended a container's lease says so under LEASE_KEY. The fact
       // is recorded and the key removed: the result object is serialised whole
