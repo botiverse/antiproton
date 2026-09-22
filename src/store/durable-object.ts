@@ -413,6 +413,14 @@ export class DurableObjectStore implements StorageAdapter {
       this.#now(), this.#now());
   }
 
+  async startOperation(tenantId: string, operationId: string) {
+    // From pending or rejected only; a terminal row is never revived. No event:
+    // this is a start, not a completion (src/core/store.ts).
+    this.#sql.exec(
+      "UPDATE operations SET status='running', updated_at=? WHERE tenant_id=? AND operation_id=? AND status IN ('pending','rejected')",
+      this.#now(), tenantId, operationId);
+  }
+
   async getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null> {
     const r = this.#one("SELECT * FROM operations WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
     if (!r) return null;
