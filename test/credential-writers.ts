@@ -63,6 +63,11 @@ await check("attaching a key to a mount with no account points the mount at the 
 });
 
 await check("removing the agent's own key clears the reference (today's behaviour, pinned until the revert lands)", async () => {
+  // A placeholder, not a promise: this pins what remove does TODAY so that the
+  // change is deliberate. The feature that follows (#531) makes remove revert
+  // to the catalogue's reference for the alias — `operator:run9` for a sandbox
+  // mount — and this assertion is the one it replaces. The refusal case above
+  // is different in kind: it holds now and after.
   const { rt, ref } = await runtime(agentRef("m"));
   must(await rt.removeCredential("t", "a", "m"), "the remove was refused");
   must((await ref()) === null, `the reference reads ${await ref()}`);
