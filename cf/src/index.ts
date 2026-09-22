@@ -1266,7 +1266,8 @@ export class AgentDO extends DurableObject<Env> {
       const made = await this.#adopt(rt, tenantId, agentId, JSON.parse(agentJson) as StoredAgent);
       await this.#openTask(rt, tenantId, agentId, sessionId);
       // Not the console's default mounts: an API agent has what its caller declared (agents-api/provisioning.ts).
-      await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment));
+      const provides = (id: string) => rt.plugins().find((pl) => pl.id === id)?.provides;
+      await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment, provides));
       await rt.bindOperatorModel(tenantId, agentId);
       await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
       await this.ctx.storage.setAlarm(Date.now());
