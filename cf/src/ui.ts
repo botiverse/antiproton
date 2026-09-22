@@ -1587,11 +1587,12 @@ ${table(["kind", "count", "billed"], byKind.map((k) => [k.kind, k.n, secs(k.ms)]
  * and they were invisible until now.
  */
 export function sandboxPanel(d: any): string {
-  // Ask the mount, never its plugin's private state. `mountReports[alias]` is
-  // written by whoever can answer, so the page no longer knows which plugin a
-  // container comes from — and a mount with nothing to report is simply absent.
+  // Ask the mount what it provides, never which plugin it is. The row carries
+  // its plugin's provides declaration, and `mountReports[alias]` is written by
+  // whoever can answer — so the page picks a container without learning the
+  // plugin's name, and a mount with nothing to report is simply absent.
   const aliases = new Set(
-    (d.mounts ?? []).filter((m: any) => m.plugin === "sandbox").map((m: any) => m.alias));
+    (d.mounts ?? []).filter((m: any) => (m.provides ?? []).includes("container")).map((m: any) => m.alias));
   const name = [...aliases][0] ?? "sandbox";
   // Checked on the way in (mount-reports.ts): the payload crossed a Durable Object boundary as JSON, so it is
   // parsed into the contract types once, here, and what does not read is left out rather than drawn wrong.

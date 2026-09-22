@@ -1471,8 +1471,11 @@ export class AgentDO extends DurableObject<Env> {
         tenantId, taskId),
       compactions: rows(`SELECT id, seq, timestamp, LENGTH(body) AS bytes FROM pi_entries
                           WHERE type='compaction' ORDER BY seq DESC LIMIT 20`),
+      // The row carries what its plugin provides, so the page can ask a mount
+      // what it is instead of which plugin it is: the containers panel picks
+      // "container" without ever naming the plugin that declares it.
       mounts: rows("SELECT alias, plugin, tool_version, public_config, secret_ref, policy FROM mounts WHERE tenant_id=? AND agent_id=?",
-        tenantId, agentId),
+        tenantId, agentId).map((m) => ({ ...m, provides: rt.plugins().find((p) => p.id === m.plugin)?.provides ?? [] })),
       connections: rows("SELECT alias, state, expires_at, updated_at FROM connections WHERE tenant_id=? AND agent_id=?",
         tenantId, agentId),
       // What each mount says about itself, rather than what the page can infer
