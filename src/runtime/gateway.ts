@@ -597,7 +597,23 @@ export class ToolGateway {
 
     if (opts.idempotencyKey) {
       const prior = await this.#store.getOperation(ctx.tenantId, operationId);
-      if (prior && schema.sideEffects === "write") {
+      // The question is whether the earlier attempt ever BEGAN, not why it
+      // stopped: a row that reads `rejected` (the row's own status, written by
+      // the deny path below — not the `rejected` a ToolResult carries when no
+      // row was ever made) was refused at the door and never ran, so the key
+      // is free. Every other value means it began, or that nothing can say it
+      // did not: `pending` is a row written before the start mark (an older
+      // version, or a crash between the two), and is refused the same way.
+      if (prior && schema.sideEffects === "write" && prior.status !== "rejected") {
+        // Said as the guard knows it, by the row's value. `running`, and the
+        // ends a run can reach — `succeeded`, `failed`, and `unknown`, which
+        // only the catch after the plugin threw ever writes ("a request that
+        // may have landed") — began, and may have landed. `pending` (a row
+        // that never reached the start mark) and `cancelled` (which a denied
+        // approval writes as well as a stopped background job) cannot be told
+        // to have begun, and are not told they did.
+        const began = prior.status === "running" || prior.status === "succeeded"
+          || prior.status === "failed" || prior.status === "unknown";
         return {
           status: "unknown",
           operationId,
@@ -610,9 +626,11 @@ export class ToolGateway {
             // over the whole catalogue). The call it just made is the subject;
             // it does not need to be named back (Piper, Vera, Dora, #113's
             // class, 2026-09-12).
-            message:
-              `this call was already attempted under this key ` +
-              `(status ${prior.status}); it may have landed, so it is not repeated`,
+            message: began
+              ? `this call was already attempted under this key (status ${prior.status}); ` +
+                `it ran and may have landed, so it is not repeated`
+              : `this call was already attempted under this key (status ${prior.status}); ` +
+                `whether it began cannot be told from the record, so it is not repeated`,
           },
         };
       }
@@ -683,6 +701,11 @@ export class ToolGateway {
       } catch { /* the count is lost, the call is not */ }
     };
     try {
+      // The attempt begins here, and the record says so before the plugin is
+      // asked: from now on a repeat under this key is refused as one that may
+      // have landed. (The row can still read `rejected` from an earlier refusal
+      // under the same key; this moves it on, so the key is not free twice.)
+      await this.#store.startOperation(ctx.tenantId, operationId);
       const raw = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
       // A tool that ended a container's lease says so under LEASE_KEY. The fact
       // is recorded and the key removed: the result object is serialised whole

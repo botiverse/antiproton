@@ -150,6 +150,19 @@ export interface StorageAdapter {
   recordTrace?(rows: readonly TraceRow[]): Promise<void>;
 
   recordOperation(op: Omit<OperationRecord, "status" | "resultRef">): Promise<void>;
+  /**
+   * The attempt began executing. Written by the gateway right before the
+   * plugin is called, so that "did this call ever start" is a recorded fact a
+   * later reader can ask — the idempotency guard asks it, and refuses a repeat
+   * of anything that began. Only a row that reads `pending` or `rejected` is
+   * moved to `running`: a terminal row is never revived. No event. The status
+   * means the same thing at both places that write it — the attempt began —
+   * but `completeOperation(…, "running")` writes it at a moment that is also
+   * a completion (a call returned `Backgrounded`), which is why that one
+   * emits `operation.completed` and this one does not: the event belongs to
+   * what that writer also does, not to the status.
+   */
+  startOperation(tenantId: string, operationId: string): Promise<void>;
   getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null>;
   completeOperation(
     tenantId: string,
