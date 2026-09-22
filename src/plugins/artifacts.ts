@@ -65,6 +65,10 @@ export function artifactsPlugin(artifacts: R2Artifacts, bucket: string): Plugin 
 
     tools: [
       {
+        // The one tool that reads a parked result back. Declared so the
+        // runtime can find it by what it does rather than by this plugin's id
+        // and this tool's name — an operator may mount it under any alias.
+        reads: "parked-result",
         name: "read",
         summary:
           "Read back a parked result by its r2:// reference: whole, fields/offset/limit for part of a list, "

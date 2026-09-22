@@ -10,7 +10,7 @@
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import type { Plugin } from "../src/plugins/types.ts";
-import { limitForCall, offloadLimit, parkResult, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
+import { limitForCall, offloadLimit, parkResult, parkedReader, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 
@@ -198,6 +198,46 @@ await check("every offered tool's own description states the limit and what to d
   const without = withLimitNote([tools[0]!], null);
   must(without[0]!.description.includes(`over ${offloadLimit(null) / 1024} KB`) && /discarded/.test(without[0]!.description),
     `without a reader: ${without[0]!.description}`);
+});
+
+await check("the reader is found by what the tool DOES, not by the plugin's id and the tool's name", async () => {
+  // The old form rebuilt the string `artifacts` + `.read`. Both halves of that
+  // are things an operator or an author may change, and changing either left
+  // the runtime with no reader and nothing saying so — every parked result a
+  // dead end, silently.
+  const parked = { reads: "parked-result" as const };
+  const P = { parameters: { type: "object" }, sideEffects: "read" as const };
+  const gh = { name: "gh__api_get", address: "gh.api_get", description: "", ...P };
+
+  // 1. The same plugin under a different alias is still the reader.
+  const renamed = [gh, { name: "vault__read", address: "vault.read", description: "", ...P, ...parked }];
+  must(parkedReader(renamed)?.address === "vault.read", `an alias rename lost the reader: ${JSON.stringify(parkedReader(renamed))}`);
+
+  // 2. A different tool name on a different plugin qualifies, because the
+  //    declaration is the qualification.
+  const other = [gh, { name: "box__fetch_back", address: "box.fetch_back", description: "", ...P, ...parked }];
+  must(parkedReader(other)?.name === "box__fetch_back", `a second reader was not recognised: ${JSON.stringify(parkedReader(other))}`);
+
+  // 3. Nothing declaring it means no reader — and this is the half that must
+  //    not quietly become "the first tool": the limit note then has to say the
+  //    rest is discarded rather than name a tool that cannot read it back.
+  must(parkedReader([gh]) === null, "a tool that declares nothing was taken for the reader");
+  const note = withLimitNote([gh], parkedReader([gh]));
+  must(/discarded/.test(note[0]!.description) && !/read/i.test(note[0]!.description.split("over")[1] ?? ""),
+    `with no reader the note must not name one: ${note[0]!.description}`);
+
+  // 4. An address that merely LOOKS like the old pattern is not enough — this
+  //    is what makes the three above a reading rather than a coincidence.
+  const lookalike = [{ name: "artifacts__read", address: "artifacts.read", description: "", ...P }];
+  must(parkedReader(lookalike) === null, "the old name pattern still qualifies a tool that declares nothing");
+
+  // 5. And the declaration has to still be ON something. Everything above is
+  //    about fixtures; without this the whole rule passes with the real plugin
+  //    having quietly lost the field, and every parked result becomes a dead
+  //    end while this suite stays green.
+  const declaring = artifactsPlugin(null as any, "local").tools.filter((t) => t.reads === "parked-result");
+  must(declaring.length === 1 && declaring[0]!.name === "read",
+    `artifacts must declare exactly one parked-result reader, got ${JSON.stringify(declaring.map((t) => t.name))}`);
 });
 
 await check("a 10 KB result is parked when it can be read back, and kept whole when it cannot", async () => {

@@ -54,6 +54,11 @@ export interface MountedTool {
   /** Set when the plugin's mount owns a shared resource, so its calls must not
    *  overlap. pi executes a turn's tool calls in parallel by default. */
   exclusive?: boolean;
+  /** Carried from {@link ToolSchema}: this tool can hand back a result the
+   *  runtime parked. Carried rather than re-derived, because the runtime used
+   *  to find the reader by rebuilding the string `artifacts` + `.read`, which
+   *  a rename of either silently broke. */
+  reads?: "parked-result";
 }
 
 export interface ToolResult {
