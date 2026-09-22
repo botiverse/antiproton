@@ -18,6 +18,7 @@ import { maskRawRefs } from "../../src/store/refs.ts";
 import { hasTable, readEntries, readTranscript, sessionFor } from "./transcript-read.ts";
 import { trajectory } from "./ui.ts";
 import type { MountReports } from "./mount-reports.ts";
+import { worthReporting } from "./mount-reports.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -74,7 +75,7 @@ async function mountReports(
       const holding = holdingOf(plugin);
       const activity = holding ? await holding.activity(ctx) : { live: null };
       const usage = holding?.usage ? await holding.usage(ctx) : [];
-      if (activity?.live || usage.length) out[m.alias] = { activity, usage };
+      if (worthReporting(activity, usage)) out[m.alias] = { activity, usage };
     } catch {
       // One mount that cannot answer read-only must not blank the report for the rest.
     }

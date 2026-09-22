@@ -45,6 +45,7 @@ import { pluginEnabled } from "../../src/plugins/types.ts";
 
 /** What the plugins page is handed about each mount; declared and checked in cf/src/mount-reports.ts. */
 import type { MountReports } from "./mount-reports.ts";
+import { worthReporting } from "./mount-reports.ts";
 export type { MountReports };
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
 import { BenchState } from "./bench.ts";
@@ -1624,9 +1625,10 @@ export class AgentDO extends DurableObject<Env> {
           gw.mountActivity({ tenantId, agentId, taskId }, m.alias),
           gw.mountUsage({ tenantId, agentId, taskId }, m.alias),
         ]);
-        // Nothing running and nothing finished is not a report; leaving it out
-        // keeps the page's own emptiness check honest.
-        if (activity?.live || (usage as unknown[]).length) out[m.alias] = { activity, usage };
+        // Kept only when the report says something (worthReporting, shared with
+        // diagnose-read so the two surfaces cannot drift); an empty report
+        // would defeat the page's own emptiness check.
+        if (worthReporting(activity, usage)) out[m.alias] = { activity, usage };
       } catch {
         // One mount that cannot answer must not blank the panel for the rest.
       }

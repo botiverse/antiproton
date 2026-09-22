@@ -50,6 +50,15 @@ const writer = {
     async release() { return false; },
   },
 } as any;
+/** A plugin whose record only says how much of it would not read — no live box, no finished stretches. */
+const recorder = {
+  id: "recorder",
+  holds: {
+    async activity() { return { live: null, unreadable: 3 }; },
+    async usage() { return []; },
+    async release() { return false; },
+  },
+} as any;
 
 async function agentObject() {
   const host = sqliteHost();
@@ -133,7 +142,22 @@ await check("the report says what the old one said about mounts, events, jobs an
   host.dispose();
 });
 
-await check("a claimed object whose store was never initialised reads as a report, not a missing table", async () => {
+await check("a mount that can only say its record would not read still reaches the report", async () => {
+  // The fixture borrows neither the plugin name under test nor the alias: what
+  // matters is that "I could not tell" is not read as "there is nothing".
+  const { host, store } = await agentObject();
+  await store.addMount({
+    tenantId: "demo", agentId: "u-a", alias: "tape", plugin: "recorder", installationId: "i-tape",
+    connectionId: null, toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+  });
+  const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a",
+    { store, plugins: [reader, writer, recorder], alarm: async () => null, now: () => 5_000 }) as any;
+  assert(r.mountReports.tape?.activity.unreadable === 3,
+    `the unreadable-only mount was dropped from the report: ${JSON.stringify(r.mountReports)}`);
+  host.dispose();
+});
+
+check("a claimed object whose store was never initialised reads as a report, not a missing table", async () => {
   // An agent the Agents API only named: the constructor's tables and an owner row, and none of the store's (Ada, #347).
   const host = sqliteHost();
   host.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");

@@ -85,6 +85,32 @@ check("a container mount is picked by what it provides, not its plugin's name", 
     "the release form targeted the mount that only shares the old plugin's name");
 });
 
+check("a mount whose record partly refuses to read is not read as idle", () => {
+  // Both idle assertions — "never started" and "nothing is running" — claim the
+  // record says none when it only says unreadable. The panel must keep the cost
+  // open instead.
+  const html = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
+    mountReports: { box: { activity: { live: null, unreadable: 3 }, usage: [] } },
+  });
+  must(!html.includes("no container has ever been started"), "an unreadable record read as 'never started'");
+  must(!html.includes("nothing is running"), "an unreadable record read as idle");
+  must(html.includes("would not read"), "the page did not say the record is partly unreadable");
+  must(html.includes("still billing"), "the page closed the cost it cannot know is closed");
+});
+
+check("unreadable history with a finished session still leaves 'is it running' open", () => {
+  const html = sandboxPanel({
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
+    mountReports: { box: { activity: { live: null, unreadable: 1 }, usage: [
+      { id: "b0", startedAt: 1, endedAt: 2, lastUsedAt: 2, uses: 1, kept: [] },
+    ] } },
+  });
+  must(!html.includes("nothing is running"), "unreadable history read as idle");
+  must(html.includes("would not read"), "the page did not say the record is partly unreadable");
+  must(html.includes("1 call(s)"), "the finished session that did read was not rendered");
+});
+
 check("a mount with no report is not a container, whatever its connection says", () => {
   // A report is written only when something runs or ran; a stale connection row
   // in the old shape must not reach the panel at all.
