@@ -19,7 +19,14 @@ import type { TraceRow, TraceVerdict } from "./outbox.ts";
  * the call did not deliver, and no later fact will say it did.
  */
 export function operationEnded(status: OperationStatus): boolean {
-  return status === "succeeded" || status === "failed" || status === "cancelled" || status === "unknown";
+  // A switch, not a boolean chain, so that adding a status is a compile error
+  // here as well as in operationVerdict: "is this an end" is the judgement the
+  // gateway's deny path (and any new status) has to answer, and a chain would
+  // answer it silently with false.
+  switch (status) {
+    case "succeeded": case "failed": case "cancelled": case "unknown": return true;
+    case "pending": case "running": return false;
+  }
 }
 
 export function operationVerdict(status: OperationStatus): TraceVerdict {
