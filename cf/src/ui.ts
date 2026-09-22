@@ -1894,6 +1894,14 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   // folded away, and no remove — there is nothing here to remove, the
   // deployment's reference is not this page's to delete. A paste rejected on
   // top of it still reports its reason outside the fold.
+  //
+  // Do not narrow this control by consulting revertsTo: that field answers
+  // what removing a key returns to, not whether overriding is allowed, and
+  // letting it decide both is how one value comes to mean two things. The
+  // server refuses an override it cannot revert — a reference the catalogue
+  // does not name — and the reason comes back here; rendering from fields and
+  // refusing from the catalogue are two questions, each answered where it is
+  // asked (Piper, on #531).
   if (c.operator === true) {
     // "Included": an operator-attached credential means the deployment covers
     // this mount — nothing acting "as" an account. "Limited Free" names the
@@ -1912,7 +1920,10 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
   // account for this alias, so remove is a revert, not a deletion — the
   // button and its warning say where the mount ends up. "none" (the five
   // seeded aliases whose catalogue row has no reference, and every unseeded
-  // mount) is today's plain remove.
+  // mount) is today's plain remove. The states cannot share controls because
+  // the operator branch returns above: by the time `shared` is read the mount
+  // is known not to be the operator's — the structure, not the field values,
+  // is what keeps the override and the revert from meeting.
   const shared = c.revertsTo === "operator";
   const state = verified
     ? `<b>attached · verified</b>${account ? `<span>acting as <code>${esc(account)}</code></span>` : ""}`
