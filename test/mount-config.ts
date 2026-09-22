@@ -10,6 +10,7 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { validateMount, assertMountConfig } from "../src/runtime/mount-config.ts";
 import { pluginEnabled, renameSafety, type PluginChoice, isExclusive } from "../src/plugins/types.ts";
 import { AgentRuntime, SEEDED_PLUGINS } from "../cf/src/runtime.ts";
+import { capabilityTags } from "../scripts/plugin-capabilities.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { sandboxPlugin, execArgv, execOutput, sessionOf, activityOf, providerOf, keepSessions, usageOf, asBoxState, segmentsOf, keptNote, savedNote, notAReasonToRelease } from "../src/plugins/sandbox.ts";
@@ -1189,6 +1190,56 @@ await check("no plugin carries the members the capability groups replaced", () =
  * present while nothing declares it is a page describing a registry we do not
  * ship.
  */
+/**
+ * The other end of the page guard, with the input the real registry cannot give.
+ *
+ * The case below runs the generator over what we ship, and @Rex measured what
+ * that can and cannot catch (2026-09-22): "a plugin declares it and the page
+ * does not show it" goes red — that is the defect that happened. The reverse,
+ * "the page shows it and nothing declares it", has **no discriminating input
+ * today**, because every capability we ship is declared by one plugin, the
+ * sandbox, so `declared` is `true` for all three and a column stuck on `true`
+ * agrees with the truth everywhere. He made it red only by also deleting the
+ * sandbox's declaration — which is manufacturing the sample, not finding one.
+ *
+ * The missing input is a plugin that declares SOME of them, and that is a
+ * fixture rather than a deployment to wait for. So the mapping is asked
+ * directly here, off three plugins that exist only in this file:
+ *
+ *   declares holds only        → holds + serialised, NOT background
+ *   declares background only   → background, NOT holds, NOT serialised
+ *   declares nothing           → no tags at all
+ *
+ * Any capability whose test is hardcoded — `of: () => true`, or the string-key
+ * read that broke the page — now disagrees with one of those three rows.
+ */
+await check("a capability's tag follows that plugin's own declaration, not the registry's", async () => {
+  const holder = { id: "holder", version: "1", tools: [],
+    holds: { tools: { release: "letgo" }, async activity() { return { live: null }; }, async release() {} } } as unknown as Plugin;
+  const worker = { id: "worker", version: "1", tools: [],
+    background: { async poll() { return { done: false }; }, async cancel() {} } } as unknown as Plugin;
+  const plain = { id: "plain", version: "1", tools: [] } as unknown as Plugin;
+
+  const expected: Array<[Plugin, string[]]> = [
+    // Serialisation is derived from `holds`, so a holder gets both without
+    // declaring the second one.
+    [holder, ["holds something releasable", "one call at a time"]],
+    [worker, ["can work in the background"]],
+    [plain, []],
+  ];
+  for (const [plugin, want] of expected) {
+    const got = capabilityTags(plugin);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`${plugin.id} should be tagged ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+    }
+  }
+  // The rows only discriminate while they disagree with each other: if every
+  // capability were true of every plugin, three identical rows would pass a
+  // hardcoded mapping exactly as the real registry does.
+  const tagCounts = new Set(expected.map(([p]) => capabilityTags(p).length));
+  if (tagCounts.size < 3) throw new Error("the three fixtures no longer differ, so a hardcoded mapping would pass them");
+});
+
 await check("the contract page shows a capability exactly when some plugin declares it", async () => {
   const { execFileSync } = await import("node:child_process");
   const page = execFileSync("node", ["scripts/plugin-map.ts"], { encoding: "utf8", timeout: 120_000 });
