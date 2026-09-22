@@ -8,7 +8,8 @@ import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, Inb
 import { holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
-import { pluginEnabled } from "../plugins/types.ts";
+import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
+import { isReleased, leaseRow } from "../trace/seams.ts";
 import { toolCallRows } from "../usage/outbox.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
@@ -402,6 +403,20 @@ export class ToolGateway {
     });
   }
 
+  /** One row per ended lease, whichever of the three exits reported it. */
+  async #lease(ctx: CallContext, alias: string, fact: import("../plugins/types.ts").Released) {
+    await this.#store.recordTrace?.([leaseRow({ tenantId: ctx.tenantId, agentId: ctx.agentId, alias }, fact)]);
+  }
+
+  /** Records and strips a `Released` reported under LEASE_KEY; hands back everything else untouched. */
+  async #takeLease(ctx: CallContext, alias: string, result: unknown): Promise<unknown> {
+    if (!result || typeof result !== "object" || Array.isArray(result) || result instanceof Backgrounded) return result;
+    const { [LEASE_KEY]: fact, ...rest } = result as Record<string, unknown>;
+    if (!isReleased(fact)) return result;
+    await this.#lease(ctx, alias, fact);
+    return rest;
+  }
+
   async releaseTask(
     ctx: CallContext,
     /** One mount rather than all of them. A plugin's `release` was always
@@ -443,7 +458,15 @@ export class ToolGateway {
         // Only report what was actually holding something: a release log that
         // names every mount tells you nothing about what was costing anything.
         if (did !== false) released.push(mount.alias);
+        // The lease's end, as the plugin reported it from its own read, into the
+        // trace outbox (src/trace/seams.ts). A boolean or nothing reports no
+        // fact and writes no row.
+        if (isReleased(did)) await this.#lease(ctx, mount.alias, did);
       } catch (e) {
+        // A release that did not release is still an ended lease, and the most
+        // expensive one: the plugin attaches the fact to the error it throws.
+        const fact = (e as { released?: unknown })?.released;
+        if (isReleased(fact)) await this.#lease(ctx, mount.alias, fact);
         // Best effort, but not silent. Swallowing this is how a metered
         // container stays alive with nothing left that would notice — the
         // same failure, one layer up, that stopBox was fixed for.
@@ -653,7 +676,14 @@ export class ToolGateway {
       } catch { /* the count is lost, the call is not */ }
     };
     try {
-      const result = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
+      const raw = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
+      // A tool that ended a container's lease says so under LEASE_KEY. The fact
+      // is recorded and the key removed: the result object is serialised whole
+      // into what the model reads, so left in place it is tokens in the
+      // conversation, every release. Removed by name, so the name is a sentinel
+      // no plugin would choose for a field meant to be kept; anything under it
+      // that is not a `Released` is not touched, so a misuse stays visible.
+      const result = await this.#takeLease(ctx, r.mount.alias, raw);
       // Checked on the value the plugin returned, before anything serialises
       // it: the signal is the class, and a copy that went through JSON is data
       // (Piper, 2026-09-14). The work has started and outlives this call; the
@@ -674,7 +704,9 @@ export class ToolGateway {
       await counted("ok");
       return { status: "succeeded", operationId, result };
     } catch (err) {
-      const e = err as Error & PluginErrorFields & { retryable?: boolean };
+      const e = err as Error & PluginErrorFields & { retryable?: boolean; released?: unknown };
+      // A release tool that failed to release still ended a lease (see releaseTask).
+      if (isReleased(e.released)) await this.#lease(ctx, r.mount.alias, e.released);
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
       // The same two fields go onto the RECORD, not only onto what this call returns. The returned

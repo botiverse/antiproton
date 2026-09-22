@@ -19,7 +19,7 @@ import type {
   TaskRecord,
   WaitSpec,
 } from "../core/types.ts";
-import { appendTrace } from "../trace/outbox.ts";
+import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
 
 const SCHEMA = `
@@ -651,6 +651,10 @@ export class SqliteStore implements StorageAdapter {
 
   async recordUsage(rows: readonly UsageRow[]) {
     appendUsage(this.#usageSql() as any, rows);
+  }
+
+  async recordTrace(rows: readonly TraceRow[]) {
+    appendTrace(this.#usageSql() as any, rows);
   }
 
   /** The usage outbox, for tests. */
