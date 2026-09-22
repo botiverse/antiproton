@@ -906,12 +906,29 @@ export interface Released {
  *
  * Two of the sandbox's ending paths are tool calls (`release`, `start_from`)
  * and do not pass through `holds.release`, so the fact crosses the boundary in
- * two shapes: a return value, and a declared key on a result.
- * Declared as a constant because the kernel finds it by this name — the same
- * arrangement as `HELD_KEY`, and for the same reason: a name rebuilt at the
- * reading end is right only until someone renames one of the two.
+ * two shapes: a return value, and a declared key on a result. Declared as a
+ * constant because the kernel finds it by this name — the same arrangement as
+ * `HELD_KEY`, and for the same reason: a name rebuilt at the reading end is
+ * right only until someone renames one of the two.
+ *
+ * **The kernel deletes this key after recording, and that deletion is load
+ * bearing.** A plugin's result object is serialised whole into the text the
+ * model reads (`JSON.stringify(res.result)`, src/runtime/pi-tools.ts), so this
+ * is not a field that merely sits unread on an object — left in place it is
+ * tokens in the conversation, every release, forever.
+ *
+ * The value is a sentinel rather than a word because of that deletion, not
+ * instead of it. Something removed **by name** has to carry a name no plugin
+ * would choose for a field it wants the model to keep: `lease` is exactly the
+ * word a future container plugin might return on purpose, and the strip would
+ * eat it. `CWD_MARK` is the same shape one layer down — a marker the kernel
+ * parses out of output, spelled so that nothing else can be mistaken for it.
+ *
+ * So the two halves answer different failures and neither replaces the other:
+ * the strip keeps the key out of the model's context, and the spelling keeps
+ * the strip off somebody else's field.
  */
-export const LEASE_KEY = "lease";
+export const LEASE_KEY = "__ap_lease__";
 
 /**
  * Attach a `Released` to a failure, so a release that did NOT release is still
