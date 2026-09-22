@@ -310,7 +310,11 @@ export function usagePanel(d: UsageData): string {
   // passes missed were never written. Said once, above the numbers, for the
   // same reason the firstHours lines are — one fact, one line, never per tile.
   // A possibility, not a count: the marker does not say which entries, so the
-  // page does not either.
+  // page does not either. The strength of this sentence is decided by the
+  // partial query's scope (cf/src/usage-d1.ts): narrowing the query is what
+  // would let the sentence strengthen and move. The scope's current value is
+  // stated at the query, not here — a pointer carries the dependency, not the
+  // value, or the two drift.
   const partialLine = d.partial
     ? `<div class="u-note">part of the record would not read during this window — the figures below may be incomplete</div>`
     : "";
