@@ -18,7 +18,7 @@ import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, offersPlugin, offersCapability, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offersPlugin, offersCapability, offeredToolName, qualifyMountedTools, runJsTool, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -1588,8 +1588,7 @@ export class AgentRuntime {
     // offered them from: qualification sanitises the alias and breaks ties, so
     // a name rebuilt here would be a copy that is right only until it is not.
     const { tools } = await this.#catalogueFor(tenantId, agentId);
-    const offeredName = (alias: string, tool: string) =>
-      (tools as MountedTool[]).find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
+    const offeredName = (alias: string, tool: string) => offeredToolName(tools as MountedTool[], alias, tool);
 
     // A background exec does not touch lastUsedAt, so a box running one looks
     // idle for as long as the command runs; reclaim would take the machine out

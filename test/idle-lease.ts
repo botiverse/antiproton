@@ -7,6 +7,8 @@
  * again until its new release time is near.
  */
 import { idleDecision, releaseAt, warningText } from "../src/runtime/idle-lease.ts";
+import { offeredToolName, qualifyMountedTools } from "../src/runtime/pi-tools.ts";
+import { sandboxPlugin } from "../src/plugins/sandbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -104,6 +106,55 @@ check("a mount that offers no tools still gets a warning that is true", () => {
   const t = warningText("node", { release: null, quiet: null }, 25 * MIN, 5 * MIN, null);
   must(!/call `/.test(t), `nothing to call, so it must not say to call anything: ${t}`);
   must(/released in 5 minutes/.test(t), "the consequence still holds");
+});
+
+/**
+ * The hop between the two ends that were already asserted.
+ *
+ * The warning tells the agent to "call `<alias>.release`", and the name in that
+ * sentence is looked up in the list the model was offered — not built from the
+ * alias. Two ends of that were pinned and the middle was not: `mount-config`
+ * asserts the sandbox is in the catalogue (so its tools are offered at all),
+ * and the cases above assert what `warningText` does with a name and without
+ * one. Nothing asked whether the lookup actually finds `release` and `quiet`.
+ *
+ * It matters because of how it fails: rename either tool and the lookup returns
+ * null, the sentence silently loses the way out of an idle container, and both
+ * existing ends stay green (@Rex traced it, 2026-09-22).
+ *
+ * Built from the real plugin's real tools through the same qualification the
+ * model's names go through, so a rename or a tie-break at the length cap is
+ * what this reads rather than what it assumes.
+ */
+check("the warning's `release` and `quiet` are names the model was really offered", () => {
+  const sandbox = sandboxPlugin(null as any, "local", null);
+  const alias = "sandbox";
+  const offered = qualifyMountedTools(sandbox.tools.map((t) => ({
+    name: t.name, address: `${alias}.${t.name}`, description: t.summary,
+    parameters: t.parameters, sideEffects: t.sideEffects, idempotency: t.idempotency,
+  })));
+
+  for (const tool of ["release", "quiet"] as const) {
+    const name = offeredToolName(offered, alias, tool);
+    must(name !== null,
+      `the idle warning names \`${alias}.${tool}\`, and the lookup found nothing — if that tool was renamed, `
+      + `the warning has stopped telling the agent how to release its container`);
+    must(offered.some((t) => t.name === name && t.address === `${alias}.${tool}`),
+      `${tool} resolved to ${name}, which is not the offered name for that address`);
+  }
+
+  // The sentence with those names in it, so this case ends where the agent
+  // reads: both halves present, and neither of them a rebuilt string.
+  const t = warningText(alias, {
+    release: offeredToolName(offered, alias, "release"),
+    quiet: offeredToolName(offered, alias, "quiet"),
+  }, 25 * MIN, 5 * MIN, 60);
+  must(/call `/.test(t), `the warning must name what to call: ${t}`);
+
+  // And the negative direction, so the lookup is not just returning something
+  // for everything it is asked.
+  must(offeredToolName(offered, alias, "no_such_tool") === null, "the lookup answered for a tool that is not there");
+  must(offeredToolName(offered, "other", "release") === null, "the lookup ignored the alias");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

@@ -187,6 +187,29 @@ export function offersCapability(
   });
 }
 
+/**
+ * The name the model was actually offered for one mount's tool, or null.
+ *
+ * Looked up in the offered list rather than rebuilt from the alias, because
+ * qualification sanitises the alias and breaks ties at the length cap — a name
+ * rebuilt here would be a copy that is right only until it is not.
+ *
+ * Here rather than beside its caller for two reasons: it is a question about
+ * `MountedTool`, like `offersPlugin` and `offersCapability` above it; and its
+ * caller sits in a method needing a live object and a transcript, so the rule
+ * was unreachable from a test. The typecheck's program boundary settled the
+ * first one — exporting it from `cf/src/runtime.ts` pulled Worker globals into
+ * the node program the moment a test imported it. And it carries more than it looks like — the idle warning tells
+ * the agent to "call `<alias>.release`", so when this returns null that
+ * sentence quietly loses the way out. @Rex traced the chain and found this
+ * middle hop was the one nobody had asked about (2026-09-22): the set end is
+ * asserted in `test/mount-config.ts`, the text end in `test/idle-lease.ts`, and
+ * this is what joins them.
+ */
+export function offeredToolName(tools: MountedTool[], alias: string, tool: string): string | null {
+  return tools.find((t) => t.address === `${alias}.${tool}`)?.name ?? null;
+}
+
 export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   const used = new Set<string>();
   return tools.map((t) => {
