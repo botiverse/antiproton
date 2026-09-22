@@ -128,6 +128,22 @@ await check("start_from reports the lease of the container it displaced", async 
   } finally { f.restore(); }
 });
 
+await check("the key the kernel removes is spelled so it cannot be anyone's field", () => {
+  // The kernel deletes this key by name after recording it, and a plugin's
+  // result is serialised whole into what the model reads — so the deletion is
+  // what keeps it out of the conversation, and the spelling is what keeps the
+  // deletion off a field somebody meant to send. `lease` would be a reasonable
+  // name for a future container plugin's own output; this must not be.
+  must(/^__ap_[a-z_]+__$/.test(LEASE_KEY),
+    `a key that gets deleted by name must be unmistakable, not \`${LEASE_KEY}\``);
+  // Same spelling as the marker one layer down, for the same reason.
+  must(LEASE_KEY.startsWith("__ap_"), `${LEASE_KEY} does not follow the repo's sentinel form (__AP_CWD__)`);
+  // And it is still a constant both ends share: the point of declaring it is
+  // that nobody rebuilds the string at the reading end.
+  const result = { released: true, [LEASE_KEY]: { id: "b" } } as Record<string, unknown>;
+  must(Object.keys(result).includes(LEASE_KEY), "the constant no longer names the key it is used to write");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);
