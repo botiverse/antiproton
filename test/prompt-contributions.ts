@@ -13,6 +13,9 @@ import type { Plugin } from "../src/plugins/types.ts";
 import { limitForCall, offloadLimit, parkResult, parkedReader, tooLargeResult, withLimitNote } from "../cf/src/runtime.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
+import { statePlugin } from "../src/plugins/state.ts";
+import { heldPrompt } from "../src/runtime/held.ts";
+import { offeredToolName } from "../src/runtime/pi-tools.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -264,6 +267,86 @@ await check("run_js' missing fetch is stated as run_js' own, not as true of ever
   const p = systemPrompt({ sandbox: true });
   must(!/(^|[.\n] ?)There is no fetch/.test(p), "an unscoped 'There is no fetch' is back in the prompt");
   must(/run_js code has no fetch/.test(p) && /true of run_js alone/.test(p), "the prompt must say whose fetch is missing");
+});
+
+/**
+ * Nothing in the system prompt moves because time passed.
+ *
+ * The order cases above guard REORDERING — a rename cannot shuffle the
+ * paragraphs. @Rex found the neighbour they leave open (2026-09-22): a
+ * paragraph that changes IN PLACE reorders nothing and still throws the cached
+ * prefix away, and none of the fourteen cases here asked whether the same
+ * contribution comes out the same twice. Before step 7 that was free — every
+ * paragraph was rendered from declarations — and step 7 added the first one
+ * built from something live: what the agent is still holding.
+ *
+ * The line is "does it move with the CLOCK", not "does it never move" (cody,
+ * @Rex, 2026-09-22): `state`'s working set already changes when the agent
+ * writes a note, and that is a deliberate trade, not a defect. What must never
+ * happen is a prompt that differs between two `open`s where NOTHING changed
+ * but the time — which is every alarm, every reopen, forever.
+ *
+ * An instant is safe and a duration is not: an instant does not move when the
+ * reader does. So this builds the whole prompt twice, hours apart, with the
+ * same agent and the same held resource, and asks for the same bytes. Asserted
+ * over `systemPrompt` rather than over any one paragraph, because the cached
+ * prefix is what the assembler returns, and a future contribution that prints
+ * an elapsed time has to be caught by something that was written before it.
+ */
+await check("the whole system prompt is byte-identical across two opens hours apart", async () => {
+  const held = [{
+    alias: "sandbox", live: { id: "box-9", startedAt: 1_700_000_000_000, lastUsedAt: 1_700_000_060_000 },
+    quietUntil: null, billing: "billed for every second it exists, not per call",
+    tools: { release: "release", postpone: "quiet" },
+  }];
+  const offered = [
+    { name: "sandbox__release", address: "sandbox.release" },
+    { name: "sandbox__quiet", address: "sandbox.quiet" },
+  ] as any[];
+  // The two plugins that really contribute a paragraph today, through the real
+  // gateway, in registry order — not `says()` fixtures, because a fixture
+  // returning a constant cannot read a clock and so cannot fail this.
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const plugins = [artifactsPlugin(null as any, "local"), statePlugin(store, null as any, "local")];
+  for (const [alias, plugin] of [["artifacts", "artifacts"], ["state", "state"]] as const) {
+    await store.addMount({
+      tenantId: "t", agentId: "a", alias, installationId: `i-${alias}`, connectionId: null,
+      plugin, toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+    } as any);
+  }
+  const gw = new ToolGateway(store, plugins, new Set(plugins.map((pl) => pl.id)),
+    { async resolve() { return "SECRET"; } } as any);
+
+  const build = async () => systemPrompt({
+    persona: { name: "a", description: "d" },
+    contributions: await gw.promptContributions({ tenantId: "t", agentId: "a", taskId: "k" } as any),
+    held: heldPrompt(held as any, (alias, tool) => offeredToolName(offered, alias, tool)),
+    policy: "P",
+    sandbox: true,
+  });
+
+  const real = Date.now;
+  let first: string, later: string;
+  try {
+    Date.now = () => 1_700_000_060_000;
+    first = await build();
+    // Four hours later. Same agent, same notes, same container, same mounts.
+    Date.now = () => 1_700_000_060_000 + 4 * 3_600_000;
+    later = await build();
+  } finally { Date.now = real; }
+  if (first !== later) {
+    // Name the paragraph, not just the mismatch: the prompt is long, and "they
+    // differ" leaves the reader diffing by eye.
+    const a = first.split("\n\n"), b = later.split("\n\n");
+    const at = a.findIndex((para, i) => para !== b[i]);
+    throw new Error(`the prompt moved because time passed, at paragraph ${at}:\n  ${a[at]}\n  ${b[at]}`);
+  }
+  // A positive control, so a prompt that came back empty both times cannot pass
+  // this: the held paragraph has to actually be in there.
+  must(first.includes("box-9") && first.includes("sandbox__release"),
+    "the held paragraph is not in the prompt, so identity proves nothing");
 });
 
 await check("the model is told the size at which its results are parked", async () => {
