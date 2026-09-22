@@ -644,6 +644,22 @@ export interface MountActivity {
    * that only asks about the fields inside a record can never report that the
    * record was not a record — and that is the case where a
    * mount looks idle while whatever its id named goes unreleased.
+   *
+   * **Read it as a predicate, not a quantity.** The number mixes kinds that are
+   * not commensurable with anything a consumer displays: one unreadable entry
+   * in a saved-environment list costs no container seconds at all, while one
+   * unreadable record costs a whole mount's live box and history at once, and
+   * both add exactly 1. So `unreadable > 0` answers "is what I am about to show
+   * a lower bound" — which is the question all three consumers turned out to
+   * have — and the count itself answers nothing a reader can act on. Printing
+   * it beside a figure invites the conversion that does not exist, because two
+   * numbers side by side are assumed to share a unit.
+   *
+   * And it is about the record NOW. A consumer that has to say whether some
+   * past window was complete cannot get that from here: damage seen on one pass
+   * and repaired before the next leaves a hole in whatever was recorded
+   * meanwhile, and this field will have stopped mentioning it. A window's
+   * completeness has to be recorded by whoever records the window.
    */
   unreadable?: number;
 }
