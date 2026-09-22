@@ -605,11 +605,15 @@ export class ToolGateway {
       // did not: `pending` is a row written before the start mark (an older
       // version, or a crash between the two), and is refused the same way.
       if (prior && schema.sideEffects === "write" && prior.status !== "rejected") {
-        // Said as the guard knows it: a row that began (`running`, or ended
-        // after running) may have landed; one that cannot say it began
-        // (`pending`; `cancelled`, which a denied approval also writes;
-        // `unknown`) is not told it did.
-        const began = prior.status === "running" || prior.status === "succeeded" || prior.status === "failed";
+        // Said as the guard knows it, by the row's value. `running`, and the
+        // ends a run can reach — `succeeded`, `failed`, and `unknown`, which
+        // only the catch after the plugin threw ever writes ("a request that
+        // may have landed") — began, and may have landed. `pending` (a row
+        // that never reached the start mark) and `cancelled` (which a denied
+        // approval writes as well as a stopped background job) cannot be told
+        // to have begun, and are not told they did.
+        const began = prior.status === "running" || prior.status === "succeeded"
+          || prior.status === "failed" || prior.status === "unknown";
         return {
           status: "unknown",
           operationId,

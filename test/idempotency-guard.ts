@@ -127,6 +127,26 @@ for (const backend of Object.keys(BACKENDS) as Array<keyof typeof BACKENDS>) {
     must(!/may have landed/.test(r.error.message), "a row that cannot say it began was told it may have landed");
     must(calls.length === 0, "the plugin ran");
   });
+  await check(`a cancelled row cannot be told to have begun; an unknown one began and is told so (${backend})`, async () => {
+    // `cancelled` is what a human's denial of an approval writes (the plugin
+    // was never called) and also what stopping a background job writes (it
+    // ran); the sentence must not claim the first may have landed. `unknown`
+    // is written only after the plugin threw, so it began.
+    const store = await BACKENDS[backend]();
+    await mount(store, null);
+    const { gw, calls } = fixture(store);
+    const op = { operationId: opId, tenantId: "t", agentId: "a", taskId: "k", mountAlias: "svc", tool: "svc.go", toolVersion: "1.0.0" };
+    await store.recordOperation(op);
+    await store.completeOperation("t", opId, "cancelled", null);
+    const c: any = await gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY });
+    must(c.error?.code === "already_attempted" && /cannot be told/.test(c.error.message) && !/may have landed/.test(c.error.message),
+      `a cancelled row: ${JSON.stringify(c.error)}`);
+    await store.completeOperation("t", opId, "unknown", null);
+    const u: any = await gw.invoke(caller, "svc.go", {}, { idempotencyKey: KEY });
+    must(u.error?.code === "already_attempted" && /it ran and may have landed/.test(u.error.message),
+      `an unknown row: ${JSON.stringify(u.error)}`);
+    must(calls.length === 0, "the plugin ran");
+  });
 }
 
 for (const r of results) {
