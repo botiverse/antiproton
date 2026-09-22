@@ -113,6 +113,16 @@ await check("something under the key that is not a Released is neither recorded 
   must(f.leases().length === 0, "a malformed fact was recorded");
 });
 
+await check("an end before its start is not a fact: not recorded, not hidden", async () => {
+  // A damaged record can produce this (a createdAt written wrong is enough);
+  // clamped to 0 ms it would look like a box released the instant it was made.
+  const backwards: Released = { ...FACT, startedAt: FACT.endedAt + 1 };
+  const f = await fixture([plugin("svc", { result: { ok: true, [LEASE_KEY]: backwards } })]);
+  const r: any = await f.gw.invoke(caller, "svc.go", {});
+  must(LEASE_KEY in r.result, "a backwards fact was hidden instead of left visible");
+  must(f.leases().length === 0, "a backwards fact was recorded");
+});
+
 await check("a tool that failed to release reports the lease on the error it throws", async () => {
   const bad: Released = { ...FACT, status: "error", error: "still running" };
   const f = await fixture([plugin("svc", { throwOnInvoke: markReleased(new Error("could not release"), bad) })]);

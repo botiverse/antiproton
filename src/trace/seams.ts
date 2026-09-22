@@ -136,6 +136,11 @@ export function isReleased(x: unknown): x is Released {
   const r = x as Record<string, unknown>;
   return typeof r.id === "string" && r.id.length > 0
     && typeof r.startedAt === "number" && typeof r.endedAt === "number"
+    // An end before its start is not a fact but a damaged record read as one
+    // (a createdAt written wrong is enough); clamped to 0 ms it would join
+    // back and look like a box released the instant it was made. Refused, it
+    // stays visible where it was reported.
+    && r.endedAt >= r.startedAt
     && (r.status === "freed" || r.status === "error");
 }
 
@@ -150,7 +155,7 @@ export function leaseRow(o: { tenantId: string; agentId: string; alias: string }
     at: fact.endedAt, tenantId: o.tenantId, agentId: o.agentId,
     kind: "container.lease", spanId: fact.id,
     status: fact.status, verdict: fact.status === "freed" ? "ok" : "failed",
-    ms: Math.max(0, fact.endedAt - fact.startedAt),
+    ms: fact.endedAt - fact.startedAt,
     attrs: { mount: o.alias, ...(fact.error ? { error: fact.error } : {}) },
   };
 }
