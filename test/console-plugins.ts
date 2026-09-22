@@ -165,6 +165,9 @@ check("your own key over a shared default: the remove is a revert, and it says w
 check("your own key where the catalogue names nothing: remove is a plain remove", () => {
   // The five seeded aliases whose catalogue row has no reference, and every
   // unseeded mount: removing deletes, the confirm says the account is lost.
+  // Green on both sides of #536 by design: this case records today's
+  // behaviour, it does not prove the change — the same pinning shape as the
+  // placeholder assertions in #532.
   const html = render(mount("gh", "github", { connected: true,
     credential: { attached: true, verified: true, account: "botiverse", revertsTo: "none" } }));
   must(/>remove</.test(html), "the button still says remove");
