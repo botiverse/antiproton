@@ -62,6 +62,11 @@ Nothing imports these. Nothing types them. Everything rests on them:
   reports operations left open by the previous process in `open[]`. This is our
   entire crash-recovery mechanism; there is no sweeper any more.
 - `Storage.commit` is all-or-nothing across entries, values, lists and usage.
+- `AssistantMessage["stopReason"]` is exactly the set the trace seams decide
+  over: which reasons end a model call's span and which are the placeholder's
+  and a poll's. The set is pinned in `src/trace/seams.ts` by a record keyed on
+  that union, so an added or removed reason fails the typecheck there rather
+  than reading silently as "not an end".
 
 Each has a test. That is deliberate: an upgrade that quietly changes one of
 these should fail here, not on a tenant.

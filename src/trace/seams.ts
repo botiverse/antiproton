@@ -76,18 +76,20 @@ export function approvalRow(a: {
  * answer carries the job id it came from (src/model/pi-bridge.ts, `jobId`),
  * so the row joins back to `pi_model_jobs` by that id; the placeholder and
  * any poll entries carry "deferred"/"pending" and are not ends.
+ *
+ * The stop reasons are pi-ai's union, not ours, so a switch here would still
+ * compile when pi adds one. A record keyed by that union does not: a reason
+ * pi adds is a missing key, one it removes is an excess key, and either is a
+ * type error at this line. That is the test docs/pi-upstream.md promises for
+ * the contract it records about this union (see "Behavioural contracts").
  */
+const STOP_REASON_ENDS: Record<AssistantMessage["stopReason"], "end" | "not-end"> = {
+  stop: "end", length: "end", toolUse: "end", error: "end", aborted: "end",
+  pending: "not-end", deferred: "not-end",
+};
+
 export function answerEnded(stopReason: AssistantMessage["stopReason"]): boolean {
-  // Unlike operationEnded, this union is pi-ai's, not ours: a switch here would
-  // still compile clean when pi adds a reason, so exhaustiveness cannot be had
-  // from the compiler and is had by reading instead — every member is named,
-  // the two that are not ends included, so a reader can see all seven were
-  // decided rather than two being absent.
-  switch (stopReason) {
-    case "stop": case "length": case "toolUse": case "error": case "aborted": return true;
-    case "pending": case "deferred": return false;
-    default: return false;
-  }
+  return STOP_REASON_ENDS[stopReason] === "end";
 }
 
 /**
