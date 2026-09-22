@@ -46,7 +46,7 @@ const report = {
 
 check("a live container offers release now — one form, alias in body, confirmation that warns about the refusal", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
     mountReports: { box: report },
   });
   const forms = html.match(/<form[^>]*hx-post="\/ui\/sandbox\/release"[^>]*>[\s\S]*?<\/form>/g) ?? [];
@@ -58,18 +58,38 @@ check("a live container offers release now — one form, alias in body, confirma
 
 check("the sandbox panel asks the mount, under any alias", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
     mountReports: { box: report },
   });
   must(html.includes("a container is running"), "a live container from a mount report did not render");
   must(html.includes("billed for every second it exists"), "the billing sentence from the plugin did not show");
 });
 
+check("a container mount is picked by what it provides, not its plugin's name", () => {
+  // The fixture cannot borrow the name under test: one mount's plugin is not
+  // "sandbox" but declares a container, another is named "sandbox" and declares
+  // nothing. Asking the name picks the second — red before this change; asking
+  // what the mount provides picks the first.
+  const html = sandboxPanel({
+    mounts: [
+      { alias: "mybox", plugin: "holder", provides: ["container"] },
+      { alias: "sb", plugin: "sandbox" },
+    ],
+    mountReports: { mybox: report },
+  });
+  must(html.includes("a container is running"),
+    "a container-providing mount under another plugin's name did not reach the panel");
+  must(html.includes('name="alias" value="mybox"'),
+    "the release form did not target the container-providing mount");
+  must(!html.includes('name="alias" value="sb"'),
+    "the release form targeted the mount that only shares the old plugin's name");
+});
+
 check("a mount with no report is not a container, whatever its connection says", () => {
   // A report is written only when something runs or ran; a stale connection row
   // in the old shape must not reach the panel at all.
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
     connections: [{ alias: "box", state: JSON.stringify({ boxId: "b1", createdAt: Date.now() - 1000 }), expires_at: null, updated_at: 0 }],
   });
   must(html.includes("no container has ever been started"), "the old connection shape leaked through");
@@ -77,7 +97,7 @@ check("a mount with no report is not a container, whatever its connection says",
 
 check("an idle-but-present sandbox mount is named in the empty state", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
   });
   must(html.includes("no container has ever been started"), "wrong empty branch");
   must(html.includes("<span class=\"chip\">box</span>"), "the hint did not name the mount it has");
@@ -85,7 +105,7 @@ check("an idle-but-present sandbox mount is named in the empty state", () => {
 
 check("the quiet-until notice shows when the agent postponed, and artifacts union across sessions", () => {
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
     mountReports: { box: {
       activity: { live: { id: "b1", startedAt: Date.now() - 60_000, lastUsedAt: Date.now() - 5_000 },
         quietUntil: Date.now() + 3_600_000, billing: "billed" },
@@ -102,7 +122,7 @@ check("the quiet-until notice shows when the agent postponed, and artifacts unio
 check("a report that does not read draws less, never NaN or undefined", () => {
   // The payload crosses a Durable Object boundary as JSON; a bad row is dropped on the way in (mount-reports.ts).
   const html = sandboxPanel({
-    mounts: [{ alias: "box", plugin: "sandbox" }],
+    mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
     mountReports: { box: {
       activity: { live: null, billing: "billed" },
       usage: [
