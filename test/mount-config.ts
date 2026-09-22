@@ -213,19 +213,27 @@ await check("every plugin the runtime registers is in everyPlugin", () => {
   // below assert something about a plugin production never loads. The one
   // direction reads like completeness and is only half of it.
   //
-  // Not a plain subset either way: the appworld plugins are in the list on
-  // purpose and are deliberately NOT registered in the Worker — they are the
-  // benchmark's. So the reverse holds against the union, and the exception is
-  // named rather than the assertion being weakened to let anything through.
-  const benchOnly = new Set(appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }).map((p) => p.id));
-  const stray = [...listed].filter((id) => !registered.includes(id) && !benchOnly.has(id));
+  // Not a plain subset either way, so the exception is NAMED rather than the
+  // assertion loosened: the appworld plugins are in the list on purpose and are
+  // deliberately not registered in the Worker. Their users are
+  // `scripts/plugin-map.ts`, `test/appworld.ts` and this file — measured, not
+  // assumed: `bench/` does not mention them at all, which is why calling them
+  // "the benchmark's" was wrong (@Rex corrected his own suggestion and mine,
+  // 2026-09-22). So the reverse holds against the union with this set, and a
+  // future plugin that lives outside the Worker has one place to say so.
+  const outsideTheWorker = new Set(
+    appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }).map((p) => p.id),
+  );
+  const stray = [...listed].filter((id) => !registered.includes(id) && !outsideTheWorker.has(id));
   if (stray.length) {
     throw new Error(
       `in everyPlugin but not registered by the runtime, so the checks below describe something production does `
-      + `not load: ${stray.join(", ")}. If it is bench-only, say so where benchOnly is built.`,
+      + `not load: ${stray.join(", ")}. If it belongs outside the Worker, say so where outsideTheWorker is built.`,
     );
   }
-  if (benchOnly.size === 0) throw new Error("the exception list is empty, so the reverse rule is unconstrained");
+  if (outsideTheWorker.size === 0) {
+    throw new Error("the exception set is empty, so the reverse rule is unconstrained");
+  }
 });
 
 await check("no plugin takes a credential as a setting", () => {
