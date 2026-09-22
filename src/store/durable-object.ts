@@ -416,9 +416,22 @@ export class DurableObjectStore implements StorageAdapter {
   async startOperation(tenantId: string, operationId: string) {
     // From pending or rejected only; a terminal row is never revived. No event:
     // the moment is a start, not also a completion (src/core/store.ts).
-    this.#sql.exec(
-      "UPDATE operations SET status='running', updated_at=? WHERE tenant_id=? AND operation_id=? AND status IN ('pending','rejected')",
-      this.#now(), tenantId, operationId);
+    //
+    // Read, check, write in one transaction, as `decideApproval` does below and
+    // for the same reason it gives — two callers must not both be told they
+    // took this. The condition is written twice on purpose: the `WHERE` is the
+    // invariant (a terminal row is never demoted) and holds wherever this
+    // statement is read, while the `SELECT` is what makes "did it match" an
+    // answer this method can return. Nothing here reads a cursor's written-row
+    // count, which no other query in this file does either.
+    return this.#tx(() => {
+      const r = this.#one("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+      if (!r || (r.status !== "pending" && r.status !== "rejected")) return false;
+      this.#sql.exec(
+        "UPDATE operations SET status='running', updated_at=? WHERE tenant_id=? AND operation_id=? AND status IN ('pending','rejected')",
+        this.#now(), tenantId, operationId);
+      return true;
+    });
   }
 
   async getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null> {

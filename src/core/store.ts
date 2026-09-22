@@ -151,18 +151,26 @@ export interface StorageAdapter {
 
   recordOperation(op: Omit<OperationRecord, "status" | "resultRef">): Promise<void>;
   /**
-   * The attempt began executing. Written by the gateway right before the
-   * plugin is called, so that "did this call ever start" is a recorded fact a
-   * later reader can ask — the idempotency guard asks it, and refuses a repeat
-   * of anything that began. Only a row that reads `pending` or `rejected` is
-   * moved to `running`: a terminal row is never revived. No event. The status
-   * means the same thing at both places that write it — the attempt began —
-   * but `completeOperation(…, "running")` writes it at a moment that is also
-   * a completion (a call returned `Backgrounded`), which is why that one
-   * emits `operation.completed` and this one does not: the event belongs to
-   * what that writer also does, not to the status.
+   * Claim the attempt and record that it began. Written by the gateway right
+   * before the plugin is called, so that "did this call ever start" is a
+   * recorded fact a later reader can ask — the idempotency guard asks it, and
+   * refuses a repeat of anything that began. Only a row that reads `pending`
+   * or `rejected` is moved to `running`: a terminal row is never revived. No
+   * event. The status means the same thing at both places that write it — the
+   * attempt began — but `completeOperation(…, "running")` writes it at a
+   * moment that is also a completion (a call returned `Backgrounded`), which
+   * is why that one emits `operation.completed` and this one does not: the
+   * event belongs to what that writer also does, not to the status.
+   *
+   * **True when this caller took the attempt, false when someone else already
+   * had it.** The two differ only under concurrency, and only because the
+   * answer is read: the `pending`/`rejected` condition already picks a single
+   * winner among callers racing for one key, so a caller told `false` must not
+   * go on to the plugin (#528). Returning nothing made this a mark — a record
+   * that someone began — where the guard needs a claim, which decides who
+   * begins, and has to decide it before the plugin is entered.
    */
-  startOperation(tenantId: string, operationId: string): Promise<void>;
+  startOperation(tenantId: string, operationId: string): Promise<boolean>;
   getOperation(tenantId: string, operationId: string): Promise<OperationRecord | null>;
   completeOperation(
     tenantId: string,
