@@ -235,6 +235,30 @@ check("the mount list names each mount, its plugin and its credential state, and
   must(plugins(d).includes(cat.slice(0, 60)), "the whole page still composes the catalogue");
 });
 
+check("the catalogue says which way inheritance resolved, and what decided it", () => {
+  // `defaultForAllAgents` reaches this page as a payload field that
+  // `cf/src/index.ts` computes from the catalogue. Nothing here asserted it, so
+  // dropping that field from the payload would have drawn every inheriting
+  // plugin as "opt-in" with no suite reddening — the same shape as #488, a
+  // consumer reading a field nobody pinned.
+  const d = { installed: [
+    { id: "tools", version: "1", tools: [], config: [], choice: "inherit", enabled: true, defaultForAllAgents: true },
+    { id: "exa", version: "1", tools: [], config: [], choice: "inherit", enabled: false, defaultForAllAgents: false },
+    { id: "github", version: "1", tools: [], config: [], choice: "enable", enabled: true, defaultForAllAgents: false },
+  ], mounts: [], used: {} };
+  const cat = catalogue(d);
+  must(/on by inheritance — the plugin is default for all agents/.test(cat),
+    "a plugin that is on because the deployment seeds it must say so");
+  must(/off by inheritance — the plugin is opt-in/.test(cat),
+    "and one that is off because nobody opted in must say that instead");
+  // Without this, "inherit" and an explicit answer would be indistinguishable,
+  // which is the reason the chip spells out what inherit resolved to.
+  must(/this agent answered "enable"/.test(cat),
+    "an answer this agent gave is not described as inheritance");
+  must(!/answered "enable"[\s\S]*by inheritance/.test(cat.replace(/\n/g, " ")),
+    "the two reasons must not both be claimed for one plugin");
+});
+
 check("an unknown mount alias is said back, escaped", () => {
   const html = mountFragment({ installed: [], mounts: [], used: {} }, `<img src=x onerror=1>`);
   must(!html.includes("<img src=x"), "the alias must be escaped");
