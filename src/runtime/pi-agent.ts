@@ -369,6 +369,13 @@ export class PiAgent {
         "something upstream is passing a cancelled stream through as an answer",
       );
     }
+    // Handed back whole, on purpose. The answer's `jobId` (the trace spine's
+    // link from the stored entry to this job) survives to the entry body only
+    // because nothing between here and the commit rebuilds the message from
+    // chosen fields — the type names the field, it does not make anyone
+    // require it. A refactor that constructs a new object here would drop it
+    // silently and typecheck clean, so any such change has to come with the
+    // assertion in test/pi-agent.ts that reads the stored entry back.
     return message as Answered;
   }
 
