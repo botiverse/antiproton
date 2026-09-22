@@ -1,0 +1,64 @@
+/**
+ * The trace rows the store writes at its own seams, built here so the two
+ * store implementations (src/store/durable-object.ts, src/store/sqlite.ts)
+ * write the same row from the same facts and neither carries its own copy of
+ * the mapping.
+ *
+ * A row is written where the fact it joins back to is committed, inside the
+ * same transaction, from the values that transaction read — never from a
+ * later read of the record (a span whose numbers came from somewhere else
+ * joins correctly and is still wrong; the recorder asserts the arithmetic).
+ */
+import type { OperationStatus } from "../core/types.ts";
+import type { TraceRow, TraceVerdict } from "./outbox.ts";
+
+/**
+ * `completeOperation` is also how the gateway says "running" (a progress
+ * update, not an end), so a tool.call span closes only on a terminal status.
+ * `unknown` is terminal — the harness lost the outcome — and reads as failed:
+ * the call did not deliver, and no later fact will say it did.
+ */
+export function operationEnded(status: OperationStatus): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled" || status === "unknown";
+}
+
+export function operationVerdict(status: OperationStatus): TraceVerdict {
+  switch (status) {
+    case "succeeded": return "ok";
+    case "cancelled": return "cancelled";
+    case "failed": case "unknown": return "failed";
+    // Not an end; callers ask operationEnded first. Named so the switch stays
+    // exhaustive when a status is added.
+    case "pending": case "running": return "failed";
+  }
+}
+
+/** The tool.call row for an operation that just ended. */
+export function toolCallRow(op: {
+  tenantId: string; agentId: string; taskId: string; operationId: string;
+  mountAlias: string; tool: string; status: OperationStatus;
+  createdAt: number; endedAt: number; callId?: string | null;
+}): TraceRow {
+  return {
+    at: op.endedAt, tenantId: op.tenantId, agentId: op.agentId,
+    kind: "tool.call", spanId: op.operationId,
+    status: op.status, verdict: operationVerdict(op.status),
+    ms: Math.max(0, op.endedAt - op.createdAt),
+    attrs: { tool: op.tool, mount: op.mountAlias, task: op.taskId, ...(op.callId ? { callId: op.callId } : {}) },
+  };
+}
+
+/** The approval.wait row for a decision that just landed. */
+export function approvalRow(a: {
+  tenantId: string; agentId: string; taskId: string; operationId: string;
+  mountAlias: string; tool: string; decision: "approved" | "denied"; approver: string;
+  createdAt: number; decidedAt: number;
+}): TraceRow {
+  return {
+    at: a.decidedAt, tenantId: a.tenantId, agentId: a.agentId,
+    kind: "approval.wait", spanId: a.operationId,
+    status: a.decision, verdict: a.decision === "approved" ? "ok" : "blocked",
+    ms: Math.max(0, a.decidedAt - a.createdAt),
+    attrs: { tool: a.tool, mount: a.mountAlias, task: a.taskId, approver: a.approver },
+  };
+}

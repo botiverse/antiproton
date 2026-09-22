@@ -19,6 +19,8 @@ import type {
   TaskRecord,
   WaitSpec,
 } from "../core/types.ts";
+import { appendTrace } from "../trace/outbox.ts";
+import { approvalRow, operationEnded, toolCallRow } from "../trace/seams.ts";
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -665,11 +667,12 @@ export class SqliteStore implements StorageAdapter {
     facts?: CompletedFacts,
   ) {
     this.#tx(() => {
+      const endedAt = now();
       this.#db
         .prepare(
           "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
         )
-        .run(status, resultRef, now(), tenantId, operationId);
+        .run(status, resultRef, endedAt, tenantId, operationId);
       this.#db
         .prepare(
           "UPDATE waits SET resolved=1 WHERE tenant_id=? AND operation_id=? AND resolved=0",
@@ -677,7 +680,7 @@ export class SqliteStore implements StorageAdapter {
         .run(tenantId, operationId);
       // Uniform wakeup: everything the harness reacts to arrives as an event.
       const op = this.#db
-        .prepare("SELECT agent_id, task_id FROM operations WHERE tenant_id=? AND operation_id=?")
+        .prepare("SELECT agent_id, task_id, mount_alias, tool, created_at FROM operations WHERE tenant_id=? AND operation_id=?")
         .get(tenantId, operationId) as any;
       if (op) {
         this.#insertEvent({
@@ -688,6 +691,15 @@ export class SqliteStore implements StorageAdapter {
           payload: completedPayload(operationId, status, resultRef, result, facts),
           dedupKey: `op:${operationId}:completed`,
         });
+        // The trace row, in the same transaction as the fact it joins back to
+        // (src/trace/seams.ts). "running" is not an end and writes none.
+        if (operationEnded(status)) {
+          appendTrace(this.#usageSql() as any, [toolCallRow({
+            tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
+            mountAlias: op.mount_alias, tool: op.tool, status,
+            createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
+          })]);
+        }
       }
     });
   }
@@ -996,10 +1008,17 @@ export class SqliteStore implements StorageAdapter {
       if (!r) return { ok: false as const, reason: "not_found" as const };
       // Deciding twice would let one approval authorise two executions.
       if (r.state !== "pending") return { ok: false as const, reason: "already_decided" as const };
+      const at = now();
       this.#db
         .prepare("UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?")
-        .run(decision, approver, now(), tenantId, operationId);
-      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: now() }) };
+        .run(decision, approver, at, tenantId, operationId);
+      // The wait is over either way; the row says how long and which way.
+      appendTrace(this.#usageSql() as any, [approvalRow({
+        tenantId, agentId: r.agent_id, taskId: r.task_id, operationId,
+        mountAlias: r.mount_alias, tool: r.tool, decision, approver,
+        createdAt: Number(r.created_at), decidedAt: at,
+      })]);
+      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at }) };
     });
   }
 
