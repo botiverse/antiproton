@@ -19,6 +19,7 @@
  * memory actually is, and it removes a whole identifier from the system.
  */
 import { createModels } from "@earendil-works/pi-ai";
+import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { ensureBackgroundTable } from "./background-jobs.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentHarness } from "@earendil-works/pi-agent-core";
@@ -361,7 +362,7 @@ export class PiAgent {
   #pollJob(id: string): Answered | null {
     const row = this.#sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", id).toArray()[0] as any;
     if (!row?.answer) return null;
-    const message = JSON.parse(row.answer) as AssistantMessage;
+    const message = JSON.parse(row.answer) as AnsweredMessage;
     if (message.stopReason === "aborted") {
       throw new Error(
         `the stored answer for ${id} says "aborted", which nothing that writes this row can produce; ` +
@@ -385,7 +386,7 @@ export class PiAgent {
   }
 
   /** The worker's answer. Writing it is what makes the next drive finish. */
-  deliver(id: string, answer: AssistantMessage): boolean {
+  deliver(id: string, answer: AnsweredMessage): boolean {
     const row = this.#sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", id).toArray()[0] as any;
     if (!row || row.answer) return false;
     this.#sql.exec("UPDATE pi_model_jobs SET answer = ?, answered_at = ? WHERE id = ?",
