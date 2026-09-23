@@ -35,6 +35,7 @@
     "test/diagnose-read.ts",
     "test/credential-writers.ts",
     "test/trace-drain.ts",
+    "test/message-landed.ts",
     "test/agents-api-keys.ts",
     "test/agents-api-shapes.ts",
     "test/agents-api-store.ts",

@@ -92,6 +92,35 @@ await check("空闲时发 steer 也会启动一轮,而不是石沉大海", async
   await f.agent.close();
 });
 
+await check("答案送到之后、run 结束之前到的消息,不会困在 inbox 里", async () => {
+  const f = await fixture();
+  await f.agent.say("hello");
+  await f.agent.step();
+  // The worker has written the final answer; the run is still the lane's
+  // current operation until the next step() drives it to settled. A message
+  // in this window is refused as a prompt and filed as a steer, and the
+  // question is whether the run that is ending takes it with it. It does:
+  // the turn boundary selects queued steers before the run settles, so the
+  // message becomes the next turn. Green on both sides of task #6 by design:
+  // this was the first reading of the 2026-09-22 stalls, and it was wrong —
+  // the case stays so the window is known to be safe rather than suspected.
+  f.w.answer(f.w.pending(f.host)[0]!.id, { text: "done" });
+  const before = (await f.agent.lane.inspectExecution(CTX)).current?.id;
+  if (!before) throw new Error("the fixture did not reproduce the window: no current operation");
+  await f.agent.say("and one more thing");
+  const out = await f.agent.step();
+  const entries = await f.agent.storage.scanEntries({ order: "asc" }, CTX);
+  if (!JSON.stringify(entries).includes("and one more thing")) {
+    throw new Error("the message that arrived in the window is not in the transcript");
+  }
+  if (out.open !== 1 || f.w.pending(f.host).length !== 1) {
+    throw new Error(`no run started for it: open=${out.open}, jobs=${f.w.pending(f.host).length}`);
+  }
+  f.w.answer(f.w.pending(f.host)[0]!.id, { text: "ok" });
+  await f.agent.step();
+  await f.agent.close();
+});
+
 await check("step 挂起而不是等待,并把活派给队列", async () => {
   const f = await fixture();
   await f.agent.say("hello");
