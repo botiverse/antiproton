@@ -31,7 +31,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, isMessageRefused } from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
@@ -3329,9 +3329,10 @@ export default {
             // so the route hears it here; anything else is the 500 it was.
             try {
               await stub.uiSay(gate.tenantId, agentId, taskId, text, mode);
-            } catch (e: any) {
-              if (!isMessageRefused(e)) throw e;
-              return new Response(`refused: ${String(e?.message ?? e)}`, { status: 409 });
+            } catch (e) {
+              const refusal = messageRefusal(e);
+              if (refusal === null) throw e;
+              return new Response(`refused: ${refusal}`, { status: 409 });
             }
           }
           const t = await stub.uiTranscript(gate.tenantId, agentId, taskId);
