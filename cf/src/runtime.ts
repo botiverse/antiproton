@@ -553,8 +553,13 @@ export function parsePluginChoice(value: unknown): PluginChoice | null {
 /** The first words of a refusal thrown by `messageLanded`: an error crossing a Durable Object stub keeps
  *  its message and loses its class, so a route that wants to answer 409 rather than 500 matches on these. */
 export const MESSAGE_REFUSED = "message refused by the lane";
-export function isMessageRefused(e: unknown): boolean {
-  return String((e as any)?.message ?? e).startsWith(MESSAGE_REFUSED);
+
+/** The refusal's text when `e` is one, or null. `e` is whatever a catch holds, so it is asked before it is
+ *  read: an object with a `message` is read there, anything else is read as itself. */
+export function messageRefusal(e: unknown): string | null {
+  const message = typeof e === "object" && e !== null && "message" in e ? (e as { message?: unknown }).message : e;
+  const text = String(message ?? e);
+  return text.startsWith(MESSAGE_REFUSED) ? text : null;
 }
 
 export function messageLanded(

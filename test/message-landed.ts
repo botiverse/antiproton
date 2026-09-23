@@ -6,7 +6,7 @@
  * The judgement is a pure function so the shape a lane returns can be handed
  * to it here without a bound runtime, a model, or an object.
  */
-import { messageLanded } from "../cf/src/runtime.ts";
+import { messageLanded, messageRefusal, MESSAGE_REFUSED } from "../cf/src/runtime.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -50,6 +50,18 @@ check("a refusal is thrown with the lane's own tag, never reported as queued", (
 check("no result at all is not a refusal (a followUp returns nothing to judge)", () => {
   const r = messageLanded(undefined, "followUp");
   if (r.mode !== "followUp" || !r.queued) throw new Error(JSON.stringify(r));
+});
+
+check("a thrown refusal is recognised from a catch, and anything else is not", () => {
+  let thrown: unknown;
+  try { messageLanded(refusedEmpty, "prompt"); } catch (e) { thrown = e; }
+  const got = messageRefusal(thrown);
+  if (got === null || !got.startsWith(MESSAGE_REFUSED)) throw new Error(`the refusal was not recognised: ${got}`);
+  // Across a Durable Object stub the class is lost and the message survives: a bare string still reads.
+  if (messageRefusal(`${MESSAGE_REFUSED} (Closed): gone`) === null) throw new Error("a bare refusal string was not recognised");
+  for (const other of [new Error("other"), "other", null, undefined, 42, {}]) {
+    if (messageRefusal(other) !== null) throw new Error(`read as a refusal: ${JSON.stringify(other)}`);
+  }
 });
 
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
