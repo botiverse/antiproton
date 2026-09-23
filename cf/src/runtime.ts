@@ -558,7 +558,12 @@ export function isMessageRefused(e: unknown): boolean {
 }
 
 export function messageLanded(
-  res: { ok?: boolean; error?: { _tag?: string; message?: string }; value?: { operationId?: unknown } } | null | undefined,
+  res: {
+    ok?: boolean;
+    error?: { _tag?: string; message?: string };
+    // A run admitted carries an operation id; a message queued carries an entry id.
+    value?: { operationId?: unknown; entryId?: unknown };
+  } | null | undefined,
   mode: "prompt" | "steer" | "followUp",
 ): { mode: "prompt" | "steer" | "followUp"; queued: boolean } {
   if (res && res.ok === false) {
