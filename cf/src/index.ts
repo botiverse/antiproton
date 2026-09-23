@@ -31,7 +31,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows } from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, isMessageRefused } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
@@ -3322,13 +3322,16 @@ export default {
           const refused = text ? refuseSecret(text, form.get("allowSecret") === "1") : null;
           if (refused) return refused;
           if (text) {
-            // A refusal returned as a value is still a refusal: the page shows
-            // it only if the status says so (Vera, after the day the lane
-            // refused every message and the route answered 200 each time).
-            const r: any = await stub.uiSay(gate.tenantId, agentId, taskId, text, mode);
-            if (r?.result?.ok === false) {
-              const err = r.result.error;
-              return new Response(`refused: ${err?.code ?? ""} ${err?.message ?? JSON.stringify(err)}`.trim(), { status: 409 });
+            // A refusal is still a refusal: the page shows it only if the
+            // status says so (Vera, after the day the lane refused every
+            // message and the route answered 200 each time). The runtime now
+            // throws it rather than returning it as a value (messageLanded),
+            // so the route hears it here; anything else is the 500 it was.
+            try {
+              await stub.uiSay(gate.tenantId, agentId, taskId, text, mode);
+            } catch (e: any) {
+              if (!isMessageRefused(e)) throw e;
+              return new Response(`refused: ${String(e?.message ?? e)}`, { status: 409 });
             }
           }
           const t = await stub.uiTranscript(gate.tenantId, agentId, taskId);

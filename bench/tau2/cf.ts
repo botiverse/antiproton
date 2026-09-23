@@ -264,6 +264,11 @@ async function runTask(task: any) {
     const stop = /###(STOP|TRANSFER|OUT-OF-SCOPE)###/.exec(u.text);
     if (VERBOSE) console.log(`    user  > ${u.text.replace(/\s+/g, " ").slice(0, 130)}`);
     if (stop) { ended = stop[1]!.toLowerCase(); break; }
+    // The simulator, not the agent, ran out of words: a reasoning model that
+    // spends its budget before the reply returns empty content (twice on
+    // 2026-09-22). Posting "" asked the object a question it refused, and the
+    // refusal was filed as a stall of the agent. Named for whose turn it was.
+    if (u.text.trim() === "") { ended = `sim_empty (${u.finishReason})`; break; }
 
     await post("/bench/say", { taskId, text: u.text });
 

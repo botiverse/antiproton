@@ -537,6 +537,38 @@ export function parsePluginChoice(value: unknown): PluginChoice | null {
   return value === "enable" || value === "disable" || value === "inherit" ? value : null;
 }
 
+/**
+ * What actually happened to a message, rather than what was asked for: a run
+ * admitted carries an operation id, a queued message carries an entry id.
+ *
+ * And a lane can refuse — an empty prompt, a closed harness — which used to be
+ * reported here as `steer, queued`, because anything without an operation id
+ * read as queued. On 2026-09-22 the τ² user simulator twice answered with an
+ * empty string (a reasoning model that spent its budget before the reply), the
+ * runner posted it, the lane refused it as `InvalidMessage: empty`, /bench/say
+ * answered 200 "queued", and the runner waited five minutes for a reply to a
+ * message that had never landed — recorded as `agent_stalled`. A refusal is
+ * the caller's to hear, so it is thrown, not filed under a mode it never was.
+ */
+/** The first words of a refusal thrown by `messageLanded`: an error crossing a Durable Object stub keeps
+ *  its message and loses its class, so a route that wants to answer 409 rather than 500 matches on these. */
+export const MESSAGE_REFUSED = "message refused by the lane";
+export function isMessageRefused(e: unknown): boolean {
+  return String((e as any)?.message ?? e).startsWith(MESSAGE_REFUSED);
+}
+
+export function messageLanded(
+  res: { ok?: boolean; error?: { _tag?: string; message?: string }; value?: { operationId?: unknown } } | null | undefined,
+  mode: "prompt" | "steer" | "followUp",
+): { mode: "prompt" | "steer" | "followUp"; queued: boolean } {
+  if (res && res.ok === false) {
+    const why = res.error?._tag ?? "refused";
+    throw new Error(`${MESSAGE_REFUSED} (${why}): ${res.error?.message ?? "no reason given"}`);
+  }
+  const landed = res?.value?.operationId ? "prompt" : mode === "followUp" ? "followUp" : "steer";
+  return { mode: landed, queued: landed !== "prompt" };
+}
+
 export class AgentRuntime {
   readonly store: DurableObjectStore;
   #deps: RuntimeDeps;
@@ -1556,10 +1588,7 @@ export class AgentRuntime {
     // otherwise, so the next wake steps it.
     markSession(this.#deps.ctx.storage.sql, session, true);
     const res: any = await agent.say(text, mode);
-    // What actually happened rather than what was asked for: a run admitted
-    // carries an operation id, a queued message carries an entry id.
-    const landed = res?.value?.operationId ? "prompt" : mode === "followUp" ? "followUp" : "steer";
-    return { mode: landed, queued: landed !== "prompt", result: res };
+    return { ...messageLanded(res, mode), result: res };
   }
 
   /**
