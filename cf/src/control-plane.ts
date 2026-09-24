@@ -19,7 +19,7 @@
  *   object is created on first use and records its (tenant, agent) then (AgentDO #claim), so
  *   sign-in builds nothing and has nothing to undo if the first request never comes.
  *
- * Schema: cf/migrations/0001_identities.sql and 0002_api_keys.sql, applied by cf/scripts/deploy.sh
+ * Schema: cf/migrations/0001_identities.sql, 0002_api_keys.sql and 0007_service_tokens.sql, applied by cf/scripts/deploy.sh
  * before the Worker ships. Depends on: those files. A column changed there is changed in the queries below.
  */
 
@@ -185,6 +185,78 @@ export function d1ApiKeys(db: D1Database, now: () => number = Date.now): ApiKeyD
          WHERE (SELECT COUNT(*) FROM api_keys WHERE tenant_id = ? AND owner_agent_id = ? AND revoked_at IS NULL) < ?`,
       ).bind(row.hash, row.tenantId, row.ownerAgentId, row.label, now(), row.tenantId, row.ownerAgentId, max).run();
       return Number(res.meta?.changes ?? 0) > 0;
+    },
+  };
+}
+
+/**
+ * A service token as the operator lists it (task #7). The hash names the row and cannot be presented
+ * as a token (keys.ts hashApiKey is one-way over 32 random bytes), so a listing may carry it.
+ */
+export interface ServiceTokenRow {
+  hash: string;
+  label: string;
+  tenantId: string;
+  agentId: string;
+  createdAt: number;
+  revokedAt: number | null;
+  lastUsedAt: number | null;
+}
+
+/** What presenting a live token resolves to: the identity the operator gave it. */
+export interface ServiceTokenIdentity {
+  label: string;
+  tenantId: string;
+  agentId: string;
+}
+
+export interface ServiceTokenDirectory {
+  issue(row: ServiceTokenIdentity & { hash: string }): Promise<void>;
+  /** A token resolves only while it is not revoked. */
+  lookup(hash: string): Promise<ServiceTokenIdentity | null>;
+  /** Whether a live token was revoked by this call: a second revoke is false. */
+  revoke(hash: string): Promise<boolean>;
+  /** Every token, newest first, revoked ones included so the list says when. */
+  list(): Promise<ServiceTokenRow[]>;
+  /**
+   * Record a use. A token is presented on every request it makes, so this writes only when the
+   * last record is older than an hour: the column answers "is anyone still using this", which does
+   * not need the minute.
+   */
+  touch(hash: string): Promise<void>;
+}
+
+const HOUR_MS = 3600_000;
+
+export function d1ServiceTokens(db: D1Database, now: () => number = Date.now): ServiceTokenDirectory {
+  const identity = (r: any): ServiceTokenIdentity => ({ label: String(r.label), tenantId: String(r.tenant_id), agentId: String(r.agent_id) });
+  return {
+    async issue(row) {
+      await db.prepare("INSERT INTO service_tokens(hash, label, tenant_id, agent_id, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(row.hash, row.label, row.tenantId, row.agentId, now()).run();
+    },
+    async lookup(hash) {
+      const r: any = await db.prepare("SELECT label, tenant_id, agent_id FROM service_tokens WHERE hash = ? AND revoked_at IS NULL")
+        .bind(hash).first();
+      return r ? identity(r) : null;
+    },
+    async revoke(hash) {
+      const res = await db.prepare("UPDATE service_tokens SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL")
+        .bind(now(), hash).run();
+      return Number(res.meta?.changes ?? 0) > 0;
+    },
+    async list() {
+      const { results } = await db.prepare("SELECT * FROM service_tokens ORDER BY created_at DESC, hash").all();
+      return (results as any[]).map((r) => ({
+        ...identity(r), hash: String(r.hash), createdAt: Number(r.created_at),
+        revokedAt: r.revoked_at === null ? null : Number(r.revoked_at),
+        lastUsedAt: r.last_used_at === null ? null : Number(r.last_used_at),
+      }));
+    },
+    async touch(hash) {
+      const t = now();
+      await db.prepare("UPDATE service_tokens SET last_used_at = ? WHERE hash = ? AND (last_used_at IS NULL OR last_used_at < ?)")
+        .bind(t, hash, t - HOUR_MS).run();
     },
   };
 }

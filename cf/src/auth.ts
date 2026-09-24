@@ -13,6 +13,9 @@
  * `node test/auth.ts` and by the deployed Worker.
  */
 
+import type { ServiceTokenIdentity } from "./control-plane.ts";
+import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
+
 export type ViewerSource = "github" | "automation" | "qa" | "anonymous";
 
 /** A resolved identity. `email` doubles as the stable key an agent hangs off. */
@@ -153,22 +156,58 @@ export interface ViewerEnv {
   SESSION_SECRET?: string;
   AUTOMATION_TOKEN?: string;
   UI_ALLOW_ANONYMOUS?: string;
+  /** Where a service token is looked up (task #7). Absent, no service token resolves to anyone. */
+  serviceTokens?: ServiceTokenLookup;
 }
 
-/** The QA identity: a session minted from a key, never from an email. */
+/** The two questions identity asks of the token directory; the Worker passes d1ServiceTokens. */
+export interface ServiceTokenLookup {
+  lookup(hash: string): Promise<ServiceTokenIdentity | null>;
+  touch(hash: string): Promise<void>;
+}
+
+/** The QA identity: a session minted from the deployment's key, never from an email. */
 export const QA_VIEWER: Viewer = { email: "qa", name: "QA", username: null, picture: null, source: "qa" };
+/** The session subject of that key's sessions; a service token's session carries the token's hash instead. */
+export const QA_KEY_SUBJECT = "qa";
+
+/**
+ * A service token's identity: the QA source, so it reaches what the QA key reaches and nothing the
+ * operator does, under the label and agent the operator gave it, so audit tells tokens apart.
+ */
+export function serviceViewer(id: ServiceTokenIdentity): Viewer {
+  return { email: `service:${id.label}`, name: id.label, username: null, picture: null, source: "qa", agentId: id.agentId, tenantId: id.tenantId };
+}
+
+/** The agent a console identity keyed on its email hangs off. */
+export function uiAgent(who: string): string {
+  return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
+}
+
+/** The token behind a hash, asked every time: a revoked token names nobody from that moment. */
+async function viewerOfToken(env: ViewerEnv, hash: string): Promise<Viewer | null> {
+  if (!env.serviceTokens) return null;
+  const id = await env.serviceTokens.lookup(hash);
+  if (!id) return null;
+  await env.serviceTokens.touch(hash);
+  return serviceViewer(id);
+}
 
 /**
  * The single place identity is decided. In order: a session this Worker
- * sealed; the automation token; and, only where the deployment says so,
- * anonymous. Nothing else on a request is an identity: the Cloudflare Access
+ * sealed; the automation token; a service token (task #7); and, only where
+ * the deployment says so, anonymous. Nothing else on a request is an identity: the Cloudflare Access
  * header that once was is no longer read.
  */
 export async function resolveViewer(request: Request, env: ViewerEnv, opts: { allowAnonymous?: boolean; now?: number } = {}): Promise<Viewer | null> {
   if (env.SESSION_SECRET) {
     const s = await open<SessionClaims>(env.SESSION_SECRET, readCookie(request, SESSION_COOKIE), opts.now);
     if (s && s.v === 1 && typeof s.who === "string" && s.who) {
-      if (s.source === "qa") return QA_VIEWER;
+      if (s.source === "qa") {
+        if (s.sub === QA_KEY_SUBJECT) return QA_VIEWER;
+        // A service token's session: the token is asked again, so revoking it ends this too.
+        return viewerOfToken(env, s.sub);
+      }
       if (s.source === "github") {
         // A GitHub session without its agent is not an identity: the key is
         // the mapping, and a cookie that lost it names nobody.
@@ -183,6 +222,12 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
   const token = request.headers.get("x-harness-token");
   if (env.AUTOMATION_TOKEN && token && constantTimeEqual(token, env.AUTOMATION_TOKEN)) {
     return { email: "automation", name: "automation", username: null, picture: null, source: "automation" };
+  }
+  // The same header carrying a service token: the directory is asked only for a value shaped like
+  // one, so a wrong operator token costs no lookup and is refused as it always was.
+  if (token && looksLikeServiceToken(token)) {
+    const v = await viewerOfToken(env, await hashServiceToken(token));
+    if (v) return v;
   }
   if (opts.allowAnonymous && env.UI_ALLOW_ANONYMOUS === "1") {
     return { email: "anonymous (UNPROTECTED)", name: null, username: null, picture: null, source: "anonymous" };
