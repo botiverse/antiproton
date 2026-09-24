@@ -9,7 +9,7 @@
  */
 import {
   seal, open, resolveViewer, sessionCookieFor, b64url, unb64url,
-  readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER,
+  readCookie, constantTimeEqual, SESSION_COOKIE, QA_VIEWER, QA_KEY_SUBJECT, serviceViewer, uiAgent,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
   GITHUB_TOKEN, GITHUB_API, programmaticAccess, isOperator, type Viewer,
 } from "../cf/src/auth.ts";
@@ -82,6 +82,44 @@ await check("the QA key session is its own identity, not automation", async () =
   const a = await resolveViewer(req(undefined, { "x-harness-token": "tok" }), env, { now });
   assert(a?.source === "automation", "automation header");
   assert((await resolveViewer(req(undefined, { "x-harness-token": "wrong" }), env, { now })) === null, "wrong token accepted");
+});
+
+await check("a service token is its own identity: live in the header and in a session, nobody once revoked", async () => {
+  const { hashServiceToken, newServiceToken } = await import("../cf/src/service-token.ts");
+  const t = newServiceToken(); const hash = await hashServiceToken(t);
+  let live = true; const asked: string[] = []; const touched: string[] = [];
+  const env = {
+    SESSION_SECRET: SECRET, AUTOMATION_TOKEN: "tok",
+    serviceTokens: {
+      async lookup(h: string) { asked.push(h); return live && h === hash ? { label: "nightly", tenantId: "demo", agentId: "u-nightly" } : null; },
+      async touch(h: string) { touched.push(h); },
+    },
+  };
+  const v = await resolveViewer(req(undefined, { "x-harness-token": t }), env, { now });
+  assert(v?.source === "qa" && v.name === "nightly" && v.agentId === "u-nightly" && v.tenantId === "demo" && v.email === "service:nightly", `header resolved ${JSON.stringify(v)}`);
+  assert(touched.length === 1 && touched[0] === hash, "a use was not recorded once");
+  // The operator token is still the operator, and a wrong one asks nobody.
+  assert((await resolveViewer(req(undefined, { "x-harness-token": "tok" }), env, { now }))?.source === "automation", "operator lost");
+  asked.length = 0;
+  assert((await resolveViewer(req(undefined, { "x-harness-token": "wrong" }), env, { now })) === null, "wrong token accepted");
+  assert((await resolveViewer(req(undefined, { "x-harness-token": "st-short" }), env, { now })) === null, "a short st- value accepted");
+  assert(asked.length === 0, `the directory was asked for ${JSON.stringify(asked)}`);
+  // A session minted from the token carries the hash, and is asked again each time.
+  const set = await sessionCookieFor(SECRET, serviceViewer({ label: "nightly", tenantId: "demo", agentId: "u-nightly" }), hash, now);
+  const value = set.split(";")[0].split("=")[1];
+  const s = await resolveViewer(req(`${SESSION_COOKIE}=${value}`), env, { now });
+  assert(s?.source === "qa" && s.name === "nightly" && s.agentId === "u-nightly", `session resolved ${JSON.stringify(s)}`);
+  live = false;
+  assert((await resolveViewer(req(`${SESSION_COOKIE}=${value}`), env, { now })) === null, "a revoked token's session still names it");
+  assert((await resolveViewer(req(undefined, { "x-harness-token": t }), env, { now })) === null, "a revoked token still resolves in the header");
+  // The deployment key's own session is untouched by any of this, and needs no directory.
+  const qa = await sessionCookieFor(SECRET, QA_VIEWER, QA_KEY_SUBJECT, now);
+  const q = await resolveViewer(req(`${SESSION_COOKIE}=${qa.split(";")[0].split("=")[1]}`), { SESSION_SECRET: SECRET }, { now });
+  assert(q?.email === "qa", "the QA key session broke");
+  // Without a directory, a token session and a token header name nobody rather than throwing.
+  assert((await resolveViewer(req(`${SESSION_COOKIE}=${value}`), { SESSION_SECRET: SECRET }, { now })) === null, "token session resolved without a directory");
+  assert((await resolveViewer(req(undefined, { "x-harness-token": t }), { SESSION_SECRET: SECRET }, { now })) === null, "token header resolved without a directory");
+  assert(uiAgent("nightly build/2") === "u-nightly_build_2", `uiAgent ${uiAgent("nightly build/2")}`);
 });
 
 await check("the anonymous branch is unreachable unless the deployment opens it", async () => {

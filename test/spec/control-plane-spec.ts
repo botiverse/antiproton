@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Identities, d1InboundHooks } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Identities, d1InboundHooks, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -14,7 +14,8 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   let clock = 1_800_000_000_000;
   const keys = d1ApiKeys(db, () => ++clock);
   const hooks = d1InboundHooks(db, () => ++clock);
-  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks")]);
+  const tokens = d1ServiceTokens(db, () => clock);
+  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM service_tokens")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -167,6 +168,46 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-other" })) === true, "the owner could not revoke it");
     assert((await keys.lookup("k5")) === null, "a revoked key still resolves");
     assert((await keys.revokeOwned("k5", { tenantId: "t", ownerAgentId: "u-other" })) === false, "revoking twice reported a revoke");
+  });
+
+  add("service_tokens has exactly the columns the token queries read", async () => {
+    const { results } = await db.prepare("PRAGMA table_info(service_tokens)").all();
+    const names = (results as any[]).map((r) => String(r.name)).sort().join(",");
+    assert(names === "agent_id,created_at,hash,label,last_used_at,revoked_at,tenant_id", `columns ${names}`);
+  });
+
+  add("a service token resolves to its identity until it is revoked; the listing keeps it and says when", async () => {
+    clock = 1_800_000_000_000;
+    await tokens.issue({ hash: "s1", label: "nightly", tenantId: "demo", agentId: "u-nightly" });
+    clock += 1;
+    await tokens.issue({ hash: "s2", label: "probe", tenantId: "t-2", agentId: "u-probe" });
+    const got = await tokens.lookup("s1");
+    assert(got?.label === "nightly" && got.tenantId === "demo" && got.agentId === "u-nightly", `lookup ${JSON.stringify(got)}`);
+    assert((await tokens.lookup("s9")) === null, "an absent token resolved");
+    clock += 1;
+    assert((await tokens.revoke("s1")) === true, "the first revoke did not report");
+    assert((await tokens.revoke("s1")) === false, "a second revoke reported again");
+    assert((await tokens.lookup("s1")) === null, "a revoked token still resolves");
+    assert((await tokens.lookup("s2"))?.label === "probe", "revoking one token touched another");
+    const list = await tokens.list();
+    assert(list.map((t) => t.hash).join(",") === "s2,s1", `order ${list.map((t) => t.hash).join(",")}`);
+    const s1 = list.find((t) => t.hash === "s1")!;
+    assert(s1.revokedAt === 1_800_000_000_002 && s1.createdAt === 1_800_000_000_000 && s1.lastUsedAt === null, `s1 ${JSON.stringify(s1)}`);
+  });
+
+  add("touch records a use at most once an hour, and never for a revoked token's past", async () => {
+    clock = 1_800_000_000_000;
+    await tokens.issue({ hash: "s3", label: "cron", tenantId: "demo", agentId: "u-cron" });
+    await tokens.touch("s3");
+    const first = (await tokens.list())[0]!.lastUsedAt;
+    assert(first === clock, `first touch ${first}`);
+    clock += 1000;
+    await tokens.touch("s3");
+    assert((await tokens.list())[0]!.lastUsedAt === first, "a touch within the hour wrote");
+    clock += 3600_000;
+    await tokens.touch("s3");
+    assert((await tokens.list())[0]!.lastUsedAt === clock, "a touch after an hour did not write");
+    await tokens.touch("s9");
   });
 
   return cases;

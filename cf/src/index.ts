@@ -53,7 +53,7 @@ import {
   resolveViewer,
   programmaticAccess,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
-  constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER,
+  constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER, QA_KEY_SUBJECT, serviceViewer, uiAgent,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
 } from "./auth.ts";
@@ -71,6 +71,9 @@ import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
 import { flushTrace } from "./trace-r2.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
+import { d1ServiceTokens } from "./control-plane.ts";
+import { adminServiceTokens } from "./admin-service-tokens.ts";
+import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -2186,12 +2189,14 @@ export class AgentDO extends DurableObject<Env> {
  * request is one: only something this Worker signed.
  */
 const viewerMemo = new WeakMap<Request, Promise<Viewer | null>>();
+/** What identity reads from the deployment: its secrets, and where a service token is looked up (task #7). */
+const viewerEnv = (env: Env) => ({ ...env, serviceTokens: d1ServiceTokens(env.CONTROL_DB) });
 async function viewer(request: Request, env: Env, allowAnonymous = false): Promise<Viewer | null> {
   let p = viewerMemo.get(request);
-  if (!p) { p = resolveViewer(request, env); viewerMemo.set(request, p); }
+  if (!p) { p = resolveViewer(request, viewerEnv(env)); viewerMemo.set(request, p); }
   const v = await p;
   if (v || !allowAnonymous) return v;
-  return resolveViewer(request, env, { allowAnonymous: true });
+  return resolveViewer(request, viewerEnv(env), { allowAnonymous: true });
 }
 
 function githubConfig(env: Env): GithubConfig | null {
@@ -2300,25 +2305,33 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // automation, and it never reaches /admin, which stays header-only.
       // No link leads here; the page itself wears the door's clothes (login.ts).
       if (method !== "POST") return html(keyPage());
-      if (!env.SESSION_SECRET || !env.QA_ACCESS_KEY) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      // The same door takes a service token (task #7), so the deployment key alone being unset is
+      // not "unconfigured": only a Worker without a session secret cannot sign anyone in.
+      if (!env.SESSION_SECRET) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       // Two secrets that happen to be equal would let this key reach the
       // admin routes through the other door; refuse rather than assume.
-      if (env.AUTOMATION_TOKEN && constantTimeEqual(env.QA_ACCESS_KEY, env.AUTOMATION_TOKEN)) {
+      if (env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && constantTimeEqual(env.QA_ACCESS_KEY, env.AUTOMATION_TOKEN)) {
         return Response.json({ error: "MISCONFIGURED", hint: "QA_ACCESS_KEY must differ from AUTOMATION_TOKEN" }, { status: 500 });
       }
       const form = await formOf(request);
       const key = String(form?.get("key") ?? "");
-      if (!key || !constantTimeEqual(key, env.QA_ACCESS_KEY)) {
+      let session: string | null = null;
+      if (key && env.QA_ACCESS_KEY && constantTimeEqual(key, env.QA_ACCESS_KEY)) {
+        session = await sessionCookieFor(env.SESSION_SECRET, QA_VIEWER, QA_KEY_SUBJECT);
+      } else if (key && looksLikeServiceToken(key)) {
+        // A service token's session carries the token's hash, and is asked again on every request.
+        const hash = await hashServiceToken(key);
+        const id = await d1ServiceTokens(env.CONTROL_DB).lookup(hash);
+        if (id) session = await sessionCookieFor(env.SESSION_SECRET, serviceViewer(id), hash);
+      }
+      if (!session) {
         // A browser gets the form back with the reason; a script gets JSON.
         if ((request.headers.get("accept") ?? "").includes("text/html")) {
           return new Response(keyPage("the key does not match"), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
         }
         return Response.json({ error: "BAD_KEY", hint: "the key does not match" }, { status: 401 });
       }
-      return new Response(null, {
-        status: 302,
-        headers: { location: new URL("/ui", url).toString(), "set-cookie": await sessionCookieFor(env.SESSION_SECRET, QA_VIEWER, "qa") },
-      });
+      return new Response(null, { status: 302, headers: { location: new URL("/ui", url).toString(), "set-cookie": session } });
     }
     case "/ui/whoami": {
       // The probe: what identity this request actually resolves to, and the
@@ -2628,9 +2641,6 @@ export interface UiTranscript {
   busy: "thinking" | "waiting-for-approval" | null;
 }
 
-function uiAgent(who: string): string {
-  return `u-${who.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48)}`;
-}
 
 /** The agent a viewer owns: the one the identity table resolved at sign-in
  *  (GitHub), else the one derived from the email (everything older). */
@@ -2739,6 +2749,8 @@ export default {
     // The OpenAI-compatible agents API and its key issuance answer before any
     // object is chosen: they authenticate differently and address by key.
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
+    // The operator's service tokens (task #7): identities, so before any object as well.
+    if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
     // A service's push: addressed by the hook id alone, before any sign-in.
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
