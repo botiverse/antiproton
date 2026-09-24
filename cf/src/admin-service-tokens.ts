@@ -35,7 +35,11 @@ export async function adminServiceTokens(request: Request, token: string | undef
       const tenantId = field(body, "tenantId") ?? "demo";
       // One agent per token unless the operator pinned one: the label names it, the way an email names a person's.
       const agentId = field(body, "agentId") ?? uiAgent(label);
-      try { agentObjectName(tenantId, agentId); } catch (e) { return answer({ error: String((e as Error)?.message ?? e) }, 400); }
+      try { agentObjectName(tenantId, agentId); } catch (e) {
+        // Asked, not asserted: `e` is unknown, and the shape #543 settled on for a catch reads the message only if there is one.
+        const message = typeof e === "object" && e !== null && "message" in e ? (e as { message?: unknown }).message : e;
+        return answer({ error: String(message) }, 400);
+      }
       const t = newServiceToken();
       const hash = await hashServiceToken(t);
       await dir.issue({ hash, label, tenantId, agentId });
