@@ -1802,6 +1802,17 @@ export class AgentRuntime {
       }
       // Past its release time. This mount only: each has its own idle clock,
       // so one reaching its time says nothing about another's.
+      //
+      // Nothing is saved first, and that is the decision rather than the gap it
+      // looks like. The agent was told before this point and had two calls in
+      // hand — release and postpone — so reaching here without either is a
+      // choice it made on a turn it was given, not something the pass did
+      // behind it. Saving on its behalf would need someone to say what: a
+      // container's filesystem does not mark which files are the work, so
+      // keeping something would be guessing, and a guess nobody comes back to
+      // read still costs what the machine costs. Asked and answered as the
+      // whole of an older task (#12); reopening it means first deciding what is
+      // worth keeping, not adding a step here.
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias });
       releaseFailed = [...releaseFailed, ...r.failed];
       sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
