@@ -62,12 +62,14 @@ export interface ModelAdapter {
       /**
        * How much the model may think before it answers, when the provider
        * lets a request say. Unset leaves the provider's default (for a
-       * reasoning model, thinking on). "off" is for a caller that wants an
-       * answer and nothing else — a role-player, a classifier — where a
-       * reasoning trace only spends the token budget the answer needs:
-       * the τ² user simulator returned empty replies that way (2026-09-22,
-       * -24, -25). The adapter says it in the provider's dialect; a provider
-       * with no such dial ignores it.
+       * reasoning model, thinking on). The trace is billed against maxTokens
+       * with the answer, so a caller with a small cap chooses here: the τ²
+       * user simulator returned empty replies at the default effort under
+       * 2000 (2026-09-22, -24, -25), and with "off" stopped applying the
+       * conditions in its script (2026-09-25); it runs at "low" under a cap
+       * the trace cannot exhaust. "off" is for a caller that needs no
+       * judgement at all. The adapter says it in the provider's dialect; a
+       * provider with no such dial ignores it.
        */
       reasoning?: "off" | "low" | "high";
     },
