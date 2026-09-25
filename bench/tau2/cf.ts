@@ -63,6 +63,8 @@ const GUIDELINES = readFileSync(here + "simulation_guidelines.md", "utf8");
 const model = new OpenAiCompatibleModel({
   baseUrl: process.env.DEEPSEEK_BASE_URL!, apiKey: process.env.DEEPSEEK_API_KEY!, model: MODEL_ID,
 });
+/** How the user simulator is called; written into every record so a series can be split where it changed. */
+const SIM = { maxTokens: 2000, reasoning: "off" } as const;
 
 // Each arm gets its own object, so one arm's activity is never read as
 // another's — the meter is per object and it does not reset itself.
@@ -258,7 +260,12 @@ async function runTask(task: any) {
 
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
-    const u = await model.complete(sim, { maxTokens: 2000 });
+    // The simulator answers without a reasoning trace: it plays a customer from a
+    // script, and the trace only spent the budget the reply needed — thinking on,
+    // the same 2000 ran out mid-turn and the reply came back empty (three rounds in
+    // three days, 2026-09-22 to -25). So the cap bounds the reply, and the record
+    // below carries the condition, since rounds before it were run the other way.
+    const u = await model.complete(sim, SIM);
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
     const stop = /###(STOP|TRANSFER|OUT-OF-SCOPE)###/.exec(u.text);
@@ -406,7 +413,7 @@ if (act) {
     (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
 }
 const recorded = recordRun(run, {
-  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT,
+  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT, sim: SIM,
   tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER,
   ...(DEAFNESS ? { ignoreAnswers: DEAFNESS } : {}),
   startedAt: new Date(t0Run).toISOString(),

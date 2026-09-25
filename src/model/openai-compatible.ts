@@ -24,6 +24,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
     opts: {
       maxTokens?: number; temperature?: number;
       tools?: ToolDefinition[]; toolChoice?: "auto" | "required" | "none";
+      reasoning?: "off" | "low" | "high";
     } = {},
   ): Promise<ModelResponse> {
     // Reasoning tokens are billed against max_tokens, so the cap is a budget for
@@ -36,7 +37,15 @@ export class OpenAiCompatibleModel implements ModelAdapter {
     // The provider accepts 65536. This is half of that: high enough that the
     // budget is not the thing that ends a turn, low enough to still be a bound
     // on a reasoning trace that has run away.
+    //
+    // With `reasoning: "off"` there is no trace, and the same cap bounds the
+    // answer alone — which is what a caller that asks for it means by it.
     const maxTokens = opts.maxTokens ?? 32_768;
+    // DeepSeek's dialect: `thinking.type` switches the trace off, and
+    // `reasoning_effort` sizes it. Nothing is sent when the caller did not ask,
+    // so a request without the option is the request it always was.
+    const reasoningDial = opts.reasoning === "off" ? { thinking: { type: "disabled" } }
+      : opts.reasoning ? { reasoning_effort: opts.reasoning } : {};
     let lastErr: Error | null = null;
 
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -52,6 +61,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
             messages,
             max_tokens: maxTokens,
             temperature: opts.temperature ?? 0,
+            ...reasoningDial,
             ...(opts.tools?.length
               ? {
                   tools: opts.tools.map((t) => ({

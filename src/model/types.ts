@@ -59,6 +59,17 @@ export interface ModelAdapter {
       /** "required" forces a tool call — used to separate *which* tool the model
        *  picks from *whether* it decides to act at all. */
       toolChoice?: "auto" | "required" | "none";
+      /**
+       * How much the model may think before it answers, when the provider
+       * lets a request say. Unset leaves the provider's default (for a
+       * reasoning model, thinking on). "off" is for a caller that wants an
+       * answer and nothing else — a role-player, a classifier — where a
+       * reasoning trace only spends the token budget the answer needs:
+       * the τ² user simulator returned empty replies that way (2026-09-22,
+       * -24, -25). The adapter says it in the provider's dialect; a provider
+       * with no such dial ignores it.
+       */
+      reasoning?: "off" | "low" | "high";
     },
   ): Promise<ModelResponse>;
 }
