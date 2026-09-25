@@ -129,8 +129,8 @@ async function runTask(task: any, verbose: boolean) {
 
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
-    // As in cf.ts: the simulator answers without a reasoning trace, so the cap bounds the reply.
-    const u = await model.complete(sim, { maxTokens: 2000, reasoning: "off" });
+    // As in cf.ts: the simulator thinks a little (its script has conditions) under a cap that a little thinking cannot exhaust.
+    const u = await model.complete(sim, { maxTokens: 8192, reasoning: "low" });
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
     const stop = /###(STOP|TRANSFER|OUT-OF-SCOPE)###/.exec(u.text);

@@ -64,7 +64,7 @@ const model = new OpenAiCompatibleModel({
   baseUrl: process.env.DEEPSEEK_BASE_URL!, apiKey: process.env.DEEPSEEK_API_KEY!, model: MODEL_ID,
 });
 /** How the user simulator is called; written into every record so a series can be split where it changed. */
-const SIM = { maxTokens: 2000, reasoning: "off" } as const;
+const SIM = { maxTokens: 8192, reasoning: "low" } as const;
 
 // Each arm gets its own object, so one arm's activity is never read as
 // another's — the meter is per object and it does not reset itself.
@@ -260,11 +260,18 @@ async function runTask(task: any) {
 
   while (turns++ < 14) {
     sim.push({ role: "user", content: agentSaid });
-    // The simulator answers without a reasoning trace: it plays a customer from a
-    // script, and the trace only spent the budget the reply needed — thinking on,
-    // the same 2000 ran out mid-turn and the reply came back empty (three rounds in
-    // three days, 2026-09-22 to -25). So the cap bounds the reply, and the record
-    // below carries the condition, since rounds before it were run the other way.
+    // The simulator plays a customer from a script, and two things went wrong in
+    // turn. Thinking at the provider's default effort, a 2000 cap was a budget for
+    // the trace and the reply together, and three rounds in three days the trace
+    // spent it all and the reply came back empty. Thinking off, the reply always
+    // came, but a script with a condition in it ("if the agent asks for
+    // confirmation, only exchange the desk lamp") was never applied: the simulator
+    // repeated "keep everything on hold" verbatim until the turn limit
+    // (2026-09-25 18:53Z, task 6), and at that point a replay with any reasoning
+    // at all decided the lamp, three times out of three. So the script needs a
+    // little judgement, and the cap needs to be one a little judgement cannot
+    // exhaust: low effort, and four times the reply's budget. The record carries
+    // the condition, since rounds before it were run each of the other two ways.
     const u = await model.complete(sim, SIM);
     simCalls += 1;
     sim.push({ role: "assistant", content: u.text });
