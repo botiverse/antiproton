@@ -370,6 +370,32 @@ const INVITED_FILES = [
 /** Every file under the invited scope above, read once. */
 const INVITED = [...new Set([...INVITED_DIRS.flatMap(tsIn), ...NAMED, ...INVITED_FILES])];
 
+/**
+ * The scope of the resolvable-path case below, and it is neither `FILES` nor `INVITED`.
+ *
+ * `FILES` would be wrong for a reason the paragraph at the top of this file is
+ * about: all of `cf/src` is in it because @Nova invited the NAME rule there
+ * (#453), and a path rule is a different standard. The eleven `cf/src` files
+ * named above were invited for a POINTER standard, so they carry this one too —
+ * and one of them, `cf/src/secret-shape.ts`, is where the defect that produced
+ * this case sat.
+ *
+ * `INVITED` would be wrong for a different reason, and not a matter of consent:
+ * `bench`, `src/core`, `src/runtime`, `src/store` and `src/model` did invite a
+ * pointer standard, but they hold eight paths of kinds this rule cannot yet tell
+ * apart — a path relative to the directory ABOVE the file (`bench/swebench/cf.ts`
+ * names its `tau2` sibling's `cf.ts` without the `bench/` in front, and this
+ * case reads comments in its own file, so the spelling cannot be shown here),
+ * pi named in prose with its version further up the file, and
+ * an upstream repository named by name rather than version
+ * (`sierra-research/tau2-bench`). Every one is legitimate. Reddening on them
+ * would buy nothing and cost the thing that matters more: a class that cries
+ * wolf stops being read, which is what @Rex found with `placeholder`'s twenty
+ * legitimate hits. They are listed in #561 for their owners, and the scope grows
+ * when the rule can name those kinds — not when someone silences them.
+ */
+const POINTERS = [...new Set([...tsIn("src/plugins"), ...tsIn("test"), ...NAMED, ...INVITED_FILES])];
+
 check("a comment points into another file by name, not by line number", () => {
   // Scope: `INVITED` above — the ownership reading that fixes it lives there.
   const mine = INVITED;
@@ -434,6 +460,9 @@ check("a comment points into another file by name, not by line number", () => {
  * real one; on `1c8b416`, none. **The red comes from a tree that existed, not
  * from a sample built to be caught** — the fixtures below only keep it red.
  *
+ * Scope is `POINTERS` above, and the reason it is neither of the two scopes
+ * already in this file is written there.
+ *
  * What this does NOT cover, said plainly because the other half of the same
  * defect sat there: only `.ts` files are read, so the twin of that pointer in
  * `cf/migrations/0007_service_tokens.sql`, and the pointer @cody found in
@@ -476,7 +505,7 @@ function pathsIn(file: string, text: string): string[] {
 }
 
 check("a path a comment points at resolves in the tree it names", () => {
-  const found = FILES.flatMap((f) => pathsIn(f, readFileSync(f, "utf8")));
+  const found = POINTERS.flatMap((f) => pathsIn(f, readFileSync(f, "utf8")));
   if (found.length) {
     throw new Error(
       `a pointer that does not resolve, and grep will not tell you — the same spelling is a real name elsewhere:\n  ` +
@@ -487,12 +516,12 @@ check("a path a comment points at resolves in the tree it names", () => {
   // A green here must be a reading of the comments, not of an empty set: the
   // pattern has to be finding paths for "none of them is broken" to mean
   // anything (@cody's gate rule, the same one the reachability case above uses).
-  const seen = FILES.reduce((n, f) => {
+  const seen = POINTERS.reduce((n, f) => {
     const text = readFileSync(f, "utf8");
     return n + text.split("\n").filter((l) => COMMENT.test(l))
       .reduce((k, l) => k + [...l.replace(URL_IN_LINE, " ").matchAll(BARE_PATH)].length, 0);
   }, 0);
-  if (seen < 20) throw new Error(`only ${seen} paths seen in comments across ${FILES.length} files, so a green says nothing`);
+  if (seen < 20) throw new Error(`only ${seen} paths seen in comments across ${POINTERS.length} files, so a green says nothing`);
 });
 
 check("the three ways a path can name its tree are told apart", () => {
