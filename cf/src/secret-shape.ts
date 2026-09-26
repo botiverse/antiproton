@@ -41,7 +41,7 @@ const GENERIC_SHAPES: ReadonlyArray<readonly [string, RegExp]> = [
   // scheme://user:password@host — a user alone (git@github.com, https://user@host) is not a credential.
   ["url-with-password", /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]{8,}@[^\s/@]+/i],
   ["neon-password", /\bnpg_[A-Za-z0-9]{12,}/],
-  // Our own service tokens (cf/src/service-tokens.ts): the prefix is theirs alone, so the value
+  // Our own service tokens (cf/src/service-token.ts): the prefix is theirs alone, so the value
   // is recognisable without a label, unlike the API keys below.
   ["service-token", /\bst-[A-Za-z0-9_-]{40,}/],
   // A key recognised by the LABEL beside it rather than by its own shape:
