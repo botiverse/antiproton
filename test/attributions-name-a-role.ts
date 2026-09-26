@@ -56,10 +56,10 @@
  * that way. So the third case below asserts that the no-name repair PASSES, rather
  * than leaving it as advice in a comment nothing enforces.
  */
-import { readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** JSDoc tags and the like: an `@` in a comment that is not a person. */
 const NOT_A_PERSON = /^@(link|param|returns?|see|example|throws|deprecated|type|typedef|template|module|name|default|ts-[a-z-]+)$/;
@@ -332,43 +332,47 @@ function coordinatesIn(file: string, text: string): string[] {
   return out;
 }
 
+// Deliberately NOT `FILES`, and collected the way ownership is held.
+//
+// The scan above takes directories, but this repository's ownership is by
+// file (@Nova, 2026-09-21): `cf/src` holds her console files beside @cody's,
+// and reading the directory as one person's is the mistake @Rex and I each
+// made today, in opposite directions. So each owner named their own, and a
+// directory appears only where one person holds all of it:
+//
+//   src/plugins          mine
+//   test/**              @Rex — after his citation in `test/exclusive.ts`
+//                        rotted: `:377` is `})(),` today, and nothing said so
+//   bench, src/core,     @cody — `src/runtime/gateway.ts` was one of the two
+//   src/runtime,         already rotted, and `bench/record.ts` was his own,
+//   src/store, src/model four hours old when #475 moved 28 lines above it
+//   6 cf/src files       @Nova, named individually
+//   5 cf/src files       @cody, named individually
+//
+// What is NOT here is not dirty — every one of these measured zero before it
+// was added, and so does the rest of the repository. It is absent for want of
+// an owner who asked to live under the rule: a few `cf/src` files belong to
+// nobody either of them would speak for, and they stay out until someone does.
+//
+// Reading `test/**` puts this file inside its own scan, which the name rule
+// above refuses for itself. It is safe HERE for a structural reason rather
+// than by luck: `coordinatesIn` reads comment lines only, and the control
+// fixture below sits in a string on an `if (` line. A fixture that ever moves
+// into a comment reds this, and that is correct — a specimen of the defect is
+// the defect once a scanner reads it.
+const INVITED_DIRS = ["src/plugins", "test", "bench", "src/core", "src/runtime", "src/store", "src/model"];
+const INVITED_FILES = [
+  "cf/src/ui.ts", "cf/src/usage.ts", "cf/src/usage-d1.ts",
+  "cf/src/usage-windows.ts", "cf/src/md.ts", "cf/src/brand.ts",
+  "cf/src/index.ts", "cf/src/runtime.ts", "cf/src/secret-shape.ts",
+  "cf/src/bench.ts", "cf/src/pi-view.ts",
+];
+/** Every file under the invited scope above, read once. */
+const INVITED = [...new Set([...INVITED_DIRS.flatMap(tsIn), ...NAMED, ...INVITED_FILES])];
+
 check("a comment points into another file by name, not by line number", () => {
-  // Deliberately NOT `FILES`, and collected the way ownership is held.
-  //
-  // The scan above takes directories, but this repository's ownership is by
-  // file (@Nova, 2026-09-21): `cf/src` holds her console files beside @cody's,
-  // and reading the directory as one person's is the mistake @Rex and I each
-  // made today, in opposite directions. So each owner named their own, and a
-  // directory appears only where one person holds all of it:
-  //
-  //   src/plugins          mine
-  //   test/**              @Rex — after his citation in `test/exclusive.ts`
-  //                        rotted: `:377` is `})(),` today, and nothing said so
-  //   bench, src/core,     @cody — `src/runtime/gateway.ts` was one of the two
-  //   src/runtime,         already rotted, and `bench/record.ts` was his own,
-  //   src/store, src/model four hours old when #475 moved 28 lines above it
-  //   6 cf/src files       @Nova, named individually
-  //   5 cf/src files       @cody, named individually
-  //
-  // What is NOT here is not dirty — every one of these measured zero before it
-  // was added, and so does the rest of the repository. It is absent for want of
-  // an owner who asked to live under the rule: a few `cf/src` files belong to
-  // nobody either of them would speak for, and they stay out until someone does.
-  //
-  // Reading `test/**` puts this file inside its own scan, which the name rule
-  // above refuses for itself. It is safe HERE for a structural reason rather
-  // than by luck: `coordinatesIn` reads comment lines only, and the control
-  // fixture below sits in a string on an `if (` line. A fixture that ever moves
-  // into a comment reds this, and that is correct — a specimen of the defect is
-  // the defect once a scanner reads it.
-  const INVITED_DIRS = ["src/plugins", "test", "bench", "src/core", "src/runtime", "src/store", "src/model"];
-  const INVITED_FILES = [
-    "cf/src/ui.ts", "cf/src/usage.ts", "cf/src/usage-d1.ts",
-    "cf/src/usage-windows.ts", "cf/src/md.ts", "cf/src/brand.ts",
-    "cf/src/index.ts", "cf/src/runtime.ts", "cf/src/secret-shape.ts",
-    "cf/src/bench.ts", "cf/src/pi-view.ts",
-  ];
-  const mine = [...new Set([...INVITED_DIRS.flatMap(tsIn), ...NAMED, ...INVITED_FILES])];
+  // Scope: `INVITED` above — the ownership reading that fixes it lives there.
+  const mine = INVITED;
   const found = mine.flatMap((f) => coordinatesIn(f, readFileSync(f, "utf8")));
   if (found.length) {
     throw new Error(
@@ -392,6 +396,135 @@ check("a comment points into another file by name, not by line number", () => {
   // Not only `.ts`: the rot is in the coordinate, not in the language.
   if (coordinatesIn("x", "  // see scripts/publish-runs.sh:191").length !== 1) {
     throw new Error("stopped recognising a coordinate outside .ts");
+  }
+});
+
+/**
+ * A path in a comment is a pointer too, and a dead one need not grep empty.
+ *
+ * Two comments pointed at `cf/src/service-token.ts` spelled with a plural `s`,
+ * a file that does not exist (found on `0e2957f`, repaired in #560 — the literal
+ * cannot be written here, because a specimen of the defect in a comment IS the
+ * defect once this case reads it, so it lives in the fixtures below). Nothing
+ * rang: that spelling is a real name elsewhere in the tree — `test/service-tokens.ts`
+ * and `cf/src/admin-service-tokens.ts` — so a grep for it comes back non-empty,
+ * and a dead pointer read as alive.
+ *
+ * So the criterion is neither "does this spelling appear somewhere" nor "does it
+ * resolve at the repository root". It is **does it resolve in the tree it
+ * names**, and which tree that is can be asked rather than judged:
+ *
+ *   - it resolves from the root, or beside the commenting file — the second is
+ *     not a nicety: `cf/src/control-plane.ts` names `keys.ts` under the
+ *     `agents-api` directory beside it, and three sites in `cf/src` are written
+ *     that way. Rejecting them would be a
+ *     gate red on arrival, which is how a class stops being read.
+ *   - its first segment is a directory of THIS repository, and it resolves
+ *     nowhere ⇒ the defect above.
+ *   - its first segment is not ours ⇒ it names another tree, and then it must
+ *     say WHICH, at what version. Seven sites do: "Depends on: openai 7.15.0 —
+ *     resources/beta/agents/agents.d.ts", `@earendil-works/pi-agent-core 0.85.1`,
+ *     `pi-coding-agent 0.83.0`, `raft-ui 0.5.11`. That is the `docs/pi-upstream.md`
+ *     family, and the version is what makes such a pointer checkable at all —
+ *     so one with no version named is the same defect wearing a foreign path.
+ *
+ * Measured before it was written, over this scope: 52 distinct path tokens in
+ * comments, 42 resolving from the root, 3 beside their file, 7 naming a pinned
+ * dependency. On `0e2957f` the same three rules leave exactly one finding, the
+ * real one; on `1c8b416`, none. **The red comes from a tree that existed, not
+ * from a sample built to be caught** — the fixtures below only keep it red.
+ *
+ * What this does NOT cover, said plainly because the other half of the same
+ * defect sat there: only `.ts` files are read, so the twin of that pointer in
+ * `cf/migrations/0007_service_tokens.sql`, and the pointer @cody found in
+ * `bench/appworld/README.md` (at a bench driver deleted in `2df66b3`, now
+ * `test/appworld.ts`), are both out of reach here. Widening the
+ * file types is the same question of consent as widening the directories.
+ */
+const BARE_PATH = /(?<![A-Za-z0-9_./-])(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9.]*/g;
+
+/** A version beside the path is what makes a pointer into another tree checkable. */
+const VERSIONED = /\b[0-9]+\.[0-9]+(?:\.[0-9]+)?\b/;
+
+/** The top level of this repository, asked rather than listed — a new directory must not read as foreign. */
+const OURS = new Set(
+  execFileSync("git", ["ls-tree", "--name-only", "-d", "HEAD"], { encoding: "utf8" }).split("\n").filter(Boolean),
+);
+
+function pathsIn(file: string, text: string): string[] {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  lines.forEach((line, i) => {
+    if (!COMMENT.test(line)) return;
+    for (const m of line.replace(URL_IN_LINE, " ").matchAll(BARE_PATH)) {
+      // A sentence ends in a period, and the period is not part of the name.
+      const token = m[0].replace(/\.+$/, "");
+      if (existsSync(token) || existsSync(join(dirname(file), token))) continue;
+      if (OURS.has(token.split("/")[0]!)) {
+        out.push(`${file}:${i + 1} — ${token} names this repository and is not in it`);
+        continue;
+      }
+      // The version may sit on the line above: `Depends on: <pkg> <version> —`
+      // wraps, and the path lands on the continuation.
+      const sentence = [line, lines[i - 1] ?? "", lines[i - 2] ?? ""].filter((l) => COMMENT.test(l)).join(" ");
+      if (!VERSIONED.test(sentence)) {
+        out.push(`${file}:${i + 1} — ${token} points outside this repository without naming the tree or its version`);
+      }
+    }
+  });
+  return out;
+}
+
+check("a path a comment points at resolves in the tree it names", () => {
+  const found = FILES.flatMap((f) => pathsIn(f, readFileSync(f, "utf8")));
+  if (found.length) {
+    throw new Error(
+      `a pointer that does not resolve, and grep will not tell you — the same spelling is a real name elsewhere:\n  ` +
+      found.join("\n  ") +
+      `\n  Repair it by name: point at the file that exists, or name the dependency and its version.`,
+    );
+  }
+  // A green here must be a reading of the comments, not of an empty set: the
+  // pattern has to be finding paths for "none of them is broken" to mean
+  // anything (@cody's gate rule, the same one the reachability case above uses).
+  const seen = FILES.reduce((n, f) => {
+    const text = readFileSync(f, "utf8");
+    return n + text.split("\n").filter((l) => COMMENT.test(l))
+      .reduce((k, l) => k + [...l.replace(URL_IN_LINE, " ").matchAll(BARE_PATH)].length, 0);
+  }, 0);
+  if (seen < 20) throw new Error(`only ${seen} paths seen in comments across ${FILES.length} files, so a green says nothing`);
+});
+
+check("the three ways a path can name its tree are told apart", () => {
+  // The real defect, and its real repair — both as they were written.
+  const plural = `  // Our own service tokens (cf/src/service-${"tokens"}.ts): the prefix is theirs alone`;
+  if (pathsIn("cf/src/secret-shape.ts", plural).length !== 1) throw new Error("accepted a path that resolves nowhere");
+  const singular = "  // Our own service tokens (cf/src/service-token.ts): the prefix is theirs alone";
+  if (pathsIn("cf/src/secret-shape.ts", singular).length !== 0) throw new Error("rejected the file that exists");
+
+  // Beside the commenting file, which is how three `cf/src` sites are written.
+  const sibling = " * Only the hash is stored (agents-api/keys.ts); the key is shown once.";
+  if (pathsIn("cf/src/control-plane.ts", sibling).length !== 0) throw new Error("read a path beside its own file as missing");
+  // …and the same spelling from a file that has no such neighbour is still a finding,
+  // or the rule above would excuse every unresolvable path in the repository.
+  if (pathsIn("src/plugins/github.ts", sibling).length !== 1) throw new Error("the sibling rule reaches past its own directory");
+
+  // Another tree, named with its version: not ours to resolve.
+  const dep = " * Depends on: openai 7.15.0 — resources/beta/agents/agents.d.ts (AgentSessionItem and its members)";
+  if (pathsIn("cf/src/agents-api/transcript.ts", dep).length !== 0) throw new Error("read a pinned dependency's file as ours");
+  // The version on the line ABOVE, which is how that sentence wraps in two files.
+  const wrapped = " * Depends on: openai 7.15.0 — resources/beta/agents/agents.d.ts and\n *   lib/agents/turn-state.js (when sessions.stream stops).";
+  if (pathsIn("cf/src/agents-api/events.ts", wrapped).length !== 0) throw new Error("a wrapped dependency sentence lost its version");
+  // Without a version there is no tree to resolve it in, so it is the same defect.
+  const unowned = " * mirrors resources/beta/agents/agents.d.ts";
+  if (pathsIn("cf/src/agents-api/events.ts", unowned).length !== 1) throw new Error("accepted a foreign path with no tree named");
+
+  // A URL is not a path, and a handle in data is not a comment.
+  if (pathsIn("x", "  // the report is published to https://antiproton.ai/runs/index.html").length !== 0) {
+    throw new Error("read a URL as a path into the tree");
+  }
+  if (pathsIn("x", `  if (got !== "src/a.ts: error TS2554") throw new Error(got);`).length !== 0) {
+    throw new Error("read a string literal as a pointer");
   }
 });
 
