@@ -4,7 +4,7 @@
 -- Control-plane data, beside the API keys: who may present a token, and as which (tenant, agent).
 -- Read and written by cf/src/control-plane.ts (d1ServiceTokens): a column changed here is changed
 -- there, and test/control-plane-d1.sh runs both against real D1. Only the hash is stored; the
--- token is shown once, when it is issued (cf/src/service-tokens.ts).
+-- token is shown once, when it is issued (cf/src/service-token.ts).
 CREATE TABLE IF NOT EXISTS service_tokens (
   hash         TEXT PRIMARY KEY,   -- SHA-256 of the token, hex (cf/src/agents-api/keys.ts hashApiKey)
   label        TEXT NOT NULL,      -- what the operator called it; shown as the viewer's name

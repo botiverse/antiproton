@@ -36,7 +36,7 @@ Two local workarounds, both recorded rather than papered over:
 ```bash
 bench/appworld/serve.sh start                  # frees the ports first, always
 ~/appworld-env/bin/python bench/appworld/dump_catalogue.py
-N=3 node --experimental-strip-types bench/appworld/run.ts
+AW_TASK=50e1ac9_1 node --experimental-strip-types test/appworld.ts   # the conformance run; the old bench/appworld/run.ts driver was deleted in 2df66b3
 ```
 
 `catalogue.json` and `tasks-*.json` are **not committed**: they derive from
