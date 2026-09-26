@@ -446,7 +446,10 @@ check("a comment points into another file by name, not by line number", () => {
  *     that way. Rejecting them would be a
  *     gate red on arrival, which is how a class stops being read.
  *   - its first segment is a directory of THIS repository, and it resolves
- *     nowhere ⇒ the defect above.
+ *     nowhere ⇒ the defect above. This branch has no exemption on purpose, and a
+ *     dependency that publishes a `src/` of its own is where that costs something
+ *     (@cody, reviewing #562): the verdict stays red, because a reader cannot tell
+ *     whose file it is either, and the MESSAGE carries both repairs instead.
  *   - its first segment is not ours ⇒ it names another tree, and then it must
  *     say WHICH, at what version. Seven sites do: "Depends on: openai 7.15.0 —
  *     resources/beta/agents/agents.d.ts", `@earendil-works/pi-agent-core 0.85.1`,
@@ -489,13 +492,25 @@ function pathsIn(file: string, text: string): string[] {
       // A sentence ends in a period, and the period is not part of the name.
       const token = m[0].replace(/\.+$/, "");
       if (existsSync(token) || existsSync(join(dirname(file), token))) continue;
-      if (OURS.has(token.split("/")[0]!)) {
-        out.push(`${file}:${i + 1} — ${token} names this repository and is not in it`);
-        continue;
-      }
       // The version may sit on the line above: `Depends on: <pkg> <version> —`
       // wraps, and the path lands on the continuation.
       const sentence = [line, lines[i - 1] ?? "", lines[i - 2] ?? ""].filter((l) => COMMENT.test(l)).join(" ");
+      if (OURS.has(token.split("/")[0]!)) {
+        // A dependency publishes `src/` too, and then the first segment is ours
+        // while the file is theirs (@cody, reviewing #562). The verdict stays
+        // red, because a reader cannot tell the two apart either — but the
+        // message has to carry BOTH repairs, or it sends the next person to
+        // rename a comment that was already true. What it must not do is let the
+        // version decide: "a version appears nearby" would exempt a broken path
+        // of ours from the only branch that has no exemption.
+        out.push(
+          `${file}:${i + 1} — ${token} names this repository and is not in it` +
+          (VERSIONED.test(sentence)
+            ? `, and the sentence names another tree: if the file is THEIRS, spell it so it does not open with one of our top-level names (\`<package>/${token}\`); if it is ours, point at the file that exists`
+            : ``),
+        );
+        continue;
+      }
       if (!VERSIONED.test(sentence)) {
         out.push(`${file}:${i + 1} — ${token} points outside this repository without naming the tree or its version`);
       }
@@ -547,6 +562,23 @@ check("the three ways a path can name its tree are told apart", () => {
   // Without a version there is no tree to resolve it in, so it is the same defect.
   const unowned = " * mirrors resources/beta/agents/agents.d.ts";
   if (pathsIn("cf/src/agents-api/events.ts", unowned).length !== 1) throw new Error("accepted a foreign path with no tree named");
+
+  // First segment ours, file theirs: red either way, and the message carries both
+  // repairs. No site has this shape today (@cody's reading on #562), so this is
+  // prevention — and the assertion is on the MESSAGE, because the defect the note
+  // describes is a correct comment repaired in the wrong direction.
+  const collides = " * Depends on: openai 7.15.0 — src/resources/beta/agents/agents.d.ts (AgentSessionItem)";
+  const said = pathsIn("cf/src/agents-api/transcript.ts", collides);
+  if (said.length !== 1) throw new Error("a path opening with one of our top-level names stopped being a finding");
+  if (!said[0]!.includes("if the file is THEIRS")) {
+    throw new Error("the finding no longer names the upstream repair, so it sends the reader to rename a true comment");
+  }
+  // …and the same shape with no tree named says only the one thing, or the two
+  // messages would be indistinguishable and the hint would be noise.
+  const plainOurs = " * see src/resources/beta/agents/agents.d.ts";
+  if (pathsIn("cf/src/agents-api/transcript.ts", plainOurs).some((f) => f.includes("if the file is THEIRS"))) {
+    throw new Error("offered the upstream repair where no tree was named");
+  }
 
   // A URL is not a path, and a handle in data is not a comment.
   if (pathsIn("x", "  // the report is published to https://antiproton.ai/runs/index.html").length !== 0) {
