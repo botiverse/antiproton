@@ -31,7 +31,11 @@ export async function adoptProvisionedAgent(
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
   // The deployment's model, always: the contract offers no choice (tygg, 2026-09-28).
   await rt.bindOperatorModel(tenantId, agentId);
-  // The plugin is not seeded for every agent; this agent has chosen it, the way a person would in the console.
+  // The same default mounts every agent gets — memory (state), artifacts, web, GitHub, sandbox, tools — the way the
+  // console and the Agents API seed them. Missed on the first cut: Ant2 on staging had the raft mount and nothing
+  // else, so the agent truthfully said it had no memory (tygg, 2026-09-28). Idempotent: adds only what is missing.
+  await rt.provision(tenantId, agentId);
+  // The raft plugin is not seeded for every agent; this agent has chosen it, the way a person would in the console.
   await rt.store.setPluginChoice(tenantId, agentId, "raft", "enable");
   const mount = await rt.addMount(tenantId, agentId, { alias: PROVISION_MOUNT_ALIAS, plugin: "raft", config: { serverUrl: spec.raftOrigin } });
   if (!mount.ok) return mount;
