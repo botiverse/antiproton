@@ -24,7 +24,10 @@ const pushy: Plugin = {
   tools: [{ name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke(_t, _a, ctx) { handed[ctx.alias] = ctx.inbound; return { has: !!ctx.inbound }; },
   async receive(event, secret) {
-    return event.headers["x-signed-with"] === secret ? { deliver: true, text: "ok" } : { deliver: false, reason: "bad", rejected: true };
+    if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad", rejected: true };
+    // The lane is the plugin's word from the service's facts; here the test states it in a header.
+    const as = event.headers["x-as"];
+    return as === "user" || as === "event" ? { deliver: true, text: "ok", as } : { deliver: true, text: "ok" };
   },
 };
 const quiet: Plugin = { ...pushy, id: "quiet", receive: undefined };
@@ -65,7 +68,23 @@ async function runtime(opts: { hooks?: boolean } = {}) {
   };
   return { rt, host, rows, grab };
 }
-const ev = (secret: string) => ({ headers: { "x-signed-with": secret }, body: new Uint8Array([1]) });
+const ev = (secret: string, extra: Record<string, string> = {}) => ({ headers: { "x-signed-with": secret, ...extra }, body: new Uint8Array([1]) });
+
+await check("what the plugin says about who is speaking decides whether the agent reads a label", async () => {
+  const { rt, host, grab } = await runtime();
+  const posted: string[] = [];
+  (rt as any).postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  const made = await (await grab("a", "p"))!.create();
+  for (const extra of [{}, { "x-as": "event" }, { "x-as": "user" }]) {
+    must((await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret, extra))).outcome === "delivered", `not delivered for ${JSON.stringify(extra)}`);
+  }
+  must(posted.length === 3, `posted ${posted.length}`);
+  const [unsaid, event, user] = posted;
+  must(/not by the user/.test(unsaid!) && unsaid!.endsWith("\nok"), `default lost the label: ${unsaid}`);
+  must(event === unsaid, `saying "event" differs from saying nothing: ${event}`);
+  must(user === "ok", `the user lane carried a label: ${user}`);
+  host.dispose();
+});
 
 await check("a plugin that can receive makes a hook for its own mount, and the secret it gets is the one events are checked with", async () => {
   const { rt, host, rows, grab } = await runtime();
