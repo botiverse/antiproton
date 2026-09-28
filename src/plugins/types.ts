@@ -830,6 +830,25 @@ export interface InboundEvent {
 }
 
 /**
+ * One thing the agent did, for the service the agent belongs to (Raft's
+ * raft-agent-activity-ingest.v1, 2026-09-28). Names are the service's hook
+ * event names; the runtime maps its own ended spans onto them
+ * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
+ * an unknown field with 400, so a plugin passes these through and adds none.
+ */
+export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
+export interface ActivityEvent {
+  /** Unique per agent for all time; the service dedupes on it. */
+  eventId: string;
+  hookEventName: ActivityEventName;
+  /** ISO 8601. */
+  occurredAt: string;
+  toolName?: string;
+  durationMs?: number;
+  errorClass?: string;
+}
+
+/**
  * What a plugin makes of an inbound request.
  *
  * `text` is the whole of what reaches the agent, and the plugin writes it: a
@@ -854,44 +873,10 @@ export interface InboundEvent {
  * 401 reads as "not you" — and a service that stops pushing after a few 401s
  * would otherwise stop over one field. A plugin sets one of `rejected` and
  * `malformed`, not both.
- *
- * `as` says how the runtime hands the text to the agent. `"event"`, the
- * default, delivers it under the label that says it was written outside this
- * conversation and is information, not an instruction. `"user"` delivers it
- * as the person in the conversation speaking: a Raft message from a server
- * member to this agent is exactly that. A plugin says `"user"` only from a
- * fact the service states (a sender type), never from reading the content;
- * the runtime does not look at the text to decide either.
- *
- * The two ways of being wrong are not symmetric. A plugin that omits the field
- * lands on the labelled side; a plugin that says `"user"` wrongly removes the
- * label. So this default is the opposite kind from a default that quietly
- * decides for someone: it pushes a plugin that has not thought about the
- * question towards the labelled side, and nothing but an explicit word gets
- * a text past the label.
  */
-/**
- * One thing the agent did, for the service the agent belongs to (Raft's
- * raft-agent-activity-ingest.v1, 2026-09-28). Names are the service's hook
- * event names; the runtime maps its own ended spans onto them
- * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
- * an unknown field with 400, so a plugin passes these through and adds none.
- */
-export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
-export interface ActivityEvent {
-  /** Unique per agent for all time; the service dedupes on it. */
-  eventId: string;
-  hookEventName: ActivityEventName;
-  /** ISO 8601. */
-  occurredAt: string;
-  toolName?: string;
-  durationMs?: number;
-  errorClass?: string;
-}
-
 export type InboundResult =
   | { deliver: false; reason: string; rejected?: boolean; malformed?: boolean }
-  | { deliver: true; text: string; dedupeKey?: string; as?: "user" | "event" };
+  | { deliver: true; text: string; dedupeKey?: string };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {
