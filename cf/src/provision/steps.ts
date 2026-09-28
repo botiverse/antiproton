@@ -29,7 +29,7 @@ export async function adoptProvisionedAgent(
   const persona = { ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: "raft" };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
-  // The deployment's model; a caller-chosen one was checked against the offered list by the handler.
+  // The deployment's model, always: the contract offers no choice (tygg, 2026-09-28).
   await rt.bindOperatorModel(tenantId, agentId);
   // The plugin is not seeded for every agent; this agent has chosen it, the way a person would in the console.
   await rt.store.setPluginChoice(tenantId, agentId, "raft", "enable");

@@ -35,11 +35,13 @@ export interface ProvisionAgentOps {
   tool(agentId: string, name: ProvisionTool): Promise<{ ok: true; result: Json } | { ok: false; error: string }>;
 }
 
+/**
+ * No `model` anywhere: a provisioned agent runs on the deployment's default, and Raft shows no
+ * selector (tygg, 2026-09-28). If choice comes later it is a new field, not a revived one.
+ */
 export interface ProvisionDeps {
   now(): number;
   registry: ProvisionRegistry;
-  /** What `model` may be. Opaque to Raft; shown in its dropdown. */
-  models(): Promise<Array<{ id: string; label: string }>>;
   agent: ProvisionAgentOps;
 }
 
@@ -84,15 +86,6 @@ function credentialField(body: unknown): string | Fail {
   return v;
 }
 
-async function modelField(body: unknown, deps: ProvisionDeps): Promise<string | null | Fail> {
-  const v = field(body, "model");
-  if (v === undefined || v === null) return null;
-  if (typeof v !== "string") return { status: 422, code: "invalid", message: "model must be a string", param: "model" };
-  const models = await deps.models();
-  if (!models.some((m) => m.id === v)) return { status: 422, code: "invalid", message: `model is not one this deployment offers (${models.map((m) => m.id).join(", ")})`, param: "model" };
-  return v;
-}
-
 /** What Raft sees of a row. The credential has no field here to be in. */
 function view(row: ProvisionedAgent, live?: Json) {
   return {
@@ -102,7 +95,6 @@ function view(row: ProvisionedAgent, live?: Json) {
     raftOrigin: row.raftOrigin,
     name: row.name,
     instructions: row.instructions,
-    model: row.model,
     status: row.status,
     push: { registered: row.pushRegistered, ...(row.pushError ? { error: row.pushError } : {}), ...(live !== undefined ? { live } : {}) },
     createdAt: new Date(row.createdAt).toISOString(),
@@ -125,10 +117,6 @@ export async function handleProvision(
 ): Promise<Response | null> {
   const seg = path.split("/").filter(Boolean);
   const { tenantId } = who;
-
-  if (seg.length === 1 && seg[0] === "models" && method === "GET") {
-    return ok({ models: await deps.models() });
-  }
 
   if (seg.length === 1 && seg[0] === "agents" && method === "POST") {
     const raftAgentId = field(body, "raftAgentId");
@@ -153,13 +141,11 @@ export async function handleProvision(
     if (isFail(name)) return fail(name);
     const instructions = textField(body, "instructions", INSTRUCTIONS_MAX, false) ?? "";
     if (isFail(instructions)) return fail(instructions);
-    const model = await modelField(body, deps);
-    if (isFail(model)) return fail(model);
     const credential = credentialField(body);
     if (isFail(credential)) return fail(credential);
 
     const agentId = providerAgentId(raftAgentId);
-    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model };
+    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions };
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
     if (row) {
@@ -205,13 +191,10 @@ export async function handleProvision(
     if (isFail(name)) return fail(name);
     const instructions = textField(body, "instructions", INSTRUCTIONS_MAX, false);
     if (isFail(instructions)) return fail(instructions);
-    const modelGiven = field(body, "model") !== undefined;
-    const model = await modelField(body, deps);
-    if (isFail(model)) return fail(model);
-    if (name === undefined && instructions === undefined && !modelGiven) {
-      return fail({ status: 422, code: "empty", message: "nothing to change: give name, instructions or model" });
+    if (name === undefined && instructions === undefined) {
+      return fail({ status: 422, code: "empty", message: "nothing to change: give name or instructions" });
     }
-    const patch = { ...(name !== undefined ? { name } : {}), ...(instructions !== undefined ? { instructions } : {}), ...(modelGiven ? { model } : {}) };
+    const patch = { ...(name !== undefined ? { name } : {}), ...(instructions !== undefined ? { instructions } : {}) };
     await deps.registry.update(tenantId, row.raftAgentId, patch);
     const next = { ...row, ...patch, updatedAt: deps.now() };
     await deps.agent.adopt(row.agentId, { name: next.name, instructions: next.instructions, raftOrigin: next.raftOrigin });

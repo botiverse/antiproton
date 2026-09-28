@@ -2550,8 +2550,6 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   const deps: ProvisionDeps = {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
-    // One entry to start: the deployment's operator model. The string is opaque to Raft.
-    models: async () => [{ id: env.HARNESS_MODEL, label: env.HARNESS_MODEL }],
     agent: {
       adopt: async (agentId, spec) => {
         const r = await stub(agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));

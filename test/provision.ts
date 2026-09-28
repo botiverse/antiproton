@@ -39,7 +39,6 @@ function fakeDeps() {
   const deps: ProvisionDeps = {
     now: () => (t += 1000),
     registry,
-    models: async () => [{ id: "deepseek-flash", label: "deepseek-flash" }],
     agent: {
       adopt: async (agentId, spec) => { calls.push(`adopt ${agentId} ${spec.name}|${spec.instructions}|${spec.raftOrigin}`); },
       attachCredential: async (agentId, credential) => {
@@ -91,7 +90,7 @@ await check("the same key with any field different is 409 and touches nothing: e
   const f = fakeDeps();
   await call(f.deps, "POST", "/agents", body(), "01JAGENT");
   f.calls.length = 0;
-  for (const over of [{ name: "Cody 2" }, { instructions: "be long" }, { raftServerId: "srv-2" }, { model: "deepseek-flash" }]) {
+  for (const over of [{ name: "Cody 2" }, { instructions: "be long" }, { raftServerId: "srv-2" }]) {
     const r = await call(f.deps, "POST", "/agents", body(over), "01JAGENT");
     assert(r.status === 409 && r.body.error.code === "idempotency_conflict" && r.body.error.message.includes(Object.keys(over)[0]!), `${JSON.stringify(over)} → ${r.status} ${r.text}`);
   }
@@ -115,7 +114,6 @@ await check("each malformed field is 422 naming the field, and nothing is made",
     [{ name: "x".repeat(61) }, "name"],
     [{ instructions: "x".repeat(8001) }, "instructions"],
     [{ instructions: `use ${"sk" + "_agent_" + "Q".repeat(24)} for raft` }, "instructions"],
-    [{ model: "gpt-9" }, "model"],
     [{ credential: "not-a-credential" }, "credential"],
     [{ credential: undefined }, "credential"],
   ];
@@ -155,8 +153,8 @@ await check("PATCH changes what it is given, re-adopts with the merged persona, 
   const f = fakeDeps();
   await call(f.deps, "POST", "/agents", body());
   f.calls.length = 0;
-  const r = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", { instructions: "be thorough", model: "deepseek-flash" });
-  assert(r.status === 200 && r.body.name === "Cody" && r.body.instructions === "be thorough" && r.body.model === "deepseek-flash", r.text);
+  const r = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", { instructions: "be thorough" });
+  assert(r.status === 200 && r.body.name === "Cody" && r.body.instructions === "be thorough" && !("model" in r.body), r.text);
   assert(f.calls.join(";") === "adopt raft_01JAGENT Cody|be thorough|https://api.raft.build", f.calls.join(";"));
   assert(f.rows.get("01JAGENT")!.instructions === "be thorough", "the registry did not change");
   const empty = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", {});
@@ -208,15 +206,14 @@ await check("a DELETE whose disable_push fails still deletes, and says what coul
   assert(f.calls.some((c) => c.startsWith("remove ")), "the credential stayed");
 });
 
-await check("GET reads the row and asks the plugin for live push status; models lists what may be chosen; other paths are not ours", async () => {
+await check("GET reads the row and asks the plugin for live push status; there is no model anywhere; other paths are not ours", async () => {
   const f = fakeDeps();
-  await call(f.deps, "POST", "/agents", body());
+  const made = await call(f.deps, "POST", "/agents", body({ model: "deepseek-flash" }));
+  assert(made.status === 201 && !("model" in made.body), `a model field came back: ${made.text}`);
   const got = await call(f.deps, "GET", "/agents/raft_01JAGENT");
   assert(got.status === 200 && got.body.push.registered === true && got.body.push.live.registration === "active", got.text);
   assert((await call(f.deps, "GET", "/agents/raft_nobody")).status === 404, "an unknown agent read");
-  const models = await call(f.deps, "GET", "/models");
-  assert(models.status === 200 && models.body.models[0].id === "deepseek-flash", models.text);
-  for (const [m, p] of [["GET", "/agents"], ["POST", "/models"], ["GET", "/other"], ["DELETE", "/agents/raft_01JAGENT/credential"]] as const) {
+  for (const [m, p] of [["GET", "/agents"], ["GET", "/models"], ["GET", "/other"], ["DELETE", "/agents/raft_01JAGENT/credential"]] as const) {
     assert((await call(f.deps, m, p)).status === 0, `${m} ${p} was answered`);
   }
 });

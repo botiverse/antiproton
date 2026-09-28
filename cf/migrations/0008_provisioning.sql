@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS provisioned_agents (
   raft_origin     TEXT NOT NULL,
   name            TEXT NOT NULL,
   instructions    TEXT NOT NULL,
-  model           TEXT,                    -- null: the deployment's operator model
   status          TEXT NOT NULL,           -- provisioning | active | deleted
   push_registered INTEGER NOT NULL DEFAULT 0,
   push_error      TEXT,

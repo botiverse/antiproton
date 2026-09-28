@@ -216,7 +216,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
     const cols = async (table: string) => ((await db.prepare(`PRAGMA table_info(${table})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
     assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
-    assert((await cols("provisioned_agents")) === "agent_id,created_at,deleted_at,instructions,model,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
+    assert((await cols("provisioned_agents")) === "agent_id,created_at,deleted_at,instructions,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
       `provisioned_agents ${await cols("provisioned_agents")}`);
   });
 
@@ -243,7 +243,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   add("the registry keeps one row per Raft agent, finds it by either id, refuses a second claim on an agent id, and patches only what it is given", async () => {
     clock = 1_800_000_000_000;
     const base = { tenantId: "t-raft", raftAgentId: "01J", agentId: "raft_01J", raftServerId: "srv", raftOrigin: "https://api.raft.build",
-      name: "Cody", instructions: "be brief", model: null, status: "provisioning" as const, pushRegistered: false, pushError: null };
+      name: "Cody", instructions: "be brief", status: "provisioning" as const, pushRegistered: false, pushError: null };
     await registry.create(base);
     const byRaft = await registry.get("t-raft", "01J");
     const byAgent = await registry.getByAgentId("t-raft", "raft_01J");
