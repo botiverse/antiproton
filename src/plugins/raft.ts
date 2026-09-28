@@ -22,7 +22,7 @@ const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
 /**
  * Under the runtime's 4,000-character cut (src/runtime/inbound.ts INBOUND_TEXT_MAX) with room for the
  * one instruction below it: the two caps stack, and the instruction used to be exactly the part a
- * long notice lost (2026-09-28 review, finding 2). The instruction also goes first, so no cut can reach it.
+ * long notice lost. The instruction also goes first, so no cut can reach it.
  */
 const NOTICE_TEXT_MAX = 3_600;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
@@ -462,7 +462,7 @@ export const raftPlugin: Plugin = {
         lastSeenSeq: typeof data.last_seen_seq === "number" ? data.last_seen_seq : null,
         lastSeenMessageId: typeof data.last_seen_msgId === "string" ? data.last_seen_msgId : null,
         hasMore: data.has_more,
-        // Raft caps a pull per conversation, so a true here means unread messages remain (Tenny, 2026-09-28).
+        // Raft caps a pull per conversation, so a true here means unread messages remain.
         ...(data.has_more ? { note: "More unread messages remain: call receive_events again until hasMore is false." } : {}),
         replyTarget: typeof data.reply_target === "string" ? data.reply_target : null,
       };
@@ -607,7 +607,7 @@ export const raftPlugin: Plugin = {
     const state = await loadPushState(ctx);
     if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };
     // A mount whose account is gone (a delete whose disable_push could not run) has nobody to tell; it
-    // is skipped, not an error, or the alarm would retry every minute for ever (2026-09-28 review, finding 8).
+    // is skipped, not an error, or the alarm would retry every minute for ever.
     if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
     if (events.length === 0) return { sent: 0 };
     await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });

@@ -1,4 +1,4 @@
--- Provider tokens gain a scope (tygg, 2026-09-28: one key per Raft deployment, configless on Raft's side).
+-- Provider tokens gain a scope: one key per Raft deployment, so Raft's side needs no per-server configuration.
 --   tenant   — the token IS one tenant (as before): every agent it makes lives in tenant_id.
 --   platform — the token stands for a whole Raft deployment: tenant_id is NULL and the tenant of each
 --              request is derived from the Raft server it names (raft_<serverId>), created on first sight,

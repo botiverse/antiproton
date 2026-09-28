@@ -100,7 +100,7 @@ export async function flushTrace(
   // Pruned through what BOTH readers have consumed; the cursor above records the export alone.
   const exported = Math.max(sent, through);
   const prunable = holdThrough === null ? exported : Math.min(exported, holdThrough);
-  // A read before the write: an idle pass used to issue a DELETE that deleted nothing (2026-09-28 review, finding 9).
+  // A read before the write: an idle pass used to issue a DELETE that deleted nothing.
   if (prunable > 0 && sql.exec("SELECT 1 AS hit FROM trace_outbox WHERE seq <= ? LIMIT 1", prunable).toArray().length) pruneTrace(sql, prunable);
   return { rows: rows.length, dropped, key };
 }

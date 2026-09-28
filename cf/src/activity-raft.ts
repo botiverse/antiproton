@@ -63,7 +63,7 @@ export async function flushActivity(
  * activity first, then the export with a hold at whatever activity has NOT
  * consumed. A failing activity send holds at its unmoved cursor — passing
  * "nothing held" would let the export prune the very rows the next pass needs
- * (2026-09-28 review, finding 1). Each failure is reported, not thrown: the
+ * Each failure is reported, not thrown: the
  * pass goes on and asks for another pass.
  */
 export async function flushActivityThenTrace(

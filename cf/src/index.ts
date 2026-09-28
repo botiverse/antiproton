@@ -1209,7 +1209,7 @@ export class AgentDO extends DurableObject<Env> {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
     // The name and description follow the agent (a PATCH from the API or the provider renames it);
-    // the avatar and the birth date do not (2026-09-28 review, finding 7).
+    // the avatar and the birth date do not.
     this.sql.exec("INSERT INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?) " +
       "ON CONFLICT(agent_id) DO UPDATE SET name = excluded.name, description = excluded.description",
       rec.agentId, rec.name, rec.description, rec.avatar, rec.createdAt);
