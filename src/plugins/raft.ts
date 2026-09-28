@@ -653,7 +653,9 @@ function batchText(alias: string, fromSeq: number, toSeq: number, events: Object
   const each = Math.max(PUSH_MESSAGE_MIN, Math.floor(PUSH_TEXT_BUDGET / events.length));
   const lines = [
     `Raft delivered ${events.length} message${events.length === 1 ? "" : "s"} (seq ${fromSeq}–${toSeq}) through the \`${alias}\` mount.` +
-    ` Reply with \`send_message\` to the target shown on the message.`,
+    // Seen on the first live delivery (2026-09-28): told to "reply to the target shown", the model
+    // greeted a channel-add notice. Where an answer is due is the model's call; the line only says how.
+    ` Where one of them calls for an answer, send it with \`send_message\` to that message's target; a system notice usually needs none.`,
   ];
   events.forEach((e, i) => {
     const where = text(e.replyTarget) ?? place(e);

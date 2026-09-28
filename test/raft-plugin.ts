@@ -509,7 +509,7 @@ await check("a signed batch delivers its messages, in order, as the conversation
   if (!out.deliver || out.dedupeKey !== "delivery-1" || out.as !== "user") throw new Error(JSON.stringify(out));
   const first = out.text.indexOf("please deploy the fix"), second = out.text.indexOf("and tell Vera");
   if (first < 0 || second < 0 || first > second) throw new Error(out.text);
-  for (const part of ["2 messages (seq 120–121)", "#general:6ed41ed7", "@tygg (human)", "msg 6ed41ed7", "dm:@Tenny", "@Tenny (agent)", "`send_message`"]) {
+  for (const part of ["2 messages (seq 120–121)", "#general:6ed41ed7", "@tygg (human)", "msg 6ed41ed7", "dm:@Tenny", "@Tenny (agent)", "`send_message`", "a system notice usually needs none"]) {
     if (!out.text.includes(part)) throw new Error(`missing ${part}:\n${out.text}`);
   }
   if (/receive_events/.test(out.text)) throw new Error(`still asks for a pull:\n${out.text}`);
