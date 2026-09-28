@@ -19,7 +19,12 @@ const MAX_EVENTS = 200;
  * here means only "received", and no receiver-side dedupe of messages exists.
  */
 const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
-const NOTICE_TEXT_MAX = 4_000;
+/**
+ * Under the runtime's 4,000-character cut (src/runtime/inbound.ts INBOUND_TEXT_MAX) with room for the
+ * one instruction below it: the two caps stack, and the instruction used to be exactly the part a
+ * long notice lost (2026-09-28 review, finding 2). The instruction also goes first, so no cut can reach it.
+ */
+const NOTICE_TEXT_MAX = 3_600;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const ACTIVITY_PATH = "/internal/agent-api/activity";
 const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
@@ -601,6 +606,9 @@ export const raftPlugin: Plugin = {
   async reportActivity(events: readonly ActivityEvent[], ctx: PluginContext) {
     const state = await loadPushState(ctx);
     if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };
+    // A mount whose account is gone (a delete whose disable_push could not run) has nobody to tell; it
+    // is skipped, not an error, or the alarm would retry every minute for ever (2026-09-28 review, finding 8).
+    if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
     if (events.length === 0) return { sent: 0 };
     await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
     return { sent: events.length };
@@ -667,7 +675,7 @@ async function receiveNotice(payload: ObjectValue, headers: Record<string, strin
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
   return {
     deliver: true,
-    text: `${body}\n\nRead them with the \`receive_events\` tool from the \`${ctx.alias}\` mount; that read is what acknowledges them.`,
+    text: `Read your Raft inbox with the \`receive_events\` tool from the \`${ctx.alias}\` mount; that read is what acknowledges it.\n\n${body}`,
     dedupeKey: payload.noticeId,
   };
 }

@@ -27,7 +27,8 @@ function fakeDeps() {
   const k = (tenantId: string, id: string) => `${tenantId}/${id}`;
   const registry: ProvisionRegistry = {
     async create(r) {
-      if ([...rows.values()].some((x) => x.tenantId === r.tenantId && x.agentId === r.agentId)) throw new Error("UNIQUE constraint failed");
+      if (fail.has("create")) throw new Error("D1_ERROR: database is unavailable");
+      if ([...rows.values()].some((x) => x.tenantId === r.tenantId && x.agentId === r.agentId)) throw new Error("UNIQUE constraint failed: provisioned_agents.agent_id");
       rows.set(k(r.tenantId, r.raftAgentId), { ...r, createdAt: t, updatedAt: t, deletedAt: null });
     },
     async get(tenantId, id) { return rows.get(k(tenantId, id)) ?? null; },
@@ -52,8 +53,9 @@ function fakeDeps() {
       tool: async (tenantId, agentId, name) => {
         tenants.add(tenantId); calls.push(`${name} ${agentId}`);
         if (fail.has(name)) return { ok: false, error: `${name}: raft returned HTTP 503` };
-        return { ok: true, result: name === "push_status" ? { enabled: true, registration: "active" } : { enabled: name === "enable_push" } };
+        return { ok: true, result: { enabled: name === "enable_push" } };
       },
+      pushStatus: async (tenantId, agentId) => { tenants.add(tenantId); calls.push(`status ${agentId}`); return { enabled: true, registration: "active", lastReached: null }; },
     },
   };
   return { deps, rows, calls, fail, tenants };
@@ -98,6 +100,33 @@ await check("the same key with any field different is 409 and touches nothing: e
     assert(r.status === 409 && r.body.error.code === "idempotency_conflict" && r.body.error.message.includes(Object.keys(over)[0]!), `${JSON.stringify(over)} → ${r.status} ${r.text}`);
   }
   assert(f.calls.length === 0 && f.rows.get("t-raft/01JAGENT")!.name === "Cody", `calls ${f.calls.join(";")}`);
+});
+
+await check("a replay that carries a different credential is 409, so a delayed retry cannot overwrite a newer one; a row from before the hash accepts and records the first replay", async () => {
+  const f = fakeDeps();
+  await call(f.deps, "POST", "/agents", body());
+  f.calls.length = 0;
+  const other = await call(f.deps, "POST", "/agents", body({ credential: "sk_agent_" + "N".repeat(32) }));
+  assert(other.status === 409 && /credential/.test(other.body.error.message) && f.calls.length === 0, `${other.status} ${other.text} calls ${f.calls.join(";")}`);
+  const same = await call(f.deps, "POST", "/agents", body());
+  assert(same.status === 200, same.text);
+  // PUT rotates: the new hash is what a later replay is compared against.
+  await call(f.deps, "PUT", "/agents/raft_01JAGENT/credential", { credential: "sk_agent_" + "N".repeat(32) });
+  const stale = await call(f.deps, "POST", "/agents", body());
+  assert(stale.status === 409, `a replay with the pre-rotation credential got ${stale.status}`);
+  // A row made before the hash existed (null): the first replay is accepted and records the hash.
+  const row = f.rows.get("t-raft/01JAGENT")!; f.rows.set("t-raft/01JAGENT", { ...row, credentialHash: null });
+  const first = await call(f.deps, "POST", "/agents", body());
+  assert(first.status === 200 && f.rows.get("t-raft/01JAGENT")!.credentialHash !== null, `${first.status} hash ${f.rows.get("t-raft/01JAGENT")!.credentialHash}`);
+});
+
+await check("a registry failure that is not the unique index is not a conflict: it propagates, so Raft retries instead of giving up", async () => {
+  const f = fakeDeps();
+  f.fail.add("create");
+  let threw: unknown = null;
+  try { await call(f.deps, "POST", "/agents", body()); } catch (e) { threw = e; }
+  assert(threw !== null && /D1_ERROR/.test(String((threw as Error).message)), `no propagation: ${String(threw)}`);
+  assert(f.rows.size === 0 && f.calls.length === 0, "something was made");
 });
 
 await check("a POST whose raftOrigin is not the token's is 422 before anything is made", async () => {
@@ -213,8 +242,11 @@ await check("GET reads the row and asks the plugin for live push status; there i
   const f = fakeDeps();
   const made = await call(f.deps, "POST", "/agents", body({ model: "deepseek-flash" }));
   assert(made.status === 201 && !("model" in made.body), `a model field came back: ${made.text}`);
+  f.calls.length = 0;
   const got = await call(f.deps, "GET", "/agents/raft_01JAGENT");
   assert(got.status === 200 && got.body.push.registered === true && got.body.push.live.registration === "active", got.text);
+  // Read from the mount's state, never through the gateway: a poll leaves no tool call behind.
+  assert(f.calls.join(";") === "status raft_01JAGENT", `GET ran tools: ${f.calls.join(";")}`);
   assert((await call(f.deps, "GET", "/agents/raft_nobody")).status === 404, "an unknown agent read");
   for (const [m, p] of [["GET", "/agents"], ["GET", "/models"], ["GET", "/other"], ["DELETE", "/agents/raft_01JAGENT/credential"]] as const) {
     assert((await call(f.deps, m, p)).status === 0, `${m} ${p} was answered`);

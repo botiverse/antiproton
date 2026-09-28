@@ -111,7 +111,7 @@ await check("an explicit seed list mounts a non-default plugin and its tools rea
   // was never switched on. #491 made provision() skip it without a word; the production τ² round went 0/24.
   const { rt, host } = await runtime();
   await rt.store.createAgent("t", "bench-1");
-  await rt.provision("t", "bench-1", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any]);
+  await rt.provision("t", "bench-1", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any], { chosen: true });
   const mounts = (await rt.store.listMounts("t", "bench-1")).map((m) => m.alias);
   must(mounts.includes("p"), `explicit seed not mounted: ${mounts.join(",")}`);
   must((await rt.store.pluginChoices("t", "bench-1")).pushy === "enable", "the explicit seed was not recorded as a choice");
@@ -120,12 +120,16 @@ await check("an explicit seed list mounts a non-default plugin and its tools rea
   // An explicit "disable" still wins over an explicit seed.
   await rt.store.createAgent("t", "bench-2");
   await rt.store.setPluginChoice("t", "bench-2", "pushy", "disable");
-  await rt.provision("t", "bench-2", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any]);
+  await rt.provision("t", "bench-2", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any], { chosen: true });
   must(!(await rt.store.listMounts("t", "bench-2")).some((m) => m.alias === "p"), "a disabled plugin was mounted from an explicit seed");
   // The default list is not an explicit choice: a non-default plugin is not switched on by it.
   await rt.store.createAgent("t", "plain");
   await rt.provision("t", "plain");
   must((await rt.store.pluginChoices("t", "plain")).pushy === undefined, "the default seeds switched on a non-default plugin");
+  // Nor is a fresh copy of a list: only saying so counts.
+  await rt.store.createAgent("t", "copy");
+  await rt.provision("t", "copy", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any]);
+  must((await rt.store.pluginChoices("t", "copy")).pushy === undefined && !(await rt.store.listMounts("t", "copy")).some((m) => m.alias === "p"), "an unsaid list switched a plugin on");
   host.dispose();
 });
 

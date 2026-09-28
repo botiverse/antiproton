@@ -508,12 +508,13 @@ await check("an inbox notice reaches the agent as Raft wrote it, with the one in
   globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
   const out = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
   if (!out.deliver || out.dedupeKey !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(out));
-  if (!out.text.startsWith("Inbox update: 2 unread") || !out.text.includes("`receive_events` tool from the `raft` mount") || !/acknowledges/.test(out.text)) throw new Error(out.text);
+  if (!out.text.startsWith("Read your Raft inbox with the `receive_events` tool from the `raft` mount") || !out.text.includes("Inbox update: 2 unread") || !/acknowledges/.test(out.text)) throw new Error(out.text);
   if (m.state()?.lastReached?.deliveryId !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(m.state()));
   const extra = await raftPlugin.receive!(pushed(notice({ latestPreview: "added later", other: 1 }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
   if (!extra.deliver) throw new Error(`a field it does not know was refused: ${JSON.stringify(extra)}`);
+  // A long notice is cut under the runtime's 4,000 with the instruction intact and first, so no later cut can take it.
   const long = await raftPlugin.receive!(pushed(notice({ text: "y".repeat(5000) }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
-  if (!long.deliver || !long.text.includes("… (cut)") || long.text.length > 4300) throw new Error(`length ${long.deliver ? long.text.length : "-"}`);
+  if (!long.deliver || !long.text.includes("… (cut)") || long.text.length > 4000 || !long.text.startsWith("Read your Raft inbox")) throw new Error(`length ${long.deliver ? long.text.length : "-"}`);
 });
 
 await check("a notice is checked for its signature and header before any state is read, and a signed body Raft got wrong is 400, never 401", async () => {
@@ -567,6 +568,14 @@ await check("activity posts the events as given to Raft's ingest while push is o
   if (!("skipped" in skipped) || quiet.length !== 0) throw new Error(JSON.stringify({ skipped, calls: quiet.length }));
   const none = await raftPlugin.reportActivity!([], on.ctx);
   if (!("sent" in none) || none.sent !== 0 || quiet.length !== 0) throw new Error(JSON.stringify(none));
+});
+
+await check("activity for a mount with no account is skipped, not an error: a deleted agent must not re-arm the alarm for ever", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  m.ctx.credential = null;
+  const calls = one(json(200, {}));
+  const out = await raftPlugin.reportActivity!([{ eventId: "raft_x:1", hookEventName: "Stop", occurredAt: "2026-09-28T08:00:00.000Z" }], m.ctx);
+  if (!("skipped" in out) || !/no account/.test(out.skipped) || calls.length !== 0) throw new Error(JSON.stringify({ out, calls: calls.length }));
 });
 
 await check("an activity post that fails throws, so the runtime keeps the events for the next pass", async () => {
