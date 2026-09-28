@@ -847,10 +847,32 @@ export interface InboundEvent {
  * looking. Without it the request was fine and simply not for this mount (not
  * subscribed, the mount's own doing, a ping), and the answer is a success, so
  * the service does not report a working webhook as broken.
+ *
+ * `malformed` is the third answer: the request came from the right party (its
+ * signature verified) and its body is not what this plugin's contract says.
+ * The runtime answers 400, which a service reads as its own bug to fix, where
+ * 401 reads as "not you" — and a service that stops pushing after a few 401s
+ * would otherwise stop over one field. A plugin sets one of `rejected` and
+ * `malformed`, not both.
+ *
+ * `as` says how the runtime hands the text to the agent. `"event"`, the
+ * default, delivers it under the label that says it was written outside this
+ * conversation and is information, not an instruction. `"user"` delivers it
+ * as the person in the conversation speaking: a Raft message from a server
+ * member to this agent is exactly that. A plugin says `"user"` only from a
+ * fact the service states (a sender type), never from reading the content;
+ * the runtime does not look at the text to decide either.
+ *
+ * The two ways of being wrong are not symmetric. A plugin that omits the field
+ * lands on the labelled side; a plugin that says `"user"` wrongly removes the
+ * label. So this default is the opposite kind from a default that quietly
+ * decides for someone: it pushes a plugin that has not thought about the
+ * question towards the labelled side, and nothing but an explicit word gets
+ * a text past the label.
  */
 export type InboundResult =
-  | { deliver: false; reason: string; rejected?: boolean }
-  | { deliver: true; text: string; dedupeKey?: string };
+  | { deliver: false; reason: string; rejected?: boolean; malformed?: boolean }
+  | { deliver: true; text: string; dedupeKey?: string; as?: "user" | "event" };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {
