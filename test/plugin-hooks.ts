@@ -25,6 +25,7 @@ const pushy: Plugin = {
   async invoke(_t, _a, ctx) { handed[ctx.alias] = ctx.inbound; return { has: !!ctx.inbound }; },
   async receive(event, secret) {
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad", rejected: true };
+    if (event.headers["x-malformed"]) return { deliver: false, reason: "not my shape", malformed: true };
     // The lane is the plugin's word from the service's facts; here the test states it in a header.
     const as = event.headers["x-as"];
     return as === "user" || as === "event" ? { deliver: true, text: "ok", as } : { deliver: true, text: "ok" };
@@ -69,6 +70,16 @@ async function runtime(opts: { hooks?: boolean } = {}) {
   return { rt, host, rows, grab };
 }
 const ev = (secret: string, extra: Record<string, string> = {}) => ({ headers: { "x-signed-with": secret, ...extra }, body: new Uint8Array([1]) });
+
+await check("a signed body the plugin cannot read is malformed, which is neither rejected nor ignored", async () => {
+  const { rt, host, grab } = await runtime();
+  const made = await (await grab("a", "p"))!.create();
+  const r = await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret, { "x-malformed": "1" }));
+  must(r.outcome === "malformed", `outcome ${r.outcome}`);
+  const log = await rt.inboundLog(1);
+  must(log[0]?.outcome === "malformed" && log[0]?.reason === "not my shape", `record ${JSON.stringify(log[0])}`);
+  host.dispose();
+});
 
 await check("what the plugin says about who is speaking decides whether the agent reads a label", async () => {
   const { rt, host, grab } = await runtime();

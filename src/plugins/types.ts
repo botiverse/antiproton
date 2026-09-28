@@ -848,6 +848,13 @@ export interface InboundEvent {
  * subscribed, the mount's own doing, a ping), and the answer is a success, so
  * the service does not report a working webhook as broken.
  *
+ * `malformed` is the third answer: the request came from the right party (its
+ * signature verified) and its body is not what this plugin's contract says.
+ * The runtime answers 400, which a service reads as its own bug to fix, where
+ * 401 reads as "not you" — and a service that stops pushing after a few 401s
+ * would otherwise stop over one field. A plugin sets one of `rejected` and
+ * `malformed`, not both.
+ *
  * `as` says how the runtime hands the text to the agent. `"event"`, the
  * default, delivers it under the label that says it was written outside this
  * conversation and is information, not an instruction. `"user"` delivers it
@@ -864,7 +871,7 @@ export interface InboundEvent {
  * a text past the label.
  */
 export type InboundResult =
-  | { deliver: false; reason: string; rejected?: boolean }
+  | { deliver: false; reason: string; rejected?: boolean; malformed?: boolean }
   | { deliver: true; text: string; dedupeKey?: string; as?: "user" | "event" };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */

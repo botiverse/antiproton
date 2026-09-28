@@ -73,10 +73,10 @@ await check("a text the plugin marks as the user speaking carries no label, and 
   assert(unsaid === still, unsaid);
 });
 
-await check("each outcome has its answer: accepted ones 202, a bad request 401, too large 413, too many 429", () => {
-  const got = (["delivered", "ignored", "duplicate", "rejected", "too_large", "rate_limited", "failed"] as const)
+await check("each outcome has its answer: accepted ones 202, not you 401, your body 400, too large 413, too many 429", () => {
+  const got = (["delivered", "ignored", "duplicate", "rejected", "malformed", "too_large", "rate_limited", "failed"] as const)
     .map((o) => `${o}=${inboundStatus(o)}`).join(" ");
-  assert(got === "delivered=202 ignored=202 duplicate=202 rejected=401 too_large=413 rate_limited=429 failed=503", got);
+  assert(got === "delivered=202 ignored=202 duplicate=202 rejected=401 malformed=400 too_large=413 rate_limited=429 failed=503", got);
 });
 
 await check("a delivered key is a duplicate on the same hook within a day, and not on another hook or after", () => {
@@ -159,10 +159,10 @@ await check("every outcome has a verdict, and the verdict is one the outbox acce
   // Exhaustive by construction: a new outcome without a verdict fails the
   // switch's typecheck; a verdict outside the table would be dropped at append
   // as an orphan, which this pins from the other side.
-  const outcomes = ["delivered", "ignored", "duplicate", "rejected", "rate_limited", "too_large", "failed"] as const;
+  const outcomes = ["delivered", "ignored", "duplicate", "rejected", "malformed", "rate_limited", "too_large", "failed"] as const;
   const want: Record<(typeof outcomes)[number], string> = {
     delivered: "ok", ignored: "ok", duplicate: "ok",
-    rejected: "blocked", rate_limited: "blocked", too_large: "blocked", failed: "failed",
+    rejected: "blocked", malformed: "blocked", rate_limited: "blocked", too_large: "blocked", failed: "failed",
   };
   for (const o of outcomes) {
     const v = inboundVerdict(o);

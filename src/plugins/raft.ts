@@ -14,7 +14,6 @@ const MAX_EVENTS = 200;
 const PUSH_SCHEMA = "raft-agent-inbox.v2";
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const PUSH_FIELDS = new Set(["schema", "deliveryId", "recipientAgentId", "cursor", "events"]);
 /**
  * How much of a batch the agent reads. The runtime cuts a delivery at
  * INBOUND_TEXT_MAX (src/runtime/inbound.ts); this budget stays under it with
@@ -285,14 +284,20 @@ function event(value: unknown): Json {
     ...(text(e.timestamp) ?? text(e.createdAt) ? { timestamp: text(e.timestamp) ?? text(e.createdAt) } : {}),
     senderType: ["human", "agent", "system", "third_party_app"].includes(sender ?? "") ? sender! : "unknown",
     ...(text(e.sender_name) ?? text(e.senderName) ? { senderName: text(e.sender_name) ?? text(e.senderName) } : {}),
+    ...(text(e.sender_id) ? { senderId: text(e.sender_id) } : {}),
+    ...(text(e.channel_id) ? { channelId: text(e.channel_id) } : {}),
     ...(text(e.channel_name) ? { channelName: text(e.channel_name) } : {}),
     ...(text(e.channel_type) ? { channelType: text(e.channel_type) } : {}),
     ...(text(e.parent_channel_name) ? { parentChannelName: text(e.parent_channel_name) } : {}),
     ...(text(e.parent_channel_type) ? { parentChannelType: text(e.parent_channel_type) } : {}),
-    // Where a reply to this message goes, when Raft names it (raft-agent-inbox.v2
-    // batches do; the pull answer names one for the whole batch instead).
-    ...(text(e.reply_target) ?? text(e.replyTarget) ? { replyTarget: text(e.reply_target) ?? text(e.replyTarget) } : {}),
+    // Where a reply to this message goes. A raft-agent-inbox.v2 batch names one
+    // per message, since one batch spans conversations; the pull answer names
+    // one for the whole batch instead.
+    ...(text(e.reply_target) ? { replyTarget: text(e.reply_target) } : {}),
     ...(typeof e.mentioned === "boolean" ? { mentioned: e.mentioned } : {}),
+    // A message that is a task carries the task's number and status.
+    ...(number(e.task_number) !== undefined ? { taskNumber: number(e.task_number) } : {}),
+    ...(text(e.task_status) ? { taskStatus: text(e.task_status) } : {}),
     attachments,
   } as Json;
 }
@@ -592,25 +597,24 @@ export const raftPlugin: Plugin = {
       return { deliver: false, rejected: true, reason: "the signature does not match this mount's inbound secret" };
     }
 
+    // Signed by Raft, so what follows is Raft's own mistake, not a stranger's:
+    // `malformed` (400), never `rejected` (401), which Raft counts towards
+    // switching the registration off. A field this version does not know is
+    // ignored; a change that would need refusing is what a v3 schema is for.
     let payload: ObjectValue;
     try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
-    catch { return { deliver: false, rejected: true, reason: "signed, but the body is not JSON" }; }
+    catch { return { deliver: false, malformed: true, reason: "signed, but the body is not JSON" }; }
     const cursor = object(payload.cursor);
     if (payload.schema !== PUSH_SCHEMA ||
         typeof payload.deliveryId !== "string" || !PUSH_ID.test(payload.deliveryId) ||
         typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ||
         number(cursor.fromSeq) === undefined || number(cursor.toSeq) === undefined || cursor.fromSeq > cursor.toSeq ||
         !Array.isArray(payload.events)) {
-      return { deliver: false, rejected: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} delivery` };
+      return { deliver: false, malformed: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} delivery` };
     }
     const headerDeliveryId = inbound.headers["x-raft-delivery-id"];
     if (!headerDeliveryId || headerDeliveryId !== payload.deliveryId) {
-      return { deliver: false, rejected: true, reason: "the Raft delivery id header does not match the signed body" };
-    }
-    // The envelope is versioned; a field this version does not know is a
-    // contract change, and loud is better than silently dropped.
-    if (Object.keys(payload).some((field) => !PUSH_FIELDS.has(field))) {
-      return { deliver: false, rejected: true, reason: `signed, but the body carries fields ${PUSH_SCHEMA} does not have` };
+      return { deliver: false, malformed: true, reason: "the Raft delivery id header does not match the signed body" };
     }
 
     const state = await loadPushState(ctx);
@@ -650,7 +654,10 @@ function batchText(alias: string, fromSeq: number, toSeq: number, events: Object
     const where = text(e.replyTarget) ?? place(e);
     const who = `${text(e.senderName) ? `@${e.senderName}` : "someone"} (${e.senderType})`;
     const head = [`${i + 1}.`, number(e.seq) !== undefined ? `seq ${e.seq}` : null, where, who,
-      text(e.messageId) ? `msg ${e.messageId}` : null, text(e.timestamp) ?? null].filter((part) => part !== null).join(" · ");
+      text(e.messageId) ? `msg ${e.messageId}` : null, text(e.timestamp) ?? null,
+      e.mentioned === true ? "mentions you" : null,
+      number(e.taskNumber) !== undefined ? `task #${e.taskNumber}${text(e.taskStatus) ? ` (${e.taskStatus})` : ""}` : null,
+    ].filter((part) => part !== null).join(" · ");
     const content = text(e.content) ?? "";
     const body = content.length > each
       ? `${content.slice(0, each)}… (cut, ${content.length - each} more characters; read the message with a tool)`
@@ -670,8 +677,8 @@ function place(e: ObjectValue): string {
   const channel = text(e.channelName);
   const kind = text(e.channelType);
   if (!channel && !kind) return "(no target given)";
-  const parent = text(e.parentChannelName) ? ` in ${e.parentChannelName}` : "";
-  return `${kind === "dm" ? "dm:" : ""}${channel ? (kind === "dm" ? `@${channel}` : `#${channel}`) : kind}${parent}`;
+  if (kind === "thread") return `a thread${text(e.parentChannelName) ? ` in #${e.parentChannelName}` : ""}`;
+  return `${kind === "dm" ? "dm:" : ""}${channel ? (kind === "dm" ? `@${channel}` : `#${channel}`) : kind}`;
 }
 
 function indent(body: string): string {

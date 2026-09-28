@@ -772,7 +772,7 @@ export class AgentRuntime {
     // mount is not taking events, which the service should not report as broken.
     if ("skipped" in answer) return done("ignored", answer.skipped);
     const result = answer.result;
-    if (!result.deliver) return done(result.rejected ? "rejected" : "ignored", result.reason);
+    if (!result.deliver) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
