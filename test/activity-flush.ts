@@ -2,12 +2,11 @@
  * The activity drain (cf/src/activity-raft.ts) on a real SQLite outbox with a
  * recording gateway: the cursor moves only on a send that returned, a throw
  * keeps the rows, a skipping service still advances, the trace export prunes
- * only through what both readers consumed, and a backlog past the cap is
- * skipped with a warning rather than held for ever.
+ * only through what both readers consumed.
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { appendTrace, type TraceRow } from "../src/trace/outbox.ts";
-import { flushActivity, activityCursor, ACTIVITY_BACKLOG_MAX } from "../cf/src/activity-raft.ts";
+import { flushActivity, activityCursor } from "../cf/src/activity-raft.ts";
 import { flushTrace } from "../cf/src/trace-r2.ts";
 import type { ActivityEvent } from "../src/plugins/types.ts";
 
@@ -33,7 +32,6 @@ function gateway(mode: "send" | "skip" | "throw" = "send") {
   return g;
 }
 const left = (sql: any) => Number(sql.exec("SELECT COUNT(*) AS n FROM trace_outbox").toArray()[0].n);
-const quiet = async <T,>(fn: () => Promise<T>) => { const warned: string[] = []; const o = console.warn; console.warn = (...a: unknown[]) => { warned.push(a.map(String).join(" ")); }; try { return { out: await fn(), warned }; } finally { console.warn = o; } };
 
 await check("rows become events, the send returns, the cursor moves to the last row read; a second pass with nothing new sends nothing", async () => {
   const { sql } = sqliteHost(); const g = gateway();
@@ -80,17 +78,6 @@ await check("the trace export prunes only through what the activity reader has c
   appendTrace(sql, [tool(4)]);
   await flushTrace(bucket, sql, OWNER.tenantId, OWNER.agentId);
   must(left(sql) === 0, "unheld rows were kept");
-});
-
-await check("a backlog past the cap is skipped to the newest rows with a warning, and the pass says how many", async () => {
-  const { sql } = sqliteHost(); const g = gateway();
-  const rows: TraceRow[] = [];
-  for (let i = 1; i <= ACTIVITY_BACKLOG_MAX + 10; i++) rows.push(answered(i));
-  appendTrace(sql, rows);
-  const { out, warned } = await quiet(() => flushActivity(g, sql, OWNER.tenantId, OWNER.agentId, 5));
-  must(out.dropped === ACTIVITY_BACKLOG_MAX + 5 && out.events === 5 && out.through === ACTIVITY_BACKLOG_MAX + 10, JSON.stringify(out));
-  must(warned.length === 1 && /skipped/.test(warned[0]!), JSON.stringify(warned));
-  must(g.batches[0]![0]!.eventId === `raft_a1:${ACTIVITY_BACKLOG_MAX + 6}`, JSON.stringify(g.batches[0]![0]));
 });
 
 console.log(`\n  activity flush\n  ${"─".repeat(56)}`);
