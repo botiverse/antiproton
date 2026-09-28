@@ -28,6 +28,16 @@ const NOTICE_TEXT_MAX = 3_600;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const ACTIVITY_PATH = "/internal/agent-api/activity";
 const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
+/**
+ * The status dot Raft shows beside an agent, the one set managed agents use.
+ * Raft derives the usual states from the activity events this plugin already
+ * sends (turn start, tool calls, stop, fatal); `set_status` is for what only
+ * the agent knows, and the most recent `occurredAt` wins either way, so an
+ * explicit status lasts until the next activity says otherwise.
+ */
+const STATUS_VALUES = ["online", "thinking", "working", "error", "offline"] as const;
+type StatusValue = typeof STATUS_VALUES[number];
+const STATUS_DETAIL_MAX = 200;
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 type ObjectValue = Record<string, any>;
@@ -432,6 +442,20 @@ export const raftPlugin: Plugin = {
       sideEffects: "read",
       idempotency: "native",
     },
+    {
+      name: "set_status",
+      summary: "Set the status dot Raft shows beside you. Raft already follows your activity (thinking, working, online, error); " +
+        "use this for a state only you know, such as error with a reason, or offline. The next activity overrides it.",
+      parameters: {
+        type: "object", additionalProperties: false, required: ["status"],
+        properties: {
+          status: { type: "string", enum: [...STATUS_VALUES], description: "one of online, thinking, working, error, offline" },
+          detail: { type: "string", maxLength: STATUS_DETAIL_MAX, description: "a short reason shown with the status, optional" },
+        },
+      },
+      sideEffects: "write",
+      idempotency: "native",
+    },
   ],
 
   async checkCredential(ctx) {
@@ -600,6 +624,22 @@ export const raftPlugin: Plugin = {
         registration: null,
       });
       return { enabled: false, remoteDeregistration, cleanupPending: staleHookIds.length };
+    }
+    if (name === "set_status") {
+      const status = (args as { status?: unknown })?.status;
+      if (typeof status !== "string" || !(STATUS_VALUES as readonly string[]).includes(status)) {
+        throw new Error(`status must be one of ${STATUS_VALUES.join(", ")}`);
+      }
+      const rawDetail = (args as { detail?: unknown })?.detail;
+      if (rawDetail !== undefined && typeof rawDetail !== "string") throw new Error("detail must be a string");
+      if (rawDetail !== undefined && rawDetail.length > STATUS_DETAIL_MAX) throw new Error(`detail is longer than ${STATUS_DETAIL_MAX} characters`);
+      if (!ctx.credential) throw new Error(`the ${ctx.alias} mount has no Raft agent credential, so Raft cannot be told`);
+      // One event on the activity ingest, in Raft's own shape for a status (Tenny, #raft-antiproton:a184491e):
+      // no hookEventName, the fields Raft named and nothing more, since the ingest refuses a field it does not know.
+      const occurredAt = new Date().toISOString();
+      const event = { eventId: `st_${crypto.randomUUID()}`, kind: "status", status: status as StatusValue, ...(rawDetail ? { detail: rawDetail } : {}), occurredAt };
+      await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: [event] });
+      return { status, ...(rawDetail ? { detail: rawDetail } : {}), at: occurredAt };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);

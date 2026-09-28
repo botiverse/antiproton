@@ -576,6 +576,33 @@ await check("a notice for a mount whose push is off, or for another Raft agent, 
   if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
 });
 
+await check("set_status posts one status event in Raft's shape, refuses a value outside the set, and needs a credential", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const calls = one(json(200, { accepted: 1 }));
+  const out = await raftPlugin.invoke("set_status", { status: "error", detail: "waiting on a person" }, m.ctx) as any;
+  if (out.status !== "error" || out.detail !== "waiting on a person" || typeof out.at !== "string") throw new Error(JSON.stringify(out));
+  const body = JSON.parse(calls[0]!.init.body);
+  const ev = body.events?.[0];
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/activity" || body.schema !== "raft-agent-activity-ingest.v1" || body.events.length !== 1 ||
+      JSON.stringify(Object.keys(ev).sort()) !== JSON.stringify(["detail", "eventId", "kind", "occurredAt", "status"]) ||
+      ev.kind !== "status" || ev.status !== "error" || ev.detail !== "waiting on a person" || !/^st_/.test(ev.eventId) || ev.occurredAt !== out.at) {
+    throw new Error(`the event is not Raft's shape: ${JSON.stringify(body)}`);
+  }
+  if (!String(calls[0]!.init.headers.authorization).startsWith("Bearer sk_agent_")) throw new Error("no credential on the status call");
+  const bare = one(json(200, { accepted: 1 }));
+  await raftPlugin.invoke("set_status", { status: "offline" }, m.ctx);
+  if ("detail" in JSON.parse(bare[0]!.init.body).events[0]) throw new Error("an absent detail was sent as a field");
+  for (const [args, expect] of [[{ status: "busy" }, /one of online, thinking, working, error, offline/], [{ status: "online", detail: "x".repeat(201) }, /longer than 200/], [{}, /one of/]] as const) {
+    let threw: string | null = null;
+    try { await raftPlugin.invoke("set_status", args as any, m.ctx); } catch (e) { threw = String((e as Error).message); }
+    if (!threw || !expect.test(threw)) throw new Error(`${JSON.stringify(args)}: ${threw ?? "accepted"}`);
+  }
+  const none = { ...ctx(null), db: m.ctx.db } as any;
+  let refused: string | null = null;
+  try { await raftPlugin.invoke("set_status", { status: "online" }, none); } catch (e) { refused = String((e as Error).message); }
+  if (!refused || !/no Raft agent credential/.test(refused)) throw new Error(`without a credential: ${refused ?? "accepted"}`);
+});
+
 await check("activity posts the events as given to Raft's ingest while push is on, and says skipped when it is off", async () => {
   const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const calls = one(json(200, { accepted: 2 }));
