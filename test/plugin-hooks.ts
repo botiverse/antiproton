@@ -106,6 +106,29 @@ await check("what a plugin delivers reaches the agent under the label that says 
   must(posted.length === 1 && /not by the user/.test(posted[0]!) && posted[0]!.endsWith("\nok"), `posted ${JSON.stringify(posted)}`);
   host.dispose();
 });
+await check("an explicit seed list mounts a non-default plugin and its tools reach the catalogue; the default list still leaves it to the switch", async () => {
+  // The bench arm's shape: rt.provision(tenant, agent, [seeds]) with a plugin that is not in DEFAULT_MOUNTS and
+  // was never switched on. #491 made provision() skip it without a word; the production τ² round went 0/24.
+  const { rt, host } = await runtime();
+  await rt.store.createAgent("t", "bench-1");
+  await rt.provision("t", "bench-1", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any]);
+  const mounts = (await rt.store.listMounts("t", "bench-1")).map((m) => m.alias);
+  must(mounts.includes("p"), `explicit seed not mounted: ${mounts.join(",")}`);
+  must((await rt.store.pluginChoices("t", "bench-1")).pushy === "enable", "the explicit seed was not recorded as a choice");
+  const r: any = await rt.gateway().invoke({ tenantId: "t", agentId: "bench-1", taskId: "k" }, "p.grab", {});
+  must(r.ok !== false && r.status !== "rejected", `the seeded plugin's tool did not run: ${JSON.stringify(r)}`);
+  // An explicit "disable" still wins over an explicit seed.
+  await rt.store.createAgent("t", "bench-2");
+  await rt.store.setPluginChoice("t", "bench-2", "pushy", "disable");
+  await rt.provision("t", "bench-2", [{ alias: "p", plugin: "pushy", config: {}, secretRef: null, policy: null } as any]);
+  must(!(await rt.store.listMounts("t", "bench-2")).some((m) => m.alias === "p"), "a disabled plugin was mounted from an explicit seed");
+  // The default list is not an explicit choice: a non-default plugin is not switched on by it.
+  await rt.store.createAgent("t", "plain");
+  await rt.provision("t", "plain");
+  must((await rt.store.pluginChoices("t", "plain")).pushy === undefined, "the default seeds switched on a non-default plugin");
+  host.dispose();
+});
+
 await check("a plugin that can receive makes a hook for its own mount, and the secret it gets is the one events are checked with", async () => {
   const { rt, host, rows, grab } = await runtime();
   const inbound = await grab("a", "p");

@@ -1277,6 +1277,15 @@ export class AgentRuntime {
     // would look like the switch not working rather than like a rule being
     // applied twice.
     const choices = await this.store.pluginChoices(tenantId, agentId);
+    // A caller that hands over its own seed list has chosen those plugins: a
+    // benchmark arm seeding `retail`, a demo seeding `ops`. #491 made the
+    // catalogue the only source of "on by default", and this path was never
+    // told — so a non-default plugin in an explicit list was skipped below
+    // without a word, and the retail tools vanished from every bench agent the
+    // first time #491 reached production (Vera, 2026-09-28 12:53Z, 0/24).
+    // The choice is recorded, not bypassed, so the catalogue and the gateway
+    // agree with what was mounted; an explicit "disable" still wins.
+    const explicit = mounts !== AgentRuntime.DEFAULT_MOUNTS;
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
       // mount being added, so an open of an agent that already has its seven
@@ -1289,6 +1298,10 @@ export class AgentRuntime {
       // connection state behind it — the gateway and the catalogue withhold
       // it instead, and switching it back on returns what was there.
       const declared = this.#plugins.find((p) => p.id === m.plugin);
+      if (declared && explicit && !SEEDED_PLUGINS.has(m.plugin) && choices[m.plugin] !== "disable" && choices[m.plugin] !== "enable") {
+        await this.store.setPluginChoice(tenantId, agentId, m.plugin, "enable");
+        choices[m.plugin] = "enable";
+      }
       if (declared && !pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin])) continue;
       // The seed is hand-written and reaches every agent, and the console's
       // validator only shows problems to whoever opens the plugins page. The
