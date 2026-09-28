@@ -8,9 +8,11 @@
  * lane's current operation, is said to be unreadable rather than guessed; what is stored about work in
  * flight is reported instead: model calls with no answer yet, and background jobs.
  */
-import type { Plugin, PluginContext } from "../../src/plugins/types.ts";
+import type { DbKey, DbSpec, Plugin, PluginContext } from "../../src/plugins/types.ts";
 import { holdingOf } from "../../src/plugins/types.ts";
-import type { Json, ModelBinding, MountRecord } from "../../src/core/types.ts";
+import { type DbScope, PluginDbTables } from "../../src/store/plugin-db.ts";
+import { openPluginDatabase } from "../../src/runtime/plugin-db.ts";
+import type { ModelBinding, MountRecord } from "../../src/core/types.ts";
 import type { SqlHost } from "../../src/store/pi-storage.ts";
 import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
@@ -26,7 +28,6 @@ type Sql = SqlHost["sql"];
 export interface DiagnosisStore {
   getModelBinding(tenantId: string, agentId: string): Promise<ModelBinding | null>;
   listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;
-  getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null>;
   listState(tenantId: string, agentId: string, prefix?: string, limit?: number): Promise<Array<{ key: string }>>;
   getState(tenantId: string, agentId: string, key: string): Promise<{ value: unknown; ref: string | null } | null>;
   stateUsage(tenantId: string, agentId: string): Promise<{ keys: number; bytes: number }>;
@@ -48,13 +49,40 @@ const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): a
   hasTable(sql, table) ? (sql.exec(query, ...bindings).toArray() as any[]) : [];
 
 /**
- * What each mount says it is holding and has held: the sandbox panel's data. The plugin is handed a
- * connection it can read and not write, so a plugin whose report would change its state is refused here
- * rather than trusted; one that cannot answer that way is left out, as one failing mount always was.
+ * The plugin databases, read in place. An object whose store was never initialised has no table, and
+ * that is the same fact as "nothing stored": every read answers empty rather than failing on a name.
+ * Nothing here writes, so the transaction hook is never reached.
+ */
+function pluginDbOf(sql: Sql): PluginDbTables {
+  const host = hasTable(sql, "plugin_db")
+    ? { sql, transactionSync: <T>(fn: () => T) => fn() }
+    : { sql: { exec: () => ({ toArray: () => [] }) }, transactionSync: <T>(fn: () => T) => fn() };
+  return new PluginDbTables(host);
+}
+
+/**
+ * What a mount's database says about itself to an operator: the version it was written under and,
+ * for each key the plugin `listed`, whether it is present. Names only, and only the declared ones —
+ * the value never leaves the object, and a key the plugin did not list is not named here either.
+ */
+function databaseSummary(
+  tables: PluginDbTables, scope: DbScope, spec: DbSpec | undefined,
+): { version: number | null; listed: Array<{ store: string; key: DbKey; present: boolean }> } | null {
+  if (!spec) return null;
+  const listed: Array<{ store: string; key: DbKey; present: boolean }> = [];
+  for (const [store, s] of Object.entries(spec.stores)) {
+    for (const key of s.listed ?? []) listed.push({ store, key, present: tables.get(scope, store, key) !== undefined });
+  }
+  return { version: tables.version(scope), listed };
+}
+
+/**
+ * What each mount says it is holding and has held: the sandbox panel's data. The plugin is handed its
+ * database read-only, so a plugin whose report would change its state is refused here rather than
+ * trusted; one that cannot answer that way is left out, as one failing mount always was.
  */
 async function mountReports(
-  sql: Sql, mounts: MountRecord[], plugins: Plugin[], owner: { tenantId: string; agentId: string }, taskId: string,
-  store: DiagnosisStore,
+  tables: PluginDbTables, mounts: MountRecord[], plugins: Plugin[], owner: { tenantId: string; agentId: string }, taskId: string,
 ): Promise<MountReports> {
   const out: MountReports = {};
   for (const m of mounts) {
@@ -65,10 +93,7 @@ async function mountReports(
       alias: m.alias,
       credential: null,
       publicConfig: m.publicConfig,
-      connection: {
-        get: async () => hasTable(sql, "connections") ? store.getConnection(owner.tenantId, owner.agentId, m.alias) : null,
-        set: async () => { throw new Error("read-only: a diagnosis does not change a mount's state"); },
-      },
+      db: openPluginDatabase(tables, { ...owner, alias: m.alias, plugin: m.plugin }, plugin.database, { readOnly: true }),
       async sibling() { return null; },
     };
     try {
@@ -116,6 +141,7 @@ export async function readDiagnosis(
   // A claimed object whose store was never initialised (an agent the API only named) has none of the store's
   // tables; each read is guarded instead of letting "no such table" become a 500 (Ada, #347).
   const mounts = hasTable(sql, "mounts") ? await store.listMounts(tenantId, agentId) : [];
+  const tables = pluginDbOf(sql);
   const hasState = hasTable(sql, "agent_state");
   const stateKeys = hasState ? await store.listState(tenantId, agentId, "", 20) : [];
   const docs: Record<string, unknown> = {};
@@ -150,9 +176,10 @@ export async function readDiagnosis(
       // `createdAt` survives a replacement (the upsert leaves it alone), so it dates the FIRST attach while
       // `updatedAt` dates the last one. Null for an operator ref: that secret is not in this agent's store.
       secretTimes: await secretTimes(sql, store, tenantId, agentId, m.secretRef, m.alias),
-      connection: hasTable(sql, "connections") && (await store.getConnection(tenantId, agentId, m.alias)) != null,
+      database: databaseSummary(tables, { tenantId, agentId, alias: m.alias, plugin: m.plugin },
+        deps.plugins.find((p) => p.id === m.plugin)?.database),
     }))),
-    mountReports: await mountReports(sql, mounts, deps.plugins, owner, taskId, store),
+    mountReports: await mountReports(tables, mounts, deps.plugins, owner, taskId),
     eventKinds: kinds,
     lastEvents: transcript.events.slice(-6).map((e) => ({
       seq: e.sequence, kind: e.kind, detail: JSON.stringify(e.payload).slice(0, 220),

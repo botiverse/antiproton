@@ -35,20 +35,21 @@ function racer(id: string, exclusive: boolean) {
     // `defaultForAllAgents` because the gateway refuses a mount whose plugin is
     // not enabled for this agent, and these fixtures are about a different rule.
     id, version: "1.0.0", tools: [tool], 
+    database: { version: 1, stores: { marks: {} } },
 
     async invoke(_t: string, args: any) {
       inside += 1;
       if (inside > 1) overlapped = true;
-      const state = (await this.__ctx.connection.get()) as any;
+      const state = (await this.__ctx.db.get("marks", "last")) as any;
       await new Promise((r) => setTimeout(r, 5));
-      await this.__ctx.connection.set({ ...(state ?? {}), last: (args as any).mark });
+      await this.__ctx.db.put("marks", { ...(state ?? {}), last: (args as any).mark }, "last");
       seen.push(String((args as any).mark));
       inside -= 1;
       return { ok: true };
     },
   } as any;
   // Read, pause, write — the same shape as the real release: it reads the
-  // connection state, destroys the box, and writes the emptied state back.
+  // box record, destroys the box, and writes the emptied record back.
   // Attached to the group rather than the top level, and only when this racer
   // is the serialised one: `holds` is now what says both things at once.
   if (exclusive) {
@@ -58,9 +59,9 @@ function racer(id: string, exclusive: boolean) {
       async release(c: any) {
         inside += 1;
         if (inside > 1) overlapped = true;
-        await c.connection.get();
+        await c.db.get("marks", "last");
         await new Promise((r) => setTimeout(r, 5));
-        await c.connection.set({});
+        await c.db.put("marks", {}, "last");
         seen.push("release");
         inside -= 1;
         return true;
@@ -99,7 +100,7 @@ await check("独占的挂载:两个并发调用不重叠,两次写都留下", as
   ]);
   if (r.overlapped()) throw new Error("two calls to an exclusive mount ran at the same time");
   if (r.seen.length !== 2) throw new Error(`both calls should have run: ${r.seen.join(",")}`);
-  const state: any = await store.getConnection("t", "a", "node");
+  const state: any = store.pluginDb.get({ tenantId: "t", agentId: "a", alias: "node", plugin: "node" }, "marks", "last");
   if (!state?.last) throw new Error("neither write survived");
 });
 

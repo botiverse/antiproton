@@ -22,7 +22,6 @@ const ctx = (over: Record<string, unknown> = {}) => ({
   credential: "a-key",
   credentialRefKind: "operator" as const,
   publicConfig: {},
-  connection: { async get() { return null; }, async set() {} },
   async sibling() { return null; },
   ...over,
 });

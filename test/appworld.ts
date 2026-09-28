@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway, type SecretResolver } from "../src/runtime/gateway.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
+import { SESSION_KEY, SESSION_STORE } from "../src/plugins/appworld.ts";
 
 const ENV = process.env.AW_ENV_URL ?? "http://localhost:8799";
 const API = process.env.AW_API_URL ?? "http://localhost:8800";
@@ -68,6 +69,10 @@ const ctx = { tenantId: T, agentId: AGENT, taskId: TASK_ID };
 
 // ---------------------------------------------------------------- cases
 
+/** A mount's session record, read from the rows under the app's own plugin id (one plugin per app). */
+const scopeOf = (alias: string) => ({ tenantId: T, agentId: AGENT, alias, plugin: alias });
+const sessionOf = (alias: string) => store.pluginDb.get(scopeOf(alias), SESSION_STORE, SESSION_KEY) ?? null;
+
 await test("凭据不进模型面 — no schema mentions access_token", async () => {
   const leaks = plugins.flatMap((p) =>
     p.tools.filter((t) => JSON.stringify(t.parameters).includes("access_token"))
@@ -81,8 +86,8 @@ await test("密码工具被收回 — the credential-reading tool is not mounted
   assert((r as any).error.code === "unknown_tool", `expected unknown_tool, got ${(r as any).error.code}`);
 });
 
-await test("无令牌起步 — connection state is empty before the first call", async () => {
-  const c = await store.getConnection(T, AGENT, "spotify");
+await test("无令牌起步 — the session store is empty before the first call", async () => {
+  const c = sessionOf("spotify");
   assert(c === null, `expected no session, got ${JSON.stringify(c)}`);
 });
 
@@ -92,8 +97,8 @@ await test("网关代登录 — an authenticated call succeeds without the agent
   assert((r as any).result.email === profile.email, "returned the supervisor's account");
 });
 
-await test("令牌落在 mount 的连接态里 — token cached, not in the result", async () => {
-  const c = (await store.getConnection(T, AGENT, "spotify")) as any;
+await test("令牌落在 mount 的数据库里 — token cached, not in the result", async () => {
+  const c = (sessionOf("spotify")) as any;
   assert(c && typeof c.token === "string" && c.token.length > 0, "session token stored");
   const r = await gw.invoke(ctx, "spotify.show_account", {});
   assert(r.status === "succeeded", "second call succeeds");
@@ -101,19 +106,19 @@ await test("令牌落在 mount 的连接态里 — token cached, not in the resu
 });
 
 await test("会话按 mount 隔离 — logging into spotify does not authenticate amazon", async () => {
-  assert(await store.getConnection(T, AGENT, "amazon") === null, "amazon has no session yet");
+  assert(sessionOf("amazon") === null, "amazon has no session yet");
   const r = await gw.invoke(ctx, "amazon.show_account", {});
   assert(r.status === "succeeded", `amazon call: ${r.status}`);
-  const a = (await store.getConnection(T, AGENT, "amazon")) as any;
-  const s = (await store.getConnection(T, AGENT, "spotify")) as any;
+  const a = (sessionOf("amazon")) as any;
+  const s = (sessionOf("spotify")) as any;
   assert(a.token !== s.token, "each mount holds its own token");
 });
 
 await test("过期令牌自动重取 — a poisoned session is re-established transparently", async () => {
-  await store.putConnection(T, AGENT, "spotify", { token: "not-a-real-token", obtainedAt: 0 });
+  store.pluginDb.put(scopeOf("spotify"), SESSION_STORE, SESSION_KEY, { token: "not-a-real-token", obtainedAt: 0 }, null);
   const r = await gw.invoke(ctx, "spotify.show_account", {});
   assert(r.status === "succeeded", `expected recovery, got ${r.status}`);
-  const c = (await store.getConnection(T, AGENT, "spotify")) as any;
+  const c = (sessionOf("spotify")) as any;
   assert(c.token !== "not-a-real-token", "session was replaced");
 });
 

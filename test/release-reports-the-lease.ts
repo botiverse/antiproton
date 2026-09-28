@@ -12,9 +12,12 @@
  * Each case below is the red method for one of those shapes: delete the fact
  * at that site and exactly that case fails.
  */
-import { sandboxPlugin, asBoxState } from "../src/plugins/sandbox.ts";
+import { BOX_KEY, BOX_STORE, sandboxPlugin, asBoxState } from "../src/plugins/sandbox.ts";
 import { LEASE_KEY, type Released } from "../src/plugins/types.ts";
 import type { Json } from "../src/core/types.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -28,15 +31,18 @@ const STARTED = 1_700_000_000_000;
 
 /** A mount whose record holds one live box, with a run9 that answers however the test says. */
 function fixture(run9: (path: string, method: string) => { status: number; body: unknown }) {
-  let record: Json = {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" };
+  tables.put(scope, BOX_STORE, BOX_KEY, {
     boxId: BOX, createdAt: STARTED, lastUsedAt: STARTED + 60_000, execs: 2, saved: [], sessions: [],
-  } as unknown as Json;
+  }, null);
+  const record = () => tables.get(scope, BOX_STORE, BOX_KEY) as Json;
   const ctx: any = {
     caller: { tenantId: "t", agentId: "a", taskId: "k" },
     alias: "sandbox",
     credential: JSON.stringify({ ak: "AK", sk: "SK", project: "p" }),
     publicConfig: { account: "container" },
-    connection: { get: async () => record, set: async (v: Json) => { record = v; } },
+    db: openPluginDatabase(tables, scope, sandboxPlugin(null as any, "local").database),
     sibling: async () => null,
   };
   const real = globalThis.fetch;
@@ -44,7 +50,7 @@ function fixture(run9: (path: string, method: string) => { status: number; body:
     const r = run9(String(url), String(init?.method ?? "GET"));
     return new Response(JSON.stringify(r.body), { status: r.status, headers: { "content-type": "application/json" } });
   }) as any;
-  return { ctx, restore: () => { globalThis.fetch = real; }, read: () => record };
+  return { ctx, tables, scope, restore: () => { globalThis.fetch = real; }, read: record };
 }
 
 const gone = () => ({ status: 200, body: {} });
@@ -114,10 +120,10 @@ await check("start_from reports the lease of the container it displaced", async 
   // a release here — the box is ended as a side effect of choosing the next
   // one. An unrecorded span is exactly as expensive as any other.
   const f = fixture(gone);
-  (f.ctx.connection as any).get = async () => ({
+  f.tables.put(f.scope, BOX_STORE, BOX_KEY, {
     boxId: BOX, createdAt: STARTED, lastUsedAt: STARTED + 60_000, execs: 2, saved: [], sessions: [],
     envs: [{ name: "py", snapId: "snap-1", savedAt: STARTED + 10 }],
-  });
+  }, null);
   try {
     const out = await sandboxPlugin(null as any, "local")
       .invoke!("start_from", { name: "py" } as unknown as Json, f.ctx) as Record<string, unknown>;

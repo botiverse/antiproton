@@ -6,8 +6,8 @@ import type { Plugin } from "./types.ts";
  * without wiring a real production system to a demo.
  *
  * Reads are free; writes are the kind of thing a person should sign off. State
- * is per-agent and lives in the mount's connection record, which keeps the demo
- * honest — it uses the same storage a real plugin would.
+ * is per-agent and lives in the mount's database, which keeps the demo honest —
+ * it uses the same storage a real plugin would.
  */
 interface Fleet {
   servers: Array<{ id: string; role: string; version: string; healthy: boolean }>;
@@ -24,9 +24,13 @@ const FRESH: Fleet = {
   history: [],
 };
 
+const FLEET_STORE = "fleet";
+const FLEET_KEY = "state";
+
 export const demoPlugin: Plugin = {
   id: "demo",
   version: "1.0.0",
+  database: { version: 1, stores: { [FLEET_STORE]: { listed: [FLEET_KEY] } } },
   tools: [
     {
       name: "list_servers",
@@ -63,7 +67,7 @@ export const demoPlugin: Plugin = {
   ],
 
   async invoke(tool, args, ctx): Promise<Json> {
-    const state = ((await ctx.connection.get()) as Fleet | null) ?? structuredClone(FRESH);
+    const state = ((await ctx.db.get(FLEET_STORE, FLEET_KEY)) as Fleet | undefined) ?? structuredClone(FRESH);
     const a = (args ?? {}) as { server?: string; version?: string; role?: string };
 
     if (tool === "list_servers") {
@@ -79,13 +83,13 @@ export const demoPlugin: Plugin = {
       const from = target.version;
       target.version = a.version;
       state.history.push({ at: Date.now(), action: "deploy", detail: `${target.id} ${from} -> ${a.version}` });
-      await ctx.connection.set(state);
+      await ctx.db.put(FLEET_STORE, state, FLEET_KEY);
       return { server: target.id, from, to: a.version, deployed: true };
     }
 
     if (tool === "restart") {
       state.history.push({ at: Date.now(), action: "restart", detail: target.id });
-      await ctx.connection.set(state);
+      await ctx.db.put(FLEET_STORE, state, FLEET_KEY);
       return { server: target.id, restarted: true };
     }
 

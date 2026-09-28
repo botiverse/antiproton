@@ -9,8 +9,11 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sandboxPlugin, splitCwd, withCwdTrailer } from "../src/plugins/sandbox.ts";
+import { BOX_KEY, BOX_STORE, sandboxPlugin, splitCwd, withCwdTrailer } from "../src/plugins/sandbox.ts";
 import { Backgrounded } from "../src/plugins/types.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -80,11 +83,20 @@ function run9(box: Record<string, unknown>, answers: Record<string, Array<Record
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
-    connection: { get: async () => box, set: async (v: unknown) => { writes.push(v); } },
+    db: boxDb(box, (v) => writes.push(v)),
     sibling: async () => null,
   };
   return { ctx, posts, writes };
 }
+/** A real database holding one box record, with every write also handed to `onPut`. */
+function boxDb(box: unknown, onPut: (v: unknown) => void) {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" };
+  if (box) tables.put(scope, BOX_STORE, BOX_KEY, box, null);
+  const db = openPluginDatabase(tables, scope, plugin.database);
+  return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(value); return db.put(store, value as any, key); } };
+}
+
 const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [] };
 const plugin = sandboxPlugin(null as any, "local");
 

@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice } from "../plugins/types.ts";
+import { PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
@@ -130,11 +131,6 @@ CREATE TABLE IF NOT EXISTS follow_ups (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
   text TEXT NOT NULL, created_at INTEGER NOT NULL);
 
-CREATE TABLE IF NOT EXISTS connections (
-  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
-  state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
-  PRIMARY KEY (tenant_id, agent_id, alias));
-
 CREATE TABLE IF NOT EXISTS mounts (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
@@ -166,13 +162,23 @@ const j = (v: Json) => JSON.stringify(v ?? null);
 export class SqliteStore implements StorageAdapter {
   readonly name = "sqlite";
   #db: DatabaseSync;
+  readonly pluginDb: PluginDbTables;
 
   constructor(path = ":memory:") {
     this.#db = new DatabaseSync(path);
+    const db = this.#db;
+    // Eager, as the Durable Object's `sql.exec` is: a statement runs when
+    // `exec` is called, not when its rows are read, or a CREATE TABLE whose
+    // result nobody reads would never run.
+    this.pluginDb = new PluginDbTables({
+      sql: { exec: (query, ...bindings) => { const rows = db.prepare(query).all(...(bindings as any[])); return { toArray: () => rows }; } },
+      transactionSync: (fn) => this.#tx(fn),
+    });
   }
 
   async init() {
     this.#db.exec(SCHEMA);
+    this.pluginDb.ensure();
     // CREATE TABLE IF NOT EXISTS silently accepts an existing table that lacks
     // the column, so an object created before this change would never get it.
     for (const alter of [
@@ -842,16 +848,6 @@ export class SqliteStore implements StorageAdapter {
     }));
   }
 
-  async getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null> {
-    const r = this.#db
-      .prepare("SELECT state, expires_at FROM connections WHERE tenant_id=? AND agent_id=? AND alias=?")
-      .get(tenantId, agentId, alias) as any;
-    // An expired session is not a session: returning it would send the plugin
-    // out with a token the far side has already rejected.
-    if (!r || (r.expires_at != null && Number(r.expires_at) <= now())) return null;
-    return JSON.parse(r.state);
-  }
-
   // ------------------------------------------------------------ agent state
 
   async putState(tenantId: string, agentId: string, key: string, entry: StateEntry) {
@@ -955,19 +951,6 @@ export class SqliteStore implements StorageAdapter {
     }
     if (rows.length) this.#db.prepare("DELETE FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=?").run(tenantId, agentId, taskId);
     return rows.length;
-  }
-
-  async putConnection(
-    tenantId: string, agentId: string, alias: string, state: Json, expiresAt: number | null = null,
-  ) {
-    this.#db
-      .prepare(
-        `INSERT INTO connections(tenant_id, agent_id, alias, state, expires_at, updated_at)
-         VALUES (?,?,?,?,?,?)
-         ON CONFLICT(tenant_id, agent_id, alias) DO UPDATE SET
-           state=excluded.state, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
-      )
-      .run(tenantId, agentId, alias, j(state), expiresAt, now());
   }
 
   async setModelBinding(b: ModelBinding) {
@@ -1124,7 +1107,7 @@ export class SqliteStore implements StorageAdapter {
     ).run(tenantId, agentId, plugin, choice, now());
   }
 
-  /** One transaction: the mount, its connection state, and its own secret. */
+  /** One transaction: the mount, its databases, and its own secret. */
   async renameMount(
     tenantId: string, agentId: string, from: string, to: string,
     secret: { newRef: string } | null,
@@ -1144,7 +1127,7 @@ export class SqliteStore implements StorageAdapter {
           return { ok: false as const, error: `a credential is already stored under the name ${to}` };
         }
         this.#db.prepare("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?").run(to, tenantId, agentId, from);
-        this.#db.prepare("UPDATE connections SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?").run(to, tenantId, agentId, from);
+        this.pluginDb.rename(tenantId, agentId, from, to);
         if (secret) {
           this.#db.prepare("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?").run(to, tenantId, agentId, from);
           this.#db.prepare("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?").run(secret.newRef, tenantId, agentId, to);

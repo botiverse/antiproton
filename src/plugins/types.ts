@@ -20,11 +20,160 @@ export interface ToolSchema {
   reads?: "parked-result";
 }
 
-/** Where a plugin keeps what it derived from a credential. Scoped to one mount,
- *  so two mounts of the same plugin never share a session. */
-export interface ConnectionState {
-  get(): Promise<Json | null>;
-  set(state: Json, expiresAt?: number | null): Promise<void>;
+/**
+ * A key in a plugin database: a string or a finite number, ordered the way
+ * IndexedDB orders them — every number before every string, numbers by value,
+ * strings by code unit. Arrays and dates are not keys here; the store is
+ * SQLite, whose own ordering of numbers before text is what makes ranges over
+ * mixed keys cost nothing to implement and impossible to get subtly wrong.
+ */
+export type DbKey = string | number;
+
+/**
+ * A range of keys, in `IDBKeyRange`'s vocabulary: build one with
+ * {@link KeyRange}. `lower`/`upper` absent means unbounded on that side.
+ */
+export interface DbKeyRange {
+  readonly lower?: DbKey;
+  readonly upper?: DbKey;
+  readonly lowerOpen: boolean;
+  readonly upperOpen: boolean;
+}
+
+const keyOf = (k: DbKey, what: string): DbKey => {
+  if (typeof k === "string" || (typeof k === "number" && Number.isFinite(k))) return k;
+  throw new Error(`${what} must be a string or a finite number`);
+};
+
+/** `IDBKeyRange`'s four constructors, over {@link DbKey}. */
+export const KeyRange = {
+  bound(lower: DbKey, upper: DbKey, lowerOpen = false, upperOpen = false): DbKeyRange {
+    return { lower: keyOf(lower, "range lower bound"), upper: keyOf(upper, "range upper bound"), lowerOpen, upperOpen };
+  },
+  lowerBound(lower: DbKey, open = false): DbKeyRange {
+    return { lower: keyOf(lower, "range lower bound"), lowerOpen: open, upperOpen: false };
+  },
+  upperBound(upper: DbKey, open = false): DbKeyRange {
+    return { upper: keyOf(upper, "range upper bound"), lowerOpen: false, upperOpen: open };
+  },
+  only(key: DbKey): DbKeyRange {
+    const k = keyOf(key, "range key");
+    return { lower: k, upper: k, lowerOpen: false, upperOpen: false };
+  },
+};
+
+export type DbQuery = DbKey | DbKeyRange | null | undefined;
+
+/**
+ * The operations a plugin database offers, in idb's calling convention:
+ * `get(store, key)`, `put(store, value, key?)`, `delete(store, key | range)`,
+ * `getAll(store, query?, count?)`, `getAllFromIndex(store, index, query?,
+ * count?)`, `count(store, query?)`. Reads come back `unknown`: data outlives
+ * the code that wrote it, so no reader is promised a shape, and the reader
+ * verifies (`asBoxState` in the sandbox plugin is the pattern). Values are
+ * JSON; `put` refuses anything else. A store with a `keyPath` takes its key
+ * from the value and refuses an explicit one; a store without one requires it.
+ * `get` of a missing key is `undefined`, as in IndexedDB.
+ *
+ * The synchronous form is what a {@link PluginDatabase.transaction} callback
+ * and an `upgrade` are handed: the same operations, answering directly. They
+ * are synchronous because the database is SQLite inside the agent's own
+ * object and a transaction is a lock held while the callback runs; an `await`
+ * inside it would hold that lock across I/O nothing else could proceed past.
+ * IndexedDB has the same rule in a less visible form — a transaction that is
+ * awaited across anything but its own requests has already committed. The
+ * rule is enforced, not only typed: a callback that returns a promise is
+ * refused inside the transaction, so its synchronous writes roll back, and
+ * a handle kept past its callback refuses every call. A transaction reaches
+ * only the stores it named.
+ */
+export interface DbOperations {
+  get(store: string, key: DbKey): unknown;
+  put(store: string, value: Json, key?: DbKey): DbKey;
+  delete(store: string, query: DbKey | DbKeyRange): void;
+  getAll(store: string, query?: DbQuery, count?: number): unknown[];
+  getAllFromIndex(store: string, index: string, query?: DbQuery, count?: number): unknown[];
+  count(store: string, query?: DbQuery): number;
+}
+
+/**
+ * What a plugin is handed as `ctx.db`: its own mount's database, declared in
+ * {@link Plugin.database}, opened by the kernel. The plugin holds no database
+ * name and no other path to storage, so it cannot name another mount's data;
+ * the same plugin mounted twice is two databases.
+ *
+ * Every method is its own transaction. `transaction` runs a callback that
+ * sees and changes the database atomically — read, decide, write — and undoes
+ * everything if the callback throws. The callback is synchronous; the reason
+ * is on {@link DbOperations}.
+ */
+export interface PluginDatabase {
+  get(store: string, key: DbKey): Promise<unknown>;
+  put(store: string, value: Json, key?: DbKey): Promise<DbKey>;
+  delete(store: string, query: DbKey | DbKeyRange): Promise<void>;
+  getAll(store: string, query?: DbQuery, count?: number): Promise<unknown[]>;
+  getAllFromIndex(store: string, index: string, query?: DbQuery, count?: number): Promise<unknown[]>;
+  count(store: string, query?: DbQuery): Promise<number>;
+  transaction<T>(stores: string | readonly string[], mode: "readonly" | "readwrite", fn: (tx: DbOperations) => T): Promise<T>;
+}
+
+/** One object store of a plugin database; see {@link Plugin.database}. */
+export interface DbStoreSpec {
+  /**
+   * Where the key lives inside each value (`"id"`, or a dotted path). Absent
+   * means the caller supplies the key to `put`.
+   */
+  keyPath?: string;
+  /**
+   * Index name → key path inside the value. A value whose path is missing or
+   * not a {@link DbKey} is stored but not indexed, as IndexedDB does. One
+   * index per store in this version: an implementation limit, not a rule of
+   * the shape.
+   */
+  indexes?: Record<string, string>;
+  /**
+   * Keys whose NAME may be shown outside the object, meaning "this exists":
+   * a diagnosis lists them with whether they are present. Never their values,
+   * and never to the model. Keys not named here are private; a store that
+   * omits this lists no key. What is always shown, `listed` or not, is the
+   * store's name, how many keys it holds and when one last changed — the
+   * operator's storage page reads those counts from the rows directly.
+   */
+  listed?: readonly DbKey[];
+}
+
+/**
+ * The database a plugin keeps per mount. Declared here, statically, rather than
+ * opened in a call the way idb's `openDB` is — the one place this contract
+ * departs from idb's calling convention. Two readers need the declaration
+ * without running the plugin: the check that no credential-class key name is
+ * `listed` (test/plugin-db.ts), and a diagnosis, which lists what exists. And
+ * an upgrade needs one definite moment: the kernel runs `upgrade` once, before
+ * this mount's first use of the database in a call, never "whichever tool
+ * call arrives first".
+ *
+ * The database is stored with the id of the plugin that owns it. Opened under
+ * another plugin id it is an empty database, and old rows are never handed
+ * over: isolation does not rest on "a mount alias is never re-pointed", which
+ * nothing guarantees.
+ *
+ * The version is stored with the rows, in the same transaction as the upgrade
+ * that produced it, so `oldVersion` is read, never guessed; a fresh database
+ * sees `oldVersion` 0, as in IndexedDB, which is where a plugin seeds. An
+ * `upgrade` that throws advances nothing: this use is refused with the reason,
+ * and the next use runs `upgrade` again — so it must be re-runnable, and its
+ * changes land with the version, all or nothing, or half-migrated rows would
+ * read as the new version. A stored version HIGHER than the declared one (a
+ * rollback) opens normally, runs no `upgrade`, and is never lowered: lowering
+ * would re-run the migration when the newer code returns. Old code reads new
+ * data because reads are `unknown` and the reader verifies.
+ */
+export interface DbSpec {
+  /** Bumped when `stores` or the shape of stored values changes; `upgrade` sees the version the data was written under. */
+  version: number;
+  stores: Record<string, DbStoreSpec>;
+  /** Runs once, inside the transaction that records `version`, when the stored version is lower. */
+  upgrade?(db: DbOperations, oldVersion: number): void;
 }
 
 export interface PluginContext {
@@ -70,8 +219,12 @@ export interface PluginContext {
    */
   credentialRefKind?: CredentialRefKind;
   publicConfig: Record<string, Json>;
-  /** Survives across calls and across executions; never reaches the model. */
-  connection: ConnectionState;
+  /**
+   * This mount's database, as declared in {@link Plugin.database}. Survives
+   * across calls and across executions; never reaches the model. A plugin that
+   * declares no database is refused on every call.
+   */
+  db: PluginDatabase;
   /**
    * This mount's inbound hooks. Present only for a plugin that implements
    * `receive`, on a deployment that can take pushed events.
@@ -79,8 +232,8 @@ export interface PluginContext {
    * Rules for a plugin using them (from the #388 review):
    * - **The secret and the URL never go into a tool result or an error**:
    *   what `invoke` returns lands in the transcript. The secret is handed to
-   *   the service and nowhere else, `ctx.connection` included.
-   * - **Keep the live `hookId` in `ctx.connection`**, and revoke the previous
+   *   the service and nowhere else, `ctx.db` included.
+   * - **Keep the live `hookId` in `ctx.db`**, and revoke the previous
    *   one once a new one is registered: every `create()` is another address
    *   that stays valid until something revokes it, and only the plugin knows it.
    * - **If registering with the service definitely fails, revoke the new hook.**
@@ -104,7 +257,8 @@ export interface PluginContext {
     /** As on this mount: what kind of credential that mount names, so a null
      *  one can be reported as unreadable rather than absent. */
     credentialRefKind?: CredentialRefKind;
-    connection: ConnectionState;
+    /** That mount's database, opened under that mount's plugin. */
+    db: PluginDatabase;
     /**
      * Which plugin that mount is. A credential is only meaningful to the service
      * it was issued for, so a plugin that hands one to a particular host checks
@@ -1058,6 +1212,8 @@ export interface Plugin {
 
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
+  /** The database each mount of this plugin keeps; see {@link DbSpec}. */
+  database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */
   credential?: CredentialSpec;
   /**
@@ -1135,11 +1291,11 @@ export interface Plugin {
    *   webhook. A runtime that holds more than one secret for a hook may
    *   also take a delivery as proof of which secret the service uses.
    * - **A refused request leaves no trace.** Nothing is written to
-   *   `ctx.connection` before returning `rejected`: a stranger's request must
+   *   `ctx.db` before returning `rejected`: a stranger's request must
    *   not change what the mount remembers, and a runtime holding more than
    *   one secret for a hook may offer the same request again with another.
    * - **Deliver only what this mount subscribed to**, as recorded in
-   *   `ctx.connection` by the plugin's own tools.
+   *   `ctx.db` by the plugin's own tools.
    * - **Drop what the mount's own account caused.** An agent that comments on
    *   an issue it is subscribed to would otherwise be woken by its own comment,
    *   and answer it.
@@ -1147,7 +1303,7 @@ export interface Plugin {
    *   is not a second event.
    *
    * The service is waiting for an answer — GitHub gives up after ten seconds —
-   * so this reads connection state and answers; it does not call the service.
+   * so this reads the mount's database and answers; it does not call the service.
    * The runtime acknowledges once the text is posted, never after the model
    * runs.
    *

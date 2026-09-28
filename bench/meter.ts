@@ -13,6 +13,7 @@
  * only when the rates are supplied — see `ratesFromEnv`.
  */
 import type { StorageAdapter } from "../src/core/store.ts";
+import { BOX_KEY, BOX_STORE } from "../src/plugins/sandbox.ts";
 
 export interface Meter {
   /** Seconds a metered container existed, summed over every session. */
@@ -31,9 +32,10 @@ export interface Meter {
 /**
  * Read the container meter off the mounts.
  *
- * The run9 plugin writes a session — box id, start, end, exec count — into its
- * mount's connection state when the box is handed back, precisely so the meter
- * outlives the box. Anything still running has no `endedAt` and is counted up
+ * The sandbox plugin writes a session — box id, start, end, exec count — into
+ * its mount's database when the box is handed back, precisely so the meter
+ * outlives the box. Read under the sandbox plugin's id: a database is filed by
+ * plugin, and a mount of any other plugin under these aliases has no sessions. Anything still running has no `endedAt` and is counted up
  * to now, because an unreleased container is the case worth seeing.
  */
 export async function readMeter(
@@ -47,8 +49,8 @@ export async function readMeter(
 ): Promise<Meter> {
   let ms = 0, containers = 0;
   for (const alias of aliases) {
-    const conn = (await store.getConnection(tenantId, agentId, alias)) as any;
-    for (const s of conn?.state?.sessions ?? conn?.sessions ?? []) {
+    const conn = store.pluginDb.get({ tenantId, agentId, alias, plugin: "sandbox" }, BOX_STORE, BOX_KEY) as any;
+    for (const s of conn?.sessions ?? []) {
       const started = Number(s.startedAt ?? 0);
       if (!started) continue;
       containers += 1;

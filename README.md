@@ -312,7 +312,7 @@ and carry the token itself. Here the nine apps are nine ordinary mounts:
 |---|---|---|
 | Where credentials live | the agent's context | `secret_ref`, dereferenced server-side |
 | Who logs in | the agent | the gateway |
-| Where the token is kept | the agent's context | the mount's connection state |
+| Where the token is kept | the agent's context | the mount's database |
 | What the model sees | passwords, tokens, Python | `spotify.show_song({song_id})` |
 
 Nine end-to-end cases assert it against the live servers: no schema mentions

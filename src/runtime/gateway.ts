@@ -10,6 +10,7 @@ import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
 import { isReleased, leaseRow } from "../trace/seams.ts";
+import { openPluginDatabase } from "./plugin-db.ts";
 import { toolCallRows } from "../usage/outbox.ts";
 
 /** Resolves secret_ref -> credential. Values never enter the JS sandbox, a
@@ -355,11 +356,7 @@ export class ToolGateway {
             alias: mount.alias,
             credential: null,
             publicConfig: mount.publicConfig,
-            connection: {
-              get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
-              set: (state, expiresAt) =>
-                this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
-            },
+            db: this.#db(ctx, mount),
             async sibling() { return null; },
           });
         } catch (e: any) {
@@ -379,7 +376,7 @@ export class ToolGateway {
    *
    * Here because this is the only place that builds a `PluginContext`, and
    * because the alternative is what it replaces: three callers reaching into
-   * one plugin's connection state for a field named `boxId`, each of them
+   * one plugin's stored state for a field named `boxId`, each of them
    * quietly asserting that "something running" is that plugin's idea of it.
    *
    * No credential is resolved. The contract says this must not need one — it is
@@ -402,11 +399,7 @@ export class ToolGateway {
       alias: mount.alias,
       credential: null,
       publicConfig: mount.publicConfig,
-      connection: {
-        get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
-        set: (state, expiresAt) =>
-          this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
-      },
+      db: this.#db(ctx, mount),
       async sibling() { return null; },
     });
   }
@@ -438,11 +431,7 @@ export class ToolGateway {
       alias: mount.alias,
       credential: null,
       publicConfig: mount.publicConfig,
-      connection: {
-        get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
-        set: (state, expiresAt) =>
-          this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
-      },
+      db: this.#db(ctx, mount),
       async sibling() { return null; },
     });
   }
@@ -464,7 +453,7 @@ export class ToolGateway {
   async releaseTask(
     ctx: CallContext,
     /** One mount rather than all of them. A plugin's `release` was always
-     *  per-mount — it is handed the alias and that mount's own connection —
+     *  per-mount — it is handed the alias and that mount's own database —
      *  and the fan-out is here, so this is where a caller that means one box
      *  says so (Piper, 2026-09-12). */
     opts?: { alias?: string },
@@ -485,11 +474,7 @@ export class ToolGateway {
             : null,
           credentialRefKind: secretRefKind(mount.secretRef),
           publicConfig: mount.publicConfig,
-          connection: {
-            get: () => this.#store.getConnection(ctx.tenantId, ctx.agentId, mount.alias),
-            set: (state, expiresAt) =>
-              this.#store.putConnection(ctx.tenantId, ctx.agentId, mount.alias, state, expiresAt ?? null),
-          },
+          db: this.#db(ctx, mount),
           async sibling() { return null; },
         });
         // Behind the same lock as a call on this mount, for an exclusive
@@ -556,7 +541,7 @@ export class ToolGateway {
    * owed its turn, not the refusal.
    *
    * `invoke` is not the only caller any more. A release is a read-modify-write
-   * on the same connection state a `shell` call rewrites, and outside this
+   * on the same stored state a `shell` call rewrites, and outside this
    * chain the two interleave: the command reads "no container", starts box B
    * and records it, while the release writes back the empty state it read
    * first. Box B then exists, bills, and is named by nothing (Piper,
@@ -792,6 +777,19 @@ export class ToolGateway {
   }
 
   /**
+   * A mount's database, opened under the plugin the mount row names and with
+   * that plugin's declaration. Opened fresh per context: the version rule
+   * runs on first use, and a context that never touches storage pays nothing.
+   */
+  #db(ctx: { tenantId: string; agentId: string }, mount: MountRecord) {
+    return openPluginDatabase(
+      this.#store.pluginDb,
+      { tenantId: ctx.tenantId, agentId: ctx.agentId, alias: mount.alias, plugin: mount.plugin },
+      this.#plugins.get(mount.plugin)?.database,
+    );
+  }
+
+  /**
    * What a plugin is handed for one of this agent's mounts. One construction
    * for the call and for everything that comes back to the same work later —
    * a poll or a cancel sees exactly the context the call saw, credential
@@ -800,11 +798,7 @@ export class ToolGateway {
   #contextFor(ctx: CallContext, mount: MountRecord, credential: string | null) {
     const store = this.#store;
     const secrets = this.#secrets;
-    const connectionFor = (alias: string) => ({
-      get: () => store.getConnection(ctx.tenantId, ctx.agentId, alias),
-      set: (state: Json, expiresAt?: number | null) =>
-        store.putConnection(ctx.tenantId, ctx.agentId, alias, state, expiresAt ?? null),
-    });
+    const db = (m: MountRecord) => this.#db(ctx, m);
     return {
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
@@ -817,7 +811,7 @@ export class ToolGateway {
       publicConfig: mount.publicConfig,
       // Scoped to the mount, not the plugin: two accounts of the same service
       // must never see each other's session.
-      connection: connectionFor(mount.alias),
+      db: db(mount),
       // A mount's own hooks, and only for a plugin that can take what they carry.
       ...(this.#inbound && this.#plugins.get(mount.plugin)?.receive
         ? { inbound: this.#inbound(ctx.tenantId, ctx.agentId, mount.alias) } : {}),
@@ -831,7 +825,7 @@ export class ToolGateway {
             : null,
           // The sibling's null is ambiguous in exactly the same three ways as this mount's.
           credentialRefKind: secretRefKind(other.secretRef),
-          connection: connectionFor(other.alias),
+          db: db(other),
           plugin: other.plugin,
           policy: other.policy ?? null,
         };
@@ -956,16 +950,11 @@ export class ToolGateway {
     if (!plugin?.checkCredential) return null;
     const credential = mount.secretRef
       ? await this.#secrets.resolve(mount.secretRef, { tenantId, agentId }) : null;
-    const store = this.#store;
-    const connectionFor = (a: string) => ({
-      get: () => store.getConnection(tenantId, agentId, a),
-      set: (state: Json, expiresAt?: number | null) => store.putConnection(tenantId, agentId, a, state, expiresAt ?? null),
-    });
     try {
       return await plugin.checkCredential({
         caller: { tenantId, agentId, taskId: "credential-check" },
         alias,
-        credential, publicConfig: mount.publicConfig, connection: connectionFor(alias),
+        credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
         async sibling() { return null; },
       });
     } catch (e) {

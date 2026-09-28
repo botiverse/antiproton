@@ -74,12 +74,20 @@ function pushState(value: unknown): PushState {
   };
 }
 
+/**
+ * Where the push state lives in this mount's database: one record under one
+ * key. Exported for the provisioning reader, which projects the same record
+ * for Raft without going through a call.
+ */
+export const PUSH_STORE = "push";
+export const PUSH_KEY = "state";
+
 async function loadPushState(ctx: PluginContext): Promise<PushState> {
-  return pushState(await ctx.connection.get());
+  return pushState((await ctx.db.get(PUSH_STORE, PUSH_KEY)) ?? null);
 }
 
 async function savePushState(ctx: PluginContext, state: PushState): Promise<void> {
-  await ctx.connection.set(state as unknown as Json);
+  await ctx.db.put(PUSH_STORE, state as unknown as Json, PUSH_KEY);
 }
 
 function baseUrl(ctx: PluginContext): URL {
@@ -340,6 +348,8 @@ function integer(value: unknown, name: string, min: number, max: number): number
 export const raftPlugin: Plugin = {
   id: "raft",
   version: "1.0.0",
+  /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
+  database: { version: 1, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] } } },
   config: [
     { name: "serverUrl", type: "string", required: true, format: "origin", summary: "Raft server origin, for example https://api.raft.build." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },

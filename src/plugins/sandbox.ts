@@ -20,7 +20,7 @@ import { toAgentRef } from "../store/refs.ts";
  * buys is everything QuickJS cannot do — npm packages, a filesystem, minutes of
  * compute instead of five seconds.
  *
- * The box is per mount and kept in connection state, so a package installed by
+ * The box is per mount and kept in the mount's database, so a package installed by
  * one call is still there for the next.
  */
 export interface SandboxConfig {
@@ -104,7 +104,15 @@ interface Session {
 }
 
 /**
- * The mount's connection state. `sessions` is what makes the meter readable:
+ * Where the box record lives in this mount's database: one record under one
+ * key. Exported for the bench meter, which reads the sessions of a finished
+ * run from the rows without a call.
+ */
+export const BOX_STORE = "box";
+export const BOX_KEY = "state";
+
+/**
+ * The mount's box record. `sessions` is what makes the meter readable:
  * a container is the most expensive thing here and the only one billed for
  * simply existing, so how long each one lived is worth keeping even after it
  * is gone.
@@ -537,7 +545,7 @@ const DEFAULTS = {
 async function stopBox(
   ctx: PluginContext,
 ): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number; lease: Released } | null> {
-  const state = asBoxState(await ctx.connection.get());
+  const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
   if (!state?.boxId || !ctx.credential) return null;
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
   providerOf(cfg);
@@ -571,9 +579,9 @@ async function stopBox(
   // container alive and billed with nothing naming it — the orphan `asBoxState`
   // refuses to create. A lock in the gateway closes the
   // window inside one object; this half does not depend on the caller.
-  const now = asBoxState(await ctx.connection.get());
+  const now = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
   const mine = !now?.boxId || now.boxId === state.boxId;
-  await ctx.connection.set(mine
+  await ctx.db.put(BOX_STORE, mine
     ? {
       boxId: "", createdAt: 0, lastUsedAt: 0,
       sessions: keepSessions(state.sessions, session),
@@ -584,7 +592,7 @@ async function stopBox(
     }
     // Somebody else's container is in the record. Leave it named, and add only
     // what this release knows: the session the released box just finished.
-    : { ...now, sessions: keepSessions(now.sessions, session) } as unknown as Json);
+    : { ...now, sessions: keepSessions(now.sessions, session) } as unknown as Json, BOX_KEY);
   // Both instants travel, not just their difference: the recorder checks that
   // the duration it stores is this fact's own `endedAt - startedAt`, and they
   // all come from `session`, which was built from the state THIS call read.
@@ -665,7 +673,7 @@ export function usageOf(state: BoxState | null | undefined): MountUsage[] {
  *
  * A function rather than a slice at the call site so the cap is a rule that can
  * fail a test. The number itself is a choice about how much state to carry in a
- * connection record, not about how much history matters — the history lives
+ * box record, not about how much history matters — the history lives
  * where the key does.
  */
 export function keepSessions(prior: Session[] | undefined, next: Session): Session[] {
@@ -901,11 +909,11 @@ async function reconcileGithub(
   if (want.withheld) next.githubWithheld = want.withheld;
   // Recorded as gone before registering again, so a registration that fails
   // does not leave the record promising access the box no longer has.
-  await ctx.connection.set(next as unknown as Json);
+  await ctx.db.put(BOX_STORE, next as unknown as Json, BOX_KEY);
   if (digest !== had && want.token) {
     next.githubPlaceholder = await registerGithub(api, cfg.project, state.boxId, want.token);
     next.githubTokenDigest = digest!;
-    await ctx.connection.set(next as unknown as Json);
+    await ctx.db.put(BOX_STORE, next as unknown as Json, BOX_KEY);
   }
   return next;
 }
@@ -942,6 +950,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       "the container is handed back when the turn ends.";
   return {
   id: "sandbox",
+  /** The box record: that a mount has one is listable; the box id, the kept environments and the sessions are not. */
+  database: { version: 1, stores: { [BOX_STORE]: { listed: [BOX_KEY] } } },
   /** This mount holds a container: something real, billed while it exists.
    *  The three below are one decision, not three — see `Holding`. */
   // What this plugin can give a session. Declared so the agents API can pick
@@ -958,13 +968,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     /** What this mount is keeping alive, read from its own state and nothing
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {
-      const raw = await ctx.connection.get();
+      const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
       return activityOf(asBoxState(raw), unreadableEntries(raw));
     },
     /** The window this mount still holds. Bounded on purpose, which is why it is
      *  the console's history and not anybody's ledger. */
     async usage(ctx: PluginContext): Promise<MountUsage[]> {
-      return usageOf(asBoxState(await ctx.connection.get()));
+      return usageOf(asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY)));
     },
     /** Hands this mount's box back, so an idle one is not left running on the
      *  tenant's quota because nobody thought to stop it. Safe to call when there
@@ -980,7 +990,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  `cf/src/runtime.ts` — so that is where it is stated and where it changes.
      *
      *  Not per task, despite what the gateway's `releaseTask` is called: the body
-     *  below reads the mount's connection state and never looks at the caller's
+     *  below reads the mount's box record and never looks at the caller's
      *  task. */
     async release(ctx: PluginContext): Promise<Released | false> {
       const r = await stopBox(ctx);
@@ -1010,10 +1020,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${h.execId}`);
       if (!TERMINAL.includes(rec.state)) return { done: false, progress: { state: rec.state } };
       // The box as it was when the work started: this runs outside the call, and
-      // writing connection state from here would race a second job finishing at
+      // writing the box record from here would race a second job finishing at
       // the same moment — the read-modify-write `exclusive` exists to prevent,
       // in a new place (Piper, 2026-09-14, `83f0658d`).
-      const state = asBoxState(await ctx.connection.get());
+      const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
       return { done: true, result: finished(rec, cfg, state) as Json };
     },
     /**
@@ -1405,7 +1415,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
     // Checked before anything else: neither releasing nor choosing an
     // environment should be the thing that starts a container.
-    const prior = asBoxState(await ctx.connection.get());
+    const prior = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
     if (tool === "release" && !prior?.boxId) {
       return { released: false, note: "nothing was running" };
     }
@@ -1432,9 +1442,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // Releasing first, because the choice applies to the next container and
       // silently leaving the old one running is how a machine gets forgotten.
       const released = prior?.boxId ? await stopBox(ctx) : null;
-      const after = asBoxState(await ctx.connection.get());
-      await ctx.connection.set({ ...(after ?? { boxId: "", createdAt: 0, lastUsedAt: 0 }),
-        startFrom: env.snapId } as unknown as Json);
+      const after = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
+      await ctx.db.put(BOX_STORE, { ...(after ?? { boxId: "", createdAt: 0, lastUsedAt: 0 }),
+        startFrom: env.snapId } as unknown as Json, BOX_KEY);
       return {
         startingFrom: env.name, note: "the next run or shell starts from this environment",
         released: !!released,
@@ -1479,7 +1489,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // still tell "used" from "kept by request". Postponing is not using the
       // machine. There is no total cap: each postponement is a call the agent
       // chose to make, within this mount's limit.
-      await ctx.connection.set({ ...prior, quietUntil } as unknown as Json);
+      await ctx.db.put(BOX_STORE, { ...prior, quietUntil } as unknown as Json, BOX_KEY);
       return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
     }
 
@@ -1502,7 +1512,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     };
 
     // One box per mount, remembered, so an install survives to the next call.
-    let state = asBoxState(await ctx.connection.get());
+    let state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
     // An emptied record keeps the session history and what was kept, but has no box.
     const history = state?.sessions ?? [];
     const kept = state?.envs ?? [];
@@ -1558,7 +1568,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(image ? { image } : {}),
         ...(kept.length ? { envs: kept } : {}),
       };
-      await ctx.connection.set(state as unknown as Json);
+      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
       // The value never enters the box and never reaches the model: only the
       // placeholder does, and run9 swaps it in on the way out.
       const githubPlaceholder = want.token ? await registerGithub(api, cfg.project, boxId, want.token) : null;
@@ -1570,7 +1580,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(githubPlaceholder ? { githubPlaceholder, githubTokenDigest: await tokenDigest(want.token!) } : {}),
         ...(want.withheld ? { githubWithheld: want.withheld } : {}),
       };
-      await ctx.connection.set(state as unknown as Json);
+      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
     }
 
     /**
@@ -1608,7 +1618,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // (tygg, 2026-09-14, `64c275ab`).
       const shown = toAgentRef(stored.ref, ctx.caller) ?? stored.ref;
       state = { ...state!, saved: [...(state!.saved ?? []), shown], lastUsedAt: Date.now() };
-      await ctx.connection.set(state as unknown as Json);
+      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
       return { path, ref: shown, bytes: body.length };
     };
 
@@ -1639,7 +1649,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       };
       const envs = [env, ...(state!.envs ?? []).filter((e) => e.name !== name)].slice(0, 20);
       state = { ...state!, envs, lastUsedAt: Date.now() };
-      await ctx.connection.set(state as unknown as Json);
+      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
       return {
         kept: name, snapshot: snapId,
         note: keptNote(lease),
@@ -1741,7 +1751,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // one place, because a result built twice is two rules about one shape
     // and they drift (the lesson of #291).
     const afterStart: BoxState = { ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1 };
-    await ctx.connection.set(afterStart as unknown as Json);
+    await ctx.db.put(BOX_STORE, afterStart as unknown as Json, BOX_KEY);
 
     const grace = Date.now() + cfg.graceMs;
     for (;;) {
@@ -1765,12 +1775,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (TERMINAL.includes(rec.state)) {
         const result = finished(rec, cfg, state);
         // Only the call that ran the command writes the directory: a job finished
-        // later through the poll must not write connection state (see pollBackground),
+        // later through the poll must not write the box record (see pollBackground),
         // so a command handed over does not move the shell, as `&` would not.
         const cwd = tool === "shell" ? splitCwd(String(rec.output_summary ?? "")).cwd : null;
         const moved = movedFrom !== null && (state.cwd ?? null) !== null;
         if (tool === "shell" && (cwd ?? null) !== (state.cwd ?? null)) {
-          await ctx.connection.set({ ...afterStart, cwd: cwd ?? undefined } as unknown as Json);
+          await ctx.db.put(BOX_STORE, { ...afterStart, cwd: cwd ?? undefined } as unknown as Json, BOX_KEY);
         }
         return moved
           ? { ...result, note: `${movedFrom} no longer exists, so this command started in ${wd}` }

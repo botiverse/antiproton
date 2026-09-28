@@ -1,8 +1,11 @@
 import { createHmac } from "node:crypto";
-import { raftPlugin } from "../src/plugins/raft.ts";
+import { raftPlugin, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
 import type { PluginErrorFields } from "../src/plugins/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
@@ -38,24 +41,29 @@ function ctx(
     alias: "raft",
     credential,
     publicConfig: { serverUrl: "https://raft.example", ...config },
-    connection: { get: async () => null, set: async () => {} },
+    db: freshDb().db,
     inbound,
     sibling: async () => null,
   } as any;
 }
 
-function mount(initial: unknown = null, inbound = fakeInbound()) {
-  let state = initial;
+/** A real, empty database for one raft mount, and a reader of its one record. */
+function freshDb() {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "tenant", agentId: "agent", alias: "raft", plugin: raftPlugin.id };
   return {
-    ctx: {
-      ...ctx(),
-      connection: {
-        get: async () => state,
-        set: async (value: unknown) => { state = value; },
-      },
-      inbound: inbound.api,
-    } as any,
-    state: () => state as any,
+    tables, scope,
+    db: openPluginDatabase(tables, scope, raftPlugin.database),
+    state: () => tables.get(scope, PUSH_STORE, PUSH_KEY) as any,
+  };
+}
+
+function mount(initial: unknown = null, inbound = fakeInbound()) {
+  const fresh = freshDb();
+  if (initial !== null) fresh.tables.put(fresh.scope, PUSH_STORE, PUSH_KEY, initial, null);
+  return {
+    ctx: { ...ctx(), db: fresh.db, inbound: inbound.api } as any,
+    state: fresh.state,
     inbound,
   };
 }
@@ -519,7 +527,7 @@ await check("an inbox notice reaches the agent as Raft wrote it, with the one in
 
 await check("a notice is checked for its signature and header before any state is read, and a signed body Raft got wrong is 400, never 401", async () => {
   let reads = 0;
-  const guarded = { ...ctx(), connection: { get: async () => { reads++; return null; }, set: async () => { throw new Error("state written"); } } } as any;
+  const guarded = { ...ctx(), db: { get: async () => { reads++; return undefined; }, put: async () => { throw new Error("state written"); } } } as any;
   const unsigned = pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }); delete (unsigned.headers as any)["x-raft-signature-256"];
   const rej = await raftPlugin.receive!(unsigned, PUSH_SECRET, guarded);
   if (rej.deliver || !rej.rejected) throw new Error(JSON.stringify(rej));
@@ -659,7 +667,7 @@ await check("disable_push stays disabled while retaining hooks whose local revok
   }
 });
 
-await check("push_status safely normalizes corrupt persisted connection state", async () => {
+await check("push_status safely normalizes a corrupt persisted record", async () => {
   for (const lastReached of [{ deliveryId: 9, at: "yesterday" }, { deliveryId: "event-future", at: 1e100 }, { eventId: "v1-shape", at: 1 }]) {
     const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached });
     const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;

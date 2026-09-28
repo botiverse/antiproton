@@ -254,7 +254,7 @@ const runOut = (r: any) => ({
 // ---- inbound events ---------------------------------------------------------
 
 /**
- * What this mount has asked to hear about, kept in its connection state.
+ * What this mount has asked to hear about, kept in its database.
  *
  * `login` is the account the mount acts as, recorded when a subscription is
  * made so that `receive` can drop the mount's own comments without calling
@@ -349,15 +349,16 @@ const EVENTS: Record<string, EventRule> = {
   },
 };
 
+const INBOUND_STORE = "inbound";
+const INBOUND_KEY = "state";
+
 async function inboundOf(ctx: PluginContext): Promise<Inbound> {
-  const state = (await ctx.connection.get()) as { inbound?: Inbound } | null;
-  const i = state?.inbound;
+  const i = (await ctx.db.get(INBOUND_STORE, INBOUND_KEY)) as Inbound | undefined;
   return { login: i?.login ?? null, subscriptions: i?.subscriptions ?? [], ...(i?.lastReached ? { lastReached: i.lastReached } : {}) };
 }
 
 async function saveInbound(ctx: PluginContext, inbound: Inbound) {
-  const state = ((await ctx.connection.get()) ?? {}) as Record<string, Json>;
-  await ctx.connection.set({ ...state, inbound: inbound as unknown as Json });
+  await ctx.db.put(INBOUND_STORE, inbound as unknown as Json, INBOUND_KEY);
 }
 
 function issueNumberOf(a: Record<string, any>): number | null {
@@ -423,6 +424,8 @@ const PAGE_ARGS = {
 export const githubPlugin: Plugin = {
   id: "github",
   version: "2.0.0",
+  /** The subscriptions this mount holds; that they exist is listable, which repositories is not. */
+  database: { version: 1, stores: { [INBOUND_STORE]: { listed: [INBOUND_KEY] } } },
   credential: {
     // Optional, not absent: without a token this mount still reads public
     // repositories, which is what the `gh_public` mount is for. Declaring it
