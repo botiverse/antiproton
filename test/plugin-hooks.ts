@@ -32,6 +32,9 @@ const pushy: Plugin = {
   },
 };
 const quiet: Plugin = { ...pushy, id: "quiet", receive: undefined };
+// Reports activity; records what it was handed and with which mount's credential state.
+const told: Array<{ alias: string; n: number; credential: string | null }> = [];
+pushy.reportActivity = async (events, ctx) => { told.push({ alias: ctx.alias, n: events.length, credential: ctx.credential }); return { sent: events.length }; };
 
 async function runtime(opts: { hooks?: boolean } = {}) {
   const host = sqliteHost();
@@ -70,6 +73,21 @@ async function runtime(opts: { hooks?: boolean } = {}) {
   return { rt, host, rows, grab };
 }
 const ev = (secret: string, extra: Record<string, string> = {}) => ({ headers: { "x-signed-with": secret, ...extra }, body: new Uint8Array([1]) });
+
+await check("activity reaches every mount whose plugin reports it, through the gateway's gate, and a switched-off plugin is skipped with the reason", async () => {
+  const { rt, host } = await runtime();
+  told.length = 0;
+  const events = [{ eventId: "a:1", hookEventName: "Stop" as const, occurredAt: "2026-09-28T08:00:00.000Z" }];
+  const out = await rt.gateway().reportActivity("t", "a", events);
+  must(out.length === 2 && out.every((r) => "sent" in r && r.sent === 1) && told.map((t) => t.alias).sort().join(",") === "p,p2", JSON.stringify({ out, told }));
+  must(told.every((t) => t.credential === null), "a mount with no account showed a credential");
+  await rt.store.setPluginChoice("t", "a", "pushy", "disable");
+  told.length = 0;
+  const off = await rt.gateway().reportActivity("t", "a", events);
+  must(off.length === 2 && off.every((r) => "skipped" in r && /switched off/.test(r.skipped)) && told.length === 0, JSON.stringify(off));
+  must((await rt.gateway().reportActivity("t", "b", events)).every((r) => "sent" in r), "another agent's mounts were affected");
+  host.dispose();
+});
 
 await check("a signed body the plugin cannot read is malformed, which is neither rejected nor ignored", async () => {
   const { rt, host, grab } = await runtime();

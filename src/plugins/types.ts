@@ -870,6 +870,25 @@ export interface InboundEvent {
  * question towards the labelled side, and nothing but an explicit word gets
  * a text past the label.
  */
+/**
+ * One thing the agent did, for the service the agent belongs to (Raft's
+ * raft-agent-activity-ingest.v1, 2026-09-28). Names are the service's hook
+ * event names; the runtime maps its own ended spans onto them
+ * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
+ * an unknown field with 400, so a plugin passes these through and adds none.
+ */
+export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
+export interface ActivityEvent {
+  /** Unique per agent for all time; the service dedupes on it. */
+  eventId: string;
+  hookEventName: ActivityEventName;
+  /** ISO 8601. */
+  occurredAt: string;
+  toolName?: string;
+  durationMs?: number;
+  errorClass?: string;
+}
+
 export type InboundResult =
   | { deliver: false; reason: string; rejected?: boolean; malformed?: boolean }
   | { deliver: true; text: string; dedupeKey?: string; as?: "user" | "event" };
@@ -1147,4 +1166,18 @@ export interface Plugin {
    * it returns is short and quotes rather than forwards.
    */
   receive?(event: InboundEvent, secret: string, ctx: PluginContext): Promise<InboundResult>;
+
+  /**
+   * Tell the service what the agent has been doing, so its own display of the
+   * agent (status, trajectory) follows a run here. Called by the runtime on its
+   * alarm pass with the events since the last call, never by the model; the
+   * credential stays in the call context. A plugin whose service is not
+   * listening (push off, no account) says `skipped` and the runtime moves on;
+   * a throw keeps the events for the next pass.
+   *
+   * Not named `activity`: that was a member of the retired mount-meter shape,
+   * and test/mount-config.ts keeps every retired name from coming back with a
+   * new meaning (the same word would read as the old thing to anyone who knew it).
+   */
+  reportActivity?(events: readonly ActivityEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
 }

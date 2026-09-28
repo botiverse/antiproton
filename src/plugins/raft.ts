@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { originProblem, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { originProblem, type ActivityEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -21,6 +21,8 @@ const MAX_EVENTS = 200;
 const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
 const NOTICE_TEXT_MAX = 4_000;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
+const ACTIVITY_PATH = "/internal/agent-api/activity";
+const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 type ObjectValue = Record<string, any>;
@@ -546,6 +548,15 @@ export const raftPlugin: Plugin = {
     }
     if (name === "disable_push") {
       const current = await loadPushState(ctx);
+      // The service would otherwise show the agent "online" for ever: say the session ended
+      // first, best effort, before the account stops being able to say anything.
+      if (current.enabled && current.agentId) {
+        try {
+          await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: [{
+            eventId: `${current.agentId}:session-end:${Date.now()}`, hookEventName: "SessionEnd", occurredAt: new Date().toISOString(),
+          }] });
+        } catch { /* deregistration matters more than the last status line */ }
+      }
       let remoteDeregistration: "confirmed" | "unconfirmed" = "confirmed";
       try { await call(ctx, "DELETE", PUSH_REGISTRATION_PATH); }
       catch (error) {
@@ -576,6 +587,21 @@ export const raftPlugin: Plugin = {
       };
     }
     throw new Error(`unknown raft tool: ${name}`);
+  },
+
+  /**
+   * The agent's activity, to Raft's ingest, so Agent Activity shows this agent
+   * the way it shows a managed one. Only while push is on: that is the state
+   * in which Raft is running this agent and looking. The events are passed
+   * through as given; the field set is the runtime's (src/runtime/activity.ts)
+   * and Raft refuses an unknown field, so nothing is added here.
+   */
+  async reportActivity(events: readonly ActivityEvent[], ctx: PluginContext) {
+    const state = await loadPushState(ctx);
+    if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };
+    if (events.length === 0) return { sent: 0 };
+    await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
+    return { sent: events.length };
   },
 
   /**
