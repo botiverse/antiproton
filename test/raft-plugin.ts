@@ -68,7 +68,8 @@ function mount(initial: unknown = null, inbound = fakeInbound()) {
   };
 }
 
-function pushed(payload: unknown, options: { secret?: string; deliveryId?: string } = {}) {
+const HOOK_ID = "hk_0123456789abcdef";
+function pushed(payload: unknown, options: { secret?: string; deliveryId?: string; hookId?: string } = {}) {
   const body = new TextEncoder().encode(JSON.stringify(payload));
   const signature = createHmac("sha256", options.secret ?? PUSH_SECRET).update(body).digest("hex");
   return {
@@ -77,6 +78,7 @@ function pushed(payload: unknown, options: { secret?: string; deliveryId?: strin
       "x-raft-delivery-id": options.deliveryId ?? String((payload as any)?.deliveryId ?? ""),
     },
     body,
+    hookId: options.hookId ?? HOOK_ID,
   };
 }
 
@@ -544,6 +546,25 @@ await check("a notice is checked for its signature and header before any state i
   }
   const wrongHeader = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_other" }), PUSH_SECRET, guarded);
   if (wrongHeader.deliver || !wrongHeader.malformed || reads !== 0) throw new Error(JSON.stringify({ wrongHeader, reads }));
+});
+
+await check("a signed notice at a mount with no push record rebuilds the record from the delivery and goes through; a record that says off stays off", async () => {
+  // No record at all: never enabled, or the record was lost. The signature verified against this
+  // hook's secret, so Raft points at this hook, and the notice names the agent — enough to rebuild.
+  const m = mount();
+  globalThis.fetch = (async () => { throw new Error("rebuilding the record called the network"); }) as any;
+  const out = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef", hookId: "hk_from_the_delivery" }), PUSH_SECRET, m.ctx);
+  if (!out.deliver) throw new Error(`not delivered: ${JSON.stringify(out)}`);
+  const s = m.state();
+  if (s?.enabled !== true || s?.agentId !== "agent-1" || s?.hookId !== "hk_from_the_delivery" || s?.registration !== "active" || s?.lastReached?.deliveryId !== "ntc_0123456789abcdef") {
+    throw new Error(`the record was not rebuilt from the delivery: ${JSON.stringify(s)}`);
+  }
+  // From here on it is an ordinary enabled mount: a notice for another agent is refused by the rebuilt id.
+  const cross = await raftPlugin.receive!(pushed(notice({ recipientAgentId: "agent-2" }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
+  if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
+  // The rebuilt record is what enable_push would have written, so disable_push can revoke the hook it names.
+  const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
+  if (status.enabled !== true || status.registration !== "active") throw new Error(`push_status after the rebuild: ${JSON.stringify(status)}`);
 });
 
 await check("a notice for a mount whose push is off, or for another Raft agent, is ignored and not delivered", async () => {

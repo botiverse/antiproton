@@ -24,7 +24,7 @@ const hook: Plugin = {
   },
 };
 const deaf: Plugin = { id: "deaf", version: "1.0.0",  tools: [], async invoke() { return null; } };
-const event = { headers: { "x-sig": "s" }, body: new Uint8Array([1, 2, 3]) };
+const event = { headers: { "x-sig": "s" }, body: new Uint8Array([1, 2, 3]), hookId: "hk_test" };
 
 async function fixture(pinned = "1.0.0") {
   asked.length = 0;

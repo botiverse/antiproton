@@ -981,6 +981,17 @@ export class Backgrounded {
 export interface InboundEvent {
   headers: Record<string, string>;
   body: Uint8Array;
+  /**
+   * The hook this delivery arrived at: one of this mount's own, resolved by
+   * the runtime before the plugin sees the event. Supplied because a delivery
+   * that verifies against the hook's secret is proof the service still points
+   * at this hook — proof a plugin can rebuild its own record from, if that
+   * record is gone. That works because the secret lives at the hook layer, in
+   * the agent's secret store under the hook's name (cf/src/runtime.ts
+   * `receiveHook`), not in anything the plugin keeps: a change that drops
+   * per-mount plugin state leaves the hook and its secret standing.
+   */
+  hookId: string;
 }
 
 /**
