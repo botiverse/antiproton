@@ -1,0 +1,62 @@
+/** The trace-row → activity-event mapping (src/runtime/activity.ts): what each row kind becomes, and nothing the service does not know. */
+import { activityEvents, ACTIVITY_BATCH_MAX } from "../src/runtime/activity.ts";
+import type { TraceOutboxRow } from "../src/trace/outbox.ts";
+
+const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+function check(name: string, fn: () => void) {
+  try { fn(); results.push({ name, ok: true }); }
+  catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
+}
+function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
+const T0 = 1_790_000_000_000;
+const row = (seq: number, kind: TraceOutboxRow["kind"], status: string, verdict: TraceOutboxRow["verdict"], extra: Partial<TraceOutboxRow> = {}): TraceOutboxRow =>
+  ({ seq, at: T0 + seq * 1000, tenantId: "t", agentId: "raft_a", kind, spanId: `s${seq}`, status, verdict, attrs: {}, ...extra });
+
+check("a delivered inbound row is the message that starts the turn; other inbound outcomes are not", () => {
+  const ev = activityEvents("raft_a", [row(1, "inbound", "delivered", "ok"), row(2, "inbound", "duplicate", "ok"), row(3, "inbound", "rejected", "blocked")]);
+  must(ev.length === 1 && ev[0]!.hookEventName === "UserPromptSubmit" && ev[0]!.eventId === "raft_a:1" && ev[0]!.occurredAt === new Date(T0 + 1000).toISOString(), JSON.stringify(ev));
+});
+
+check("a tool row is two events: the call dated its start and the result dated its end, named as the model names the tool", () => {
+  const ev = activityEvents("raft_a", [row(5, "tool.call", "succeeded", "ok", { ms: 2500, attrs: { tool: "send_message", mount: "raft" } })]);
+  must(ev.length === 2, JSON.stringify(ev));
+  const [pre, post] = ev;
+  must(pre!.hookEventName === "PreToolUse" && pre!.eventId === "raft_a:5:pre" && pre!.toolName === "raft__send_message" && pre!.occurredAt === new Date(T0 + 5000 - 2500).toISOString(), JSON.stringify(pre));
+  must(post!.hookEventName === "PostToolUse" && post!.eventId === "raft_a:5" && post!.durationMs === 2500 && post!.errorClass === undefined && post!.occurredAt === new Date(T0 + 5000).toISOString(), JSON.stringify(post));
+});
+
+check("a tool row that did not succeed is a failure carrying the status as its class", () => {
+  for (const [status, verdict] of [["failed", "failed"], ["rejected", "blocked"], ["cancelled", "cancelled"]] as const) {
+    const ev = activityEvents("raft_a", [row(7, "tool.call", status, verdict, { ms: 10, attrs: { tool: "run", mount: "sandbox" } })]);
+    must(ev[1]!.hookEventName === "PostToolUseFailure" && ev[1]!.errorClass === status && ev[1]!.toolName === "sandbox__run", `${status}: ${JSON.stringify(ev)}`);
+  }
+});
+
+check("a model row ends the turn on stop, length and aborted, dies on error, and says nothing while it asked for tools", () => {
+  const ev = activityEvents("raft_a", [
+    row(10, "model.call", "toolUse", "ok"), row(11, "model.call", "stop", "ok"), row(12, "model.call", "length", "ok"),
+    row(13, "model.call", "aborted", "cancelled"), row(14, "model.call", "error", "failed"),
+  ]);
+  must(ev.map((e) => `${e.eventId}=${e.hookEventName}`).join(",") === "raft_a:11=Stop,raft_a:12=Stop,raft_a:13=Stop,raft_a:14=BridgeFatal", JSON.stringify(ev));
+  must(ev[3]!.errorClass === "model_call_failed", JSON.stringify(ev[3]));
+});
+
+check("approval and container rows are not the service's business", () => {
+  must(activityEvents("raft_a", [row(20, "approval.wait", "approved", "ok"), row(21, "container.lease", "released", "ok")]).length === 0, "something was emitted");
+});
+
+check("every event carries only fields the service knows, ids are unique, and two batches never exceed the request limit", () => {
+  const rows: TraceOutboxRow[] = [];
+  for (let i = 1; i <= ACTIVITY_BATCH_MAX; i++) rows.push(row(i, "tool.call", "succeeded", "ok", { ms: 1, attrs: { tool: "t", mount: "m" } }));
+  const ev = activityEvents("raft_a", rows);
+  must(ev.length === 2 * ACTIVITY_BATCH_MAX && ev.length <= 200, `events ${ev.length}`);
+  must(new Set(ev.map((e) => e.eventId)).size === ev.length, "duplicate event ids");
+  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass"]);
+  for (const e of ev) for (const k of Object.keys(e)) must(allowed.has(k), `unknown field ${k}`);
+});
+
+console.log(`\n  activity mapping\n  ${"─".repeat(56)}`);
+for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
+const passed = results.filter((r) => r.ok).length;
+console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
+process.exit(results.length > 0 && passed === results.length ? 0 : 1);

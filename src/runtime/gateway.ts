@@ -5,7 +5,7 @@ import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
-import { holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
+import { type ActivityEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
@@ -888,6 +888,38 @@ export class ToolGateway {
       : null;
     const context = this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential);
     return { result: await plugin.receive!(event, secret, context) };
+  }
+
+  /**
+   * The agent's activity, to every mount whose plugin reports it (the raft
+   * mount, in practice). The same gate as an inbound event minus the need to
+   * receive: the mount exists, its plugin is switched on for this agent and
+   * is the version the mount pins. A plugin that throws propagates, so the
+   * caller keeps the events for the next pass; one that says `skipped` is
+   * done with them.
+   */
+  async reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
+    Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
+    const out: Array<{ alias: string; sent: number } | { alias: string; skipped: string }> = [];
+    const choices = await this.#store.pluginChoices(tenantId, agentId);
+    for (const mount of await this.#store.listMounts(tenantId, agentId)) {
+      const plugin = this.#plugins.get(mount.plugin);
+      if (!plugin?.reportActivity) continue;
+      if (!pluginEnabled(this.#seeded.has(mount.plugin), choices[mount.plugin])) {
+        out.push({ alias: mount.alias, skipped: `${mount.plugin} is switched off for this agent` });
+        continue;
+      }
+      if (plugin.version !== mount.toolVersion) {
+        out.push({ alias: mount.alias, skipped: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` });
+        continue;
+      }
+      const credential = mount.secretRef
+        ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+        : null;
+      const context = this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential);
+      out.push({ alias: mount.alias, ...(await plugin.reportActivity(events, context)) });
+    }
+    return out;
   }
 
   /** Whether this mount could take a pushed event now, and if not, why. */

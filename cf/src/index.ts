@@ -69,6 +69,7 @@ import { countHeldTime } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
 import { flushTrace } from "./trace-r2.ts";
+import { flushActivity } from "./activity-raft.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { d1ServiceTokens } from "./control-plane.ts";
@@ -2056,10 +2057,20 @@ export class AgentDO extends DurableObject<Env> {
           usagePending = true;
           console.warn(`usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
         }
-        // This pass's trace rows, to R2 (cf/src/trace-r2.ts). Same terms as
-        // usage: a failure keeps the rows and asks for another pass.
+        // This pass's activity, to the service that runs this agent (cf/src/activity-raft.ts),
+        // read from the same trace rows before they are exported; a failure keeps its cursor.
+        let activityThrough: number | null = null;
         try {
-          await flushTrace(this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+          activityThrough = (await flushActivity(rt.gateway(), this.sql as any, who.tenantId, who.agentId)).through;
+        } catch (e: any) {
+          usagePending = true;
+          console.warn(`activity flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
+        }
+        // This pass's trace rows, to R2 (cf/src/trace-r2.ts). Same terms as
+        // usage: a failure keeps the rows and asks for another pass. Rows the
+        // activity reader has not consumed are exported but kept.
+        try {
+          await flushTrace(this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId, 500, Date.now, activityThrough);
         } catch (e: any) {
           usagePending = true;
           console.warn(`trace flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);

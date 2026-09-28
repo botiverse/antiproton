@@ -534,13 +534,59 @@ await check("a notice for a mount whose push is off, or for another Raft agent, 
   if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
 });
 
+await check("activity posts the events as given to Raft's ingest while push is on, and says skipped when it is off", async () => {
+  const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const calls = one(json(200, { accepted: 2 }));
+  const events = [
+    { eventId: "raft_x:1", hookEventName: "UserPromptSubmit" as const, occurredAt: "2026-09-28T08:00:00.000Z" },
+    { eventId: "raft_x:2", hookEventName: "Stop" as const, occurredAt: "2026-09-28T08:00:05.000Z" },
+  ];
+  const out = await raftPlugin.reportActivity!(events, on.ctx);
+  if (!("sent" in out) || out.sent !== 2) throw new Error(JSON.stringify(out));
+  const body = JSON.parse(calls[0]!.init.body);
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/activity" || calls[0]!.init.method !== "POST" ||
+      body.schema !== "raft-agent-activity-ingest.v1" || JSON.stringify(body.events) !== JSON.stringify(events) || Object.keys(body).length !== 2) {
+    throw new Error(JSON.stringify({ url: calls[0]!.url, body }));
+  }
+  if (!String(calls[0]!.init.headers.authorization).startsWith("Bearer sk_agent_")) throw new Error("no credential on the activity call");
+  const off = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const quiet = one(json(200, {}));
+  const skipped = await raftPlugin.reportActivity!(events, off.ctx);
+  if (!("skipped" in skipped) || quiet.length !== 0) throw new Error(JSON.stringify({ skipped, calls: quiet.length }));
+  const none = await raftPlugin.reportActivity!([], on.ctx);
+  if (!("sent" in none) || none.sent !== 0 || quiet.length !== 0) throw new Error(JSON.stringify(none));
+});
+
+await check("an activity post that fails throws, so the runtime keeps the events for the next pass", async () => {
+  const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  one(json(503, { errorCode: "UNAVAILABLE" }));
+  const why = await failure(() => raftPlugin.reportActivity!([{ eventId: "raft_x:1", hookEventName: "Stop", occurredAt: "2026-09-28T08:00:00.000Z" }], on.ctx));
+  if (!/HTTP 503/.test(why.message)) throw new Error(why.message);
+});
+
+await check("disable_push tells Raft the session ended before deregistering, and still deregisters when that post fails", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old", staleHookIds: [], registration: "active", lastReached: null });
+  const calls = many(json(500, {}), new Response(null, { status: 204 }));
+  const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
+  if (disabled.enabled !== false || disabled.remoteDeregistration !== "confirmed") throw new Error(JSON.stringify(disabled));
+  const first = JSON.parse(calls[0]!.init.body);
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/activity" || first.events[0].hookEventName !== "SessionEnd" ||
+      !String(first.events[0].eventId).startsWith("agent-1:session-end:") || calls[1]!.init.method !== "DELETE") {
+    throw new Error(JSON.stringify(calls.map((c) => [c.init.method, c.url])));
+  }
+  const off = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", hookId: null, staleHookIds: [], registration: null, lastReached: null });
+  const quiet = one(new Response(null, { status: 204 }));
+  await raftPlugin.invoke("disable_push", {}, off.ctx);
+  if (quiet.length !== 1 || quiet[0]!.init.method !== "DELETE") throw new Error(`a disabled mount announced a session end: ${JSON.stringify(quiet.map((c) => c.init.method))}`);
+});
+
 await check("disable_push stops later delivery and push_status exposes no secret", async () => {
   const m = mount({
     enabled: true, agentId: "agent-1", agentName: "raft-bot",
     hookId: "hook-old", staleHookIds: ["hook-stale"], registration: "active",
     lastReached: { deliveryId: "delivery-old", at: Date.parse("2026-09-17T00:00:00.000Z") },
   });
-  const calls = one(new Response(null, { status: 204 }));
+  const calls = many(json(200, {}), new Response(null, { status: 204 }));
   const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
   const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
   if (disabled.enabled !== false || disabled.remoteDeregistration !== "confirmed" || disabled.cleanupPending !== 0 ||
@@ -550,8 +596,8 @@ await check("disable_push stops later delivery and push_status exposes no secret
   if (status.lastReached?.deliveryId !== "delivery-old" || JSON.stringify(status).includes(PUSH_SECRET)) {
     throw new Error(JSON.stringify(status));
   }
-  if (calls.length !== 1 || calls[0]!.init.method !== "DELETE" ||
-      calls[0]!.url !== "https://raft.example/internal/agent-api/push-webhook") throw new Error(JSON.stringify(calls));
+  if (calls.length !== 2 || calls[1]!.init.method !== "DELETE" ||
+      calls[1]!.url !== "https://raft.example/internal/agent-api/push-webhook") throw new Error(JSON.stringify(calls.map((c) => [c.init.method, c.url])));
   if (m.inbound.revoked.sort().join(",") !== "hook-old,hook-stale" || m.state().hookId !== null) {
     throw new Error(JSON.stringify({ state: m.state(), revoked: m.inbound.revoked }));
   }

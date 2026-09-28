@@ -67,9 +67,15 @@ export function traceBody(rows: readonly TraceOutboxRow[]): Uint8Array {
   return new TextEncoder().encode(rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
 }
 
+/**
+ * `holdThrough`: a second reader of the outbox (cf/src/activity-raft.ts) has
+ * consumed rows only up to this seq; rows past it are exported but not pruned,
+ * so that reader still finds them on its next pass. Absent means no other
+ * reader is holding anything.
+ */
 export async function flushTrace(
   sink: TraceSink, sql: Sql, tenantId: string, agentId: string, limit = 500,
-  now: () => number = Date.now,
+  now: () => number = Date.now, holdThrough: number | null = null,
 ): Promise<{ rows: number; dropped: number; key: string | null }> {
   sql.exec(LOCAL);
   const known = sql.exec("SELECT through_seq FROM trace_sent WHERE id = 1").toArray()[0];
@@ -90,7 +96,10 @@ export async function flushTrace(
   }
   if (through > sent) {
     sql.exec("INSERT INTO trace_sent(id, through_seq) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET through_seq = excluded.through_seq", through);
-    pruneTrace(sql, through);
   }
+  // Pruned through what BOTH readers have consumed; the cursor above records the export alone.
+  const exported = Math.max(sent, through);
+  const prunable = holdThrough === null ? exported : Math.min(exported, holdThrough);
+  if (prunable > 0) pruneTrace(sql, prunable);
   return { rows: rows.length, dropped, key };
 }
