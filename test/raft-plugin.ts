@@ -176,6 +176,12 @@ await check("send uses the configured origin, keeps the credential host-side, an
   }
 });
 
+await check("a message with no conversation identity never reaches the model as a made-up target", async () => {
+  one(json(200, { ok: true, state: "sent", messageId: "m-5", messageSeq: 8, recentUnread: [{ content: "no channel fields" }] }));
+  const out = await raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-n" }, ctx()) as any;
+  if (/undefined|no channel fields/.test(JSON.stringify(out))) throw new Error(`an unplaceable message reached the result: ${JSON.stringify(out)}`);
+});
+
 await check("a held send returns the newer messages as lines, and the same send again attests them and goes through", async () => {
   const m = mount();
   const calls = many(

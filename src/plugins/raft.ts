@@ -452,8 +452,9 @@ export const raftPlugin: Plugin = {
       if (!out.ok) throw sdkFailure(out, true);
       if (out.state === "held") {
         // The held messages are in this result, so the model sees them now: record that, and the next send
-        // of the same message into this conversation attests it instead of being held again.
-        if (!out.data.withheld && out.data.seenUpToSeq !== null) raft.frontier.recordUpTo(out.data.target, out.data.seenUpToSeq);
+        // of the same message into this conversation attests it instead of being held again. The SDK records
+        // nothing when the context was withheld.
+        raft.frontier.recordHeld(out.data);
         await saveFrontier(ctx, raft);
         return {
           state: "held", target: out.data.target, newMessages: out.data.newMessageCount,
