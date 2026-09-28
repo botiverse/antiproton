@@ -364,7 +364,7 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "receive_events",
-      summary: "Receive and acknowledge queued Raft messages once: the way to read after an inbox notice. A failed call may already have consumed the returned batch; do not retry automatically.",
+      summary: "Receive and acknowledge queued Raft messages once: the way to read after an inbox notice. Raft hands out at most a few per conversation per call: while the result says hasMore, call again until it is false. A failed call may already have consumed the returned batch; do not retry automatically.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
@@ -457,6 +457,8 @@ export const raftPlugin: Plugin = {
         lastSeenSeq: typeof data.last_seen_seq === "number" ? data.last_seen_seq : null,
         lastSeenMessageId: typeof data.last_seen_msgId === "string" ? data.last_seen_msgId : null,
         hasMore: data.has_more,
+        // Raft caps a pull per conversation, so a true here means unread messages remain (Tenny, 2026-09-28).
+        ...(data.has_more ? { note: "More unread messages remain: call receive_events again until hasMore is false." } : {}),
         replyTarget: typeof data.reply_target === "string" ? data.reply_target : null,
       };
     }

@@ -192,6 +192,15 @@ await check("receive makes exactly one request and returns only the message proj
   if (/internalSecret|storageKey|pending_notice_ids|wake_reason/.test(encoded)) throw new Error(`unprojected data: ${encoded}`);
 });
 
+await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
+  const calls = one(json(200, { events: [{ message_id: "m-9", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], last_seen_seq: 12, has_more: true }));
+  const out = await raftPlugin.invoke("receive_events", { since: "latest", limit: 10 }, ctx()) as any;
+  if (out.hasMore !== true || !/call receive_events again until hasMore is false/.test(out.note) || calls.length !== 1) throw new Error(JSON.stringify(out));
+  one(json(200, { events: [], last_seen_seq: 12, has_more: false }));
+  const done = await raftPlugin.invoke("receive_events", { since: "latest" }, ctx()) as any;
+  if (done.hasMore !== false || "note" in done) throw new Error(JSON.stringify(done));
+});
+
 await check("receive transport failure is uncertain and is never retried inside the plugin", async () => {
   let calls = 0;
   globalThis.fetch = (async () => { calls++; throw new Error("socket closed"); }) as any;
