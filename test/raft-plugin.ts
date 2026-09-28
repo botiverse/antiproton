@@ -515,11 +515,14 @@ await check("a notice is checked for its signature and header before any state i
   if (rej.deliver || !rej.rejected) throw new Error(JSON.stringify(rej));
   const wrongSecret = await raftPlugin.receive!(pushed(notice(), { secret: "wrong", deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, guarded);
   if (wrongSecret.deliver || !wrongSecret.rejected) throw new Error(JSON.stringify(wrongSecret));
-  for (const bad of [notice({ text: "" }), notice({ targets: "none" }), notice({ noticeId: "has space" }),
-    { schema: "raft-agent-inbox.v2", deliveryId: "ibx_x", recipientAgentId: "agent-1", cursor: { fromSeq: 1, toSeq: 1 }, events: [{ content: "raw message" }] },
-    { schema: "raft-agent-inbox.v1", eventId: "e", recipientAgentId: "agent-1", reason: "inbox_changed" }]) {
+  for (const [bad, expect] of [
+    [notice({ text: "" }), /not a notice: text missing/], [notice({ targets: "none" }), /targets missing/], [notice({ noticeId: "has space" }), /noticeId missing/],
+    [{ schema: "raft-agent-inbox.v2", deliveryId: "ibx_x", recipientAgentId: "agent-1", cursor: { fromSeq: 1, toSeq: 1 }, events: [{ content: "raw message" }] }, /schema is "raft-agent-inbox\.v2", not raft-agent-inbox-notice\.v1/],
+    [{ schema: "raft-agent-inbox.v1", eventId: "e", recipientAgentId: "agent-1", reason: "inbox_changed" }, /schema is "raft-agent-inbox\.v1"/],
+    [{ noticeId: "n", recipientAgentId: "agent-1", text: "x", targets: [] }, /schema is "undefined"/],
+  ] as const) {
     const r = await raftPlugin.receive!(pushed(bad, { deliveryId: String((bad as any).noticeId ?? (bad as any).deliveryId ?? (bad as any).eventId) }), PUSH_SECRET, guarded);
-    if (r.deliver || r.rejected || !r.malformed || JSON.stringify(r).includes("raw message")) throw new Error(JSON.stringify({ bad, r }));
+    if (r.deliver || r.rejected || !r.malformed || !expect.test(r.reason) || JSON.stringify(r).includes("raw message")) throw new Error(JSON.stringify({ bad, r }));
   }
   const wrongHeader = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_other" }), PUSH_SECRET, guarded);
   if (wrongHeader.deliver || !wrongHeader.malformed || reads !== 0) throw new Error(JSON.stringify({ wrongHeader, reads }));
