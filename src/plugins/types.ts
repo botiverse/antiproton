@@ -875,7 +875,11 @@ export interface ActivityEvent {
  * `malformed`, not both.
  */
 export type InboundResult =
-  | { deliver: false; reason: string; rejected?: boolean; malformed?: boolean }
+  // One of `rejected` and `malformed`, and the type says so: two booleans left "set at most one" to a
+  // comment, and a result with both would have been answered 401 by the runtime's first check — the
+  // side `malformed` exists to avoid.
+  | { deliver: false; reason: string; rejected?: true; malformed?: never }
+  | { deliver: false; reason: string; malformed?: true; rejected?: never }
   | { deliver: true; text: string; dedupeKey?: string };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
