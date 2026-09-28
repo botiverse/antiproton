@@ -2555,29 +2555,30 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
     try { body = text ? JSON.parse(text) : {}; }
     catch { return refuse(400, "invalid_json", "the body is not JSON"); }
   }
-  const { tenantId } = who;
-  const stub = (agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
-  const home = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, PROVIDER_HOME)));
+  // The tenant is the handler's to decide (a platform token derives it from the request's Raft server), so every
+  // agent operation names it.
+  const stub = (tenantId: string, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
   const deps: ProvisionDeps = {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
     agent: {
-      adopt: async (agentId, spec) => {
-        const r = await stub(agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));
+      adopt: async (tenantId, agentId, spec) => {
+        const r = await stub(tenantId, agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));
         if (!r.ok) throw new Error(r.error);
-        // Listed under the provider's home, so the console shows what Raft made. Idempotent.
-        await home.uiRecordAgent(tenantId, PROVIDER_HOME, { agentId, name: spec.name, description: spec.instructions, avatar: r.avatar, createdAt: Date.now() });
+        // Listed under the provider's home in that tenant, so the console shows what Raft made. Idempotent.
+        await stub(tenantId, PROVIDER_HOME).uiRecordAgent(tenantId, PROVIDER_HOME, { agentId, name: spec.name, description: spec.instructions, avatar: r.avatar, createdAt: Date.now() });
       },
-      attachCredential: async (agentId, credential) => {
-        const r = await stub(agentId).uiAttachCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS, { token: credential });
+      attachCredential: async (tenantId, agentId, credential) => {
+        const r = await stub(tenantId, agentId).uiAttachCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS, { token: credential });
         return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
       },
-      removeCredential: (agentId) => stub(agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
-      tool: (agentId, name) => stub(agentId).provisionTool(tenantId, agentId, name),
+      removeCredential: (tenantId, agentId) => stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
+      tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
     },
   };
   try {
-    const res = await handleProvision(request.method, url.pathname.slice("/provision".length), { idempotencyKey: request.headers.get("idempotency-key") }, body, who, deps);
+    const res = await handleProvision(request.method, url.pathname.slice("/provision".length),
+      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId") }, body, who, deps);
     return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
   } catch (e) {
     const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);

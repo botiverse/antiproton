@@ -14,25 +14,28 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 
-const WHO = { label: "raft-prod", tenantId: "t-raft", raftOrigin: "https://api.raft.build" };
+const WHO = { label: "raft-prod", tenantId: "t-raft", raftOrigin: "https://api.raft.build", scope: "tenant" as const };
+const PLATFORM = { label: "raft-deployment", raftOrigin: "https://api.raft.build", scope: "platform" as const };
 const CRED = "sk_agent_" + "R".repeat(32);
 
 function fakeDeps() {
   let t = 1_800_000_000_000;
   const rows = new Map<string, ProvisionedAgent>();
   const calls: string[] = [];
+  const tenants = new Set<string>();
   const fail = new Set<string>();
+  const k = (tenantId: string, id: string) => `${tenantId}/${id}`;
   const registry: ProvisionRegistry = {
     async create(r) {
-      if ([...rows.values()].some((x) => x.agentId === r.agentId)) throw new Error("UNIQUE constraint failed");
-      rows.set(r.raftAgentId, { ...r, createdAt: t, updatedAt: t, deletedAt: null });
+      if ([...rows.values()].some((x) => x.tenantId === r.tenantId && x.agentId === r.agentId)) throw new Error("UNIQUE constraint failed");
+      rows.set(k(r.tenantId, r.raftAgentId), { ...r, createdAt: t, updatedAt: t, deletedAt: null });
     },
-    async get(_t, id) { return rows.get(id) ?? null; },
-    async getByAgentId(_t, agentId) { return [...rows.values()].find((r) => r.agentId === agentId) ?? null; },
-    async update(_t, id, patch) {
-      const r = rows.get(id);
+    async get(tenantId, id) { return rows.get(k(tenantId, id)) ?? null; },
+    async getByAgentId(tenantId, agentId) { return [...rows.values()].find((r) => r.tenantId === tenantId && r.agentId === agentId) ?? null; },
+    async update(tenantId, id, patch) {
+      const r = rows.get(k(tenantId, id));
       if (!r) return false;
-      rows.set(id, { ...r, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)), updatedAt: t });
+      rows.set(k(tenantId, id), { ...r, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)), updatedAt: t });
       return true;
     },
   };
@@ -40,27 +43,27 @@ function fakeDeps() {
     now: () => (t += 1000),
     registry,
     agent: {
-      adopt: async (agentId, spec) => { calls.push(`adopt ${agentId} ${spec.name}|${spec.instructions}|${spec.raftOrigin}`); },
-      attachCredential: async (agentId, credential) => {
-        calls.push(`attach ${agentId} ${credential.length}`);
+      adopt: async (tenantId, agentId, spec) => { tenants.add(tenantId); calls.push(`adopt ${agentId} ${spec.name}|${spec.instructions}|${spec.raftOrigin}`); },
+      attachCredential: async (tenantId, agentId, credential) => {
+        tenants.add(tenantId); calls.push(`attach ${agentId} ${credential.length}`);
         return fail.has("attach") ? { ok: false, error: "Raft returned HTTP 401" } : { ok: true, account: "@cody" };
       },
-      removeCredential: async (agentId) => { calls.push(`remove ${agentId}`); return true; },
-      tool: async (agentId, name) => {
-        calls.push(`${name} ${agentId}`);
+      removeCredential: async (tenantId, agentId) => { tenants.add(tenantId); calls.push(`remove ${agentId}`); return true; },
+      tool: async (tenantId, agentId, name) => {
+        tenants.add(tenantId); calls.push(`${name} ${agentId}`);
         if (fail.has(name)) return { ok: false, error: `${name}: raft returned HTTP 503` };
         return { ok: true, result: name === "push_status" ? { enabled: true, registration: "active" } : { enabled: name === "enable_push" } };
       },
     },
   };
-  return { deps, rows, calls, fail };
+  return { deps, rows, calls, fail, tenants };
 }
 
 const body = (over: Record<string, unknown> = {}) => ({
   raftAgentId: "01JAGENT", raftServerId: "srv-1", raftOrigin: WHO.raftOrigin, name: "Cody", instructions: "be brief", credential: CRED, ...over,
 });
-async function call(deps: ProvisionDeps, method: string, path: string, payload?: unknown, key: string | null = null) {
-  const r = await handleProvision(method, path, { idempotencyKey: key }, payload, WHO, deps);
+async function call(deps: ProvisionDeps, method: string, path: string, payload?: unknown, key: string | null = null, who: typeof WHO | typeof PLATFORM = WHO, raftServerId: string | null = null) {
+  const r = await handleProvision(method, path, { idempotencyKey: key, raftServerId }, payload, who, deps);
   if (!r) return { status: 0, body: null as any, text: "" };
   const text = await r.text();
   return { status: r.status, body: (text ? JSON.parse(text) : null) as any, text };
@@ -73,7 +76,7 @@ await check("POST makes the agent in five steps, in order, and the answer never 
   assert(r.body.providerAgentId === "raft_01JAGENT" && r.body.status === "active" && r.body.push.registered === true && r.body.push.error === undefined, r.text);
   assert(!r.text.includes(CRED) && !r.text.includes("sk_agent"), "the credential is in the answer");
   assert(f.calls.join(";") === "adopt raft_01JAGENT Cody|be brief|https://api.raft.build;attach raft_01JAGENT 41;enable_push raft_01JAGENT", f.calls.join(";"));
-  const row = f.rows.get("01JAGENT")!;
+  const row = f.rows.get("t-raft/01JAGENT")!;
   assert(row.status === "active" && row.pushRegistered && row.pushError === null && !JSON.stringify(row).includes("sk_agent"), JSON.stringify(row));
 });
 
@@ -94,7 +97,7 @@ await check("the same key with any field different is 409 and touches nothing: e
     const r = await call(f.deps, "POST", "/agents", body(over), "01JAGENT");
     assert(r.status === 409 && r.body.error.code === "idempotency_conflict" && r.body.error.message.includes(Object.keys(over)[0]!), `${JSON.stringify(over)} → ${r.status} ${r.text}`);
   }
-  assert(f.calls.length === 0 && f.rows.get("01JAGENT")!.name === "Cody", `calls ${f.calls.join(";")}`);
+  assert(f.calls.length === 0 && f.rows.get("t-raft/01JAGENT")!.name === "Cody", `calls ${f.calls.join(";")}`);
 });
 
 await check("a POST whose raftOrigin is not the token's is 422 before anything is made", async () => {
@@ -132,7 +135,7 @@ await check("a refused credential leaves the row provisioning without push, and 
   f.fail.add("attach");
   const r = await call(f.deps, "POST", "/agents", body());
   assert(r.status === 422 && r.body.error.code === "credential_refused" && r.body.error.param === "credential", r.text);
-  assert(f.rows.get("01JAGENT")!.status === "provisioning" && !f.calls.some((c) => c.startsWith("enable_push")), JSON.stringify({ row: f.rows.get("01JAGENT"), calls: f.calls }));
+  assert(f.rows.get("t-raft/01JAGENT")!.status === "provisioning" && !f.calls.some((c) => c.startsWith("enable_push")), JSON.stringify({ row: f.rows.get("t-raft/01JAGENT"), calls: f.calls }));
   f.fail.delete("attach");
   const again = await call(f.deps, "POST", "/agents", body());
   assert(again.status === 200 && again.body.status === "active" && again.body.push.registered === true, again.text);
@@ -143,7 +146,7 @@ await check("a failed push registration is still a made agent: 201, registered f
   f.fail.add("enable_push");
   const r = await call(f.deps, "POST", "/agents", body());
   assert(r.status === 201 && r.body.status === "active" && r.body.push.registered === false && /503/.test(r.body.push.error), r.text);
-  assert(f.rows.get("01JAGENT")!.pushError!.includes("503"), JSON.stringify(f.rows.get("01JAGENT")));
+  assert(f.rows.get("t-raft/01JAGENT")!.pushError!.includes("503"), JSON.stringify(f.rows.get("t-raft/01JAGENT")));
   f.fail.delete("enable_push");
   const again = await call(f.deps, "POST", "/agents", body());
   assert(again.status === 200 && again.body.push.registered === true && again.body.push.error === undefined, again.text);
@@ -156,7 +159,7 @@ await check("PATCH changes what it is given, re-adopts with the merged persona, 
   const r = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", { instructions: "be thorough" });
   assert(r.status === 200 && r.body.name === "Cody" && r.body.instructions === "be thorough" && !("model" in r.body), r.text);
   assert(f.calls.join(";") === "adopt raft_01JAGENT Cody|be thorough|https://api.raft.build", f.calls.join(";"));
-  assert(f.rows.get("01JAGENT")!.instructions === "be thorough", "the registry did not change");
+  assert(f.rows.get("t-raft/01JAGENT")!.instructions === "be thorough", "the registry did not change");
   const empty = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", {});
   assert(empty.status === 422 && empty.body.error.code === "empty", empty.text);
   const bad = await call(f.deps, "PATCH", "/agents/raft_01JAGENT", { name: "x".repeat(61) });
@@ -237,6 +240,30 @@ await check("an agent is also addressed by the Raft id it was made from, so a lo
   for (const [m, p] of [["GET", "/agents/by-raft-agent"], ["GET", "/agents/by-raft-agent/01JAGENT/other"], ["PUT", "/agents/by-raft-agent/01JAGENT/credential/x"]] as const) {
     assert((await call(f.deps, m, p, {})).status === 0, `${m} ${p} was answered`);
   }
+});
+
+await check("a platform token acts in the tenant named by the Raft server: raft_<serverId> on POST from the body, elsewhere from the URL, and none without it", async () => {
+  const f = fakeDeps();
+  const made = await call(f.deps, "POST", "/agents", body({ raftServerId: "d21383ee-df0a-4ed0-8f4c-ef263f2adb68" }), "01JAGENT", PLATFORM);
+  assert(made.status === 201 && [...f.tenants].join(",") === "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68", `${made.status} tenants ${[...f.tenants]}`);
+  assert(f.rows.get("raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68/01JAGENT")?.tenantId === "raft_d21383ee-df0a-4ed0-8f4c-ef263f2adb68", "row not in the derived tenant");
+  // Another server, same Raft agent id: another tenant, no clash.
+  const other = await call(f.deps, "POST", "/agents", body({ raftServerId: "95f993fa-2a68-4797-b8ae-7beb7d984ada" }), "01JAGENT", PLATFORM);
+  assert(other.status === 201 && f.rows.size === 2, `${other.status} rows ${f.rows.size}`);
+  // Reads and deletes need the server on the URL; without it nothing is looked up.
+  const noServer = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT", undefined, null, PLATFORM);
+  assert(noServer.status === 422 && noServer.body.error.param === "raftServerId", noServer.text);
+  const got = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT", undefined, null, PLATFORM, "95f993fa-2a68-4797-b8ae-7beb7d984ada");
+  assert(got.status === 200 && got.body.raftServerId === "95f993fa-2a68-4797-b8ae-7beb7d984ada", got.text);
+  const gone = await call(f.deps, "DELETE", "/agents/by-raft-agent/01JAGENT", undefined, null, PLATFORM, "d21383ee-df0a-4ed0-8f4c-ef263f2adb68");
+  assert(gone.status === 200 && gone.body.status === "deleted" && f.rows.get("raft_95f993fa-2a68-4797-b8ae-7beb7d984ada/01JAGENT")?.status === "active", "the wrong server's agent was touched");
+  // A tenant token ignores the URL's server: its tenant is fixed.
+  const fixed = fakeDeps();
+  await call(fixed.deps, "POST", "/agents", body());
+  const ignored = await call(fixed.deps, "GET", "/agents/by-raft-agent/01JAGENT", undefined, null, WHO, "some-other-server");
+  assert(ignored.status === 200 && [...fixed.tenants].join(",") === "t-raft", ignored.text);
+  const badServer = await call(f.deps, "POST", "/agents", body({ raftServerId: "has space" }), "01JAGENT", PLATFORM);
+  assert(badServer.status === 422 && badServer.body.error.param === "raftServerId", badServer.text);
 });
 
 await check("the antiproton agent id is the Raft id, prefixed, made legal for an object name, and bounded", async () => {
