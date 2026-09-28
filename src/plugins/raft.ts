@@ -7,25 +7,21 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { originProblem, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { originProblem, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
-const PUSH_SCHEMA = "raft-agent-inbox.v2";
+/**
+ * Raft's push is a NOTICE that the inbox changed — the same "Inbox update" text
+ * Raft's daemon injects into a managed agent — never the messages (tygg,
+ * 2026-09-28). The agent reads them itself with `receive_events`, which
+ * acknowledges by cursor. So a lost or repeated notice costs nothing, a 2xx
+ * here means only "received", and no receiver-side dedupe of messages exists.
+ */
+const NOTICE_SCHEMA = "raft-agent-inbox-notice.v1";
+const NOTICE_TEXT_MAX = 4_000;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-/**
- * How much of a batch the agent reads. The runtime cuts a delivery at
- * INBOUND_TEXT_MAX (src/runtime/inbound.ts); this budget stays under it with
- * room for the lines around each message, and is shared by the messages of one
- * batch so that no message is dropped: a batch acknowledged is a batch the
- * agent never sees again (2xx advances Raft's cursor), so cutting long
- * messages is right and dropping short ones is not.
- */
-const PUSH_TEXT_BUDGET = 10_000;
-const PUSH_MESSAGE_MIN = 200;
-/** Senders whose words are the conversation, not an event about it (raft-agent-inbox.v2). */
-const SPEAKERS = new Set(["human", "agent"]);
 
 type ObjectValue = Record<string, any>;
 
@@ -366,7 +362,7 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "receive_events",
-      summary: "Receive and acknowledge queued Raft messages once. Not needed while push is enabled: new messages then arrive by themselves. A failed call may already have consumed the returned batch; do not retry automatically.",
+      summary: "Receive and acknowledge queued Raft messages once: the way to read after an inbox notice. A failed call may already have consumed the returned batch; do not retry automatically.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
@@ -390,7 +386,7 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "enable_push",
-      summary: "Create and register this mount's signed Raft push endpoint: Raft then delivers this agent's new messages as they arrive.",
+      summary: "Create and register this mount's signed Raft push endpoint: Raft then notifies this agent when its inbox changes.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
       idempotency: "none",
@@ -583,15 +579,9 @@ export const raftPlugin: Plugin = {
   },
 
   /**
-   * One signed batch of this agent's Raft inbox, delivered by Raft
-   * (raft-agent-inbox.v2). Every message in it reaches the agent in the order
-   * Raft gave, cut long rather than dropped, because the 2xx this returns is
-   * the acknowledgement that moves Raft's cursor past the batch.
-   *
-   * Who wrote each message is a fact Raft states (its sender type). A batch
-   * with a person or an agent speaking is delivered as the conversation
-   * itself, each line still naming its sender; a batch made only of system and
-   * app events keeps the runtime's "outside content" label.
+   * One signed inbox notice from Raft (raft-agent-inbox-notice.v1): a
+   * reminder that this agent's inbox changed, in Raft's own words, delivered to
+   * the agent as a wake, never the messages themselves.
    */
   async receive(inbound, secret, ctx) {
     const signature = inbound.headers["x-raft-signature-256"];
@@ -601,95 +591,47 @@ export const raftPlugin: Plugin = {
     if (!(await validPushSignature(inbound.body, signature, secret))) {
       return { deliver: false, rejected: true, reason: "the signature does not match this mount's inbound secret" };
     }
-
     // Signed by Raft, so what follows is Raft's own mistake, not a stranger's:
     // `malformed` (400), never `rejected` (401), which Raft counts towards
     // switching the registration off. A field this version does not know is
-    // ignored; a change that would need refusing is what a v3 schema is for.
+    // ignored; a change that would need refusing is what a v2 schema is for.
     let payload: ObjectValue;
     try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
     catch { return { deliver: false, malformed: true, reason: "signed, but the body is not JSON" }; }
-    const cursor = object(payload.cursor);
-    if (payload.schema !== PUSH_SCHEMA ||
-        typeof payload.deliveryId !== "string" || !PUSH_ID.test(payload.deliveryId) ||
-        typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ||
-        number(cursor.fromSeq) === undefined || number(cursor.toSeq) === undefined || cursor.fromSeq > cursor.toSeq ||
-        !Array.isArray(payload.events)) {
-      return { deliver: false, malformed: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} delivery` };
+    if (payload.schema !== NOTICE_SCHEMA) {
+      return { deliver: false, malformed: true, reason: `signed, but the body is not a ${NOTICE_SCHEMA} notice` };
     }
-    const headerDeliveryId = inbound.headers["x-raft-delivery-id"];
-    if (!headerDeliveryId || headerDeliveryId !== payload.deliveryId) {
-      return { deliver: false, malformed: true, reason: "the Raft delivery id header does not match the signed body" };
-    }
-
-    const state = await loadPushState(ctx);
-    await savePushState(ctx, {
-      ...state,
-      lastReached: { deliveryId: payload.deliveryId, at: Date.now() },
-    });
-    if (!state.enabled) return { deliver: false, reason: "push is disabled for this mount" };
-    if (!state.agentId || payload.recipientAgentId !== state.agentId) {
-      return { deliver: false, reason: "the signed delivery names a different Raft agent" };
-    }
-    const events = payload.events.map(event) as ObjectValue[];
-    if (events.length === 0) return { deliver: false, reason: "an empty batch: nothing to deliver" };
-
-    return {
-      deliver: true,
-      as: events.some((e) => SPEAKERS.has(String(e.senderType))) ? "user" : "event",
-      text: batchText(ctx.alias, cursor.fromSeq, cursor.toSeq, events),
-      dedupeKey: payload.deliveryId,
-    };
+    return receiveNotice(payload, inbound.headers, ctx);
   },
 };
 
 /**
- * The batch as the agent reads it: one numbered block per message, in Raft's
- * order, each naming where it was said, by whom and of what kind, so the agent
- * can answer to the right place and weigh the right speaker. Attachments come
- * as references only; the file itself is fetched with a tool.
+ * A signed inbox notice: Raft's own words about what is unread, handed to the
+ * model as they are, plus the one instruction Raft's daemon gives a managed
+ * agent — read it yourself. The notice is Raft's text, not a person's, so it
+ * goes under the outside-content label (`as` stays the default).
  */
-function batchText(alias: string, fromSeq: number, toSeq: number, events: ObjectValue[]): string {
-  const each = Math.max(PUSH_MESSAGE_MIN, Math.floor(PUSH_TEXT_BUDGET / events.length));
-  const lines = [
-    `Raft delivered ${events.length} message${events.length === 1 ? "" : "s"} (seq ${fromSeq}–${toSeq}) through the \`${alias}\` mount.` +
-    // Seen on the first live delivery (2026-09-28): told to "reply to the target shown", the model
-    // greeted a channel-add notice. Where an answer is due is the model's call; the line only says how.
-    ` Where one of them calls for an answer, send it with \`send_message\` to that message's target; a system notice usually needs none.`,
-  ];
-  events.forEach((e, i) => {
-    const where = text(e.replyTarget) ?? place(e);
-    const who = `${text(e.senderName) ? `@${e.senderName}` : "someone"} (${e.senderType})`;
-    const head = [`${i + 1}.`, number(e.seq) !== undefined ? `seq ${e.seq}` : null, where, who,
-      text(e.messageId) ? `msg ${e.messageId}` : null, text(e.timestamp) ?? null,
-      e.mentioned === true ? "mentions you" : null,
-      number(e.taskNumber) !== undefined ? `task #${e.taskNumber}${text(e.taskStatus) ? ` (${e.taskStatus})` : ""}` : null,
-    ].filter((part) => part !== null).join(" · ");
-    const content = text(e.content) ?? "";
-    const body = e.truncated === true
-      ? "(too large for this delivery; read this message with a tool)"
-      : content.length > each
-      ? `${content.slice(0, each)}… (cut, ${content.length - each} more characters; read the message with a tool)`
-      : content;
-    lines.push(head, indent(body));
-    const attachments = Array.isArray(e.attachments) ? e.attachments as ObjectValue[] : [];
-    if (attachments.length > 0) {
-      lines.push(indent(`attachments: ${attachments.map((a) =>
-        `${a.filename}${a.mimeType ? ` (${a.mimeType}${number(a.sizeBytes) !== undefined ? `, ${a.sizeBytes} bytes` : ""})` : ""} id ${a.id}`).join("; ")}`));
-    }
-  });
-  return lines.join("\n");
+async function receiveNotice(payload: ObjectValue, headers: Record<string, string>, ctx: PluginContext): Promise<InboundResult> {
+  if (typeof payload.noticeId !== "string" || !PUSH_ID.test(payload.noticeId) ||
+      typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ||
+      typeof payload.text !== "string" || !payload.text.trim() || !Array.isArray(payload.targets)) {
+    return { deliver: false, malformed: true, reason: `signed, but the body is not a ${NOTICE_SCHEMA} notice` };
+  }
+  const headerId = headers["x-raft-delivery-id"];
+  if (!headerId || headerId !== payload.noticeId) {
+    return { deliver: false, malformed: true, reason: "the Raft delivery id header does not match the signed notice" };
+  }
+  const state = await loadPushState(ctx);
+  await savePushState(ctx, { ...state, lastReached: { deliveryId: payload.noticeId, at: Date.now() } });
+  if (!state.enabled) return { deliver: false, reason: "push is disabled for this mount" };
+  if (!state.agentId || payload.recipientAgentId !== state.agentId) {
+    return { deliver: false, reason: "the signed notice names a different Raft agent" };
+  }
+  const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
+  return {
+    deliver: true,
+    text: `${body}\n\nRead them with the \`receive_events\` tool from the \`${ctx.alias}\` mount; that read is what acknowledges them.`,
+    dedupeKey: payload.noticeId,
+  };
 }
 
-/** Where a message was said, from the fields Raft gives when no reply target is named. */
-function place(e: ObjectValue): string {
-  const channel = text(e.channelName);
-  const kind = text(e.channelType);
-  if (!channel && !kind) return "(no target given)";
-  if (kind === "thread") return `a thread${text(e.parentChannelName) ? ` in #${e.parentChannelName}` : ""}`;
-  return `${kind === "dm" ? "dm:" : ""}${channel ? (kind === "dm" ? `@${channel}` : `#${channel}`) : kind}`;
-}
-
-function indent(body: string): string {
-  return body.split("\n").map((line) => `   ${line}`).join("\n");
-}
