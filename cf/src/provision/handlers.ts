@@ -132,6 +132,22 @@ function view(row: ProvisionedAgent, live?: Json) {
   };
 }
 
+/**
+ * Register push again for an agent that already exists: the operator's repair for a mount whose push
+ * record is gone while Raft still points at the old hook. The same tool as at creation, so there is
+ * one registration path; the row's `registered` follows the result the same way. Raft need do
+ * nothing — the plugin rebuilds the hook and re-registers it with the agent's own credential, and
+ * Raft replaces the old URL and secret.
+ */
+export async function repairPush(
+  deps: ProvisionDeps, tenantId: string, raftAgentId: string,
+): Promise<{ ok: true; push: ProvisionedAgent["pushRegistered"]; error: string | null } | { ok: false; error: string }> {
+  const row = await deps.registry.get(tenantId, raftAgentId);
+  if (!row || row.deletedAt !== null) return { ok: false, error: `no live provisioned agent ${raftAgentId} in tenant ${tenantId}` };
+  const after = await registerPush(deps, row);
+  return { ok: true, push: after.pushRegistered, error: after.pushError };
+}
+
 /** Register push through the plugin's own tool and write what happened; the row says `registered` only when it is. */
 async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise<ProvisionedAgent> {
   const push = await deps.agent.tool(row.tenantId, row.agentId, "enable_push");

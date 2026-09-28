@@ -79,6 +79,7 @@ import { d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
+import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -2551,10 +2552,26 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
     try { body = text ? JSON.parse(text) : {}; }
     catch { return refuse(400, "invalid_json", "the body is not JSON"); }
   }
-  // The tenant is the handler's to decide (a platform token derives it from the request's Raft server), so every
-  // agent operation names it.
+  const deps = provisionDeps(env);
+  try {
+    const res = await handleProvision(request.method, url.pathname.slice("/provision".length),
+      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId") }, body, who, deps);
+    return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
+  } catch (e) {
+    const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
+    return refuse(500, "internal", message);
+  }
+}
+
+/**
+ * What the provisioning rules act through: D1 for the registry, the agents' objects for everything
+ * else. Shared by the provider route and the operator's push repair, so both reach an agent the same way.
+ * The tenant is the caller's to decide (a platform token derives it from the request's Raft server), so
+ * every agent operation names it.
+ */
+function provisionDeps(env: Env): ProvisionDeps {
   const stub = (tenantId: string, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
-  const deps: ProvisionDeps = {
+  return {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
     agent: {
@@ -2573,14 +2590,6 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
     },
   };
-  try {
-    const res = await handleProvision(request.method, url.pathname.slice("/provision".length),
-      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId") }, body, who, deps);
-    return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
-  } catch (e) {
-    const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
-    return refuse(500, "internal", message);
-  }
 }
 
 /** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
@@ -3144,6 +3153,22 @@ export default {
           }
           const s3 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
           return Response.json(await s3.uiRenameMount(t, a, from, to));
+        }
+        case "/admin/provision-push": {
+          // Register push again for one provisioned agent, through the same tool creation uses. The
+          // operator's repair for a mount whose push record is gone while Raft still points at the
+          // old hook — a storage change that dropped per-mount state was the first occasion. Raft
+          // need do nothing: the plugin rebuilds the hook and re-registers it with the agent's own
+          // credential, so this is ours to run, and it is idempotent.
+          if (env.AUTOMATION_TOKEN && request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+          if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
+          const t = String(url.searchParams.get("tenantId") ?? "");
+          const r = String(url.searchParams.get("raftAgentId") ?? "");
+          if (!t || !r) return Response.json({ error: "tenantId and raftAgentId are required" }, { status: 400 });
+          const out = await repairPush(provisionDeps(env), t, r);
+          return Response.json(out, { status: out.ok ? 200 : 404 });
         }
         case "/admin/diagnose":
           return await adminDiagnose(request, env.AUTOMATION_TOKEN,
