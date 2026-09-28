@@ -542,6 +542,23 @@ await check("a long message is cut and says so, and no message of a large batch 
   if (batch.text.length > 60_000) throw new Error(`batch text ${batch.text.length}`);
 });
 
+await check("a message Raft left out as too large is named, not shown as empty", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const big = raftMessage({ truncated: true });
+  delete (big as any).content;
+  const out = await raftPlugin.receive!(pushed(pushPayload({ events: [big] })), PUSH_SECRET, m.ctx);
+  if (!out.deliver || !out.text.includes("too large for this delivery; read this message with a tool") || !out.text.includes("msg 6ed41ed7")) {
+    throw new Error(JSON.stringify(out));
+  }
+});
+
+await check("a bare 200 on push registration is a registration, not a malformed answer", async () => {
+  const m = mount();
+  const calls = many(json(200, { agentId: "agent-1", agentName: "raft-bot", serverId: "srv" }), new Response("", { status: 200 }));
+  const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;
+  if (out.enabled !== true || out.registration !== "active" || calls[1]!.init.method !== "PUT") throw new Error(JSON.stringify({ out, calls: calls.map((c) => c.init.method) }));
+});
+
 await check("attachments arrive as references, never as content", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const out = await raftPlugin.receive!(pushed(pushPayload({ events: [raftMessage({

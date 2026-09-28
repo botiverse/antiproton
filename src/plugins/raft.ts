@@ -178,7 +178,10 @@ async function call(
   }
   let data: unknown = null;
   if (response.status === 204) return { status: response.status, data: {} };
-  try { data = await response.json(); }
+  // A success with nothing to say (Raft's PUT push-webhook answers 200 bare) is not "not JSON".
+  const raw = await response.text();
+  if (response.ok && raw.trim() === "") return { status: response.status, data: {} };
+  try { data = JSON.parse(raw); }
   catch {
     if (!response.ok) {
       const message = `raft returned HTTP ${response.status}`;
@@ -295,6 +298,8 @@ function event(value: unknown): Json {
     // one for the whole batch instead.
     ...(text(e.reply_target) ? { replyTarget: text(e.reply_target) } : {}),
     ...(typeof e.mentioned === "boolean" ? { mentioned: e.mentioned } : {}),
+    // Raft leaves out the content of a message too large for the batch and says so.
+    ...(e.truncated === true ? { truncated: true } : {}),
     // A message that is a task carries the task's number and status.
     ...(number(e.task_number) !== undefined ? { taskNumber: number(e.task_number) } : {}),
     ...(text(e.task_status) ? { taskStatus: text(e.task_status) } : {}),
@@ -659,7 +664,9 @@ function batchText(alias: string, fromSeq: number, toSeq: number, events: Object
       number(e.taskNumber) !== undefined ? `task #${e.taskNumber}${text(e.taskStatus) ? ` (${e.taskStatus})` : ""}` : null,
     ].filter((part) => part !== null).join(" · ");
     const content = text(e.content) ?? "";
-    const body = content.length > each
+    const body = e.truncated === true
+      ? "(too large for this delivery; read this message with a tool)"
+      : content.length > each
       ? `${content.slice(0, each)}… (cut, ${content.length - each} more characters; read the message with a tool)`
       : content;
     lines.push(head, indent(body));
