@@ -205,6 +205,43 @@ await check("a transaction is atomic — a throw undoes its writes — and a rea
   must(tables.get(scope(), "notes", "n") === 2, "the readonly transaction wrote");
 });
 
+await check("an async callback is refused inside the transaction and writes nothing; a handle kept past its callback refuses", async () => {
+  const { db, tables } = fresh();
+  await db.put("notes", "before", "a");
+  // The idb habit: put, await something, put, throw. Under transactionSync the first await commits.
+  await refused(() => db.transaction("notes", "readwrite", async (tx) => {
+    tx.put("notes", "first", "a");
+    await new Promise((r) => setTimeout(r, 1));
+    tx.put("notes", "second", "b");
+    throw new Error("late");
+  }), /must be synchronous/, "an async transaction callback");
+  await new Promise((r) => setTimeout(r, 5));
+  must(tables.get(scope(), "notes", "a") === "before" && tables.get(scope(), "notes", "b") === undefined,
+    `an async callback's writes survived: ${JSON.stringify(tables.getAll(scope(), "notes", null, null))}`);
+  let kept: any;
+  await db.transaction("notes", "readwrite", (tx) => { kept = tx; tx.put("notes", 1, "k"); });
+  await refused(async () => kept.get("notes", "k"), /transaction has ended/, "a read through a kept handle");
+  await refused(async () => kept.put("notes", 2, "k"), /transaction has ended/, "a write through a kept handle");
+  must(tables.get(scope(), "notes", "k") === 1, "the kept handle wrote outside its transaction");
+  await refused(() => db.transaction("notes", "readonly", (tx) => tx.count("items")), /store items is not in this transaction; it named notes/,
+    "a store the transaction did not name");
+});
+
+await check("an async upgrade is refused: the version stays, its writes roll back, and the next use tries again", async () => {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  let calls = 0;
+  const db = openPluginDatabase(tables, scope(), {
+    version: 2, stores: { notes: {} },
+    upgrade: (async (tx: any) => { calls++; tx.put("notes", "half", "k"); await null; tx.put("notes", "late", "j"); }) as any,
+  });
+  await refused(() => db.get("notes", "k"), /upgrade from 0 to 2 failed: upgrade must be synchronous/, "the first use");
+  await new Promise((r) => setTimeout(r, 5));
+  must(tables.version(scope()) === null && tables.get(scope(), "notes", "k") === undefined && tables.get(scope(), "notes", "j") === undefined,
+    `an async upgrade left something behind: version ${tables.version(scope())}, rows ${JSON.stringify(tables.getAll(scope(), "notes", null, null))}`);
+  await refused(() => db.get("notes", "k"), /must be synchronous/, "the second use");
+  must(calls === 2, `upgrade ran ${calls} times; a refused upgrade is retried`);
+});
+
 await check("a read-only opening reads, refuses every write in the diagnosis's words, and never upgrades", async () => {
   const tables = new PluginDbTables(sqliteHost()).ensure();
   tables.put(scope(), "notes", "k", "present", null);

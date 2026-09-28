@@ -81,7 +81,11 @@ export type DbQuery = DbKey | DbKeyRange | null | undefined;
  * object and a transaction is a lock held while the callback runs; an `await`
  * inside it would hold that lock across I/O nothing else could proceed past.
  * IndexedDB has the same rule in a less visible form — a transaction that is
- * awaited across anything but its own requests has already committed.
+ * awaited across anything but its own requests has already committed. The
+ * rule is enforced, not only typed: a callback that returns a promise is
+ * refused inside the transaction, so its synchronous writes roll back, and
+ * a handle kept past its callback refuses every call. A transaction reaches
+ * only the stores it named.
  */
 export interface DbOperations {
   get(store: string, key: DbKey): unknown;
@@ -131,7 +135,9 @@ export interface DbStoreSpec {
    * Keys whose NAME may be shown outside the object, meaning "this exists":
    * a diagnosis lists them with whether they are present. Never their values,
    * and never to the model. Keys not named here are private; a store that
-   * omits this lists nothing.
+   * omits this lists no key. What is always shown, `listed` or not, is the
+   * store's name, how many keys it holds and when one last changed — the
+   * operator's storage page reads those counts from the rows directly.
    */
   listed?: readonly DbKey[];
 }

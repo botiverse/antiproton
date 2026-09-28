@@ -35,6 +35,23 @@ export interface OpenOptions {
 
 const READ_ONLY = "read-only: a diagnosis does not change a mount's state";
 
+const isThenable = (v: unknown): boolean => !!v && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
+
+/**
+ * What a transaction callback or an `upgrade` returned, checked inside the
+ * transaction. A thenable means the callback was async: `transactionSync`
+ * committed at its first `await`, every later write landed outside the
+ * transaction, and its own throw would undo nothing — so this throws instead,
+ * while the synchronous part can still be rolled back. The pending promise is
+ * settled quietly: its continuation runs later against a closed handle, which
+ * refuses, and nobody is left to hear that rejection.
+ */
+function mustBeSync(returned: unknown, what: string): void {
+  if (!isThenable(returned)) return;
+  (returned as Promise<unknown>).then(() => {}, () => {});
+  throw new Error(`${what} must be synchronous: an async callback commits at its first await, and a throw after that undoes nothing`);
+}
+
 /**
  * Build the database a plugin is handed for one mount. `spec` undefined means
  * the plugin declares none, and every operation says so rather than storing
@@ -61,15 +78,28 @@ export function openPluginDatabase(
     return s;
   };
 
-  /** The operations, with the declaration applied; `writes` false refuses put and delete. */
-  const ops = (writes: boolean): DbOperations => ({
+  /**
+   * The operations, with the declaration applied. `writes` false refuses put
+   * and delete; `only` limits the stores a transaction named, as IndexedDB
+   * does; `handle.closed` is set when a transaction callback has returned, so
+   * a `tx` kept past its callback refuses rather than reading and writing
+   * outside the transaction it belonged to.
+   */
+  const ops = (writes: boolean, only: ReadonlySet<string> | null = null, handle: { closed: boolean } = { closed: false }): DbOperations => {
+    const storeIn = (name: string): DbStoreSpec => {
+      if (handle.closed) throw new Error("this transaction has ended; its handle cannot be used outside its callback");
+      const s = storeOf(name);
+      if (only && !only.has(name)) throw new Error(`store ${name} is not in this transaction; it named ${[...only].join(", ")}`);
+      return s;
+    };
+    return {
     get(store, key) {
-      storeOf(store);
+      storeIn(store);
       if (!isKey(key)) throw new Error("key must be a string or a finite number");
       return tables.get(scope, store, key);
     },
     put(store, value, key) {
-      const s = storeOf(store);
+      const s = storeIn(store);
       if (!writes) throw new Error(readOnly ? READ_ONLY : "put in a readonly transaction");
       const text = JSON.stringify(value);
       if (text === undefined) throw new Error("value must be JSON");
@@ -89,26 +119,27 @@ export function openPluginDatabase(
       return k;
     },
     delete(store, query) {
-      storeOf(store);
+      storeIn(store);
       if (!writes) throw new Error(readOnly ? READ_ONLY : "delete in a readonly transaction");
       tables.delete(scope, store, query);
     },
     getAll(store, query, count) {
-      storeOf(store);
+      storeIn(store);
       return tables.getAll(scope, store, query, count ?? null);
     },
     getAllFromIndex(store, index, query, count) {
-      const s = storeOf(store);
+      const s = storeIn(store);
       if (!s.indexes || !Object.prototype.hasOwnProperty.call(s.indexes, index)) {
         throw new Error(`${who} declares no index named ${index} on store ${store}`);
       }
       return tables.getAllFromIndex(scope, store, query, count ?? null);
     },
     count(store, query) {
-      storeOf(store);
+      storeIn(store);
       return tables.count(scope, store, query);
     },
-  });
+    };
+  };
 
   let upgraded = false;
   /**
@@ -125,7 +156,9 @@ export function openPluginDatabase(
       const from = stored ?? 0;
       try {
         tables.transaction(() => {
-          spec.upgrade?.(ops(true), from);
+          const handle = { closed: false };
+          try { mustBeSync(spec.upgrade?.(ops(true, null, handle), from), "upgrade"); }
+          finally { handle.closed = true; }
           tables.setVersion(scope, spec.version);
         });
       } catch (e) {
@@ -145,9 +178,17 @@ export function openPluginDatabase(
     async count(store, query) { ready(); return rw.count(store, query); },
     async transaction(stores, mode, fn) {
       ready();
-      for (const name of typeof stores === "string" ? [stores] : stores) storeOf(name);
+      const named = new Set(typeof stores === "string" ? [stores] : stores);
+      for (const name of named) storeOf(name);
       if (mode === "readwrite" && readOnly) throw new Error(READ_ONLY);
-      return tables.transaction(() => fn(ops(mode === "readwrite")));
+      return tables.transaction(() => {
+        const handle = { closed: false };
+        try {
+          const out = fn(ops(mode === "readwrite", named, handle));
+          mustBeSync(out, "a transaction callback");
+          return out;
+        } finally { handle.closed = true; }
+      });
     },
   };
 }
