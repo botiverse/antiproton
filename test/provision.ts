@@ -4,7 +4,7 @@
  * echoed. The steps inside the agent's object run against a real runtime in test/provision-runtime.ts;
  * the registry's SQL against real D1 in test/control-plane-d1.sh.
  */
-import { handleProvision, providerAgentId, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
+import { handleProvision, providerAgentId, repairPush, type ProvisionDeps } from "../cf/src/provision/handlers.ts";
 import type { ProvisionedAgent, ProvisionRegistry } from "../cf/src/control-plane.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -311,6 +311,23 @@ await check("the antiproton agent id is the Raft id, prefixed, made legal for an
 });
 
 console.log(`\n  provision (raft-agent-provider.v1)\n  ${"─".repeat(56)}`);
+await check("the push repair re-registers through the same tool creation used, and the row follows the result", async () => {
+  const { deps, rows, calls, fail } = fakeDeps();
+  const made = await call(deps, "POST", "/agents", body(), "01JAGENT");
+  assert(made.status === 201, `create: ${made.status} ${made.text}`);
+  const before = calls.length;
+  const row = [...rows.values()][0]!;
+  const fixed = await repairPush(deps, row.tenantId, row.raftAgentId);
+  assert(fixed.ok && fixed.push === true && fixed.error === null, `repair: ${JSON.stringify(fixed)}`);
+  assert(calls.slice(before).join(";") === `enable_push ${row.agentId}`, `the repair did something other than enable_push: ${calls.slice(before).join(";")}`);
+  fail.add("enable_push");
+  const broken = await repairPush(deps, row.tenantId, row.raftAgentId);
+  assert(broken.ok && broken.push === false && /503/.test(String(broken.error)), `a failed registration must say so: ${JSON.stringify(broken)}`);
+  assert(rows.get(`${row.tenantId}/${row.raftAgentId}`)!.pushRegistered === false, "the row still says registered after a failed repair");
+  const missing = await repairPush(deps, row.tenantId, "never-made");
+  assert(!missing.ok && /no live provisioned agent never-made/.test(missing.error), `an unknown agent: ${JSON.stringify(missing)}`);
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);
