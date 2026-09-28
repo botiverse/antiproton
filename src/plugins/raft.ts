@@ -625,7 +625,11 @@ export const raftPlugin: Plugin = {
     try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
     catch { return { deliver: false, malformed: true, reason: "signed, but the body is not JSON" }; }
     if (payload.schema !== NOTICE_SCHEMA) {
-      return { deliver: false, malformed: true, reason: `signed, but the body is not a ${NOTICE_SCHEMA} notice` };
+      // The schema value itself is named: it is the one fact that tells an old
+      // format apart from a new one with a field wrong (the 09:44Z 400 on 2026-09-28
+      // could not be told apart from our record).
+      const schema = typeof payload.schema === "string" ? payload.schema.slice(0, 64) : typeof payload.schema;
+      return { deliver: false, malformed: true, reason: `signed, but the schema is ${JSON.stringify(schema)}, not ${NOTICE_SCHEMA}` };
     }
     return receiveNotice(payload, inbound.headers, ctx);
   },
@@ -638,10 +642,15 @@ export const raftPlugin: Plugin = {
  * goes under the outside-content label (`as` stays the default).
  */
 async function receiveNotice(payload: ObjectValue, headers: Record<string, string>, ctx: PluginContext): Promise<InboundResult> {
-  if (typeof payload.noticeId !== "string" || !PUSH_ID.test(payload.noticeId) ||
-      typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ||
-      typeof payload.text !== "string" || !payload.text.trim() || !Array.isArray(payload.targets)) {
-    return { deliver: false, malformed: true, reason: `signed, but the body is not a ${NOTICE_SCHEMA} notice` };
+  const missing = [
+    typeof payload.noticeId !== "string" || !PUSH_ID.test(payload.noticeId) ? "noticeId" : null,
+    typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ? "recipientAgentId" : null,
+    typeof payload.text !== "string" || !payload.text.trim() ? "text" : null,
+    !Array.isArray(payload.targets) ? "targets" : null,
+  ].filter((f): f is string => f !== null);
+  if (missing.length) {
+    // Field names only, never values: the record is read by an operator, and a value may be anything.
+    return { deliver: false, malformed: true, reason: `signed ${NOTICE_SCHEMA}, but not a notice: ${missing.join(", ")} missing or malformed` };
   }
   const headerId = headers["x-raft-delivery-id"];
   if (!headerId || headerId !== payload.noticeId) {
