@@ -75,7 +75,8 @@ await check("what the plugin says about who is speaking decides whether the agen
   const posted: string[] = [];
   (rt as any).postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
   const made = await (await grab("a", "p"))!.create();
-  for (const extra of [{}, { "x-as": "event" }, { "x-as": "user" }]) {
+  const lanes: Array<Record<string, string>> = [{}, { "x-as": "event" }, { "x-as": "user" }];
+  for (const extra of lanes) {
     must((await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret, extra))).outcome === "delivered", `not delivered for ${JSON.stringify(extra)}`);
   }
   must(posted.length === 3, `posted ${posted.length}`);
