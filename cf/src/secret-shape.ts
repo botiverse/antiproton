@@ -44,6 +44,8 @@ const GENERIC_SHAPES: ReadonlyArray<readonly [string, RegExp]> = [
   // Our own service tokens (cf/src/service-token.ts): the prefix is theirs alone, so the value
   // is recognisable without a label, unlike the API keys below.
   ["service-token", /\bst-[A-Za-z0-9_-]{40,}/],
+  // A Raft server's provider token (cf/src/provider-token.ts): a tenant, not an agent; same reasoning.
+  ["provider-token", /\bpt-[A-Za-z0-9_-]{40,}/],
   // A key recognised by the LABEL beside it rather than by its own shape:
   // `x-api-key: <value>`, `EXA_API_KEY=<value>`. Exa's key is a bare UUID —
   // the shape of every id this system prints (Raft message ids, agent ids,

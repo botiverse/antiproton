@@ -31,6 +31,7 @@ check("each credential shape is recognised by kind, wherever it sits in a messag
     ["private-key", `-----BEGIN ${"OPENSSH"} PRIVATE KEY-----\nabc`],
     ["slack-token", `${"xo" + "xb-" + r("1", 20)}`],
     ["service-token", `${"st" + "-" + r("k", 43)}`],
+    ["provider-token", `${"pt" + "-" + r("k", 43)}`],
     ["url-with-password", `read replica ${"postgresql://owner:" + r("p", 12) + "@db.example.com/app?sslmode=require"}`],
     ["neon-password", `password ${"np" + "g_" + r("Z", 16)}`],
     // Recognised by the label beside it, because the value alone is a UUID —

@@ -311,3 +311,137 @@ export function d1InboundHooks(db: D1Database, now: () => number = Date.now): Ho
     },
   };
 }
+
+// ---- provisioning (raft-agent-provider.v1): a Raft server's token, and the agents it made.
+
+/** What a provider token stands for: a tenant, and the one Raft origin its mounts may point at. */
+export interface ProviderTokenIdentity {
+  label: string;
+  tenantId: string;
+  raftOrigin: string;
+}
+
+export interface ProviderTokenDirectory {
+  issue(row: ProviderTokenIdentity & { hash: string }): Promise<void>;
+  /** A token resolves only while it is not revoked. */
+  lookup(hash: string): Promise<ProviderTokenIdentity | null>;
+  /** Whether a live token was revoked by this call. */
+  revoke(hash: string): Promise<boolean>;
+  list(): Promise<Array<ProviderTokenIdentity & { hash: string; createdAt: number; revokedAt: number | null; lastUsedAt: number | null }>>;
+  /** Remember a use, at most once an hour: enough to see a dead token, cheap enough for every request. */
+  touch(hash: string): Promise<void>;
+}
+
+export function d1ProviderTokens(db: D1Database, now: () => number = Date.now): ProviderTokenDirectory {
+  const identity = (r: any): ProviderTokenIdentity => ({ label: String(r.label), tenantId: String(r.tenant_id), raftOrigin: String(r.raft_origin) });
+  return {
+    async issue(row) {
+      await db.prepare("INSERT INTO provider_tokens(hash, label, tenant_id, raft_origin, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(row.hash, row.label, row.tenantId, row.raftOrigin, now()).run();
+    },
+    async lookup(hash) {
+      const r: any = await db.prepare("SELECT label, tenant_id, raft_origin FROM provider_tokens WHERE hash = ? AND revoked_at IS NULL")
+        .bind(hash).first();
+      return r ? identity(r) : null;
+    },
+    async revoke(hash) {
+      const res = await db.prepare("UPDATE provider_tokens SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL")
+        .bind(now(), hash).run();
+      return Number(res.meta?.changes ?? 0) > 0;
+    },
+    async list() {
+      const { results } = await db.prepare("SELECT * FROM provider_tokens ORDER BY created_at DESC, hash").all();
+      return (results as any[]).map((r) => ({
+        ...identity(r), hash: String(r.hash), createdAt: Number(r.created_at),
+        revokedAt: r.revoked_at === null ? null : Number(r.revoked_at),
+        lastUsedAt: r.last_used_at === null ? null : Number(r.last_used_at),
+      }));
+    },
+    async touch(hash) {
+      const t = now();
+      await db.prepare("UPDATE provider_tokens SET last_used_at = ? WHERE hash = ? AND (last_used_at IS NULL OR last_used_at < ?)")
+        .bind(t, hash, t - HOUR_MS).run();
+    },
+  };
+}
+
+export type ProvisionStatus = "provisioning" | "active" | "deleted";
+
+/** One Raft agent the provider made, as the registry keeps it. Never the credential. */
+export interface ProvisionedAgent {
+  tenantId: string;
+  raftAgentId: string;
+  agentId: string;
+  raftServerId: string;
+  raftOrigin: string;
+  name: string;
+  instructions: string;
+  model: string | null;
+  status: ProvisionStatus;
+  pushRegistered: boolean;
+  pushError: string | null;
+  createdAt: number;
+  updatedAt: number;
+  deletedAt: number | null;
+}
+
+export type ProvisionedAgentPatch = Partial<Pick<ProvisionedAgent, "name" | "instructions" | "model" | "status" | "pushRegistered" | "pushError" | "deletedAt">>;
+
+export interface ProvisionRegistry {
+  /** A new row. Throws when the Raft id, or the agent id, is already taken in this tenant. */
+  create(row: Omit<ProvisionedAgent, "createdAt" | "updatedAt" | "deletedAt">): Promise<void>;
+  get(tenantId: string, raftAgentId: string): Promise<ProvisionedAgent | null>;
+  getByAgentId(tenantId: string, agentId: string): Promise<ProvisionedAgent | null>;
+  /** Whether a row was changed. `updated_at` moves with every change. */
+  update(tenantId: string, raftAgentId: string, patch: ProvisionedAgentPatch): Promise<boolean>;
+}
+
+export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now): ProvisionRegistry {
+  const row = (r: any): ProvisionedAgent => ({
+    tenantId: String(r.tenant_id), raftAgentId: String(r.raft_agent_id), agentId: String(r.agent_id),
+    raftServerId: String(r.raft_server_id), raftOrigin: String(r.raft_origin),
+    name: String(r.name), instructions: String(r.instructions), model: r.model === null ? null : String(r.model),
+    status: String(r.status) as ProvisionStatus,
+    pushRegistered: Number(r.push_registered) === 1, pushError: r.push_error === null ? null : String(r.push_error),
+    createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+    deletedAt: r.deleted_at === null ? null : Number(r.deleted_at),
+  });
+  // The column a patch key writes. Listed, so a key this table does not have is a failed lookup, not SQL.
+  const COLUMNS: Record<keyof ProvisionedAgentPatch, string> = {
+    name: "name", instructions: "instructions", model: "model", status: "status",
+    pushRegistered: "push_registered", pushError: "push_error", deletedAt: "deleted_at",
+  };
+  return {
+    async create(r) {
+      const t = now();
+      await db.prepare(
+        "INSERT INTO provisioned_agents(tenant_id, raft_agent_id, agent_id, raft_server_id, raft_origin, name, instructions, model, status, push_registered, push_error, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(r.tenantId, r.raftAgentId, r.agentId, r.raftServerId, r.raftOrigin, r.name, r.instructions, r.model, r.status,
+        r.pushRegistered ? 1 : 0, r.pushError, t, t).run();
+    },
+    async get(tenantId, raftAgentId) {
+      const r = await db.prepare("SELECT * FROM provisioned_agents WHERE tenant_id = ? AND raft_agent_id = ?").bind(tenantId, raftAgentId).first();
+      return r ? row(r) : null;
+    },
+    async getByAgentId(tenantId, agentId) {
+      const r = await db.prepare("SELECT * FROM provisioned_agents WHERE tenant_id = ? AND agent_id = ?").bind(tenantId, agentId).first();
+      return r ? row(r) : null;
+    },
+    async update(tenantId, raftAgentId, patch) {
+      const sets: string[] = [];
+      const values: unknown[] = [];
+      for (const key of Object.keys(patch) as Array<keyof ProvisionedAgentPatch>) {
+        const v = patch[key];
+        if (v === undefined) continue;
+        sets.push(`${COLUMNS[key]} = ?`);
+        values.push(typeof v === "boolean" ? (v ? 1 : 0) : v);
+      }
+      sets.push("updated_at = ?");
+      values.push(now());
+      const res = await db.prepare(`UPDATE provisioned_agents SET ${sets.join(", ")} WHERE tenant_id = ? AND raft_agent_id = ?`)
+        .bind(...values, tenantId, raftAgentId).run();
+      return Number(res.meta?.changes ?? 0) > 0;
+    },
+  };
+}

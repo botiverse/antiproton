@@ -62,6 +62,8 @@
     "test/mount-config.ts",
     "test/plugin-enable.ts",
     "test/plugin-hooks.ts",
+    "test/provision.ts",
+    "test/provision-runtime.ts",
     "test/admin-mount.ts",
     "test/prompt-contributions.ts",
     "test/control-plane.ts",

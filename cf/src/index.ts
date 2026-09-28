@@ -74,6 +74,11 @@ import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory 
 import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
+import { adminProviderTokens } from "./admin-provider-tokens.ts";
+import { d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
+import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
+import { adoptProvisionedAgent, provisionTool, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -1698,6 +1703,19 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("adminAddMount", () => this.runtime().addMount(tenantId, agentId, seed));
   }
 
+  /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
+  async provisionAdopt(tenantId: string, agentId: string, specJson: string) {
+    this.#claim(tenantId, agentId);
+    const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string };
+    return this.#busy("provisionAdopt", () => adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }));
+  }
+
+  /** One of the raft plugin's push tools, run by the provider rather than the model. */
+  async provisionTool(tenantId: string, agentId: string, name: ProvisionTool) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("provisionTool", () => provisionTool(this.runtime(), tenantId, agentId, name));
+  }
+
   async hookDropSecret(tenantId: string, agentId: string, hookId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
@@ -2504,6 +2522,60 @@ async function adminMounts(request: Request, env: Env): Promise<Response> {
   return r.ok ? Response.json({ added: r.added }) : Response.json({ error: r.error }, { status: 400 });
 }
 
+/**
+ * `/provision/...`: a Raft server creates, edits and deletes agents here (raft-agent-provider.v1),
+ * authenticated by its provider token. The token is the tenant; the request never names one. The
+ * rules are in cf/src/provision/handlers.ts; this wires them to D1 and to the agents' objects.
+ */
+async function provision(request: Request, env: Env, url: URL): Promise<Response> {
+  const refuse = (status: number, code: string, message: string) =>
+    Response.json({ error: { code, message } }, { status, headers: { "cache-control": "no-store" } });
+  const m = /^Bearer\s+(\S+)$/i.exec((request.headers.get("authorization") ?? "").trim());
+  const token = m?.[1] ?? "";
+  if (!looksLikeProviderToken(token)) return refuse(401, "unauthorized", "send the provider token as Authorization: Bearer <token>");
+  const tokens = d1ProviderTokens(env.CONTROL_DB);
+  const hash = await hashProviderToken(token);
+  const who = await tokens.lookup(hash);
+  if (!who) return refuse(401, "unauthorized", "the provider token is not one this deployment issued, or was revoked");
+  await tokens.touch(hash);
+  let body: unknown = undefined;
+  if (request.method === "POST" || request.method === "PATCH" || request.method === "PUT") {
+    const text = await request.text();
+    try { body = text ? JSON.parse(text) : {}; }
+    catch { return refuse(400, "invalid_json", "the body is not JSON"); }
+  }
+  const { tenantId } = who;
+  const stub = (agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  const home = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, PROVIDER_HOME)));
+  const deps: ProvisionDeps = {
+    now: () => Date.now(),
+    registry: d1ProvisionedAgents(env.CONTROL_DB),
+    // One entry to start: the deployment's operator model. The string is opaque to Raft.
+    models: async () => [{ id: env.HARNESS_MODEL, label: env.HARNESS_MODEL }],
+    agent: {
+      adopt: async (agentId, spec) => {
+        const r = await stub(agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));
+        if (!r.ok) throw new Error(r.error);
+        // Listed under the provider's home, so the console shows what Raft made. Idempotent.
+        await home.uiRecordAgent(tenantId, PROVIDER_HOME, { agentId, name: spec.name, description: spec.instructions, avatar: r.avatar, createdAt: Date.now() });
+      },
+      attachCredential: async (agentId, credential) => {
+        const r = await stub(agentId).uiAttachCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS, { token: credential });
+        return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
+      },
+      removeCredential: (agentId) => stub(agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
+      tool: (agentId, name) => stub(agentId).provisionTool(tenantId, agentId, name),
+    },
+  };
+  try {
+    const res = await handleProvision(request.method, url.pathname.slice("/provision".length), { idempotencyKey: request.headers.get("idempotency-key") }, body, who, deps);
+    return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
+  } catch (e) {
+    const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
+    return refuse(500, "internal", message);
+  }
+}
+
 /** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
 async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const key = bearerKey(request);
@@ -2751,6 +2823,9 @@ export default {
     if (url.pathname === "/admin/api-keys") return adminApiKeys(request, env);
     // The operator's service tokens (task #7): identities, so before any object as well.
     if (url.pathname === "/admin/service-tokens") return adminServiceTokens(request, env.AUTOMATION_TOKEN, d1ServiceTokens(env.CONTROL_DB), url);
+    // A Raft server's provider tokens, and the agents it provisions with them (raft-agent-provider.v1).
+    if (url.pathname === "/admin/provider-tokens") return adminProviderTokens(request, env.AUTOMATION_TOKEN, d1ProviderTokens(env.CONTROL_DB), url);
+    if (url.pathname.startsWith("/provision/")) return provision(request, env, url);
     // A service's push: addressed by the hook id alone, before any sign-in.
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);

@@ -1,0 +1,246 @@
+/**
+ * `/provision/*` — raft-agent-provider.v1 (agreed with Tenny, Raft, 2026-09-28 in #raft-antiproton).
+ *
+ * Raft creates an external agent, picks antiproton as its runtime, and calls here with the server's
+ * provider token. What follows on our side is the five steps a person would do by hand — an agent
+ * record, a model binding, a `raft` mount pointing at that Raft, the agent's `sk_agent` credential
+ * sealed onto the mount, and push registration — run through the same RPCs and the plugin's own
+ * `enable_push` tool, so there is one registration path and one audit trail. Once made, the agent
+ * runs on the P1 protocol like any hand-connected one; provisioning only removes the manual setup.
+ *
+ * The rules that need no Worker live here, over `ProvisionDeps`, so each can go red in
+ * test/provision.ts: the shape of a request, idempotency, the token's origin, what a replay is
+ * allowed to do, and that the credential is sealed and never echoed. cf/src/index.ts wires the deps
+ * to the token directory, the registry (both D1) and the agent's object.
+ *
+ * Idempotency is strict: `Idempotency-Key` is the Raft agent id, and a replay must carry the same
+ * body. Same key with any field different is 409, never a quiet update — Raft edits through PATCH,
+ * and a delayed POST retry must not overwrite an edit that landed after it (Tenny's race).
+ */
+import type { Json } from "../../../src/core/types.ts";
+import { originProblem } from "../../../src/plugins/types.ts";
+import { secretShape } from "../secret-shape.ts";
+import type { ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
+
+export type ProvisionTool = "enable_push" | "disable_push" | "push_status";
+
+/** What the handler asks of the agent's own object. Each is one RPC in cf/src/index.ts. */
+export interface ProvisionAgentOps {
+  /** Create or update the record (persona), bind the model, make sure the `raft` mount points at `raftOrigin`. */
+  adopt(agentId: string, spec: { name: string; instructions: string; raftOrigin: string }): Promise<void>;
+  /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
+  attachCredential(agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
+  removeCredential(agentId: string): Promise<boolean>;
+  /** Run one of the raft plugin's push tools through the gateway, as the model would. */
+  tool(agentId: string, name: ProvisionTool): Promise<{ ok: true; result: Json } | { ok: false; error: string }>;
+}
+
+export interface ProvisionDeps {
+  now(): number;
+  registry: ProvisionRegistry;
+  /** What `model` may be. Opaque to Raft; shown in its dropdown. */
+  models(): Promise<Array<{ id: string; label: string }>>;
+  agent: ProvisionAgentOps;
+}
+
+export const PROVIDER_AGENT_PREFIX = "raft_";
+const NAME_MAX = 60;
+const INSTRUCTIONS_MAX = 8_000;
+const RAFT_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+/** The plugin's own reading of its credential (src/plugins/raft.ts looksLike). */
+const RAFT_CREDENTIAL = /^sk_agent_[A-Za-z0-9_-]{16,}$/;
+
+/**
+ * The antiproton agent a Raft agent is, from its id alone: deterministic, so a replay lands on the
+ * same object without a lookup, and legal for an object name (cf/src/object-name.ts).
+ */
+export function providerAgentId(raftAgentId: string): string {
+  return (PROVIDER_AGENT_PREFIX + raftAgentId.replace(/[^A-Za-z0-9._-]/g, "_")).slice(0, 64);
+}
+
+type Fail = { status: number; code: string; message: string; param?: string };
+const fail = (f: Fail) => Response.json({ error: { code: f.code, message: f.message, ...(f.param ? { param: f.param } : {}) } }, { status: f.status, headers: { "cache-control": "no-store" } });
+const ok = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
+
+const field = (body: unknown, key: string): unknown => (typeof body === "object" && body !== null ? (body as Record<string, unknown>)[key] : undefined);
+
+/** A text field within bounds, and not a credential someone pasted where a name goes. */
+function textField(body: unknown, key: string, max: number, required: boolean): string | undefined | Fail {
+  const v = field(body, key);
+  if (v === undefined) return required ? { status: 422, code: "missing", message: `${key} is required`, param: key } : undefined;
+  if (typeof v !== "string") return { status: 422, code: "invalid", message: `${key} must be a string`, param: key };
+  if (required && !v.trim()) return { status: 422, code: "invalid", message: `${key} must not be empty`, param: key };
+  if (v.length > max) return { status: 422, code: "invalid", message: `${key} is at most ${max} characters`, param: key };
+  const shape = secretShape(v);
+  if (shape) return { status: 422, code: "credential_in_text", message: `${key} carries what looks like a ${shape}; credentials go in the credential field only`, param: key };
+  return v;
+}
+const isFail = (v: unknown): v is Fail => typeof v === "object" && v !== null && "status" in v && "code" in v;
+
+function credentialField(body: unknown): string | Fail {
+  const v = field(body, "credential");
+  if (typeof v !== "string" || !v) return { status: 422, code: "missing", message: "credential is required", param: "credential" };
+  if (!RAFT_CREDENTIAL.test(v)) return { status: 422, code: "invalid", message: "credential is not a Raft agent credential", param: "credential" };
+  return v;
+}
+
+async function modelField(body: unknown, deps: ProvisionDeps): Promise<string | null | Fail> {
+  const v = field(body, "model");
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string") return { status: 422, code: "invalid", message: "model must be a string", param: "model" };
+  const models = await deps.models();
+  if (!models.some((m) => m.id === v)) return { status: 422, code: "invalid", message: `model is not one this deployment offers (${models.map((m) => m.id).join(", ")})`, param: "model" };
+  return v;
+}
+
+/** What Raft sees of a row. The credential has no field here to be in. */
+function view(row: ProvisionedAgent, live?: Json) {
+  return {
+    providerAgentId: row.agentId,
+    raftAgentId: row.raftAgentId,
+    raftServerId: row.raftServerId,
+    raftOrigin: row.raftOrigin,
+    name: row.name,
+    instructions: row.instructions,
+    model: row.model,
+    status: row.status,
+    push: { registered: row.pushRegistered, ...(row.pushError ? { error: row.pushError } : {}), ...(live !== undefined ? { live } : {}) },
+    createdAt: new Date(row.createdAt).toISOString(),
+    updatedAt: new Date(row.updatedAt).toISOString(),
+    deletedAt: row.deletedAt === null ? null : new Date(row.deletedAt).toISOString(),
+  };
+}
+
+/** Register push through the plugin's own tool and write what happened; the row says `registered` only when it is. */
+async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise<ProvisionedAgent> {
+  const push = await deps.agent.tool(row.agentId, "enable_push");
+  const patch = { status: "active" as const, pushRegistered: push.ok, pushError: push.ok ? null : push.error };
+  await deps.registry.update(row.tenantId, row.raftAgentId, patch);
+  return { ...row, ...patch, updatedAt: deps.now() };
+}
+
+export async function handleProvision(
+  method: string, path: string, headers: { idempotencyKey: string | null }, body: unknown,
+  who: ProviderTokenIdentity, deps: ProvisionDeps,
+): Promise<Response | null> {
+  const seg = path.split("/").filter(Boolean);
+  const { tenantId } = who;
+
+  if (seg.length === 1 && seg[0] === "models" && method === "GET") {
+    return ok({ models: await deps.models() });
+  }
+
+  if (seg.length === 1 && seg[0] === "agents" && method === "POST") {
+    const raftAgentId = field(body, "raftAgentId");
+    if (typeof raftAgentId !== "string" || !RAFT_ID.test(raftAgentId)) {
+      return fail({ status: 422, code: "invalid", message: `raftAgentId must match ${RAFT_ID}`, param: "raftAgentId" });
+    }
+    if (headers.idempotencyKey !== null && headers.idempotencyKey !== raftAgentId) {
+      return fail({ status: 422, code: "invalid", message: "Idempotency-Key must be the raftAgentId", param: "Idempotency-Key" });
+    }
+    const raftServerId = textField(body, "raftServerId", 128, true);
+    if (isFail(raftServerId)) return fail(raftServerId);
+    const raftOrigin = field(body, "raftOrigin");
+    if (typeof raftOrigin !== "string" || originProblem(raftOrigin)) {
+      return fail({ status: 422, code: "invalid", message: `raftOrigin ${typeof raftOrigin === "string" ? originProblem(raftOrigin) : "is required"}`, param: "raftOrigin" });
+    }
+    // The token was minted for one Raft. A mount made under it points there and nowhere else, so a
+    // leaked token cannot aim an agent's credential at another address.
+    if (raftOrigin !== who.raftOrigin) {
+      return fail({ status: 422, code: "origin_mismatch", message: "raftOrigin is not the origin this token was issued for", param: "raftOrigin" });
+    }
+    const name = textField(body, "name", NAME_MAX, true);
+    if (isFail(name)) return fail(name);
+    const instructions = textField(body, "instructions", INSTRUCTIONS_MAX, false) ?? "";
+    if (isFail(instructions)) return fail(instructions);
+    const model = await modelField(body, deps);
+    if (isFail(model)) return fail(model);
+    const credential = credentialField(body);
+    if (isFail(credential)) return fail(credential);
+
+    const agentId = providerAgentId(raftAgentId);
+    const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions, model };
+    let row = await deps.registry.get(tenantId, raftAgentId);
+    let created = false;
+    if (row) {
+      if (row.status === "deleted") {
+        return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
+      }
+      const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) => row![k] !== asked[k]);
+      if (differs.length) {
+        return fail({ status: 409, code: "idempotency_conflict", message: `a different request was already made under this key (${differs.join(", ")}); edits go through PATCH` });
+      }
+    } else {
+      const t = deps.now();
+      row = { tenantId, raftAgentId, agentId, ...asked, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
+      try { await deps.registry.create(row); }
+      catch {
+        // The Raft id is new but the agent id it maps to is taken: two Raft ids that sanitise alike.
+        return fail({ status: 409, code: "agent_id_taken", message: `${agentId} already belongs to another Raft agent in this tenant` });
+      }
+      created = true;
+    }
+    // From here every step is idempotent, so a replay of a request that died half-way finishes it.
+    await deps.agent.adopt(agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin });
+    const attached = await deps.agent.attachCredential(agentId, credential);
+    if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
+    row = await registerPush(deps, row);
+    return ok(view(row), created ? 201 : 200);
+  }
+
+  if (seg[0] !== "agents" || seg.length < 2 || seg.length > 3) return null;
+  const row = await deps.registry.getByAgentId(tenantId, seg[1]!);
+  const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${seg[1]}` });
+
+  if (seg.length === 2 && method === "GET") {
+    if (!row) return gone();
+    if (row.status === "deleted") return ok(view(row));
+    const status = await deps.agent.tool(row.agentId, "push_status");
+    return ok(view(row, status.ok ? status.result : { error: status.error }));
+  }
+
+  if (seg.length === 2 && method === "PATCH") {
+    if (!row || row.status === "deleted") return gone();
+    const name = textField(body, "name", NAME_MAX, false);
+    if (isFail(name)) return fail(name);
+    const instructions = textField(body, "instructions", INSTRUCTIONS_MAX, false);
+    if (isFail(instructions)) return fail(instructions);
+    const modelGiven = field(body, "model") !== undefined;
+    const model = await modelField(body, deps);
+    if (isFail(model)) return fail(model);
+    if (name === undefined && instructions === undefined && !modelGiven) {
+      return fail({ status: 422, code: "empty", message: "nothing to change: give name, instructions or model" });
+    }
+    const patch = { ...(name !== undefined ? { name } : {}), ...(instructions !== undefined ? { instructions } : {}), ...(modelGiven ? { model } : {}) };
+    await deps.registry.update(tenantId, row.raftAgentId, patch);
+    const next = { ...row, ...patch, updatedAt: deps.now() };
+    await deps.agent.adopt(row.agentId, { name: next.name, instructions: next.instructions, raftOrigin: next.raftOrigin });
+    return ok(view(next));
+  }
+
+  if (seg.length === 3 && seg[2] === "credential" && method === "PUT") {
+    if (!row || row.status === "deleted") return gone();
+    const credential = credentialField(body);
+    if (isFail(credential)) return fail(credential);
+    const attached = await deps.agent.attachCredential(row.agentId, credential);
+    if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
+    // A new credential means a new registration on Raft's side; the plugin replaces the hook and re-PUTs.
+    return ok(view(await registerPush(deps, row)));
+  }
+
+  if (seg.length === 2 && method === "DELETE") {
+    if (!row) return gone();
+    if (row.status === "deleted") return ok(view(row));
+    // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
+    // reported is what could not be undone here. The object and its transcript stay: data is
+    // never destroyed by a delete, here as for every agent.
+    const off = await deps.agent.tool(row.agentId, "disable_push");
+    await deps.agent.removeCredential(row.agentId);
+    const t = deps.now();
+    const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
+    await deps.registry.update(tenantId, row.raftAgentId, patch);
+    return ok(view({ ...row, ...patch, updatedAt: t }));
+  }
+
+  return null;
+}

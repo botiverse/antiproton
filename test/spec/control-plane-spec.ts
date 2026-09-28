@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Identities, d1InboundHooks, d1ServiceTokens } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -15,7 +15,10 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   const keys = d1ApiKeys(db, () => ++clock);
   const hooks = d1InboundHooks(db, () => ++clock);
   const tokens = d1ServiceTokens(db, () => clock);
-  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM service_tokens")]);
+  const provider = d1ProviderTokens(db, () => clock);
+  const registry = d1ProvisionedAgents(db, () => clock);
+  const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM service_tokens"),
+    db.prepare("DELETE FROM provider_tokens"), db.prepare("DELETE FROM provisioned_agents")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -208,6 +211,57 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     await tokens.touch("s3");
     assert((await tokens.list())[0]!.lastUsedAt === clock, "a touch after an hour did not write");
     await tokens.touch("s9");
+  });
+
+  add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
+    const cols = async (table: string) => ((await db.prepare(`PRAGMA table_info(${table})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
+    assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
+    assert((await cols("provisioned_agents")) === "agent_id,created_at,deleted_at,instructions,model,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
+      `provisioned_agents ${await cols("provisioned_agents")}`);
+  });
+
+  add("a provider token resolves to its tenant and origin until it is revoked; touch writes once an hour", async () => {
+    clock = 1_800_000_000_000;
+    await provider.issue({ hash: "p1", label: "raft-prod", tenantId: "t-raft", raftOrigin: "https://api.raft.build" });
+    const got = await provider.lookup("p1");
+    assert(got?.tenantId === "t-raft" && got.raftOrigin === "https://api.raft.build" && got.label === "raft-prod", `lookup ${JSON.stringify(got)}`);
+    assert((await provider.lookup("p9")) === null, "an absent token resolved");
+    await provider.touch("p1");
+    const first = (await provider.list())[0]!;
+    assert(first.lastUsedAt === clock, `first touch ${first.lastUsedAt}`);
+    clock += 60_000;
+    await provider.touch("p1");
+    assert((await provider.list())[0]!.lastUsedAt === first.lastUsedAt, "a touch within the hour wrote");
+    clock += 3_600_001;
+    await provider.touch("p1");
+    assert((await provider.list())[0]!.lastUsedAt === clock, "a touch after an hour did not write");
+    assert((await provider.revoke("p1")) === true && (await provider.revoke("p1")) === false, "revoke did not report once");
+    assert((await provider.lookup("p1")) === null, "a revoked token still resolves");
+    assert((await provider.list())[0]!.revokedAt === clock, "the listing lost the revocation");
+  });
+
+  add("the registry keeps one row per Raft agent, finds it by either id, refuses a second claim on an agent id, and patches only what it is given", async () => {
+    clock = 1_800_000_000_000;
+    const base = { tenantId: "t-raft", raftAgentId: "01J", agentId: "raft_01J", raftServerId: "srv", raftOrigin: "https://api.raft.build",
+      name: "Cody", instructions: "be brief", model: null, status: "provisioning" as const, pushRegistered: false, pushError: null };
+    await registry.create(base);
+    const byRaft = await registry.get("t-raft", "01J");
+    const byAgent = await registry.getByAgentId("t-raft", "raft_01J");
+    assert(byRaft && byAgent && JSON.stringify(byRaft) === JSON.stringify(byAgent), "the two lookups disagree");
+    assert(byRaft!.createdAt === clock && byRaft!.updatedAt === clock && byRaft!.deletedAt === null && byRaft!.pushRegistered === false, JSON.stringify(byRaft));
+    assert((await registry.get("t-other", "01J")) === null, "another tenant saw the row");
+    let threw = false;
+    try { await registry.create({ ...base, raftAgentId: "01J/x" }); } catch { threw = true; }
+    assert(threw, "a second Raft id claimed the same agent id");
+    clock += 5;
+    assert((await registry.update("t-raft", "01J", { status: "active", pushRegistered: true })) === true, "update did not report");
+    const after = await registry.get("t-raft", "01J");
+    assert(after!.status === "active" && after!.pushRegistered === true && after!.name === "Cody" && after!.updatedAt === clock && after!.createdAt === clock - 5, JSON.stringify(after));
+    clock += 5;
+    await registry.update("t-raft", "01J", { status: "deleted", deletedAt: clock, pushError: "disable_push: gone" });
+    const gone = await registry.get("t-raft", "01J");
+    assert(gone!.status === "deleted" && gone!.deletedAt === clock && gone!.pushError === "disable_push: gone" && gone!.pushRegistered === true, JSON.stringify(gone));
+    assert((await registry.update("t-raft", "nope", { name: "x" })) === false, "an absent row reported a change");
   });
 
   return cases;
