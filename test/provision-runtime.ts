@@ -71,6 +71,9 @@ await check("adopt makes the record with the persona, binds the operator model, 
   must(binding?.model === "deepseek-flash", `binding ${JSON.stringify(binding)}`);
   const mount = await rt.store.getMountByAlias("t", "raft_01J", PROVISION_MOUNT_ALIAS);
   must(mount?.plugin === "raft" && (mount.publicConfig as any).serverUrl === ORIGIN && mount.secretRef === null, JSON.stringify(mount));
+  // The defaults every agent gets, memory and artifacts among them: a provisioned agent is not a lesser agent.
+  const aliases = (await rt.store.listMounts("t", "raft_01J")).map((m) => m.alias).sort();
+  for (const a of ["artifacts", "state", "tools", "web", "gh", "sandbox", "raft"]) must(aliases.includes(a), `no ${a} mount: ${aliases.join(",")}`);
   const second = await adoptProvisionedAgent(rt, "t", "raft_01J", { ...SPEC, name: "Cody 2", instructions: "be thorough", avatar: "ffffffff" });
   must(second.ok && second.avatar === "0badcafe", `avatar changed: ${JSON.stringify(second)}`);
   const after = (await rt.store.loadAgent("t", "raft_01J"))?.config as any;
