@@ -72,23 +72,12 @@ function pushed(payload: unknown, options: { secret?: string; deliveryId?: strin
   };
 }
 
-/** One message as `GET /events` lists it: the same shape a v2 batch carries. */
-function raftMessage(overrides: Record<string, unknown> = {}) {
+/** An inbox notice as Raft sends it (raft-agent-inbox-notice.v1). */
+function notice(overrides: Record<string, unknown> = {}) {
   return {
-    seq: 120, message_id: "6ed41ed7", content: "please deploy the fix", timestamp: "2026-09-28T03:32:58Z",
-    sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel",
-    reply_target: "#general:6ed41ed7", attachments: [],
-    ...overrides,
-  };
-}
-
-function pushPayload(overrides: Record<string, unknown> = {}) {
-  return {
-    schema: "raft-agent-inbox.v2",
-    deliveryId: "delivery-1",
-    recipientAgentId: "agent-1",
-    cursor: { fromSeq: 120, toSeq: 120 },
-    events: [raftMessage()],
+    schema: "raft-agent-inbox-notice.v1", noticeId: "ntc_0123456789abcdef", recipientAgentId: "agent-1", occurredAt: "2026-09-28T08:50:00.000Z",
+    text: "Inbox update: 2 unread messages total; 1 changed target\n#qa-browser  pending: 2 messages · latest sender @tygg · you were mentioned",
+    targets: [{ target: "#qa-browser", channelId: "c1", channelType: "channel", pendingCount: 2, firstPendingMsgId: "m1", latestMsgId: "m2", latestSenderName: "tygg", latestSenderType: "human", flags: ["mention"] }],
     ...overrides,
   };
 }
@@ -498,60 +487,6 @@ await check("push state keeps every valid hook id until it is explicitly revoked
   }
 });
 
-await check("a signed batch delivers its messages, in order, as the conversation, without network access", async () => {
-  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
-  const incoming = pushPayload({
-    cursor: { fromSeq: 120, toSeq: 121 },
-    events: [raftMessage(), raftMessage({ seq: 121, message_id: "2f89c9ba", content: "and tell Vera", sender_type: "agent", sender_name: "Tenny", reply_target: "dm:@Tenny" })],
-  });
-  const out = await raftPlugin.receive!(pushed(incoming), PUSH_SECRET, m.ctx);
-  if (!out.deliver || out.dedupeKey !== "delivery-1" || out.as !== "user") throw new Error(JSON.stringify(out));
-  const first = out.text.indexOf("please deploy the fix"), second = out.text.indexOf("and tell Vera");
-  if (first < 0 || second < 0 || first > second) throw new Error(out.text);
-  for (const part of ["2 messages (seq 120–121)", "#general:6ed41ed7", "@tygg (human)", "msg 6ed41ed7", "dm:@Tenny", "@Tenny (agent)", "`send_message`", "a system notice usually needs none"]) {
-    if (!out.text.includes(part)) throw new Error(`missing ${part}:\n${out.text}`);
-  }
-  if (/receive_events/.test(out.text)) throw new Error(`still asks for a pull:\n${out.text}`);
-  if (m.state()?.lastReached?.deliveryId !== "delivery-1") throw new Error(`last reach not stored: ${JSON.stringify(m.state())}`);
-});
-
-await check("who is speaking decides the lane: a person or an agent makes it the conversation, system and app events keep the label", async () => {
-  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const system = raftMessage({ sender_type: "system", sender_name: "System", content: "@raft-bot was added to this channel." });
-  const app = raftMessage({ seq: 121, sender_type: "third_party_app", sender_name: "linear", content: "issue LIN-4 moved" });
-  const onlyEvents = await raftPlugin.receive!(pushed(pushPayload({ cursor: { fromSeq: 120, toSeq: 121 }, events: [system, app] })), PUSH_SECRET, m.ctx);
-  if (!onlyEvents.deliver || onlyEvents.as !== "event") throw new Error(JSON.stringify(onlyEvents));
-  if (!onlyEvents.text.includes("(system)") || !onlyEvents.text.includes("(third_party_app)")) throw new Error(onlyEvents.text);
-  const mixed = await raftPlugin.receive!(pushed(pushPayload({ cursor: { fromSeq: 120, toSeq: 121 }, events: [system, raftMessage({ seq: 121 })] })), PUSH_SECRET, m.ctx);
-  if (!mixed.deliver || mixed.as !== "user" || !mixed.text.includes("(system)") || !mixed.text.includes("(human)")) throw new Error(JSON.stringify(mixed));
-  const unknown = await raftPlugin.receive!(pushed(pushPayload({ events: [raftMessage({ sender_type: "robot" })] })), PUSH_SECRET, m.ctx);
-  if (!unknown.deliver || unknown.as !== "event" || !unknown.text.includes("(unknown)")) throw new Error(JSON.stringify(unknown));
-});
-
-await check("a long message is cut and says so, and no message of a large batch is dropped", async () => {
-  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const long = await raftPlugin.receive!(pushed(pushPayload({ events: [raftMessage({ content: "y".repeat(20_000) })] })), PUSH_SECRET, m.ctx);
-  if (!long.deliver || long.text.length > 11_000 || !/cut, 10000 more characters; read the message with a tool/.test(long.text)) {
-    throw new Error(`length ${long.deliver ? long.text.length : "-"}: ${long.deliver ? long.text.slice(-120) : JSON.stringify(long)}`);
-  }
-  const events = Array.from({ length: 100 }, (_, i) => raftMessage({ seq: 120 + i, message_id: `m${i}`, content: `message number ${i} ${"z".repeat(500)}` }));
-  const batch = await raftPlugin.receive!(pushed(pushPayload({ cursor: { fromSeq: 120, toSeq: 219 }, events })), PUSH_SECRET, m.ctx);
-  if (!batch.deliver) throw new Error(JSON.stringify(batch));
-  for (let i = 0; i < 100; i++) if (!batch.text.includes(`message number ${i} `)) throw new Error(`message ${i} dropped`);
-  if (batch.text.length > 60_000) throw new Error(`batch text ${batch.text.length}`);
-});
-
-await check("a message Raft left out as too large is named, not shown as empty", async () => {
-  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const big = raftMessage({ truncated: true });
-  delete (big as any).content;
-  const out = await raftPlugin.receive!(pushed(pushPayload({ events: [big] })), PUSH_SECRET, m.ctx);
-  if (!out.deliver || !out.text.includes("too large for this delivery; read this message with a tool") || !out.text.includes("msg 6ed41ed7")) {
-    throw new Error(JSON.stringify(out));
-  }
-});
-
 await check("a bare 200 on push registration is a registration, not a malformed answer", async () => {
   const m = mount();
   const calls = many(json(200, { agentId: "agent-1", agentName: "raft-bot", serverId: "srv" }), new Response("", { status: 200 }));
@@ -559,93 +494,44 @@ await check("a bare 200 on push registration is a registration, not a malformed 
   if (out.enabled !== true || out.registration !== "active" || calls[1]!.init.method !== "PUT") throw new Error(JSON.stringify({ out, calls: calls.map((c) => c.init.method) }));
 });
 
-await check("attachments arrive as references, never as content", async () => {
+await check("an inbox notice reaches the agent as Raft wrote it, with the one instruction to read, and is deduped on its notice id", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const out = await raftPlugin.receive!(pushed(pushPayload({ events: [raftMessage({
-    content: "see the report", attachments: [{ id: "att-1", filename: "report.pdf", mimeType: "application/pdf", sizeBytes: 12345, data: "JVBERi0xLjQK" }],
-  })] })), PUSH_SECRET, m.ctx);
-  if (!out.deliver || !out.text.includes("report.pdf (application/pdf, 12345 bytes) id att-1") || out.text.includes("JVBERi0")) {
-    throw new Error(JSON.stringify(out));
-  }
+  globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
+  const out = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
+  if (!out.deliver || out.dedupeKey !== "ntc_0123456789abcdef" || out.as !== undefined) throw new Error(JSON.stringify(out));
+  if (!out.text.startsWith("Inbox update: 2 unread") || !out.text.includes("`receive_events` tool from the `raft` mount") || !/acknowledges/.test(out.text)) throw new Error(out.text);
+  if (m.state()?.lastReached?.deliveryId !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(m.state()));
+  const extra = await raftPlugin.receive!(pushed(notice({ latestPreview: "added later", other: 1 }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
+  if (!extra.deliver) throw new Error(`a field it does not know was refused: ${JSON.stringify(extra)}`);
+  const long = await raftPlugin.receive!(pushed(notice({ text: "y".repeat(5000) }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
+  if (!long.deliver || !long.text.includes("… (cut)") || long.text.length > 4300) throw new Error(`length ${long.deliver ? long.text.length : "-"}`);
 });
 
-await check("push verifies the signature and matching delivery id before reading mount state", async () => {
+await check("a notice is checked for its signature and header before any state is read, and a signed body Raft got wrong is 400, never 401", async () => {
   let reads = 0;
-  const guarded = {
-    ...ctx(),
-    connection: { get: async () => { reads++; return null; }, set: async () => { throw new Error("state written"); } },
-  } as any;
-  const unsigned = pushed(pushPayload());
-  delete (unsigned.headers as any)["x-raft-signature-256"];
-  const missing = await raftPlugin.receive!(unsigned, PUSH_SECRET, guarded);
-  if (missing.deliver || !missing.rejected) throw new Error(JSON.stringify(missing));
-  const wrongSecret = await raftPlugin.receive!(pushed(pushPayload(), { secret: "wrong" }), PUSH_SECRET, guarded);
+  const guarded = { ...ctx(), connection: { get: async () => { reads++; return null; }, set: async () => { throw new Error("state written"); } } } as any;
+  const unsigned = pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }); delete (unsigned.headers as any)["x-raft-signature-256"];
+  const rej = await raftPlugin.receive!(unsigned, PUSH_SECRET, guarded);
+  if (rej.deliver || !rej.rejected) throw new Error(JSON.stringify(rej));
+  const wrongSecret = await raftPlugin.receive!(pushed(notice(), { secret: "wrong", deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, guarded);
   if (wrongSecret.deliver || !wrongSecret.rejected) throw new Error(JSON.stringify(wrongSecret));
-  // Signed, so a header that disagrees with the body is Raft's mistake (400), not a stranger's (401).
-  const wrongId = await raftPlugin.receive!(pushed(pushPayload(), { deliveryId: "other" }), PUSH_SECRET, guarded);
-  if (wrongId.deliver || wrongId.rejected || !wrongId.malformed || reads !== 0) throw new Error(JSON.stringify({ wrongId, reads }));
-});
-
-await check("push reads a thread and a task from the fields Raft names, and a field it does not know is ignored", async () => {
-  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const inThread = raftMessage({
-    channel_type: "thread", channel_name: "6ed41ed7", parent_channel_name: "raft-antiproton", parent_channel_type: "channel",
-    reply_target: undefined, mentioned: true, task_number: 1, task_status: "in_progress", sender_id: "u-1", channel_id: "c-1",
-    thread_join_context: { anything: true }, traceparent: "00-abc-def-01",
-  });
-  const out = await raftPlugin.receive!(pushed(pushPayload({ events: [inThread], extraTopLevelField: { added: "in v2.1" } })), PUSH_SECRET, m.ctx);
-  if (!out.deliver) throw new Error(JSON.stringify(out));
-  for (const part of ["a thread in #raft-antiproton", "mentions you", "task #1 (in_progress)"]) {
-    if (!out.text.includes(part)) throw new Error(`missing ${part}:\n${out.text}`);
+  for (const bad of [notice({ text: "" }), notice({ targets: "none" }), notice({ noticeId: "has space" }),
+    { schema: "raft-agent-inbox.v2", deliveryId: "ibx_x", recipientAgentId: "agent-1", cursor: { fromSeq: 1, toSeq: 1 }, events: [{ content: "raw message" }] },
+    { schema: "raft-agent-inbox.v1", eventId: "e", recipientAgentId: "agent-1", reason: "inbox_changed" }]) {
+    const r = await raftPlugin.receive!(pushed(bad, { deliveryId: String((bad as any).noticeId ?? (bad as any).deliveryId ?? (bad as any).eventId) }), PUSH_SECRET, guarded);
+    if (r.deliver || r.rejected || !r.malformed || JSON.stringify(r).includes("raw message")) throw new Error(JSON.stringify({ bad, r }));
   }
-  if (/traceparent|thread_join_context|extraTopLevelField/.test(out.text)) throw new Error(`passed through a field it does not know:\n${out.text}`);
+  const wrongHeader = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_other" }), PUSH_SECRET, guarded);
+  if (wrongHeader.deliver || !wrongHeader.malformed || reads !== 0) throw new Error(JSON.stringify({ wrongHeader, reads }));
 });
 
-await check("push rejects delivery ids that cannot be used as bounded dedupe keys", async () => {
-  let reads = 0;
-  const guarded = {
-    ...ctx(),
-    connection: { get: async () => { reads++; return null; }, set: async () => { throw new Error("state written"); } },
-  } as any;
-  for (const deliveryId of ["contains space", "x".repeat(129), ""]) {
-    const out = await raftPlugin.receive!(pushed(pushPayload({ deliveryId })), PUSH_SECRET, guarded);
-    if (out.deliver || out.rejected || !out.malformed) throw new Error(JSON.stringify({ deliveryId, out }));
-  }
-  if (reads !== 0) throw new Error(`invalid delivery ids reached mount state: ${reads}`);
-});
-
-await check("push drops disabled and cross-agent deliveries, and an empty batch is acknowledged and not delivered", async () => {
-  const disabled = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const disabledOut = await raftPlugin.receive!(pushed(pushPayload()), PUSH_SECRET, disabled.ctx);
-  if (disabledOut.deliver || !/disabled/.test(disabledOut.reason)) throw new Error(JSON.stringify(disabledOut));
-
-  const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const cross = await raftPlugin.receive!(pushed(pushPayload({ recipientAgentId: "agent-2" })), PUSH_SECRET, enabled.ctx);
+await check("a notice for a mount whose push is off, or for another Raft agent, is ignored and not delivered", async () => {
+  const off = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const ignored = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, off.ctx);
+  if (ignored.deliver || ignored.malformed || ignored.rejected || !/disabled/.test(ignored.reason)) throw new Error(JSON.stringify(ignored));
+  const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const cross = await raftPlugin.receive!(pushed(notice({ recipientAgentId: "agent-2" }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, on.ctx);
   if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
-  const empty = await raftPlugin.receive!(pushed(pushPayload({ events: [] })), PUSH_SECRET, enabled.ctx);
-  if (empty.deliver || empty.rejected || !/empty/.test(empty.reason)) throw new Error(JSON.stringify(empty));
-});
-
-await check("a signed body that is not a v2 delivery is malformed (400), never rejected (401), and quotes no content", async () => {
-  const enabled = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  const v1 = { schema: "raft-agent-inbox.v1", eventId: "event-1", recipientAgentId: "agent-1", reason: "inbox_changed" };
-  const v1Out = await raftPlugin.receive!(pushed(v1, { deliveryId: "event-1" }), PUSH_SECRET, enabled.ctx);
-  if (v1Out.deliver || v1Out.rejected || !v1Out.malformed) throw new Error(JSON.stringify(v1Out));
-  const notJson = pushed(pushPayload());
-  notJson.body = new TextEncoder().encode("{not json");
-  notJson.headers["x-raft-signature-256"] = `sha256=${createHmac("sha256", PUSH_SECRET).update(notJson.body).digest("hex")}`;
-  const notJsonOut = await raftPlugin.receive!(notJson, PUSH_SECRET, enabled.ctx);
-  if (notJsonOut.deliver || notJsonOut.rejected || !notJsonOut.malformed) throw new Error(JSON.stringify(notJsonOut));
-  for (const bad of [
-    pushPayload({ schema: "raft-agent-inbox.v3" }),
-    pushPayload({ cursor: { fromSeq: 5, toSeq: 4 } }),
-    pushPayload({ cursor: { fromSeq: "120", toSeq: 120 } }),
-    pushPayload({ events: "raw message" }),
-  ]) {
-    const out = await raftPlugin.receive!(pushed(bad), PUSH_SECRET, enabled.ctx);
-    if (out.deliver || out.rejected || !out.malformed) throw new Error(JSON.stringify({ bad, out }));
-    if (JSON.stringify(out).includes("raw message")) throw new Error(`content leaked in refusal: ${JSON.stringify(out)}`);
-  }
 });
 
 await check("disable_push stops later delivery and push_status exposes no secret", async () => {
