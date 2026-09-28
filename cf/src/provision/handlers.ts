@@ -39,7 +39,7 @@ export interface ProvisionAgentOps {
   /**
    * The mount's push state, read directly. A GET used to run `push_status` through the gateway, and
    * every Raft poll became a tool.call trace row, a usage row and two Agent Activity events the model
-   * never caused (2026-09-28 review, finding 5).
+   * never caused.
    */
   pushStatus(tenantId: string, agentId: string): Promise<PushStatus | null>;
 }
@@ -60,7 +60,7 @@ export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | nul
 
 /**
  * No `model` anywhere: a provisioned agent runs on the deployment's default, and Raft shows no
- * selector (tygg, 2026-09-28). If choice comes later it is a new field, not a revived one.
+ * selector. If choice comes later it is a new field, not a revived one.
  */
 export interface ProvisionDeps {
   now(): number;
@@ -191,7 +191,7 @@ export async function handleProvision(
       }
       const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) => row![k] !== asked[k]);
       // The credential is the one field that matters most: a delayed retry with an old one must not
-      // overwrite a newer PUT /credential (2026-09-28 review, finding 4). Compared by hash; a row from
+      // overwrite a newer PUT /credential. Compared by hash; a row from
       // before the hash existed accepts the first replay and records it.
       if (row.credentialHash !== null && row.credentialHash !== credentialHash) differs.push("credential" as keyof typeof asked);
       if (differs.length) {
@@ -204,7 +204,7 @@ export async function handleProvision(
       try { await deps.registry.create(row); }
       catch (e) {
         // Only the unique index says 409 (two Raft ids that sanitise alike). Anything else — D1 away, a
-        // migration missing — is a 500 Raft retries, not a permanent conflict (2026-09-28 review, finding 3).
+        // migration missing — is a 500 Raft retries, not a permanent conflict.
         const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
         if (!/UNIQUE constraint/i.test(message)) throw e;
         return fail({ status: 409, code: "agent_id_taken", message: `${agentId} already belongs to another Raft agent in this tenant` });

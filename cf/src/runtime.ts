@@ -1283,11 +1283,11 @@ export class AgentRuntime {
     // catalogue the only source of "on by default", and this path was never
     // told — so a non-default plugin in an explicit list was skipped below
     // without a word, and the retail tools vanished from every bench agent the
-    // first time #491 reached production (Vera, 2026-09-28 12:53Z, 0/24).
+    // first time #491 reached production: a τ² round of 0/24 with no retail tool in the histogram.
     // The choice is recorded, not bypassed, so the catalogue and the gateway
     // agree with what was mounted; an explicit "disable" still wins.
     // Said, not inferred: array identity told a fresh copy of the defaults apart from the defaults,
-    // which is not the question (2026-09-28 review, finding 6).
+    // which is not the question.
     const explicit = opts.chosen === true;
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
