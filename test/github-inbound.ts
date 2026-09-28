@@ -14,6 +14,9 @@ import { createHmac } from "node:crypto";
 import { githubPlugin, validGithubSignature } from "../src/plugins/github.ts";
 import { policyFor } from "../src/runtime/gateway.ts";
 import type { InboundEvent, InboundResult } from "../src/plugins/types.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -24,17 +27,20 @@ async function check(name: string, fn: () => Promise<void>) {
 const SECRET = "inbound-secret-for-tests";
 const realFetch = globalThis.fetch;
 
-/** A mount context whose connection state is a plain variable. */
-function mount(credential: string | null = null, initial: unknown = null) {
-  let state: any = initial;
+/** A mount context over a real, empty database; `state()` reads the plugin's one record back from the rows. */
+function mount(credential: string | null = null) {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "t", agentId: "a", alias: "gh", plugin: githubPlugin.id };
   return {
     ctx: {
       caller: { tenantId: "t", agentId: "a", taskId: "k" },
       alias: "gh", credential, publicConfig: {},
-      connection: { get: async () => state, set: async (v: any) => { state = v; } },
+      db: openPluginDatabase(tables, scope, githubPlugin.database),
       sibling: async () => null,
     } as any,
-    state: () => state,
+    state: () => tables.get(scope, "inbound", "state") as any,
+    /** Every row of this mount's database, whichever store: what a write touched. */
+    rows: () => tables.count(scope, "inbound", null),
   };
 }
 
@@ -351,13 +357,15 @@ await check("if the account's name cannot be learnt, nothing is subscribed", asy
   catch { threw = true; }
   finally { globalThis.fetch = realFetch; }
   if (!threw) throw new Error("subscribed without knowing whose comments are its own");
-  if (m.state()?.inbound?.subscriptions?.length) throw new Error(`something was stored: ${JSON.stringify(m.state())}`);
+  if (m.state()?.subscriptions?.length) throw new Error(`something was stored: ${JSON.stringify(m.state())}`);
 });
 
-await check("subscriptions leave the rest of the mount's connection state alone", async () => {
-  const m = mount(null, { other: "kept" });
+await check("subscriptions are one record under the plugin's declared store, and a second one replaces it", async () => {
+  const m = mount();
   await githubPlugin.invoke("issue_subscribe", { repo: "acme/widgets" }, m.ctx);
-  if (m.state()?.other !== "kept") throw new Error(`other state was lost: ${JSON.stringify(m.state())}`);
+  await githubPlugin.invoke("issue_subscribe", { repo: "acme/gadgets" }, m.ctx);
+  if (m.rows() !== 1) throw new Error(`the inbound store holds ${m.rows()} rows; the record is one key`);
+  if (m.state()?.subscriptions?.length !== 2) throw new Error(`the second subscription did not join the first: ${JSON.stringify(m.state())}`);
 });
 
 await check("a bad repo or issue number is refused before anything is stored", async () => {
@@ -367,7 +375,7 @@ await check("a bad repo or issue number is refused before anything is stored", a
     try { await githubPlugin.invoke("issue_subscribe", args, m.ctx); } catch { threw = true; }
     if (!threw) throw new Error(`accepted ${JSON.stringify(args)}`);
   }
-  if (m.state() !== null) throw new Error(`something was stored: ${JSON.stringify(m.state())}`);
+  if (m.state() !== undefined) throw new Error(`something was stored: ${JSON.stringify(m.state())}`);
 });
 
 await check("subscribing and unsubscribing are writes, so a mount's policy can hold them", async () => {
@@ -403,8 +411,8 @@ await check("a bad signature is refused for every event kind, ping included, and
       const m = await subscribed("acme/widgets");
       const before = JSON.stringify(m.state());
       let writes = 0;
-      const set = m.ctx.connection.set;
-      m.ctx.connection.set = async (v: any) => { writes++; return set(v); };
+      const put = m.ctx.db.put.bind(m.ctx.db);
+      m.ctx.db.put = async (...a: any[]) => { writes++; return put(...a); };
       const r = await receive(signed(kind, payload, { secret, form }), m.ctx);
       const label = `${kind || "(no kind)"}${form ? " (form)" : ""} signed with ${JSON.stringify(secret)}`;
       if (r.deliver || !r.rejected) throw new Error(`${label} was not refused: ${JSON.stringify(r)}`);

@@ -1480,9 +1480,9 @@ ${table(["alias", "plugin", "config", "credential", "policy"], (d.mounts ?? []).
       [m.alias, m.plugin, cfg(m.public_config), m.secret_ref ?? "—",
        m.policy ? cfg(m.policy) : "open"]))}
 
-<h3>connections</h3>
-${table(["alias", "state", "updated"], (d.connections ?? []).map((c: any) =>
-      [c.alias, String(c.state).slice(0, 120), ago(Number(c.updated_at))]))}
+<h3>databases</h3>
+${table(["mount", "plugin", "store", "keys", "updated"], (d.databases ?? []).map((c: any) =>
+      [c.alias, c.plugin, c.store, String(c.keys), ago(Number(c.updatedAt))]))}
 
 <h3>operations</h3>
 ${table(["tool", "status", "parked to", "when"], (d.operations ?? []).map((o: any) =>

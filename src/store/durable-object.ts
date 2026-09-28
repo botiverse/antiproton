@@ -1,5 +1,6 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
 import type { PluginChoice } from "../plugins/types.ts";
+import { PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
 import type {
@@ -77,10 +78,6 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS follow_ups (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
      text TEXT NOT NULL, created_at INTEGER NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS connections (
-  tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
-  state TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL,
-  PRIMARY KEY (tenant_id, agent_id, alias));`,
     `CREATE TABLE IF NOT EXISTS mounts (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL,
      connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL,
@@ -118,15 +115,18 @@ export class DurableObjectStore implements StorageAdapter {
   #ctx: Ctx;
   #sql: Sql;
   #now: () => number;
+  readonly pluginDb: PluginDbTables;
 
   constructor(ctx: Ctx, opts: { now?: () => number } = {}) {
     this.#ctx = ctx;
     this.#sql = ctx.storage.sql;
     this.#now = opts.now ?? (() => Date.now());
+    this.pluginDb = new PluginDbTables(ctx.storage, { now: this.#now });
   }
 
   async init() {
     for (const stmt of SCHEMA) this.#sql.exec(stmt);
+    this.pluginDb.ensure();
     // Columns added after a table already exists are invisible to
     // CREATE TABLE IF NOT EXISTS; each ALTER is idempotent by trial.
     for (const alter of [
@@ -567,15 +567,6 @@ export class DurableObjectStore implements StorageAdapter {
     }));
   }
 
-  async getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null> {
-    const r = this.#all(
-      "SELECT state, expires_at FROM connections WHERE tenant_id=? AND agent_id=? AND alias=?",
-      tenantId, agentId, alias,
-    )[0] as any;
-    if (!r || (r.expires_at != null && Number(r.expires_at) <= this.#now())) return null;
-    return JSON.parse(r.state);
-  }
-
   // ------------------------------------------------------------ agent state
 
   async putState(tenantId: string, agentId: string, key: string, entry: StateEntry) {
@@ -655,18 +646,6 @@ export class DurableObjectStore implements StorageAdapter {
     }
     if (rows.length) this.#sql.exec("DELETE FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=?", tenantId, agentId, taskId);
     return rows.length;
-  }
-
-  async putConnection(
-    tenantId: string, agentId: string, alias: string, state: Json, expiresAt: number | null = null,
-  ) {
-    this.#sql.exec(
-      `INSERT INTO connections(tenant_id, agent_id, alias, state, expires_at, updated_at)
-       VALUES (?,?,?,?,?,?)
-       ON CONFLICT(tenant_id, agent_id, alias) DO UPDATE SET
-         state=excluded.state, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
-      tenantId, agentId, alias, JSON.stringify(state ?? null), expiresAt, this.#now(),
-    );
   }
 
   async setModelBinding(b: ModelBinding) {
@@ -803,7 +782,7 @@ export class DurableObjectStore implements StorageAdapter {
       tenantId, agentId, plugin, choice, this.#now());
   }
 
-  /** One transaction: the mount, its connection state, and its own secret. */
+  /** One transaction: the mount, its databases, and its own secret. */
   async renameMount(
     tenantId: string, agentId: string, from: string, to: string,
     secret: { newRef: string } | null,
@@ -825,7 +804,7 @@ export class DurableObjectStore implements StorageAdapter {
           return { ok: false as const, error: `a credential is already stored under the name ${to}` };
         }
         this.#sql.exec("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
-        this.#sql.exec("UPDATE connections SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
+        this.pluginDb.rename(tenantId, agentId, from, to);
         if (secret) {
           this.#sql.exec("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?", to, tenantId, agentId, from);
           this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?", secret.newRef, tenantId, agentId, to);

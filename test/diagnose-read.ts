@@ -4,7 +4,7 @@
  *
  * The property is the one test/transcript-read.ts holds for the transcript:
  * reading changes nothing, not a row and not a table, including through the
- * plugins asked what their mounts hold, which get a connection they cannot
+ * plugins asked what their mounts hold, which get a database they cannot
  * write. Checked by dumping the whole database before and after.
  */
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
@@ -36,8 +36,9 @@ const message = (id: string, parentId: string | null, text: string) =>
 /** A plugin whose report reads its mount's state, and one whose report tries to change it. */
 const reader = {
   id: "reader",
+  database: { version: 1, stores: { rec: { listed: ["state"] } } },
   holds: {
-    async activity(ctx: any) { const s = await ctx.connection.get(); return { live: s ? { id: String(s.boxId), startedAt: 1, lastUsedAt: 2 } : null }; },
+    async activity(ctx: any) { const s = await ctx.db.get("rec", "state"); return { live: s ? { id: String(s.boxId), startedAt: 1, lastUsedAt: 2 } : null }; },
     async usage() { return []; },
     async release() { return false; },
   },
@@ -45,8 +46,9 @@ const reader = {
 let writerTried = false;
 const writer = {
   id: "writer",
+  database: { version: 1, stores: { rec: {} } },
   holds: {
-    async activity(ctx: any) { writerTried = true; await ctx.connection.set({ touched: true }); return { live: { id: "w", startedAt: 1, lastUsedAt: 1 } }; },
+    async activity(ctx: any) { writerTried = true; await ctx.db.put("rec", { touched: true }, "state"); return { live: { id: "w", startedAt: 1, lastUsedAt: 1 } }; },
     async release() { return false; },
   },
 } as any;
@@ -81,7 +83,7 @@ async function agentObject() {
   // A row under the OPERATOR mount's alias too, so "an operator ref is not dated" is decided by the ref's
   // kind rather than by there being nothing to find — without this the assertion passes either way.
   await store.putSecret("demo", "u-a", "sandbox", { ciphertext: "z", iv: "w", account: null, verified: false });
-  await store.putConnection("demo", "u-a", "sandbox", { boxId: "box-1" } as any);
+  store.pluginDb.put({ tenantId: "demo", agentId: "u-a", alias: "sandbox", plugin: "reader" }, "rec", "state", { boxId: "box-1" }, null);
   recordBackgroundJob(host.sql as any, { tenantId: "demo", agentId: "u-a" },
     { id: "op1", session: "main", mount: "sandbox", tool: "sandbox__shell", handle: {} }, 1_000);
   return { host, store };
@@ -96,7 +98,7 @@ await check("reading the report changes nothing, including through a plugin that
   writerTried = false;
   const report = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
   assert(report !== null, "an agent the object holds read as null");
-  assert(writerTried, "the writing plugin was never asked, so the read-only connection was not exercised");
+  assert(writerTried, "the writing plugin was never asked, so the read-only database was not exercised");
   assert(dump(host) === before, "the database changed while the report was read");
   host.dispose();
 });
@@ -130,7 +132,13 @@ await check("the report says what the old one said about mounts, events, jobs an
   const { host, store } = await agentObject();
   const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
   const sandbox = r.mounts.find((m: any) => m.alias === "sandbox");
-  assert(sandbox?.secret === "operator" && sandbox.connection === true && sandbox.config.account === "sandbox", `mounts: ${JSON.stringify(r.mounts)}`);
+  assert(sandbox?.secret === "operator" && sandbox.config.account === "sandbox", `mounts: ${JSON.stringify(r.mounts)}`);
+  // The database summary names the listed key and whether it is present — and nothing of the value.
+  assert(JSON.stringify(sandbox.database) === JSON.stringify({ version: null, listed: [{ store: "rec", key: "state", present: true }] }),
+    `database summary: ${JSON.stringify(sandbox.database)}`);
+  assert(!JSON.stringify(r.mounts).includes("box-1"), "a stored value reached the mounts summary");
+  const gh = r.mounts.find((m: any) => m.alias === "gh");
+  assert(gh.database.listed[0].present === false, `an empty database listed a key as present: ${JSON.stringify(gh.database)}`);
   assert(r.mountReports.sandbox?.activity.live?.id === "box-1", `the reading plugin's report: ${JSON.stringify(r.mountReports)}`);
   assert(!("scratch" in r.mountReports), `a plugin that could only report by writing was reported: ${JSON.stringify(r.mountReports)}`);
   assert(r.entries === 2 && r.eventKinds.message === 2 && r.lastEvents.length === 2, `events: ${JSON.stringify({ e: r.entries, k: r.eventKinds })}`);

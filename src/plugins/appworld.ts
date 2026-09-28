@@ -13,7 +13,7 @@ import type { Plugin, PluginContext, PluginErrorFields, ToolSchema } from "./typ
  * So this is not an adapter written for a benchmark: it is the same shape every
  * other integration has. One plugin per app, one mount per account, credentials
  * resolved from `secret_ref`, the derived session token kept in the mount's
- * connection state, and the model addressing `spotify.search_songs` with no idea
+ * database, and the model addressing `spotify.search_songs` with no idea
  * that a token exists at all.
  */
 
@@ -81,6 +81,9 @@ function toSchema(doc: ApiDoc): ToolSchema {
     idempotency: write ? "none" : "native",
   };
 }
+
+export const SESSION_STORE = "session";
+export const SESSION_KEY = "current";
 
 interface Session { token: string; obtainedAt: number }
 
@@ -159,7 +162,7 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
 
     async function session(ctx: PluginContext, force = false): Promise<string> {
       if (!force) {
-        const cached = (await ctx.connection.get()) as Session | null;
+        const cached = (await ctx.db.get(SESSION_STORE, SESSION_KEY)) as Session | undefined;
         if (cached?.token) return cached.token;
       }
       if (!ctx.credential) {
@@ -167,13 +170,15 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
       }
       const cred = JSON.parse(ctx.credential) as AppCredential;
       const token = await login(cfg.apiBaseUrl, app, cred);
-      await ctx.connection.set({ token, obtainedAt: Date.now() } satisfies Session);
+      await ctx.db.put(SESSION_STORE, { token, obtainedAt: Date.now() } satisfies Session, SESSION_KEY);
       return token;
     }
 
     return {
       id: app,
       version: "1.0.0",
+      /** The session token this mount logged in with. Nothing listed: the one key is a credential's shadow. */
+      database: { version: 1, stores: { [SESSION_STORE]: {} } },
       /**
        * Declared, not discovered. Without this a mount with no `secret_ref`
        * passes validation and fails on the agent's first authenticated call,
@@ -241,11 +246,11 @@ export function appworldPlugins(catalogue: Catalogue, cfg: AppWorldConfig): Plug
         for (const [param, otherApp] of siblingTokens(doc)) {
           const other = await ctx.sibling(otherApp);
           if (!other?.credential) continue; // optional parameter; leave it unset
-          const cached = (await other.connection.get()) as Session | null;
+          const cached = (await other.db.get(SESSION_STORE, SESSION_KEY)) as Session | undefined;
           let t = cached?.token;
           if (!t) {
             t = await login(cfg.apiBaseUrl, otherApp, JSON.parse(other.credential) as AppCredential);
-            await other.connection.set({ token: t, obtainedAt: Date.now() } satisfies Session);
+            await other.db.put(SESSION_STORE, { token: t, obtainedAt: Date.now() } satisfies Session, SESSION_KEY);
           }
           params[param] = t;
         }

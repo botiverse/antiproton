@@ -446,7 +446,7 @@ export interface RuntimeDeps {
  * The mounts this agent still has, once its own answers are applied.
  *
  * A switched-off mount is still a mount: the credential reference, the
- * connection state and the alias all survive, and switching the plugin back on
+ * database and the alias all survive, and switching the plugin back on
  * returns them. It is only kept out of the catalogue, so the model is not
  * offered tools it would be refused for using. Deleting instead would lose
  * things that cannot be recovered, which is why nothing in this codebase
@@ -927,7 +927,7 @@ export class AgentRuntime {
 
     // Read before the release, because after it there is nothing to ask: the id
     // is what the warning row is keyed by. Through `activity` rather than the
-    // connection state, which is the plugin's own and named `boxId` in exactly
+    // stored state, which is the plugin's own and named `boxId` in exactly
     // one plugin.
     const live = (await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias)).live;
     const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias });
@@ -946,7 +946,7 @@ export class AgentRuntime {
    * The alias is the operator's word for a mount, and until now it was the one
    * thing about a mount that could not be changed — not by design, but because
    * nothing implemented it. What made it look dangerous is that the alias keys
-   * two live things: the mount row and the connection state, and the second is
+   * two live things: the mount row and the database, and the second is
    * where a running box's id sits. The store does both in one transaction, so
    * "half a rename" is not a state this can reach.
    *
@@ -1298,7 +1298,7 @@ export class AgentRuntime {
       // A seed the agent has turned off is not added. Only the adding is
       // governed here: a mount that already exists is left alone, because
       // switching a plugin off must not destroy the credential and the
-      // connection state behind it — the gateway and the catalogue withhold
+      // database behind it — the gateway and the catalogue withhold
       // it instead, and switching it back on returns what was there.
       const declared = this.#plugins.find((p) => p.id === m.plugin);
       if (declared && explicit && !SEEDED_PLUGINS.has(m.plugin) && choices[m.plugin] !== "disable" && choices[m.plugin] !== "enable") {
@@ -1328,7 +1328,7 @@ export class AgentRuntime {
    * Where `provision` skips quietly (plugin switched off, alias present), this
    * answers. An alias that is already there is left alone: the same plugin and
    * settings is a repeat, anything else is refused rather than overwritten,
-   * because a mount carries a credential and connection state that a replace
+   * because a mount carries a credential and a database that a replace
    * would orphan. It is always added without a credential.
    */
   async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }):
@@ -1750,7 +1750,7 @@ export class AgentRuntime {
    * What is held is the plugin's (`holds.activity` reports it); the schedule is
    * the framework's, which is why this reads that report rather than the plugin
    * reading a clock. Until 2026-09-22 this loop read `boxId`, `lastUsedAt` and
-   * `quietUntil` out of one plugin's connection state and named its tools with
+   * `quietUntil` out of one plugin's stored state and named its tools with
    * the literals `release` and `quiet` — so it was the sandbox's idle pass
    * wearing the framework's name, and a second plugin that held something got
    * no warning and no reclaim. Now every mount whose plugin declares `holds`

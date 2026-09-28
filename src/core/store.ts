@@ -17,6 +17,7 @@ import type {
 // than defining a second copy of the same three words. Type-only, and
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
 import type { CredentialRefKind, CredentialState, PluginChoice } from "../plugins/types.ts";
+import type { PluginDbTables } from "../store/plugin-db.ts";
 import type { UsageRow } from "../usage/outbox.ts";
 import type { TraceRow } from "../trace/outbox.ts";
 
@@ -294,14 +295,12 @@ export interface StorageAdapter {
   /** Move any waiting follow-ups into the log, oldest first. Returns how many. */
   flushFollowUps(tenantId: string, agentId: string, taskId: string): Promise<number>;
 
-  getConnection(tenantId: string, agentId: string, alias: string): Promise<Json | null>;
-  putConnection(
-    tenantId: string,
-    agentId: string,
-    alias: string,
-    state: Json,
-    expiresAt?: number | null,
-  ): Promise<void>;
+  /**
+   * The rows of every plugin database, keyed by mount and plugin. The kernel
+   * opens a plugin's view of them (src/runtime/plugin-db.ts); nothing else
+   * reads a plugin's rows through this except a diagnosis and a rename.
+   */
+  readonly pluginDb: PluginDbTables;
 
   /**
    * Whose model account this agent spends. A tenant with no binding cannot run:

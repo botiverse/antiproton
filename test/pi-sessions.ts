@@ -70,24 +70,25 @@ await check("two conversations in one object: each reads only its own transcript
  * panel rather than an error. So the rows are read back with no session in
  * hand, and the tables are checked for never having grown a column for one.
  */
-await check("mounts, connection state and credentials are the agent's, shared by every conversation", async () => {
+await check("mounts, plugin databases and credentials are the agent's, shared by every conversation", async () => {
   const store = new SqliteStore(":memory:"); await store.init();
   await store.addMount({ tenantId: "t", agentId: "a", alias: "gh", plugin: "github", installationId: "i",
     connectionId: null, toolVersion: "1", publicConfig: { account: "shared" }, secretRef: "agent:gh" });
-  await store.putConnection("t", "a", "gh", { boxId: "held-by-the-agent" });
+  const ghDb = { tenantId: "t", agentId: "a", alias: "gh", plugin: "github" };
+  store.pluginDb.put(ghDb, "inbound", "state", { boxId: "held-by-the-agent" }, null);
   await store.putSecret("t", "a", "gh", { ciphertext: "c", iv: "i", account: "octocat", verified: true });
   // Read back the way the gateway does: tenant, agent, alias — nothing names a
   // conversation, so there is nothing a second conversation could fail to match.
   const mount = await store.getMountByAlias("t", "a", "gh");
   if (mount?.secretRef !== "agent:gh") throw new Error(`mount not found without a session: ${JSON.stringify(mount)}`);
-  const conn = await store.getConnection("t", "a", "gh") as any;
-  if (conn?.boxId !== "held-by-the-agent") throw new Error(`connection state not found without a session: ${JSON.stringify(conn)}`);
+  const conn = store.pluginDb.get(ghDb, "inbound", "state") as any;
+  if (conn?.boxId !== "held-by-the-agent") throw new Error(`the mount's database was not found without a session: ${JSON.stringify(conn)}`);
   const meta = await store.secretMeta("t", "a", "gh");
   if (meta?.account !== "octocat") throw new Error(`credential not found without a session: ${JSON.stringify(meta)}`);
   // And the discriminating check: none of the three tables has a column that
   // could scope a row to a conversation. Adding one is where this would break.
   const tables = store.dumpTables();
-  for (const name of ["mounts", "connections", "secrets"]) {
+  for (const name of ["mounts", "plugin_db", "secrets"]) {
     const rows = tables[name] as Record<string, unknown>[] | undefined;
     if (!rows?.length) throw new Error(`${name} has no row to inspect`);
     const cols = Object.keys(rows[0]!);

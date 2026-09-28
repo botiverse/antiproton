@@ -27,7 +27,6 @@ async function fixture(agentId = "a") {
   const ctx = (over: Partial<PluginContext> = {}) => ({
     publicConfig: { account: "agent memory" }, credential: null,
     caller: { tenantId: "t", agentId, taskId: "k" }, alias: "state",
-    connection: { get: async () => null, set: async () => {} },
     ...over,
   }) as unknown as PluginContext;
   return { store, plugin, ctx };

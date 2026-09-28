@@ -2,7 +2,7 @@
  * Giving a mount a different name, without losing what the old one keyed.
  *
  * The alias is the operator's word for a mount, and three live things are
- * filed under it: the mount row, the connection state — where a running
+ * filed under it: the mount row, the mount's database — where a running
  * container's id lives — and, because `attachCredential` names a secret after
  * the mount, the credential itself. Moving two of the three is the failure
  * that matters: a box nothing can release, or an account the console reports
@@ -23,6 +23,9 @@ async function check(name: string, fn: () => Promise<void>) {
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
 
+/** The database of the run9 mount under `alias`: filed by plugin, so the id travels with a rename. */
+const boxOf = (alias: string) => ({ tenantId: "t", agentId: "a", alias, plugin: "run9" });
+
 async function fixture(opts: { secret?: boolean; operatorRef?: boolean } = {}) {
   const store = new SqliteStore(":memory:");
   await store.init();
@@ -36,7 +39,7 @@ async function fixture(opts: { secret?: boolean; operatorRef?: boolean } = {}) {
   if (opts.secret !== false && !opts.operatorRef) {
     await store.putSecret("t", "a", "node", { ciphertext: "sealed", iv: "iv" });
   }
-  await store.putConnection("t", "a", "node", { boxId: "b-1", createdAt: 1 });
+  store.pluginDb.put(boxOf("node"), "box", "state", { boxId: "b-1", createdAt: 1 }, null);
   return store;
 }
 
@@ -51,8 +54,8 @@ await check("挂载、连接状态、凭据三样一起搬", async () => {
 
   // The container. If this does not move, the box is billed by the second and
   // nothing can reach it to hand it back.
-  const conn = await store.getConnection("t", "a", "sandbox");
-  if (!conn) throw new Error("the connection state stayed under the old name: the running box is now unreachable");
+  const conn = store.pluginDb.get(boxOf("sandbox"), "box", "state");
+  if (!conn) throw new Error("the database stayed under the old name: the running box is now unreachable");
   if ((conn as any)?.boxId !== "b-1") throw new Error("the box id did not travel with it");
 
   // The credential, and the pointer to it. Either half left behind is a
@@ -93,8 +96,8 @@ await check("重名会被整体拒绝,而不是搬一半", async () => {
   const old = await store.getMountByAlias("t", "a", "node");
   if (!old) throw new Error("the refusal still took the old mount away");
   if (old.plugin !== "run9") throw new Error("the wrong mount survived");
-  const conn = await store.getConnection("t", "a", "node");
-  if (!conn) throw new Error("the connection state moved even though the rename was refused");
+  const conn = store.pluginDb.get(boxOf("node"), "box", "state");
+  if (!conn) throw new Error("the database moved even though the rename was refused");
   if (!(await store.secretMeta("t", "a", "node"))) throw new Error("the secret moved even though the rename was refused");
 });
 
@@ -142,11 +145,12 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
   const store = await fixture();
   const holding: Plugin = {
     id: "run9", version: "1.0.0", tools: [],
+    database: { version: 1, stores: { box: {} } },
     async invoke() { return {}; },
     holds: {
       tools: { release: "release" },
       async activity(ctx) {
-        const st: any = await ctx.connection.get();
+        const st: any = await ctx.db.get("box", "state");
         // Deliberately not the plugin's own field name: whatever it keeps, the
         // shape it answers in is the contract's.
         return { live: st?.boxId ? { id: st.boxId, startedAt: st.createdAt ?? 0, lastUsedAt: st.createdAt ?? 0 } : null };
@@ -168,7 +172,7 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
   if (typeof no.live.idleMs !== "number") throw new Error("the refusal does not say how long it has been idle");
 
   // Hand the box back, and the same mount stops standing in the way.
-  await store.putConnection("t", "a", "node", { boxId: null });
+  store.pluginDb.put(boxOf("node"), "box", "state", { boxId: null }, null);
   const idle = await gw.mountActivity(ctx, "node");
   if (idle.live) throw new Error("a mount with nothing running still reported a container");
   if (!renameSafety(idle, Date.now()).safe) throw new Error("an idle mount was still refused");
@@ -189,13 +193,13 @@ await check("框架不读容器字段,它问挂载 —— 而挂载在跑就不�
  * right after a real rename — including the case where the credential is the
  * deployment's and must not have moved — or the check would pass a half move.
  */
-await check("diagnose 的两格读数:凭证类别与连接状态跟着别名走", async () => {
+await check("diagnose 的两格读数:凭证类别与数据库跟着别名走", async () => {
   const own = await fixture();
   await own.renameMount("t", "a", "node", "sandbox", { newRef: agentRef("sandbox") });
   const moved = await own.getMountByAlias("t", "a", "sandbox");
   if (secretRefKind(moved?.secretRef) !== "agent") throw new Error(`agent credential reads as ${secretRefKind(moved?.secretRef)}`);
-  if ((await own.getConnection("t", "a", "sandbox")) == null) throw new Error("no state under the new alias");
-  if ((await own.getConnection("t", "a", "node")) != null) throw new Error("state left under the old alias");
+  if (own.pluginDb.get(boxOf("sandbox"), "box", "state") == null) throw new Error("no state under the new alias");
+  if (own.pluginDb.get(boxOf("node"), "box", "state") != null) throw new Error("state left under the old alias");
 
   const op = await fixture({ operatorRef: true });
   await op.renameMount("t", "a", "node", "sandbox", null);

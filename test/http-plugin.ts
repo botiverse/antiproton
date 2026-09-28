@@ -15,7 +15,6 @@ const ctx = (allowedHosts: string[], extra = {}) => ({
   alias: "web",
   credential: null,
   publicConfig: { allowedHosts, ...extra },
-  connection: { async get() { return null; }, async set() {} },
   async sibling() { return null; },
 });
 

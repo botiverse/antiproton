@@ -5,7 +5,7 @@
  * panel hardcoded which documents are read back into the prompt, so a change
  * to the state plugin's working set would silently drift the tag. The sandbox
  * panel now asks the mount (`mountReports`) instead of reading the sandbox
- * plugin's private connection state — a mount with nothing to report is
+ * plugin's private rows — a mount with nothing to report is
  * simply absent, and `kept` unions across sessions because each usage entry
  * only carries what that one session saved out.
  */
@@ -131,14 +131,14 @@ check("a live container with dropped records says the total is a lower bound", (
     "a live container was hidden in the idle-unknown notice");
 });
 
-check("a mount with no report is not a container, whatever its connection says", () => {
-  // A report is written only when something runs or ran; a stale connection row
-  // in the old shape must not reach the panel at all.
+check("a mount with no report is not a container, whatever its database holds", () => {
+  // A report is written only when something runs or ran; a database summary
+  // says a store has rows and must not be read as a container by the panel.
   const html = sandboxPanel({
     mounts: [{ alias: "box", plugin: "holder", provides: ["container"] }],
-    connections: [{ alias: "box", state: JSON.stringify({ boxId: "b1", createdAt: Date.now() - 1000 }), expires_at: null, updated_at: 0 }],
+    databases: [{ alias: "box", plugin: "holder", store: "box", keys: 1, updatedAt: Date.now() - 1000 }],
   });
-  must(html.includes("no container has ever been started"), "the old connection shape leaked through");
+  must(html.includes("no container has ever been started"), "a database row was read as a container");
 });
 
 check("an idle-but-present sandbox mount is named in the empty state", () => {

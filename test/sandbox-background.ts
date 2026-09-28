@@ -12,8 +12,11 @@
  * `background.poll` must produce the same result, because the model cannot tell
  * which way its work came back and nothing downstream should have to.
  */
-import { sandboxPlugin } from "../src/plugins/sandbox.ts";
+import { BOX_KEY, BOX_STORE, sandboxPlugin } from "../src/plugins/sandbox.ts";
 import { Backgrounded } from "../src/plugins/types.ts";
+import { PluginDbTables } from "../src/store/plugin-db.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -23,6 +26,15 @@ async function check(name: string, fn: () => Promise<void>) {
 
 const plugin = sandboxPlugin(null as any, "local");
 const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [] };
+/** A real database holding one box record, with every write also handed to `onPut`. */
+function boxDb(box: unknown, onPut: (v: unknown) => void) {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" };
+  if (box) tables.put(scope, BOX_STORE, BOX_KEY, box, null);
+  const db = openPluginDatabase(tables, scope, sandboxPlugin(null as any, "local").database);
+  return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(value); return db.put(store, value as any, key); } };
+}
+
 
 /** run9, answering with the exec states given, one per GET. */
 function run9(states: string[], extra: Record<string, unknown> = {}) {
@@ -41,7 +53,7 @@ function run9(states: string[], extra: Record<string, unknown> = {}) {
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 0, ...extra },
-    connection: { get: async () => BOX, set: async (v: unknown) => { written = v; } },
+    db: boxDb(BOX, (v) => { written = v; }),
     sibling: async () => null,
   };
   return { ctx, calls, written: () => written };
@@ -131,7 +143,7 @@ function killing(kills: number[], states: string[]) {
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 0 },
-    connection: { get: async () => BOX, set: async () => {} },
+    db: boxDb(BOX, () => {}),
     sibling: async () => null,
   };
   return { ctx, calls };

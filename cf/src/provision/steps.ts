@@ -5,6 +5,7 @@
  */
 import type { Json } from "../../../src/core/types.ts";
 import type { AgentRuntime } from "../runtime.ts";
+import { PUSH_KEY, PUSH_STORE, raftPlugin } from "../../../src/plugins/raft.ts";
 import type { ProvisionTool, PushStatus } from "./handlers.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
@@ -58,12 +59,13 @@ export async function provisionTool(
 }
 
 /**
- * The push state the raft plugin keeps on its mount, projected for the provider. Read from the store
- * so a Raft poll leaves no trace row, no usage row and no Agent Activity event behind.
+ * The push state the raft plugin keeps on its mount, projected for the provider. Read from the rows
+ * so a Raft poll leaves no trace row, no usage row and no Agent Activity event behind; under the raft
+ * plugin's id, because a database is filed by plugin and the alias alone names nothing.
  */
 export async function provisionPushStatus(rt: AgentRuntime, tenantId: string, agentId: string): Promise<PushStatus | null> {
   await rt.ready();
-  const raw = await rt.store.getConnection(tenantId, agentId, PROVISION_MOUNT_ALIAS);
+  const raw = rt.store.pluginDb.get({ tenantId, agentId, alias: PROVISION_MOUNT_ALIAS, plugin: raftPlugin.id }, PUSH_STORE, PUSH_KEY);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const s = raw as Record<string, unknown>;
   const reached = s.lastReached && typeof s.lastReached === "object" ? s.lastReached as Record<string, unknown> : null;

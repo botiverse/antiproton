@@ -902,7 +902,7 @@ export class AgentDO extends DurableObject<Env> {
    * content, so counting every message with a usage field counts a model call
    * once for the answer and once per poll that found it not ready; those are
    * skipped. The container meter is read after release, from the session the
-   * run9 plugin writes into the mount's connection state when the box is
+   * run9 plugin writes into the mount's database when the box is
    * handed back — written there precisely so it outlives the box.
    */
   async benchSweStats(taskId: string, wallMs: number) {
@@ -1470,7 +1470,7 @@ export class AgentDO extends DurableObject<Env> {
       try { return Number((rows(`SELECT COUNT(*) AS n FROM ${t}`)[0] ?? {}).n ?? 0); }
       catch { return 0; }
     };
-    const tables = ["agents", "agent_state", "approvals", "connections", "counters",
+    const tables = ["agents", "agent_state", "approvals", "plugin_db", "counters",
       "model_bindings", "mounts", "operations", "quotas",
       "pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"];
     return {
@@ -1494,10 +1494,12 @@ export class AgentDO extends DurableObject<Env> {
       // "container" without ever naming the plugin that declares it.
       mounts: rows("SELECT alias, plugin, tool_version, public_config, secret_ref, policy FROM mounts WHERE tenant_id=? AND agent_id=?",
         tenantId, agentId).map((m) => ({ ...m, provides: rt.plugins().find((p) => p.id === m.plugin)?.provides ?? [] })),
-      connections: rows("SELECT alias, state, expires_at, updated_at FROM connections WHERE tenant_id=? AND agent_id=?",
-        tenantId, agentId),
+      // Per (mount, plugin, store): how many keys and when the last changed.
+      // Never a key or a value: which keys may be named is the plugin's
+      // declaration (`listed`), read by the diagnosis, not by this page.
+      databases: rt.store.pluginDb.summary(tenantId, agentId),
       // What each mount says about itself, rather than what the page can infer
-      // from the JSON in `connections`. The sandbox panel used to read a run9
+      // from a plugin's rows. The sandbox panel used to read a run9
       // box id, its exec count and its saved refs straight out of that blob,
       // which is one plugin's private shape sitting in a page — the last of the
       // reach-ins Piper's audit found. Asked of every mount that answers, so
@@ -1582,7 +1584,6 @@ export class AgentDO extends DurableObject<Env> {
       // a per-mount join would print a name that exists nowhere.
       mounts: await Promise.all(mounts.map(async (m) => {
         const plugin = byId.get(m.plugin);
-        const conn = await rt.store.getConnection(tenantId, agentId, m.alias).catch(() => null);
         return {
           alias: m.alias,
           plugin: m.plugin,
@@ -1600,7 +1601,6 @@ export class AgentDO extends DurableObject<Env> {
           // one is deliberately not a deletion.
           enabled: plugin ? pluginEnabled(SEEDED_PLUGINS.has(m.plugin), choices[m.plugin]) : true,
           config: m.publicConfig ?? {},
-          session: conn ? { expiresAt: (conn as any).expiresAt ?? null } : null,
           // Attached, verified, account, last four, dates. Never a value.
           credential: await rt.credentialMeta(tenantId, agentId, m),
           // Why a seed change did not reach this mount, when it did not. The

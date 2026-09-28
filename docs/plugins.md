@@ -39,6 +39,9 @@ import type { Plugin } from "./types.ts";
 export const notesPlugin: Plugin = {
   id: "notes",
   version: "1.0.0",
+  // The one store this plugin keeps, under one key. Declared here so the
+  // kernel opens it for each mount; the plugin never names a database.
+  database: { version: 1, stores: { note: {} } },
   tools: [
     {
       name: "read_note",
@@ -66,13 +69,13 @@ export const notesPlugin: Plugin = {
 
   async invoke(tool, args, ctx): Promise<Json> {
     const max = (ctx.publicConfig.maxChars as number | undefined) ?? 2000;
-    if (tool === "read_note") return { note: await ctx.connection.get() };
+    if (tool === "read_note") return { note: (await ctx.db.get("note", "text")) ?? null };
     if (tool === "write_note") {
       const text = String((args as { text?: unknown })?.text ?? "");
       if (text.length > max) {
         throw new Error(`note has ${text.length} characters; the limit is ${max}`);
       }
-      await ctx.connection.set(text);
+      await ctx.db.put("note", text, "text");
       return { saved: text.length };
     }
     throw new Error(`unknown tool: ${tool}`);
@@ -171,9 +174,17 @@ build that produced the message — which in the reading that prompted this mean
 three builds, because the sentence a conclusion rested on did not exist yet on
 the day of the call.
 
-**Keep per-mount state in `ctx.connection`.** It belongs to one mount, survives
-across calls and runs, and is never shown to the model. Two mounts of the same
-plugin never share it.
+**Keep per-mount state in `ctx.db`.** Declare it under `database` — a
+`version`, the `stores` (each with an optional `keyPath`, one index, and the
+`listed` keys a diagnosis may name), and an `upgrade(db, oldVersion)` for when
+the shape changes — and use it the way you would idb's wrapper: `get`, `put`,
+`delete`, `getAll`, `getAllFromIndex`, `count`, and `transaction` for a
+read-decide-write. It belongs to one mount, survives across calls and runs,
+and is never shown to the model. Two mounts of the same plugin never share it,
+and two plugins never share a mount's rows, even under the same alias. Reads
+come back `unknown`: verify the shape and fail to empty, because the data
+outlives the code that wrote it. The full rules are on `DbSpec` in
+`src/plugins/types.ts`.
 
 **The version is a pin.** Mounts record the registry's `version`, and the
 gateway refuses a call when a mount's pin and the registry disagree. Only raise
@@ -195,7 +206,7 @@ holds: {
 
 `activity` must not need the credential and must not call anything remote: it
 is asked on a timer, and often when the credential has been removed. Read
-`ctx.connection` and answer. `release` must be safe to call twice, it releases
+`ctx.db` and answer. `release` must be safe to call twice, it releases
 everything the mount holds *for the agent* rather than what one conversation
 used, and it throws when it could not let go of something still being billed.
 
@@ -293,7 +304,7 @@ that has to count is a message, not a paragraph
   entries of its own record it could not read (`unreadable`). The console
   panel, the idle sweep and mount renaming all read it. It must not need the
   credential and must not call anything remote: it is asked on a timer, and
-  often when the credential has been removed. Read `ctx.connection` and answer.
+  often when the credential has been removed. Read `ctx.db` and answer.
   `unreadable` means "I could not read this", not "there is nothing". A record
   read leniently must still count what it skipped, or a broken record looks
   like an idle mount.
@@ -328,7 +339,7 @@ outside, so the plugin acts as a gate, not a pipe.
 Two parts, both in the plugin:
 
 1. **Tools that record what the agent wants to hear about**, kept in
-   `ctx.connection`. They are writes, so a mount's policy can hold them.
+   `ctx.db`. They are writes, so a mount's policy can hold them.
 2. **`receive(event, secret, ctx)`**, which the runtime calls for each request
    the service sends. It gets the raw body bytes, lowercase header names and
    the hook's secret, and answers either `{ deliver: true, text }` or
@@ -353,6 +364,7 @@ async function signedBy(body: Uint8Array, header: string | undefined, secret: st
 export const statusPlugin: Plugin = {
   id: "status",
   version: "1.0.0",
+  database: { version: 1, stores: { watch: {} } },
   tools: [{
     name: "watch",
     summary: "Be told when a component's status changes. Changes arrive as messages.",
@@ -369,8 +381,8 @@ export const statusPlugin: Plugin = {
     if (tool !== "watch") throw new Error(`unknown tool: ${tool}`);
     const component = String((args as { component?: unknown })?.component ?? "");
     if (!component) throw new Error("component is required");
-    const watched = ((await ctx.connection.get()) as string[] | null) ?? [];
-    if (!watched.includes(component)) await ctx.connection.set([...watched, component]);
+    const watched = ((await ctx.db.get("watch", "components")) as string[] | undefined) ?? [];
+    if (!watched.includes(component)) await ctx.db.put("watch", [...watched, component], "components");
     return { watching: component };
   },
 
@@ -391,7 +403,7 @@ export const statusPlugin: Plugin = {
       return { deliver: false, rejected: true, reason: "the body is not a JSON object" };
     }
     const p = parsed as { id?: string; component?: string; status?: string };
-    const watched = ((await ctx.connection.get()) as string[] | null) ?? [];
+    const watched = ((await ctx.db.get("watch", "components")) as string[] | undefined) ?? [];
     if (!p.component || !watched.includes(p.component)) {
       return { deliver: false, reason: `${p.component}: not watched` };
     }
@@ -467,8 +479,8 @@ The rules that go with them:
 
 - **The secret and the URL never go into a tool result or an error.** What
   `invoke` returns is written into the conversation. The secret goes to the
-  service and nowhere else, `ctx.connection` included.
-- **Keep the live `hookId` in `ctx.connection`.** Every `create()` is another
+  service and nowhere else, `ctx.db` included.
+- **Keep the live `hookId` in `ctx.db`.** Every `create()` is another
   address that stays valid until something revokes it, and the plugin is the
   only thing that knows the id. An id that is not written down is an address
   nobody can ever take away — so never drop one to keep a list short.
@@ -493,7 +505,8 @@ The rules that go with them:
   confirmed.
 
 The `raft` plugin's `enable_push` is this, and it is the one to read in
-full. In outline, with its helpers left out:
+full. In outline, with its helpers left out (`pushState` reads the mount's
+record from `ctx.db`, `savePush` writes it back):
 
 ```ts
 async function enablePush(ctx: PluginContext): Promise<Json> {
@@ -504,7 +517,7 @@ async function enablePush(ctx: PluginContext): Promise<Json> {
   // new-then-old, further down.
   const superseded = await revokeAll(ctx, state.superseded);
   if (superseded.length > 0) {
-    await ctx.connection.set({ ...state, superseded });
+    await savePush(ctx, { ...state, superseded });
     throw new Error("an earlier endpoint could not be revoked; try enable_push again");
   }
 
@@ -518,13 +531,13 @@ async function enablePush(ctx: PluginContext): Promise<Json> {
     }
     // It may have landed, so the service may already be posting to the new
     // hook. Keep it, and keep the old id to revoke on the next attempt.
-    await ctx.connection.set({ hookId: hook.hookId, superseded: ids(state) });
+    await savePush(ctx, { hookId: hook.hookId, superseded: ids(state) });
     throw e;
   }
   // Written down before the old ones are revoked; then whatever would not
   // revoke stays on the list for the next call.
-  await ctx.connection.set({ hookId: hook.hookId, superseded: ids(state) });
-  await ctx.connection.set({ hookId: hook.hookId, superseded: await revokeAll(ctx, ids(state)) });
+  await savePush(ctx, { hookId: hook.hookId, superseded: ids(state) });
+  await savePush(ctx, { hookId: hook.hookId, superseded: await revokeAll(ctx, ids(state)) });
   return { push: "enabled" };  // never the URL, and never the secret
 }
 ```
@@ -571,10 +584,10 @@ revokes a hook.
   event the plugin does not handle included: anything but `rejected` tells
   the service its request was accepted.
 - **Write nothing before refusing.** A request that ends in `rejected` must
-  leave `ctx.connection` as it was: a stranger's request must not change what
+  leave `ctx.db` as it was: a stranger's request must not change what
   the mount remembers.
 - **Deliver only what the mount subscribed to**, as the plugin's own tools
-  recorded it in `ctx.connection`.
+  recorded it in `ctx.db`.
 - **Drop what the mount's own account caused**, whenever the agent can act on
   the service. Otherwise the agent is woken by its own reply and answers it.
 - **Write the text itself:** one line saying what happened, kept on one line
