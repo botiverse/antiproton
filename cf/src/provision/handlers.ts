@@ -174,18 +174,24 @@ export async function handleProvision(
     return ok(view(row), created ? 201 : 200);
   }
 
-  if (seg[0] !== "agents" || seg.length < 2 || seg.length > 3) return null;
-  const row = await deps.registry.getByAgentId(tenantId, seg[1]!);
-  const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${seg[1]}` });
+  // An agent is addressed by its providerAgentId, or by the Raft id it was made from
+  // (`/agents/by-raft-agent/<raftAgentId>`): a POST whose answer was lost leaves Raft with no
+  // providerAgentId, and a delete must still reach the agent it made (Tenny's orphan case).
+  if (seg[0] !== "agents") return null;
+  const byRaft = seg[1] === "by-raft-agent";
+  const rest = byRaft ? seg.slice(2) : seg.slice(1);
+  if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
+  const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+  const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
 
-  if (seg.length === 2 && method === "GET") {
+  if (rest.length === 1 && method === "GET") {
     if (!row) return gone();
     if (row.status === "deleted") return ok(view(row));
     const status = await deps.agent.tool(row.agentId, "push_status");
     return ok(view(row, status.ok ? status.result : { error: status.error }));
   }
 
-  if (seg.length === 2 && method === "PATCH") {
+  if (rest.length === 1 && method === "PATCH") {
     if (!row || row.status === "deleted") return gone();
     const name = textField(body, "name", NAME_MAX, false);
     if (isFail(name)) return fail(name);
@@ -201,7 +207,7 @@ export async function handleProvision(
     return ok(view(next));
   }
 
-  if (seg.length === 3 && seg[2] === "credential" && method === "PUT") {
+  if (rest.length === 2 && method === "PUT") {
     if (!row || row.status === "deleted") return gone();
     const credential = credentialField(body);
     if (isFail(credential)) return fail(credential);
@@ -211,7 +217,7 @@ export async function handleProvision(
     return ok(view(await registerPush(deps, row)));
   }
 
-  if (seg.length === 2 && method === "DELETE") {
+  if (rest.length === 1 && method === "DELETE") {
     if (!row) return gone();
     if (row.status === "deleted") return ok(view(row));
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is

@@ -218,6 +218,27 @@ await check("GET reads the row and asks the plugin for live push status; there i
   }
 });
 
+await check("an agent is also addressed by the Raft id it was made from, so a lost POST answer still lets Raft delete it", async () => {
+  const f = fakeDeps();
+  const never = await call(f.deps, "DELETE", "/agents/by-raft-agent/01JAGENT");
+  assert(never.status === 404 && /Raft agent 01JAGENT/.test(never.body.error.message), `never created → ${never.status} ${never.text}`);
+  await call(f.deps, "POST", "/agents", body());
+  const got = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT");
+  assert(got.status === 200 && got.body.providerAgentId === "raft_01JAGENT" && got.body.push.live.enabled === true, got.text);
+  const patched = await call(f.deps, "PATCH", "/agents/by-raft-agent/01JAGENT", { name: "Cody 2" });
+  assert(patched.status === 200 && patched.body.name === "Cody 2", patched.text);
+  const cred = await call(f.deps, "PUT", "/agents/by-raft-agent/01JAGENT/credential", { credential: CRED });
+  assert(cred.status === 200 && cred.body.push.registered === true, cred.text);
+  f.calls.length = 0;
+  const gone = await call(f.deps, "DELETE", "/agents/by-raft-agent/01JAGENT");
+  assert(gone.status === 200 && gone.body.status === "deleted" && f.calls.join(";") === "disable_push raft_01JAGENT;remove raft_01JAGENT", gone.text);
+  assert((await call(f.deps, "DELETE", "/agents/by-raft-agent/01JAGENT")).status === 200, "a second delete by Raft id changed its answer");
+  assert((await call(f.deps, "GET", "/agents/raft_01JAGENT")).body.status === "deleted", "the two addresses disagree");
+  for (const [m, p] of [["GET", "/agents/by-raft-agent"], ["GET", "/agents/by-raft-agent/01JAGENT/other"], ["PUT", "/agents/by-raft-agent/01JAGENT/credential/x"]] as const) {
+    assert((await call(f.deps, m, p, {})).status === 0, `${m} ${p} was answered`);
+  }
+});
+
 await check("the antiproton agent id is the Raft id, prefixed, made legal for an object name, and bounded", async () => {
   assert(providerAgentId("01JAGENT") === "raft_01JAGENT", providerAgentId("01JAGENT"));
   assert(providerAgentId("a/b:c") === "raft_a_b_c", providerAgentId("a/b:c"));
