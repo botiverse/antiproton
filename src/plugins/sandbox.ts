@@ -283,7 +283,7 @@ export function leaseTerms(lease: BoxLease): string {
 /**
  * The stored state, or null when what came back is not it.
  *
- * `ConnectionState` hands back `Json`, which is `unknown` — so `as BoxState`
+ * `ctx.db` hands back `unknown` — so `as BoxState`
  * was never a narrowing, it was an assertion the compiler cannot check, on
  * data that outlives the code that wrote it. The risk is not a mistyped call
  * site; it is this call site reading a row written by an older version, which
