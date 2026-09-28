@@ -20,6 +20,7 @@
     "typecheck-baseline": "node test/typecheck-baseline.ts"
   },
   "dependencies": {
+    "@botiverse/raft-sdk": "1.0.0-alpha.0",
     "@earendil-works/pi-agent-core": "0.85.1",
     "quickjs-emscripten": "^0.32.0"
   },

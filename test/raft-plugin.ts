@@ -122,12 +122,15 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
   throw new Error("expected failure");
 }
 
-await check("declares the queue drain as a non-idempotent write", async () => {
+await check("declares the inbox pull as a write that repeats safely, and the rest as before", async () => {
   if (raftPlugin.version !== "1.0.0") throw new Error(`unexpected plugin version: ${raftPlugin.version}`);
+  // Under cursor acknowledgement a pull acknowledges the previous batch (a write) and repeating it hands back
+  // the same batch (native), which is what lets a failed pull be retried.
   const receive = raftPlugin.tools.find((tool) => tool.name === "receive_events");
-  if (receive?.sideEffects !== "write" || receive.idempotency !== "none") {
-    throw new Error(`unsafe declaration: ${JSON.stringify(receive)}`);
+  if (receive?.sideEffects !== "write" || receive.idempotency !== "native") {
+    throw new Error(`receive declaration: ${JSON.stringify(receive)}`);
   }
+  if ("since" in ((receive.parameters as any).properties ?? {})) throw new Error("the model can still pass since; the cursor is the plugin's");
   const send = raftPlugin.tools.find((tool) => tool.name === "send_message");
   if (send?.sideEffects !== "write" || send.idempotency !== "key") throw new Error("send lost its key idempotency");
   const join = raftPlugin.tools.find((tool) => tool.name === "join_channel");
@@ -151,18 +154,15 @@ await check("serverUrl rejects cleartext non-loopback origins before sending the
 });
 
 await check("send uses the configured origin, keeps the credential host-side, and projects the response", async () => {
-  const calls = one(json(200, {
-    ok: true, state: "sent", messageId: "m-1", messageSeq: 7,
-    recentUnread: [{ content: "must not enter the result" }], serverExtra: "also hidden",
-  }));
+  const calls = one(json(200, { ok: true, state: "sent", messageId: "m-1", messageSeq: 7, serverExtra: "also hidden" }));
   const out = await raftPlugin.invoke("send_message", {
     target: "#general", content: "hello", idempotencyKey: "stable-1",
   }, ctx()) as any;
   if (JSON.stringify(out) !== JSON.stringify({ state: "sent", messageId: "m-1", messageSeq: 7 })) {
     throw new Error(`unexpected projection: ${JSON.stringify(out)}`);
   }
-  if (calls.length !== 1 || calls[0]!.url !== "https://raft.example/internal/agent-api/send") {
-    throw new Error(`wrong request: ${JSON.stringify(calls)}`);
+  if (calls.length !== 1 || !calls[0]!.url.startsWith("https://raft.example/internal/agent-api/") || !/\/send$/.test(calls[0]!.url)) {
+    throw new Error(`wrong request: ${JSON.stringify(calls.map((c) => c.url))}`);
   }
   const headers = new Headers(calls[0]!.init.headers);
   if (headers.get("authorization") !== "Bearer sk_agent_test_1234567890") throw new Error("credential not attached");
@@ -176,72 +176,121 @@ await check("send uses the configured origin, keeps the credential host-side, an
   }
 });
 
+await check("a held send returns the newer messages as lines, and the same send again attests them and goes through", async () => {
+  const m = mount();
+  const calls = many(
+    json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+      heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] }),
+    json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }),
+  );
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
+  if (held.state !== "held" || held.messages?.[0] !== "[target=#general msg=abcdef12 time=2026-09-28 10:00:00Z type=human] @tygg: wait, one more thing" ||
+      !/same idempotencyKey/.test(held.note)) {
+    throw new Error(`held: ${JSON.stringify(held)}`);
+  }
+  // A second invocation is a fresh client, as it would be in a new process: what the model was shown survives in the database.
+  const sent = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
+  const second = JSON.parse(String(calls[1]!.init.body));
+  if (sent.state !== "sent" || second.seenUpToSeq !== 20 || second.idempotencyKey !== "k-held") {
+    throw new Error(`the resend did not attest what the model saw: ${JSON.stringify({ sent, second })}`);
+  }
+});
+
 await check("send requires a stable idempotency key before reaching Raft", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
   const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "hello" }, ctx()));
   if (!/idempotencyKey/.test(why.message)) throw why;
 });
 
-await check("receive makes exactly one request and returns only the message projection", async () => {
-  const calls = one(json(200, {
-    events: [{
-      id: "m-2", seq: 9, content: "hi", sender_type: "human", sender_name: "tygg",
-      channel_name: "wg-raft-sdk", channel_type: "regular", internalSecret: "hidden",
-      attachments: [{ id: "a-1", filename: "readme.txt", storageKey: "hidden" }],
-    }],
-    last_seen_seq: 9, last_seen_msgId: "m-2", has_more: false, reply_target: "#wg-raft-sdk",
-    pending_notice_ids: ["hidden"], wake_reason: "hidden",
-  }));
-  const out = await raftPlugin.invoke("receive_events", { since: 3, limit: 4 }, ctx()) as any;
-  if (calls.length !== 1 || calls[0]!.url !== "https://raft.example/internal/agent-api/events?since=3&limit=4") {
-    throw new Error(`receive calls: ${JSON.stringify(calls)}`);
+/** A /events answer in the shape the Raft SDK validates. */
+function events(evs: unknown[], over: Record<string, unknown> = {}) {
+  return json(200, { events: evs, last_seen_msgId: null, last_seen_seq: null, reply_target: null, has_more: false, ack_mode: "cursor", ...over });
+}
+
+await check("a pull acknowledges nothing on its own: the next pull carries the cursor, and messages reach the model as the CLI's lines", async () => {
+  const m = mount();
+  const calls = many(
+    events([{
+      id: "m-2aaaaaa", seq: 9, content: "hi", sender_type: "human", sender_name: "tygg", timestamp: "2026-09-28T10:00:00Z",
+      channel_name: "wg-raft-sdk", channel_type: "channel", internalSecret: "hidden",
+    }], { last_seen_seq: 9, last_seen_msgId: "m-2aaaaaa", reply_target: "#wg-raft-sdk", pending_notice_ids: ["hidden"], wake_reason: "hidden" }),
+    events([]),
+  );
+  const out = await raftPlugin.invoke("receive_events", { limit: 4 }, m.ctx) as any;
+  const first = new URL(calls[0]!.url);
+  if (first.pathname !== "/internal/agent-api/events" || first.searchParams.get("ack") !== "cursor" || /^\d+$/.test(first.searchParams.get("since") ?? "")) {
+    throw new Error(`the first pull: ${calls[0]!.url}`);
   }
-  if (calls[0]!.init.cache !== "no-store") throw new Error(`receive cache mode: ${calls[0]!.init.cache}`);
-  const encoded = JSON.stringify(out);
-  if (!encoded.includes('"messageId":"m-2"') || !encoded.includes('"senderName":"tygg"')) throw new Error(encoded);
-  if (/internalSecret|storageKey|pending_notice_ids|wake_reason/.test(encoded)) throw new Error(`unprojected data: ${encoded}`);
+  if (JSON.stringify(out.messages) !== JSON.stringify(["[target=#wg-raft-sdk msg=m-2aaaaa time=2026-09-28 10:00:00Z type=human] @tygg: hi"]) ||
+      out.hasMore !== false || out.replyTarget !== "#wg-raft-sdk") {
+    throw new Error(`projection: ${JSON.stringify(out)}`);
+  }
+  if (/internalSecret|pending_notice_ids|wake_reason|hidden/.test(JSON.stringify(out))) throw new Error(`unprojected data: ${JSON.stringify(out)}`);
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const second = new URL(calls[1]!.url);
+  if (second.searchParams.get("since") !== "9" || second.searchParams.get("ack") !== "cursor") {
+    throw new Error(`the next pull did not acknowledge the batch the model was handed: ${calls[1]!.url}`);
+  }
 });
 
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
-  const calls = one(json(200, { events: [{ message_id: "m-9", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], last_seen_seq: 12, has_more: true }));
-  const out = await raftPlugin.invoke("receive_events", { since: "latest", limit: 10 }, ctx()) as any;
+  const m = mount();
+  const calls = one(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }));
+  const out = await raftPlugin.invoke("receive_events", { limit: 10 }, m.ctx) as any;
   if (out.hasMore !== true || !/call receive_events again until hasMore is false/.test(out.note) || calls.length !== 1) throw new Error(JSON.stringify(out));
-  one(json(200, { events: [], last_seen_seq: 12, has_more: false }));
-  const done = await raftPlugin.invoke("receive_events", { since: "latest" }, ctx()) as any;
+  one(events([], { last_seen_seq: 12 }));
+  const done = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   if (done.hasMore !== false || "note" in done) throw new Error(JSON.stringify(done));
 });
 
-await check("receive transport failure is uncertain and is never retried inside the plugin", async () => {
-  let calls = 0;
-  globalThis.fetch = (async () => { calls++; throw new Error("socket closed"); }) as any;
-  const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
-  if (calls !== 1) throw new Error(`receive made ${calls} attempts`);
-  if (why.retryable !== true || !/acknowledgement may already have occurred/.test(why.message)) {
-    throw new Error(`uncertainty was lost: ${why.message}, retryable=${why.retryable}`);
+await check("a failed pull loses nothing: the cursor stays, and the next pull asks for the same batch again", async () => {
+  const m = mount();
+  const calls = many(events([{ id: "m-3aaaaaa", seq: 5, content: "x", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 5 }));
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  let attempts = 0;
+  const seen: string[] = [];
+  globalThis.fetch = (async (url: any) => { attempts++; seen.push(String(url)); throw new Error("socket closed"); }) as any;
+  const why = await failure(() => raftPlugin.invoke("receive_events", {}, m.ctx));
+  if (attempts !== 1) throw new Error(`receive made ${attempts} attempts`);
+  if (why.mayHaveLanded === true) throw new Error("a pull under cursor acks was reported as possibly consuming messages");
+  if (/socket closed/.test(why.message)) throw new Error(`the transport cause leaked: ${why.message}`);
+  const again = one(events([]));
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  if (new URL(seen[0]!).searchParams.get("since") !== "5" || new URL(again[0]!.url).searchParams.get("since") !== "5") {
+    throw new Error(`the failed pull moved the cursor: ${JSON.stringify({ failed: seen[0], next: again[0]!.url })}`);
   }
+  if (calls.length !== 1) throw new Error("the first pull made more than one request");
 });
 
-await check("receive rejects an invalid response without exposing its body", async () => {
+await check("receive rejects an invalid response without exposing its body, and keeps the cursor", async () => {
+  const m = mount();
   one(json(200, { events: "wrong", secret: "body-secret" }));
-  const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
-  if (!/acknowledgement may already have occurred/.test(why.message) || /body-secret/.test(why.message)) throw why;
+  const why = await failure(() => raftPlugin.invoke("receive_events", {}, m.ctx));
+  if (/body-secret/.test(why.message)) throw why;
+  if (m.ctx.db && (await m.ctx.db.get("inbox", "cursor")) !== undefined) throw new Error("an invalid answer set a cursor");
 });
 
-await check("receive HTTP and non-JSON failures preserve acknowledgement uncertainty without leaking bodies", async () => {
+await check("receive HTTP and non-JSON failures do not leak bodies", async () => {
   for (const response of [
     json(500, { message: "private upstream detail" }),
     new Response("private proxy page", { status: 502, headers: { "content-type": "text/html" } }),
   ]) {
     one(response);
-    const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
-    if (!/acknowledgement may already have occurred/.test(why.message) || !/no retry was attempted/.test(why.message)) {
-      throw new Error(`uncertainty was lost: ${why.message}`);
-    }
+    const why = await failure(() => raftPlugin.invoke("receive_events", {}, mount().ctx));
     if (/private upstream detail|private proxy page/.test(why.message)) throw new Error(`body leaked: ${why.message}`);
+    if (why.mayHaveLanded === true) throw new Error(`a failed pull was reported as possibly consuming messages: ${why.message}`);
   }
 });
 
-await check("the gateway persists every post-dispatch receive failure as unknown", async () => {
+await check("a Server that still acknowledges on read is named in the result, and no cursor is kept for it", async () => {
+  const m = mount();
+  one(events([{ id: "m-4aaaaaa", seq: 3, content: "x", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 3, ack_mode: "immediate" }));
+  const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  if (out.acknowledged !== "on this read") throw new Error(JSON.stringify(out));
+  if ((await m.ctx.db.get("inbox", "cursor")) !== undefined) throw new Error("a cursor was kept for a batch already acknowledged");
+});
+
+await check("the gateway records a failed pull as failed, not unknown: under cursor acks nothing was consumed", async () => {
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("tenant", "agent");
@@ -273,13 +322,10 @@ await check("the gateway persists every post-dispatch receive failure as unknown
   for (const [name, arrange] of cases) {
     arrange();
     const out = await invoke();
-    if (out.status !== "unknown") throw new Error(`${name} persisted as ${out.status}: ${JSON.stringify(out)}`);
+    if (out.status !== "failed") throw new Error(`${name} persisted as ${out.status}: ${JSON.stringify(out)}`);
     const message = out.error?.message ?? "";
-    if (!/acknowledgement may already have occurred/.test(message) || !/no retry was attempted/.test(message)) {
-      throw new Error(`${name} lost the uncertainty/no-retry contract: ${message}`);
-    }
     if (/private socket detail|private upstream detail|private proxy page|body-secret/.test(message)) {
-      throw new Error(`${name} leaked a response or transport detail: ${message}`);
+      throw new Error(`${name} leaked: ${message}`);
     }
   }
 });
@@ -710,14 +756,17 @@ await check("push_status safely normalizes a corrupt persisted record", async ()
  * on its own, and may the last attempt have landed — and a 5xx answers yes to
  * both (@Vera counted the three sites, 2026-09-20).
  */
-await check("an uncertain delivery says it may have landed, and does not say it will clear", async () => {
-  globalThis.fetch = (async () => new Response("", { status: 500 })) as any;
-  const why = await failure(() => raftPlugin.invoke("receive_events", {}, ctx()));
+await check("a send that got no answer says it may have landed, and does not say it will clear", async () => {
+  globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
+  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-u" }, ctx()));
   if (why.mayHaveLanded !== true) throw new Error(`uncertainty was lost: mayHaveLanded=${why.mayHaveLanded}`);
-  if (why.transient !== undefined) throw new Error(`a drained batch was called self-clearing: transient=${why.transient}`);
-  // The flag its consumer still reads must not move until that consumer does.
-  if (why.retryable !== true) throw new Error(`the transitional flag changed: retryable=${why.retryable}`);
+  const refused = await (async () => {
+    one(json(403, { error: "forbidden" }));
+    return failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-r" }, ctx()));
+  })();
+  if (refused.mayHaveLanded === true) throw new Error("a refusal was reported as possibly landed");
 });
+
 
 /**
  * A state holding as many ids as the cap still enables push, once they are gone.

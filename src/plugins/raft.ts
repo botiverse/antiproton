@@ -7,6 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
+import { createRaft, type Raft, type SeenFrontierSnapshot, type RaftFailure } from "@botiverse/raft-sdk";
 import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -283,68 +284,54 @@ async function validPushSignature(body: Uint8Array, signature: string | undefine
   return crypto.subtle.verify("HMAC", key, actual, body);
 }
 
-function attachment(value: unknown): Json | null {
-  const a = object(value);
-  if (typeof a.id !== "string" || typeof a.filename !== "string") return null;
-  return {
-    id: a.id,
-    filename: a.filename,
-    ...(typeof a.mimeType === "string" ? { mimeType: a.mimeType } : {}),
-    ...(typeof a.sizeBytes === "number" ? { sizeBytes: a.sizeBytes } : {}),
-  };
+
+
+
+/**
+ * The inbox cursor and the seen frontier, kept per mount. The cursor is what the next pull acknowledges;
+ * the frontier is what this agent has been shown per conversation, which a send attests so a reply into a
+ * conversation it has read is not held. Both survive the object being a new process between two calls.
+ */
+export const INBOX_STORE = "inbox";
+const CURSOR_KEY = "cursor";
+const FRONTIER_KEY = "frontier";
+
+/** A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved frontier. */
+async function raftFor(ctx: PluginContext): Promise<Raft> {
+  const serverUrl = baseUrl(ctx).origin;
+  const snapshot = await ctx.db.get(INBOX_STORE, FRONTIER_KEY);
+  return createRaft({
+    serverUrl, credential: requireCredential(ctx),
+    // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
+    fetch: (input, init) => fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeout(ctx)) }),
+    frontier: frontierSnapshot(snapshot),
+  });
 }
 
-function event(value: unknown): Json {
-  const e = object(value);
-  const sender = text(e.sender_type) ?? text(e.senderType);
-  const attachments = Array.isArray(e.attachments)
-    ? e.attachments.map(attachment).filter((a): a is Json => a !== null)
-    : [];
-  return {
-    type: "message",
-    ...(text(e.message_id) ?? text(e.id) ? { messageId: text(e.message_id) ?? text(e.id) } : {}),
-    ...(number(e.seq) !== undefined ? { seq: number(e.seq) } : {}),
-    ...(text(e.content) !== undefined ? { content: text(e.content) } : {}),
-    ...(text(e.timestamp) ?? text(e.createdAt) ? { timestamp: text(e.timestamp) ?? text(e.createdAt) } : {}),
-    senderType: ["human", "agent", "system", "third_party_app"].includes(sender ?? "") ? sender! : "unknown",
-    ...(text(e.sender_name) ?? text(e.senderName) ? { senderName: text(e.sender_name) ?? text(e.senderName) } : {}),
-    ...(text(e.sender_id) ? { senderId: text(e.sender_id) } : {}),
-    ...(text(e.channel_id) ? { channelId: text(e.channel_id) } : {}),
-    ...(text(e.channel_name) ? { channelName: text(e.channel_name) } : {}),
-    ...(text(e.channel_type) ? { channelType: text(e.channel_type) } : {}),
-    ...(text(e.parent_channel_name) ? { parentChannelName: text(e.parent_channel_name) } : {}),
-    ...(text(e.parent_channel_type) ? { parentChannelType: text(e.parent_channel_type) } : {}),
-    // Where a reply to this message goes. A raft-agent-inbox.v2 batch names one
-    // per message, since one batch spans conversations; the pull answer names
-    // one for the whole batch instead.
-    ...(text(e.reply_target) ? { replyTarget: text(e.reply_target) } : {}),
-    ...(typeof e.mentioned === "boolean" ? { mentioned: e.mentioned } : {}),
-    // Raft leaves out the content of a message too large for the batch and says so.
-    ...(e.truncated === true ? { truncated: true } : {}),
-    // A message that is a task carries the task's number and status.
-    ...(number(e.task_number) !== undefined ? { taskNumber: number(e.task_number) } : {}),
-    ...(text(e.task_status) ? { taskStatus: text(e.task_status) } : {}),
-    attachments,
-  } as Json;
+function frontierSnapshot(value: unknown): SeenFrontierSnapshot | null {
+  const v = object(value);
+  return v.version === 1 && typeof v.targets === "object" && v.targets !== null && typeof v.aliases === "object" && v.aliases !== null
+    ? v as unknown as SeenFrontierSnapshot : null;
 }
 
-function sendResult(data: ObjectValue): Json {
-  if (data.state === "sent" && data.ok === true && typeof data.messageId === "string") {
-    return {
-      state: "sent", messageId: data.messageId,
-      ...(number(data.messageSeq) !== undefined ? { messageSeq: number(data.messageSeq) } : {}),
-    };
-  }
-  if (data.state === "held") {
-    return {
-      state: "held",
-      ...(text(data.reason) ? { reason: text(data.reason) } : {}),
-      ...(Array.isArray(data.available_actions)
-        ? { availableActions: data.available_actions.filter((v): v is string => typeof v === "string") }
-        : {}),
-    };
-  }
-  throw new Error("raft send response did not match the expected contract");
+async function saveFrontier(ctx: PluginContext, raft: Raft): Promise<void> {
+  await ctx.db.put(INBOX_STORE, raft.frontier.snapshot() as unknown as Json, FRONTIER_KEY);
+}
+
+/**
+ * An SDK failure as this plugin's error: the SDK's safe text and next step, and whether a retry may help.
+ * `write` says the operation had an effect to lose: for a send, a request that got no answer or a 5xx may
+ * have landed (a repeat with the same key is still safe). A pull under cursor acknowledgement has nothing
+ * to lose, since the batch it asked for is acknowledged only by the next pull.
+ */
+function sdkFailure(out: RaftFailure, write = false): Error {
+  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${out.error.nextAction}` : ""}`);
+  const unanswered = out.error.code === "TRANSPORT_ERROR" || out.error.code === "UNAVAILABLE" ||
+    (out.error.status !== undefined && out.error.status >= 500);
+  // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
+  // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.
+  const landed = write && unanswered;
+  return marked(e, { retryable: landed, transient: out.error.retryable, mayHaveLanded: landed });
 }
 
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
@@ -359,7 +346,7 @@ export const raftPlugin: Plugin = {
   id: "raft",
   version: "1.0.0",
   /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
-  database: { version: 1, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] } } },
+  database: { version: 2, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [CURSOR_KEY] } } },
   config: [
     { name: "serverUrl", type: "string", required: true, format: "origin", summary: "Raft server origin, for example https://api.raft.build." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
@@ -374,13 +361,14 @@ export const raftPlugin: Plugin = {
   tools: [
     {
       name: "send_message",
-      summary: "Send a message to a Raft channel, thread, or DM. The target is explicit; this tool does not infer a reply target.",
+      summary: "Send a message to a Raft channel, thread, or DM. The target is explicit; copy it from the `target=` of the message you answer. " +
+        "If newer messages arrived there that you have not seen, the send is held and they are returned: read them, then send again.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
           target: { type: "string", description: "For example #general, #general:abcd1234, or dm:@name." },
           content: { type: "string" },
-          idempotencyKey: { type: "string", description: "Stable key for safely repeating this send." },
+          idempotencyKey: { type: "string", description: "One key per message. After a held answer, send the same content again with the same key; if you change the content, use a new key." },
         },
         required: ["target", "content", "idempotencyKey"],
       },
@@ -389,16 +377,19 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "receive_events",
-      summary: "Receive and acknowledge queued Raft messages once: the way to read after an inbox notice. Raft hands out at most a few per conversation per call: while the result says hasMore, call again until it is false. A failed call may already have consumed the returned batch; do not retry automatically.",
+      summary: "Read your queued Raft messages: the way to read after an inbox notice. Each message is one line, " +
+        "`[target=… msg=… time=… type=…] @sender: content`; reply with send_message to that target. Raft hands out at most a few " +
+        "per conversation per call: while hasMore is true, call again. A batch is acknowledged by your next call, so a failed call " +
+        "loses nothing and may simply be repeated.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
-          since: { anyOf: [{ type: "integer", minimum: 0 }, { const: "latest" }] },
           limit: { type: "integer", minimum: 1, maximum: MAX_EVENTS },
         },
       },
+      // It acknowledges the previous batch, so it is a write; repeating it hands back the same batch.
       sideEffects: "write",
-      idempotency: "none",
+      idempotency: "native",
     },
     {
       name: "join_channel",
@@ -456,35 +447,51 @@ export const raftPlugin: Plugin = {
       if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
       if (typeof a.content !== "string" || !a.content.trim()) throw new Error("content is required");
       if (typeof a.idempotencyKey !== "string" || !a.idempotencyKey.trim()) throw new Error("idempotencyKey is required");
-      const { data } = await call(ctx, "POST", "/internal/agent-api/send", {
-        target: a.target, content: a.content, idempotencyKey: a.idempotencyKey,
-      });
-      return sendResult(data);
+      const raft = await raftFor(ctx);
+      const out = await raft.messages.send({ target: a.target, content: a.content, idempotencyKey: a.idempotencyKey });
+      if (!out.ok) throw sdkFailure(out, true);
+      if (out.state === "held") {
+        // The held messages are in this result, so the model sees them now: record that, and the next send
+        // of the same message into this conversation attests it instead of being held again.
+        if (!out.data.withheld && out.data.seenUpToSeq !== null) raft.frontier.recordUpTo(out.data.target, out.data.seenUpToSeq);
+        await saveFrontier(ctx, raft);
+        return {
+          state: "held", target: out.data.target, newMessages: out.data.newMessageCount,
+          messages: out.data.heldMessages.map((m) => m.text),
+          ...(out.data.omittedMessageCount ? { omitted: out.data.omittedMessageCount } : {}),
+          note: "Not sent: newer messages arrived in this conversation. Read them; to send your message as it is, call send_message " +
+            "again with the same idempotencyKey; to change it, use a new key.",
+        };
+      }
+      await saveFrontier(ctx, raft);
+      return {
+        state: "sent", messageId: out.data.messageId,
+        ...(out.data.messageSeq !== null ? { messageSeq: out.data.messageSeq } : {}),
+        ...(out.data.recentUnread.length ? { recentUnread: out.data.recentUnread.map((m) => m.text) } : {}),
+      };
     }
     if (name === "receive_events") {
-      const since = a.since === "latest" ? "latest" : integer(a.since, "since", 0, Number.MAX_SAFE_INTEGER);
       const limit = integer(a.limit, "limit", 1, MAX_EVENTS);
-      const query = new URLSearchParams();
-      if (since !== undefined) query.set("since", String(since));
-      if (limit !== undefined) query.set("limit", String(limit));
-      const { data } = await call(
-        ctx,
-        "GET",
-        `/internal/agent-api/events${query.size ? `?${query}` : ""}`,
-        undefined,
-        { cache: "no-store", deliveryMayHaveOccurred: true },
-      );
-      if (!Array.isArray(data.events) || typeof data.has_more !== "boolean") {
-        throw receiveFailure("raft events response did not match the expected contract");
-      }
+      const raft = await raftFor(ctx);
+      // Cursor acknowledgement: this pull acknowledges the batch the previous call returned, and nothing
+      // is acknowledged by being fetched. A lost answer or a crash before the result is recorded costs a
+      // repeat of the same batch, not the messages. The cursor lives in the mount's database because the
+      // object may be a new process by the next call; without it every pull would hand back the same
+      // unacknowledged batch.
+      const stored = await ctx.db.get(INBOX_STORE, CURSOR_KEY);
+      const since = typeof stored === "number" && Number.isSafeInteger(stored) && stored >= 0 ? stored : undefined;
+      const out = await raft.inbox.check({ ack: "cursor", ...(since !== undefined ? { since } : {}), ...(limit !== undefined ? { limit } : {}) });
+      if (!out.ok) throw sdkFailure(out);
+      const batch = out.data;
+      if (batch.cursor !== null && batch.ackMode === "cursor") await ctx.db.put(INBOX_STORE, batch.cursor, CURSOR_KEY);
+      await saveFrontier(ctx, raft);
       return {
-        events: data.events.map(event),
-        lastSeenSeq: typeof data.last_seen_seq === "number" ? data.last_seen_seq : null,
-        lastSeenMessageId: typeof data.last_seen_msgId === "string" ? data.last_seen_msgId : null,
-        hasMore: data.has_more,
-        // Raft caps a pull per conversation, so a true here means unread messages remain.
-        ...(data.has_more ? { note: "More unread messages remain: call receive_events again until hasMore is false." } : {}),
-        replyTarget: typeof data.reply_target === "string" ? data.reply_target : null,
+        messages: batch.messages.map((m) => m.text),
+        hasMore: batch.hasMore,
+        ...(batch.hasMore ? { note: "More unread messages remain: call receive_events again until hasMore is false." } : {}),
+        ...(batch.replyTarget ? { replyTarget: batch.replyTarget } : {}),
+        // A Server that predates cursor acks acknowledged this batch already; say so rather than imply safety.
+        ...(batch.ackMode === "immediate" ? { acknowledged: "on this read" } : {}),
       };
     }
     if (name === "join_channel") {
@@ -707,7 +714,7 @@ async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: P
   const body = payload.text.length > NOTICE_TEXT_MAX ? `${payload.text.slice(0, NOTICE_TEXT_MAX)}… (cut)` : payload.text;
   return {
     deliver: true,
-    text: `Read your Raft inbox with the \`receive_events\` tool from the \`${ctx.alias}\` mount; that read is what acknowledges it.\n\n${body}`,
+    text: `Read your Raft inbox with the \`receive_events\` tool from the \`${ctx.alias}\` mount, until hasMore is false; your next read acknowledges what you were given.\n\n${body}`,
     dedupeKey: payload.noticeId,
   };
 }
