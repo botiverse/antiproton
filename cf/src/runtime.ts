@@ -749,7 +749,7 @@ export class AgentRuntime {
    * or not, so an operator can see what arrived and why it went nowhere.
    */
   async receiveHook(tenantId: string, agentId: string, alias: string, hookId: string,
-    event: InboundEvent | null): Promise<{ outcome: InboundOutcome }> {
+    event: Omit<InboundEvent, "hookId"> | null): Promise<{ outcome: InboundOutcome }> {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
     ensureInboundTable(sql);
@@ -763,7 +763,9 @@ export class AgentRuntime {
     if (!secret) return done("failed", "this hook has no secret in the agent's store");
     let answer;
     try {
-      answer = await this.#gateway.receive(tenantId, agentId, alias, event, secret);
+      // The hook travels with the event: verified against this hook's secret, the delivery is the
+      // plugin's evidence about which hook the service still points at.
+      answer = await this.#gateway.receive(tenantId, agentId, alias, { ...event, hookId }, secret);
     } catch (e: any) {
       // The plugin's own words stay in the record; the service only hears 503.
       return done("failed", String(e?.message ?? e));

@@ -341,8 +341,9 @@ Two parts, both in the plugin:
 1. **Tools that record what the agent wants to hear about**, kept in
    `ctx.db`. They are writes, so a mount's policy can hold them.
 2. **`receive(event, secret, ctx)`**, which the runtime calls for each request
-   the service sends. It gets the raw body bytes, lowercase header names and
-   the hook's secret, and answers either `{ deliver: true, text }` or
+   the service sends. It gets the raw body bytes, lowercase header names, the
+   id of the hook it arrived at and that hook's secret, and answers either
+   `{ deliver: true, text }` or
    `{ deliver: false, reason }`.
 
 A service that reports status changes and signs its requests with an HMAC is

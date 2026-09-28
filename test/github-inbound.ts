@@ -57,6 +57,7 @@ function signed(kind: string, payload: unknown, opts: { secret?: string; deliver
       "content-type": opts.form ? "application/x-www-form-urlencoded" : "application/json",
     },
     body,
+    hookId: "hk_test",
   };
 }
 
@@ -150,7 +151,7 @@ await check("a signed body that is not JSON is refused as a bad request", async 
   const m = await subscribed("acme/widgets");
   const body = new TextEncoder().encode("not json");
   const sig = createHmac("sha256", SECRET).update(body).digest("hex");
-  dropped(await receive({ headers: { "x-github-event": "issues", "x-hub-signature-256": `sha256=${sig}` }, body }, m.ctx), true);
+  dropped(await receive({ headers: { "x-github-event": "issues", "x-hub-signature-256": `sha256=${sig}` }, body, hookId: "hk_test" }, m.ctx), true);
 });
 
 await check("the form-encoded content type delivers the same event", async () => {

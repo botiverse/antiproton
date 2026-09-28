@@ -19,11 +19,14 @@ function must(cond: unknown, msg: string) { if (!cond) throw new Error(msg); }
 
 // The plugin under test hands its `inbound` out through a tool, so the test can drive it.
 const handed: Record<string, InboundHooks | undefined> = {};
+/** The hook id each delivery said it arrived at, as the plugin saw it. */
+const arrivedAt: string[] = [];
 const pushy: Plugin = {
   id: "pushy", version: "1.0.0", 
   tools: [{ name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
   async invoke(_t, _a, ctx) { handed[ctx.alias] = ctx.inbound; return { has: !!ctx.inbound }; },
   async receive(event, secret) {
+    arrivedAt.push(event.hookId);
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad", rejected: true };
     if (event.headers["x-malformed"]) return { deliver: false, reason: "not my shape", malformed: true };
     return { deliver: true, text: "ok" };
@@ -103,6 +106,8 @@ await check("what a plugin delivers reaches the agent under the label that says 
   (rt as any).postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
   const made = await (await grab("a", "p"))!.create();
   must((await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret))).outcome === "delivered", "not delivered");
+  // The event names the hook it arrived at, which the runtime resolved before the plugin saw it.
+  must(arrivedAt.at(-1) === made.hookId, `the plugin saw hookId ${arrivedAt.at(-1)}, not the hook the delivery came to`);
   must(posted.length === 1 && /not by the user/.test(posted[0]!) && posted[0]!.endsWith("\nok"), `posted ${JSON.stringify(posted)}`);
   host.dispose();
 });

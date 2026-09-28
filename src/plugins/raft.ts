@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { originProblem, type ActivityEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -45,6 +45,13 @@ function number(value: unknown): number | undefined {
 }
 
 type PushState = {
+  /**
+   * Whether a record exists at all. `false` is not "disabled": disabling
+   * writes a record that says so. No record means push was never enabled on
+   * this mount, or the record was lost — and a delivery that verifies tells
+   * those two apart, since only a registered hook receives one.
+   */
+  known: boolean;
   enabled: boolean;
   agentId: string | null;
   agentName: string | null;
@@ -61,6 +68,7 @@ function pushState(value: unknown): PushState {
     ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_ID.test(value)))]
     : [];
   return {
+    known: value !== null && value !== undefined,
     enabled: state.enabled === true,
     agentId: text(state.agentId) ?? null,
     agentName: text(state.agentName) ?? null,
@@ -87,7 +95,9 @@ async function loadPushState(ctx: PluginContext): Promise<PushState> {
 }
 
 async function savePushState(ctx: PluginContext, state: PushState): Promise<void> {
-  await ctx.db.put(PUSH_STORE, state as unknown as Json, PUSH_KEY);
+  // `known` is a fact about the row's existence, read on load; written down it would be a stale copy.
+  const { known: _known, ...record } = state;
+  await ctx.db.put(PUSH_STORE, record as unknown as Json, PUSH_KEY);
 }
 
 function baseUrl(ctx: PluginContext): URL {
@@ -651,7 +661,7 @@ export const raftPlugin: Plugin = {
       const schema = typeof payload.schema === "string" ? payload.schema.slice(0, 64) : typeof payload.schema;
       return { deliver: false, malformed: true, reason: `signed, but the schema is ${JSON.stringify(schema)}, not ${NOTICE_SCHEMA}` };
     }
-    return receiveNotice(payload, inbound.headers, ctx);
+    return receiveNotice(payload, inbound, ctx);
   },
 };
 
@@ -661,7 +671,8 @@ export const raftPlugin: Plugin = {
  * agent — read it yourself. The notice is Raft's text, not a person's, so it
  * goes under the outside-content label (`as` stays the default).
  */
-async function receiveNotice(payload: ObjectValue, headers: Record<string, string>, ctx: PluginContext): Promise<InboundResult> {
+async function receiveNotice(payload: ObjectValue, inbound: InboundEvent, ctx: PluginContext): Promise<InboundResult> {
+  const headers = inbound.headers;
   const missing = [
     typeof payload.noticeId !== "string" || !PUSH_ID.test(payload.noticeId) ? "noticeId" : null,
     typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ? "recipientAgentId" : null,
@@ -676,7 +687,18 @@ async function receiveNotice(payload: ObjectValue, headers: Record<string, strin
   if (!headerId || headerId !== payload.noticeId) {
     return { deliver: false, malformed: true, reason: "the Raft delivery id header does not match the signed notice" };
   }
-  const state = await loadPushState(ctx);
+  let state = await loadPushState(ctx);
+  if (!state.known) {
+    // No record, yet a notice signed with this hook's secret: Raft still points at this hook, and the
+    // notice names the agent it is for. That is everything `enable_push` would have recorded, so the
+    // record is rebuilt from the delivery and the notice goes through — without calling Raft, and
+    // without a new hook. A storage change that dropped per-mount state was the first occasion; a
+    // record that says disabled is not this case, and stays ignored below.
+    state = {
+      known: true, enabled: true, agentId: payload.recipientAgentId, agentName: null,
+      hookId: PUSH_ID.test(inbound.hookId) ? inbound.hookId : null, staleHookIds: [], registration: "active", lastReached: null,
+    };
+  }
   await savePushState(ctx, { ...state, lastReached: { deliveryId: payload.noticeId, at: Date.now() } });
   if (!state.enabled) return { deliver: false, reason: "push is disabled for this mount" };
   if (!state.agentId || payload.recipientAgentId !== state.agentId) {
