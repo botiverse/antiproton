@@ -776,7 +776,7 @@ export class AgentRuntime {
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
-    await this.postMessage(tenantId, agentId, inboundMessage(alias, String(result.text)), "prompt", MAIN_SESSION);
+    await this.postMessage(tenantId, agentId, inboundMessage(alias, String(result.text), result.as), "prompt", MAIN_SESSION);
     return done("delivered", null, key);
   }
 

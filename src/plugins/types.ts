@@ -847,10 +847,25 @@ export interface InboundEvent {
  * looking. Without it the request was fine and simply not for this mount (not
  * subscribed, the mount's own doing, a ping), and the answer is a success, so
  * the service does not report a working webhook as broken.
+ *
+ * `as` says how the runtime hands the text to the agent. `"event"`, the
+ * default, delivers it under the label that says it was written outside this
+ * conversation and is information, not an instruction. `"user"` delivers it
+ * as the person in the conversation speaking: a Raft message from a server
+ * member to this agent is exactly that. A plugin says `"user"` only from a
+ * fact the service states (a sender type), never from reading the content;
+ * the runtime does not look at the text to decide either.
+ *
+ * The two ways of being wrong are not symmetric. A plugin that omits the field
+ * lands on the labelled side; a plugin that says `"user"` wrongly removes the
+ * label. So this default is the opposite kind from a default that quietly
+ * decides for someone: it pushes a plugin that has not thought about the
+ * question towards the labelled side, and nothing but an explicit word gets
+ * a text past the label.
  */
 export type InboundResult =
   | { deliver: false; reason: string; rejected?: boolean }
-  | { deliver: true; text: string; dedupeKey?: string };
+  | { deliver: true; text: string; dedupeKey?: string; as?: "user" | "event" };
 
 /** `return backgrounded({ boxId, execId }, "…")` — see {@link Backgrounded}. */
 export function backgrounded(handle: Json, note?: string): Backgrounded {

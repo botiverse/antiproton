@@ -11,11 +11,22 @@ import { originProblem, type Plugin, type PluginContext, type PluginErrorFields 
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
-const PUSH_SCHEMA = "raft-agent-inbox.v1";
-const PUSH_REASON = "inbox_changed";
+const PUSH_SCHEMA = "raft-agent-inbox.v2";
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
-const PUSH_EVENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const PUSH_FIELDS = new Set(["schema", "eventId", "recipientAgentId", "reason"]);
+const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const PUSH_FIELDS = new Set(["schema", "deliveryId", "recipientAgentId", "cursor", "events"]);
+/**
+ * How much of a batch the agent reads. The runtime cuts a delivery at
+ * INBOUND_TEXT_MAX (src/runtime/inbound.ts); this budget stays under it with
+ * room for the lines around each message, and is shared by the messages of one
+ * batch so that no message is dropped: a batch acknowledged is a batch the
+ * agent never sees again (2xx advances Raft's cursor), so cutting long
+ * messages is right and dropping short ones is not.
+ */
+const PUSH_TEXT_BUDGET = 10_000;
+const PUSH_MESSAGE_MIN = 200;
+/** Senders whose words are the conversation, not an event about it (raft-agent-inbox.v2). */
+const SPEAKERS = new Set(["human", "agent"]);
 
 type ObjectValue = Record<string, any>;
 
@@ -38,25 +49,25 @@ type PushState = {
   hookId: string | null;
   staleHookIds: string[];
   registration: "active" | "uncertain" | null;
-  lastReached: { eventId: string; at: number } | null;
+  lastReached: { deliveryId: string; at: number } | null;
 };
 
 function pushState(value: unknown): PushState {
   const state = object(value);
   const reached = object(state.lastReached);
   const staleHookIds = Array.isArray(state.staleHookIds)
-    ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_EVENT_ID.test(value)))]
+    ? [...new Set(state.staleHookIds.filter((value): value is string => typeof value === "string" && PUSH_ID.test(value)))]
     : [];
   return {
     enabled: state.enabled === true,
     agentId: text(state.agentId) ?? null,
     agentName: text(state.agentName) ?? null,
-    hookId: typeof state.hookId === "string" && PUSH_EVENT_ID.test(state.hookId) ? state.hookId : null,
+    hookId: typeof state.hookId === "string" && PUSH_ID.test(state.hookId) ? state.hookId : null,
     staleHookIds,
     registration: state.registration === "active" || state.registration === "uncertain" ? state.registration : null,
-    lastReached: typeof reached.eventId === "string" && typeof reached.at === "number" &&
+    lastReached: typeof reached.deliveryId === "string" && typeof reached.at === "number" &&
         Number.isFinite(reached.at) && Math.abs(reached.at) <= 8.64e15
-      ? { eventId: reached.eventId, at: reached.at }
+      ? { deliveryId: reached.deliveryId, at: reached.at }
       : null,
   };
 }
@@ -278,6 +289,10 @@ function event(value: unknown): Json {
     ...(text(e.channel_type) ? { channelType: text(e.channel_type) } : {}),
     ...(text(e.parent_channel_name) ? { parentChannelName: text(e.parent_channel_name) } : {}),
     ...(text(e.parent_channel_type) ? { parentChannelType: text(e.parent_channel_type) } : {}),
+    // Where a reply to this message goes, when Raft names it (raft-agent-inbox.v2
+    // batches do; the pull answer names one for the whole batch instead).
+    ...(text(e.reply_target) ?? text(e.replyTarget) ? { replyTarget: text(e.reply_target) ?? text(e.replyTarget) } : {}),
+    ...(typeof e.mentioned === "boolean" ? { mentioned: e.mentioned } : {}),
     attachments,
   } as Json;
 }
@@ -341,7 +356,7 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "receive_events",
-      summary: "Receive and acknowledge queued Raft messages once. A failed call may already have consumed the returned batch; do not retry automatically.",
+      summary: "Receive and acknowledge queued Raft messages once. Not needed while push is enabled: new messages then arrive by themselves. A failed call may already have consumed the returned batch; do not retry automatically.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
@@ -365,21 +380,21 @@ export const raftPlugin: Plugin = {
     },
     {
       name: "enable_push",
-      summary: "Create and register this mount's signed, content-free Raft inbox wake endpoint.",
+      summary: "Create and register this mount's signed Raft push endpoint: Raft then delivers this agent's new messages as they arrive.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
       idempotency: "none",
     },
     {
       name: "disable_push",
-      summary: "Stop signed Raft inbox notifications from waking this agent through this mount.",
+      summary: "Stop Raft from pushing this agent's messages through this mount.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
       idempotency: "native",
     },
     {
       name: "push_status",
-      summary: "Show whether signed Raft inbox notifications are enabled and when one last reached this mount.",
+      summary: "Show whether Raft push is enabled for this mount and when a delivery last reached it.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "read",
       idempotency: "native",
@@ -550,13 +565,24 @@ export const raftPlugin: Plugin = {
         registration: current.registration,
         cleanupPending: current.staleHookIds.length,
         lastReached: current.lastReached
-          ? { eventId: current.lastReached.eventId, at: new Date(current.lastReached.at).toISOString() }
+          ? { deliveryId: current.lastReached.deliveryId, at: new Date(current.lastReached.at).toISOString() }
           : null,
       };
     }
     throw new Error(`unknown raft tool: ${name}`);
   },
 
+  /**
+   * One signed batch of this agent's Raft inbox, delivered by Raft
+   * (raft-agent-inbox.v2). Every message in it reaches the agent in the order
+   * Raft gave, cut long rather than dropped, because the 2xx this returns is
+   * the acknowledgement that moves Raft's cursor past the batch.
+   *
+   * Who wrote each message is a fact Raft states (its sender type). A batch
+   * with a person or an agent speaking is delivered as the conversation
+   * itself, each line still naming its sender; a batch made only of system and
+   * app events keeps the runtime's "outside content" label.
+   */
   async receive(inbound, secret, ctx) {
     const signature = inbound.headers["x-raft-signature-256"];
     if (!signature) {
@@ -569,38 +595,85 @@ export const raftPlugin: Plugin = {
     let payload: ObjectValue;
     try { payload = object(JSON.parse(new TextDecoder().decode(inbound.body))); }
     catch { return { deliver: false, rejected: true, reason: "signed, but the body is not JSON" }; }
-    if (payload.schema !== PUSH_SCHEMA || payload.reason !== PUSH_REASON ||
-        typeof payload.eventId !== "string" || !PUSH_EVENT_ID.test(payload.eventId) ||
-        typeof payload.recipientAgentId !== "string" || !PUSH_EVENT_ID.test(payload.recipientAgentId)) {
-      return { deliver: false, rejected: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} event` };
+    const cursor = object(payload.cursor);
+    if (payload.schema !== PUSH_SCHEMA ||
+        typeof payload.deliveryId !== "string" || !PUSH_ID.test(payload.deliveryId) ||
+        typeof payload.recipientAgentId !== "string" || !PUSH_ID.test(payload.recipientAgentId) ||
+        number(cursor.fromSeq) === undefined || number(cursor.toSeq) === undefined || cursor.fromSeq > cursor.toSeq ||
+        !Array.isArray(payload.events)) {
+      return { deliver: false, rejected: true, reason: `signed, but the body is not a ${PUSH_SCHEMA} delivery` };
     }
-    const headerEventId = inbound.headers["x-raft-event-id"];
-    if (!headerEventId || headerEventId !== payload.eventId) {
-      return { deliver: false, rejected: true, reason: "the Raft event id header does not match the signed body" };
+    const headerDeliveryId = inbound.headers["x-raft-delivery-id"];
+    if (!headerDeliveryId || headerDeliveryId !== payload.deliveryId) {
+      return { deliver: false, rejected: true, reason: "the Raft delivery id header does not match the signed body" };
     }
+    // The envelope is versioned; a field this version does not know is a
+    // contract change, and loud is better than silently dropped.
     if (Object.keys(payload).some((field) => !PUSH_FIELDS.has(field))) {
-      return {
-        deliver: false,
-        rejected: true,
-        reason: "signed, but Raft inbox notifications must not carry message content",
-      };
+      return { deliver: false, rejected: true, reason: `signed, but the body carries fields ${PUSH_SCHEMA} does not have` };
     }
 
     const state = await loadPushState(ctx);
     await savePushState(ctx, {
       ...state,
-      lastReached: { eventId: payload.eventId, at: Date.now() },
+      lastReached: { deliveryId: payload.deliveryId, at: Date.now() },
     });
     if (!state.enabled) return { deliver: false, reason: "push is disabled for this mount" };
     if (!state.agentId || payload.recipientAgentId !== state.agentId) {
-      return { deliver: false, reason: "the signed event names a different Raft agent" };
+      return { deliver: false, reason: "the signed delivery names a different Raft agent" };
     }
+    const events = payload.events.map(event) as ObjectValue[];
+    if (events.length === 0) return { deliver: false, reason: "an empty batch: nothing to deliver" };
 
     return {
       deliver: true,
-      text: `Raft inbox state changed. Call the \`receive_events\` tool from the \`${ctx.alias}\` mount exactly once to retrieve and acknowledge ` +
-        "the current canonical inbox batch. Do not retry automatically if that call reports uncertain delivery.",
-      dedupeKey: payload.eventId,
+      as: events.some((e) => SPEAKERS.has(String(e.senderType))) ? "user" : "event",
+      text: batchText(ctx.alias, cursor.fromSeq, cursor.toSeq, events),
+      dedupeKey: payload.deliveryId,
     };
   },
 };
+
+/**
+ * The batch as the agent reads it: one numbered block per message, in Raft's
+ * order, each naming where it was said, by whom and of what kind, so the agent
+ * can answer to the right place and weigh the right speaker. Attachments come
+ * as references only; the file itself is fetched with a tool.
+ */
+function batchText(alias: string, fromSeq: number, toSeq: number, events: ObjectValue[]): string {
+  const each = Math.max(PUSH_MESSAGE_MIN, Math.floor(PUSH_TEXT_BUDGET / events.length));
+  const lines = [
+    `Raft delivered ${events.length} message${events.length === 1 ? "" : "s"} (seq ${fromSeq}–${toSeq}) through the \`${alias}\` mount.` +
+    ` Reply with \`send_message\` to the target shown on the message.`,
+  ];
+  events.forEach((e, i) => {
+    const where = text(e.replyTarget) ?? place(e);
+    const who = `${text(e.senderName) ? `@${e.senderName}` : "someone"} (${e.senderType})`;
+    const head = [`${i + 1}.`, number(e.seq) !== undefined ? `seq ${e.seq}` : null, where, who,
+      text(e.messageId) ? `msg ${e.messageId}` : null, text(e.timestamp) ?? null].filter((part) => part !== null).join(" · ");
+    const content = text(e.content) ?? "";
+    const body = content.length > each
+      ? `${content.slice(0, each)}… (cut, ${content.length - each} more characters; read the message with a tool)`
+      : content;
+    lines.push(head, indent(body));
+    const attachments = Array.isArray(e.attachments) ? e.attachments as ObjectValue[] : [];
+    if (attachments.length > 0) {
+      lines.push(indent(`attachments: ${attachments.map((a) =>
+        `${a.filename}${a.mimeType ? ` (${a.mimeType}${number(a.sizeBytes) !== undefined ? `, ${a.sizeBytes} bytes` : ""})` : ""} id ${a.id}`).join("; ")}`));
+    }
+  });
+  return lines.join("\n");
+}
+
+/** Where a message was said, from the fields Raft gives when no reply target is named. */
+function place(e: ObjectValue): string {
+  const channel = text(e.channelName);
+  const kind = text(e.channelType);
+  if (!channel && !kind) return "(no target given)";
+  const parent = text(e.parentChannelName) ? ` in ${e.parentChannelName}` : "";
+  return `${kind === "dm" ? "dm:" : ""}${channel ? (kind === "dm" ? `@${channel}` : `#${channel}`) : kind}${parent}`;
+}
+
+function indent(body: string): string {
+  return body.split("\n").map((line) => `   ${line}`).join("\n");
+}

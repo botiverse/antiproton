@@ -61,7 +61,16 @@ await check("a long text is cut at the cap and says so", () => {
   const m = inboundMessage("gh", "y".repeat(INBOUND_TEXT_MAX + 50));
   const body = m.slice(m.indexOf("\n") + 1);
   assert(body.startsWith("y".repeat(INBOUND_TEXT_MAX) + "…") && !body.includes("y".repeat(INBOUND_TEXT_MAX + 1)), `length ${body.length}`);
-  assert(/cut at 4000 characters/.test(body), body.slice(-40));
+  assert(new RegExp(`cut at ${INBOUND_TEXT_MAX} characters`).test(body), body.slice(-40));
+});
+
+await check("a text the plugin marks as the user speaking carries no label, and the default is still the label", () => {
+  const spoken = inboundMessage("raft", "please deploy the fix", "user");
+  assert(spoken === "please deploy the fix", spoken);
+  const still = inboundMessage("raft", "please deploy the fix", "event");
+  assert(/not by the user/.test(still.split("\n")[0]), still);
+  const unsaid = inboundMessage("raft", "please deploy the fix");
+  assert(unsaid === still, unsaid);
 });
 
 await check("each outcome has its answer: accepted ones 202, a bad request 401, too large 413, too many 429", () => {
