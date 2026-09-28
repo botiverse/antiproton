@@ -68,8 +68,7 @@ import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../sr
 import { countHeldTime } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
-import { flushTrace } from "./trace-r2.ts";
-import { flushActivity } from "./activity-raft.ts";
+import { flushActivityThenTrace } from "./activity-raft.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
 import { d1ServiceTokens } from "./control-plane.ts";
@@ -79,7 +78,7 @@ import { adminProviderTokens } from "./admin-provider-tokens.ts";
 import { d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
-import { adoptProvisionedAgent, provisionTool, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
+import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
@@ -850,7 +849,7 @@ export class AgentDO extends DurableObject<Env> {
         // measuring an agent that loses large tool output, which production
         // agents do not (2026-09-12).
         { alias: "artifacts", plugin: "artifacts", account: "builtin" },
-      ]);
+      ], { chosen: true });
       // The machine, from the instance's own image. Config is per mount, so a
       // different repository is a different mount record, not different code.
       await rt.store.addMount({
@@ -976,7 +975,7 @@ export class AgentDO extends DurableObject<Env> {
       await rt.provision("bench", agentId, [
         { alias: "tools", plugin: "tools", account: "builtin" },
         { alias: "retail", plugin: "retail", account: "benchmark" },
-      ]);
+      ], { chosen: true });
       return { taskId, agentId, offload: this.#offloadOn() };
     });
   }
@@ -1209,7 +1208,10 @@ export class AgentDO extends DurableObject<Env> {
   async uiRecordAgent(tenantId: string, ownerAgentId: string, rec: { agentId: string; name: string; description: string; avatar: string; createdAt: number }) {
     this.#claim(tenantId, ownerAgentId);
     this.#directory();
-    this.sql.exec("INSERT OR IGNORE INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?)",
+    // The name and description follow the agent (a PATCH from the API or the provider renames it);
+    // the avatar and the birth date do not (2026-09-28 review, finding 7).
+    this.sql.exec("INSERT INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?) " +
+      "ON CONFLICT(agent_id) DO UPDATE SET name = excluded.name, description = excluded.description",
       rec.agentId, rec.name, rec.description, rec.avatar, rec.createdAt);
     return rec;
   }
@@ -1717,6 +1719,12 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("provisionTool", () => provisionTool(this.runtime(), tenantId, agentId, name));
   }
 
+  /** The raft mount's push state, read from the store: no tool call, no trace, no usage. */
+  async provisionPushStatus(tenantId: string, agentId: string) {
+    this.#claim(tenantId, agentId);
+    return provisionPushStatus(this.runtime(), tenantId, agentId);
+  }
+
   async hookDropSecret(tenantId: string, agentId: string, hookId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
@@ -2057,24 +2065,12 @@ export class AgentDO extends DurableObject<Env> {
           usagePending = true;
           console.warn(`usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
         }
-        // This pass's activity, to the service that runs this agent (cf/src/activity-raft.ts),
-        // read from the same trace rows before they are exported; a failure keeps its cursor.
-        let activityThrough: number | null = null;
-        try {
-          activityThrough = (await flushActivity(rt.gateway(), this.sql as any, who.tenantId, who.agentId)).through;
-        } catch (e: any) {
-          usagePending = true;
-          console.warn(`activity flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
-        }
-        // This pass's trace rows, to R2 (cf/src/trace-r2.ts). Same terms as
-        // usage: a failure keeps the rows and asks for another pass. Rows the
-        // activity reader has not consumed are exported but kept.
-        try {
-          await flushTrace(this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId, 500, Date.now, activityThrough);
-        } catch (e: any) {
-          usagePending = true;
-          console.warn(`trace flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
-        }
+        // This pass's activity to the service that runs this agent, then this pass's trace rows
+        // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
+        // Same terms as usage: a failure keeps the rows and asks for another pass.
+        const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+        if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
+        if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
         if (out.wakeInMs === null && usagePending) {
           await this.ctx.storage.setAlarm(Date.now() + 60_000);
         } else if (out.wakeInMs !== null) {
@@ -2574,6 +2570,7 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
       },
       removeCredential: (tenantId, agentId) => stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, PROVISION_MOUNT_ALIAS),
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
+      pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
     },
   };
   try {

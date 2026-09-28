@@ -5,7 +5,7 @@
  */
 import type { Json } from "../../../src/core/types.ts";
 import type { AgentRuntime } from "../runtime.ts";
-import type { ProvisionTool } from "./handlers.ts";
+import type { ProvisionTool, PushStatus } from "./handlers.ts";
 
 /** The alias the provisioned mount carries: the plugin's own name, as a person would pick. */
 export const PROVISION_MOUNT_ALIAS = "raft";
@@ -55,4 +55,22 @@ export async function provisionTool(
     : typeof (err as { message?: unknown }).message === "string" ? String((err as { message: string }).message)
     : JSON.stringify(err);
   return { ok: false, error: `${name}: ${message}` };
+}
+
+/**
+ * The push state the raft plugin keeps on its mount, projected for the provider. Read from the store
+ * so a Raft poll leaves no trace row, no usage row and no Agent Activity event behind.
+ */
+export async function provisionPushStatus(rt: AgentRuntime, tenantId: string, agentId: string): Promise<PushStatus | null> {
+  await rt.ready();
+  const raw = await rt.store.getConnection(tenantId, agentId, PROVISION_MOUNT_ALIAS);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const s = raw as Record<string, unknown>;
+  const reached = s.lastReached && typeof s.lastReached === "object" ? s.lastReached as Record<string, unknown> : null;
+  return {
+    enabled: s.enabled === true,
+    registration: s.registration === "active" || s.registration === "uncertain" ? s.registration : null,
+    lastReached: reached && typeof reached.deliveryId === "string" && typeof reached.at === "number"
+      ? { deliveryId: reached.deliveryId, at: new Date(reached.at).toISOString() } : null,
+  };
 }

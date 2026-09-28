@@ -6,7 +6,7 @@
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { appendTrace, type TraceRow } from "../src/trace/outbox.ts";
-import { flushActivity, activityCursor } from "../cf/src/activity-raft.ts";
+import { flushActivity, activityCursor, flushActivityThenTrace } from "../cf/src/activity-raft.ts";
 import { flushTrace } from "../cf/src/trace-r2.ts";
 import type { ActivityEvent } from "../src/plugins/types.ts";
 
@@ -78,6 +78,25 @@ await check("the trace export prunes only through what the activity reader has c
   appendTrace(sql, [tool(4)]);
   await flushTrace(bucket, sql, OWNER.tenantId, OWNER.agentId);
   must(left(sql) === 0, "unheld rows were kept");
+});
+
+await check("the alarm's order: a failing activity send holds the export at its unmoved cursor, so the next pass still finds and sends the rows", async () => {
+  const { sql } = sqliteHost();
+  const bucket = { async put() {} };
+  appendTrace(sql, [tool(1), answered(2)]);
+  const g = gateway("throw");
+  const first = await flushActivityThenTrace(g, bucket, sql, OWNER.tenantId, OWNER.agentId);
+  must(first.activityError !== null && /unreachable/.test(first.activityError) && first.traceError === null, JSON.stringify(first));
+  must(left(sql) === 2 && activityCursor(sql) === 0, `rows left ${left(sql)} cursor ${activityCursor(sql)}`);
+  g.mode = "send";
+  const second = await flushActivityThenTrace(g, bucket, sql, OWNER.tenantId, OWNER.agentId);
+  must(second.activityError === null && g.batches.length === 1 && g.batches[0]!.length === 3, JSON.stringify({ second, batches: g.batches.length }));
+  must(left(sql) === 0 && activityCursor(sql) === 2, `rows left ${left(sql)} cursor ${activityCursor(sql)}`);
+  // A failing export is reported the same way and keeps its own rows.
+  appendTrace(sql, [tool(3)]);
+  const failing = { async put() { throw new Error("r2 unavailable"); } };
+  const third = await flushActivityThenTrace(g, failing, sql, OWNER.tenantId, OWNER.agentId);
+  must(third.activityError === null && /r2 unavailable/.test(third.traceError ?? "") && left(sql) === 1, JSON.stringify({ third, left: left(sql) }));
 });
 
 console.log(`\n  activity flush\n  ${"─".repeat(56)}`);

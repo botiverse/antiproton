@@ -22,7 +22,10 @@ import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
 import type { ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
 
-export type ProvisionTool = "enable_push" | "disable_push" | "push_status";
+export type ProvisionTool = "enable_push" | "disable_push";
+
+/** What the mount says about its push registration, read from its state — not a tool call. */
+export interface PushStatus { enabled: boolean; registration: "active" | "uncertain" | null; lastReached: { deliveryId: string; at: string } | null }
 
 /** What the handler asks of the agent's own object. Each is one RPC in cf/src/index.ts. */
 export interface ProvisionAgentOps {
@@ -33,6 +36,12 @@ export interface ProvisionAgentOps {
   removeCredential(tenantId: string, agentId: string): Promise<boolean>;
   /** Run one of the raft plugin's push tools through the gateway, as the model would. */
   tool(tenantId: string, agentId: string, name: ProvisionTool): Promise<{ ok: true; result: Json } | { ok: false; error: string }>;
+  /**
+   * The mount's push state, read directly. A GET used to run `push_status` through the gateway, and
+   * every Raft poll became a tool.call trace row, a usage row and two Agent Activity events the model
+   * never caused (2026-09-28 review, finding 5).
+   */
+  pushStatus(tenantId: string, agentId: string): Promise<PushStatus | null>;
 }
 
 /**
@@ -92,6 +101,12 @@ function textField(body: unknown, key: string, max: number, required: boolean): 
   return v;
 }
 const isFail = (v: unknown): v is Fail => typeof v === "object" && v !== null && "status" in v && "code" in v;
+
+/** Hex SHA-256, the same function the API keys and tokens use for what is stored of a secret. */
+export async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 function credentialField(body: unknown): string | Fail {
   const v = field(body, "credential");
@@ -167,6 +182,7 @@ export async function handleProvision(
 
     const agentId = providerAgentId(raftAgentId);
     const asked = { raftServerId: raftServerId!, raftOrigin, name: name!, instructions };
+    const credentialHash = await sha256Hex(credential);
     let row = await deps.registry.get(tenantId, raftAgentId);
     let created = false;
     if (row) {
@@ -174,15 +190,23 @@ export async function handleProvision(
         return fail({ status: 409, code: "deleted", message: "this Raft agent was deleted here; a new agent needs a new id" });
       }
       const differs = (Object.keys(asked) as Array<keyof typeof asked>).filter((k) => row![k] !== asked[k]);
+      // The credential is the one field that matters most: a delayed retry with an old one must not
+      // overwrite a newer PUT /credential (2026-09-28 review, finding 4). Compared by hash; a row from
+      // before the hash existed accepts the first replay and records it.
+      if (row.credentialHash !== null && row.credentialHash !== credentialHash) differs.push("credential" as keyof typeof asked);
       if (differs.length) {
         return fail({ status: 409, code: "idempotency_conflict", message: `a different request was already made under this key (${differs.join(", ")}); edits go through PATCH` });
       }
+      if (row.credentialHash === null) { await deps.registry.update(tenantId, raftAgentId, { credentialHash }); row = { ...row, credentialHash }; }
     } else {
       const t = deps.now();
-      row = { tenantId, raftAgentId, agentId, ...asked, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
+      row = { tenantId, raftAgentId, agentId, ...asked, credentialHash, status: "provisioning", pushRegistered: false, pushError: null, createdAt: t, updatedAt: t, deletedAt: null };
       try { await deps.registry.create(row); }
-      catch {
-        // The Raft id is new but the agent id it maps to is taken: two Raft ids that sanitise alike.
+      catch (e) {
+        // Only the unique index says 409 (two Raft ids that sanitise alike). Anything else — D1 away, a
+        // migration missing — is a 500 Raft retries, not a permanent conflict (2026-09-28 review, finding 3).
+        const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
+        if (!/UNIQUE constraint/i.test(message)) throw e;
         return fail({ status: 409, code: "agent_id_taken", message: `${agentId} already belongs to another Raft agent in this tenant` });
       }
       created = true;
@@ -207,8 +231,8 @@ export async function handleProvision(
   if (rest.length === 1 && method === "GET") {
     if (!row) return gone();
     if (row.status === "deleted") return ok(view(row));
-    const status = await deps.agent.tool(tenantId, row.agentId, "push_status");
-    return ok(view(row, status.ok ? status.result : { error: status.error }));
+    const live = await deps.agent.pushStatus(tenantId, row.agentId);
+    return ok(view(row, (live ?? { error: "no push state on the mount" }) as unknown as Json));
   }
 
   if (rest.length === 1 && method === "PATCH") {
@@ -233,8 +257,10 @@ export async function handleProvision(
     if (isFail(credential)) return fail(credential);
     const attached = await deps.agent.attachCredential(tenantId, row.agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
+    const credentialHash = await sha256Hex(credential);
+    await deps.registry.update(tenantId, row.raftAgentId, { credentialHash });
     // A new credential means a new registration on Raft's side; the plugin replaces the hook and re-PUTs.
-    return ok(view(await registerPush(deps, row)));
+    return ok(view(await registerPush(deps, { ...row, credentialHash })));
   }
 
   if (rest.length === 1 && method === "DELETE") {

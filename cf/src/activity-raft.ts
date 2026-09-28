@@ -18,6 +18,7 @@
  * events and the service dedupes.
  */
 import { pendingTrace } from "../../src/trace/outbox.ts";
+import { flushTrace, type TraceSink } from "./trace-r2.ts";
 import { ACTIVITY_BATCH_MAX, activityEvents } from "../../src/runtime/activity.ts";
 import type { ActivityEvent } from "../../src/plugins/types.ts";
 
@@ -55,4 +56,32 @@ export async function flushActivity(
   }
   if (through > sent0) setCursor(sql, through);
   return { events: events.length, sent, through: Math.max(sent0, through), skipped };
+}
+
+/**
+ * The two readers of the trace outbox, in the order the alarm pass runs them:
+ * activity first, then the export with a hold at whatever activity has NOT
+ * consumed. A failing activity send holds at its unmoved cursor — passing
+ * "nothing held" would let the export prune the very rows the next pass needs
+ * (2026-09-28 review, finding 1). Each failure is reported, not thrown: the
+ * pass goes on and asks for another pass.
+ */
+export async function flushActivityThenTrace(
+  gateway: ActivityGateway, sink: TraceSink, sql: Sql, tenantId: string, agentId: string,
+): Promise<{ activityError: string | null; traceError: string | null }> {
+  let holdThrough: number;
+  let activityError: string | null = null;
+  try {
+    holdThrough = (await flushActivity(gateway, sql, tenantId, agentId)).through;
+  } catch (e) {
+    activityError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
+    holdThrough = activityCursor(sql);
+  }
+  let traceError: string | null = null;
+  try {
+    await flushTrace(sink, sql, tenantId, agentId, 500, Date.now, holdThrough);
+  } catch (e) {
+    traceError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
+  }
+  return { activityError, traceError };
 }

@@ -5,7 +5,7 @@
  * own tools. The hook index is a stand-in, as in test/plugin-hooks.ts.
  */
 import { AgentRuntime } from "../cf/src/runtime.ts";
-import { adoptProvisionedAgent, provisionTool, PROVISION_MOUNT_ALIAS } from "../cf/src/provision/steps.ts";
+import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVISION_MOUNT_ALIAS } from "../cf/src/provision/steps.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import type { HookRow } from "../cf/src/control-plane.ts";
 
@@ -103,8 +103,10 @@ await check("the credential is sealed onto the mount and checked against Raft, a
   must(put && put.url === `${ORIGIN}/internal/agent-api/push-webhook` && put.auth === `Bearer ${CRED}`, JSON.stringify(calls.map((c) => [c.method, c.url])));
   must(/^https:\/\/hooks\.test\/hooks\/[A-Za-z0-9_-]{43}$/.test(put!.body.url) && /^[0-9a-f]{64}$/.test(put!.body.secret), JSON.stringify({ ...put!.body, secret: "…" }));
   must([...rows.values()].filter((r) => r.agentId === "raft_01J" && r.revokedAt === null).length === 1, "not exactly one live hook");
-  const status = await provisionTool(rt, "t", "raft_01J", "push_status");
-  must(status.ok && (status.result as any).enabled === true && !JSON.stringify(status).includes(put!.body.secret), JSON.stringify(status));
+  const before = Number((await rt.store.listMounts("t", "raft_01J")).length);
+  const status = await provisionPushStatus(rt, "t", "raft_01J");
+  must(status?.enabled === true && status.registration === "active" && !JSON.stringify(status).includes(put!.body.secret), JSON.stringify(status));
+  must(Number((await rt.store.listMounts("t", "raft_01J")).length) === before, "reading push status changed the mounts");
   const off = await provisionTool(rt, "t", "raft_01J", "disable_push");
   must(off.ok && (off.result as any).enabled === false && (off.result as any).remoteDeregistration === "confirmed", JSON.stringify(off));
   must(calls.some((c) => c.method === "DELETE" && c.url === `${ORIGIN}/internal/agent-api/push-webhook`), "no DELETE reached Raft");

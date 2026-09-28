@@ -1258,6 +1258,7 @@ export class AgentRuntime {
     tenantId: string,
     agentId: string,
     mounts: SeedMount[] = AgentRuntime.DEFAULT_MOUNTS,
+    opts: { chosen?: boolean } = {},
   ) {
     await this.ready();
     if (await this.store.loadTask(tenantId, `${agentId}:probe`)) return { agentId, created: false };
@@ -1285,7 +1286,9 @@ export class AgentRuntime {
     // first time #491 reached production (Vera, 2026-09-28 12:53Z, 0/24).
     // The choice is recorded, not bypassed, so the catalogue and the gateway
     // agree with what was mounted; an explicit "disable" still wins.
-    const explicit = mounts !== AgentRuntime.DEFAULT_MOUNTS;
+    // Said, not inferred: array identity told a fresh copy of the defaults apart from the defaults,
+    // which is not the question (2026-09-28 review, finding 6).
+    const explicit = opts.chosen === true;
     for (const m of mounts) {
       // The skip comes first on purpose: the assert below runs only for a
       // mount being added, so an open of an agent that already has its seven
