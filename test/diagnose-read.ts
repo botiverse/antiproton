@@ -184,6 +184,22 @@ check("a claimed object whose store was never initialised reads as a report, not
   host.dispose();
 });
 
+await check("model jobs are listed answered or not: a pending one by its wait, an answered one by what the queue and the model took", async () => {
+  const { host, store } = await agentObject();
+  host.sql.exec("CREATE TABLE IF NOT EXISTS pi_model_jobs(id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, answered_at INTEGER, request TEXT, answer TEXT)");
+  const t0 = 1_790_614_792_567; // the call whose answer took 105 s, as the diagnosis would show it
+  host.sql.exec("INSERT INTO pi_model_jobs(id, created_at, answered_at) VALUES ('mj_slow', ?, ?)", t0, t0 + 105_000);
+  host.sql.exec("INSERT INTO pi_model_jobs(id, created_at, answered_at) VALUES ('mj_open', ?, NULL)", t0 + 200_000);
+  const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { ...deps(store), now: () => t0 + 230_000 }) as any;
+  const byId = Object.fromEntries(r.modelJobs.map((j: any) => [j.id, j]));
+  assert(byId.mj_slow?.answerMs === 105_000 && byId.mj_slow.answeredAt === t0 + 105_000 && byId.mj_slow.ageMs === undefined,
+    `the answered job: ${JSON.stringify(byId.mj_slow)}`);
+  assert(byId.mj_open?.ageMs === 30_000 && byId.mj_open.answeredAt === null && byId.mj_open.answerMs === undefined,
+    `the pending job: ${JSON.stringify(byId.mj_open)}`);
+  assert(r.modelJobs[0].id === "mj_open", "newest first");
+  host.dispose();
+});
+
 await check("an agent or conversation the object does not hold is null, and an unclaimed object gains no table", async () => {
   const { host, store } = await agentObject();
   const before = dump(host);

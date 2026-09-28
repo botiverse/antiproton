@@ -196,8 +196,15 @@ export async function readDiagnosis(
     // be seen, beside what else this object has had go wrong.
     traceDrops: rows(sql, "trace_drops", "SELECT at, dropped FROM trace_drops ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
-    modelJobs: rows(sql, "pi_model_jobs", "SELECT id, created_at FROM pi_model_jobs WHERE answer IS NULL ORDER BY created_at DESC LIMIT 10")
-      .map((r) => ({ id: r.id, ageMs: now - Number(r.created_at) })),
+    // The last ten model jobs, answered ones included. A pending job shows how long it has waited; an
+    // answered one shows how long the queue and the model took together (created → answered). The third
+    // instant, when the answer was applied to the lane, is the assistant message's `at` in the transcript,
+    // under the same job id. Listing only pending jobs hid a 105-second answer on a provisioned agent
+    // (2026-09-28 16:59:52Z call, applied 17:01:38Z): once it was answered there was nothing left to read.
+    modelJobs: rows(sql, "pi_model_jobs", "SELECT id, created_at, answered_at FROM pi_model_jobs ORDER BY created_at DESC LIMIT 10")
+      .map((r) => r.answered_at === null || r.answered_at === undefined
+        ? { id: r.id, createdAt: Number(r.created_at), answeredAt: null, ageMs: now - Number(r.created_at) }
+        : { id: r.id, createdAt: Number(r.created_at), answeredAt: Number(r.answered_at), answerMs: Number(r.answered_at) - Number(r.created_at) }),
     // What the console's trajectory tab would draw, from the same read, with no busy state to show.
     rendered: (() => {
       try {
