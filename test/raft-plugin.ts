@@ -370,7 +370,7 @@ await check("enable_push creates a hook and registers it without exposing its se
   if (encoded.includes("hook-secret") || encoded.includes("hooks.example")) throw new Error(`hook material leaked: ${encoded}`);
   if (JSON.stringify(m.state()) !== JSON.stringify({
     enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-1",
-    staleHookIds: [], registration: "active", lastReached: null,
+    staleHookIds: [], registration: "active", lastReached: null, seen: {},
   })) {
     throw new Error(`push state: ${JSON.stringify(m.state())}`);
   }
@@ -383,7 +383,7 @@ await check("enable_push revokes a newly created hook after a definite registrat
   );
   const original = {
     enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
-    staleHookIds: [], registration: "active", lastReached: null,
+    staleHookIds: [], registration: "active", lastReached: null, seen: {},
   };
   const m = mount(original);
   const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
@@ -413,7 +413,7 @@ await check("enable_push preserves an ambiguous new registration for recovery wi
   }) as any;
   const m = mount({
     enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
-    staleHookIds: [], registration: "active", lastReached: null,
+    staleHookIds: [], registration: "active", lastReached: null, seen: {},
   });
   const why = await failure(() => raftPlugin.invoke("enable_push", {}, m.ctx));
   const encoded = JSON.stringify({ message: why.message, state: m.state() });
@@ -559,6 +559,35 @@ await check("a bare 200 on push registration is a registration, not a malformed 
   if (out.enabled !== true || out.registration !== "active" || calls[1]!.init.method !== "PUT") throw new Error(JSON.stringify({ out, calls: calls.map((c) => c.init.method) }));
 });
 
+await check("a message already delivered under another delivery is not delivered again, a retry under the same delivery id still is, and the window and cap hold", async () => {
+  const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const first = await raftPlugin.receive!(pushed(pushPayload({ deliveryId: "ibx_a", cursor: { fromSeq: 120, toSeq: 121 },
+    events: [raftMessage({ seq: 120, message_id: "m120" }), raftMessage({ seq: 121, message_id: "m121", content: "second" })] })), PUSH_SECRET, m.ctx);
+  if (!first.deliver) throw new Error(JSON.stringify(first));
+  // Catch-up after a lost 2xx: a different delivery id, a wider range, m120 and m121 again plus a new m122.
+  const overlap = await raftPlugin.receive!(pushed(pushPayload({ deliveryId: "ibx_b", cursor: { fromSeq: 120, toSeq: 122 },
+    events: [raftMessage({ seq: 120, message_id: "m120" }), raftMessage({ seq: 121, message_id: "m121", content: "second" }), raftMessage({ seq: 122, message_id: "m122", content: "third" })] })), PUSH_SECRET, m.ctx);
+  if (!overlap.deliver || overlap.text.includes("m120") || overlap.text.includes("second") || !overlap.text.includes("third")) throw new Error(JSON.stringify(overlap));
+  // Entirely already delivered: not delivered, not rejected (202 ignored), and the reason says so.
+  const all = await raftPlugin.receive!(pushed(pushPayload({ deliveryId: "ibx_c", events: [raftMessage({ seq: 120, message_id: "m120" })] })), PUSH_SECRET, m.ctx);
+  if (all.deliver || all.rejected || all.malformed || !/already delivered/.test(all.reason)) throw new Error(JSON.stringify(all));
+  // The same delivery id again (Raft's retry after our 429): the plugin delivers; the runtime decides by its own dedupe.
+  const retry = await raftPlugin.receive!(pushed(pushPayload({ deliveryId: "ibx_a", cursor: { fromSeq: 120, toSeq: 121 },
+    events: [raftMessage({ seq: 120, message_id: "m120" }), raftMessage({ seq: 121, message_id: "m121", content: "second" })] })), PUSH_SECRET, m.ctx);
+  if (!retry.deliver || !retry.text.includes("second")) throw new Error(JSON.stringify(retry));
+  // Past the window the id is forgotten; past the cap the oldest go first.
+  const old = Object.fromEntries(Array.from({ length: 5_010 }, (_, i) => [`old${i}`, { d: "ibx_old", at: Date.now() - (i < 5 ? 25 * 3_600_000 : 1000 + i) }]));
+  const aged = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null, seen: { ...old, m120: { d: "ibx_a", at: Date.now() - 25 * 3_600_000 } } });
+  const again = await raftPlugin.receive!(pushed(pushPayload({ deliveryId: "ibx_d", events: [raftMessage({ seq: 120, message_id: "m120" })] })), PUSH_SECRET, aged.ctx);
+  if (!again.deliver) throw new Error(JSON.stringify(again));
+  const kept = Object.keys(aged.state().seen);
+  if (kept.length > 5_000 || kept.some((k) => /^old[0-4]$/.test(k)) || !kept.includes("m120")) throw new Error(`seen ${kept.length}, has old0-4: ${kept.some((k) => /^old[0-4]$/.test(k))}`);
+  // A message with no id cannot be remembered and is always delivered.
+  const anon = raftMessage({ seq: 130 }); delete (anon as any).message_id;
+  const noId = await raftPlugin.receive!(pushed(pushPayload({ deliveryId: "ibx_e", events: [anon] })), PUSH_SECRET, m.ctx);
+  if (!noId.deliver) throw new Error(JSON.stringify(noId));
+});
+
 await check("attachments arrive as references, never as content", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const out = await raftPlugin.receive!(pushed(pushPayload({ events: [raftMessage({
@@ -678,7 +707,7 @@ await check("disable_push closes the local endpoint even when Raft returns an er
       : (async () => json(404, { errorCode: "PUSH_WEBHOOK_NOT_FOUND" })) as any;
     const m = mount({
       enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: `hook-${remote}`,
-      staleHookIds: [`stale-${remote}`], registration: "active", lastReached: null,
+      staleHookIds: [`stale-${remote}`], registration: "active", lastReached: null, seen: {},
     });
     const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
     const expectedRemote = remote === "not-found" ? "confirmed" : "unconfirmed";
@@ -696,7 +725,7 @@ await check("disable_push stays disabled while retaining hooks whose local revok
   inbound.api.revoke = async () => { throw new Error("private cleanup detail"); };
   const m = mount({
     enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old",
-    staleHookIds: ["hook-stale"], registration: "active", lastReached: null,
+    staleHookIds: ["hook-stale"], registration: "active", lastReached: null, seen: {},
   }, inbound);
   const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
   if (disabled.enabled !== false || disabled.remoteDeregistration !== "unconfirmed" || disabled.cleanupPending !== 2 ||
@@ -708,7 +737,7 @@ await check("disable_push stays disabled while retaining hooks whose local revok
 
 await check("push_status safely normalizes corrupt persisted connection state", async () => {
   for (const lastReached of [{ deliveryId: 9, at: "yesterday" }, { deliveryId: "event-future", at: 1e100 }, { eventId: "v1-shape", at: 1 }]) {
-    const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached });
+    const m = mount({ enabled: "yes", agentId: 42, agentName: ["bad"], lastReached, seen: { ok: { d: "x", at: 1 }, bad: "nope", worse: { d: 1, at: "y" } } });
     const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
     if (JSON.stringify(status) !== JSON.stringify({
       enabled: false, account: null, registration: null, cleanupPending: 0, lastReached: null,
@@ -753,7 +782,7 @@ await check("a mount carrying a cap's worth of superseded endpoints can still en
   );
   const inbound = fakeInbound();
   const m = mount(
-    { hookId: "hook-live", staleHookIds: ["hook-old-1", "hook-old-2"], registration: "active", lastReached: null },
+    { hookId: "hook-live", staleHookIds: ["hook-old-1", "hook-old-2"], registration: "active", lastReached: null, seen: {} },
     inbound,
   );
   const out = await raftPlugin.invoke("enable_push", {}, m.ctx) as any;

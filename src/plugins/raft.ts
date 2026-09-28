@@ -26,6 +26,16 @@ const PUSH_TEXT_BUDGET = 10_000;
 const PUSH_MESSAGE_MIN = 200;
 /** Senders whose words are the conversation, not an event about it (raft-agent-inbox.v2). */
 const SPEAKERS = new Set(["human", "agent"]);
+/**
+ * How long a delivered message id is remembered, and how many. Raft delivers
+ * at least once: a lost 2xx makes it send the message again, in a later batch
+ * with another deliveryId and not necessarily the same range, so the
+ * deliveryId dedupe cannot catch it (Tenny, 2026-09-28). The window matches
+ * the runtime's deliveryId window (src/runtime/inbound.ts); the cap bounds
+ * the mount's state — a day of one agent's messages is far under it.
+ */
+const SEEN_TTL_MS = 24 * 60 * 60_000;
+const SEEN_MAX = 5_000;
 
 type ObjectValue = Record<string, any>;
 
@@ -49,7 +59,16 @@ type PushState = {
   staleHookIds: string[];
   registration: "active" | "uncertain" | null;
   lastReached: { deliveryId: string; at: number } | null;
+  /** Message ids delivered to the agent, each with the delivery that carried it and when. */
+  seen: Record<string, { d: string; at: number }>;
 };
+
+/** The remembered ids still inside the window, newest-capped. */
+function pruneSeen(seen: Record<string, { d: string; at: number }>, now: number): Record<string, { d: string; at: number }> {
+  const kept = Object.entries(seen).filter(([, v]) => now - v.at <= SEEN_TTL_MS);
+  kept.sort((a, b) => b[1].at - a[1].at);
+  return Object.fromEntries(kept.slice(0, SEEN_MAX));
+}
 
 function pushState(value: unknown): PushState {
   const state = object(value);
@@ -68,6 +87,10 @@ function pushState(value: unknown): PushState {
         Number.isFinite(reached.at) && Math.abs(reached.at) <= 8.64e15
       ? { deliveryId: reached.deliveryId, at: reached.at }
       : null,
+    seen: Object.fromEntries(Object.entries(object(state.seen)).flatMap(([id, v]) => {
+      const e = object(v);
+      return typeof e.d === "string" && typeof e.at === "number" && Number.isFinite(e.at) ? [[id, { d: e.d, at: e.at }]] : [];
+    })),
   };
 }
 
@@ -623,10 +646,9 @@ export const raftPlugin: Plugin = {
     }
 
     const state = await loadPushState(ctx);
-    await savePushState(ctx, {
-      ...state,
-      lastReached: { deliveryId: payload.deliveryId, at: Date.now() },
-    });
+    const now = Date.now();
+    const reached = { ...state, lastReached: { deliveryId: payload.deliveryId, at: now } };
+    await savePushState(ctx, reached);
     if (!state.enabled) return { deliver: false, reason: "push is disabled for this mount" };
     if (!state.agentId || payload.recipientAgentId !== state.agentId) {
       return { deliver: false, reason: "the signed delivery names a different Raft agent" };
@@ -634,10 +656,28 @@ export const raftPlugin: Plugin = {
     const events = payload.events.map(event) as ObjectValue[];
     if (events.length === 0) return { deliver: false, reason: "an empty batch: nothing to deliver" };
 
+    // A message already delivered under ANOTHER delivery is not delivered again.
+    // The same delivery id is a retry of this very batch: the runtime answers
+    // it by its own dedupe if it was delivered, and delivers it if it was not
+    // (rate-limited, say) — so nothing marked by this id counts as seen.
+    const seen = pruneSeen(state.seen, now);
+    const fresh = events.filter((e) => {
+      const id = text(e.messageId);
+      return !id || !seen[id] || seen[id].d === payload.deliveryId;
+    });
+    if (fresh.length === 0) {
+      return { deliver: false, reason: `every message in this batch was already delivered under another delivery (${events.length})` };
+    }
+    for (const e of fresh) {
+      const id = text(e.messageId);
+      if (id) seen[id] = { d: payload.deliveryId, at: now };
+    }
+    await savePushState(ctx, { ...reached, seen: pruneSeen(seen, now) });
+
     return {
       deliver: true,
-      as: events.some((e) => SPEAKERS.has(String(e.senderType))) ? "user" : "event",
-      text: batchText(ctx.alias, cursor.fromSeq, cursor.toSeq, events),
+      as: fresh.some((e) => SPEAKERS.has(String(e.senderType))) ? "user" : "event",
+      text: batchText(ctx.alias, cursor.fromSeq, cursor.toSeq, fresh),
       dedupeKey: payload.deliveryId,
     };
   },
