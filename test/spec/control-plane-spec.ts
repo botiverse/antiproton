@@ -215,16 +215,21 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
 
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
     const cols = async (table: string) => ((await db.prepare(`PRAGMA table_info(${table})`).all()).results as any[]).map((r) => String(r.name)).sort().join(",");
-    assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
+    assert((await cols("provider_tokens")) === "created_at,hash,label,last_used_at,raft_origin,revoked_at,scope,tenant_id", `provider_tokens ${await cols("provider_tokens")}`);
     assert((await cols("provisioned_agents")) === "agent_id,created_at,deleted_at,instructions,name,push_error,push_registered,raft_agent_id,raft_origin,raft_server_id,status,tenant_id,updated_at",
       `provisioned_agents ${await cols("provisioned_agents")}`);
   });
 
   add("a provider token resolves to its tenant and origin until it is revoked; touch writes once an hour", async () => {
     clock = 1_800_000_000_000;
-    await provider.issue({ hash: "p1", label: "raft-prod", tenantId: "t-raft", raftOrigin: "https://api.raft.build" });
+    await provider.issue({ hash: "p1", label: "raft-prod", scope: "tenant", tenantId: "t-raft", raftOrigin: "https://api.raft.build" });
     const got = await provider.lookup("p1");
-    assert(got?.tenantId === "t-raft" && got.raftOrigin === "https://api.raft.build" && got.label === "raft-prod", `lookup ${JSON.stringify(got)}`);
+    assert(got?.scope === "tenant" && got.tenantId === "t-raft" && got.raftOrigin === "https://api.raft.build" && got.label === "raft-prod", `lookup ${JSON.stringify(got)}`);
+    await provider.issue({ hash: "p2", label: "raft-deployment", scope: "platform", raftOrigin: "https://api-aws-staging.botiverse.dev" });
+    const platform = await provider.lookup("p2");
+    assert(platform?.scope === "platform" && !("tenantId" in platform) && platform.raftOrigin === "https://api-aws-staging.botiverse.dev", `platform ${JSON.stringify(platform)}`);
+    const row: any = await db.prepare("SELECT scope, tenant_id FROM provider_tokens WHERE hash = 'p2'").first();
+    assert(row.scope === "platform" && row.tenant_id === null, `stored ${JSON.stringify(row)}`);
     assert((await provider.lookup("p9")) === null, "an absent token resolved");
     await provider.touch("p1");
     const first = (await provider.list())[0]!;

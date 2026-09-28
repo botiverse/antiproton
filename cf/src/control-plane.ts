@@ -314,12 +314,14 @@ export function d1InboundHooks(db: D1Database, now: () => number = Date.now): Ho
 
 // ---- provisioning (raft-agent-provider.v1): a Raft server's token, and the agents it made.
 
-/** What a provider token stands for: a tenant, and the one Raft origin its mounts may point at. */
-export interface ProviderTokenIdentity {
-  label: string;
-  tenantId: string;
-  raftOrigin: string;
-}
+/**
+ * What a provider token stands for, and the one Raft origin its mounts may point at. A tenant-scoped
+ * token IS one tenant; a platform-scoped one stands for a whole Raft deployment, and the tenant of each
+ * request is derived from the Raft server it names (cf/src/provision/handlers.ts tenantFor).
+ */
+export type ProviderTokenIdentity =
+  | { label: string; raftOrigin: string; scope: "tenant"; tenantId: string }
+  | { label: string; raftOrigin: string; scope: "platform" };
 
 export interface ProviderTokenDirectory {
   issue(row: ProviderTokenIdentity & { hash: string }): Promise<void>;
@@ -333,14 +335,16 @@ export interface ProviderTokenDirectory {
 }
 
 export function d1ProviderTokens(db: D1Database, now: () => number = Date.now): ProviderTokenDirectory {
-  const identity = (r: any): ProviderTokenIdentity => ({ label: String(r.label), tenantId: String(r.tenant_id), raftOrigin: String(r.raft_origin) });
+  const identity = (r: any): ProviderTokenIdentity => r.scope === "platform"
+    ? { label: String(r.label), raftOrigin: String(r.raft_origin), scope: "platform" }
+    : { label: String(r.label), raftOrigin: String(r.raft_origin), scope: "tenant", tenantId: String(r.tenant_id) };
   return {
     async issue(row) {
-      await db.prepare("INSERT INTO provider_tokens(hash, label, tenant_id, raft_origin, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(row.hash, row.label, row.tenantId, row.raftOrigin, now()).run();
+      await db.prepare("INSERT INTO provider_tokens(hash, label, scope, tenant_id, raft_origin, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(row.hash, row.label, row.scope, row.scope === "tenant" ? row.tenantId : null, row.raftOrigin, now()).run();
     },
     async lookup(hash) {
-      const r: any = await db.prepare("SELECT label, tenant_id, raft_origin FROM provider_tokens WHERE hash = ? AND revoked_at IS NULL")
+      const r: any = await db.prepare("SELECT label, scope, tenant_id, raft_origin FROM provider_tokens WHERE hash = ? AND revoked_at IS NULL")
         .bind(hash).first();
       return r ? identity(r) : null;
     },

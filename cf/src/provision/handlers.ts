@@ -27,12 +27,26 @@ export type ProvisionTool = "enable_push" | "disable_push" | "push_status";
 /** What the handler asks of the agent's own object. Each is one RPC in cf/src/index.ts. */
 export interface ProvisionAgentOps {
   /** Create or update the record (persona), bind the model, make sure the `raft` mount points at `raftOrigin`. */
-  adopt(agentId: string, spec: { name: string; instructions: string; raftOrigin: string }): Promise<void>;
+  adopt(tenantId: string, agentId: string, spec: { name: string; instructions: string; raftOrigin: string }): Promise<void>;
   /** Seal the credential onto the `raft` mount; the plugin checks it against Raft. */
-  attachCredential(agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
-  removeCredential(agentId: string): Promise<boolean>;
+  attachCredential(tenantId: string, agentId: string, credential: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
+  removeCredential(tenantId: string, agentId: string): Promise<boolean>;
   /** Run one of the raft plugin's push tools through the gateway, as the model would. */
-  tool(agentId: string, name: ProvisionTool): Promise<{ ok: true; result: Json } | { ok: false; error: string }>;
+  tool(tenantId: string, agentId: string, name: ProvisionTool): Promise<{ ok: true; result: Json } | { ok: false; error: string }>;
+}
+
+/**
+ * The tenant a request acts in. A tenant-scoped token is one tenant. A platform-scoped token (one key
+ * for a whole Raft deployment, tygg 2026-09-28) derives it from the Raft server the request names —
+ * the POST body's raftServerId, `?raftServerId=` on every other route — so isolation and billing
+ * follow the server while Raft holds a single key. A tenant exists by being named: nothing to create.
+ */
+export function tenantFor(who: ProviderTokenIdentity, raftServerId: string | null): string | Fail {
+  if (who.scope === "tenant") return who.tenantId;
+  if (!raftServerId || !RAFT_ID.test(raftServerId)) {
+    return { status: 422, code: "missing", message: "a platform token needs the Raft server: raftServerId in the body, or ?raftServerId= on the URL", param: "raftServerId" };
+  }
+  return `raft_${raftServerId.replace(/[^A-Za-z0-9._-]/g, "_")}`.slice(0, 64);
 }
 
 /**
@@ -60,7 +74,7 @@ export function providerAgentId(raftAgentId: string): string {
   return (PROVIDER_AGENT_PREFIX + raftAgentId.replace(/[^A-Za-z0-9._-]/g, "_")).slice(0, 64);
 }
 
-type Fail = { status: number; code: string; message: string; param?: string };
+export type Fail = { status: number; code: string; message: string; param?: string };
 const fail = (f: Fail) => Response.json({ error: { code: f.code, message: f.message, ...(f.param ? { param: f.param } : {}) } }, { status: f.status, headers: { "cache-control": "no-store" } });
 const ok = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
 
@@ -105,20 +119,27 @@ function view(row: ProvisionedAgent, live?: Json) {
 
 /** Register push through the plugin's own tool and write what happened; the row says `registered` only when it is. */
 async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise<ProvisionedAgent> {
-  const push = await deps.agent.tool(row.agentId, "enable_push");
+  const push = await deps.agent.tool(row.tenantId, row.agentId, "enable_push");
   const patch = { status: "active" as const, pushRegistered: push.ok, pushError: push.ok ? null : push.error };
   await deps.registry.update(row.tenantId, row.raftAgentId, patch);
   return { ...row, ...patch, updatedAt: deps.now() };
 }
 
 export async function handleProvision(
-  method: string, path: string, headers: { idempotencyKey: string | null }, body: unknown,
+  method: string, path: string, headers: { idempotencyKey: string | null; raftServerId: string | null }, body: unknown,
   who: ProviderTokenIdentity, deps: ProvisionDeps,
 ): Promise<Response | null> {
   const seg = path.split("/").filter(Boolean);
-  const { tenantId } = who;
+  if (seg[0] !== "agents") return null;
+  // On POST the body names the server; elsewhere the URL does.
+  const serverForTenant = method === "POST" && seg.length === 1
+    ? (typeof field(body, "raftServerId") === "string" ? field(body, "raftServerId") as string : null)
+    : headers.raftServerId;
+  const tenant = tenantFor(who, serverForTenant);
+  if (isFail(tenant)) return fail(tenant);
+  const tenantId = tenant;
 
-  if (seg.length === 1 && seg[0] === "agents" && method === "POST") {
+  if (seg.length === 1 && method === "POST") {
     const raftAgentId = field(body, "raftAgentId");
     if (typeof raftAgentId !== "string" || !RAFT_ID.test(raftAgentId)) {
       return fail({ status: 422, code: "invalid", message: `raftAgentId must match ${RAFT_ID}`, param: "raftAgentId" });
@@ -167,8 +188,8 @@ export async function handleProvision(
       created = true;
     }
     // From here every step is idempotent, so a replay of a request that died half-way finishes it.
-    await deps.agent.adopt(agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin });
-    const attached = await deps.agent.attachCredential(agentId, credential);
+    await deps.agent.adopt(tenantId, agentId, { name: row.name, instructions: row.instructions, raftOrigin: row.raftOrigin });
+    const attached = await deps.agent.attachCredential(tenantId, agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
     row = await registerPush(deps, row);
     return ok(view(row), created ? 201 : 200);
@@ -177,7 +198,6 @@ export async function handleProvision(
   // An agent is addressed by its providerAgentId, or by the Raft id it was made from
   // (`/agents/by-raft-agent/<raftAgentId>`): a POST whose answer was lost leaves Raft with no
   // providerAgentId, and a delete must still reach the agent it made (Tenny's orphan case).
-  if (seg[0] !== "agents") return null;
   const byRaft = seg[1] === "by-raft-agent";
   const rest = byRaft ? seg.slice(2) : seg.slice(1);
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
@@ -187,7 +207,7 @@ export async function handleProvision(
   if (rest.length === 1 && method === "GET") {
     if (!row) return gone();
     if (row.status === "deleted") return ok(view(row));
-    const status = await deps.agent.tool(row.agentId, "push_status");
+    const status = await deps.agent.tool(tenantId, row.agentId, "push_status");
     return ok(view(row, status.ok ? status.result : { error: status.error }));
   }
 
@@ -203,7 +223,7 @@ export async function handleProvision(
     const patch = { ...(name !== undefined ? { name } : {}), ...(instructions !== undefined ? { instructions } : {}) };
     await deps.registry.update(tenantId, row.raftAgentId, patch);
     const next = { ...row, ...patch, updatedAt: deps.now() };
-    await deps.agent.adopt(row.agentId, { name: next.name, instructions: next.instructions, raftOrigin: next.raftOrigin });
+    await deps.agent.adopt(tenantId, row.agentId, { name: next.name, instructions: next.instructions, raftOrigin: next.raftOrigin });
     return ok(view(next));
   }
 
@@ -211,7 +231,7 @@ export async function handleProvision(
     if (!row || row.status === "deleted") return gone();
     const credential = credentialField(body);
     if (isFail(credential)) return fail(credential);
-    const attached = await deps.agent.attachCredential(row.agentId, credential);
+    const attached = await deps.agent.attachCredential(tenantId, row.agentId, credential);
     if (!attached.ok) return fail({ status: 422, code: "credential_refused", message: attached.error, param: "credential" });
     // A new credential means a new registration on Raft's side; the plugin replaces the hook and re-PUTs.
     return ok(view(await registerPush(deps, row)));
@@ -223,8 +243,8 @@ export async function handleProvision(
     // Raft revokes the credential itself, so pushes stop even if this fails half-way; what is
     // reported is what could not be undone here. The object and its transcript stay: data is
     // never destroyed by a delete, here as for every agent.
-    const off = await deps.agent.tool(row.agentId, "disable_push");
-    await deps.agent.removeCredential(row.agentId);
+    const off = await deps.agent.tool(tenantId, row.agentId, "disable_push");
+    await deps.agent.removeCredential(tenantId, row.agentId);
     const t = deps.now();
     const patch = { status: "deleted" as const, pushRegistered: false, pushError: off.ok ? null : off.error, deletedAt: t };
     await deps.registry.update(tenantId, row.raftAgentId, patch);
