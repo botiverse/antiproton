@@ -498,7 +498,7 @@ await check("an inbox notice reaches the agent as Raft wrote it, with the one in
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   globalThis.fetch = (async () => { throw new Error("receive called the network"); }) as any;
   const out = await raftPlugin.receive!(pushed(notice(), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);
-  if (!out.deliver || out.dedupeKey !== "ntc_0123456789abcdef" || out.as !== undefined) throw new Error(JSON.stringify(out));
+  if (!out.deliver || out.dedupeKey !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(out));
   if (!out.text.startsWith("Inbox update: 2 unread") || !out.text.includes("`receive_events` tool from the `raft` mount") || !/acknowledges/.test(out.text)) throw new Error(out.text);
   if (m.state()?.lastReached?.deliveryId !== "ntc_0123456789abcdef") throw new Error(JSON.stringify(m.state()));
   const extra = await raftPlugin.receive!(pushed(notice({ latestPreview: "added later", other: 1 }), { deliveryId: "ntc_0123456789abcdef" }), PUSH_SECRET, m.ctx);

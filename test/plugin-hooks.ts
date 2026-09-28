@@ -26,9 +26,7 @@ const pushy: Plugin = {
   async receive(event, secret) {
     if (event.headers["x-signed-with"] !== secret) return { deliver: false, reason: "bad", rejected: true };
     if (event.headers["x-malformed"]) return { deliver: false, reason: "not my shape", malformed: true };
-    // The lane is the plugin's word from the service's facts; here the test states it in a header.
-    const as = event.headers["x-as"];
-    return as === "user" || as === "event" ? { deliver: true, text: "ok", as } : { deliver: true, text: "ok" };
+    return { deliver: true, text: "ok" };
   },
 };
 const quiet: Plugin = { ...pushy, id: "quiet", receive: undefined };
@@ -99,23 +97,15 @@ await check("a signed body the plugin cannot read is malformed, which is neither
   host.dispose();
 });
 
-await check("what the plugin says about who is speaking decides whether the agent reads a label", async () => {
+await check("what a plugin delivers reaches the agent under the label that says it is not the user", async () => {
   const { rt, host, grab } = await runtime();
   const posted: string[] = [];
   (rt as any).postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
   const made = await (await grab("a", "p"))!.create();
-  const lanes: Array<Record<string, string>> = [{}, { "x-as": "event" }, { "x-as": "user" }];
-  for (const extra of lanes) {
-    must((await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret, extra))).outcome === "delivered", `not delivered for ${JSON.stringify(extra)}`);
-  }
-  must(posted.length === 3, `posted ${posted.length}`);
-  const [unsaid, event, user] = posted;
-  must(/not by the user/.test(unsaid!) && unsaid!.endsWith("\nok"), `default lost the label: ${unsaid}`);
-  must(event === unsaid, `saying "event" differs from saying nothing: ${event}`);
-  must(user === "ok", `the user lane carried a label: ${user}`);
+  must((await rt.receiveHook("t", "a", "p", made.hookId, ev(made.secret))).outcome === "delivered", "not delivered");
+  must(posted.length === 1 && /not by the user/.test(posted[0]!) && posted[0]!.endsWith("\nok"), `posted ${JSON.stringify(posted)}`);
   host.dispose();
 });
-
 await check("a plugin that can receive makes a hook for its own mount, and the secret it gets is the one events are checked with", async () => {
   const { rt, host, rows, grab } = await runtime();
   const inbound = await grab("a", "p");
