@@ -1283,7 +1283,8 @@ export class AgentRuntime {
     // catalogue the only source of "on by default", and this path was never
     // told — so a non-default plugin in an explicit list was skipped below
     // without a word, and the retail tools vanished from every bench agent the
-    // first time #491 reached production: a τ² round of 0/24 with no retail tool in the histogram.
+    // first time #491 reached production: the 2026-09-28 12:53Z τ² round (build c26ebd4) went
+    // 0/24 with no retail tool in the histogram.
     // The choice is recorded, not bypassed, so the catalogue and the gateway
     // agree with what was mounted; an explicit "disable" still wins.
     // Said, not inferred: array identity told a fresh copy of the defaults apart from the defaults,
