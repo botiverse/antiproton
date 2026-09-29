@@ -76,7 +76,7 @@ import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
 import { d1Connections, d1Connectors, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
-import { CONNECT_CALLBACK_PATH, CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, type ConnectDeps } from "./provision/connect.ts";
+import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
@@ -2344,12 +2344,11 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       if (!deps) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       return connectStart(url, deps);
     }
-    case CONNECT_CALLBACK_PATH: {
-      const deps = connectDeps(env);
-      if (!deps) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
-      return connectCallback(request, url, deps);
-    }
     case "/login/github/callback": {
+      // Shared with Connect GitHub (provision/connect.ts CONNECT_CALLBACK_PATH): a callback whose connect
+      // cookie matches its state is that flow's; anything else is a sign-in.
+      const connect = connectDeps(env);
+      if (connect && await isConnectCallback(request, url, connect)) return connectCallback(request, url, connect);
       const cfg = githubConfig(env);
       if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       const st = await open<LoginState>(env.SESSION_SECRET!, readCookie(request, LOGIN_COOKIE));

@@ -27,7 +27,11 @@ export const CONNECTION_PROVIDERS = ["github"] as const;
 export type ConnectionProvider = typeof CONNECTION_PROVIDERS[number];
 export const CONNECT_LINK_TTL_MS = 10 * 60_000;
 export const CONNECT_START_PATH = "/connect/start";
-export const CONNECT_CALLBACK_PATH = "/login/github/callback/connect";
+// The sign-in's own callback, not a path under it. GitHub's docs accept a subdirectory of the registered
+// callback, but the preview App refused `/login/github/callback/connect` while it took this one (read
+// 2026-09-29); sharing the one registered URL does not depend on that rule. `isConnectCallback` tells
+// the two flows apart by the flow cookie and its state.
+export const CONNECT_CALLBACK_PATH = "/login/github/callback";
 const FLOW_COOKIE = "ap_connect";
 /** The plugin whose mount a provider's credential goes on; found by plugin, whatever the mount is called. */
 export const CONNECTION_PLUGIN: Record<ConnectionProvider, string> = { github: "github" };
@@ -123,7 +127,14 @@ export async function connectStart(url: URL, deps: ConnectDeps): Promise<Respons
   });
 }
 
-/** `GET /login/github/callback/connect`: exchange, hold, and send the browser back to be confirmed. */
+/** Whether a callback on the shared path belongs to a connect flow: its cookie opens and its state matches. */
+export async function isConnectCallback(request: Request, url: URL, deps: Pick<ConnectDeps, "secret" | "now">): Promise<boolean> {
+  const flow = await open<{ oauthState: string; exp: number }>(deps.secret, readCookie(request, FLOW_COOKIE), deps.now());
+  const state = url.searchParams.get("state");
+  return !!flow && !!state && constantTimeEqual(state, flow.oauthState);
+}
+
+/** `GET /login/github/callback` for a connect flow: exchange, hold, and send the browser back to be confirmed. */
 export async function connectCallback(request: Request, url: URL, deps: ConnectDeps): Promise<Response> {
   const flow = await open<{ link: ConnectLink; oauthState: string; exp: number }>(deps.secret, readCookie(request, FLOW_COOKIE), deps.now());
   const state = url.searchParams.get("state");
