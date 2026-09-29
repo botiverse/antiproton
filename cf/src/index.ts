@@ -90,7 +90,7 @@ import { operatorModelOf } from "./model-request.ts";
 import { operatorRequest } from "../../src/model/operator-request.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
-  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
+  page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
 
 /** The inspector's runtime tab: the object, then its containers. Storage is a
@@ -3322,7 +3322,9 @@ async function route(request: Request, env: Env): Promise<Response> {
           const agentId = uiSelected?.agentId ?? gate.agentId;
           const taskId = url.searchParams.get("taskId") ?? `t_${agentId}`;
           await stub.uiEnsure(gate.tenantId, agentId, taskId);
-          return new Response(page(taskId, who, agentId, gate.viewer), {
+          // The shell needs to know whether this viewer administers the deployment, so the
+          // rail can draw the admin item. Same answer as /ui/whoami, computed at the edge.
+          return new Response(page(taskId, who, agentId, gate.viewer ? { ...gate.viewer, admin: isAdmin(gate.viewer, env) } : undefined), {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         }
@@ -3514,6 +3516,40 @@ async function route(request: Request, env: Env): Promise<Response> {
           return request.headers.get("hx-request")
             ? new Response(usagePanel(data), { headers: { ...headers, "content-type": "text/html; charset=utf-8" } })
             : Response.json({ tenantId: gate.tenantId, ...data }, { headers });
+        }
+        case "/ui/admin": {
+          // The admin area's fragment. The rail item is only drawn for admins; this is the
+          // second check, same as /admin/models — a non-admin is told nothing, not "refused".
+          // Writes arrive as form posts so htmx can swap the re-rendered panel in; each is
+          // applied through the same handler the JSON route uses, then the panel re-reads.
+          const v = await viewer(request, env);
+          if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+          const deps = {
+            overrides: d1ModelOverrides(env.CONTROL_DB),
+            defaults: { model: env.HARNESS_MODEL, baseUrl: env.DEEPSEEK_BASE_URL },
+            now: Date.now,
+          };
+          const actor = v!.sub ?? v!.email;
+          let error: string | null = null;
+          if (request.method === "POST") {
+            const form = await formOf(request);
+            if (!form) return new Response("expected a form body", { status: 400 });
+            const fields = Object.fromEntries(["tenantId", "agentId", "model"].map((k) => [k, String(form.get(k) ?? "")]));
+            // The handler wants an explicit scope and validates the ids per scope: an agent
+            // is named by tenant and id, a tenant by id alone, neither by the deployment.
+            const scope = fields.agentId ? "agent" : fields.tenantId ? "tenant" : "deployment";
+            const body = { scope, tenantId: fields.tenantId, agentId: fields.agentId, ...(form.get("action") === "remove" ? {} : { model: fields.model }) };
+            const write = await adminModels(form.get("action") === "remove" ? "DELETE" : "PUT", body, actor, deps);
+            if (!write.ok) {
+              // A refused write must read as a refusal: the handler's reason goes back on
+              // the panel, above the forms, or the re-render looks like a silent success.
+              const why = await write.json().catch(() => null) as { error?: { message?: string } } | null;
+              error = why?.error?.message ?? "the change was not saved";
+            }
+          }
+          const read = await adminModels("GET", null, actor, deps);
+          const data: Parameters<typeof adminPanel>[0] = await read.json();
+          return new Response(adminPanel({ ...data, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/api-keys":
         case "/ui/api-keys/new":
