@@ -36,6 +36,8 @@ export function contextWindowFor(
   fallback = ASSUMED_CONTEXT_WINDOW,
 ): number {
   if (!model) return fallback;
+  // Through a gateway a model is named `provider/model`; the window is the model's.
+  model = model.slice(model.indexOf("/") + 1);
   if (CONTEXT_WINDOWS[model]) return CONTEXT_WINDOWS[model]!;
   // Dated or suffixed variants of a known model share its window.
   const base = Object.keys(CONTEXT_WINDOWS).find((k) => model.startsWith(k));
