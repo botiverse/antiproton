@@ -2129,6 +2129,46 @@ await check("a container acts as every declaring mount only through a placeholde
 });
 
 /**
+ * `agentSecret` reaches the agent's own kept rows and nothing else in the same
+ * table, through the real gateway and the real sealed resolver: a mount's
+ * credential stored as `agent:gh` (row `gh`) is not reachable by naming `gh`,
+ * nor by naming the row whole.
+ */
+await check("the gateway's agentSecret reads a kept secret and never a mount credential", async () => {
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const { ToolGateway } = await import("../src/runtime/gateway.ts");
+  const { agentSecrets, importKek, seal } = await import("../src/runtime/secrets.ts");
+  const probe: any = {
+    id: "probe", version: "1.0.0",
+    tools: [{ name: "peek", summary: "x", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "safe" }],
+    invoke: async (_t: string, _a: unknown, ctx: any) => ({
+      kept: await ctx.agentSecret("openai"),
+      mount: await ctx.agentSecret("gh"),
+      whole: await ctx.agentSecret("kept:openai"),
+      hook: await ctx.agentSecret("hook:abc"),
+    }),
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k", {});
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "p", plugin: "probe", installationId: "i-p", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null,
+  } as any);
+  const kek = await importKek(btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))));
+  await store.putSecret("t", "a", "gh", await seal(kek, "ghp_mount_credential"));
+  await store.putSecret("t", "a", "hook:abc", await seal(kek, "hook-secret"));
+  await store.putSecret("t", "a", "kept:openai", await seal(kek, "sk-kept"));
+  const resolver = agentSecrets(store as any, kek, { async resolve() { return null; } } as any);
+  const gw = new ToolGateway(store, [probe], new Set(["probe"]), resolver);
+  const r: any = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "p.peek", {});
+  if (r.status !== "succeeded") throw new Error(`the probe did not run: ${JSON.stringify(r)}`);
+  const got = JSON.stringify(r.result);
+  if (got !== JSON.stringify({ kept: "sk-kept", mount: null, whole: null, hook: null })) throw new Error(`agentSecret answered ${got}`);
+});
+
+/**
  * A sibling says which plugin it is.
  *
  * A plugin that hands a sibling's credential to a service has to know the alias

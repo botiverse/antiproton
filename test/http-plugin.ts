@@ -16,6 +16,8 @@ const ctx = (allowedHosts: string[], extra = {}) => ({
   credential: null,
   publicConfig: { allowedHosts, ...extra },
   async sibling() { return null; },
+  // The agent's kept secrets, as the gateway answers for them: by name, null when there is none.
+  async agentSecret(name: string) { return name === "acme" ? "sk-acme-0123456789" : null; },
 });
 
 await test("默认开放", "with no allowlist configured, any public host is reachable", async () => {
@@ -126,6 +128,48 @@ await test("凭据头不出门", "credential headers are refused and the refusal
     // header never becomes part of a request.
     assert(/allowlist/.test((e as Error).message), (e as Error).message);
   }
+});
+
+await test("按名用密钥", "a kept secret is named in secretHeaders, filled in on the way out, and never comes back", async () => {
+  const real = globalThis.fetch;
+  const sent: Array<{ url: string; headers: Record<string, string> }> = [];
+  (globalThis as any).fetch = async (u: URL | string, init: any) => {
+    sent.push({ url: String(u), headers: init.headers });
+    // A service that echoes what it was sent, in the body and in a header.
+    return new Response(JSON.stringify({ youSent: init.headers["x-api-key"] }), {
+      status: 200, headers: { "content-type": "application/json", "x-echo": String(init.headers["x-api-key"]) },
+    });
+  };
+  try {
+    const out: any = await httpPlugin.invoke("send",
+      { url: "https://api.acme.test/v1", body: { q: 1 }, secretHeaders: { "X-Api-Key": "acme" } } as any, ctx(["api.acme.test"]) as any);
+    eq(sent[0]?.headers["x-api-key"], "sk-acme-0123456789", "the value went out in the header");
+    assert(!JSON.stringify(out).includes("sk-acme-0123456789"), `the value came back: ${JSON.stringify(out)}`);
+    assert(out.body.includes("[secret acme]") && out.headers["x-echo"] === "[secret acme]", `the echo is not named: ${JSON.stringify(out)}`);
+    eq(out.secretHeaders?.["x-api-key"], "acme", "the result says which secret went where, by name");
+    let msg = "";
+    try { await httpPlugin.invoke("get", { url: "https://api.acme.test/v1", secretHeaders: { authorization: "nope" } } as any, ctx(["api.acme.test"]) as any); }
+    catch (e) { msg = (e as Error).message; }
+    assert(/no secret named nope/.test(msg), `a missing secret: ${msg}`);
+  } finally { (globalThis as any).fetch = real; }
+});
+
+await test("跳转不带密钥", "a kept secret goes to the first URL's origin only, not after a redirect elsewhere", async () => {
+  const real = globalThis.fetch;
+  const sent: Array<{ url: string; key?: string }> = [];
+  (globalThis as any).fetch = async (u: URL | string, init: any) => {
+    const s = String(u);
+    sent.push({ url: s, key: init.headers.authorization });
+    if (s.startsWith("https://api.acme.test/")) return new Response(null, { status: 302, headers: { location: "https://cdn.other.test/x" } });
+    return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+  };
+  try {
+    const out: any = await httpPlugin.invoke("get",
+      { url: "https://api.acme.test/a", secretHeaders: { authorization: "acme" } } as any, ctx(["api.acme.test", "cdn.other.test"]) as any);
+    eq(sent[0]?.key, "sk-acme-0123456789", "the first hop carried it");
+    eq(sent[1]?.key, undefined, "the redirect to another origin did not");
+    eq(out.secretHeadersNotSentTo, "cdn.other.test", "and the result says where it was held back");
+  } finally { (globalThis as any).fetch = real; }
 });
 
 console.log(`\n  outbound http — a mount, not a capability\n  ${"─".repeat(66)}`);

@@ -23,6 +23,15 @@ import type { StorageAdapter } from "../core/store.ts";
 import type { SecretResolver } from "./gateway.ts";
 
 export const AGENT_REF = "agent:";
+/**
+ * The rows the agent keeps itself (`state.secret_put`), apart from mount
+ * credentials and hook secrets in the same table. Anything that hands a value
+ * to the agent or at its direction reads only under this prefix, so it can
+ * never reach a credential only the server uses.
+ */
+export const KEPT_PREFIX = "kept:";
+/** A name the agent may keep a secret under. */
+export const KEPT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 export function agentRef(name: string): string { return AGENT_REF + name; }
 export function isAgentRef(ref: string | null | undefined): boolean {
   return typeof ref === "string" && ref.startsWith(AGENT_REF);

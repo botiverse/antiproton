@@ -96,6 +96,7 @@ async function mountReports(
       db: openPluginDatabase(tables, { ...owner, alias: m.alias, plugin: m.plugin }, plugin.database, { readOnly: true }),
       async sibling() { return null; },
       async sandboxForms() { return []; },
+      async agentSecret() { return null; },
     };
     try {
       const holding = holdingOf(plugin);
