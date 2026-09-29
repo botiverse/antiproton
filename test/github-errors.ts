@@ -88,6 +88,28 @@ await check("with an account, the same answers carry no hint about attaching one
 });
 
 /**
+ * An account's 404 names what a person can do about it, and only what applies.
+ *
+ * From staging (cody, 2026-09-29): Ant3's `repo_view` got a 404 that said only
+ * "about what that account may do", and the agent had nothing to tell anyone.
+ */
+await check("with an account, a 404 lists its causes, and names private access only when the grant lacks it", async () => {
+  const json = { "content-type": "application/json" };
+  answer(404, JSON.stringify({ message: "Not Found" }), { ...json, "x-oauth-scopes": "public_repo, read:org" });
+  const publicOnly = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/private" }, ctx("tok", "agent")));
+  answer(404, JSON.stringify({ message: "Not Found" }), { ...json, "x-oauth-scopes": "repo, read:org" });
+  const withRepo = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/private" }, ctx("tok", "agent")));
+  answer(404, JSON.stringify({ message: "Not Found" }), json);
+  const noHeader = await failure(() => githubPlugin.invoke("repo_view", { repo: "o/private" }, ctx("tok", "agent")));
+  for (const why of [publicOnly, withRepo, noHeader]) {
+    if (!/misspelled/.test(why) || !/Authorized OAuth Apps/.test(why)) throw new Error(`a cause is missing: ${why}`);
+  }
+  if (!/public repositories only/.test(publicOnly) || !/public_repo, read:org/.test(publicOnly)) throw new Error(`public-only grant: ${publicOnly}`);
+  if (/private repositories/.test(withRepo) || /not granted that repository/.test(withRepo)) throw new Error(`a grant with repo was told it lacks private access: ${withRepo}`);
+  if (!/not granted that repository/.test(noHeader)) throw new Error(`a token without scopes lost the private cause: ${noHeader}`);
+});
+
+/**
  * Which identity a failure was made with, said on the failure itself.
  *
  * Two mounts answer a 403 identically — one with no account, one naming an

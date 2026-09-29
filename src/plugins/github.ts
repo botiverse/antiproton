@@ -72,14 +72,14 @@ function repoOf(args: Record<string, any>): string {
  * two sentences for one state; what GitHub's status means for that identity is
  * this plugin's to add.
  */
-function identityLine(ctx: PluginContext, status: number): string {
+function identityLine(ctx: PluginContext, status: number, scopes: string | null): string {
   if (status !== 401 && status !== 403 && status !== 404) return "";
   if (credentialState(ctx) === "attached") {
     // A refused credential is the one case where holding an account is the
     // problem rather than the answer, and attaching another does nothing.
-    return status === 401
-      ? ` — ${identityNote(ctx)}, and GitHub refused that credential itself, so it has to be replaced rather than added to`
-      : ` — ${identityNote(ctx)}, so this is about what that account may do or its own rate, not a missing account`;
+    if (status === 401) return ` — ${identityNote(ctx)}, and GitHub refused that credential itself, so it has to be replaced rather than added to`;
+    if (status === 404) return ` — ${identityNote(ctx)}, and GitHub answers 404 alike for what does not exist and for what that account may not see. ${notFoundCauses(scopes)}`;
+    return ` — ${identityNote(ctx)}, so this is about what that account may do or its own rate, not a missing account`;
   }
   const consequence = status === 404
     ? " and a private repository answers exactly like a missing one"
@@ -87,6 +87,35 @@ function identityLine(ctx: PluginContext, status: number): string {
     ? " and shares GitHub's low anonymous rate limit with everything else calling from this server"
     : "";
   return ` — this call was anonymous${consequence}: ${identityNote(ctx)}`;
+}
+
+/**
+ * The causes of an account's 404, so the agent can tell a person what to do.
+ *
+ * "What that account may do" alone left an agent with nothing to say (a
+ * staging `repo_view`, 2026-09-29). GitHub reports a classic or OAuth token's
+ * grant in `x-oauth-scopes`; when it does, the private-repository cause is
+ * named only if `repo` is missing from it. A token that sends no such header
+ * (fine-grained, or a GitHub App's) is granted repositories one by one, so
+ * that cause stays, worded for it.
+ */
+function notFoundCauses(scopes: string | null): string {
+  const granted = scopes === null ? null : scopes.split(",").map((s) => s.trim()).filter(Boolean);
+  const causes = ["the owner/name (or path) is misspelled"];
+  if (granted === null) {
+    causes.push("it is private and this credential was not granted that repository");
+  } else if (!granted.includes("repo")) {
+    causes.push(
+      `it is private and this credential reaches public repositories only (its scopes: ${granted.join(", ") || "none"}); ` +
+      "it has to be replaced by one that includes private repositories (`repo`; through Connect GitHub, connect again choosing private repositories)",
+    );
+  }
+  causes.push("the account itself has no access to it: not a member of its organization or a collaborator on it");
+  causes.push(
+    "it belongs to an organization that restricts OAuth apps and has not approved this one; an owner of that organization " +
+    "grants it on GitHub under Settings → Applications → Authorized OAuth Apps → this app → Grant (a member can only Request)",
+  );
+  return `Possible causes: ${causes.map((c, i) => `(${i + 1}) ${c}`).join("; ")}.`;
 }
 
 async function call(
@@ -152,7 +181,7 @@ async function call(
     // console badges a stored failure, and a badge matched out of prose breaks
     // silently the next time the prose changes.
     const err = markIdentity(new Error(
-      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status)}`,
+      `${who} ${res.status}: ${parsed?.message ?? res.statusText}${rate}${identityLine(ctx, res.status, res.headers.get("x-oauth-scopes"))}`,
     ), ctx);
     const limited = res.status === 429 || (res.status === 403 && remaining === "0");
     // Two questions, and a 5xx answers yes to both: it may clear on its own,
