@@ -25,6 +25,18 @@ export async function workerBuild(base: string): Promise<string | null> {
   } catch { return null; }
 }
 
+/** The model the deployment serves, as { name, endpoint } — the provider path
+ *  a series segments on when it changes (direct DeepSeek vs AI Gateway).
+ *  Same /ui/whoami surface as workerBuild; a second fetch keeps this additive. */
+export async function workerModel(base: string): Promise<{ name: string; endpoint: string } | null> {
+  try {
+    const r = await fetch(`${base}/ui/whoami`);
+    const j: any = await r.json();
+    const m = j?.model;
+    return typeof m?.name === "string" && typeof m?.endpoint === "string" ? { name: m.name, endpoint: m.endpoint } : null;
+  } catch { return null; }
+}
+
 /**
  * Which code the driver itself ran from. Two witnesses write a record: the
  * Worker reports its build, the driver computes the per-task fields from its
