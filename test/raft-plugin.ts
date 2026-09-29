@@ -239,6 +239,21 @@ await check("a pull acknowledges nothing on its own: the next pull carries the c
   }
 });
 
+await check("a message line never points at a CLI command this mount lacks, and a left-out body says it was left out", async () => {
+  const m = mount();
+  one(events([
+    { id: "m-6aaaaaa", seq: 1, content: "see file", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel",
+      attachments: [{ id: "att-1", filename: "plan.pdf" }] },
+    { id: "m-7aaaaaa", seq: 2, content: "", truncated: true, sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel" },
+  ], { last_seen_seq: 2 }));
+  const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
+  const [withFile, cut] = out.messages as string[];
+  if (/raft attachment view/.test(withFile!) || !/1 attachment: plan\.pdf — this mount has no tool to open attachments\]$/.test(withFile!)) {
+    throw new Error(`attachment line: ${withFile}`);
+  }
+  if (!/content left out by Raft: too large/.test(cut!)) throw new Error(`a left-out body read as an empty message: ${cut}`);
+});
+
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
   const m = mount();
   const calls = one(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }));

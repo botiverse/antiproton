@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { createRaft, type Raft, type SeenFrontierSnapshot, type RaftFailure } from "@botiverse/raft-sdk";
+import { createRaft, type Raft, type RaftMessage, type SeenFrontierSnapshot, type RaftFailure } from "@botiverse/raft-sdk";
 import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -284,9 +284,6 @@ async function validPushSignature(body: Uint8Array, signature: string | undefine
   return crypto.subtle.verify("HMAC", key, actual, body);
 }
 
-
-
-
 /**
  * The inbox cursor and the seen frontier, kept per mount. The cursor is what the next pull acknowledges;
  * the frontier is what this agent has been shown per conversation, which a send attests so a reply into a
@@ -332,6 +329,26 @@ function sdkFailure(out: RaftFailure, write = false): Error {
   // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.
   const landed = write && unanswered;
   return marked(e, { retryable: landed, transient: out.error.retryable, mayHaveLanded: landed });
+}
+
+/**
+ * One message as the model reads it: the SDK's canonical line, which is the CLI's, with the two things
+ * the CLI says that are not true on this mount put right. The CLI ends a message that has attachments with
+ * "use raft attachment view to download", a command this mount has no tool for, so a model would go looking
+ * for it; here the attachments are named and the missing tool is said. And a message whose content Raft left
+ * out because it was too large renders as a sender and nothing after the colon, which reads as an empty
+ * message; here it says the content was left out. Both are fixed by rebuilding the suffix from the message's
+ * own fields, so a change to the SDK's wording shows as a failing test rather than a doubled suffix.
+ */
+function modelLine(m: RaftMessage): string {
+  let line = m.text;
+  if (m.attachments.length) {
+    const cli = ` [${m.attachments.length} attachment${m.attachments.length > 1 ? "s" : ""}: ${m.attachments.map((a) => `${a.filename} (id:${a.id})`).join(", ")} — use raft attachment view to download]`;
+    if (line.endsWith(cli)) line = line.slice(0, -cli.length);
+    line += ` [${m.attachments.length} attachment${m.attachments.length > 1 ? "s" : ""}: ${m.attachments.map((a) => a.filename).join(", ")} — this mount has no tool to open attachments]`;
+  }
+  if ((m.raw as { truncated?: unknown }).truncated === true) line += " [content left out by Raft: too large for one pull; this mount has no tool to read it in full]";
+  return line;
 }
 
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
@@ -458,7 +475,7 @@ export const raftPlugin: Plugin = {
         await saveFrontier(ctx, raft);
         return {
           state: "held", target: out.data.target, newMessages: out.data.newMessageCount,
-          messages: out.data.heldMessages.map((m) => m.text),
+          messages: out.data.heldMessages.map(modelLine),
           ...(out.data.omittedMessageCount ? { omitted: out.data.omittedMessageCount } : {}),
           note: "Not sent: newer messages arrived in this conversation. Read them; to send your message as it is, call send_message " +
             "again with the same idempotencyKey; to change it, use a new key.",
@@ -468,7 +485,7 @@ export const raftPlugin: Plugin = {
       return {
         state: "sent", messageId: out.data.messageId,
         ...(out.data.messageSeq !== null ? { messageSeq: out.data.messageSeq } : {}),
-        ...(out.data.recentUnread.length ? { recentUnread: out.data.recentUnread.map((m) => m.text) } : {}),
+        ...(out.data.recentUnread.length ? { recentUnread: out.data.recentUnread.map(modelLine) } : {}),
       };
     }
     if (name === "receive_events") {
@@ -487,7 +504,7 @@ export const raftPlugin: Plugin = {
       if (batch.cursor !== null && batch.ackMode === "cursor") await ctx.db.put(INBOX_STORE, batch.cursor, CURSOR_KEY);
       await saveFrontier(ctx, raft);
       return {
-        messages: batch.messages.map((m) => m.text),
+        messages: batch.messages.map(modelLine),
         hasMore: batch.hasMore,
         ...(batch.hasMore ? { note: "More unread messages remain: call receive_events again until hasMore is false." } : {}),
         ...(batch.replyTarget ? { replyTarget: batch.replyTarget } : {}),
