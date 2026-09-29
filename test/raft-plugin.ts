@@ -266,6 +266,47 @@ await check("a message line never points at a CLI command this mount lacks, and 
   }
 });
 
+await check("a version-2 mount's cursor and frontier become the SDK's state: the next pull acknowledges exactly that batch, and the old keys are gone", async () => {
+  const tables = new PluginDbTables(sqliteHost()).ensure();
+  const scope = { tenantId: "tenant", agentId: "agent", alias: "raft", plugin: raftPlugin.id };
+  tables.setVersion(scope, 2);
+  tables.put(scope, "inbox", "cursor", 41, null);
+  tables.put(scope, "inbox", "frontier", { version: 1, targets: { "#general": { upTo: 30 } }, aliases: {} }, null);
+  const db = openPluginDatabase(tables, scope, raftPlugin.database);
+  const calls = one(events([]));
+  await raftPlugin.invoke("receive_events", {}, { ...ctx(), db });
+  const since = new URL(calls[0]!.url).searchParams.get("since");
+  if (since !== "41") throw new Error(`the carried-over batch was not the one acknowledged: since=${since}`);
+  const st = tables.get(scope, "inbox", "state") as any;
+  if (tables.version(scope) !== 3 || st?.schema !== "raft-sdk-state.v1" || st.frontier?.targets?.["#general"]?.upTo !== 30) {
+    throw new Error(`upgrade: version ${tables.version(scope)}, state ${JSON.stringify(st)}`);
+  }
+  if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");
+});
+
+await check("prepare_action posts one of the three model-preparable cards and says nothing has happened yet", async () => {
+  const calls = one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
+  const out = await raftPlugin.invoke("prepare_action", {
+    target: "#general", action: { type: "channel:create", name: "launch-room", draftHint: "for Thursday's launch" },
+  }, ctx()) as any;
+  if (out.prepared !== true || out.messageId !== "abcdef12-3456" || !/nothing has happened yet/.test(out.note)) throw new Error(JSON.stringify(out));
+  const body = JSON.parse(String(calls[0]!.init.body));
+  if (!/\/internal\/agent-api\/prepare-action$/.test(calls[0]!.url) || body.target !== "#general" || body.action?.type !== "channel:create" ||
+      body.action.name !== "launch-room" || body.action.draftHint !== "for Thursday's launch") {
+    throw new Error(`request: ${calls[0]!.url} ${JSON.stringify(body)}`);
+  }
+  const tool = raftPlugin.tools.find((x) => x.name === "prepare_action");
+  if (tool?.sideEffects !== "write" || tool.idempotency !== "none") throw new Error(`declaration: ${JSON.stringify(tool)}`);
+  // An integration card needs ids a model cannot know; it is refused before anything is sent.
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const why = await failure(() => raftPlugin.invoke("prepare_action", { target: "#general", action: { type: "integration:register_app", name: "x", returnUrl: "https://x" } }, ctx()));
+  if (sent !== 0 || !/channel:create, channel:add_member or agent:create/.test(why.message)) throw new Error(`integration card: sent=${sent} ${why.message}`);
+  // A card Raft's contract refuses (a name too long) is refused by the SDK before sending, naming no body.
+  const tooLong = await failure(() => raftPlugin.invoke("prepare_action", { target: "#general", action: { type: "channel:create", name: "x".repeat(81) } }, ctx()));
+  if (sent !== 0 || tooLong.mayHaveLanded === true) throw new Error(`contract refusal: sent=${sent} ${tooLong.message}`);
+});
+
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
   const m = mount();
   const calls = one(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }));
@@ -300,7 +341,8 @@ await check("receive rejects an invalid response without exposing its body, and 
   one(json(200, { events: "wrong", secret: "body-secret" }));
   const why = await failure(() => raftPlugin.invoke("receive_events", {}, m.ctx));
   if (/body-secret/.test(why.message)) throw why;
-  if (m.ctx.db && (await m.ctx.db.get("inbox", "cursor")) !== undefined) throw new Error("an invalid answer set a cursor");
+  const st = (await m.ctx.db.get("inbox", "state")) as any;
+  if (st?.pendingCursor != null || st?.cursor != null) throw new Error(`an invalid answer set a cursor: ${JSON.stringify(st)}`);
 });
 
 await check("receive HTTP and non-JSON failures do not leak bodies", async () => {
@@ -320,7 +362,11 @@ await check("a Server that still acknowledges on read is named in the result, an
   one(events([{ id: "m-4aaaaaa", seq: 3, content: "x", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 3, ack_mode: "immediate" }));
   const out = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   if (out.acknowledged !== "on this read") throw new Error(JSON.stringify(out));
-  if ((await m.ctx.db.get("inbox", "cursor")) !== undefined) throw new Error("a cursor was kept for a batch already acknowledged");
+  // What matters is what the next pull sends: the batch was acknowledged on read, so no cursor may make it look pending.
+  const next = one(events([]));
+  await raftPlugin.invoke("receive_events", {}, m.ctx);
+  const since = new URL(next[0]!.url).searchParams.get("since");
+  if (since !== null && since !== "latest" && Number(since) < 3) throw new Error(`the pull after an on-read batch sent since=${since}`);
 });
 
 await check("the gateway records a failed pull as failed, not unknown: under cursor acks nothing was consumed", async () => {

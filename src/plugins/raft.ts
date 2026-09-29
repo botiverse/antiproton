@@ -7,7 +7,7 @@
  * the model's context.
  */
 import type { Json } from "../core/types.ts";
-import { createRaft, type Raft, type RaftMessage, type SeenFrontierSnapshot, type RaftFailure } from "@botiverse/raft-sdk";
+import { createRaft, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
 import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -285,34 +285,48 @@ async function validPushSignature(body: Uint8Array, signature: string | undefine
 }
 
 /**
- * The inbox cursor and the seen frontier, kept per mount. The cursor is what the next pull acknowledges;
- * the frontier is what this agent has been shown per conversation, which a send attests so a reply into a
- * conversation it has read is not held. Both survive the object being a new process between two calls.
+ * The SDK's state for this mount — committed and pending inbox cursors, the seen frontier, held-send
+ * keys — kept as one record in the mount's database. The next pull acknowledges what was committed;
+ * the frontier is what this agent was shown per conversation, which a send attests so a reply into a
+ * conversation it has read is not held. All of it survives the object being a new process between calls.
  */
 export const INBOX_STORE = "inbox";
-const CURSOR_KEY = "cursor";
-const FRONTIER_KEY = "frontier";
+const STATE_KEY = "state";
 
-/** A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved frontier. */
-async function raftFor(ctx: PluginContext): Promise<Raft> {
-  const serverUrl = baseUrl(ctx).origin;
-  const snapshot = await ctx.db.get(INBOX_STORE, FRONTIER_KEY);
+function isRaftState(value: unknown): value is RaftState {
+  const v = object(value);
+  return v.schema === RAFT_STATE_SCHEMA && typeof v.version === "number" && typeof v.frontier === "object" && v.frontier !== null;
+}
+
+/** The mount's database as the SDK's state store: a read, and a compare-and-set write in one transaction. */
+function stateStore(ctx: PluginContext): RaftStateStore {
+  return {
+    async load() {
+      const v = await ctx.db.get(INBOX_STORE, STATE_KEY);
+      return isRaftState(v) ? v : null;
+    },
+    async save(state, { expectedVersion }) {
+      await ctx.db.transaction(INBOX_STORE, "readwrite", (tx) => {
+        const cur = tx.get(INBOX_STORE, STATE_KEY);
+        const stored = isRaftState(cur) ? cur.version : undefined;
+        if (stored !== expectedVersion) throw new Error(`stale Raft state: stored ${stored ?? "none"}, expected ${expectedVersion ?? "none"}`);
+        tx.put(INBOX_STORE, state as unknown as Json, STATE_KEY);
+      });
+    },
+  };
+}
+
+/** A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state. */
+function raftFor(ctx: PluginContext): Raft {
   return createRaft({
-    serverUrl, credential: requireCredential(ctx),
+    serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx),
     // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
     fetch: (input, init) => fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeout(ctx)) }),
-    frontier: frontierSnapshot(snapshot),
+    state: stateStore(ctx),
+    // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
+    // the call, and the SDK does not retry it. Said in the Worker's log, where an operator would look.
+    onStateSaveError: (error, { phase }) => console.warn(`raft state ${phase} failed for mount ${ctx.alias}: ${String((error as Error)?.message ?? error)}`),
   });
-}
-
-function frontierSnapshot(value: unknown): SeenFrontierSnapshot | null {
-  const v = object(value);
-  return v.version === 1 && typeof v.targets === "object" && v.targets !== null && typeof v.aliases === "object" && v.aliases !== null
-    ? v as unknown as SeenFrontierSnapshot : null;
-}
-
-async function saveFrontier(ctx: PluginContext, raft: Raft): Promise<void> {
-  await ctx.db.put(INBOX_STORE, raft.frontier.snapshot() as unknown as Json, FRONTIER_KEY);
 }
 
 /**
@@ -367,7 +381,30 @@ export const raftPlugin: Plugin = {
   id: "raft",
   version: "1.0.0",
   /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
-  database: { version: 2, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [CURSOR_KEY] } } },
+  database: {
+    version: 3, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY] } },
+    /**
+     * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
+     * The version-2 cursor was the last batch handed to the model, not yet acknowledged, which is exactly the
+     * SDK's pending cursor: carried over, the next call commits it and the pull after acknowledges it, so an
+     * upgrade neither repeats a batch nor acknowledges one early.
+     */
+    upgrade(db, oldVersion) {
+      if (oldVersion !== 2) return;
+      const cursor = db.get(INBOX_STORE, "cursor");
+      const frontier = db.get(INBOX_STORE, "frontier");
+      const f = object(frontier);
+      const state: RaftState = {
+        schema: RAFT_STATE_SCHEMA, version: 0, cursor: null,
+        pendingCursor: typeof cursor === "number" && Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : null,
+        frontier: f.version === 1 && typeof f.targets === "object" && f.targets !== null && typeof f.aliases === "object" && f.aliases !== null
+          ? f as unknown as RaftState["frontier"] : { version: 1, targets: {}, aliases: {} },
+      };
+      db.put(INBOX_STORE, state as unknown as Json, STATE_KEY);
+      db.delete(INBOX_STORE, "cursor");
+      db.delete(INBOX_STORE, "frontier");
+    },
+  },
   config: [
     { name: "serverUrl", type: "string", required: true, format: "origin", summary: "Raft server origin, for example https://api.raft.build." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "Request timeout in milliseconds, clamped to 1000–60000." },
@@ -376,7 +413,7 @@ export const raftPlugin: Plugin = {
     required: true,
     summary: "A Raft agent credential for the agent account this mount represents.",
     shape: "token",
-    grants: "Send messages, receive queued events, and join visible channels as that Raft agent.",
+    grants: "Send messages, receive queued events, join visible channels, and post action cards as that Raft agent.",
     looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
   },
   tools: [
@@ -438,6 +475,56 @@ export const raftPlugin: Plugin = {
       idempotency: "native",
     },
     {
+      name: "prepare_action",
+      summary: "Post an action card in a Raft channel or DM for a person to confirm: creating a channel, adding members to one, " +
+        "or creating an agent. Nothing happens until a person clicks it there; they act with their own permissions. " +
+        "Use it for what you cannot or should not do yourself, and say in draftHint why you prepared it.",
+      parameters: {
+        type: "object", additionalProperties: false, required: ["target", "action"],
+        properties: {
+          target: { type: "string", description: "Where the card is posted, for example #general or dm:@name." },
+          action: {
+            oneOf: [
+              {
+                type: "object", additionalProperties: false, required: ["type", "name"],
+                properties: {
+                  type: { const: "channel:create" },
+                  name: { type: "string", maxLength: 80 },
+                  visibility: { enum: ["public", "private"] },
+                  description: { type: "string", maxLength: 500 },
+                  initialHumans: { type: "array", items: { type: "string" }, maxItems: 64, description: "handles or ids" },
+                  initialAgents: { type: "array", items: { type: "string" }, maxItems: 64, description: "handles or ids" },
+                  draftHint: { type: "string", maxLength: 2000 },
+                },
+              },
+              {
+                type: "object", additionalProperties: false, required: ["type", "channel"],
+                properties: {
+                  type: { const: "channel:add_member" },
+                  channel: { type: "string", description: "#name or id" },
+                  humans: { type: "array", items: { type: "string" }, maxItems: 64 },
+                  agents: { type: "array", items: { type: "string" }, maxItems: 64 },
+                  draftHint: { type: "string", maxLength: 2000 },
+                },
+              },
+              {
+                type: "object", additionalProperties: false, required: ["type", "name"],
+                properties: {
+                  type: { const: "agent:create" },
+                  name: { type: "string", maxLength: 60 },
+                  description: { type: "string", maxLength: 500 },
+                  draftHint: { type: "string", maxLength: 2000 },
+                },
+              },
+            ],
+          },
+        },
+      },
+      // Each call posts a card; a repeat posts another.
+      sideEffects: "write",
+      idempotency: "none",
+    },
+    {
       name: "push_status",
       summary: "Show whether Raft push is enabled for this mount and when a delivery last reached it.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
@@ -468,7 +555,7 @@ export const raftPlugin: Plugin = {
       if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
       if (typeof a.content !== "string" || !a.content.trim()) throw new Error("content is required");
       if (typeof a.idempotencyKey !== "string" || !a.idempotencyKey.trim()) throw new Error("idempotencyKey is required");
-      const raft = await raftFor(ctx);
+      const raft = raftFor(ctx);
       const out = await raft.messages.send({ target: a.target, content: a.content, idempotencyKey: a.idempotencyKey });
       if (!out.ok) throw sdkFailure(out, true);
       if (out.state === "held") {
@@ -476,7 +563,7 @@ export const raftPlugin: Plugin = {
         // of the same message into this conversation attests it instead of being held again. The SDK records
         // nothing when the context was withheld.
         raft.frontier.recordHeld(out.data);
-        await saveFrontier(ctx, raft);
+        await raft.state.save();
         return {
           state: "held", target: out.data.target, newMessages: out.data.newMessageCount,
           messages: out.data.heldMessages.map(modelLine),
@@ -485,7 +572,6 @@ export const raftPlugin: Plugin = {
             "again with the same idempotencyKey; to change it, use a new key.",
         };
       }
-      await saveFrontier(ctx, raft);
       return {
         state: "sent", messageId: out.data.messageId,
         ...(out.data.messageSeq !== null ? { messageSeq: out.data.messageSeq } : {}),
@@ -494,19 +580,15 @@ export const raftPlugin: Plugin = {
     }
     if (name === "receive_events") {
       const limit = integer(a.limit, "limit", 1, MAX_EVENTS);
-      const raft = await raftFor(ctx);
-      // Cursor acknowledgement: this pull acknowledges the batch the previous call returned, and nothing
-      // is acknowledged by being fetched. A lost answer or a crash before the result is recorded costs a
-      // repeat of the same batch, not the messages. The cursor lives in the mount's database because the
-      // object may be a new process by the next call; without it every pull would hand back the same
-      // unacknowledged batch.
-      const stored = await ctx.db.get(INBOX_STORE, CURSOR_KEY);
-      const since = typeof stored === "number" && Number.isSafeInteger(stored) && stored >= 0 ? stored : undefined;
-      const out = await raft.inbox.check({ ack: "cursor", ...(since !== undefined ? { since } : {}), ...(limit !== undefined ? { limit } : {}) });
+      const raft = raftFor(ctx);
+      // Cursor acknowledgement: nothing is acknowledged by being fetched. This call commits the batch the
+      // previous call handed to the model (kept as pending in the mount's state, since the object may be a
+      // new process by now), and the pull sends that as `since`, which is what acknowledges it on the
+      // Server. A pull that fails leaves the new batch pending, so the next call gets it again.
+      await raft.inbox.commit();
+      const out = await raft.inbox.check({ ack: "cursor", ...(limit !== undefined ? { limit } : {}) });
       if (!out.ok) throw sdkFailure(out);
       const batch = out.data;
-      if (batch.cursor !== null && batch.ackMode === "cursor") await ctx.db.put(INBOX_STORE, batch.cursor, CURSOR_KEY);
-      await saveFrontier(ctx, raft);
       return {
         messages: batch.messages.map(modelLine),
         hasMore: batch.hasMore,
@@ -629,6 +711,27 @@ export const raftPlugin: Plugin = {
         registration: null,
       });
       return { enabled: false, remoteDeregistration, cleanupPending: staleHookIds.length };
+    }
+    if (name === "prepare_action") {
+      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
+      const action = object(a.action);
+      // The three a model may prepare. The integration cards take ids a model has no way to know, and are
+      // made by Raft's own integration commands.
+      if (action.type !== "channel:create" && action.type !== "channel:add_member" && action.type !== "agent:create") {
+        throw new Error("action.type must be channel:create, channel:add_member or agent:create");
+      }
+      const out = await raftFor(ctx).routes.actions.prepare({ target: a.target, action } as never);
+      if (!out.ok) {
+        const e = out.error;
+        // The SDK checks the card against Raft's contract before sending; that refusal names the field, never a body.
+        const unanswered = e.kind === "transport" || (e.kind === "http" && e.status >= 500);
+        throw marked(new Error(e.kind === "http" ? `raft refused the card (HTTP ${e.status}${e.errorCode ? `, ${e.errorCode}` : ""})` : e.message),
+          { mayHaveLanded: unanswered, retryable: unanswered, transient: unanswered });
+      }
+      return {
+        prepared: true, target: a.target, messageId: out.data.messageId,
+        note: "The card is posted; nothing has happened yet. A person confirms it in Raft, acting with their own permissions.",
+      };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);
