@@ -55,7 +55,7 @@ check("every event carries only fields the service knows, ids are unique, and tw
   const ev = activityEvents("raft_a", rows);
   must(ev.length === 2 * ACTIVITY_BATCH_MAX && ev.length <= 200, `events ${ev.length}`);
   must(new Set(ev.map((e) => e.eventId)).size === ev.length, "duplicate event ids");
-  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass", "status"]);
+  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass", "status", "detail"]);
   for (const e of ev) for (const k of Object.keys(e)) must(allowed.has(k), `unknown field ${k}`);
   // The worst case for status-only events: every row a measured model call that asked for tools, each a
   // thinking start and a working end with no activity event to ride on.
@@ -63,6 +63,18 @@ check("every event carries only fields the service knows, ids are unique, and tw
   for (let i = 1; i <= ACTIVITY_BATCH_MAX; i++) models.push(row(i, "model.call", "toolUse", "ok", { ms: 100 }));
   const worst = activityEvents("raft_a", models);
   must(worst.length <= 200 && worst.every((e) => e.status && !e.hookEventName), `worst-case batch: ${worst.length}`);
+});
+
+check("in a real turn the tool call says which tool it is working on, on the PreToolUse; other statuses carry no detail", () => {
+  // The model asks for a tool (answer at 30s), the tool runs 30.005–30.2s, the model answers (stop at 31s).
+  const ev = activityEvents("raft_a", [
+    row(30, "model.call", "toolUse", "ok", { ms: 800 }),
+    { ...row(30, "tool.call", "succeeded", "ok", { ms: 195, attrs: { tool: "send_message", mount: "raft" } }), seq: 301, at: T0 + 30_200 },
+    row(31, "model.call", "stop", "ok", { ms: 700 }),
+  ]);
+  const pre = ev.find((e) => e.hookEventName === "PreToolUse");
+  must(pre?.status === "working" && pre.detail === "Using raft__send_message", JSON.stringify(pre));
+  must(ev.filter((e) => e.detail !== undefined).length === 1, `detail on other events: ${JSON.stringify(ev)}`);
 });
 
 console.log(`\n  activity mapping\n  ${"─".repeat(56)}`);

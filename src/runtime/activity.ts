@@ -54,8 +54,10 @@ export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[])
   for (const e of events) hosts.set(e.occurredAt, e);   // the last activity event at an instant carries it
   for (const [instant, s] of after) {
     const host = hosts.get(instant);
-    if (host) host.status = s.status;
-    else events.push(s);
+    if (host) {
+      host.status = s.status;
+      if (s.detail) host.detail = s.detail;
+    } else events.push(s);
   }
   return events;
 }

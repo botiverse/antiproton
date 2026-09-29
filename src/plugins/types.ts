@@ -1028,6 +1028,8 @@ export interface ActivityEvent {
    * harmless because the service keeps the latest by `occurredAt`.
    */
   status?: AgentStatus;
+  /** A short phrase shown with the status (at most 200 characters): what the agent is working on. */
+  detail?: string;
 }
 
 /**
