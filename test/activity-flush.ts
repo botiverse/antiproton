@@ -100,54 +100,15 @@ await check("the alarm's order: a failing activity send holds the export at its 
 });
 
 console.log(`\n  activity flush\n  ${"─".repeat(56)}`);
-await check("status changes go out on the same pass, and a status send that fails holds nothing: the activity cursor still moves", async () => {
-  const { sql } = sqliteHost();
-  const statusBatches: string[][] = [];
-  let statusMode: "send" | "throw" = "throw";
-  const g = { ...gateway(), async reportStatus(_t: string, _a: string, events: readonly { status: string }[]) {
-    if (statusMode === "throw") throw new Error("status endpoint down");
-    statusBatches.push(events.map((e) => e.status));
-    return [{ alias: "raft", sent: events.length }];
-  } };
+await check("status rides the activity log: it goes out on the events, and a failed send holds it with them and resends it", async () => {
+  const { sql } = sqliteHost(); const g = gateway("throw");
   appendTrace(sql, [tool(1), answered(2)]);
-  const r = await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
-  must(r.statusError === "status endpoint down" && r.sent === 3 && activityCursor(sql) === 2, `a failed status send held the pass: ${JSON.stringify(r)}`);
-  statusMode = "send";
-  appendTrace(sql, [answered(3)]);
-  const r2 = await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
-  must(r2.statusError === null && statusBatches.length === 1 && statusBatches[0]!.join(",") === "thinking,online", `statuses: ${JSON.stringify(statusBatches)}`);
-});
-
-await check("the last status of a turn is sent again on a pass with no new rows until a send returns, and not after", async () => {
-  const { sql } = sqliteHost();
-  const sentStatuses: string[][] = [];
-  let mode: "send" | "throw" = "throw";
-  const g = { ...gateway(), async reportStatus(_t: string, _a: string, events: readonly { status: string; eventId: string }[]) {
-    if (mode === "throw") throw new Error("status endpoint down");
-    sentStatuses.push(events.map((e) => `${e.status}#${e.eventId}`));
-    return [{ alias: "raft", sent: events.length }];
-  } };
-  appendTrace(sql, [answered(1)]);            // a turn ends: thinking, then online
-  const first = await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
-  must(first.statusError !== null && first.statuses === 2, JSON.stringify(first));
-  mode = "send";
-  const idle = await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);   // no new rows
-  must(idle.events === 0 && sentStatuses.length === 1 && sentStatuses[0]!.length === 1 && sentStatuses[0]![0]!.startsWith("online#"),
-    `the unconfirmed online was not sent again: ${JSON.stringify(sentStatuses)}`);
-  await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
-  must(sentStatuses.length === 1, `a confirmed status was sent again: ${JSON.stringify(sentStatuses)}`);
-  appendTrace(sql, [answered(2)]);            // the next turn: the transition from online is sent, not a repeat
-  await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
-  must(sentStatuses[1]!.map((x) => x.split("#")[0]).join(",") === "thinking,online", JSON.stringify(sentStatuses));
-});
-
-await check("the pass that runs the alarm is told when a status send failed, so an idle agent gets another pass", async () => {
-  const { sql } = sqliteHost();
-  const g = { ...gateway(), async reportStatus() { throw new Error("status endpoint down"); } };
-  appendTrace(sql, [answered(1)]);
-  const sink = { async put() {}, async list() { return []; } } as any;
-  const r = await flushActivityThenTrace(g as any, sink, sql, OWNER.tenantId, OWNER.agentId);
-  must(r.statusError === "status endpoint down" && r.activityError === null, JSON.stringify(r));
+  try { await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId); } catch { /* held */ }
+  must(activityCursor(sql) === 0, "a failed send moved the cursor");
+  g.mode = "send";
+  await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId);
+  const statuses = g.batches[0]!.filter((e) => e.status).map((e) => `${e.hookEventName ?? "-"}:${e.status}`);
+  must(statuses.join(",") === "PreToolUse:working,Stop:online", `statuses on the resent batch: ${JSON.stringify(g.batches[0])}`);
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

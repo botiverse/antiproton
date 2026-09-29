@@ -704,30 +704,37 @@ await check("a notice for a mount whose push is off, or for another Raft agent, 
   if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
 });
 
-await check("status goes to Raft's status endpoint in the standard's shape; a Raft without the endpoint yet is skipped, not an error", async () => {
+await check("a Raft that does not know status yet gets the same batch without it, so the activity log never stalls on status", async () => {
   const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const events = [
-    { eventId: "raft_x:1:status", status: "thinking" as const, occurredAt: "2026-09-29T05:00:00.000Z" },
-    { eventId: "raft_x:2:status", status: "online" as const, occurredAt: "2026-09-29T05:00:03.000Z" },
+    { eventId: "raft_x:1:pre", hookEventName: "PreToolUse" as const, occurredAt: "2026-09-29T05:00:00.000Z", toolName: "raft__send_message", status: "working" as const },
+    { eventId: "raft_x:2:status:start", occurredAt: "2026-09-29T05:00:01.000Z", status: "thinking" as const },
+    { eventId: "raft_x:3", hookEventName: "Stop" as const, occurredAt: "2026-09-29T05:00:02.000Z", status: "online" as const },
   ];
-  const calls = one(json(200, { ok: true, acceptedCount: 2, rejectedCount: 0 }));
-  const out = await raftPlugin.reportStatus!(events, on.ctx);
-  const body = JSON.parse(calls[0]!.init.body);
-  if (!("sent" in out) || out.sent !== 2 || calls[0]!.url !== "https://raft.example/internal/agent-api/status" ||
-      body.schema !== "raft-agent-status.v1" || JSON.stringify(body.events) !== JSON.stringify(events) || Object.keys(body).length !== 2) {
-    throw new Error(JSON.stringify({ out, url: calls[0]!.url, body }));
+  const calls = many(json(400, { errorCode: "event_field_unknown" }), json(200, { accepted: 2 }));
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (m: string) => { warned.push(String(m)); };
+  let out: any;
+  try { out = await raftPlugin.reportActivity!(events, on.ctx); } finally { console.warn = warn; }
+  // The downgrade is said, with what Raft answered and what was lost, so it cannot hide a refusal of status itself.
+  if (warned.length !== 1 || !/raft mount raft/.test(warned[0]!) || !/event_field_unknown/.test(warned[0]!) || !/3 status change\(s\) dropped/.test(warned[0]!)) {
+    throw new Error(`the downgrade was not said: ${JSON.stringify(warned)}`);
   }
-  one(json(404, { error: "not found" }));
-  const early = await raftPlugin.reportStatus!(events, on.ctx);
-  if (!("skipped" in early) || !/no status endpoint yet/.test(early.skipped)) throw new Error(`404: ${JSON.stringify(early)}`);
-  one(json(500, { error: "boom" }));
-  const failed = await failure(() => raftPlugin.reportStatus!(events, on.ctx));
-  if (/boom/.test(failed.message)) throw new Error("a 500 body leaked");
-  const off = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
-  let reached = 0;
-  globalThis.fetch = (async () => { reached++; return json(200, {}); }) as any;
-  const quiet = await raftPlugin.reportStatus!(events, off.ctx);
-  if (!("skipped" in quiet) || reached !== 0) throw new Error(`push off: ${JSON.stringify(quiet)} reached=${reached}`);
+  const second = JSON.parse(calls[1]!.init.body);
+  if (!("sent" in out) || out.sent !== 2 || calls.length !== 2 || second.events.length !== 2 ||
+      second.events.some((e: any) => "status" in e || !e.hookEventName) || JSON.parse(calls[0]!.init.body).events.length !== 3) {
+    throw new Error(JSON.stringify({ out, first: calls[0]!.init.body, second }));
+  }
+  // A 400 on a batch without status is the batch's own fault: no second try, it throws.
+  const plain = [{ eventId: "raft_x:9", hookEventName: "Stop" as const, occurredAt: "2026-09-29T05:00:09.000Z" }];
+  const once = one(json(400, { errorCode: "invalid" }));
+  const why = await failure(() => raftPlugin.reportActivity!(plain, on.ctx));
+  if (once.length !== 1 || !/HTTP 400/.test(why.message)) throw new Error(`plain 400: ${once.length} ${why.message}`);
+  // A 500 is not a Raft that lacks status: no second try.
+  const five = one(json(500, {}));
+  await failure(() => raftPlugin.reportActivity!(events, on.ctx));
+  if (five.length !== 1) throw new Error("a 500 was retried without status");
 });
 
 await check("activity posts the events as given to Raft's ingest while push is on, and says skipped when it is off", async () => {
@@ -768,17 +775,15 @@ await check("an activity post that fails throws, so the runtime keeps the events
   if (!/HTTP 503/.test(why.message)) throw new Error(why.message);
 });
 
-await check("disable_push tells Raft the session ended and the agent is offline before deregistering, and still deregisters when those posts fail", async () => {
+await check("disable_push tells Raft the session ended and the agent is offline before deregistering, and still deregisters when that post fails", async () => {
   const m = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", hookId: "hook-old", staleHookIds: [], registration: "active", lastReached: null });
-  const calls = many(json(500, {}), json(500, {}), new Response(null, { status: 204 }));
+  const calls = many(json(500, {}), new Response(null, { status: 204 }));
   const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
   if (disabled.enabled !== false || disabled.remoteDeregistration !== "confirmed") throw new Error(JSON.stringify(disabled));
   const first = JSON.parse(calls[0]!.init.body);
-  const second = JSON.parse(calls[1]!.init.body);
   if (calls[0]!.url !== "https://raft.example/internal/agent-api/activity" || first.events[0].hookEventName !== "SessionEnd" ||
-      !String(first.events[0].eventId).startsWith("agent-1:session-end:") ||
-      calls[1]!.url !== "https://raft.example/internal/agent-api/status" || second.schema !== "raft-agent-status.v1" || second.events[0].status !== "offline" ||
-      calls[2]!.init.method !== "DELETE") {
+      first.events[0].status !== "offline" || !String(first.events[0].eventId).startsWith("agent-1:session-end:") ||
+      calls.length !== 2 || calls[1]!.init.method !== "DELETE") {
     throw new Error(JSON.stringify(calls.map((c) => [c.init.method, c.url])));
   }
   const off = mount({ enabled: false, agentId: "agent-1", agentName: "raft-bot", hookId: null, staleHookIds: [], registration: null, lastReached: null });
@@ -793,7 +798,7 @@ await check("disable_push stops later delivery and push_status exposes no secret
     hookId: "hook-old", staleHookIds: ["hook-stale"], registration: "active",
     lastReached: { deliveryId: "delivery-old", at: Date.parse("2026-09-17T00:00:00.000Z") },
   });
-  const calls = many(json(200, {}), json(200, {}), new Response(null, { status: 204 }));
+  const calls = many(json(200, {}), new Response(null, { status: 204 }));
   const disabled = await raftPlugin.invoke("disable_push", {}, m.ctx) as any;
   const status = await raftPlugin.invoke("push_status", {}, m.ctx) as any;
   if (disabled.enabled !== false || disabled.remoteDeregistration !== "confirmed" || disabled.cleanupPending !== 0 ||
@@ -803,8 +808,8 @@ await check("disable_push stops later delivery and push_status exposes no secret
   if (status.lastReached?.deliveryId !== "delivery-old" || JSON.stringify(status).includes(PUSH_SECRET)) {
     throw new Error(JSON.stringify(status));
   }
-  if (calls.length !== 3 || calls[2]!.init.method !== "DELETE" ||
-      calls[2]!.url !== "https://raft.example/internal/agent-api/push-webhook") throw new Error(JSON.stringify(calls.map((c) => [c.init.method, c.url])));
+  if (calls.length !== 2 || calls[1]!.init.method !== "DELETE" ||
+      calls[1]!.url !== "https://raft.example/internal/agent-api/push-webhook") throw new Error(JSON.stringify(calls.map((c) => [c.init.method, c.url])));
   if (m.inbound.revoked.sort().join(",") !== "hook-old,hook-stale" || m.state().hookId !== null) {
     throw new Error(JSON.stringify({ state: m.state(), revoked: m.inbound.revoked }));
   }

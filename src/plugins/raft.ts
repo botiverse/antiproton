@@ -8,7 +8,7 @@
  */
 import type { Json } from "../core/types.ts";
 import { createRaft, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
-import { originProblem, type ActivityEvent, type StatusEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -29,8 +29,6 @@ const NOTICE_TEXT_MAX = 3_600;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const ACTIVITY_PATH = "/internal/agent-api/activity";
 const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
-const STATUS_PATH = "/internal/agent-api/status";
-const STATUS_SCHEMA = "raft-agent-status.v1";
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 type ObjectValue = Record<string, any>;
@@ -371,6 +369,16 @@ function modelLine(m: RaftMessage): string {
   return line;
 }
 
+/** The batch as a Raft without status knows it: status fields dropped, status-only events left out. */
+function withoutStatus(events: readonly ActivityEvent[]): ActivityEvent[] {
+  return events.flatMap((e) => {
+    if (!e.hookEventName) return [];
+    if (e.status === undefined) return [e];
+    const { status: _status, ...rest } = e;
+    return [rest];
+  });
+}
+
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
@@ -693,14 +701,9 @@ export const raftPlugin: Plugin = {
       if (current.enabled && current.agentId) {
         try {
           await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: [{
-            eventId: `${current.agentId}:session-end:${Date.now()}`, hookEventName: "SessionEnd", occurredAt: new Date().toISOString(),
+            eventId: `${current.agentId}:session-end:${Date.now()}`, hookEventName: "SessionEnd", status: "offline", occurredAt: new Date().toISOString(),
           }] });
         } catch { /* deregistration matters more than the last status line */ }
-        try {
-          await call(ctx, "POST", STATUS_PATH, { schema: STATUS_SCHEMA, events: [{
-            eventId: `${current.agentId}:offline:${Date.now()}`, status: "offline", occurredAt: new Date().toISOString(),
-          }] });
-        } catch { /* likewise; a Raft without the endpoint yet shows offline on its own once the credential goes quiet */ }
       }
       let remoteDeregistration: "confirmed" | "unconfirmed" = "confirmed";
       try { await call(ctx, "DELETE", PUSH_REGISTRATION_PATH); }
@@ -755,26 +758,6 @@ export const raftPlugin: Plugin = {
   },
 
   /**
-   * The agent's status changes, in Raft's status standard: this runtime knows its
-   * state and says it. The same gate as activity (push on, an account to speak
-   * with). A Raft that does not have the status endpoint yet answers 404; that is
-   * "not listening", said as skipped, so this can ship before Raft does.
-   */
-  async reportStatus(events: readonly StatusEvent[], ctx: PluginContext) {
-    const state = await loadPushState(ctx);
-    if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };
-    if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
-    if (events.length === 0) return { sent: 0 };
-    try {
-      await call(ctx, "POST", STATUS_PATH, { schema: STATUS_SCHEMA, events });
-    } catch (error) {
-      if (error instanceof Error && /HTTP 404\b/.test(error.message)) return { skipped: "this Raft has no status endpoint yet" };
-      throw error;
-    }
-    return { sent: events.length };
-  },
-
-  /**
    * The agent's activity, to Raft's ingest, so Agent Activity shows this agent
    * the way it shows a managed one. Only while push is on: that is the state
    * in which Raft is running this agent and looking. The events are passed
@@ -788,7 +771,25 @@ export const raftPlugin: Plugin = {
     // is skipped, not an error, or the alarm would retry every minute for ever.
     if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
     if (events.length === 0) return { sent: 0 };
-    await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
+    try {
+      await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
+    } catch (error) {
+      // A Raft that does not know status yet refuses the whole batch (400, unknown field), and the log
+      // holds a refused batch for ever: the activity feed would stop at the first status. So a 400 on a
+      // batch that carries status is tried once more without it — the activity goes through, and status
+      // starts to land on the first pass after Raft accepts it. A second 400 is the batch's own fault
+      // and throws as before.
+      //
+      // Temporary: remove this once Raft production accepts `status` on activity events. Until then it is
+      // also the path a status Raft does refuse would take, so it is said in the log every time — a
+      // warning that keeps appearing after Raft ships status means status itself is being refused.
+      const plain = withoutStatus(events);
+      if (!(error instanceof Error && /HTTP 400\b/.test(error.message)) || plain.length === events.length && plain.every((e, i) => e === events[i])) throw error;
+      const dropped = events.filter((e) => e.status !== undefined).length;
+      console.warn(`raft mount ${ctx.alias}: activity with status refused (${error.message}); resent without it, ${dropped} status change(s) dropped`);
+      if (plain.length) await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: plain });
+      return { sent: plain.length };
+    }
     return { sent: events.length };
   },
 

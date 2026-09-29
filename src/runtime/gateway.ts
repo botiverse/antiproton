@@ -5,7 +5,7 @@ import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
-import { type ActivityEvent, type StatusEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
+import { type ActivityEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
@@ -895,16 +895,6 @@ export class ToolGateway {
   async reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
     Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
     return this.#toReporters(tenantId, agentId, (p) => !!p.reportActivity, (p, ctx) => p.reportActivity!(events, ctx));
-  }
-
-  /**
-   * The agent's status changes, to every mount whose plugin reports status. The
-   * same gate as activity; a plugin that throws propagates, and the caller decides
-   * what that costs (for status, nothing is kept: the next change supersedes).
-   */
-  async reportStatus(tenantId: string, agentId: string, events: readonly StatusEvent[]):
-    Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
-    return this.#toReporters(tenantId, agentId, (p) => !!p.reportStatus, (p, ctx) => p.reportStatus!(events, ctx));
   }
 
   /**
