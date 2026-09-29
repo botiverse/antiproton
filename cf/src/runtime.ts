@@ -97,6 +97,8 @@ export function reconcileSeed(
  * `http`'s keyless search, withheld while the agent has an Exa mount that can search: two search tools
  * would leave the model to pick, and the keyless one answers a few queries and then serves a captcha.
  * An Exa mount with no key to use leaves the keyless one in place, so the agent still has a search.
+ * Only the operator's key is checked for presence: an agent's own key (`agent:`) whose row was deleted
+ * still counts as able to search, and that agent is left with neither until it keeps the key again.
  */
 export function keylessSearchWithheld(
   records: ReadonlyArray<Pick<MountRecord, "alias" | "plugin" | "secretRef">>, operatorExa: boolean,
@@ -1504,8 +1506,6 @@ export class AgentRuntime {
       ), [...(this.#deps.withholdTools ?? []), ...keylessSearchWithheld(records, !!this.#deps.operatorExa)])),
     };
   }
-
-
 
   /**
    * The agent, built from storage.
