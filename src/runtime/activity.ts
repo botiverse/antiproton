@@ -62,6 +62,25 @@ export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[])
   return events;
 }
 
+/**
+ * Moves the status-carrying events so each is strictly later than the one before and than `after`,
+ * the last status instant already sent; returns the new last. Raft keeps the status with the latest
+ * occurredAt, so two at one millisecond leave it to arrival order. They happen: a tool that takes 0 ms
+ * starts and ends on the model call's own end. A later event moves by the millisecond it needs,
+ * together with the activity event it rides on.
+ */
+export function orderStatuses(events: readonly ActivityEvent[], after: number): number {
+  let last = after;
+  const carrying = events.filter((e) => e.status !== undefined)
+    .map((e) => ({ e, at: Date.parse(e.occurredAt) }))
+    .sort((a, b) => a.at - b.at);
+  for (const { e, at } of carrying) {
+    last = Math.max(at, last + 1);
+    if (last !== at) e.occurredAt = new Date(last).toISOString();
+  }
+  return last;
+}
+
 /** The activity events a run of trace rows means, in row order; rows that mean nothing to the service yield none. */
 function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
   const out: ActivityEvent[] = [];
