@@ -1,8 +1,8 @@
 /**
  * Connect GitHub (cf/src/provision/connect.ts): the one-time signed link, the start that spends it
  * and sends the browser to GitHub with the smallest scopes, and the callback that exchanges the
- * code, seals the token on the agent's mount, records the connection and sends the browser back to
- * Raft with only the outcome and the initiator. No step may carry a credential back out.
+ * code, holds the token in the agent's own object under a random id, and sends the browser back to
+ * Raft as pending, with the id and the initiator — never the credential, and never yet on the mount.
  */
 import { connectCallback, connectLink, connectStart, CONNECT_CALLBACK_PATH, type ConnectDeps } from "../cf/src/provision/connect.ts";
 
@@ -18,20 +18,19 @@ const SECRET = "session-secret-for-tests-0123456789";
 const TOKEN = "gho_realtoken_never_leaves";
 
 function deps(over: Partial<ConnectDeps> = {}) {
-  const used = new Set<string>(); const puts: any[] = []; const attached: any[] = []; const exchanged: string[] = [];
+  const used = new Set<string>(); const held: any[] = []; const exchanged: string[] = [];
   let clock = 1_800_000_000_000;
   const d: ConnectDeps = {
     origin: ORIGIN, secret: SECRET, github: { clientId: "cid", clientSecret: "csecret" },
     registry: {
       async consumeLink(nonce) { if (used.has(nonce)) return false; used.add(nonce); return true; },
-      async put(c) { puts.push(c); },
     },
-    async attach(tenantId, agentId, alias, token) { attached.push({ tenantId, agentId, alias, token }); return { ok: true, account: "octocat" }; },
+    async hold(tenantId, agentId, plugin, token, id, exp, raftUserId) { held.push({ tenantId, agentId, plugin, token, id, exp, raftUserId }); return { ok: true }; },
     async exchange(code, redirectUri) { exchanged.push(`${code}@${redirectUri}`); return TOKEN; },
     now: () => clock,
     ...over,
   };
-  return { d, puts, attached, exchanged, tick: (ms: number) => { clock += ms; } };
+  return { d, held, exchanged, tick: (ms: number) => { clock += ms; } };
 }
 const spec = { tenantId: "raft_srv", agentId: "raft_a1", raftAgentId: "a1", provider: "github" as const,
   returnUrl: "https://raft.example/agents/a1", raftUserId: "u_owner", scopes: ["public_repo"] };
@@ -59,7 +58,7 @@ await check("an expired or forged link starts nothing", async () => {
   must((await connectStart(forged, deps().d)).status === 400, "a forged link started");
 });
 
-await check("the callback seals the token on the agent's GitHub mount, records who connected it, and returns only the outcome", async () => {
+await check("the callback holds the token in the agent's object and sends Raft only a pending id and the initiator", async () => {
   const x = deps();
   const { url } = await connectLink(ORIGIN, SECRET, spec, x.d.now());
   const start = await connectStart(new URL(url), x.d);
@@ -68,12 +67,12 @@ await check("the callback seals the token on the agent's GitHub mount, records w
   const res = await connectCallback(new Request(cb, { headers: { cookie: cookieFrom(start) } }), cb, x.d);
   must(res.status === 302, `callback ${res.status}`);
   const back = new URL(res.headers.get("location")!);
-  must(back.origin === "https://raft.example" && back.searchParams.get("status") === "connected" && back.searchParams.get("by") === "u_owner" &&
-    back.searchParams.get("connection") === "github", back.toString());
+  must(back.origin === "https://raft.example" && back.searchParams.get("status") === "pending" && back.searchParams.get("by") === "u_owner" &&
+    back.searchParams.get("connection") === "github" && back.searchParams.get("pending") === x.held[0]?.id, back.toString());
   must(!res.headers.get("location")!.includes(TOKEN), "the token went back to Raft");
-  must(x.attached.length === 1 && x.attached[0].alias === "gh" && x.attached[0].token === TOKEN && x.attached[0].agentId === "raft_a1", JSON.stringify(x.attached));
+  must(x.held.length === 1 && x.held[0].plugin === "github" && x.held[0].token === TOKEN && x.held[0].agentId === "raft_a1" &&
+    x.held[0].raftUserId === "u_owner" && x.held[0].exp > x.d.now(), JSON.stringify(x.held));
   must(x.exchanged[0] === `c0de@${ORIGIN}${CONNECT_CALLBACK_PATH}`, `exchanged with ${x.exchanged[0]}`);
-  must(x.puts.length === 1 && x.puts[0].account === "octocat" && x.puts[0].connectedBy === "u_owner" && !JSON.stringify(x.puts).includes(TOKEN), JSON.stringify(x.puts));
 });
 
 await check("a callback without the flow's cookie or with another state is refused, and nothing is attached", async () => {
@@ -85,13 +84,13 @@ await check("a callback without the flow's cookie or with another state is refus
   const good = new URL(start.headers.get("location")!).searchParams.get("state")!;
   const noCookie = new URL(`${ORIGIN}${CONNECT_CALLBACK_PATH}?code=c&state=${good}`);
   must((await connectCallback(new Request(noCookie), noCookie, x.d)).status === 400, "a callback without the cookie was accepted");
-  must(x.attached.length === 0 && x.exchanged.length === 0, "something was exchanged or attached");
+  must(x.held.length === 0 && x.exchanged.length === 0, "something was exchanged or held");
 });
 
-await check("a person who declines, and an attach the plugin refuses, go back to Raft as denied and failed, with nothing recorded", async () => {
+await check("a person who declines, and a hold the agent cannot keep, go back to Raft as denied and failed, with no pending id", async () => {
   for (const [over, query, status] of [
     [{}, "error=access_denied", "denied"],
-    [{ async attach() { return { ok: false as const, error: "no mount named gh" }; } }, "code=c", "failed"],
+    [{ async hold() { return { ok: false as const, error: "no SECRET_KEK" }; } }, "code=c", "failed"],
   ] as const) {
     const x = deps(over as Partial<ConnectDeps>);
     const { url } = await connectLink(ORIGIN, SECRET, spec, x.d.now());
@@ -99,8 +98,8 @@ await check("a person who declines, and an attach the plugin refuses, go back to
     const state = new URL(start.headers.get("location")!).searchParams.get("state")!;
     const cb = new URL(`${ORIGIN}${CONNECT_CALLBACK_PATH}?${query}&state=${state}`);
     const res = await connectCallback(new Request(cb, { headers: { cookie: cookieFrom(start) } }), cb, x.d);
-    must(new URL(res.headers.get("location")!).searchParams.get("status") === status, `${status}: ${res.headers.get("location")}`);
-    must(x.puts.length === 0, `${status} recorded a connection`);
+    const loc = new URL(res.headers.get("location")!);
+    must(loc.searchParams.get("status") === status && !loc.searchParams.has("pending"), `${status}: ${loc}`);
   }
 });
 

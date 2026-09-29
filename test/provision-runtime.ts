@@ -126,6 +126,37 @@ await check("a push tool without a credential on the mount fails as a tool failu
 
 globalThis.fetch = originalFetch;
 console.log(`\n  provision runtime steps\n  ${"─".repeat(56)}`);
+await check("a held connection becomes the GitHub mount's credential once, only for the user it was held for, and only before it expires", async () => {
+  const { rt, host } = await runtime();
+  await adoptProvisionedAgent(rt, "t", "raft_c1", SPEC);
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (url: any) => String(url).startsWith("https://api.github.com/user")
+    ? new Response(JSON.stringify({ login: "octocat", id: 1 }), { headers: { "content-type": "application/json" } })
+    : new Response("{}", { status: 404 })) as any;
+  try {
+    const later = Date.now() + 600_000;
+    await rt.holdConnection("t", "raft_c1", "github", "gho_one", "pend_aaaaaaaa", later, "u_owner");
+    const stranger = await rt.confirmConnection("t", "raft_c1", "github", "pend_aaaaaaaa", "u_stranger");
+    must(!stranger.ok && (stranger as any).missing, `a stranger confirmed: ${JSON.stringify(stranger)}`);
+    const after = await rt.confirmConnection("t", "raft_c1", "github", "pend_aaaaaaaa", "u_owner");
+    must(!after.ok, "a hold survived a refused confirm: an id is spent by any attempt");
+    const gh0 = await rt.store.getMountByAlias("t", "raft_c1", "gh");
+    must(gh0?.secretRef === null || !String(gh0?.secretRef).startsWith("agent:"), `the mount got a credential from a refused confirm: ${gh0?.secretRef}`);
+
+    await rt.holdConnection("t", "raft_c1", "github", "gho_two", "pend_bbbbbbbb", later, "u_owner");
+    const ok = await rt.confirmConnection("t", "raft_c1", "github", "pend_bbbbbbbb", "u_owner");
+    must(ok.ok && ok.account === "octocat", JSON.stringify(ok));
+    const gh = await rt.store.getMountByAlias("t", "raft_c1", "gh");
+    must(String(gh?.secretRef).startsWith("agent:"), `the GitHub mount did not get the credential: ${gh?.secretRef}`);
+    must(!(await rt.confirmConnection("t", "raft_c1", "github", "pend_bbbbbbbb", "u_owner")).ok, "a hold was confirmed twice");
+
+    await rt.holdConnection("t", "raft_c1", "github", "gho_old", "pend_cccccccc", Date.now() - 1, "u_owner");
+    must(!(await rt.confirmConnection("t", "raft_c1", "github", "pend_cccccccc", "u_owner")).ok, "an expired hold was confirmed");
+    must((await rt.store.listSecretNames("t", "raft_c1", "pending:")).length === 0, "held rows were left behind");
+  } finally { globalThis.fetch = real; }
+  host.dispose();
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

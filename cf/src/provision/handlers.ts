@@ -69,12 +69,15 @@ export interface ProvisionDeps {
   agent: ProvisionAgentOps;
   /** Connecting the agent to other services (connect.ts). Absent: the routes answer 404, as before. */
   connections?: {
-    registry: Pick<ConnectionRegistry, "get" | "remove">;
+    registry: Pick<ConnectionRegistry, "get" | "put" | "remove">;
     /** The one-time link the browser opens; signed, ten minutes. */
     link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
       Promise<{ url: string; expiresAt: string }>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
+    /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts). */
+    confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string):
+      Promise<{ ok: true; account: string | null } | { ok: false; error: string; missing?: true }>;
   };
 }
 
@@ -252,7 +255,9 @@ export async function handleProvision(
   // providerAgentId, and a delete must still reach the agent it made (Tenny's orphan case).
   const byRaft = seg[1] === "by-raft-agent";
   const rest = byRaft ? seg.slice(2) : seg.slice(1);
-  if (rest.length === 3 && rest[1] === "connections") return connection(method, rest, body, tenantId, byRaft, deps);
+  if ((rest.length === 3 || (rest.length === 4 && rest[3] === "confirm")) && rest[1] === "connections") {
+    return connection(method, rest, body, tenantId, byRaft, deps);
+  }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
   const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
@@ -327,6 +332,28 @@ async function connection(
   const p = provider as ConnectionProvider;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
   if (!row || row.status === "deleted") return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+
+  if (rest.length === 4) {
+    // Raft calls this server to server after checking that its session is the user the flow was started for,
+    // and sends that session's user; the hold is released only for the user it was held for.
+    if (method !== "POST") return null;
+    const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+    const unknown = Object.keys(b).find((k) => k !== "pending" && k !== "raftUserId");
+    if (unknown) return fail({ status: 400, code: "unknown_field", message: `unknown field ${unknown}`, param: unknown });
+    if (typeof b.pending !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(b.pending)) return fail({ status: 422, code: "invalid", message: "pending is the id Raft was given", param: "pending" });
+    if (typeof b.raftUserId !== "string" || !RAFT_ID.test(b.raftUserId)) {
+      return fail({ status: 422, code: "invalid", message: "raftUserId is required: the user of Raft's current session", param: "raftUserId" });
+    }
+    const r = await c.confirm(tenantId, row.agentId, p, b.pending, b.raftUserId);
+    if (!r.ok) {
+      return r.missing
+        ? fail({ status: 404, code: "not_found", message: "no pending connection with that id for this agent and user; it may have expired or been used" })
+        : fail({ status: 422, code: "connect_failed", message: r.error });
+    }
+    const connectedAt = deps.now();
+    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt });
+    return ok({ connected: true, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
+  }
 
   if (method === "POST") {
     const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;

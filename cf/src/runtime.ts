@@ -43,7 +43,7 @@ import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, seal, secretRefKind } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentRef, importKek, isAgentRef, open, seal, secretRefKind } from "../../src/runtime/secrets.ts";
 import {
   ensureInboundTable, hookSecretName, inboundMessage, newHookId, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
   INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
@@ -889,6 +889,58 @@ export class AgentRuntime {
    * clear the shared account: on a mount already using it, there is nothing of
    * this agent's to take back and the answer is `false`.
    */
+  /**
+   * A connection waiting for its initiator to be confirmed (provision/connect.ts): the token from a
+   * finished OAuth flow, sealed in this agent's own secret table under `pending:<plugin>:<exp>:<id>`,
+   * with the Raft user who started the flow kept beside it. It becomes the mount's credential only in
+   * `confirmConnection`, after Raft has checked that the person who finished the flow is the one who
+   * started it — so a link sent to someone else cannot put their account on this agent. Expired rows
+   * are cleared each time a new one is held.
+   */
+  async holdConnection(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string):
+    Promise<{ ok: true } | { ok: false; error: string }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
+    const now = Date.now();
+    for (const r of await this.store.listSecretNames(tenantId, agentId, "pending:")) {
+      if (Number(r.name.split(":")[2]) <= now) await this.store.removeSecret(tenantId, agentId, r.name);
+    }
+    const sealed = await seal(kek, token);
+    await this.store.putSecret(tenantId, agentId, `pending:${plugin}:${exp}:${id}`, { ciphertext: sealed.ciphertext, iv: sealed.iv, account: raftUserId });
+    return { ok: true };
+  }
+
+  /**
+   * Make a held connection the credential of this agent's mount of that plugin: once, before it expires,
+   * and only for the Raft user it was held for. The held row goes whatever the outcome.
+   */
+  async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string):
+    Promise<{ ok: true; account: string | null } | { ok: false; error: string; missing?: true }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
+    const row = (await this.store.listSecretNames(tenantId, agentId, `pending:${plugin}:`)).find((r) => r.name.endsWith(`:${id}`));
+    if (!row) return { ok: false, error: "no such pending connection", missing: true };
+    const meta = await this.store.secretMeta(tenantId, agentId, row.name);
+    const sealed = await this.store.getSecret(tenantId, agentId, row.name);
+    await this.store.removeSecret(tenantId, agentId, row.name);
+    if (!meta || !sealed || Number(row.name.split(":")[2]) <= Date.now() || meta.account !== raftUserId) {
+      return { ok: false, error: "no such pending connection", missing: true };
+    }
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!mount) return { ok: false, error: `this agent has no ${plugin} mount to connect` };
+    const r = await this.attachCredential(tenantId, agentId, mount.alias, { token: await open(kek, sealed) });
+    return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
+  }
+
+  /** Remove the credential from this agent's mount of that plugin; false when there was none. */
+  async detachConnection(tenantId: string, agentId: string, plugin: string): Promise<boolean> {
+    await this.ready();
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    return mount ? this.removeCredential(tenantId, agentId, mount.alias) : false;
+  }
+
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);

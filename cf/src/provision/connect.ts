@@ -10,10 +10,15 @@
  *      the flow in a cookie scoped to the callback path, and sends the browser to GitHub.
  *   3. GitHub returns to `/login/github/callback/connect` — a subdirectory of the OAuth App's
  *      registered callback, which GitHub accepts without a configuration change. The cookie and the
- *      state must agree; the code is exchanged; the token is attached to the agent's GitHub mount.
- *   4. The browser goes back to Raft with the outcome and the initiator (`by`), never a credential:
- *      Raft's landing page checks `by` against its own session, which is what stops a link sent to
- *      someone else from connecting their account to this agent (account-linking CSRF).
+ *      state must agree; the code is exchanged; the token is HELD in the agent's own object, sealed,
+ *      under a random id — not yet the mount's credential.
+ *   4. The browser goes back to Raft with `status=pending&pending=<id>&by=<raftUserId>`, never a
+ *      credential. Raft's landing page checks that its session is `by`, and only then calls
+ *      `POST …/connections/github/confirm { pending, raftUserId }` server to server, with the session's
+ *      user; the hold is released onto the mount only if that user is the one the flow was started for.
+ *      Checking after attaching would only say "it is already wrong": a link sent to someone else — and
+ *      GitHub skips its consent page for a user who has authorised the App before — would have put
+ *      their account on this agent (account-linking CSRF).
  */
 import { constantTimeEqual, cookieHeader, clearCookieHeader, GITHUB_AUTHORIZE, open, randomToken, readCookie, seal } from "../auth.ts";
 import type { ConnectionRegistry } from "../control-plane.ts";
@@ -24,8 +29,10 @@ export const CONNECT_LINK_TTL_MS = 10 * 60_000;
 export const CONNECT_START_PATH = "/connect/start";
 export const CONNECT_CALLBACK_PATH = "/login/github/callback/connect";
 const FLOW_COOKIE = "ap_connect";
-/** The mount a provider's credential goes on: the alias every agent is seeded with. */
-export const CONNECTION_MOUNT: Record<ConnectionProvider, string> = { github: "gh" };
+/** The plugin whose mount a provider's credential goes on; found by plugin, whatever the mount is called. */
+export const CONNECTION_PLUGIN: Record<ConnectionProvider, string> = { github: "github" };
+/** How long a finished flow waits for Raft to confirm its initiator. */
+export const CONNECT_HOLD_TTL_MS = 10 * 60_000;
 
 /** The smallest grant that does the job: public repositories unless private ones were asked for. */
 export function scopesFor(access: "public" | "private"): string[] {
@@ -69,9 +76,10 @@ export interface ConnectDeps {
   origin: string;
   secret: string;
   github: { clientId: string; clientSecret: string };
-  registry: Pick<ConnectionRegistry, "consumeLink" | "put">;
-  /** Seal the token onto the agent's mount; the plugin checks it and names the account. */
-  attach(tenantId: string, agentId: string, alias: string, token: string): Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
+  registry: Pick<ConnectionRegistry, "consumeLink">;
+  /** Keep the token sealed in the agent's own object until Raft confirms who finished the flow. */
+  hold(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string):
+    Promise<{ ok: true } | { ok: false; error: string }>;
   exchange(code: string, redirectUri: string): Promise<string>;
   now(): number;
 }
@@ -82,7 +90,7 @@ function page(status: number, text: string): Response {
   return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 
-function back(link: ConnectLink, status: "connected" | "denied" | "failed", extra: Record<string, string> = {}): string {
+function back(link: ConnectLink, status: "pending" | "denied" | "failed", extra: Record<string, string> = {}): string {
   const u = new URL(link.returnUrl);
   u.searchParams.set("connection", link.provider);
   u.searchParams.set("status", status);
@@ -112,7 +120,7 @@ export async function connectStart(url: URL, deps: ConnectDeps): Promise<Respons
   });
 }
 
-/** `GET /login/github/callback/connect`: exchange, attach, record, and send the browser back. */
+/** `GET /login/github/callback/connect`: exchange, hold, and send the browser back to be confirmed. */
 export async function connectCallback(request: Request, url: URL, deps: ConnectDeps): Promise<Response> {
   const flow = await open<{ link: ConnectLink; oauthState: string; exp: number }>(deps.secret, readCookie(request, FLOW_COOKIE), deps.now());
   const state = url.searchParams.get("state");
@@ -133,14 +141,11 @@ export async function connectCallback(request: Request, url: URL, deps: ConnectD
     console.error(`connect: ${link.provider} exchange failed for ${link.tenantId}/${link.agentId}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
     return done(back(link, "failed", { reason: "exchange" }));
   }
-  const attached = await deps.attach(link.tenantId, link.agentId, CONNECTION_MOUNT[link.provider], token);
-  if (!attached.ok) {
-    console.error(`connect: attaching ${link.provider} to ${link.tenantId}/${link.agentId} failed: ${attached.error}`);
-    return done(back(link, "failed", { reason: "attach" }));
+  const id = randomToken(18);
+  const held = await deps.hold(link.tenantId, link.agentId, CONNECTION_PLUGIN[link.provider], token, id, deps.now() + CONNECT_HOLD_TTL_MS, link.raftUserId);
+  if (!held.ok) {
+    console.error(`connect: holding ${link.provider} for ${link.tenantId}/${link.agentId} failed: ${held.error}`);
+    return done(back(link, "failed", { reason: "hold" }));
   }
-  await deps.registry.put({
-    tenantId: link.tenantId, raftAgentId: link.raftAgentId, provider: link.provider,
-    account: attached.account, connectedBy: link.raftUserId, connectedAt: deps.now(),
-  });
-  return done(back(link, "connected"));
+  return done(back(link, "pending", { pending: id }));
 }

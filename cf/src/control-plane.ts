@@ -494,6 +494,8 @@ export function d1Connections(db: D1Database): ConnectionRegistry {
       return (r.meta?.changes ?? 0) > 0;
     },
     async consumeLink(nonce, at) {
+      // A spent nonce only has to outlive its link (ten minutes); an hour keeps the table small.
+      await db.prepare("DELETE FROM connect_links WHERE used_at < ?").bind(at - 3_600_000).run();
       const r = await db.prepare("INSERT INTO connect_links (nonce, used_at) VALUES (?, ?) ON CONFLICT (nonce) DO NOTHING")
         .bind(nonce, at).run();
       return (r.meta?.changes ?? 0) > 0;

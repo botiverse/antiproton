@@ -335,10 +335,14 @@ await check("connections: a link for the agent's Raft only, bound to who asked, 
   f.deps.connections = {
     registry: {
       async get(t, r, p) { return conns.get(`${t}/${r}/${p}`) ?? null; },
+      async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); },
       async remove(t, r, p) { return conns.delete(`${t}/${r}/${p}`); },
     },
     async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
     async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
+    async confirm(_t, _a, _p, pending, raftUserId) {
+      return pending === "pend_ok_12345" && raftUserId === "u_owner" ? { ok: true, account: "octocat" } : { ok: false, error: "no such pending connection", missing: true };
+    },
   };
   await call(f.deps, "POST", "/agents", body(), "01JAGENT");
   const path = "/agents/by-raft-agent/01JAGENT/connections/github";
@@ -364,7 +368,14 @@ await check("connections: a link for the agent's Raft only, bound to who asked, 
 
   const none = await call(f.deps, "GET", path);
   if (none.body.connected !== false || none.body.account !== null) throw new Error(JSON.stringify(none.body));
-  conns.set(`${[...f.rows.values()][0]!.tenantId}/01JAGENT/github`, { account: "octocat", connectedBy: "u_owner", connectedAt: 1_800_000_000_000 });
+  // Confirm is Raft's, server to server, with its session's user; the wrong user or id is a 404 and records nothing.
+  const wrongUser = await call(f.deps, "POST", `${path}/confirm`, { pending: "pend_ok_12345", raftUserId: "u_stranger" });
+  if (wrongUser.status !== 404 || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`a stranger confirmed: ${wrongUser.status} ${wrongUser.text}`);
+  if ((await call(f.deps, "POST", `${path}/confirm`, { pending: "pend_ok_12345" })).status !== 422) throw new Error("a confirm without the session's user was accepted");
+  const confirmed = await call(f.deps, "POST", `${path}/confirm`, { pending: "pend_ok_12345", raftUserId: "u_owner" });
+  if (confirmed.status !== 200 || confirmed.body.connected !== true || confirmed.body.account !== "octocat" || confirmed.body.connectedBy !== "u_owner") {
+    throw new Error(`confirm: ${confirmed.status} ${confirmed.text}`);
+  }
   const got = await call(f.deps, "GET", path);
   if (got.body.connected !== true || got.body.account !== "octocat" || got.body.connectedBy !== "u_owner" || /token|secret|ghp_/.test(got.text)) throw new Error(JSON.stringify(got.body));
   const gone = await call(f.deps, "DELETE", path);

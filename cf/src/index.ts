@@ -76,7 +76,7 @@ import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
 import { d1Connections, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
-import { CONNECT_CALLBACK_PATH, CONNECT_START_PATH, CONNECTION_MOUNT, connectCallback, connectLink, connectStart, type ConnectDeps } from "./provision/connect.ts";
+import { CONNECT_CALLBACK_PATH, CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
@@ -1689,6 +1689,22 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("uiRenameMount", () => this.runtime().renameMount(tenantId, agentId, from, to));
   }
 
+  /** Connect flow (provision/connect.ts): a finished flow's token, held until Raft confirms its initiator. */
+  async connectionHold(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, token, id, exp, raftUserId));
+  }
+
+  async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId));
+  }
+
+  async connectionDetach(tenantId: string, agentId: string, plugin: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionDetach", () => this.runtime().detachConnection(tenantId, agentId, plugin));
+  }
+
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
@@ -2265,10 +2281,8 @@ function connectDeps(env: Env): ConnectDeps | null {
     origin: env.UI_ORIGIN!, secret: env.SESSION_SECRET!,
     github: { clientId: cfg.clientId, clientSecret: cfg.clientSecret },
     registry: d1Connections(env.CONTROL_DB),
-    attach: async (tenantId, agentId, alias, token) => {
-      const r = await stub(tenantId, agentId).uiAttachCredential(tenantId, agentId, alias, { token });
-      return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
-    },
+    hold: (tenantId, agentId, plugin, token, id, exp, raftUserId) =>
+      stub(tenantId, agentId).connectionHold(tenantId, agentId, plugin, token, id, exp, raftUserId),
     exchange: (code, redirectUri) => githubExchangeCode({ ...cfg, redirectUri }, code),
     now: () => Date.now(),
   };
@@ -2628,7 +2642,9 @@ function provisionDeps(env: Env): ProvisionDeps {
       connections: {
         registry: d1Connections(env.CONTROL_DB),
         link: (spec) => connectLink(env.UI_ORIGIN!, env.SESSION_SECRET!, spec, Date.now()),
-        detach: (tenantId, agentId, provider) => stub(tenantId, agentId).uiRemoveCredential(tenantId, agentId, CONNECTION_MOUNT[provider]),
+        detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
+        confirm: (tenantId, agentId, provider, pending, raftUserId) =>
+          stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId),
       },
     } : {}),
   };
