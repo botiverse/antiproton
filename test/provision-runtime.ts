@@ -130,8 +130,15 @@ await check("adopt binds the operator's model as chosen for the agent, and the d
   must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, "anthropic/claude-sonnet-5")).ok, "adopt");
   const chosen = await rt.store.getModelBinding("t", "raft_m1");
   must(chosen?.model === "anthropic/claude-sonnet-5" && chosen.secretRef === "operator:model", JSON.stringify(chosen));
+  // A choice that could not be read (null) leaves the existing binding alone: a control plane that did not
+  // answer does not move the agent back to the default.
   must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, null)).ok, "adopt again");
+  must((await rt.store.getModelBinding("t", "raft_m1"))?.model === "anthropic/claude-sonnet-5", "an unread choice moved the agent back to the default");
+  // No choice at all (undefined) is the default.
+  must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC)).ok, "adopt a third time");
   must((await rt.store.getModelBinding("t", "raft_m1"))?.model === "deepseek-flash", "no choice did not fall back to the default");
+  // A new agent whose choice could not be read still gets a binding: the default.
+  must((await adoptProvisionedAgent(rt, "t", "raft_m2", SPEC, null)).ok && (await rt.store.getModelBinding("t", "raft_m2"))?.model === "deepseek-flash", "a new agent was left unbound");
   host.dispose();
 });
 

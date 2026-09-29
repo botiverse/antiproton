@@ -1757,30 +1757,33 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
   }
 
-  /** The model this agent's operator binding should name: the admin's choice (model_overrides), else the deployment's. */
-  async #modelFor(tenantId: string, agentId: string): Promise<string> {
+  /**
+   * The model this agent's operator binding should name: the admin's choice (model_overrides), else the
+   * deployment's. Null when the choice could not be read, which is not the same as "no choice".
+   */
+  async #modelFor(tenantId: string, agentId: string): Promise<string | null> {
     try {
       return (await d1ModelOverrides(this.env.CONTROL_DB).effective(tenantId, agentId)) ?? this.env.HARNESS_MODEL;
     } catch (e) {
-      // The control plane unreachable is no reason to stop an agent: it keeps the default.
       console.warn(`model choice for ${agentId} could not be read: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-      return this.env.HARNESS_MODEL;
+      return null;
     }
   }
 
   /**
-   * Bind the operator's model as chosen for this agent. `onlyIfStale`: leave a binding alone unless it is
-   * missing, or the operator's and no longer what is chosen (the model or the endpoint changed). An agent
-   * that brought its own credential is never touched.
+   * Bind the operator's model as chosen for this agent. A binding with the agent's own credential is never
+   * touched. `onlyIfStale`: leave an operator binding alone unless it no longer names what is chosen (the
+   * model or the endpoint changed). A choice that could not be read changes nothing that exists: an
+   * agent the admin moved to another model is not moved back by a control plane that did not answer; a
+   * new agent gets the default.
    */
   async #bindModel(rt: AgentRuntime, tenantId: string, agentId: string, opts: { onlyIfStale?: boolean } = {}) {
+    const b = await rt.store.getModelBinding(tenantId, agentId);
+    if (b && b.secretRef !== OPERATOR_SECRET_REF) return;
     const model = await this.#modelFor(tenantId, agentId);
-    if (opts.onlyIfStale) {
-      const b = await rt.store.getModelBinding(tenantId, agentId);
-      const stale = b?.secretRef === OPERATOR_SECRET_REF && (b.model !== model || b.baseUrl !== this.env.DEEPSEEK_BASE_URL);
-      if (b && !stale) return;
-    }
-    await rt.bindOperatorModel(tenantId, agentId, model);
+    if (b && model === null) return;
+    if (b && opts.onlyIfStale && b.model === model && b.baseUrl === this.env.DEEPSEEK_BASE_URL) return;
+    await rt.bindOperatorModel(tenantId, agentId, model ?? this.env.HARNESS_MODEL);
   }
 
   async hookReceive(tenantId: string, agentId: string, alias: string, hookId: string,
