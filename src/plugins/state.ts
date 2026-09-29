@@ -228,9 +228,9 @@ export function statePlugin(
         name: "secret_get",
         summary:
           "Read back a secret you kept with `secret_put`, only when you need the value itself. Best from `run_js`: " +
-          "code can put the value straight into a request header or a command without printing it, and then it " +
-          "never enters this conversation. Called directly, the value is shown here and kept in the record. " +
-          "Mount credentials cannot be read this way.",
+          "code can pass the value to the sandbox's shell, in a command or an environment variable, without " +
+          "printing it, and then it never enters this conversation. Called directly, the value is shown here and " +
+          "kept in the record. Mount credentials cannot be read this way.",
         parameters: {
           type: "object", additionalProperties: false, required: ["name"],
           properties: { name: { type: "string" } },
