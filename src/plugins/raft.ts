@@ -755,13 +755,6 @@ export const raftPlugin: Plugin = {
   },
 
   /**
-   * The agent's activity, to Raft's ingest, so Agent Activity shows this agent
-   * the way it shows a managed one. Only while push is on: that is the state
-   * in which Raft is running this agent and looking. The events are passed
-   * through as given; the field set is the runtime's (src/runtime/activity.ts)
-   * and Raft refuses an unknown field, so nothing is added here.
-   */
-  /**
    * The agent's status changes, in Raft's status standard: this runtime knows its
    * state and says it. The same gate as activity (push on, an account to speak
    * with). A Raft that does not have the status endpoint yet answers 404; that is
@@ -781,6 +774,13 @@ export const raftPlugin: Plugin = {
     return { sent: events.length };
   },
 
+  /**
+   * The agent's activity, to Raft's ingest, so Agent Activity shows this agent
+   * the way it shows a managed one. Only while push is on: that is the state
+   * in which Raft is running this agent and looking. The events are passed
+   * through as given; the field set is the runtime's (src/runtime/activity.ts)
+   * and Raft refuses an unknown field, so nothing is added here.
+   */
   async reportActivity(events: readonly ActivityEvent[], ctx: PluginContext) {
     const state = await loadPushState(ctx);
     if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };

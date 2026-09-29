@@ -118,6 +118,29 @@ await check("status changes go out on the same pass, and a status send that fail
   must(r2.statusError === null && statusBatches.length === 1 && statusBatches[0]!.join(",") === "thinking,online", `statuses: ${JSON.stringify(statusBatches)}`);
 });
 
+await check("the last status of a turn is sent again on a pass with no new rows until a send returns, and not after", async () => {
+  const { sql } = sqliteHost();
+  const sentStatuses: string[][] = [];
+  let mode: "send" | "throw" = "throw";
+  const g = { ...gateway(), async reportStatus(_t: string, _a: string, events: readonly { status: string; eventId: string }[]) {
+    if (mode === "throw") throw new Error("status endpoint down");
+    sentStatuses.push(events.map((e) => `${e.status}#${e.eventId}`));
+    return [{ alias: "raft", sent: events.length }];
+  } };
+  appendTrace(sql, [answered(1)]);            // a turn ends: thinking, then online
+  const first = await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
+  must(first.statusError !== null && first.statuses === 2, JSON.stringify(first));
+  mode = "send";
+  const idle = await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);   // no new rows
+  must(idle.events === 0 && sentStatuses.length === 1 && sentStatuses[0]!.length === 1 && sentStatuses[0]![0]!.startsWith("online#"),
+    `the unconfirmed online was not sent again: ${JSON.stringify(sentStatuses)}`);
+  await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
+  must(sentStatuses.length === 1, `a confirmed status was sent again: ${JSON.stringify(sentStatuses)}`);
+  appendTrace(sql, [answered(2)]);            // the next turn: the transition from online is sent, not a repeat
+  await flushActivity(g as any, sql, OWNER.tenantId, OWNER.agentId);
+  must(sentStatuses[1]!.map((x) => x.split("#")[0]).join(",") === "thinking,online", JSON.stringify(sentStatuses));
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

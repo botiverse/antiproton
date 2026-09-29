@@ -995,13 +995,6 @@ export interface InboundEvent {
 }
 
 /**
- * One thing the agent did, for the service the agent belongs to (Raft's
- * raft-agent-activity-ingest.v1, 2026-09-28). Names are the service's hook
- * event names; the runtime maps its own ended spans onto them
- * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
- * an unknown field with 400, so a plugin passes these through and adds none.
- */
-/**
  * What the agent is doing now, in the five values the service shows beside it
  * (raft-agent-status.v1): the same set its own managed agents use.
  */
@@ -1022,6 +1015,13 @@ export interface StatusEvent {
   occurredAt: string;
 }
 
+/**
+ * One thing the agent did, for the service the agent belongs to (Raft's
+ * raft-agent-activity-ingest.v1, 2026-09-28). Names are the service's hook
+ * event names; the runtime maps its own ended spans onto them
+ * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
+ * an unknown field with 400, so a plugin passes these through and adds none.
+ */
 export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
 export interface ActivityEvent {
   /** Unique per agent for all time; the service dedupes on it. */

@@ -39,6 +39,28 @@ export function activityCursor(sql: Sql): number {
   return known ? Number(known.through_seq) : 0;
 }
 
+/**
+ * The status last derived for this agent, and whether a send of it was confirmed. Kept because status
+ * changes come only from new rows: if the last change of a turn (`online`) fails to send and the agent
+ * then stays idle, no later row will say it again, and the service would show `working` for ever. So an
+ * unconfirmed last status is sent again on each pass, rows or not, until a send returns.
+ */
+const STATUS_TABLE = "CREATE TABLE IF NOT EXISTS status_sent (id INTEGER PRIMARY KEY CHECK (id = 1), event TEXT NOT NULL, confirmed INTEGER NOT NULL)";
+
+function lastStatus(sql: Sql): { event: StatusEvent; confirmed: boolean } | null {
+  sql.exec(STATUS_TABLE);
+  const r = sql.exec("SELECT event, confirmed FROM status_sent WHERE id = 1").toArray()[0];
+  if (!r) return null;
+  try { return { event: JSON.parse(String(r.event)) as StatusEvent, confirmed: Number(r.confirmed) === 1 }; }
+  catch { return null; }
+}
+
+function setLastStatus(sql: Sql, event: StatusEvent, confirmed: boolean) {
+  sql.exec(STATUS_TABLE);
+  sql.exec("INSERT INTO status_sent(id, event, confirmed) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET event = excluded.event, confirmed = excluded.confirmed",
+    JSON.stringify(event), confirmed ? 1 : 0);
+}
+
 function setCursor(sql: Sql, through: number) {
   sql.exec("INSERT INTO activity_sent(id, through_seq) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET through_seq = excluded.through_seq", through);
 }
@@ -58,18 +80,25 @@ export async function flushActivity(
     }
   }
   // The same rows' status changes, after the activity they belong to was taken. Status is only ever
-  // "now": a failed send is reported and dropped, never a reason to hold rows — the next change says
-  // the current state anyway, and holding would make a status outage stall the activity feed.
-  const statuses = statusEvents(agentId, rows);
+  // "now", so a failed send never holds rows (a status outage must not stall the activity feed); what
+  // is kept instead is the last status and whether it was confirmed, and an unconfirmed one is sent
+  // again below even when no row is new — the last change of a turn has no later change to replace it.
+  const last = lastStatus(sql);
+  const changes = statusEvents(agentId, rows, last?.event.status ?? null);
+  const statuses = changes.length ? changes : last && !last.confirmed ? [last.event] : [];
   let statusError: string | null = null;
   if (statuses.length && gateway.reportStatus) {
+    let confirmed = false;
     try {
       for (const r of await gateway.reportStatus(tenantId, agentId, statuses)) {
         if ("skipped" in r) skipped.push(`${r.alias} (status): ${r.skipped}`);
       }
+      // A service that is not listening (push off) has nothing owed to it: done, like a send.
+      confirmed = true;
     } catch (e) {
       statusError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
     }
+    setLastStatus(sql, statuses[statuses.length - 1]!, confirmed);
   }
   if (through > sent0) setCursor(sql, through);
   return { events: events.length, sent, through: Math.max(sent0, through), skipped, statuses: statuses.length, statusError };
