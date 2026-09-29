@@ -63,8 +63,8 @@ export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[])
 }
 
 /**
- * Moves the status-carrying events so each is strictly later than the one before and than `after`,
- * the last status instant already sent; returns the new last. Raft keeps the status with the latest
+ * Moves the status-carrying events so none shares an instant with the one before or with `after`, the
+ * last status instant already sent; returns the new last. Raft keeps the status with the latest
  * occurredAt, so two at one millisecond leave it to arrival order. They happen: a tool that takes 0 ms
  * starts and ends on the model call's own end. A later event moves by the millisecond it needs,
  * together with the activity event it rides on.
@@ -75,6 +75,10 @@ export function orderStatuses(events: readonly ActivityEvent[], after: number): 
     .map((e) => ({ e, at: Date.parse(e.occurredAt) }))
     .sort((a, b) => a.at - b.at);
   for (const { e, at } of carrying) {
+    // Strictly earlier than what was already sent is left alone: Raft keeps the later one, which is right.
+    // Moving it forward would make an older status win. (Starts are dated back, so a span can overlap one
+    // sent in an earlier pass.)
+    if (at < after) continue;
     last = Math.max(at, last + 1);
     if (last !== at) e.occurredAt = new Date(last).toISOString();
   }

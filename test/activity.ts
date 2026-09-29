@@ -1,5 +1,5 @@
 /** The trace-row → activity-event mapping (src/runtime/activity.ts): what each row kind becomes, and nothing the service does not know. */
-import { activityEvents, ACTIVITY_BATCH_MAX } from "../src/runtime/activity.ts";
+import { activityEvents, ACTIVITY_BATCH_MAX, orderStatuses } from "../src/runtime/activity.ts";
 import type { TraceOutboxRow } from "../src/trace/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -75,6 +75,14 @@ check("in a real turn the tool call says which tool it is working on, on the Pre
   const pre = ev.find((e) => e.hookEventName === "PreToolUse");
   must(pre?.status === "working" && pre.detail === "Using raft__send_message", JSON.stringify(pre));
   must(ev.filter((e) => e.detail !== undefined).length === 1, `detail on other events: ${JSON.stringify(ev)}`);
+});
+
+check("a status earlier than the last one sent keeps its date and does not move the clock; one at the same instant moves by 1 ms", () => {
+  const at = (ms: number) => new Date(T0 + ms).toISOString();
+  const older = [{ eventId: "a", occurredAt: at(90), status: "working" as const }];
+  must(orderStatuses(older, T0 + 100) === T0 + 100 && older[0]!.occurredAt === at(90), `moved: ${JSON.stringify(older)}`);
+  const tied = [{ eventId: "b", occurredAt: at(100), status: "online" as const }, { eventId: "c", occurredAt: at(100), hookEventName: "Stop" as const }];
+  must(orderStatuses(tied, T0 + 100) === T0 + 101 && tied[0]!.occurredAt === at(101) && tied[1]!.occurredAt === at(100), `tie: ${JSON.stringify(tied)}`);
 });
 
 console.log(`\n  activity mapping\n  ${"─".repeat(56)}`);
