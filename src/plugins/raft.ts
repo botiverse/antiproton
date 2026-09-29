@@ -771,8 +771,9 @@ export const raftPlugin: Plugin = {
     // is skipped, not an error, or the alarm would retry every minute for ever.
     if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
     if (events.length === 0) return { sent: 0 };
+    let answer: ObjectValue;
     try {
-      await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
+      answer = (await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events })).data;
     } catch (error) {
       // A Raft that does not know status yet refuses the whole batch (400, unknown field), and the log
       // holds a refused batch for ever: the activity feed would stop at the first status. So a 400 on a
@@ -790,7 +791,15 @@ export const raftPlugin: Plugin = {
       if (plain.length) await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: plain });
       return { sent: plain.length };
     }
-    return { sent: events.length };
+    // A 200 is not "all taken": Raft counts what it refused and still answers 200 (a Raft before the
+    // status standard refuses status-only events this way). Refused events are not resent — they are
+    // the same events next time too — so they are said, where an operator would look.
+    const refused = typeof answer.rejectedCount === "number" ? answer.rejectedCount : 0;
+    if (refused > 0) {
+      const statusOnly = events.filter((e) => !e.hookEventName).length;
+      console.warn(`raft mount ${ctx.alias}: Raft refused ${refused} of ${events.length} activity event(s) (${statusOnly} status-only in the batch)`);
+    }
+    return { sent: events.length - refused };
   },
 
   /**
