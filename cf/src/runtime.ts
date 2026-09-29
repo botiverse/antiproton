@@ -881,21 +881,13 @@ export class AgentRuntime {
   }
 
   /**
-   * Take back the key this agent attached, and give the mount whatever the
-   * catalogue says it had — the shared account for a seeded mount, nothing for
-   * one that was never seeded with a reference.
-   *
-   * Only an agent's own reference is removable, so this cannot be a way to
-   * clear the shared account: on a mount already using it, there is nothing of
-   * this agent's to take back and the answer is `false`.
-   */
-  /**
    * A connection waiting for its initiator to be confirmed (provision/connect.ts): the token from a
    * finished OAuth flow, sealed in this agent's own secret table under `pending:<plugin>:<exp>:<id>`,
    * with the Raft user who started the flow kept beside it. It becomes the mount's credential only in
    * `confirmConnection`, after Raft has checked that the person who finished the flow is the one who
    * started it — so a link sent to someone else cannot put their account on this agent. Expired rows
-   * are cleared each time a new one is held.
+   * are cleared each time a new one is held. On these rows the `account` column holds the Raft user
+   * the flow was started for, not an account the credential grants: they are never a mount's credential.
    */
   async holdConnection(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string):
     Promise<{ ok: true } | { ok: false; error: string }> {
@@ -928,8 +920,11 @@ export class AgentRuntime {
     if (!meta || !sealed || Number(row.name.split(":")[2]) <= Date.now() || meta.account !== raftUserId) {
       return { ok: false, error: "no such pending connection", missing: true };
     }
-    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
-    if (!mount) return { ok: false, error: `this agent has no ${plugin} mount to connect` };
+    const mounts = await this.store.findMountsByPlugin(tenantId, agentId, plugin);
+    if (mounts.length === 0) return { ok: false, error: `this agent has no ${plugin} mount to connect` };
+    // More than one and the choice would be arbitrary; say so rather than attach to one of them.
+    if (mounts.length > 1) return { ok: false, error: `this agent has ${mounts.length} ${plugin} mounts (${mounts.map((m) => m.alias).join(", ")}); connect one in the console` };
+    const mount = mounts[0]!;
     const r = await this.attachCredential(tenantId, agentId, mount.alias, { token: await open(kek, sealed) });
     return r.ok ? { ok: true, account: r.account } : { ok: false, error: r.error };
   }
@@ -941,6 +936,15 @@ export class AgentRuntime {
     return mount ? this.removeCredential(tenantId, agentId, mount.alias) : false;
   }
 
+  /**
+   * Take back the key this agent attached, and give the mount whatever the
+   * catalogue says it had — the shared account for a seeded mount, nothing for
+   * one that was never seeded with a reference.
+   *
+   * Only an agent's own reference is removable, so this cannot be a way to
+   * clear the shared account: on a mount already using it, there is nothing of
+   * this agent's to take back and the answer is `false`.
+   */
   async removeCredential(tenantId: string, agentId: string, alias: string): Promise<boolean> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
