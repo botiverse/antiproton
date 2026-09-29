@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
-import { secretRefKind } from "./secrets.ts";
+import { AGENT_REF, isAgentRef, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
-import { type ActivityEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
+import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
@@ -93,8 +93,10 @@ export function alreadyAttempted(operationId: string, status: OperationStatus | 
 
 export interface SecretResolver {
   /** `scope` is the mount's owner. A reference is resolved for the agent whose
-   *  mount names it, never for whoever wrote the string. */
-  resolve(ref: string, scope?: { tenantId: string; agentId: string }): Promise<string | null>;
+   *  mount names it, never for whoever wrote the string. `touch: false` reads
+   *  without recording a use: for a reader that only compares, so "last used"
+   *  keeps meaning a credential was put to work. */
+  resolve(ref: string, scope?: { tenantId: string; agentId: string }, opts?: { touch?: boolean }): Promise<string | null>;
 }
 
 export const envSecrets: SecretResolver = {
@@ -358,6 +360,7 @@ export class ToolGateway {
             publicConfig: mount.publicConfig,
             db: this.#db(ctx, mount),
             async sibling() { return null; },
+            async sandboxForms() { return []; },
           });
         } catch (e: any) {
           // A plugin that cannot describe itself must not stop the agent from
@@ -401,6 +404,7 @@ export class ToolGateway {
       publicConfig: mount.publicConfig,
       db: this.#db(ctx, mount),
       async sibling() { return null; },
+      async sandboxForms() { return []; },
     });
   }
 
@@ -433,6 +437,7 @@ export class ToolGateway {
       publicConfig: mount.publicConfig,
       db: this.#db(ctx, mount),
       async sibling() { return null; },
+      async sandboxForms() { return []; },
     });
   }
 
@@ -476,6 +481,7 @@ export class ToolGateway {
           publicConfig: mount.publicConfig,
           db: this.#db(ctx, mount),
           async sibling() { return null; },
+          async sandboxForms() { return []; },
         });
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
@@ -830,6 +836,29 @@ export class ToolGateway {
           policy: other.policy ?? null,
         };
       },
+      // Found by what each plugin declares, so the container never matches a plugin's name or an alias.
+      sandboxForms: async () => {
+        const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
+        const out: Awaited<ReturnType<PluginContext["sandboxForms"]>> = [];
+        for (const m of await store.listMounts(ctx.tenantId, ctx.agentId)) {
+          const plugin = this.#plugins.get(m.plugin);
+          const form = plugin?.sandboxForm;
+          if (!form || !pluginEnabled(this.#seeded.has(m.plugin), choices[m.plugin])) continue;
+          // A mount whose calls are refused for a version mismatch must not act from the container either.
+          if (plugin.version !== m.toolVersion) continue;
+          const scope = { tenantId: m.tenantId, agentId: m.agentId };
+          out.push({
+            alias: m.alias, plugin: m.plugin, form,
+            // Read without recording a use: the container re-reads before every command to notice a
+            // change, and only registering the credential with a box puts it to work.
+            credential: m.secretRef ? await secrets.resolve(m.secretRef, scope, { touch: false }) : null,
+            used: async () => {
+              if (isAgentRef(m.secretRef)) await store.touchSecret(scope.tenantId, scope.agentId, m.secretRef!.slice(AGENT_REF.length), Date.now());
+            },
+          });
+        }
+        return out;
+      },
     };
   }
 
@@ -967,6 +996,7 @@ export class ToolGateway {
         alias,
         credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
         async sibling() { return null; },
+        async sandboxForms() { return []; },
       });
     } catch (e) {
       // A check that threw gave no verdict on the key: the provider was not

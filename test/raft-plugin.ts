@@ -43,7 +43,7 @@ function ctx(
     publicConfig: { serverUrl: "https://raft.example", ...config },
     db: freshDb().db,
     inbound,
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   } as any;
 }
 

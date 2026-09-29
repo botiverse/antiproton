@@ -540,7 +540,7 @@ await check("a verification refuses a malformed credential in words, without cal
     caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "gh",
     credential, publicConfig: {},
     db: dbFor(plugin, "gh"),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   });
   for (const [plugin, partial] of [[run9, JSON.stringify({ ak: "x" })], [spotify!, JSON.stringify({ username: "u" })]] as const) {
     if (typeof plugin.checkCredential !== "function") throw new Error(`${plugin.id} has no check`);
@@ -588,7 +588,7 @@ await check("a provider that cannot be reached is unreachable, not a rejection",
     caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "gh",
     credential, publicConfig,
     db: dbFor(plugin, "gh"),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   });
   const cases = [
     ["run9", run9, JSON.stringify({ ak: "a", sk: "b" }), { endpoint: dead }],
@@ -782,7 +782,7 @@ await check("a quiet request over the mount's ceiling is refused, and the refusa
     caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
     credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: config,
     db: dbFor(run9, "box", state, () => { written.push(true); }),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   });
   const written: boolean[] = [];
   const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 };
@@ -825,7 +825,7 @@ await check("an accepted quiet request records when to ask again, and leaves the
     caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
     credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
     db: dbFor(run9, "box", state, (v) => { saved = v; }),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   });
   // Under a lease: only there is a postponement something reads. The case after this one holds the other side.
   const leasedBox = sandboxPlugin(null as any, "local", { warnMs: 5 * 60_000, maxMs: 30 * 60_000 });
@@ -864,7 +864,7 @@ await check("without a lease, quiet answers that there is nothing to postpone an
     caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
     credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
     db: dbFor(run9, "box", { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 }, (v) => { saved = v; }),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   };
   const r: any = await run9.invoke("quiet", { minutes: 30 } as any, ctx);
   if (r.quiet !== false) throw new Error(`quiet without a lease answered ${JSON.stringify(r)}`);
@@ -894,7 +894,7 @@ await check("start_from 的每一个结局都直说【释放了没有】,而且�
     caller: { tenantId: "t", agentId: "a", taskId: "x" }, alias: "box",
     credential: JSON.stringify({ ak: "x", sk: "y" }), publicConfig: {},
     db: dbFor(run9, "box", state, (v) => { saved = v; }),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   });
   const live = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000, execs: 1,
     envs: [{ name: "ready", snapId: "s-1", savedAt: 5 }] };
@@ -1391,7 +1391,7 @@ await check("a mount reports what it is holding, with no credential and no call 
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
     credential: null, publicConfig: {},
     db: dbFor(run9, "sandbox", state),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   });
   if (typeof run9.holds?.activity !== "function") throw new Error("the sandbox no longer reports its activity");
 
@@ -1536,7 +1536,7 @@ await check("the endpoint answers for the credential when it is not the provider
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", ...extra },
-    db: recordDb(() => null), sibling: async () => null,
+    db: recordDb(() => null), sibling: async () => null, sandboxForms: async () => [],
   });
   try {
     globalThis.fetch = reply(200, "{}");
@@ -1658,7 +1658,7 @@ await check("a mount answers what it is running and what it has finished", async
     const ctx = (): any => ({
       caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
       credential: null, publicConfig: {},
-      db: recordDb(() => state), sibling: async () => null,
+      db: recordDb(() => state), sibling: async () => null, sandboxForms: async () => [],
     });
     await run9.holds!.activity(ctx());
     await run9.holds!.usage!(ctx());
@@ -1767,7 +1767,7 @@ await check("starting a new container keeps the list of kept environments", asyn
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
     db: recordDb(() => stored, (v) => { stored = v; }),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   };
   try {
     await sandboxPlugin(null as any, "local").invoke("shell", { command: "echo ok" } as any, ctx);
@@ -1817,7 +1817,7 @@ await check("a result reports the image its container started from, and says so 
       credential: JSON.stringify({ ak: "a", sk: "b" }),
       publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000, ...publicConfig },
       db: recordDb(() => box.stored, (v) => { box.stored = v; }),
-      sibling: async () => null,
+      sibling: async () => null, sandboxForms: async () => [],
     };
     return { box, ctx };
   };
@@ -1905,7 +1905,7 @@ await check("a mount reports how many entries of its record it could not read", 
   const plugin = sandboxPlugin(null as any, "local");
   const activity = (raw: unknown) => plugin.holds!.activity({
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox", credential: null, publicConfig: {},
-    db: recordDb(() => raw), sibling: async () => null,
+    db: recordDb(() => raw), sibling: async () => null, sandboxForms: async () => [],
   } as any);
   const box = { boxId: "b-1", createdAt: 1_000, lastUsedAt: 2_000 };
   const session = { boxId: "b-0", startedAt: 1, endedAt: 2, lastUsedAt: 2, execs: 1, saved: [] };
@@ -1939,7 +1939,7 @@ await check("a record that is present but does not read at all is reported, and 
   const plugin = sandboxPlugin(null as any, "local");
   const activity = (raw: unknown) => plugin.holds!.activity({
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox", credential: null, publicConfig: {},
-    db: recordDb(() => raw), sibling: async () => null,
+    db: recordDb(() => raw), sibling: async () => null, sandboxForms: async () => [],
   } as any);
   for (const raw of ["nonsense", 42, { boxId: 123, createdAt: "x" }]) {
     const a = await activity(raw);
@@ -1968,9 +1968,10 @@ await check("a record that is present but does not read at all is reported, and 
  */
 await check("the GitHub token becomes two placeholders, one of them what git sends, and neither is the token", async () => {
   const sb: any = await import("../src/plugins/sandbox.ts");
-  if (typeof sb.githubSecrets !== "function") throw new Error("githubSecrets is not exported");
+  const form = githubPlugin.sandboxForm;
+  if (!form) throw new Error("github declares no sandbox form");
   const token = "github_pat_FAKE0123456789";
-  const regs = sb.githubSecrets(token, "h-t-a-0123456789-abcdefgh");
+  const regs = sb.registrationsFor(form, token, sb.placeholderFor("gh", "h-t-a-0123456789-abcdefgh"));
   const api = regs.find((r: any) => r.hosts.includes("api.github.com"));
   const git = regs.find((r: any) => r.hosts.includes("github.com"));
   if (regs.length !== 2 || !api || !git || api === git) throw new Error(`registrations: ${JSON.stringify(regs)}`);
@@ -1978,14 +1979,15 @@ await check("the GitHub token becomes two placeholders, one of them what git sen
   if (!/^[A-Za-z0-9_]+$/.test(api.placeholder)) throw new Error(`the placeholder is not safe to put in a shell: ${api.placeholder}`);
   if (git.placeholder !== btoa(`x-access-token:${api.placeholder}`)) throw new Error("the git placeholder is not the header git sends");
   if (git.value !== btoa(`x-access-token:${token}`)) throw new Error("the git value is not the header GitHub expects");
-  if (sb.githubSecrets(token, "h-t-a-0123456789-zzzzzzzz")[0].placeholder === api.placeholder) {
+  if (sb.placeholderFor("gh", "h-t-a-0123456789-zzzzzzzz") === api.placeholder) {
     throw new Error("two boxes got the same placeholder; run9 requires them unique across the project");
   }
 });
 
 await check("every command sees GH_TOKEN as the placeholder, and git gets it for github.com and nowhere else", async () => {
   const sb: any = await import("../src/plugins/sandbox.ts");
-  if (typeof sb.githubEnv !== "function") throw new Error("githubEnv is not exported");
+  const form = githubPlugin.sandboxForm;
+  if (!form) throw new Error("github declares no sandbox form");
   const { spawnSync } = await import("node:child_process");
   const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -1994,7 +1996,7 @@ await check("every command sees GH_TOKEN as the placeholder, and git gets it for
   const command = `echo "token=$GH_TOKEN"; ` +
     `printf 'protocol=https\nhost=github.com\n\n' | git credential fill; ` +
     `printf 'protocol=https\nhost=gitlab.com\n\n' | git credential fill`;
-  const argv: string[] = sb.execArgv({ shell: "/bin/sh" }, command, sb.githubEnv(P));
+  const argv: string[] = sb.execArgv({ shell: "/bin/sh" }, command, form.env(P));
   const r = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", env: {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: mkdtempSync(join(tmpdir(), "gh-env-")),
     GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1",
@@ -2006,7 +2008,7 @@ await check("every command sees GH_TOKEN as the placeholder, and git gets it for
   }
 });
 
-await check("a container gets a GitHub mount's token only as a placeholder, and nothing from anything else", async () => {
+await check("a container acts as every declaring mount only through a placeholder, and as none it should not", async () => {
   const original = globalThis.fetch;
   const calls: Array<{ method: string; path: string; body: any }> = [];
   let n = 0;
@@ -2022,60 +2024,81 @@ await check("a container gets a GitHub mount's token only as a placeholder, and 
   }) as any;
   const token = "github_pat_FAKE0123456789";
   const plugin = sandboxPlugin(null as any, "local");
-  const start = async (sibling: unknown, publicConfig: Record<string, unknown> = {}) => {
+  const form = githubPlugin.sandboxForm!;
+  const used: string[] = [];
+  const gh = (alias = "gh", credential: string | null = token) => ({ alias, plugin: "github", form, credential, used: async () => { used.push(alias); } });
+  // A second service, so "wired by declaration" is tested on something that is not GitHub.
+  const other = {
+    alias: "acme", plugin: "acme", credential: "acme-secret", used: async () => { used.push("acme"); },
+    form: {
+      summary: "acme works here.",
+      egress: [{ name: "ACME_TOKEN", header: "x-api-key", hosts: ["api.acme.test"], value: (c: string) => c, placeholder: (p: string) => p }],
+      env: (p: string) => ({ ACME_TOKEN: p }),
+    },
+  };
+  const start = async (forms: unknown[], publicConfig: Record<string, unknown> = {}) => {
     calls.length = 0;
     const box: any = { stored: null };
-    const asked: string[] = [];
     const ctx: any = {
       caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
       credential: JSON.stringify({ ak: "a", sk: "b" }),
       publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000, ...publicConfig },
       db: recordDb(() => box.stored, (v) => { box.stored = v; }),
-      sibling: async (alias: string) => { asked.push(alias); return sibling; },
+      sibling: async () => null,
+      sandboxForms: async () => forms,
     };
     const result: any = await plugin.invoke("shell", { command: "gh repo view" } as any, ctx);
     return {
-      result, stored: box.stored, asked,
+      result, stored: box.stored,
       create: calls.find((c) => c.method === "POST" && /workspace\/boxes$/.test(c.path))?.body,
       secrets: calls.filter((c) => /\/secrets$/.test(c.path)).map((c) => c.body),
       exec: calls.find((c) => /background-execs$/.test(c.path))?.body,
     };
   };
   try {
-    const gh = await start({ plugin: "github", credential: token, db: null });
-    if (gh.asked.join() !== "gh") throw new Error(`asked for mounts ${JSON.stringify(gh.asked)}`);
-    if (gh.create?.network_mode !== "managed") throw new Error(`the box was not created with managed networking: ${JSON.stringify(gh.create)}`);
-    const hosts = gh.secrets.map((b: any) => (b.allowed_hosts ?? []).join(",")).sort();
-    if (gh.secrets.length !== 2 || !hosts.some((h: string) => h.split(",").includes("github.com"))) {
+    const one = await start([gh()]);
+    if (one.create?.network_mode !== "managed") throw new Error(`the box was not created with managed networking: ${JSON.stringify(one.create)}`);
+    const hosts = one.secrets.map((b: any) => (b.allowed_hosts ?? []).join(",")).sort();
+    if (one.secrets.length !== 2 || !hosts.some((h: string) => h.split(",").includes("github.com"))) {
       throw new Error(`registered ${JSON.stringify(hosts)}`);
     }
-    const P = gh.stored?.githubPlaceholder;
-    if (!P || !gh.exec?.command.join(" ").includes(P)) throw new Error(`the command does not carry the placeholder: ${JSON.stringify(gh.exec)}`);
-    for (const [what, v] of [["command", gh.exec], ["record", gh.stored], ["result", gh.result]] as const) {
+    const P = one.stored?.wired?.[0]?.placeholder;
+    if (!P || !one.exec?.command.join(" ").includes(P)) throw new Error(`the command does not carry the placeholder: ${JSON.stringify(one.exec)}`);
+    for (const [what, v] of [["command", one.exec], ["record", one.stored], ["result", one.result]] as const) {
       if (JSON.stringify(v).includes(token)) throw new Error(`the token is in the ${what}`);
     }
-    if (!/GitHub/.test(String(gh.result.github))) throw new Error(`the result does not say GitHub works here: ${JSON.stringify(gh.result).slice(0, 300)}`);
+    if (!/GitHub/.test(String(one.result.accounts?.gh))) throw new Error(`the result does not say GitHub works here: ${JSON.stringify(one.result).slice(0, 300)}`);
+    if (used.join() !== "gh") throw new Error(`registering did not record a use, once: ${used}`);
 
-    for (const [why, sibling, cfg] of [
-      ["another plugin's credential", { plugin: "http", credential: token, db: null }, {}],
-      ["a GitHub mount with no token", { plugin: "github", credential: null, db: null }, {}],
-      ["no such mount", null, {}],
-      ["a container with no network", { plugin: "github", credential: token, db: null }, { network: "none" }],
-      ["the setting turned off", { plugin: "github", credential: token, db: null }, { github: "" }],
-      ["a GitHub mount whose writes need approval", { plugin: "github", credential: token, db: null, policy: { write: "approval" } }, {}],
-      ["a GitHub mount with one tool denied", { plugin: "github", credential: token, db: null, policy: { tools: { pr_create: "deny" } } }, {}],
+    // Wired by what a plugin declares: a second service is wired beside GitHub with no change to the container.
+    const two = await start([gh(), other]);
+    const acme = two.secrets.find((b: any) => b.name === "ACME_TOKEN");
+    if (two.secrets.length !== 3 || acme?.inject_header_name !== "x-api-key" || acme.allowed_hosts.join() !== "api.acme.test") {
+      throw new Error(`a second declared form was not wired: ${JSON.stringify(two.secrets)}`);
+    }
+    if (!/ACME_TOKEN=/.test(two.exec?.command.join(" ")) || !/acme works here/.test(String(two.result.accounts?.acme))) {
+      throw new Error(`the second form's env or sentence is missing: ${JSON.stringify(two.result.accounts)}`);
+    }
+
+    for (const [why, forms, cfg] of [
+      ["a GitHub mount with no token", [gh("gh", null)], {}],
+      ["no declaring mount", [], {}],
+      ["a container with no network", [gh()], { network: "none" }],
+      ["accounts turned off", [gh()], { accounts: "none" }],
+      ["the old setting turned off", [gh()], { github: "" }],
     ] as const) {
-      const r = await start(sibling, cfg);
-      if (r.secrets.length || r.create?.network_mode === "managed" || r.stored?.githubPlaceholder
+      const r = await start([...forms], cfg);
+      if (r.secrets.length || r.create?.network_mode === "managed" || r.stored?.wired
         || JSON.stringify(r.exec).includes("GH_TOKEN") || JSON.stringify(calls).includes(token)) {
         throw new Error(`${why}: something was registered or exported`);
       }
     }
 
-    // Withheld because of policy: the agent is told why, and where GitHub still works.
-    const held = await start({ plugin: "github", credential: token, db: null, policy: { write: "approval" } });
-    if (held.stored?.githubWithheld !== "gh" || !/approval or denied/.test(String(held.result.github))) {
-      throw new Error(`a policy-held mount did not say why GitHub is missing: ${JSON.stringify(held.result.github)}`);
+    // Two GitHub accounts: a container has one GH_TOKEN, so neither is wired and the agent is told why.
+    const clash = await start([gh("gh"), gh("gh-work", "github_pat_OTHER0123456789")]);
+    if (clash.secrets.length || clash.stored?.wired || clash.stored?.leftOut?.length !== 2
+      || !/GH_TOKEN/.test(String(clash.result.accounts?.gh)) || !/gh-work/.test(String(clash.result.accounts?.gh))) {
+      throw new Error(`two GitHub accounts: ${JSON.stringify({ secrets: clash.secrets, stored: clash.stored, accounts: clash.result.accounts })}`);
     }
 
     // run9 refusing the registration: the box already exists and is billed, so
@@ -2093,12 +2116,13 @@ await check("a container gets a GitHub mount's token only as a placeholder, and 
         credential: JSON.stringify({ ak: "a", sk: "b" }),
         publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
         db: recordDb(() => box.stored, (v) => { box.stored = v; }),
-        sibling: async () => ({ plugin: "github", credential: token, db: null }),
+        sibling: async () => null,
+        sandboxForms: async () => [gh()],
       } as any);
     } catch { threw = true; }
     if (!threw) throw new Error("a refused registration was treated as success");
     if (!box.stored?.boxId) throw new Error("a refused registration left the billed box with no record naming it");
-    if (box.stored.githubPlaceholder) throw new Error("the record promises GitHub in a box where registration failed");
+    if (box.stored.wired) throw new Error("the record promises GitHub in a box where registration failed");
   } finally {
     globalThis.fetch = original;
   }
@@ -2107,9 +2131,9 @@ await check("a container gets a GitHub mount's token only as a placeholder, and 
 /**
  * A sibling says which plugin it is.
  *
- * The sandbox sends a sibling's credential to GitHub's hosts, so it has to know
- * the alias still names a GitHub mount; an alias pointing at anything else would
- * send that mount's credential to GitHub. Only the gateway knows, so this goes
+ * A plugin that hands a sibling's credential to a service has to know the alias
+ * still names a mount of that service; an alias pointing at anything else would
+ * send that mount's credential there. Only the gateway knows, so this goes
  * through the real one rather than a hand-built context.
  */
 await check("the gateway's sibling names the plugin of the mount it found", async () => {
@@ -2145,30 +2169,103 @@ await check("the gateway's sibling names the plugin of the mount it found", asyn
   }
 });
 
-await check("a container acts as a mount only when nothing on that mount is held or denied", async () => {
-  const sb: any = await import("../src/plugins/sandbox.ts");
-  if (typeof sb.policyLetsContainerAct !== "function") throw new Error("policyLetsContainerAct is not exported");
-  const cases: Array<[unknown, boolean]> = [
-    [null, true], [{}, true], [{ read: "allow", write: "allow", tools: { pr_create: "allow" } }, true],
-    [{ write: "approval" }, false], [{ write: "deny" }, false], [{ read: "approval" }, false],
-    [{ tools: { issue_create: "deny" } }, false], [{ write: "allow", tools: { api: "approval" } }, false],
-  ];
-  for (const [policy, want] of cases) {
-    if (sb.policyLetsContainerAct(policy) !== want) throw new Error(`${JSON.stringify(policy)} should be ${want}`);
-  }
+/**
+ * The container finds the accounts to act as by what plugins declare, through
+ * the real gateway: only mounts whose plugin declares a form, never one that is
+ * switched off, each with its credential resolved and nothing else's.
+ */
+await check("the gateway hands the container every declaring mount, by declaration, with its credential", async () => {
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const { ToolGateway } = await import("../src/runtime/gateway.ts");
+  const probe: any = {
+    id: "probe", version: "1.0.0",
+    tools: [{ name: "peek", summary: "x", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "safe" }],
+    invoke: async (_t: string, _a: unknown, ctx: any) => {
+      const found = await ctx.sandboxForms();
+      const before = (await store.secretMeta("t", "a", "sealed"))?.lastUsedAt ?? null;
+      await found.find((f: any) => f.alias === "sealed")?.used();
+      const after = (await store.secretMeta("t", "a", "sealed"))?.lastUsedAt ?? null;
+      return {
+        forms: found.filter((f: any) => f.alias !== "sealed")
+          .map((f: any) => ({ alias: f.alias, plugin: f.plugin, credential: f.credential, env: Object.keys(f.form.env("P")) })),
+        usedRecorded: before === null && typeof after === "number",
+      };
+    },
+  };
+  const form = { summary: "x", egress: [], env: (p: string) => ({ X_TOKEN: p }) };
+  const declares: any = { id: "declares", version: "1.0.0", tools: [], invoke: async () => null, sandboxForm: form };
+  const off: any = { id: "off", version: "1.0.0", tools: [], invoke: async () => null, sandboxForm: form };
+  const plain: any = { id: "plain", version: "1.0.0", tools: [], invoke: async () => null };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.createTask("t", "a", "k", {});
+  const mount = (alias: string, plugin: string, secretRef: string | null) => store.addMount({
+    tenantId: "t", agentId: "a", alias, plugin, installationId: `i-${alias}`, connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef, policy: null,
+  } as any);
+  await mount("p", "probe", null);
+  await mount("svc", "declares", "ref:svc");
+  await mount("svc-public", "declares", null);
+  await mount("quiet", "off", "ref:svc");
+  await mount("other", "plain", "ref:svc");
+  // An agent-sealed credential, to see `used()` record a use where reading did not.
+  await store.putSecret("t", "a", "sealed", { ciphertext: "x", iv: "y" });
+  await mount("sealed", "declares", "agent:sealed");
+  // Pinned to a version the registry no longer has: its calls are refused, so the container must not act as it.
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "stale", plugin: "declares", installationId: "i-stale", connectionId: null,
+    toolVersion: "0.9.0", publicConfig: {}, secretRef: "ref:svc", policy: null,
+  } as any);
+  const plugins = [probe, declares, off, plain];
+  const touched: string[] = [];
+  // `off` is not seeded, so it is switched off unless this agent turned it on.
+  const gw = new ToolGateway(store, plugins, new Set(["probe", "declares", "plain"]), {
+    async resolve(ref: string, _scope: unknown, opts?: { touch?: boolean }) {
+      if (opts?.touch !== false) touched.push(ref);
+      return ref === "ref:svc" ? "tok" : null;
+    },
+  } as any);
+  const r: any = await gw.invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "p.peek", {});
+  if (r.status !== "succeeded") throw new Error(`the probe did not run: ${JSON.stringify(r)}`);
+  const got = JSON.stringify(r.result.forms.sort((x: any, y: any) => x.alias.localeCompare(y.alias)));
+  const want = JSON.stringify([
+    { alias: "svc", plugin: "declares", credential: "tok", env: ["X_TOKEN"] },
+    { alias: "svc-public", plugin: "declares", credential: null, env: ["X_TOKEN"] },
+  ]);
+  if (got !== want) throw new Error(`sandboxForms answered ${got}, wanted ${want}`);
+  // Reading to compare is not a use: "last used" would otherwise be the last shell command.
+  if (touched.length) throw new Error(`sandboxForms recorded a use of ${touched}`);
+  if (!r.result.usedRecorded) throw new Error("used() did not record a use of the mount's credential");
+});
+
+await check("the sealed resolver reads without recording a use when asked, and records one otherwise", async () => {
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const { agentSecrets, importKek, seal } = await import("../src/runtime/secrets.ts");
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const kek = await importKek(btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))));
+  await store.putSecret("t", "a", "gh", await seal(kek, "tok"));
+  const resolver = agentSecrets(store as any, kek, { async resolve() { return null; } } as any);
+  const scope = { tenantId: "t", agentId: "a" };
+  if (await resolver.resolve("agent:gh", scope, { touch: false }) !== "tok") throw new Error("the quiet read did not read");
+  if ((await store.secretMeta("t", "a", "gh"))?.lastUsedAt != null) throw new Error("a quiet read recorded a use");
+  await resolver.resolve("agent:gh", scope);
+  if (typeof (await store.secretMeta("t", "a", "gh"))?.lastUsedAt !== "number") throw new Error("an ordinary read recorded no use");
 });
 
 /**
- * A running container's GitHub access follows the mount, not the moment it started.
+ * A running container's accounts follow the mounts, not the moment it started.
  *
- * Checked only at creation, a mount switched to approval kept its container
- * signed in until the container was released, which under a lease can be hours
- * (cody, reviewing #339); a token taken away or replaced was the same gap. So
- * before each command the mount is read again, and when what may be wired in
- * has changed, the container's GitHub secrets are deleted, measured on run9 to
- * stop substitution on the next request, and registered again only if allowed.
+ * Checked only at creation, a token taken away or replaced kept working in the
+ * container until it was released, which under a lease can be hours (cody,
+ * reviewing #339). So before each command the mounts are read again, and when
+ * what may be wired in has changed, the container's registrations for it are
+ * deleted, measured on run9 to stop substitution on the next request, and
+ * registered again only if still wanted.
  */
-await check("a running container's GitHub access follows the mount: held, removed, replaced, attached later", async () => {
+await check("a running container's accounts follow the mounts: removed, replaced, attached later, clashing", async () => {
   const original = globalThis.fetch;
   let secrets: Array<Record<string, any>> = [];
   const log: string[] = [];
@@ -2203,71 +2300,86 @@ await check("a running container's GitHub access follows the mount: held, remove
     return new Response("{}");
   }) as any;
   const plugin = sandboxPlugin(null as any, "local");
-  let mount: any = { plugin: "github", credential: "tok-1", db: null, policy: null };
+  const form = githubPlugin.sandboxForm!;
+  const noop = async () => {};
+  let forms: any[] = [{ alias: "gh", plugin: "github", form, credential: "tok-1", used: noop }];
   const box: any = { stored: null };
   const ctx: any = {
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "sandbox",
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
     db: recordDb(() => box.stored, (v) => { box.stored = v; }),
-    sibling: async () => mount,
+    sibling: async () => null,
+    sandboxForms: async () => forms,
   };
   const run = async () => { log.length = 0; return await plugin.invoke("shell", { command: "gh repo view" } as any, ctx) as any; };
   const registered = (name: string) => secrets.find((x) => x.name === name);
   const holds = (token: string) => secrets.some((x) => x.value === token || x.value === btoa(`x-access-token:${token}`));
+  const placeholder = () => box.stored?.wired?.[0]?.placeholder;
+  const withCredential = (credential: string | null) => { forms = [{ ...forms[0], credential }]; };
   try {
     await run();
-    if (secrets.length !== 2 || !box.stored.githubPlaceholder) throw new Error(`not wired in at creation: ${JSON.stringify(box.stored)}`);
+    if (secrets.length !== 2 || !placeholder()) throw new Error(`not wired in at creation: ${JSON.stringify(box.stored)}`);
     if (JSON.stringify(box.stored).includes("tok-1")) throw new Error("the record holds the token");
-    const placeholder = box.stored.githubPlaceholder;
+    const first = placeholder();
 
     await run();
     if (log.some((l) => /LIST|DELETE|POST GH/.test(l))) throw new Error(`an unchanged mount touched the box's secrets: ${log}`);
 
-    mount = { ...mount, policy: { write: "approval" } };
-    let r = await run();
-    if (secrets.length || box.stored.githubPlaceholder || box.stored.githubWithheld !== "gh"
-      || !log.includes("EXEC without GH_TOKEN") || !/approval or denied/.test(String(r.github))) {
-      throw new Error(`a policy held after creation: ${log} ${JSON.stringify(box.stored)}`);
-    }
-
-    mount = { ...mount, policy: null, credential: "tok-2" };
+    withCredential("tok-2");
     await run();
     // A new placeholder, not the old one: run9 accepts a deleted secret's placeholder
     // again and then does not substitute it (measured, 2026-09-15).
-    if (!holds("tok-2") || secrets.length !== 2 || !box.stored.githubPlaceholder || box.stored.githubPlaceholder === placeholder
-      || box.stored.githubWithheld || !log.includes("EXEC with GH_TOKEN")) {
-      throw new Error(`allowed again with a new token: ${log} ${JSON.stringify(box.stored)}`);
+    if (holds("tok-1") || !holds("tok-2") || secrets.length !== 2 || !placeholder() || placeholder() === first
+      || !log.includes("EXEC with GH_TOKEN")) {
+      throw new Error(`a replaced token: ${log} ${JSON.stringify(box.stored)}`);
     }
 
-    mount = { ...mount, credential: "tok-3" };
+    withCredential(null);
     await run();
-    if (holds("tok-2") || !holds("tok-3") || secrets.length !== 2) throw new Error(`a replaced token stayed registered: ${log}`);
-
-    mount = { ...mount, credential: null };
-    r = await run();
-    if (secrets.length || box.stored.githubPlaceholder || box.stored.githubWithheld || !log.includes("EXEC without GH_TOKEN")) {
+    if (secrets.length || box.stored.wired || !log.includes("EXEC without GH_TOKEN")) {
       throw new Error(`a removed token stayed: ${log} ${JSON.stringify(box.stored)}`);
     }
 
-    mount = { ...mount, credential: "tok-4" };
+    withCredential("tok-3");
     await run();
-    if (!holds("tok-4") || !log.includes("EXEC with GH_TOKEN")) throw new Error(`a token attached later was not wired in: ${log}`);
+    if (!holds("tok-3") || !log.includes("EXEC with GH_TOKEN")) throw new Error(`a token attached later was not wired in: ${log}`);
 
-    mount = { ...mount, policy: { write: "deny" } };
+    // A second GitHub account mounted while the box runs: both now claim GH_TOKEN, so the first comes out.
+    forms = [...forms, { alias: "gh-work", plugin: "github", form, credential: "tok-9", used: noop }];
+    let r = await run();
+    if (secrets.length || box.stored.wired || box.stored.leftOut?.length !== 2 || !log.includes("EXEC without GH_TOKEN")
+      || !/GH_TOKEN/.test(String(r.accounts?.gh))) {
+      throw new Error(`a clash after creation: ${log} ${JSON.stringify(box.stored)}`);
+    }
+    forms = [forms[0]];
+    r = await run();
+    if (!holds("tok-3") || box.stored.leftOut || r.accounts?.["gh-work"]) throw new Error(`the clash did not clear: ${log} ${JSON.stringify(box.stored)}`);
+
+    forms = [];
     failDelete = true;
     let threw = false;
     try { await run(); } catch { threw = true; }
     if (!threw || log.some((l) => l.startsWith("EXEC"))) throw new Error(`a failed revocation still ran the command: ${log}`);
-    if (!box.stored.githubPlaceholder) throw new Error("the record stopped naming access that is still registered");
+    if (!placeholder()) throw new Error("the record stopped naming access that is still registered");
     failDelete = false;
 
-    // A container from before this change: a placeholder and no digest.
-    secrets = [{ secret_id: "old1", name: "GH_TOKEN", value: "tok-5" }, { secret_id: "old2", name: "GH_TOKEN_GIT", value: btoa("x-access-token:tok-5") }];
-    box.stored = { boxId: "h-t-a-legacy", createdAt: 1, lastUsedAt: 1, execs: 1, sessions: [], githubPlaceholder: "__AP_GH_TOKEN_legacy__" };
-    mount = { plugin: "github", credential: "tok-5", db: null, policy: null };
+    // A record this code cannot account for: every registration on the box goes, then it is wired again.
+    secrets = [{ secret_id: "stray", name: "SOMETHING_ELSE", value: "x" }, ...secrets];
+    box.stored = { ...box.stored, wired: [{ alias: "gh" }] };
+    forms = [{ alias: "gh", plugin: "github", form, credential: "tok-3", used: noop }];
     await run();
-    if (!box.stored.githubTokenDigest || !registered("GH_TOKEN") || !log.includes("EXEC with GH_TOKEN")) {
+    if (registered("SOMETHING_ELSE") || !holds("tok-3") || secrets.length !== 2) {
+      throw new Error(`an unreadable wiring was not cleared: ${log} ${JSON.stringify(secrets)}`);
+    }
+
+    // A container from before `wired`: a GitHub placeholder and no mount named.
+    secrets = [{ secret_id: "old1", name: "GH_TOKEN", value: "tok-5" }, { secret_id: "old2", name: "GH_TOKEN_GIT", value: btoa("x-access-token:tok-5") }];
+    box.stored = { boxId: "h-t-a-legacy", createdAt: 1, lastUsedAt: 1, execs: 1, sessions: [], githubPlaceholder: "__AP_GH_TOKEN_legacy__", githubTokenDigest: "x" };
+    forms = [{ alias: "gh", plugin: "github", form, credential: "tok-5", used: noop }];
+    await run();
+    if (!registered("GH_TOKEN") || secrets.some((x) => x.secret_id.startsWith("old")) || box.stored.githubPlaceholder
+      || box.stored.wired?.[0]?.alias !== "gh" || !log.includes("EXEC with GH_TOKEN")) {
       throw new Error(`a container from before was not brought in line: ${log} ${JSON.stringify(box.stored)}`);
     }
   } finally {
@@ -2313,7 +2425,7 @@ await check("a release does not clear a record that names a different container,
       credential: JSON.stringify({ ak: "a", sk: "b" }),
       publicConfig: { endpoint: "https://sandbox.example" },
       db: recordDb(() => stored, (v) => { stored = v; }),
-      sibling: async () => null,
+      sibling: async () => null, sandboxForms: async () => [],
     };
     const result: any = await plugin.invoke("release", {} as any, ctx);
     return { result, stored, landed };
@@ -2365,7 +2477,7 @@ await check("the catalogue offers a mount's label, and does not call it an accou
     caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "tools",
     credential: null, publicConfig: {},
     db: recordDb(() => null),
-    sibling: async () => null, record: async () => {},
+    sibling: async () => null, sandboxForms: async () => [], record: async () => {},
   };
   // `search` answers from the catalogue, which is where the field lived.
   const found: any = await tools.invoke("search", { query: "get" }, ctx);

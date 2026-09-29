@@ -1,5 +1,5 @@
-import type { Json, MountPolicy } from "../core/types.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage, Released } from "./types.ts";
+import type { Json } from "../core/types.ts";
+import type { Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
 import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -65,9 +65,16 @@ export interface SandboxConfig {
    */
   network?: "open" | "none";
   /**
-   * Alias of this agent's GitHub mount. When it holds a token, `gh` and git in
-   * the container act as that account without holding the token. Empty turns
-   * it off.
+   * Whether the container acts as this agent's other accounts: "all" wires in
+   * every mount whose plugin declares a `SandboxForm` and holds a credential,
+   * "none" wires in nothing.
+   */
+  accounts?: "all" | "none";
+  /**
+   * Replaced by `accounts`. Before it, this named the GitHub mount to wire in,
+   * and an empty value turned wiring off; that one meaning is still honoured,
+   * because a mount set that way was switched off on purpose and must not be
+   * switched back on by an upgrade. Any other value does nothing.
    */
   github?: string;
 }
@@ -127,12 +134,10 @@ interface BoxState {
    * known, which results say rather than falling back to the setting.
    */
   image?: string;
-  /** What GH_TOKEN is in this container, when GitHub is wired in; never the token. */
-  githubPlaceholder?: string;
-  /** The GitHub mount whose token was not wired in because its policy holds or denies calls. */
-  githubWithheld?: string;
-  /** SHA-256 of the token wired in, so a replaced token is noticed without keeping it. */
-  githubTokenDigest?: string;
+  /** The mounts wired into this container (see `SandboxForm`); never a credential. */
+  wired?: Wired[];
+  /** Mounts that declare a container form and hold a credential but were left out, and why. */
+  leftOut?: LeftOut[];
   execs?: number;
   saved?: string[];
   /**
@@ -408,15 +413,7 @@ export function finished(
         "kept before then); read /etc/os-release",
     }),
     ...(state?.envs?.length ? { kept: state.envs.map((e) => e.name) } : {}),
-    ...(state?.githubWithheld ? {
-      github: `GitHub is not signed in here: calls on the \`${state.githubWithheld}\` mount are held for approval or ` +
-        "denied, and a container cannot ask for either. Use that mount's tools for GitHub.",
-    } : {}),
-    ...(state?.githubPlaceholder ? {
-      github: "gh and git work here as this agent's GitHub account, on GitHub only. GH_TOKEN holds a " +
-        "placeholder that is swapped for the token on the way out, so neither you nor anything in this " +
-        "container can read the token. If gh is missing, `apt-get update && apt-get install -y gh` installs it.",
-    } : {}),
+    ...accountsNote(state),
   };
 }
 
@@ -439,12 +436,45 @@ export function asBoxState(v: Json): BoxState | null {
   // than a miss: `null` throws at `s.boxId` or `e.name`, and one missing a
   // field ships `undefined` into the console's usage report (2026-09-12 for
   // the lists, 2026-09-15 for what is in them).
-  const { sessions, envs, ...rest } = o;
+  //
+  // `wired` is the exception: an entry dropped there would leave its
+  // registrations on the box, a credential still usable from inside with
+  // nothing here naming it to take away. So a list that does not read whole is
+  // read as "unknown", which the next command answers by deleting every
+  // registration on the box and wiring again. A record from before `wired`
+  // (`githubPlaceholder`) names the two GitHub registrations but no mount, so
+  // it matches none and is redone the same way.
+  const { sessions, envs, wired, leftOut, githubPlaceholder, githubTokenDigest: _d, githubWithheld: _w, ...rest } = o;
+  const wiring = Array.isArray(wired)
+    ? (wired.every(isWired) ? wired : [UNKNOWN_WIRING])
+    : wired !== undefined ? [UNKNOWN_WIRING]
+    : typeof githubPlaceholder === "string"
+      ? [{ alias: "", plugin: "github", placeholder: githubPlaceholder, digest: "", names: ["GH_TOKEN", "GH_TOKEN_GIT"] }]
+      : null;
   return {
     ...(rest as unknown as BoxState),
     ...(Array.isArray(sessions) ? { sessions: sessions.filter(isSession) } : {}),
     ...(Array.isArray(envs) ? { envs: envs.filter(isEnv) } : {}),
+    ...(wiring ? { wired: wiring } : {}),
+    ...(Array.isArray(leftOut) ? { leftOut: leftOut.filter(isLeftOut) } : {}),
   };
+}
+
+function isWired(v: unknown): v is Wired {
+  if (!v || typeof v !== "object") return false;
+  const w = v as Record<string, unknown>;
+  return typeof w.alias === "string" && typeof w.plugin === "string" && typeof w.placeholder === "string"
+    && typeof w.digest === "string"
+    && (w.names === null || (Array.isArray(w.names) && w.names.every((x) => typeof x === "string")))
+    && (w.summary === undefined || typeof w.summary === "string")
+    && (w.env === undefined || (typeof w.env === "object" && w.env !== null && !Array.isArray(w.env)
+      && Object.values(w.env).every((x) => typeof x === "string")));
+}
+
+function isLeftOut(v: unknown): v is LeftOut {
+  if (!v || typeof v !== "object") return false;
+  const l = v as Record<string, unknown>;
+  return typeof l.alias === "string" && typeof l.why === "string";
 }
 
 function isSession(v: unknown): v is Session {
@@ -488,7 +518,8 @@ export function unreadableEntries(v: Json): number {
   const o = v as Record<string, unknown>;
   const count = (list: unknown, readable: (x: unknown) => boolean) =>
     list === undefined ? 0 : Array.isArray(list) ? list.filter((x) => !readable(x)).length : 1;
-  return (asBoxState(v) === null ? 1 : 0) + count(o.sessions, isSession) + count(o.envs, isEnv);
+  return (asBoxState(v) === null ? 1 : 0) + count(o.sessions, isSession) + count(o.envs, isEnv)
+    + count(o.wired, isWired) + count(o.leftOut, isLeftOut);
 }
 
 const SESSIONS_KEPT = 20;
@@ -520,7 +551,7 @@ const DEFAULTS = {
   shell: "/bin/sh",
   shellPrefix: "",
   network: "open" as const,
-  github: "gh",
+  accounts: "all" as const,
   endpoint: "https://api.run.sys9.ai",
   image: "public.ecr.aws/docker/library/node:24-bookworm",
   project: "default",
@@ -777,142 +808,177 @@ export function defaultImageSentence(image: string): string {
     `and \`${m.install}\` installs more.`;
 }
 
+/** One mount wired into a container: what stands for its credential, never the credential. */
+interface Wired {
+  alias: string;
+  plugin: string;
+  /** What the container holds in the credential's place. */
+  placeholder: string;
+  /** SHA-256 of the credential wired in, so a replaced one is noticed without keeping it. */
+  digest: string;
+  /** The registrations made for it on the box, by name; `null` means unknown, so every one on the box. */
+  names: string[] | null;
+  /** The environment its commands run with; holds the placeholder, never the credential. */
+  env?: Record<string, string>;
+  /** The plugin's own sentence for the model (`SandboxForm.summary`). */
+  summary?: string;
+}
+
+interface LeftOut { alias: string; why: string }
+
+/** A wiring this record cannot account for; the next command clears the box and wires again. */
+const UNKNOWN_WIRING: Wired = { alias: "", plugin: "", placeholder: "", digest: "", names: null };
+
 /** One credential registered with run9's egress for one box. */
 interface Registration { name: string; value: string; placeholder: string; header: string; hosts: string[] }
 
 /**
- * What a GitHub token becomes for one container: two registrations with run9's
- * egress, and nothing the container can read.
- *
- * Measured on run9 (2026-09-15, fake values echoed back by httpbin): the proxy
- * replaces a placeholder only where it appears verbatim in a header, and only
- * for the hosts listed. `gh` sends `token P`, which it sees. git sends Basic
- * auth, `base64(user:P)`, which it does not, so git's header is registered
- * whole, as exactly what git sends for the helper in `githubEnv`.
+ * What stands for a mount's credential in one container. Qualified by box,
+ * because run9 requires a placeholder to be unique across the project, and
+ * fresh on every registration, because a placeholder that belonged to a deleted
+ * secret is accepted again and then not substituted (measured on run9,
+ * 2026-09-15: re-registered after a policy change, GitHub answered 401).
  */
-export function githubSecrets(
-  token: string, boxId: string,
+export function placeholderFor(
+  alias: string, boxId: string,
   fresh = [...crypto.getRandomValues(new Uint8Array(3))].map((b) => b.toString(16).padStart(2, "0")).join(""),
-): Registration[] {
-  // Qualified by box, because run9 requires a placeholder to be unique across the
-  // project, and fresh on every registration, because a placeholder that belonged
-  // to a deleted secret is accepted again and then not substituted (measured on
-  // run9, 2026-09-15: re-registered after a policy change, GitHub answered 401).
-  const placeholder = `__AP_GH_TOKEN_${boxId.slice(-8).replace(/[^A-Za-z0-9]/g, "_")}_${fresh}__`;
-  return [
-    { name: "GH_TOKEN", value: token, placeholder, header: "authorization",
-      hosts: ["api.github.com", "uploads.github.com"] },
-    { name: "GH_TOKEN_GIT", value: btoa(`x-access-token:${token}`), placeholder: btoa(`x-access-token:${placeholder}`),
-      header: "authorization", hosts: ["github.com"] },
-  ];
+): string {
+  const tag = (s: string) => s.replace(/[^A-Za-z0-9]/g, "_");
+  return `__AP_${tag(alias).toUpperCase()}_${tag(boxId.slice(-8))}_${fresh}__`;
+}
+
+/** A form's registrations for one credential and placeholder: the value goes to run9's egress, never into the box. */
+export function registrationsFor(form: SandboxForm, credential: string, placeholder: string): Registration[] {
+  return form.egress.map((e) => ({
+    name: e.name, value: e.value(credential), placeholder: e.placeholder(placeholder), header: e.header, hosts: [...e.hosts],
+  }));
 }
 
 /**
- * The environment every command runs with when GitHub is wired in: `gh` reads
- * GH_TOKEN, and git asks a helper scoped to https://github.com, which answers
- * with the same placeholder. Set per command rather than written to a file, so
- * it holds for a git installed later and there is no file to overwrite.
+ * Every name a form takes in a container: its registrations and its environment
+ * variables. git's helper is configured through `GIT_CONFIG_COUNT` and
+ * `GIT_CONFIG_KEY_0`, so a second plugin with a git helper would clash with
+ * github and both would be left out, though git takes several helpers. When
+ * that plugin arrives, number the helpers across forms instead of claiming
+ * index 0.
  */
-export function githubEnv(placeholder: string): Record<string, string> {
-  return {
-    GH_TOKEN: placeholder,
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
-    GIT_CONFIG_VALUE_0: `!f() { echo username=x-access-token; echo password=${placeholder}; }; f`,
-  };
+function claimedNames(form: SandboxForm): string[] {
+  return [...new Set([...form.egress.map((e) => e.name), ...Object.keys(form.env(""))])];
 }
 
-/**
- * Whether a container may act as a mount whose calls the gateway would police.
- *
- * Policy is enforced at the gateway, and a container holding the mount's token
- * reaches GitHub without passing through it: `gh pr create` or `git push` in
- * the box would skip the approval the same call through the gh tools waits for
- * So the token goes in only when nothing on that mount is
- * held or denied, reads included, since the box reads GitHub directly too.
- */
-export function policyLetsContainerAct(policy: MountPolicy | null | undefined): boolean {
-  if (!policy) return true;
-  return [policy.read, policy.write, ...Object.values(policy.tools ?? {})]
-    .every((d) => d === undefined || d === "allow");
+/** The environment a command runs with: every wired mount's, which names placeholders only. */
+function envFor(state: BoxState | null): Record<string, string> {
+  return Object.assign({}, ...(state?.wired ?? []).map((w) => w.env ?? {}));
 }
 
-const envFor = (state: BoxState | null) => state?.githubPlaceholder ? githubEnv(state.githubPlaceholder) : {};
+/** What the model is told about the accounts this container acts as, and the ones it does not. */
+function accountsNote(state: BoxState | null): Record<string, Json> {
+  const wired = (state?.wired ?? []).filter((w) => w.alias && w.summary);
+  const left = state?.leftOut ?? [];
+  if (!wired.length && !left.length) return {};
+  const accounts: Record<string, string> = {};
+  for (const w of wired) {
+    accounts[w.alias] = `${w.summary} The credential here is a placeholder swapped in on the way out, so nothing in ` +
+      "this container, you included, can read it.";
+  }
+  for (const l of left) accounts[l.alias] = `Not wired in: ${l.why}. Use that mount's own tools.`;
+  return { accounts };
+}
 
 type Run9Api = (method: string, path: string, body?: unknown) => Promise<any>;
 
-/** A token's identity, to notice it changed without keeping it: SHA-256, hex. */
+/** A credential's identity, to notice it changed without keeping it: SHA-256, hex. */
 async function tokenDigest(token: string): Promise<string> {
   const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+type Candidate = Awaited<ReturnType<PluginContext["sandboxForms"]>>[number];
+
 /**
- * The GitHub access a container of this mount may have right now: the token to
- * wire in or none, and the alias it was withheld for when policy is the reason.
- * Only a GitHub mount's credential, since the value goes to GitHub's hosts; and
- * a container with no network has no use for one.
+ * The accounts a container of this mount may act as right now: every mount
+ * whose plugin declares a container form and holds a credential, except where
+ * two claim one name — a container has one `GH_TOKEN` — which leaves both out
+ * and says so rather than picking one. None with no network (the credential
+ * could not be used) or with `accounts: "none"`.
  */
-async function githubWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>) {
+async function accountsWanted(ctx: PluginContext, cfg: ReturnType<typeof cfgOf>) {
   const open = cfg.network === undefined || cfg.network === "open";
-  const gh = cfg.github && open ? await ctx.sibling(cfg.github) : null;
-  const usable = gh?.plugin === "github" && gh.credential ? gh : null;
-  const held = !!usable && !policyLetsContainerAct(usable.policy);
-  return { token: usable && !held ? usable.credential! : null, withheld: held ? String(cfg.github) : null };
+  const off = cfg.accounts === "none" || cfg.github === "";
+  const found = open && !off ? (await ctx.sandboxForms()).filter((f) => f.credential) : [];
+  const claims = new Map<string, string[]>();
+  for (const f of found) for (const n of claimedNames(f.form)) claims.set(n, [...(claims.get(n) ?? []), f.alias]);
+  const wire: Array<Candidate & { credential: string; digest: string }> = [];
+  const leftOut: LeftOut[] = [];
+  for (const f of found) {
+    const clash = claimedNames(f.form).find((n) => claims.get(n)!.length > 1);
+    if (clash) {
+      leftOut.push({ alias: f.alias, why: `${clash} is also wanted by ${claims.get(clash)!.filter((a) => a !== f.alias).join(", ")}, and a container has one` });
+    } else {
+      wire.push({ ...f, credential: f.credential!, digest: await tokenDigest(f.credential!) });
+    }
+  }
+  return { wire, leftOut };
 }
 
-async function registerGithub(api: Run9Api, project: string, boxId: string, token: string): Promise<string> {
-  const regs = githubSecrets(token, boxId);
+async function register(api: Run9Api, project: string, boxId: string, c: Candidate & { credential: string; digest: string }): Promise<Wired> {
+  const placeholder = placeholderFor(c.alias, boxId);
+  const regs = registrationsFor(c.form, c.credential, placeholder);
   for (const g of regs) {
     await api("POST", `/projects/${project}/workspace/boxes/${boxId}/secrets`, {
       name: g.name, value: g.value, placeholder: g.placeholder,
       inject_header_name: g.header, allowed_hosts: g.hosts,
     });
   }
-  return regs[0]!.placeholder;
+  await c.used();
+  return {
+    alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name),
+    env: c.form.env(placeholder), summary: c.form.summary,
+  };
 }
 
 /**
- * Bring a running container's GitHub access in line with the mount, before a
- * command runs in it.
+ * Bring a container's accounts in line with the agent's mounts, at creation and
+ * before every later command.
  *
- * Checked only at creation, a mount switched to approval kept its container
- * signed in until release, hours under a lease (the #339 review), and a
- * token removed or replaced was the same gap. So the mount is read again here.
- * When what may be wired in has changed, the box's GitHub secrets are deleted,
- * which run9 honours on the very next request (measured 2026-09-15), and are
- * registered again only if allowed. Deleted by name rather than by id, so a
- * container from before this change is covered too. A deletion that fails stops
- * the command: running it would use access the mount no longer grants.
+ * Checked only at creation, a credential removed or replaced kept working in
+ * the box until release, hours under a lease (the #339 review). So the mounts
+ * are read again here. A wiring whose mount is gone, whose credential changed,
+ * or which now clashes is deleted from the box, which run9 honours on the very
+ * next request (measured 2026-09-15), and registered again only if still
+ * wanted. Deleted by the names recorded for it, or every registration on the
+ * box when the record cannot say. A deletion that fails stops the command:
+ * running it would use access the mounts no longer grant.
  */
-async function reconcileGithub(
+async function reconcileAccounts(
   ctx: PluginContext, cfg: ReturnType<typeof cfgOf>, state: BoxState, api: Run9Api,
+  want: Awaited<ReturnType<typeof accountsWanted>>,
 ): Promise<BoxState> {
-  const want = await githubWanted(ctx, cfg);
-  const digest = want.token ? await tokenDigest(want.token) : null;
-  // A placeholder with no digest is a container from before digests: unknown, so redone.
-  const had = state.githubPlaceholder ? (state.githubTokenDigest ?? "unrecorded") : null;
-  if (digest === had && (state.githubWithheld ?? null) === want.withheld) return state;
-  const next: BoxState = { ...state };
-  if (digest !== had) {
+  const had = state.wired ?? [];
+  const same = (w: Wired, c: { alias: string; plugin: string; digest: string }) =>
+    w.alias === c.alias && w.plugin === c.plugin && w.digest === c.digest && w.names !== null;
+  const keep = had.filter((w) => want.wire.some((c) => same(w, c)));
+  const drop = had.filter((w) => !keep.includes(w));
+  const add = want.wire.filter((c) => !had.some((w) => same(w, c)));
+  const leftSame = JSON.stringify(state.leftOut ?? []) === JSON.stringify(want.leftOut);
+  if (!drop.length && !add.length && leftSame) return state;
+  const next: BoxState = { ...state, wired: keep, leftOut: want.leftOut };
+  if (drop.length) {
     const base = `/projects/${cfg.project}/workspace/boxes/${state.boxId}/secrets`;
-    if (state.githubPlaceholder) {
-      const listed = await api("GET", base);
-      for (const s of Array.isArray(listed) ? listed : []) {
-        if (s?.name === "GH_TOKEN" || s?.name === "GH_TOKEN_GIT") await api("DELETE", `${base}/${s.secret_id}`);
-      }
+    const everything = drop.some((w) => w.names === null);
+    const names = new Set(drop.flatMap((w) => w.names ?? []));
+    const listed = await api("GET", base);
+    for (const s of Array.isArray(listed) ? listed : []) {
+      if (everything || names.has(s?.name)) await api("DELETE", `${base}/${s.secret_id}`);
     }
-    delete next.githubPlaceholder;
-    delete next.githubTokenDigest;
   }
-  delete next.githubWithheld;
-  if (want.withheld) next.githubWithheld = want.withheld;
   // Recorded as gone before registering again, so a registration that fails
   // does not leave the record promising access the box no longer has.
+  if (!next.wired!.length) delete next.wired;
+  if (!next.leftOut!.length) delete next.leftOut;
   await ctx.db.put(BOX_STORE, next as unknown as Json, BOX_KEY);
-  if (digest !== had && want.token) {
-    next.githubPlaceholder = await registerGithub(api, cfg.project, state.boxId, want.token);
-    next.githubTokenDigest = digest!;
+  for (const c of add) {
+    next.wired = [...(next.wired ?? []), await register(api, cfg.project, state.boxId, c)];
     await ctx.db.put(BOX_STORE, next as unknown as Json, BOX_KEY);
   }
   return next;
@@ -1127,8 +1193,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     { name: "graceMs", type: "number", default: 5000,
       summary: "How long a command may run before it is handed over as a background job. Short commands still answer in the call; longer ones return a job and the agent carries on." },
     { name: "maxOutputBytes", type: "number", summary: "Output longer than this is cut and the rest discarded, not kept anywhere. A command whose output matters should write it to a file and save that.", default: 24000 },
-    { name: "github", type: "string", default: DEFAULTS.github,
-      summary: "Alias of this agent's GitHub mount. When it holds a token, gh and git in the container act as that account without being able to read the token: they hold a placeholder that run9 swaps for it only on requests to GitHub. Empty turns this off." },
+    { name: "accounts", type: "string", choices: ["all", "none"], default: DEFAULTS.accounts,
+      summary: "\"all\" lets tools in the container act as this agent's other accounts: every mount whose plugin can (GitHub: gh and git) and that holds a credential. The container holds a placeholder that run9 swaps for the credential only on requests to that service's hosts, so nothing in it can read the credential. \"none\" turns this off." },
+    { name: "github", type: "string",
+      summary: "Replaced by accounts. An empty value still turns wiring off, as it did; any other value does nothing." },
     { name: "maxQuietMinutes", type: "number", default: 60,
       summary: "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
@@ -1530,12 +1598,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // What every result will report this container as: the setting, or the
       // image the kept environment itself started from. Unknown stays unknown.
       const image = from ? kept.find((e) => e.snapId === from)?.image : cfg.image;
-      // GitHub, when this agent has a GitHub mount holding a token. Asked at
-      // creation because run9 registers credentials per box. Only a GitHub
-      // mount's: the value goes to GitHub's hosts, and an alias naming anything
-      // else would send that mount's credential there. No network, no use for it.
-      // Read again before every later command (reconcileGithub).
-      const want = await githubWanted(ctx, cfg);
+      // The agent's other accounts this container acts as (`SandboxForm`). Asked
+      // at creation because run9 registers credentials per box, and read again
+      // before every later command (reconcileAccounts).
+      const want = await accountsWanted(ctx, cfg);
       try {
         await api("POST", `/projects/${cfg.project}/workspace/boxes`, {
           box_id: boxId,
@@ -1545,7 +1611,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           // Injection happens on run9's egress proxy, which only exists in
           // managed mode. Measured: under `normal` the placeholder goes out
           // unchanged, which would look like a working credential and not be one.
-          ...(want.token ? { network_mode: "managed" } : {}),
+          ...(want.wire.length ? { network_mode: "managed" } : {}),
           ...(cfg.shape ? { desired_shape: cfg.shape } : {}),
           description: `antiproton ${ctx.caller.tenantId}/${ctx.caller.agentId}`,
         });
@@ -1561,7 +1627,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       }
       // Recorded before anything else can fail: the box exists and is billed, so
       // a registration that throws must not leave it with no record naming it.
-      // The record gains the GitHub placeholder only once run9 has accepted it.
+      // The record gains each placeholder only once run9 has accepted it.
       state = {
         boxId, createdAt: Date.now(), lastUsedAt: Date.now(), execs: 0, saved: [],
         sessions: history,
@@ -1571,15 +1637,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
       // The value never enters the box and never reaches the model: only the
       // placeholder does, and run9 swaps it in on the way out.
-      const githubPlaceholder = want.token ? await registerGithub(api, cfg.project, boxId, want.token) : null;
       // `envs` above: release carries them over because a snapshot outlives its
       // box, and a new record written without them erased the list on the next
       // container's first command, stranding the snapshots in run9.
-      state = {
-        ...state,
-        ...(githubPlaceholder ? { githubPlaceholder, githubTokenDigest: await tokenDigest(want.token!) } : {}),
-        ...(want.withheld ? { githubWithheld: want.withheld } : {}),
-      };
+      state = await reconcileAccounts(ctx, cfg, state, api, want);
       await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
     }
 
@@ -1742,7 +1803,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       { command: argv, ...(workdir ? { workdir } : {}) },
     )).exec_id as string;
     // The box just created was wired from the mount a moment ago; any other is checked again.
-    if (!created) state = await reconcileGithub(ctx, cfg, state!, api);
+    if (!created) state = await reconcileAccounts(ctx, cfg, state!, api, await accountsWanted(ctx, cfg));
     let execId = await start(execArgv(cfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 

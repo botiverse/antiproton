@@ -244,6 +244,18 @@ each one offers rather than by looking for the id `sandbox`, so a second
 plugin that can run a container is chosen without the kernel learning its
 name.
 
+**Declare `sandboxForm` when the service has a command-line tool.** It says
+what a mount of the plugin becomes inside the agent's container: the environment
+variables the tool reads, the headers it sends the credential in, and the hosts
+those headers may go to. The container wires in every mount that declares one
+and holds a credential — found through `ctx.sandboxForms()`, never by a plugin's
+name — so a new service's CLI works in the container with no change there. The
+container only ever holds a placeholder; run9's egress proxy swaps the
+credential in on requests to the declared hosts, so the agent cannot read it
+there either. Two mounts that claim the same name (two GitHub accounts, one
+`GH_TOKEN`) are both left out, and the result says why. `github` is the first
+declarer: `gh` and `git`.
+
 **Reading a plugin's name is not always wrong; here is the test.** Naming a
 plugin is exactly what the deployment catalogue and a test fixture do, and they
 are right to: they are saying *which one to mount*. It becomes a defect when the
