@@ -1001,6 +1001,27 @@ export interface InboundEvent {
  * (src/runtime/activity.ts). Only the fields listed exist: the service refuses
  * an unknown field with 400, so a plugin passes these through and adds none.
  */
+/**
+ * What the agent is doing now, in the five values the service shows beside it
+ * (raft-agent-status.v1): the same set its own managed agents use.
+ */
+export type AgentStatus = "online" | "thinking" | "working" | "error" | "offline";
+
+/**
+ * One change of the agent's status. The runtime knows its own state, so it says
+ * it; the service keeps the latest by `occurredAt` and adds only what it observes
+ * itself (a credential gone quiet reads as offline).
+ */
+export interface StatusEvent {
+  /** Unique per agent for all time; the service dedupes on it. */
+  eventId: string;
+  status: AgentStatus;
+  /** A short human-readable phrase shown with the status. */
+  detail?: string;
+  /** ISO 8601. */
+  occurredAt: string;
+}
+
 export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "BridgeFatal" | "SessionEnd";
 export interface ActivityEvent {
   /** Unique per agent for all time; the service dedupes on it. */
@@ -1336,4 +1357,12 @@ export interface Plugin {
    * new meaning (the same word would read as the old thing to anyone who knew it).
    */
   reportActivity?(events: readonly ActivityEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
+
+  /**
+   * Tell the service the agent's status changes (see {@link StatusEvent}). Called
+   * by the runtime on the same pass as `reportActivity`, with the changes the same
+   * rows mean. Status is only ever "now": the runtime does not hold rows for it,
+   * so a throw loses these changes and the next one supersedes them.
+   */
+  reportStatus?(events: readonly StatusEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
 }

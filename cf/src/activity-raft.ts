@@ -20,11 +20,14 @@
 import { pendingTrace } from "../../src/trace/outbox.ts";
 import { flushTrace, type TraceSink } from "./trace-r2.ts";
 import { ACTIVITY_BATCH_MAX, activityEvents } from "../../src/runtime/activity.ts";
-import type { ActivityEvent } from "../../src/plugins/types.ts";
+import { statusEvents } from "../../src/runtime/status.ts";
+import type { ActivityEvent, StatusEvent } from "../../src/plugins/types.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
 export type ActivityGateway = {
   reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
+    Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>>;
+  reportStatus?(tenantId: string, agentId: string, events: readonly StatusEvent[]):
     Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>>;
 };
 
@@ -42,7 +45,7 @@ function setCursor(sql: Sql, through: number) {
 
 export async function flushActivity(
   gateway: ActivityGateway, sql: Sql, tenantId: string, agentId: string, limit = ACTIVITY_BATCH_MAX,
-): Promise<{ events: number; sent: number; through: number; skipped: string[] }> {
+): Promise<{ events: number; sent: number; through: number; skipped: string[]; statuses: number; statusError: string | null }> {
   const sent0 = activityCursor(sql);
   const { rows, through } = pendingTrace(sql, sent0, limit);
   const events = activityEvents(agentId, rows);
@@ -54,8 +57,22 @@ export async function flushActivity(
       else skipped.push(`${r.alias}: ${r.skipped}`);
     }
   }
+  // The same rows' status changes, after the activity they belong to was taken. Status is only ever
+  // "now": a failed send is reported and dropped, never a reason to hold rows — the next change says
+  // the current state anyway, and holding would make a status outage stall the activity feed.
+  const statuses = statusEvents(agentId, rows);
+  let statusError: string | null = null;
+  if (statuses.length && gateway.reportStatus) {
+    try {
+      for (const r of await gateway.reportStatus(tenantId, agentId, statuses)) {
+        if ("skipped" in r) skipped.push(`${r.alias} (status): ${r.skipped}`);
+      }
+    } catch (e) {
+      statusError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
+    }
+  }
   if (through > sent0) setCursor(sql, through);
-  return { events: events.length, sent, through: Math.max(sent0, through), skipped };
+  return { events: events.length, sent, through: Math.max(sent0, through), skipped, statuses: statuses.length, statusError };
 }
 
 /**
