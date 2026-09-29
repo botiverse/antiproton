@@ -85,7 +85,7 @@ font:14px/1.55 var(--mono-font)}
    has all four, while plugins and runtime leave the inspector and sidebar out. */
 body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
-body.shell[data-view=keys],body.shell[data-view=usage]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=keys],body.shell[data-view=usage],body.shell[data-view=admin]{grid-template-columns:56px 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 /* A zero-width column still paints its padding and border: without this the
    inspector showed as a sliver of text beside every view but agents. */
@@ -477,7 +477,7 @@ export function viewerBadge(who: string, viewer?: Viewer): string {
         <form method="post" action="/logout"><button type="submit" class="ghost">${ICONS.logout}sign out</button></form></div></details>`;
 }
 
-export function page(_taskId: string, who: string, agentId: string, viewer?: Viewer): string {
+export function page(_taskId: string, who: string, agentId: string, viewer?: Viewer & { admin?: boolean }): string {
   // The first argument is the conversation id the route used to pass. An
   // agent has one conversation now, so the page carries no task id; the
   // routes default to the agent's own. The parameter stays so the call site
@@ -508,6 +508,7 @@ ${HEAD_ASSETS}
   ${rail("plugins", "plugins")}
   ${rail("usage", "usage")}
   ${rail("keys", "api keys")}
+  ${viewer?.admin === true ? rail("admin", "admin") : ""}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
@@ -592,6 +593,12 @@ ${HEAD_ASSETS}
          the new key off the page. That is the shape of "shown once", not a bug: do not keep it around. -->
     <div class="body" id="api-keys" data-lazy hx-get="/ui/api-keys" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
   </section>
+  ${viewer?.admin === true ? `<section class="view" data-view="admin">
+    <div class="view-head"><h2>Admin</h2><span class="sub">who administers the deployment, and which model each agent serves</span></div>
+    <!-- Admin only: the rail item is not even drawn for anyone else, and the fragment route
+         checks again. Read when shown, not polled — an override is a deliberate act, not a feed. -->
+    <div class="body" id="admin" data-lazy hx-get="/ui/admin" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
+  </section>` : ""}
 </main>
 <aside class="inspector" id="inspector">
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
@@ -787,7 +794,7 @@ ${HEAD_ASSETS}
       const panel = document.getElementById('usage');
       if ([...q].length) { panel.setAttribute('hx-get', '/ui/usage?' + q); delete panel.dataset.ver; htmx.process(panel); }
     }
-    ap.show(['agents', 'plugins', 'usage', 'keys'].includes(v) ? v : 'agents');
+    ap.show(['agents', 'plugins', 'usage', 'keys', 'admin'].includes(v) ? v : 'agents');
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
@@ -1805,6 +1812,63 @@ export function apiKeysPanel(d: {
 ${d.keys.length
     ? `<table class="keys"><thead><tr><th>name</th><th>id</th><th>created</th><th>status</th><th></th></tr></thead><tbody>${d.keys.map(row).join("")}</tbody></table>`
     : `<div class="empty">no keys yet</div>`}`;
+}
+
+/**
+ * The admin area's model block: which model the deployment serves by default, and the
+ * overrides set for one tenant or one agent. The panel renders what it is handed and
+ * judges nothing about who is looking — the rail item is only drawn for admins and the
+ * fragment route checks again, server-side. Writes post back to the fragment, which
+ * applies them through the same /admin/models handler and re-renders this panel.
+ */
+export function adminPanel(d: {
+  default: { model: string; endpoint: string };
+  gateway: boolean;
+  overrides: Array<{ tenantId: string; agentId: string; model: string; setBy: string; setAt: number }>;
+}): string {
+  const target = `hx-target="#admin" hx-swap="innerHTML"`;
+  // An override's scope is which of the two ids it names: an agent, a tenant, or
+  // neither — the whole deployment. Empty ids mean the larger scope, so the same
+  // two fields serve all three. An agent is named with its tenant: the id alone
+  // could be any tenant's.
+  const scopeOf = (o: { tenantId: string; agentId: string }) =>
+    o.agentId ? `agent ${o.tenantId}/${o.agentId}` : o.tenantId ? `tenant ${o.tenantId}` : "deployment";
+  const setForm = (action: string, fields: string, button: string) => `
+    <form class="admin-set" hx-post="/ui/admin" ${target}>
+      <input type="hidden" name="action" value="${action}">${fields}
+      <label><span>model</span><input type="text" name="model" required autocomplete="off" spellcheck="false" placeholder="anthropic/claude-sonnet-5"></label>
+      <div class="row"><button type="submit">${button}</button></div>
+    </form>`;
+  const idField = (name: string, label: string) =>
+    `<label><span>${label}</span><input type="text" name="${name}" autocomplete="off" spellcheck="false" placeholder="blank = the whole deployment"></label>`;
+  const rows = d.overrides.map((o) => `<tr>
+    <td>${esc(scopeOf(o))}</td>
+    <td><code>${esc(o.model)}</code></td>
+    <td>${esc(o.setBy)}</td><td>${when(o.setAt) ?? ""}</td>
+    <td><form hx-post="/ui/admin" ${target}
+          hx-confirm="Remove this override? ${esc(scopeOf(o))} falls back to the default model on its next run.">
+      <input type="hidden" name="action" value="remove">
+      <input type="hidden" name="tenantId" value="${esc(o.tenantId)}">
+      <input type="hidden" name="agentId" value="${esc(o.agentId)}">
+      <button type="submit" class="ghost">remove</button>
+    </form></td></tr>`);
+  return `
+<h3>AI providers</h3>
+<div class="card"><div class="state"><b>${esc(d.default.model)}</b><span>${esc(d.default.endpoint)}</span>
+    ${d.gateway ? `<span class="tag">via AI Gateway</span>` : `<span class="tag">direct</span>`}</div>
+  <div class="hint" style="padding:8px 0 0">Every agent runs this model unless an override says otherwise.
+    A change takes effect the next time an agent runs.</div>
+  ${setForm("set-default", "", "set default")}
+</div>
+<h3>overrides — ${d.overrides.length}</h3>
+${d.overrides.length
+    ? `<table class="overrides"><thead><tr><th>scope</th><th>model</th><th>set by</th><th>set at</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    : `<div class="empty">no overrides — everyone is on the default</div>`}
+<details><summary>set an override</summary>
+  <div class="hint" style="padding:4px 0">an agent is named by its tenant and its id; a tenant by its id alone;
+    both blank is the deployment, the same as the default above</div>
+  ${setForm("set-override", `${idField("tenantId", "tenant")}${idField("agentId", "agent")}`, "save override")}
+</details>`;
 }
 
 /** The element a credential route swaps: one mount, re-rendered. */
