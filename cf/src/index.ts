@@ -83,6 +83,7 @@ import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOM
 import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
+import { logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -2066,6 +2067,7 @@ export class AgentDO extends DurableObject<Env> {
    * retried for ever.
    */
   async alarm() {
+    const alarmStarted = Date.now();
     const failures = this.#alarmFailures();
     if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
     try {
@@ -2082,6 +2084,8 @@ export class AgentDO extends DurableObject<Env> {
         // object either has a run in flight or it does not.
         const who = await this.owner();
         if (!who) { await this.ctx.storage.deleteAlarm(); return; }
+        // A start without its end, below, is a pass that was cut short (a deploy cancels one).
+        logEvent("alarm.start", { tenantId: who.tenantId, agentId: who.agentId, failures });
         const out = await rt.step(who.tenantId, who.agentId);
         // A container that could not be handed back is billed for merely
         // existing, so it is written down where diagnose can find it rather
@@ -2118,6 +2122,10 @@ export class AgentDO extends DurableObject<Env> {
           // Genuinely idle: stand down rather than wake every 30s for ever.
           await this.ctx.storage.deleteAlarm();
         }
+        logEvent("alarm.end", {
+          tenantId: who.tenantId, agentId: who.agentId, ms: Date.now() - alarmStarted,
+          wakeInMs: out.wakeInMs, usagePending, activityError: flushed.activityError ?? undefined, traceError: flushed.traceError ?? undefined,
+        });
       });
       this.#alarmFailures(0);
     } catch (e: any) {
@@ -2125,6 +2133,7 @@ export class AgentDO extends DurableObject<Env> {
       // two stalls stayed invisible. The fallback alarm above means the next
       // pass still happens.
       this.#alarmFailures(failures + 1);
+      logEvent("alarm.error", { object: this.ctx.id.toString(), ms: Date.now() - alarmStarted, failures: failures + 1, error: String(e?.message ?? e).slice(0, 200) });
       this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)");
       this.sql.exec("INSERT INTO alarm_errors VALUES (?,?)",
         Date.now(), String(e?.message ?? e).slice(0, 300));
@@ -2910,6 +2919,11 @@ export default {
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
+    return observed(request, () => route(request, env));
+  },
+};
+
+async function route(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     // The page's own script and font, public and immutable; the sign-in
     // page needs them before anyone is signed in.
@@ -3628,5 +3642,38 @@ export default {
       console.error("request failed:", url.pathname, e?.stack ?? e);
       return Response.json({ error: String(e?.message ?? e) }, { status: 500 });
     }
-  },
-};
+  }
+
+setLogSink((line) => console.log(line));
+
+/** The routes another system calls, or an operator does: logged one line each, and answered with a request id. */
+const OBSERVED = /^\/(provision|hooks|connect|login\/github\/callback|admin|v1)(\/|$)/;
+
+/**
+ * One `http` line per observed request, with Raft's trace id when it sends one (`X-Raft-Trace-Id`), and
+ * `X-Request-Id` on the answer, so one id finds the same request on both sides. The request id is the
+ * edge's own `cf-ray` when there is one, which is also what Cloudflare files the invocation under.
+ */
+async function observed(request: Request, handle: () => Promise<Response>): Promise<Response> {
+  const url = new URL(request.url);
+  if (!OBSERVED.test(url.pathname)) return handle();
+  const started = Date.now();
+  const requestId = request.headers.get("cf-ray") ?? crypto.randomUUID();
+  const line = {
+    method: request.method, route: routeOf(url.pathname), requestId,
+    traceId: request.headers.get("x-raft-trace-id") ?? undefined,
+    raftServerId: url.searchParams.get("raftServerId") ?? undefined,
+  };
+  let res: Response;
+  try {
+    res = await handle();
+  } catch (e) {
+    logEvent("http", { ...line, status: 500, ms: Date.now() - started, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+    throw e;
+  }
+  logEvent("http", { ...line, status: res.status, ms: Date.now() - started });
+  if (res.status === 101 || (res as { webSocket?: unknown }).webSocket) return res;
+  const out = new Response(res.body, res);
+  out.headers.set("x-request-id", requestId);
+  return out;
+}
