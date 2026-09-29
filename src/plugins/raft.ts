@@ -779,8 +779,14 @@ export const raftPlugin: Plugin = {
       // batch that carries status is tried once more without it — the activity goes through, and status
       // starts to land on the first pass after Raft accepts it. A second 400 is the batch's own fault
       // and throws as before.
+      //
+      // Temporary: remove this once Raft production accepts `status` on activity events. Until then it is
+      // also the path a status Raft does refuse would take, so it is said in the log every time — a
+      // warning that keeps appearing after Raft ships status means status itself is being refused.
       const plain = withoutStatus(events);
       if (!(error instanceof Error && /HTTP 400\b/.test(error.message)) || plain.length === events.length && plain.every((e, i) => e === events[i])) throw error;
+      const dropped = events.filter((e) => e.status !== undefined).length;
+      console.warn(`raft mount ${ctx.alias}: activity with status refused (${error.message}); resent without it, ${dropped} status change(s) dropped`);
       if (plain.length) await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: plain });
       return { sent: plain.length };
     }

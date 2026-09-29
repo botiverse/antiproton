@@ -712,7 +712,15 @@ await check("a Raft that does not know status yet gets the same batch without it
     { eventId: "raft_x:3", hookEventName: "Stop" as const, occurredAt: "2026-09-29T05:00:02.000Z", status: "online" as const },
   ];
   const calls = many(json(400, { errorCode: "event_field_unknown" }), json(200, { accepted: 2 }));
-  const out = await raftPlugin.reportActivity!(events, on.ctx);
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (m: string) => { warned.push(String(m)); };
+  let out: any;
+  try { out = await raftPlugin.reportActivity!(events, on.ctx); } finally { console.warn = warn; }
+  // The downgrade is said, with what Raft answered and what was lost, so it cannot hide a refusal of status itself.
+  if (warned.length !== 1 || !/raft mount raft/.test(warned[0]!) || !/event_field_unknown/.test(warned[0]!) || !/3 status change\(s\) dropped/.test(warned[0]!)) {
+    throw new Error(`the downgrade was not said: ${JSON.stringify(warned)}`);
+  }
   const second = JSON.parse(calls[1]!.init.body);
   if (!("sent" in out) || out.sent !== 2 || calls.length !== 2 || second.events.length !== 2 ||
       second.events.some((e: any) => "status" in e || !e.hookEventName) || JSON.parse(calls[0]!.init.body).events.length !== 3) {
