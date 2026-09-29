@@ -328,6 +328,63 @@ await check("the push repair re-registers through the same tool creation used, a
   assert(!missing.ok && /no live provisioned agent never-made/.test(missing.error), `an unknown agent: ${JSON.stringify(missing)}`);
 });
 
+await check("connections: a link for the agent's Raft only, bound to who asked, with the smallest scopes; GET shows the account, never a credential; DELETE detaches", async () => {
+  const f = fakeDeps();
+  const links: any[] = []; const detached: string[] = [];
+  const conns = new Map<string, any>();
+  f.deps.connections = {
+    registry: {
+      async get(t, r, p) { return conns.get(`${t}/${r}/${p}`) ?? null; },
+      async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); },
+      async remove(t, r, p) { return conns.delete(`${t}/${r}/${p}`); },
+    },
+    async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
+    async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
+    async confirm(_t, _a, _p, pending, raftUserId) {
+      return pending === "pend_ok_12345" && raftUserId === "u_owner" ? { ok: true, account: "octocat" } : { ok: false, error: "no such pending connection", missing: true };
+    },
+  };
+  await call(f.deps, "POST", "/agents", body(), "01JAGENT");
+  const path = "/agents/by-raft-agent/01JAGENT/connections/github";
+  const ret = `${WHO.raftOrigin}/agents/01JAGENT?tab=connections`;
+
+  const made = await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u_owner" } });
+  if (made.status !== 200 || made.body.url !== "https://ap.example/connect/start?t=signed" || JSON.stringify(made.body.scopes) !== '["public_repo"]') throw new Error(JSON.stringify(made));
+  if (links[0].raftUserId !== "u_owner" || links[0].returnUrl !== ret || links[0].provider !== "github") throw new Error(JSON.stringify(links[0]));
+  const priv = await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u_owner" }, access: "private" });
+  if (JSON.stringify(priv.body.scopes) !== '["repo"]') throw new Error(`private: ${JSON.stringify(priv.body)}`);
+
+  for (const [bad, param] of [
+    [{ returnUrl: "https://evil.example/x", initiatedBy: { raftUserId: "u" } }, "returnUrl"],
+    [{ returnUrl: ret }, "initiatedBy"],
+    [{ returnUrl: ret, initiatedBy: { raftUserId: "u" }, access: "all" }, "access"],
+  ] as const) {
+    const r = await call(f.deps, "POST", path, bad);
+    if (r.status !== 422 || r.body.error.param !== param) throw new Error(`${param}: ${r.status} ${r.text}`);
+  }
+  if ((await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u" }, extra: 1 })).status !== 400) throw new Error("an unknown field was accepted");
+  if ((await call(f.deps, "POST", "/agents/by-raft-agent/01JAGENT/connections/linear", { returnUrl: ret, initiatedBy: { raftUserId: "u" } })).status !== 404) throw new Error("an unknown provider was accepted");
+  if ((await call(f.deps, "POST", "/agents/by-raft-agent/NOPE/connections/github", { returnUrl: ret, initiatedBy: { raftUserId: "u" } })).status !== 404) throw new Error("an unknown agent got a link");
+
+  const none = await call(f.deps, "GET", path);
+  if (none.body.connected !== false || none.body.account !== null) throw new Error(JSON.stringify(none.body));
+  // Confirm is Raft's, server to server, with its session's user; the wrong user or id is a 404 and records nothing.
+  const wrongUser = await call(f.deps, "POST", `${path}/confirm`, { pending: "pend_ok_12345", raftUserId: "u_stranger" });
+  if (wrongUser.status !== 404 || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`a stranger confirmed: ${wrongUser.status} ${wrongUser.text}`);
+  if ((await call(f.deps, "POST", `${path}/confirm`, { pending: "pend_ok_12345" })).status !== 422) throw new Error("a confirm without the session's user was accepted");
+  const confirmed = await call(f.deps, "POST", `${path}/confirm`, { pending: "pend_ok_12345", raftUserId: "u_owner" });
+  if (confirmed.status !== 200 || confirmed.body.connected !== true || confirmed.body.account !== "octocat" || confirmed.body.connectedBy !== "u_owner") {
+    throw new Error(`confirm: ${confirmed.status} ${confirmed.text}`);
+  }
+  const got = await call(f.deps, "GET", path);
+  if (got.body.connected !== true || got.body.account !== "octocat" || got.body.connectedBy !== "u_owner" || /token|secret|ghp_/.test(got.text)) throw new Error(JSON.stringify(got.body));
+  const gone = await call(f.deps, "DELETE", path);
+  if (gone.status !== 204 || detached[0] !== `${[...f.rows.values()][0]!.agentId}/github` || (await call(f.deps, "GET", path)).body.connected !== false) throw new Error(`delete: ${gone.status} ${JSON.stringify(detached)}`);
+
+  const agent = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT");
+  if (JSON.stringify(agent.body.connections) !== '["github"]') throw new Error(`the agent does not say what it can connect: ${JSON.stringify(agent.body)}`);
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

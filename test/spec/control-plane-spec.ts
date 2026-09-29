@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Connections, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -18,7 +18,8 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   const provider = d1ProviderTokens(db, () => clock);
   const registry = d1ProvisionedAgents(db, () => clock);
   const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM service_tokens"),
-    db.prepare("DELETE FROM provider_tokens"), db.prepare("DELETE FROM provisioned_agents")]);
+    db.prepare("DELETE FROM provider_tokens"), db.prepare("DELETE FROM provisioned_agents"),
+    db.prepare("DELETE FROM provisioned_connections"), db.prepare("DELETE FROM connect_links")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -211,6 +212,21 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     await tokens.touch("s3");
     assert((await tokens.list())[0]!.lastUsedAt === clock, "a touch after an hour did not write");
     await tokens.touch("s9");
+  });
+
+  add("a connection is kept per agent and provider, replaced by a reconnect, and removed; a connect link is spent once", async () => {
+    const c = d1Connections(db);
+    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "octocat", connectedBy: "u1", connectedAt: 1000 });
+    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "hubot", connectedBy: "u2", connectedAt: 2000 });
+    const got = await c.get("t", "a1", "github");
+    assert(got?.account === "hubot" && got.connectedBy === "u2" && got.connectedAt === 2000, `reconnect: ${JSON.stringify(got)}`);
+    assert((await c.get("t", "a2", "github")) === null && (await c.get("t2", "a1", "github")) === null, "a connection leaked across agents or tenants");
+    assert((await c.remove("t", "a1", "github")) === true && (await c.get("t", "a1", "github")) === null, "remove");
+    assert((await c.remove("t", "a1", "github")) === false, "removing twice said it removed something");
+    assert((await c.consumeLink("n1", 1)) === true && (await c.consumeLink("n1", 2)) === false, "a link was spent twice");
+    const cols = async (t: string) => ((await db.prepare(`SELECT name FROM pragma_table_info('${t}')`).all()).results as any[]).map((r) => r.name).sort().join(",");
+    assert((await cols("provisioned_connections")) === "account,connected_at,connected_by,provider,raft_agent_id,tenant_id", `provisioned_connections ${await cols("provisioned_connections")}`);
+    assert((await cols("connect_links")) === "nonce,used_at", `connect_links ${await cols("connect_links")}`);
   });
 
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {

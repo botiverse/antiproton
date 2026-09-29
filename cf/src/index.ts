@@ -75,7 +75,8 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { d1Connections, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { CONNECT_CALLBACK_PATH, CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
@@ -1688,6 +1689,22 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("uiRenameMount", () => this.runtime().renameMount(tenantId, agentId, from, to));
   }
 
+  /** Connect flow (provision/connect.ts): a finished flow's token, held until Raft confirms its initiator. */
+  async connectionHold(tenantId: string, agentId: string, plugin: string, token: string, id: string, exp: number, raftUserId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionHold", () => this.runtime().holdConnection(tenantId, agentId, plugin, token, id, exp, raftUserId));
+  }
+
+  async connectionConfirm(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId));
+  }
+
+  async connectionDetach(tenantId: string, agentId: string, plugin: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionDetach", () => this.runtime().detachConnection(tenantId, agentId, plugin));
+  }
+
   async uiRemoveCredential(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("uiRemoveCredential", () => this.runtime().removeCredential(tenantId, agentId, alias));
@@ -2253,6 +2270,25 @@ const REFUSALS: Record<string, string> = {
 };
 
 /**
+ * What the connect flow (provision/connect.ts) needs from this deployment, or null where it cannot
+ * run: it shares the sign-in's OAuth App and session secret, and the callback lives on UI_ORIGIN.
+ */
+function connectDeps(env: Env): ConnectDeps | null {
+  const cfg = githubConfig(env);
+  if (!cfg) return null;
+  const stub = (tenantId: string, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  return {
+    origin: env.UI_ORIGIN!, secret: env.SESSION_SECRET!,
+    github: { clientId: cfg.clientId, clientSecret: cfg.clientSecret },
+    registry: d1Connections(env.CONTROL_DB),
+    hold: (tenantId, agentId, plugin, token, id, exp, raftUserId) =>
+      stub(tenantId, agentId).connectionHold(tenantId, agentId, plugin, token, id, exp, raftUserId),
+    exchange: (code, redirectUri) => githubExchangeCode({ ...cfg, redirectUri }, code),
+    now: () => Date.now(),
+  };
+}
+
+/**
  * The sign-in routes. None of them touches an agent object, so they run
  * before one is chosen. Returns null for any other path.
  */
@@ -2281,6 +2317,18 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
           "set-cookie": cookieHeader(LOGIN_COOKIE, await seal(env.SESSION_SECRET!, st), LOGIN_TTL_MS / 1000, "/login/github"),
         },
       });
+    }
+    // Connecting a provisioned agent to GitHub (provision/connect.ts): no console session involved,
+    // the signed link is the authority, and the callback is a subdirectory of the sign-in's.
+    case CONNECT_START_PATH: {
+      const deps = connectDeps(env);
+      if (!deps) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      return connectStart(url, deps);
+    }
+    case CONNECT_CALLBACK_PATH: {
+      const deps = connectDeps(env);
+      if (!deps) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      return connectCallback(request, url, deps);
     }
     case "/login/github/callback": {
       const cfg = githubConfig(env);
@@ -2589,6 +2637,16 @@ function provisionDeps(env: Env): ProvisionDeps {
       tool: (tenantId, agentId, name) => stub(tenantId, agentId).provisionTool(tenantId, agentId, name),
       pushStatus: (tenantId, agentId) => stub(tenantId, agentId).provisionPushStatus(tenantId, agentId),
     },
+    // Only where this deployment can run the flow: an OAuth App, a session secret and its own origin.
+    ...(connectDeps(env) ? {
+      connections: {
+        registry: d1Connections(env.CONTROL_DB),
+        link: (spec) => connectLink(env.UI_ORIGIN!, env.SESSION_SECRET!, spec, Date.now()),
+        detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
+        confirm: (tenantId, agentId, provider, pending, raftUserId) =>
+          stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId),
+      },
+    } : {}),
   };
 }
 
