@@ -36,7 +36,9 @@ export const CONNECT_HOLD_TTL_MS = 10 * 60_000;
 
 /** The smallest grant that does the job: public repositories unless private ones were asked for. */
 export function scopesFor(access: "public" | "private"): string[] {
-  return access === "private" ? ["repo"] : ["public_repo"];
+  // `gh` in the sandbox lists organisations and teams (read:org) and pushes workflow files (workflow).
+  // Reading a public repository needs no connection at all.
+  return [access === "private" ? "repo" : "public_repo", "read:org", "workflow"];
 }
 
 /** Where the browser may be sent back: only under the Raft origin the agent was made from. */

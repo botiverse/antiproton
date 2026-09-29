@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Connections, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Connections, d1Connectors, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -216,17 +216,35 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
 
   add("a connection is kept per agent and provider, replaced by a reconnect, and removed; a connect link is spent once", async () => {
     const c = d1Connections(db);
-    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "octocat", connectedBy: "u1", connectedAt: 1000 });
-    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "hubot", connectedBy: "u2", connectedAt: 2000 });
+    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "octocat", connectedBy: "u1", connectedAt: 1000, connectorId: null });
+    await c.put({ tenantId: "t", raftAgentId: "a1", provider: "github", account: "hubot", connectedBy: "u2", connectedAt: 2000, connectorId: "con_1" });
     const got = await c.get("t", "a1", "github");
-    assert(got?.account === "hubot" && got.connectedBy === "u2" && got.connectedAt === 2000, `reconnect: ${JSON.stringify(got)}`);
+    assert(got?.account === "hubot" && got.connectedBy === "u2" && got.connectedAt === 2000 && got.connectorId === "con_1", `reconnect: ${JSON.stringify(got)}`);
+    assert(JSON.stringify(await c.boundTo("t", "con_1")) === '["a1"]' && (await c.boundTo("t2", "con_1")).length === 0, "boundTo");
     assert((await c.get("t", "a2", "github")) === null && (await c.get("t2", "a1", "github")) === null, "a connection leaked across agents or tenants");
     assert((await c.remove("t", "a1", "github")) === true && (await c.get("t", "a1", "github")) === null, "remove");
     assert((await c.remove("t", "a1", "github")) === false, "removing twice said it removed something");
     assert((await c.consumeLink("n1", 1)) === true && (await c.consumeLink("n1", 2)) === false, "a link was spent twice");
     const cols = async (t: string) => ((await db.prepare(`SELECT name FROM pragma_table_info('${t}')`).all()).results as any[]).map((r) => r.name).sort().join(",");
-    assert((await cols("provisioned_connections")) === "account,connected_at,connected_by,provider,raft_agent_id,tenant_id", `provisioned_connections ${await cols("provisioned_connections")}`);
+    assert((await cols("provisioned_connections")) === "account,connected_at,connected_by,connector_id,provider,raft_agent_id,tenant_id", `provisioned_connections ${await cols("provisioned_connections")}`);
     assert((await cols("connect_links")) === "nonce,used_at", `connect_links ${await cols("connect_links")}`);
+  });
+
+  add("a connector is the tenant's: found only in its tenant, listed by provider, removed once; its events are kept", async () => {
+    const k = d1Connectors(db);
+    const sealed = { ciphertext: "c", iv: "i" };
+    await k.create({ id: "con_a", tenantId: "t", provider: "github", account: "octocat", creatorRaftUserId: "u1", sealed, createdAt: 1 });
+    await k.create({ id: "con_b", tenantId: "t", provider: "github", account: null, creatorRaftUserId: "u2", sealed, createdAt: 2 });
+    await k.create({ id: "con_c", tenantId: "t2", provider: "github", account: "x", creatorRaftUserId: "u3", sealed, createdAt: 3 });
+    const a = await k.get("t", "con_a");
+    assert(a?.account === "octocat" && a.creatorRaftUserId === "u1" && a.sealed.ciphertext === "c" && a.sealed.iv === "i" && a.createdAt === 1, `get: ${JSON.stringify(a)}`);
+    assert((await k.get("t2", "con_a")) === null, "a connector was found from another tenant");
+    assert((await k.list("t", "github")).map((x) => x.id).join() === "con_a,con_b", "list");
+    assert((await k.list("t", "linear")).length === 0, "list by provider");
+    assert((await k.remove("t2", "con_a")) === false && (await k.remove("t", "con_a")) === true && (await k.get("t", "con_a")) === null, "remove");
+    await k.record({ tenantId: "t", connectorId: "con_b", raftAgentId: "a1", action: "bind", actingRaftUserId: "u9", actingRole: "admin", at: 5 });
+    const ev = (await db.prepare("SELECT * FROM connector_events").all()).results as any[];
+    assert(ev.length === 1 && ev[0].acting_role === "admin" && ev[0].raft_agent_id === "a1", `events: ${JSON.stringify(ev)}`);
   });
 
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {

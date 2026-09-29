@@ -328,31 +328,54 @@ await check("the push repair re-registers through the same tool creation used, a
   assert(!missing.ok && /no live provisioned agent never-made/.test(missing.error), `an unknown agent: ${JSON.stringify(missing)}`);
 });
 
-await check("connections: a link for the agent's Raft only, bound to who asked, with the smallest scopes; GET shows the account, never a credential; DELETE detaches", async () => {
+/** Connections wired to in-memory stores: the registry, the tenant's connectors and their events, and what reached the agents. */
+function connectionsFake() {
   const f = fakeDeps();
-  const links: any[] = []; const detached: string[] = [];
-  const conns = new Map<string, any>();
+  const links: any[] = []; const detached: string[] = []; const attached: Array<{ agentId: string; sealed: any }> = [];
+  const conns = new Map<string, any>(); const connectors = new Map<string, any>(); const events: any[] = [];
+  const failDetach = new Set<string>();
+  let n = 0;
   f.deps.connections = {
     registry: {
       async get(t, r, p) { return conns.get(`${t}/${r}/${p}`) ?? null; },
       async put(c) { conns.set(`${c.tenantId}/${c.raftAgentId}/${c.provider}`, c); },
       async remove(t, r, p) { return conns.delete(`${t}/${r}/${p}`); },
+      async boundTo(t, id) { return [...conns.values()].filter((c) => c.tenantId === t && c.connectorId === id).map((c) => c.raftAgentId).sort(); },
     },
+    connectors: {
+      async create(c) { connectors.set(c.id, c); },
+      async get(t, id) { const c = connectors.get(id); return c && c.tenantId === t ? c : null; },
+      async list(t, p) { return [...connectors.values()].filter((c) => c.tenantId === t && c.provider === p); },
+      async remove(t, id) { const c = connectors.get(id); return !!c && c.tenantId === t && connectors.delete(id); },
+      async record(e) { events.push(e); },
+    },
+    newId: () => `con_${++n}`,
+    async attach(_t, agentId, _p, sealed) { attached.push({ agentId, sealed }); return { ok: true, account: "octocat" }; },
     async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
-    async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
+    async detach(_t, agentId, provider) {
+      if (failDetach.has(agentId)) throw new Error("the agent's object did not answer");
+      detached.push(`${agentId}/${provider}`); return true;
+    },
     async confirm(_t, _a, _p, pending, raftUserId) {
-      return pending === "pend_ok_12345" && raftUserId === "u_owner" ? { ok: true, account: "octocat" } : { ok: false, error: "no such pending connection", missing: true };
+      return pending === "pend_ok_12345" && raftUserId === "u_owner"
+        ? { ok: true, account: "octocat", sealed: { ciphertext: "sealed-token", iv: "iv" } }
+        : { ok: false, error: "no such pending connection", missing: true };
     },
   };
+  return { f, links, detached, attached, conns, connectors, events, failDetach };
+}
+
+await check("connections: a link for the agent's Raft only, bound to who asked, with the scopes gh needs; GET shows the account, never a credential; DELETE detaches", async () => {
+  const { f, links, detached } = connectionsFake();
   await call(f.deps, "POST", "/agents", body(), "01JAGENT");
   const path = "/agents/by-raft-agent/01JAGENT/connections/github";
   const ret = `${WHO.raftOrigin}/agents/01JAGENT?tab=connections`;
 
   const made = await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u_owner" } });
-  if (made.status !== 200 || made.body.url !== "https://ap.example/connect/start?t=signed" || JSON.stringify(made.body.scopes) !== '["public_repo"]') throw new Error(JSON.stringify(made));
+  if (made.status !== 200 || made.body.url !== "https://ap.example/connect/start?t=signed" || JSON.stringify(made.body.scopes) !== '["public_repo","read:org","workflow"]') throw new Error(JSON.stringify(made));
   if (links[0].raftUserId !== "u_owner" || links[0].returnUrl !== ret || links[0].provider !== "github") throw new Error(JSON.stringify(links[0]));
   const priv = await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u_owner" }, access: "private" });
-  if (JSON.stringify(priv.body.scopes) !== '["repo"]') throw new Error(`private: ${JSON.stringify(priv.body)}`);
+  if (JSON.stringify(priv.body.scopes) !== '["repo","read:org","workflow"]') throw new Error(`private: ${JSON.stringify(priv.body)}`);
 
   for (const [bad, param] of [
     [{ returnUrl: "https://evil.example/x", initiatedBy: { raftUserId: "u" } }, "returnUrl"],
@@ -383,6 +406,52 @@ await check("connections: a link for the agent's Raft only, bound to who asked, 
 
   const agent = await call(f.deps, "GET", "/agents/by-raft-agent/01JAGENT");
   if (JSON.stringify(agent.body.connections) !== '["github"]') throw new Error(`the agent does not say what it can connect: ${JSON.stringify(agent.body)}`);
+});
+
+await check("connectors: a confirmed connection is the tenant's; another agent is pointed at it by its creator or an admin, never by a stranger; disconnecting takes it off every agent", async () => {
+  const { f, attached, detached, conns, connectors, events, failDetach } = connectionsFake();
+  await call(f.deps, "POST", "/agents", body(), "01JAGENT");
+  await call(f.deps, "POST", "/agents", body({ raftAgentId: "01JOTHER" }), "01JOTHER");
+  const a = "/agents/by-raft-agent/01JAGENT/connections/github";
+  const b = "/agents/by-raft-agent/01JOTHER/connections/github";
+  const made = await call(f.deps, "POST", `${a}/confirm`, { pending: "pend_ok_12345", raftUserId: "u_owner" });
+  const id = made.body.connectorId;
+  if (made.status !== 200 || !id || connectors.get(id)?.creatorRaftUserId !== "u_owner" || connectors.get(id)?.sealed.ciphertext !== "sealed-token") {
+    throw new Error(`confirm did not make a connector: ${made.text}`);
+  }
+  // Every agent of the tenant sees the connector, and which one it uses; never the credential.
+  const listed = await call(f.deps, "GET", b);
+  const k = listed.body.connectors?.[0];
+  if (listed.body.connected !== false || listed.body.connectors.length !== 1 || k.id !== id || k.creatorRaftUserId !== "u_owner" || k.account !== "octocat" || k.current !== false || /sealed-token/.test(listed.text)) {
+    throw new Error(`list: ${listed.text}`);
+  }
+  if ((await call(f.deps, "GET", a)).body.connectors[0].current !== true) throw new Error("the connecting agent's connector is not marked current");
+
+  // A claim to be the creator is checked; an admin is Raft's word.
+  const stranger = await call(f.deps, "PUT", b, { connectorId: id, actingRaftUserId: "u_stranger", actingRole: "creator" });
+  if (stranger.status !== 403 || attached.length !== 0) throw new Error(`a stranger pointed an agent at someone's account: ${stranger.status} ${stranger.text}`);
+  if ((await call(f.deps, "PUT", b, { connectorId: id, actingRaftUserId: "u_x", actingRole: "owner" })).status !== 422) throw new Error("an unknown role was accepted");
+  if ((await call(f.deps, "PUT", b, { connectorId: "con_nope", actingRaftUserId: "u_owner", actingRole: "creator" })).status !== 404) throw new Error("an unknown connector was accepted");
+  const bound = await call(f.deps, "PUT", b, { connectorId: id, actingRaftUserId: "u_owner", actingRole: "creator" });
+  if (bound.status !== 200 || bound.body.connectorId !== id || attached[0]?.sealed.ciphertext !== "sealed-token" || conns.get("t-raft/01JOTHER/github")?.connectorId !== id) {
+    throw new Error(`bind: ${bound.status} ${bound.text} ${JSON.stringify(attached)}`);
+  }
+  const byAdmin = await call(f.deps, "PUT", b, { connectorId: id, actingRaftUserId: "u_admin", actingRole: "admin" });
+  if (byAdmin.status !== 200) throw new Error(`an admin could not bind: ${byAdmin.text}`);
+  if (!events.some((e) => e.action === "bind" && e.actingRaftUserId === "u_admin" && e.actingRole === "admin" && e.raftAgentId === "01JOTHER")) throw new Error(`no audit: ${JSON.stringify(events)}`);
+
+  // Disconnecting is also the creator's or an admin's. A partial failure keeps the connector, so the same call can finish.
+  const other = [...f.rows.values()].find((r) => r.raftAgentId === "01JOTHER")!.agentId;
+  if ((await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_stranger", actingRole: "creator" })).status !== 403 || !connectors.has(id)) throw new Error("a stranger disconnected it");
+  failDetach.add(other);
+  const half = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+  if (half.status !== 502 || !connectors.has(id) || half.body.failed?.[0]?.raftAgentId !== "01JOTHER") throw new Error(`partial: ${half.status} ${half.text}`);
+  failDetach.clear();
+  const done = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
+  if (done.status !== 200 || connectors.has(id) || [...conns.values()].some((c) => c.connectorId === id) || !detached.includes(`${other}/github`)) {
+    throw new Error(`disconnect: ${done.status} ${done.text} ${JSON.stringify(detached)}`);
+  }
+  if ((await call(f.deps, "GET", b)).body.connectors.length !== 0) throw new Error("a disconnected connector is still listed");
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

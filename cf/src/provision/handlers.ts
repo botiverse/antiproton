@@ -20,7 +20,7 @@
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
-import type { ConnectionRegistry, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
+import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
@@ -69,7 +69,13 @@ export interface ProvisionDeps {
   agent: ProvisionAgentOps;
   /** Connecting the agent to other services (connect.ts). Absent: the routes answer 404, as before. */
   connections?: {
-    registry: Pick<ConnectionRegistry, "get" | "put" | "remove">;
+    registry: Pick<ConnectionRegistry, "get" | "put" | "remove" | "boundTo">;
+    /** The tenant's connectors (0012): each connection is one, shared by the agents pointed at it. */
+    connectors: ConnectorStore;
+    newId(): string;
+    /** Put a connector's sealed credential on the agent's one mount of the provider's plugin. */
+    attach(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }):
+      Promise<{ ok: true; account: string | null } | { ok: false; error: string }>;
     /** The one-time link the browser opens; signed, ten minutes. */
     link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
       Promise<{ url: string; expiresAt: string }>;
@@ -77,7 +83,7 @@ export interface ProvisionDeps {
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
     /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts). */
     confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string):
-      Promise<{ ok: true; account: string | null } | { ok: false; error: string; missing?: true }>;
+      Promise<{ ok: true; account: string | null; sealed: { ciphertext: string; iv: string } } | { ok: false; error: string; missing?: true }>;
   };
 }
 
@@ -176,6 +182,11 @@ export async function handleProvision(
   who: ProviderTokenIdentity, deps: ProvisionDeps,
 ): Promise<Response | null> {
   const seg = path.split("/").filter(Boolean);
+  if (seg[0] === "connectors" && seg.length === 2 && method === "DELETE") {
+    const tenant = tenantFor(who, headers.raftServerId);
+    if (isFail(tenant)) return fail(tenant);
+    return disconnect(tenant, seg[1]!, body, deps);
+  }
   if (seg[0] !== "agents") return null;
   // On POST the body names the server; elsewhere the URL does.
   const serverForTenant = method === "POST" && seg.length === 1
@@ -317,8 +328,11 @@ export async function handleProvision(
 
 /**
  * `…/connections/:provider` (raft-agent-provider.v1, optional): POST a one-time link the browser
- * opens to connect the agent to a provider, GET what Raft may show about the connection, DELETE it.
- * The credential never passes here: it is sealed on the agent's mount by the flow in connect.ts.
+ * opens to connect the agent to a provider; `/confirm` makes the finished flow a connector of the
+ * tenant and points this agent at it; GET what Raft may show (this agent's connection and the
+ * tenant's connectors); PUT to point this agent at another connector; DELETE to take it off this
+ * agent only. A connector as a whole goes through `DELETE /connectors/:id`. No credential passes
+ * here in the clear: the flow in connect.ts seals it, and the handlers carry it only sealed.
  */
 async function connection(
   method: string, rest: string[], body: unknown, tenantId: string, byRaft: boolean, deps: ProvisionDeps,
@@ -350,9 +364,13 @@ async function connection(
         ? fail({ status: 404, code: "not_found", message: "no pending connection with that id for this agent and user; it may have expired or been used" })
         : fail({ status: 422, code: "connect_failed", message: r.error });
     }
+    // A finished authorization is a new connector of the tenant, created by whoever confirmed it.
     const connectedAt = deps.now();
-    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt });
-    return ok({ connected: true, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
+    const connectorId = c.newId();
+    await c.connectors.create({ id: connectorId, tenantId, provider: p, account: r.account, creatorRaftUserId: b.raftUserId, sealed: r.sealed, createdAt: connectedAt });
+    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: r.account, connectedBy: b.raftUserId, connectedAt, connectorId });
+    await c.connectors.record({ tenantId, connectorId, raftAgentId: row.raftAgentId, action: "create", actingRaftUserId: b.raftUserId, actingRole: "creator", at: connectedAt });
+    return ok({ connected: true, connectorId, account: r.account, connectedAt: new Date(connectedAt).toISOString(), connectedBy: b.raftUserId });
   }
 
   if (method === "POST") {
@@ -376,14 +394,110 @@ async function connection(
   }
   if (method === "GET") {
     const got = await c.registry.get(tenantId, row.raftAgentId, p);
-    return ok(got
-      ? { connected: true, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy }
-      : { connected: false, account: null, connectedAt: null, connectedBy: null });
+    const current = got?.connectorId ?? null;
+    const connectors = (await c.connectors.list(tenantId, p)).map((k) => ({
+      id: k.id, account: k.account, creatorRaftUserId: k.creatorRaftUserId, createdAt: new Date(k.createdAt).toISOString(), current: k.id === current,
+    }));
+    return ok({
+      ...(got
+        ? { connected: true, connectorId: current, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy }
+        : { connected: false, connectorId: null, account: null, connectedAt: null, connectedBy: null }),
+      connectors,
+    });
+  }
+  if (method === "PUT") {
+    const acting = actingField(body, ["connectorId"]);
+    if (isFail(acting)) return fail(acting);
+    const connectorId = (body as Record<string, unknown>).connectorId;
+    if (typeof connectorId !== "string" || !connectorId) return fail({ status: 422, code: "invalid", message: "connectorId is required", param: "connectorId" });
+    const k = await c.connectors.get(tenantId, connectorId);
+    if (!k || k.provider !== p) return fail({ status: 404, code: "not_found", message: `no ${p} connector ${connectorId} in this tenant` });
+    const refused = creatorRefused(k, acting);
+    if (refused) return fail(refused);
+    const r = await c.attach(tenantId, row.agentId, p, k.sealed);
+    if (!r.ok) return fail({ status: 422, code: "connect_failed", message: r.error });
+    const at = deps.now();
+    await c.registry.put({ tenantId, raftAgentId: row.raftAgentId, provider: p, account: k.account, connectedBy: acting.actingRaftUserId, connectedAt: at, connectorId: k.id });
+    await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: row.raftAgentId, action: "bind", ...acting, at });
+    return ok({ connected: true, connectorId: k.id, account: k.account, connectedAt: new Date(at).toISOString(), connectedBy: acting.actingRaftUserId });
   }
   if (method === "DELETE") {
+    const got = await c.registry.get(tenantId, row.raftAgentId, p);
     await c.detach(tenantId, row.agentId, p);
     await c.registry.remove(tenantId, row.raftAgentId, p);
+    // Who asked is optional here: removing a connection from an agent gives nobody an identity.
+    const acting = body === undefined || body === null ? null : actingField(body, []);
+    if (got?.connectorId && acting && !isFail(acting)) {
+      await c.connectors.record({ tenantId, connectorId: got.connectorId, raftAgentId: row.raftAgentId, action: "unbind", ...acting, at: deps.now() });
+    }
     return new Response(null, { status: 204 });
   }
   return null;
+}
+
+type Acting = { actingRaftUserId: string; actingRole: "creator" | "admin" };
+
+/** `{ actingRaftUserId, actingRole }` plus the named fields and nothing else: the session user Raft checked, and in what capacity. */
+function actingField(body: unknown, also: string[]): Acting | Fail {
+  const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+  const allowed = new Set(["actingRaftUserId", "actingRole", ...also]);
+  const unknown = Object.keys(b).find((k) => !allowed.has(k));
+  if (unknown) return { status: 400, code: "unknown_field", message: `unknown field ${unknown}`, param: unknown };
+  if (typeof b.actingRaftUserId !== "string" || !RAFT_ID.test(b.actingRaftUserId)) {
+    return { status: 422, code: "invalid", message: "actingRaftUserId is required: the user of Raft's current session", param: "actingRaftUserId" };
+  }
+  if (b.actingRole !== "creator" && b.actingRole !== "admin") {
+    return { status: 422, code: "invalid", message: "actingRole is creator or admin", param: "actingRole" };
+  }
+  return { actingRaftUserId: b.actingRaftUserId, actingRole: b.actingRole };
+}
+
+/**
+ * Pointing an agent at a connector hands it that account's identity, so only its creator or a server
+ * admin may. Raft checks both before calling, and only Raft knows who is an admin; a claim to be the
+ * creator can be checked here as well, and is.
+ */
+function creatorRefused(k: { creatorRaftUserId: string }, acting: Acting): Fail | null {
+  if (acting.actingRole === "creator" && acting.actingRaftUserId !== k.creatorRaftUserId) {
+    return { status: 403, code: "not_creator", message: "actingRole is creator, but this connector was created by someone else" };
+  }
+  return null;
+}
+
+/**
+ * `DELETE /connectors/:id`: the connector goes, and with it the credential on every agent pointed at it.
+ * The connector is removed only once every agent has been detached: a partial failure answers 502 with
+ * the agents still holding it, and the same call finishes the job.
+ */
+async function disconnect(tenantId: string, connectorId: string, body: unknown, deps: ProvisionDeps): Promise<Response> {
+  const c = deps.connections;
+  if (!c) return fail({ status: 404, code: "not_found", message: "this deployment has no connectors" });
+  const acting = actingField(body, []);
+  if (isFail(acting)) return fail(acting);
+  const k = await c.connectors.get(tenantId, connectorId);
+  if (!k) return fail({ status: 404, code: "not_found", message: `no connector ${connectorId} in this tenant` });
+  const refused = creatorRefused(k, acting);
+  if (refused) return fail(refused);
+  const provider = k.provider as ConnectionProvider;
+  const detached: string[] = [];
+  const failed: Array<{ raftAgentId: string; error: string }> = [];
+  for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
+    try {
+      const row = await deps.registry.get(tenantId, raftAgentId);
+      if (row) await c.detach(tenantId, row.agentId, provider);
+      await c.registry.remove(tenantId, raftAgentId, provider);
+      detached.push(raftAgentId);
+    } catch (e) {
+      failed.push({ raftAgentId, error: String((e as { message?: unknown })?.message ?? e).slice(0, 200) });
+    }
+  }
+  if (failed.length) {
+    return Response.json({
+      error: { code: "partially_disconnected", message: "some agents still hold this connector's credential; the same call finishes the job" },
+      detached, failed,
+    }, { status: 502, headers: { "cache-control": "no-store" } });
+  }
+  await c.connectors.remove(tenantId, k.id);
+  await c.connectors.record({ tenantId, connectorId: k.id, raftAgentId: null, action: "disconnect", ...acting, at: deps.now() });
+  return ok({ disconnected: true, connectorId: k.id, detached });
 }
