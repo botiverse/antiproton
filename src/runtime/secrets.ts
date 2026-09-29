@@ -28,6 +28,12 @@ export const AGENT_REF = "agent:";
  * credentials and hook secrets in the same table. Anything that hands a value
  * to the agent or at its direction reads only under this prefix, so it can
  * never reach a credential only the server uses.
+ *
+ * One way only: the server's resolver (`agentSecrets` below) reads any name,
+ * `kept:` rows included, because `ctx.agentSecret` reaches them through it
+ * (src/runtime/gateway.ts). A reference is set by the operator or built there,
+ * never from a plugin's own string, so that path does not widen what the
+ * agent can reach.
  */
 export const KEPT_PREFIX = "kept:";
 /** A name the agent may keep a secret under. */
