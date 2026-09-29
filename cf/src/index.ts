@@ -3530,6 +3530,7 @@ async function route(request: Request, env: Env): Promise<Response> {
             now: Date.now,
           };
           const actor = v!.sub ?? v!.email;
+          let error: string | null = null;
           if (request.method === "POST") {
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
@@ -3538,11 +3539,17 @@ async function route(request: Request, env: Env): Promise<Response> {
             // is named by tenant and id, a tenant by id alone, neither by the deployment.
             const scope = fields.agentId ? "agent" : fields.tenantId ? "tenant" : "deployment";
             const body = { scope, tenantId: fields.tenantId, agentId: fields.agentId, ...(form.get("action") === "remove" ? {} : { model: fields.model }) };
-            await adminModels(form.get("action") === "remove" ? "DELETE" : "PUT", body, actor, deps);
+            const write = await adminModels(form.get("action") === "remove" ? "DELETE" : "PUT", body, actor, deps);
+            if (!write.ok) {
+              // A refused write must read as a refusal: the handler's reason goes back on
+              // the panel, above the forms, or the re-render looks like a silent success.
+              const why = await write.json().catch(() => null) as { error?: { message?: string } } | null;
+              error = why?.error?.message ?? "the change was not saved";
+            }
           }
           const read = await adminModels("GET", null, actor, deps);
-          const data = await read.json();
-          return new Response(adminPanel(data as any), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
+          const data: Parameters<typeof adminPanel>[0] = await read.json();
+          return new Response(adminPanel({ ...data, error }), { headers: { "cache-control": "no-store", "content-type": "text/html; charset=utf-8" } });
         }
         case "/ui/api-keys":
         case "/ui/api-keys/new":

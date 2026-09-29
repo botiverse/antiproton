@@ -75,6 +75,20 @@ check("the set forms post to the fragment and the override form takes tenant and
   must(!/undefined|null|NaN/.test(html), "nothing may render as undefined, null or NaN");
 });
 
+check("a refused write says why, above the forms, and the table shows nothing new", () => {
+  // The handler's reason comes back on the panel: a bad model name, or an agent named
+  // without its tenant, is a 422 with a message — silent re-render would read as success.
+  const reason = "model is a gateway name like anthropic/claude-sonnet-5, or a bare DeepSeek model";
+  const html = adminPanel({ default: { model: "m", endpoint: "e" }, gateway: false,
+    overrides: [{ tenantId: "t9", agentId: "", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }], error: reason });
+  must(html.indexOf(`<div class="err">${reason}</div>`) < html.indexOf("<table"),
+    "the reason must sit above the forms, where a returning person reads first");
+  must((html.match(/<tr>/g) ?? []).length === 2, "only the header and the existing row — the refused one must not appear");
+  const clean = adminPanel({ default: { model: "m", endpoint: "e" }, gateway: false,
+    overrides: [{ tenantId: "t9", agentId: "", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }] });
+  must(!/<div class="err">/.test(clean), "a panel without an error must not draw an error box");
+});
+
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);

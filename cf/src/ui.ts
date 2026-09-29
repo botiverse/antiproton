@@ -1825,6 +1825,8 @@ export function adminPanel(d: {
   default: { model: string; endpoint: string };
   gateway: boolean;
   overrides: Array<{ tenantId: string; agentId: string; model: string; setBy: string; setAt: number }>;
+  /** Why the last write did not land, straight from the handler. Absent means it landed. */
+  error?: string | null;
 }): string {
   const target = `hx-target="#admin" hx-swap="innerHTML"`;
   // An override's scope is which of the two ids it names: an agent, a tenant, or
@@ -1854,6 +1856,7 @@ export function adminPanel(d: {
     </form></td></tr>`);
   return `
 <h3>AI providers</h3>
+${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
 <div class="card"><div class="state"><b>${esc(d.default.model)}</b><span>${esc(d.default.endpoint)}</span>
     ${d.gateway ? `<span class="tag">via AI Gateway</span>` : `<span class="tag">direct</span>`}</div>
   <div class="hint" style="padding:8px 0 0">Every agent runs this model unless an override says otherwise.
