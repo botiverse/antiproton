@@ -93,6 +93,18 @@ export function reconcileSeed(
   return { update: config };
 }
 
+/**
+ * `http`'s keyless search, withheld while the agent has an Exa mount that can search: two search tools
+ * would leave the model to pick, and the keyless one answers a few queries and then serves a captcha.
+ * An Exa mount with no key to use leaves the keyless one in place, so the agent still has a search.
+ */
+export function keylessSearchWithheld(
+  records: ReadonlyArray<Pick<MountRecord, "alias" | "plugin" | "secretRef">>, operatorExa: boolean,
+): string[] {
+  const exa = records.some((m) => m.plugin === "exa" && m.secretRef !== null && (m.secretRef !== OPERATOR_EXA_REF || operatorExa));
+  return exa ? records.filter((m) => m.plugin === "http").map((m) => `${m.alias}.search`) : [];
+}
+
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {
   alias: string; plugin: string;
@@ -349,6 +361,8 @@ export const OPERATOR_SECRET_REF = "operator:model";
 /** Same idea for the sandbox account. Kept distinct so a tenant can be moved
  *  onto its own run9 project without touching its model binding. */
 export const OPERATOR_RUN9_REF = "operator:run9";
+/** The operator's Exa key, for the web search every agent is seeded with. */
+export const OPERATOR_EXA_REF = "operator:exa";
 
 export interface RuntimeDeps {
   ctx: any;
@@ -367,6 +381,9 @@ export interface RuntimeDeps {
    *  `node` mount resolves to no credential and its tools refuse to run, which
    *  is the right failure: a deployment without keys should not start boxes. */
   operatorRun9?: { ak: string; sk: string };
+  /** The operator's Exa key, behind OPERATOR_EXA_REF. Absent means the `search`
+   *  mount resolves to no credential and says it cannot search. */
+  operatorExa?: string;
   /** The key under which per-agent secrets are sealed at rest: 32 bytes,
    *  base64, a Worker secret. Absent means `agent:` references cannot be
    *  stored or resolved, and the credential form says so. */
@@ -662,7 +679,9 @@ export class AgentRuntime {
       resolve: async (ref: string) =>
         ref === OPERATOR_RUN9_REF
           ? (deps.operatorRun9 ? JSON.stringify(deps.operatorRun9) : null)
-          : envSecrets.resolve(ref),
+          : ref === OPERATOR_EXA_REF
+            ? (deps.operatorExa || null)
+            : envSecrets.resolve(ref),
     };
     this.#kek = kekPromise;
     this.#secrets = {
@@ -1258,6 +1277,10 @@ export class AgentRuntime {
     // something that matters should use it, and use an allowlist too.
     { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
       secretRef: null, policy: null },
+    // Search with the operator's Exa key. The keyless search on `web` answers a few queries and then
+    // serves a captcha; this one's host is fixed by the plugin, so the key can only ever reach Exa.
+    { alias: "search", plugin: "exa", config: { account: "Exa" },
+      secretRef: OPERATOR_EXA_REF, policy: null },
     // GitHub, the first real user of the credential page. Seeded with no
     // token, so it reads public repositories; the person attaches their
     // own token there and the mount acts as that account. Writes are open:
@@ -1478,9 +1501,11 @@ export class AgentRuntime {
           reads: t.reads,
           exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
         })),
-      ), this.#deps.withholdTools ?? [])),
+      ), [...(this.#deps.withholdTools ?? []), ...keylessSearchWithheld(records, !!this.#deps.operatorExa)])),
     };
   }
+
+
 
   /**
    * The agent, built from storage.

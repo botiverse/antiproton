@@ -1299,8 +1299,8 @@ await check("every plugin the catalogue seeds is installed", async () => {
   }
   // Without this the rule passes on an empty catalogue, which is the one state
   // that would make every agent start with nothing and say nothing about it.
-  if (SEEDED_PLUGINS.size !== 6) {
-    throw new Error(`expected six seeded plugins, found ${SEEDED_PLUGINS.size}: ${[...SEEDED_PLUGINS].join(", ")}`);
+  if (SEEDED_PLUGINS.size !== 7) {
+    throw new Error(`expected seven seeded plugins, found ${SEEDED_PLUGINS.size}: ${[...SEEDED_PLUGINS].join(", ")}`);
   }
   // The sandbox in particular, and for a reason that is not about mounts.
   //
