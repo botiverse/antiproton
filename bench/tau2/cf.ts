@@ -24,7 +24,7 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { canonJson as canon, canonArgs, actionMatch as grade } from "./grade.ts";
 import { createHash } from "node:crypto";
-import { beginRun, driverCommit, recordRun, teeRun, workerBuild } from "../record.ts";
+import { beginRun, driverCommit, recordRun, teeRun, workerBuild, workerModel } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
@@ -421,6 +421,7 @@ if (act) {
 }
 const recorded = recordRun(run, {
   bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT, sim: SIM,
+  provider: await workerModel(BASE),
   tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER,
   ...(DEAFNESS ? { ignoreAnswers: DEAFNESS } : {}),
   startedAt: new Date(t0Run).toISOString(),
