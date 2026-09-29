@@ -572,3 +572,41 @@ export function d1Connectors(db: D1Database): ConnectorStore {
     },
   };
 }
+
+/** One model choice (0013_model_overrides.sql); `tenantId` and `agentId` are "" for a wider scope. */
+export interface ModelOverride { tenantId: string; agentId: string; model: string; setBy: string; setAt: number }
+
+export interface ModelOverrides {
+  /** The most specific choice for this agent: its own, then its tenant's, then the deployment's; null for the env default. */
+  effective(tenantId: string, agentId: string): Promise<string | null>;
+  list(): Promise<ModelOverride[]>;
+  put(o: ModelOverride): Promise<void>;
+  remove(tenantId: string, agentId: string): Promise<boolean>;
+}
+
+export function d1ModelOverrides(db: D1Database): ModelOverrides {
+  return {
+    async effective(tenantId, agentId) {
+      const r = await db.prepare(
+        `SELECT model FROM model_overrides
+          WHERE (tenant_id = ?1 AND agent_id = ?2) OR (tenant_id = ?1 AND agent_id = '') OR (tenant_id = '' AND agent_id = '')
+          ORDER BY (tenant_id <> '') + (agent_id <> '') DESC LIMIT 1`,
+      ).bind(tenantId, agentId).first<any>();
+      return r ? String(r.model) : null;
+    },
+    async list() {
+      const r = await db.prepare("SELECT * FROM model_overrides ORDER BY tenant_id, agent_id").all<any>();
+      return (r.results ?? []).map((x) => ({ tenantId: String(x.tenant_id), agentId: String(x.agent_id), model: String(x.model), setBy: String(x.set_by), setAt: Number(x.set_at) }));
+    },
+    async put(o) {
+      await db.prepare(
+        `INSERT INTO model_overrides (tenant_id, agent_id, model, set_by, set_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (tenant_id, agent_id) DO UPDATE SET model = excluded.model, set_by = excluded.set_by, set_at = excluded.set_at`,
+      ).bind(o.tenantId, o.agentId, o.model, o.setBy, o.setAt).run();
+    },
+    async remove(tenantId, agentId) {
+      const r = await db.prepare("DELETE FROM model_overrides WHERE tenant_id = ? AND agent_id = ?").bind(tenantId, agentId).run();
+      return (r.meta?.changes ?? 0) > 0;
+    },
+  };
+}

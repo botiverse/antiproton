@@ -68,6 +68,7 @@
     "test/provision-runtime.ts",
     "test/exa-default.ts",
     "test/model-gateway.ts",
+    "test/admin-models.ts",
     "test/admin-mount.ts",
     "test/prompt-contributions.ts",
     "test/control-plane.ts",

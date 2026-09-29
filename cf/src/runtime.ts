@@ -10,6 +10,7 @@
  * about and never will: which tenant is asking, which mounts they have, which
  * credential each mount resolves to, and who is allowed to spend what.
  */
+import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { operatorRequest, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
@@ -1489,15 +1490,17 @@ export class AgentRuntime {
    * deliberate act with a visible binding row behind it, not a default that
    * quietly applies to everyone who forgot to configure one.
    */
-  async bindOperatorModel(tenantId: string, agentId: string | null = null) {
+  /** `model`: the operator's account's model for this agent when not the deployment's default (model_overrides). */
+  async bindOperatorModel(tenantId: string, agentId: string | null = null, model?: string | null) {
     await this.ready();
     const m = this.#deps.operatorModel;
     if (!m) throw new Error("no operator model configured on this deployment");
+    const chosen = model || m.model;
     await this.store.setModelBinding({
       tenantId, agentId, provider: "openai-compatible",
-      model: m.model, baseUrl: m.baseUrl, secretRef: OPERATOR_SECRET_REF,
+      model: chosen, baseUrl: m.baseUrl, secretRef: OPERATOR_SECRET_REF,
     });
-    return { tenantId, agentId, model: m.model };
+    return { tenantId, agentId, model: chosen };
   }
 
   /** Mounts as the model sees them: a plain name, plus the mount-qualified
@@ -1683,7 +1686,9 @@ export class AgentRuntime {
       model: {
         provider: binding.provider,
         id: binding.model,
-        contextWindow: this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW,
+        // The bound model's own window when the table knows it: an agent can be on another model than
+        // the deployment's (model_overrides).
+        contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
       },
       tools: offered,
       extraTools: extraTools as any,
@@ -1952,7 +1957,12 @@ export class AgentRuntime {
   async takeJob(tenantId: string, agentId: string, jobId: string) {
     await this.ready();
     const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
-    return (await this.agent(tenantId, agentId, session)).takeJob(jobId);
+    const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId);
+    if (!job) return job;
+    // The model the queued call asks for, when it spends the operator's account; null leaves it at the
+    // deployment's default, which is also what an agent with its own credential got before.
+    const b = await this.store.getModelBinding(tenantId, agentId);
+    return { ...job, operatorModel: b?.secretRef === OPERATOR_SECRET_REF ? b.model : null };
   }
 
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {

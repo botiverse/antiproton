@@ -4,7 +4,7 @@
  * test/provision-runtime.ts can drive them through a real runtime, gateway and store.
  */
 import type { Json } from "../../../src/core/types.ts";
-import type { AgentRuntime } from "../runtime.ts";
+import { OPERATOR_SECRET_REF, type AgentRuntime } from "../runtime.ts";
 import { PUSH_KEY, PUSH_STORE, raftPlugin } from "../../../src/plugins/raft.ts";
 import type { ProvisionTool, PushStatus } from "./handlers.ts";
 
@@ -22,6 +22,7 @@ export const PROVIDER_HOME = "u-raft-provider";
 export async function adoptProvisionedAgent(
   rt: AgentRuntime, tenantId: string, agentId: string,
   spec: { name: string; instructions: string; raftOrigin: string; avatar: string },
+  model?: string | null,
 ): Promise<{ ok: true; avatar: string } | { ok: false; error: string }> {
   await rt.ready();
   const existing = await rt.store.loadAgent(tenantId, agentId);
@@ -30,8 +31,11 @@ export async function adoptProvisionedAgent(
   const persona = { ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: "raft" };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
-  // The deployment's model, always: the contract offers no choice.
-  await rt.bindOperatorModel(tenantId, agentId);
+  // The operator's model, as the deployment's admin chose it for this agent (model_overrides); Raft's
+  // contract offers no choice of its own. `model` null is a choice that could not be read: an existing
+  // binding stays as it is, and a new agent gets the default. An agent's own credential is not touched.
+  const bound = await rt.store.getModelBinding(tenantId, agentId);
+  if (!(bound && (bound.secretRef !== OPERATOR_SECRET_REF || model === null))) await rt.bindOperatorModel(tenantId, agentId, model);
   // The same default mounts every agent gets — memory (state), artifacts, web, GitHub, sandbox, tools — the way the
   // console and the Agents API seed them. Missed on the first cut: Ant2 on staging had the raft mount and nothing
   // else, so the agent truthfully said it had no memory. Idempotent: adds only what is missing.

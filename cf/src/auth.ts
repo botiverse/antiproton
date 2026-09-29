@@ -31,6 +31,20 @@ export interface Viewer {
   /** The tenant that agent lives in: each self-registered person is their
    *  own (quota and data are per tenant); older identities are "demo". */
   tenantId?: string;
+  /** The identity key a GitHub sign-in resolved to (`github:<id>`): what an admin list names. */
+  sub?: string;
+}
+
+/**
+ * Whether this viewer administers the deployment: the operator's own token, or a GitHub identity the
+ * deployment lists in ADMIN_IDENTITIES (comma-separated keys, `github:<numeric id>`). Decided here, on
+ * the server, for the page to render and for every admin route to check again.
+ */
+export function isAdmin(v: Viewer | null, env: { ADMIN_IDENTITIES?: string }): boolean {
+  if (!v) return false;
+  if (v.source === "automation") return true;
+  if (v.source !== "github" || !v.sub) return false;
+  return (env.ADMIN_IDENTITIES ?? "").split(",").map((x) => x.trim()).filter(Boolean).includes(v.sub);
 }
 
 /** What the session cookie carries. Sealed, never trusted unsealed. */
@@ -212,7 +226,11 @@ export async function resolveViewer(request: Request, env: ViewerEnv, opts: { al
         // A GitHub session without its agent is not an identity: the key is
         // the mapping, and a cookie that lost it names nobody.
         if (typeof s.agentId !== "string" || !s.agentId) return null;
-        return { email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "github", agentId: s.agentId, tenantId: typeof s.tenantId === "string" && s.tenantId ? s.tenantId : "demo" };
+        return {
+          email: s.who, name: s.name ?? null, username: s.username ?? null, picture: s.picture ?? null, source: "github",
+          agentId: s.agentId, tenantId: typeof s.tenantId === "string" && s.tenantId ? s.tenantId : "demo",
+          ...(typeof s.sub === "string" && s.sub ? { sub: s.sub } : {}),
+        };
       }
       // Any other source (the Raft sessions that once existed) names nobody:
       // the holder signs in again.
