@@ -352,9 +352,10 @@ function connectionsFake() {
     newId: () => `con_${++n}`,
     async attach(_t, agentId, _p, sealed) { attached.push({ agentId, sealed }); return { ok: true, account: "octocat" }; },
     async link(spec) { links.push(spec); return { url: "https://ap.example/connect/start?t=signed", expiresAt: "2026-09-29T07:00:00.000Z" }; },
-    async detach(_t, agentId, provider) {
+    async detach(_t, agentId, provider) { detached.push(`${agentId}/${provider}`); return true; },
+    async detachIfFrom(_t, agentId, provider, sealed) {
       if (failDetach.has(agentId)) throw new Error("the agent's object did not answer");
-      detached.push(`${agentId}/${provider}`); return true;
+      detached.push(`${agentId}/${provider}/${sealed.ciphertext}`); return true;
     },
     async confirm(_t, _a, _p, pending, raftUserId) {
       return pending === "pend_ok_12345" && raftUserId === "u_owner"
@@ -372,10 +373,10 @@ await check("connections: a link for the agent's Raft only, bound to who asked, 
   const ret = `${WHO.raftOrigin}/agents/01JAGENT?tab=connections`;
 
   const made = await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u_owner" } });
-  if (made.status !== 200 || made.body.url !== "https://ap.example/connect/start?t=signed" || JSON.stringify(made.body.scopes) !== '["public_repo","read:org","workflow"]') throw new Error(JSON.stringify(made));
+  if (made.status !== 200 || made.body.url !== "https://ap.example/connect/start?t=signed" || JSON.stringify(made.body.scopes) !== '["public_repo","read:org"]') throw new Error(JSON.stringify(made));
   if (links[0].raftUserId !== "u_owner" || links[0].returnUrl !== ret || links[0].provider !== "github") throw new Error(JSON.stringify(links[0]));
   const priv = await call(f.deps, "POST", path, { returnUrl: ret, initiatedBy: { raftUserId: "u_owner" }, access: "private" });
-  if (JSON.stringify(priv.body.scopes) !== '["repo","read:org","workflow"]') throw new Error(`private: ${JSON.stringify(priv.body)}`);
+  if (JSON.stringify(priv.body.scopes) !== '["repo","read:org"]') throw new Error(`private: ${JSON.stringify(priv.body)}`);
 
   for (const [bad, param] of [
     [{ returnUrl: "https://evil.example/x", initiatedBy: { raftUserId: "u" } }, "returnUrl"],
@@ -448,7 +449,7 @@ await check("connectors: a confirmed connection is the tenant's; another agent i
   if (half.status !== 502 || !connectors.has(id) || half.body.failed?.[0]?.raftAgentId !== "01JOTHER") throw new Error(`partial: ${half.status} ${half.text}`);
   failDetach.clear();
   const done = await call(f.deps, "DELETE", `/connectors/${id}`, { actingRaftUserId: "u_owner", actingRole: "creator" });
-  if (done.status !== 200 || connectors.has(id) || [...conns.values()].some((c) => c.connectorId === id) || !detached.includes(`${other}/github`)) {
+  if (done.status !== 200 || connectors.has(id) || [...conns.values()].some((c) => c.connectorId === id) || !detached.includes(`${other}/github/sealed-token`)) {
     throw new Error(`disconnect: ${done.status} ${done.text} ${JSON.stringify(detached)}`);
   }
   if ((await call(f.deps, "GET", b)).body.connectors.length !== 0) throw new Error("a disconnected connector is still listed");

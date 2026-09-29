@@ -79,6 +79,8 @@ export interface ProvisionDeps {
     /** The one-time link the browser opens; signed, ten minutes. */
     link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
       Promise<{ url: string; expiresAt: string }>;
+    /** Remove it only while the mount still holds this connector's credential, not a key put there since. */
+    detachIfFrom(tenantId: string, agentId: string, provider: ConnectionProvider, sealed: { ciphertext: string; iv: string }): Promise<boolean>;
     /** Remove the provider's credential from the agent's mount. */
     detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
     /** Make a held connection the mount's credential, for the Raft user it was held for (connect.ts). */
@@ -479,12 +481,14 @@ async function disconnect(tenantId: string, connectorId: string, body: unknown, 
   const refused = creatorRefused(k, acting);
   if (refused) return fail(refused);
   const provider = k.provider as ConnectionProvider;
+  // Not atomic with a PUT that lands between `boundTo` and the delete below: that agent keeps a copy of
+  // the credential and a connectorId that no longer exists, until it is pointed elsewhere or disconnected.
   const detached: string[] = [];
   const failed: Array<{ raftAgentId: string; error: string }> = [];
   for (const raftAgentId of await c.registry.boundTo(tenantId, k.id)) {
     try {
       const row = await deps.registry.get(tenantId, raftAgentId);
-      if (row) await c.detach(tenantId, row.agentId, provider);
+      if (row) await c.detachIfFrom(tenantId, row.agentId, provider, k.sealed);
       await c.registry.remove(tenantId, raftAgentId, provider);
       detached.push(raftAgentId);
     } catch (e) {

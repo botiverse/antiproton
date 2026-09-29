@@ -1709,6 +1709,11 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("connectionAttach", () => this.runtime().attachSealedConnection(tenantId, agentId, plugin, sealed));
   }
 
+  async connectionDetachIfFrom(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionDetachIfFrom", () => this.runtime().detachConnectionIfFrom(tenantId, agentId, plugin, sealed));
+  }
+
   async connectionDetach(tenantId: string, agentId: string, plugin: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("connectionDetach", () => this.runtime().detachConnection(tenantId, agentId, plugin));
@@ -2660,6 +2665,8 @@ function provisionDeps(env: Env): ProvisionDeps {
         detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
         confirm: (tenantId, agentId, provider, pending, raftUserId) =>
           stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId),
+        detachIfFrom: (tenantId, agentId, provider, sealed) =>
+          stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
         attach: (tenantId, agentId, provider, sealed) =>
           stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
         connectors: d1Connectors(env.CONTROL_DB),

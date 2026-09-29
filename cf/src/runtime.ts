@@ -969,6 +969,21 @@ export class AgentRuntime {
   }
 
   /**
+   * Remove the credential only while it is still the connector's (`sealed`): a key put on the mount
+   * since, in the console, is not the connector's to take when the connector goes. Compared by value,
+   * because each attach seals afresh and the ciphertexts never match.
+   */
+  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed): Promise<boolean> {
+    await this.ready();
+    const kek = await this.#kek;
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!kek || !mount || !isAgentRef(mount.secretRef)) return false;
+    const held = await this.store.getSecret(tenantId, agentId, mount.secretRef!.slice(agentRef("").length));
+    if (!held || await open(kek, held) !== await open(kek, sealed)) return false;
+    return this.removeCredential(tenantId, agentId, mount.alias);
+  }
+
+  /**
    * Take back the key this agent attached, and give the mount whatever the
    * catalogue says it had — the shared account for a seeded mount, nothing for
    * one that was never seeded with a reference.
