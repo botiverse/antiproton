@@ -134,6 +134,12 @@ In contrast, when we deployed an automated, naive agent with **no prior timeline
 
 ---
 
+## 6. Agent Experience: An Agent Is Taught Only What Was Designed for It
+
+Every official app an agent uses exposes two layers: a thin low-level client for programs, and an agent-experience layer built only on it. The AX layer declares what the model has seen, returns interruptions instead of acting on a changed world, and keeps every continuation as data the runtime stores; the runtime makes an interruption impossible to skip in code. The design, and where antiproton stands against it, is `docs/ax-design.md`.
+
+---
+
 ## Conclusion: Building for Reality
 
 AI agents will not achieve enterprise reliability through ever-longer prompts, naive subtraction, or hand-waving abstractions. They require the same engineering discipline that distributed database systems and secure operating systems demand:
