@@ -3,6 +3,7 @@
 | file | what it is | authoritative? |
 |---|---|---|
 | [`agents-api.md`](agents-api.md) | OpenAI Agents API compatibility guide, SDK configuration, and endpoint reference | yes — preview API guide |
+| [`ax-design.md`](ax-design.md) | Agent Experience (AX) architecture: how official apps talk to agents in two layers, premise tracking, and structured interruptions | yes — design specification |
 | [`plugins.md`](plugins.md) | how to write, configure, observe, and test plugins in Antiproton | yes — plugin authoring guide |
 | [`philosophy.md`](philosophy.md) | the core philosophy, engineering invariants, and distributed systems rationale behind antiproton | yes — design manifesto |
 | [`pi-upstream.md`](pi-upstream.md) | how to stay in sync with pi — the seams, the copied source, the contracts no type expresses, the deliberate divergences, and the upgrade checklist | yes, for anything pi-related |
