@@ -4,8 +4,8 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
-import { type ActivityEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
+import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
+import { type ActivityEvent, type StatusEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
@@ -894,11 +894,33 @@ export class ToolGateway {
    */
   async reportActivity(tenantId: string, agentId: string, events: readonly ActivityEvent[]):
     Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
+    return this.#toReporters(tenantId, agentId, (p) => !!p.reportActivity, (p, ctx) => p.reportActivity!(events, ctx));
+  }
+
+  /**
+   * The agent's status changes, to every mount whose plugin reports status. The
+   * same gate as activity; a plugin that throws propagates, and the caller decides
+   * what that costs (for status, nothing is kept: the next change supersedes).
+   */
+  async reportStatus(tenantId: string, agentId: string, events: readonly StatusEvent[]):
+    Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
+    return this.#toReporters(tenantId, agentId, (p) => !!p.reportStatus, (p, ctx) => p.reportStatus!(events, ctx));
+  }
+
+  /**
+   * One report to every mount whose plugin takes it: the mount exists, its plugin
+   * is switched on for this agent and is the version the mount pins.
+   */
+  async #toReporters(
+    tenantId: string, agentId: string,
+    takes: (plugin: Plugin) => boolean,
+    send: (plugin: Plugin, ctx: PluginContext) => Promise<{ sent: number } | { skipped: string }>,
+  ): Promise<Array<{ alias: string; sent: number } | { alias: string; skipped: string }>> {
     const out: Array<{ alias: string; sent: number } | { alias: string; skipped: string }> = [];
     const choices = await this.#store.pluginChoices(tenantId, agentId);
     for (const mount of await this.#store.listMounts(tenantId, agentId)) {
       const plugin = this.#plugins.get(mount.plugin);
-      if (!plugin?.reportActivity) continue;
+      if (!plugin || !takes(plugin)) continue;
       if (!pluginEnabled(this.#seeded.has(mount.plugin), choices[mount.plugin])) {
         out.push({ alias: mount.alias, skipped: `${mount.plugin} is switched off for this agent` });
         continue;
@@ -910,8 +932,7 @@ export class ToolGateway {
       const credential = mount.secretRef
         ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
         : null;
-      const context = this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential);
-      out.push({ alias: mount.alias, ...(await plugin.reportActivity(events, context)) });
+      out.push({ alias: mount.alias, ...(await send(plugin, this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential))) });
     }
     return out;
   }

@@ -2072,6 +2072,8 @@ export class AgentDO extends DurableObject<Env> {
         const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
+        // An unconfirmed status is resent only by a pass, and an idle agent has no other reason for one.
+        if (flushed.statusError) { usagePending = true; console.warn(`status report failed for ${who.agentId}: ${flushed.statusError}`); }
         if (out.wakeInMs === null && usagePending) {
           await this.ctx.storage.setAlarm(Date.now() + 60_000);
         } else if (out.wakeInMs !== null) {

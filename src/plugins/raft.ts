@@ -8,7 +8,7 @@
  */
 import type { Json } from "../core/types.ts";
 import { createRaft, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
-import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { originProblem, type ActivityEvent, type StatusEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -29,6 +29,8 @@ const NOTICE_TEXT_MAX = 3_600;
 const PUSH_REGISTRATION_PATH = "/internal/agent-api/push-webhook";
 const ACTIVITY_PATH = "/internal/agent-api/activity";
 const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
+const STATUS_PATH = "/internal/agent-api/status";
+const STATUS_SCHEMA = "raft-agent-status.v1";
 const PUSH_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 type ObjectValue = Record<string, any>;
@@ -694,6 +696,11 @@ export const raftPlugin: Plugin = {
             eventId: `${current.agentId}:session-end:${Date.now()}`, hookEventName: "SessionEnd", occurredAt: new Date().toISOString(),
           }] });
         } catch { /* deregistration matters more than the last status line */ }
+        try {
+          await call(ctx, "POST", STATUS_PATH, { schema: STATUS_SCHEMA, events: [{
+            eventId: `${current.agentId}:offline:${Date.now()}`, status: "offline", occurredAt: new Date().toISOString(),
+          }] });
+        } catch { /* likewise; a Raft without the endpoint yet shows offline on its own once the credential goes quiet */ }
       }
       let remoteDeregistration: "confirmed" | "unconfirmed" = "confirmed";
       try { await call(ctx, "DELETE", PUSH_REGISTRATION_PATH); }
@@ -745,6 +752,26 @@ export const raftPlugin: Plugin = {
       };
     }
     throw new Error(`unknown raft tool: ${name}`);
+  },
+
+  /**
+   * The agent's status changes, in Raft's status standard: this runtime knows its
+   * state and says it. The same gate as activity (push on, an account to speak
+   * with). A Raft that does not have the status endpoint yet answers 404; that is
+   * "not listening", said as skipped, so this can ship before Raft does.
+   */
+  async reportStatus(events: readonly StatusEvent[], ctx: PluginContext) {
+    const state = await loadPushState(ctx);
+    if (!state.enabled) return { skipped: "push is disabled for this mount, so Raft is not following this agent" };
+    if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
+    if (events.length === 0) return { sent: 0 };
+    try {
+      await call(ctx, "POST", STATUS_PATH, { schema: STATUS_SCHEMA, events });
+    } catch (error) {
+      if (error instanceof Error && /HTTP 404\b/.test(error.message)) return { skipped: "this Raft has no status endpoint yet" };
+      throw error;
+    }
+    return { sent: events.length };
   },
 
   /**
