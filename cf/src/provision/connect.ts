@@ -20,6 +20,7 @@
  *      GitHub skips its consent page for a user who has authorised the App before — would have put
  *      their account on this agent (account-linking CSRF).
  */
+import { clip, logEvent } from "../../../src/core/log.ts";
 import { constantTimeEqual, cookieHeader, clearCookieHeader, GITHUB_AUTHORIZE, open, randomToken, readCookie, seal } from "../auth.ts";
 import type { ConnectionRegistry } from "../control-plane.ts";
 
@@ -113,6 +114,7 @@ export async function connectStart(url: URL, deps: ConnectDeps): Promise<Respons
   if (!(await deps.registry.consumeLink(link.nonce, deps.now()))) {
     return page(409, "This link was already used. Start again from where you clicked Connect.");
   }
+  logEvent("connect.start", { tenantId: link.tenantId, agentId: link.agentId, provider: link.provider, scopes: link.scopes.join(" ") });
   const oauthState = randomToken();
   const authorize = new URL(GITHUB_AUTHORIZE);
   authorize.searchParams.set("client_id", deps.github.clientId);
@@ -145,21 +147,26 @@ export async function connectCallback(request: Request, url: URL, deps: ConnectD
   const done = (location: string) => new Response(null, {
     status: 302, headers: { location, "set-cookie": clearCookieHeader(FLOW_COOKIE, CONNECT_CALLBACK_PATH), "cache-control": "no-store" },
   });
-  if (url.searchParams.get("error")) return done(back(link, "denied"));
+  const said = (outcome: string, reason?: string) =>
+    logEvent("connect.callback", { tenantId: link.tenantId, agentId: link.agentId, provider: link.provider, outcome, reason });
+  if (url.searchParams.get("error")) { said("denied", clip(url.searchParams.get("error"))); return done(back(link, "denied")); }
   const code = url.searchParams.get("code");
-  if (!code) return done(back(link, "failed", { reason: "no_code" }));
+  if (!code) { said("failed", "no_code"); return done(back(link, "failed", { reason: "no_code" })); }
   let token: string;
   try {
     token = await deps.exchange(code, new URL(CONNECT_CALLBACK_PATH, deps.origin).toString());
   } catch (e) {
     console.error(`connect: ${link.provider} exchange failed for ${link.tenantId}/${link.agentId}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    said("failed", "exchange");
     return done(back(link, "failed", { reason: "exchange" }));
   }
   const id = randomToken(18);
   const held = await deps.hold(link.tenantId, link.agentId, CONNECTION_PLUGIN[link.provider], token, id, deps.now() + CONNECT_HOLD_TTL_MS, link.raftUserId);
   if (!held.ok) {
     console.error(`connect: holding ${link.provider} for ${link.tenantId}/${link.agentId} failed: ${held.error}`);
+    said("failed", "hold");
     return done(back(link, "failed", { reason: "hold" }));
   }
+  said("pending");
   return done(back(link, "pending", { pending: id }));
 }

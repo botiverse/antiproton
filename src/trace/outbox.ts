@@ -28,6 +28,7 @@
  * no row (no detector exists yet) — "no row" must not be read as "nothing
  * happened" for either.
  */
+import { logEvent } from "../core/log.ts";
 import type { SqlHost } from "../store/pi-storage.ts";
 
 type Sql = SqlHost["sql"];
@@ -114,6 +115,15 @@ export function appendTrace(sql: Sql, rows: readonly TraceRow[]) {
     // that seam is the place it shows.
     if (!Number.isFinite(row.at) || !row.kind || !row.spanId) continue;
     if (!isKind(row.kind) || !isVerdict(row.verdict)) continue;
+    // The same row, as a log line as it is written: the per-agent timeline, readable before the export
+    // batches it to R2. Written inside the caller's transaction, so a rolled-back one leaves a line whose
+    // row never landed; `spanId` is what checks a line against the export.
+    logEvent("trace", {
+      tenantId: row.tenantId, agentId: row.agentId, spanId: row.spanId, kind: row.kind, status: row.status, verdict: row.verdict,
+      ms: row.ms === undefined ? null : Math.round(row.ms), at: new Date(Math.floor(row.at)).toISOString(),
+      mount: typeof row.attrs?.mount === "string" ? row.attrs.mount : undefined,
+      tool: typeof row.attrs?.tool === "string" ? row.attrs.tool : undefined,
+    });
     sql.exec(
       "INSERT INTO trace_outbox(at, tenant_id, agent_id, kind, span_id, parent_id, status, verdict, ms, attrs) " +
       "VALUES (?,?,?,?,?,?,?,?,?,?)",

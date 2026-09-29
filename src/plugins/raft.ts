@@ -6,6 +6,7 @@
  * origin. Responses are projected so a new server field cannot silently enter
  * the model's context.
  */
+import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import { createRaft, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
 import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
@@ -189,7 +190,15 @@ async function call(
       redirect: "manual",
       signal: AbortSignal.timeout(timeout(ctx)),
     };
-    response = await fetch(url, init);
+    const started = Date.now();
+    const line = { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, method, route: routeOf(url.pathname) };
+    try {
+      response = await fetch(url, init);
+    } catch (e) {
+      logEvent("raft.call", { ...line, status: null, ms: Date.now() - started, error: clip(String((e as { message?: unknown })?.message ?? e)) });
+      throw e;
+    }
+    logEvent("raft.call", { ...line, status: response.status, ms: Date.now() - started });
   } catch {
     throw options.deliveryMayHaveOccurred
       ? receiveFailure("raft event receive failed before a response was received")
@@ -321,7 +330,20 @@ function raftFor(ctx: PluginContext): Raft {
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx),
     // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
-    fetch: (input, init) => fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeout(ctx)) }),
+    fetch: async (input, init) => {
+      const started = Date.now();
+      const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      const line = { tenantId: ctx.caller.tenantId, agentId: ctx.caller.agentId, mount: ctx.alias, method: init?.method ?? "GET", route: routeOf(u.pathname) };
+      let res: Response;
+      try {
+        res = await fetch(input, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeout(ctx)) });
+      } catch (e) {
+        logEvent("raft.call", { ...line, status: null, ms: Date.now() - started, error: clip(String((e as { message?: unknown })?.message ?? e)) });
+        throw e;
+      }
+      logEvent("raft.call", { ...line, status: res.status, ms: Date.now() - started });
+      return res;
+    },
     state: stateStore(ctx),
     // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
     // the call, and the SDK does not retry it. Said in the Worker's log, where an operator would look.
