@@ -108,6 +108,8 @@ export interface Env {
   /** JSON {"ak","sk"} for the operator's run9 account. Absent means the `node`
    *  mount exists but cannot start a container. */
   RUN9?: string;
+  /** The operator's Exa key: the default `search` mount's credential. Absent means that mount cannot search. */
+  EXA_API_KEY?: string;
   /** 32 bytes, base64: the key per-agent credentials are sealed under. */
   SECRET_KEK?: string;
   HARNESS_MODE?: string;
@@ -411,6 +413,7 @@ export class AgentDO extends DurableObject<Env> {
         model: this.env.HARNESS_MODEL,
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
+      operatorExa: this.env.EXA_API_KEY,
       secretKek: this.env.SECRET_KEK,
       // Plugins may make their own mount's hooks (Raft push); the URL must be
       // one a service can reach, which the console's own origin may not be.
@@ -781,6 +784,7 @@ export class AgentDO extends DurableObject<Env> {
         model: this.env.HARNESS_MODEL,
       },
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
+      operatorExa: this.env.EXA_API_KEY,
       secretKek: this.env.SECRET_KEK,
       // τ² mounts its domain as a plugin; SWE-bench mounts a machine, which
       // the runtime already has.
@@ -1752,8 +1756,13 @@ export class AgentDO extends DurableObject<Env> {
     event: { headers: Record<string, string>; body: Uint8Array } | null) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookReceive", async () => {
-      const r = await this.runtime().receiveHook(tenantId, agentId, alias, hookId, event);
+      const rt = this.runtime();
+      const r = await rt.receiveHook(tenantId, agentId, alias, hookId, event);
       if (r.outcome === "delivered") {
+        // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
+        // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
+        const agent = await rt.store.loadAgent(tenantId, agentId);
+        if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") await rt.provision(tenantId, agentId);
         await this.ctx.storage.setAlarm(Date.now());
         await this.broadcast();
       }

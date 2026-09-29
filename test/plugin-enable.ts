@@ -26,6 +26,7 @@ import { pluginEnabled, credentialForm } from "../src/plugins/types.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { githubPlugin } from "../src/plugins/github.ts";
 import { httpPlugin } from "../src/plugins/http.ts";
+import { exaPlugin } from "../src/plugins/exa.ts";
 import { statePlugin } from "../src/plugins/state.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { sandboxPlugin } from "../src/plugins/sandbox.ts";
@@ -195,7 +196,7 @@ await check("种子只包含【用户什么都不用给就能用】的插件", a
   const artifacts: any = { put: async () => ({}), get: async () => null };
   const store: any = new Proxy({}, { get: () => async () => null });
   const registry: Plugin[] = [];
-  registry.push(githubPlugin, demoPlugin, httpPlugin, sandboxPlugin(artifacts, "b"),
+  registry.push(githubPlugin, demoPlugin, httpPlugin, exaPlugin, sandboxPlugin(artifacts, "b"),
     statePlugin(store, artifacts, "b"), artifactsPlugin(artifacts, "b"),
     builtinToolsPlugin(store, () => registry));
 
