@@ -338,14 +338,18 @@ function sdkFailure(out: RaftFailure, write = false): Error {
  * for it; here the attachments are named and the missing tool is said. And a message whose content Raft left
  * out because it was too large renders as a sender and nothing after the colon, which reads as an empty
  * message; here it says the content was left out. Both are fixed by rebuilding the suffix from the message's
- * own fields, so a change to the SDK's wording shows as a failing test rather than a doubled suffix.
+ * own fields and replaced where the CLI put it; the tests assert whole lines, so a change to the SDK's
+ * wording shows as a failing test rather than a doubled suffix.
  */
 function modelLine(m: RaftMessage): string {
   let line = m.text;
   if (m.attachments.length) {
     const cli = ` [${m.attachments.length} attachment${m.attachments.length > 1 ? "s" : ""}: ${m.attachments.map((a) => `${a.filename} (id:${a.id})`).join(", ")} — use raft attachment view to download]`;
-    if (line.endsWith(cli)) line = line.slice(0, -cli.length);
-    line += ` [${m.attachments.length} attachment${m.attachments.length > 1 ? "s" : ""}: ${m.attachments.map((a) => a.filename).join(", ")} — this mount has no tool to open attachments]`;
+    const ours = ` [${m.attachments.length} attachment${m.attachments.length > 1 ? "s" : ""}: ${m.attachments.map((a) => a.filename).join(", ")} — this mount has no tool to open attachments]`;
+    // Replaced where it stands: the CLI puts task and reply suffixes after it, so it is not always last.
+    // Not found means the SDK's wording changed; the SDK is pinned to an exact version, and the tests that
+    // assert whole lines go red on the upgrade that changes it, rather than a model reading both suffixes.
+    line = line.includes(cli) ? line.replace(cli, ours) : line + ours;
   }
   if ((m.raw as { truncated?: unknown }).truncated === true) line += " [content left out by Raft: too large for one pull; this mount has no tool to read it in full]";
   return line;

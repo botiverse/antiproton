@@ -252,6 +252,18 @@ await check("a message line never points at a CLI command this mount lacks, and 
     throw new Error(`attachment line: ${withFile}`);
   }
   if (!/content left out by Raft: too large/.test(cut!)) throw new Error(`a left-out body read as an empty message: ${cut}`);
+  // An attachment on a task: the CLI puts the task suffix after the attachment's, so the attachment's is
+  // not last. It must be replaced where it stands, once, with nothing of the CLI's left.
+  const t = mount();
+  one(events([
+    { id: "m-8aaaaaa", seq: 3, content: "hi", sender_type: "human", sender_name: "t", channel_name: "g", channel_type: "channel",
+      attachments: [{ id: "a1", filename: "f.png" }], task_number: 7, task_status: "todo" },
+  ], { last_seen_seq: 3 }));
+  const [onTask] = ((await raftPlugin.invoke("receive_events", {}, t.ctx)) as any).messages as string[];
+  if (/raft attachment view/.test(onTask!) || (onTask!.match(/attachment/g) ?? []).length !== 2 ||
+      !/@t: hi \[1 attachment: f\.png — this mount has no tool to open attachments\] \[task #7/.test(onTask!)) {
+    throw new Error(`attachment on a task: ${onTask}`);
+  }
 });
 
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
