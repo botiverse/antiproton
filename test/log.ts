@@ -2,7 +2,7 @@
  * The structured log (src/core/log.ts): silent without a sink, one JSON line per event with one, and a
  * route that carries no id or secret. The trace outbox writes its rows through it as they commit.
  */
-import { logEvent, routeOf, setLogSink } from "../src/core/log.ts";
+import { clip, logEvent, routeOf, setLogSink } from "../src/core/log.ts";
 import { appendTrace } from "../src/trace/outbox.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
@@ -33,7 +33,11 @@ await check("a route keeps its shape and loses its ids and secrets", () => {
   for (const [path, want] of cases) must(routeOf(path) === want, `${path} → ${routeOf(path)}`);
 });
 
-await check("a trace row is a log line when it commits, naming the agent and the tool", () => {
+await check("a value someone else supplied is cut to a line's length", () => {
+  must(clip("x".repeat(500))!.length === 101 && clip("short") === "short" && clip(null) === undefined, "clip");
+});
+
+await check("a trace row is a log line as it is written, naming the agent, the tool and the span to check it by", () => {
   const lines: string[] = [];
   const { sql } = sqliteHost();
   setLogSink((l) => lines.push(l));
@@ -41,7 +45,7 @@ await check("a trace row is a log line when it commits, naming the agent and the
     appendTrace(sql as any, [{ at: 1_790_000_000_000, tenantId: "t", agentId: "a", kind: "tool.call", spanId: "op_1", status: "failed", verdict: "failed", ms: 370, attrs: { mount: "gh", tool: "github.repo_view" } }]);
   } finally { setLogSink(null); }
   const l = JSON.parse(lines[0] ?? "{}");
-  must(l.evt === "trace" && l.agentId === "a" && l.kind === "tool.call" && l.status === "failed" && l.tool === "github.repo_view" && l.ms === 370, lines[0]);
+  must(l.evt === "trace" && l.agentId === "a" && l.kind === "tool.call" && l.status === "failed" && l.tool === "github.repo_view" && l.ms === 370 && l.spanId === "op_1", lines[0]);
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

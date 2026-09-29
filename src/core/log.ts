@@ -29,3 +29,9 @@ export function routeOf(path: string): string {
     .replace(/^\/hooks\/[^/]+/, "/hooks/:hook")
     .replace(/\/(raft_[^/]+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9A-HJKMNP-TV-Z]{26}|con_[A-Za-z0-9]+|evt_[A-Za-z0-9]+)(?=\/|$)/g, "/:id");
 }
+
+/** A value someone else supplied (a header, a provider's error), cut so a line stays a line. */
+export function clip(value: string | null | undefined, max = 100): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}

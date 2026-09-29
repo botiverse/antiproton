@@ -20,7 +20,7 @@
  *      GitHub skips its consent page for a user who has authorised the App before — would have put
  *      their account on this agent (account-linking CSRF).
  */
-import { logEvent } from "../../../src/core/log.ts";
+import { clip, logEvent } from "../../../src/core/log.ts";
 import { constantTimeEqual, cookieHeader, clearCookieHeader, GITHUB_AUTHORIZE, open, randomToken, readCookie, seal } from "../auth.ts";
 import type { ConnectionRegistry } from "../control-plane.ts";
 
@@ -149,7 +149,7 @@ export async function connectCallback(request: Request, url: URL, deps: ConnectD
   });
   const said = (outcome: string, reason?: string) =>
     logEvent("connect.callback", { tenantId: link.tenantId, agentId: link.agentId, provider: link.provider, outcome, reason });
-  if (url.searchParams.get("error")) { said("denied", url.searchParams.get("error") ?? undefined); return done(back(link, "denied")); }
+  if (url.searchParams.get("error")) { said("denied", clip(url.searchParams.get("error"))); return done(back(link, "denied")); }
   const code = url.searchParams.get("code");
   if (!code) { said("failed", "no_code"); return done(back(link, "failed", { reason: "no_code" })); }
   let token: string;

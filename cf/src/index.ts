@@ -83,7 +83,7 @@ import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOM
 import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
-import { logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
+import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -3661,7 +3661,7 @@ async function observed(request: Request, handle: () => Promise<Response>): Prom
   const requestId = request.headers.get("cf-ray") ?? crypto.randomUUID();
   const line = {
     method: request.method, route: routeOf(url.pathname), requestId,
-    traceId: request.headers.get("x-raft-trace-id") ?? undefined,
+    traceId: clip(request.headers.get("x-raft-trace-id")),
     raftServerId: url.searchParams.get("raftServerId") ?? undefined,
   };
   let res: Response;
