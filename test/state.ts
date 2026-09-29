@@ -12,6 +12,9 @@ import { statePlugin, workingSet, WORKING_SET } from "../src/plugins/state.ts";
 import { READ_WHOLE_MAX } from "../src/plugins/artifacts.ts";
 import { systemPrompt } from "../src/runtime/pi-prompt.ts";
 import type { PluginContext } from "../src/plugins/types.ts";
+import { importKek, seal } from "../src/runtime/secrets.ts";
+import { ToolGateway } from "../src/runtime/gateway.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -349,6 +352,66 @@ await check("旧行的 ref 读不回来时,get 不再递给模型一个打不通
 });
 
 console.log(`\n  Agent state\n  ${"─".repeat(56)}`);
+const KEK = btoa(String.fromCharCode(...new Uint8Array(32).map((_, i) => i + 1)));
+
+await check("the agent keeps a secret by name: sealed at rest, listed by name only, read back, deleted", async () => {
+  const { store, ctx } = await fixture();
+  const key = await importKek(KEK);
+  const plugin = statePlugin(store, null, "local", async () => key);
+  await plugin.invoke("secret_put", { name: "openai", value: "sk-test-9f8e7d" }, ctx());
+  const rows = (store as any).dumpTables().secrets as any[];
+  if (rows.length !== 1 || JSON.stringify(rows).includes("sk-test-9f8e7d")) throw new Error(`stored in the clear: ${JSON.stringify(rows)}`);
+  const listed: any = await plugin.invoke("secret_list", {}, ctx());
+  if (listed.secrets.length !== 1 || listed.secrets[0].name !== "openai" || JSON.stringify(listed).includes("sk-test")) {
+    throw new Error(`list: ${JSON.stringify(listed)}`);
+  }
+  const got: any = await plugin.invoke("secret_get", { name: "openai" }, ctx());
+  if (got.value !== "sk-test-9f8e7d") throw new Error(`get: ${JSON.stringify(got)}`);
+  const del: any = await plugin.invoke("secret_delete", { name: "openai" }, ctx());
+  if (del.deleted !== true) throw new Error(`delete: ${JSON.stringify(del)}`);
+  let threw = "";
+  try { await plugin.invoke("secret_get", { name: "openai" }, ctx()); } catch (e) { threw = String((e as Error).message); }
+  if (!/no secret named openai/.test(threw)) throw new Error(`after delete: ${threw}`);
+});
+
+await check("secret_get cannot read a mount's credential or a hook's secret, even by guessing its name", async () => {
+  const { store, ctx } = await fixture();
+  const key = await importKek(KEK);
+  const plugin = statePlugin(store, null, "local", async () => key);
+  await store.putSecret("t", "a", "gh", await seal(key, "ghp_mount_credential"));
+  await store.putSecret("t", "a", "hook:abc", await seal(key, "hook-secret"));
+  for (const name of ["gh", "hook:abc", "../gh", "kept:gh"]) {
+    let out = ""; try { out = JSON.stringify(await plugin.invoke("secret_get", { name }, ctx())); } catch (e) { out = String((e as Error).message); }
+    if (/ghp_mount_credential|hook-secret/.test(out)) throw new Error(`${name} reached a credential: ${out}`);
+  }
+  const listed: any = await plugin.invoke("secret_list", {}, ctx());
+  if (listed.secrets.length !== 0) throw new Error(`list showed rows that are not the agent's: ${JSON.stringify(listed)}`);
+});
+
+await check("a deployment with no sealing key says so instead of keeping a secret in the clear", async () => {
+  const { plugin, ctx } = await fixture();
+  let threw = "";
+  try { await plugin.invoke("secret_put", { name: "x", value: "v" }, ctx()); } catch (e) { threw = String((e as Error).message); }
+  if (!/no key for sealing secrets/.test(threw)) throw new Error(threw || "kept without a key");
+});
+
+await check("code in run_js reads a secret kept with secret_put, through the same gateway call", async () => {
+  const { store } = await fixture();
+  const key = await importKek(KEK);
+  const plugin = statePlugin(store, null, "local", async () => key);
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "state", plugin: "state", installationId: "i", connectionId: null,
+    toolVersion: plugin.version, publicConfig: {}, secretRef: null, policy: null });
+  const gw = new ToolGateway(store, [plugin], new Set(["state"]), { async resolve() { return null; } });
+  const call = { tenantId: "t", agentId: "a", taskId: "k" };
+  const put = await gw.invoke(call, "state.secret_put", { name: "api", value: "tok-123" });
+  if (put.status !== "succeeded") throw new Error(`put: ${JSON.stringify(put)}`);
+  const run = await new QuickJsExecutor().execute(
+    "const r = await tool`state.secret_get ${ { name: \"api\" } }`; output(r.status === \"succeeded\" && r.result.value.length);",
+    { invoke: ({ tool, args }) => gw.invoke(call, tool, args) },
+  );
+  if (run.status !== "completed" || JSON.stringify(run.outputs) !== "[7]") throw new Error(`run_js: ${JSON.stringify(run)}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }

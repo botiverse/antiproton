@@ -861,6 +861,14 @@ export class DurableObjectStore implements StorageAdapter {
       at, tenantId, agentId, name);
   }
 
+  async listSecretNames(tenantId: string, agentId: string, prefix: string) {
+    const rows = this.#all(
+      "SELECT name, created_at, updated_at, last_used_at FROM secrets WHERE tenant_id=? AND agent_id=? AND substr(name, 1, ?) = ? ORDER BY name",
+      tenantId, agentId, prefix.length, prefix,
+    ) as any[];
+    return rows.map((r) => ({ name: String(r.name), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), lastUsedAt: r.last_used_at == null ? null : Number(r.last_used_at) }));
+  }
+
   async removeSecret(tenantId: string, agentId: string, name: string) {
     const before = this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
     this.#sql.exec("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
