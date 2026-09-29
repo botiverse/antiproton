@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
-import { AGENT_REF, isAgentRef, secretRefKind } from "./secrets.ts";
+import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
@@ -361,6 +361,7 @@ export class ToolGateway {
             db: this.#db(ctx, mount),
             async sibling() { return null; },
             async sandboxForms() { return []; },
+            async agentSecret() { return null; },
           });
         } catch (e: any) {
           // A plugin that cannot describe itself must not stop the agent from
@@ -405,6 +406,7 @@ export class ToolGateway {
       db: this.#db(ctx, mount),
       async sibling() { return null; },
       async sandboxForms() { return []; },
+      async agentSecret() { return null; },
     });
   }
 
@@ -438,6 +440,7 @@ export class ToolGateway {
       db: this.#db(ctx, mount),
       async sibling() { return null; },
       async sandboxForms() { return []; },
+      async agentSecret() { return null; },
     });
   }
 
@@ -482,6 +485,7 @@ export class ToolGateway {
           db: this.#db(ctx, mount),
           async sibling() { return null; },
           async sandboxForms() { return []; },
+          async agentSecret() { return null; },
         });
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
@@ -859,6 +863,11 @@ export class ToolGateway {
         }
         return out;
       },
+      // The agent's own rows only: the prefix keeps every mount credential and hook secret out of reach.
+      async agentSecret(name: string) {
+        if (!KEPT_NAME.test(name)) return null;
+        return secrets.resolve(agentRef(KEPT_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
+      },
     };
   }
 
@@ -997,6 +1006,7 @@ export class ToolGateway {
         credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
         async sibling() { return null; },
         async sandboxForms() { return []; },
+        async agentSecret() { return null; },
       });
     } catch (e) {
       // A check that threw gave no verdict on the key: the provider was not

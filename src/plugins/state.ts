@@ -4,17 +4,10 @@ import { toAgentRef } from "../store/refs.ts";
 import type { StorageAdapter } from "../core/store.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import type { Json } from "../core/types.ts";
-import { importKek, open, seal } from "../runtime/secrets.ts";
+import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secrets.ts";
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
-/**
- * The agent's own secrets: values it was given and needs to keep, sealed in the same table as mount
- * credentials but under their own prefix. `secret_get` reads only this prefix, so it can never return
- * a mount's credential or a hook's secret — those stay values only the server uses.
- */
-const KEPT = "kept:";
-const SECRET_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 const SECRET_VALUE_MAX = 8_000;
 
 /**
@@ -227,7 +220,8 @@ export function statePlugin(
       {
         name: "secret_get",
         summary:
-          "Read back a secret you kept with `secret_put`, only when you need the value itself. Best from `run_js`: " +
+          "Read back a secret you kept with `secret_put`, only when you need the value itself. To call an HTTP API " +
+          "with it, you do not: name it in the HTTP tool's `secretHeaders` and it is filled in on the way out. Otherwise best from `run_js`: " +
           "code can pass the value to the sandbox's shell, in a command or an environment variable, without " +
           "printing it, and then it never enters this conversation. Called directly, the value is shown here and " +
           "kept in the record. Mount credentials cannot be read this way.",
@@ -278,14 +272,14 @@ export function statePlugin(
       if (tool.startsWith("secret_")) {
         const s = (args ?? {}) as { name?: unknown; value?: unknown };
         if (tool === "secret_list") {
-          const rows = await store.listSecretNames(tenantId, agentId, KEPT);
+          const rows = await store.listSecretNames(tenantId, agentId, KEPT_PREFIX);
           return { secrets: rows.map((r) => ({
-            name: r.name.slice(KEPT.length), storedAt: new Date(r.updatedAt).toISOString(),
+            name: r.name.slice(KEPT_PREFIX.length), storedAt: new Date(r.updatedAt).toISOString(),
             lastReadAt: r.lastUsedAt === null ? null : new Date(r.lastUsedAt).toISOString(),
           })) };
         }
-        if (typeof s.name !== "string" || !SECRET_NAME.test(s.name)) throw new Error("name must be 1–64 letters, digits, . _ or -");
-        const row = KEPT + s.name;
+        if (typeof s.name !== "string" || !KEPT_NAME.test(s.name)) throw new Error("name must be 1–64 letters, digits, . _ or -");
+        const row = KEPT_PREFIX + s.name;
         if (tool === "secret_delete") return { name: s.name, deleted: await store.removeSecret(tenantId, agentId, row) };
         const key = await kek();
         if (!key) throw new Error("this deployment has no key for sealing secrets, so it cannot keep one");

@@ -197,7 +197,13 @@ export const httpPlugin: Plugin = {
           accept: { type: "string", description: "optional Accept header" },
           headers: {
             type: "object",
-            description: "extra request headers; credentials are not accepted here",
+            description: "extra request headers; credentials go in secretHeaders instead",
+          },
+          secretHeaders: {
+            type: "object", additionalProperties: { type: "string" },
+            description: "header → the name of a secret you kept with secret_put, or text with {{name}} in it: " +
+              "{\"x-api-key\": \"openai\"}, {\"authorization\": \"Bearer {{openai}}\"}. " +
+              "Sent to this URL's host only, never after a redirect elsewhere; the value never comes back to you.",
           },
           raw: { type: "boolean", description: "return the markup instead of extracted text" },
           method: { type: "string", description: "GET (default), HEAD or OPTIONS" },
@@ -217,15 +223,21 @@ export const httpPlugin: Plugin = {
         "POST, PUT, PATCH or DELETE to a URL — for APIs that need more than a GET. An object body " +
         "is sent as JSON; set form:true to send it url-encoded instead. The response comes back " +
         "like get, with its status and headers. This changes things on the far end, so a mount " +
-        "may hold it for a person to approve. It carries no credentials: authentication belongs " +
-        "to a mount with a secret, not to a header you write.",
+        "may hold it for a person to approve. A credential is never a header you write: name a " +
+        "secret you kept in secretHeaders and it is filled in on the way out.",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string", description: "absolute http(s) url" },
           method: { type: "string", description: "POST | PUT | PATCH | DELETE (default POST)" },
           body: { description: "string, or an object which is sent as JSON" },
-          headers: { type: "object", description: "extra request headers; credentials are not accepted" },
+          headers: { type: "object", description: "extra request headers; credentials go in secretHeaders instead" },
+          secretHeaders: {
+            type: "object", additionalProperties: { type: "string" },
+            description: "header → the name of a secret you kept with secret_put, or text with {{name}} in it: " +
+              "{\"x-api-key\": \"openai\"}, {\"authorization\": \"Bearer {{openai}}\"}. " +
+              "Sent to this URL's host only, never after a redirect elsewhere; the value never comes back to you.",
+          },
           accept: { type: "string" },
           form: { type: "boolean", description: "send an object body as application/x-www-form-urlencoded" },
           follow: { type: "boolean", description: "false to see a redirect rather than follow it" },
@@ -263,7 +275,7 @@ export const httpPlugin: Plugin = {
     const maxBytes = cfg.maxBytes ?? DEFAULT_MAX_BYTES;
     const a = (args ?? {}) as {
       url?: string; accept?: string; raw?: boolean;
-      headers?: Record<string, unknown>; method?: string; body?: unknown;
+      headers?: Record<string, unknown>; secretHeaders?: Record<string, unknown>; method?: string; body?: unknown;
       form?: boolean; follow?: boolean;
     };
 
@@ -352,13 +364,61 @@ export const httpPlugin: Plugin = {
       return { query: q, count: results.length, results };
     }
 
+    /**
+     * Headers whose value is a secret the agent kept, named rather than written.
+     *
+     * The rule above is about the model HOLDING a credential, not about using
+     * one: a key the agent was given and kept with `secret_put` is used here by
+     * name and filled in server-side, so it never has to pass through the
+     * conversation to reach the service. Only on the first URL's own origin, as
+     * a browser drops `authorization` on a cross-origin redirect: the model
+     * chose where the key goes, a redirect did not. And an echo of it in the
+     * response is replaced with its name before the model reads it — only a
+     * verbatim echo: one the server encoded (URL, JSON escapes, base64) is not
+     * recognised, so this narrows the leak and does not close it.
+     *
+     * A value is a name, or text with `{{name}}` in it, because most APIs want
+     * `Bearer <key>` and what an agent keeps is the bare key.
+     */
+    const kept = new Map<string, string>();
+    const secret: Record<string, { as: string; value: string }> = {};
+    for (const [header, spec] of Object.entries(a.secretHeaders ?? {})) {
+      if (typeof spec !== "string") throw new Error(`secretHeaders.${header} must be the name of a secret you kept, or text with {{name}} in it`);
+      const names = spec.includes("{{") ? [...spec.matchAll(/\{\{([^}]*)\}\}/g)].map((m) => m[1]!.trim()) : [spec];
+      if (!names.length) throw new Error(`secretHeaders.${header} has no {{name}} in it`);
+      for (const name of names) {
+        if (kept.has(name)) continue;
+        const value = await ctx.agentSecret(name);
+        if (value === null) throw new Error(`no secret named ${name}; keep one with secret_put, or see secret_list`);
+        kept.set(name, value);
+      }
+      const value = spec.includes("{{") ? spec.replace(/\{\{([^}]*)\}\}/g, (_, n: string) => kept.get(n.trim())!) : kept.get(spec)!;
+      secret[header.toLowerCase()] = { as: spec, value };
+    }
+    const hide = (text: string) => [...kept].reduce(
+      (t, [name, value]) => (value.length >= 4 ? t.split(value).join(`[secret ${name}]`) : t), text);
+    const hideHeaders = (h: Record<string, string>) =>
+      Object.fromEntries(Object.entries(h).map(([k, v]) => [k, hide(v)]));
     let target = String(a.url ?? "");
     const hops: string[] = [];
+    let origin: string | null = null;
+    // Once a hop leaves the first origin the secret stays behind, even if a later hop comes back:
+    // a redirect chain that returns was still steered by somebody else.
+    let carry = true;
+    let dropped: string | null = null;
+    // Which secret went in which header, by name, and where it was held back.
+    const secretNote = () => Object.keys(secret).length ? {
+      secretHeaders: Object.fromEntries(Object.entries(secret).map(([h, s]) => [h, s.as])),
+      ...(dropped ? { secretHeadersNotSentTo: dropped } : {}),
+    } : {};
     // Redirects are followed by hand so every hop is checked, not just the first.
     for (let hop = 0; hop < 4; hop++) {
       const check = checkUrl(target, allowed);
       if (!check.ok) throw new Error(check.why);
       hops.push(check.url.toString());
+      origin ??= check.url.origin;
+      if (check.url.origin !== origin) carry = false;
+      if (!carry && Object.keys(secret).length) dropped ??= check.url.host;
 
       const method = String(a.method ?? (tool === "send" ? "POST" : "GET")).toUpperCase();
       // The split is what lets the policy layer gate one and not the other, so
@@ -382,6 +442,7 @@ export const httpPlugin: Plugin = {
             ...(jsonBody ? { "content-type": "application/json" } : {}),
           ...(formBody ? { "content-type": "application/x-www-form-urlencoded" } : {}),
           ...extra,
+          ...(carry ? Object.fromEntries(Object.entries(secret).map(([h, s]) => [h, s.value])) : {}),
         },
         ...(a.body !== undefined
           ? {
@@ -416,14 +477,15 @@ export const httpPlugin: Plugin = {
         const body = text.slice(0, maxBytes);
         return {
           status: res.status, statusText: res.statusText,
-          url: check.url.toString(), contentType: type,
-          headers: responseHeaders(res.headers),
-          title, description,
+          url: hide(check.url.toString()), contentType: type,
+          headers: hideHeaders(responseHeaders(res.headers)),
+          title: hide(title), description: hide(description),
           bytes: payload.length, textBytes: text.length,
           ...(refused.length ? { refusedHeaders: refused } : {}),
+          ...secretNote(),
           truncated: text.length > body.length,
-          hops: hops.length > 1 ? hops : undefined,
-          text: body,
+          hops: hops.length > 1 ? hops.map(hide) : undefined,
+          text: hide(body),
         };
       }
 
@@ -431,14 +493,15 @@ export const httpPlugin: Plugin = {
       return {
         status: res.status,
         statusText: res.statusText,
-        url: check.url.toString(),
+        url: hide(check.url.toString()),
         contentType: type,
-        headers: responseHeaders(res.headers),
+        headers: hideHeaders(responseHeaders(res.headers)),
         bytes: payload.length,
         ...(refused.length ? { refusedHeaders: refused } : {}),
+        ...secretNote(),
         truncated: payload.length > body.length,
-        hops: hops.length > 1 ? hops : undefined,
-        body,
+        hops: hops.length > 1 ? hops.map(hide) : undefined,
+        body: hide(body),
       };
     }
     throw new Error(`too many redirects from ${a.url}`);

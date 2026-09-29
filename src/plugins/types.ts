@@ -291,6 +291,16 @@ export interface PluginContext {
      */
     used(): Promise<void>;
   }>>;
+  /**
+   * A secret the agent kept itself (`secret_put`), by the name it chose; null
+   * when there is none. Never a mount's credential or a hook's secret: only the
+   * agent's own rows are reachable this way.
+   *
+   * For a plugin that uses a secret where the agent directs, so the model can
+   * name it instead of reading it into the conversation. The value goes where
+   * the call says and nowhere else: not into a result, an error, or `ctx.db`.
+   */
+  agentSecret(name: string): Promise<string | null>;
 }
 
 /**
