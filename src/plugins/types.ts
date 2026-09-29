@@ -1001,21 +1001,6 @@ export interface InboundEvent {
 export type AgentStatus = "online" | "thinking" | "working" | "error" | "offline";
 
 /**
- * One change of the agent's status. The runtime knows its own state, so it says
- * it; the service keeps the latest by `occurredAt` and adds only what it observes
- * itself (a credential gone quiet reads as offline).
- */
-export interface StatusEvent {
-  /** Unique per agent for all time; the service dedupes on it. */
-  eventId: string;
-  status: AgentStatus;
-  /** A short human-readable phrase shown with the status. */
-  detail?: string;
-  /** ISO 8601. */
-  occurredAt: string;
-}
-
-/**
  * One thing the agent did, for the service the agent belongs to (Raft's
  * raft-agent-activity-ingest.v1, 2026-09-28). Names are the service's hook
  * event names; the runtime maps its own ended spans onto them
@@ -1026,12 +1011,25 @@ export type ActivityEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse
 export interface ActivityEvent {
   /** Unique per agent for all time; the service dedupes on it. */
   eventId: string;
-  hookEventName: ActivityEventName;
+  /**
+   * What happened. Absent on a status-only event: a change of status that no
+   * activity carries (a model call starting, say).
+   */
+  hookEventName?: ActivityEventName;
   /** ISO 8601. */
   occurredAt: string;
   toolName?: string;
   durationMs?: number;
   errorClass?: string;
+  /**
+   * The agent's status after this event (raft-agent-status.v1), said by the
+   * runtime that knows it. Status rides the activity log so it gets the log's
+   * delivery — held on failure, resent as-is — and a replayed old status is
+   * harmless because the service keeps the latest by `occurredAt`.
+   */
+  status?: AgentStatus;
+  /** A short human-readable phrase shown with the status. */
+  detail?: string;
 }
 
 /**
@@ -1358,11 +1356,4 @@ export interface Plugin {
    */
   reportActivity?(events: readonly ActivityEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
 
-  /**
-   * Tell the service the agent's status changes (see {@link StatusEvent}). Called
-   * by the runtime on the same pass as `reportActivity`, with the changes the same
-   * rows mean. Status is only ever "now": the runtime does not hold rows for it,
-   * so a throw loses these changes and the next one supersedes them.
-   */
-  reportStatus?(events: readonly StatusEvent[], ctx: PluginContext): Promise<{ sent: number } | { skipped: string }>;
 }

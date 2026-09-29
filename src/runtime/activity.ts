@@ -26,17 +26,42 @@
  */
 import type { TraceOutboxRow } from "../trace/outbox.ts";
 import type { ActivityEvent } from "../plugins/types.ts";
+import { statusEvents } from "./status.ts";
 
 export const ACTIVITY_SCHEMA = "raft-agent-activity-ingest.v1";
-/** Rows per pass. Raft takes at most 200 events a request (EXTERNAL_ACTIVITY_EVENT_LIMIT); a tool row makes two. */
+/**
+ * Rows per pass. Raft takes at most 200 events a request (EXTERNAL_ACTIVITY_EVENT_LIMIT). A row makes
+ * at most two: a tool row its call and result (statuses fold onto them), a model-call row at most a
+ * status-only start and an end.
+ */
 export const ACTIVITY_BATCH_MAX = 100;
 
 export function activityEventId(agentId: string, seq: number): string {
   return `${agentId}:${seq}`;
 }
 
-/** The events a run of trace rows means, in row order; rows that mean nothing to the service yield none. */
+/**
+ * The events a run of trace rows means, with the agent's status changes on them: each change goes on
+ * the activity event of the same instant when there is one, otherwise it is a status-only event.
+ */
 export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
+  const events = hookEvents(agentId, rows);
+  // The status after an instant is the last change at that instant; earlier ones at the same instant
+  // were superseded before anyone could see them.
+  const after = new Map<string, ReturnType<typeof statusEvents>[number]>();
+  for (const s of statusEvents(agentId, rows)) after.set(s.occurredAt, s);
+  const hosts = new Map<string, ActivityEvent>();
+  for (const e of events) hosts.set(e.occurredAt, e);   // the last activity event at an instant carries it
+  for (const [instant, s] of after) {
+    const host = hosts.get(instant);
+    if (host) host.status = s.status;
+    else events.push(s);
+  }
+  return events;
+}
+
+/** The activity events a run of trace rows means, in row order; rows that mean nothing to the service yield none. */
+function hookEvents(agentId: string, rows: readonly TraceOutboxRow[]): ActivityEvent[] {
   const out: ActivityEvent[] = [];
   for (const row of rows) {
     const base = { eventId: activityEventId(agentId, row.seq), occurredAt: new Date(row.at).toISOString() };

@@ -37,8 +37,12 @@ check("a model row ends the turn on stop, length and aborted, dies on error, and
     row(10, "model.call", "toolUse", "ok"), row(11, "model.call", "stop", "ok"), row(12, "model.call", "length", "ok"),
     row(13, "model.call", "aborted", "cancelled"), row(14, "model.call", "error", "failed"),
   ]);
-  must(ev.map((e) => `${e.eventId}=${e.hookEventName}`).join(",") === "raft_a:11=Stop,raft_a:12=Stop,raft_a:13=Stop,raft_a:14=BridgeFatal", JSON.stringify(ev));
-  must(ev[3]!.errorClass === "model_call_failed", JSON.stringify(ev[3]));
+  const hooks = ev.filter((e) => e.hookEventName);
+  must(hooks.map((e) => `${e.eventId}=${e.hookEventName}`).join(",") === "raft_a:11=Stop,raft_a:12=Stop,raft_a:13=Stop,raft_a:14=BridgeFatal", JSON.stringify(ev));
+  must(hooks[3]!.errorClass === "model_call_failed", JSON.stringify(hooks[3]));
+  // The status after each: the tool-use answer is a status-only working, the first stop turns online
+  // (the later stops repeat it and say nothing new), the error is error.
+  must(ev.map((e) => `${e.hookEventName ?? "-"}:${e.status ?? ""}`).join(",") === "Stop:online,Stop:,Stop:,BridgeFatal:error,-:working", JSON.stringify(ev));
 });
 
 check("approval and container rows are not the service's business", () => {
@@ -51,8 +55,14 @@ check("every event carries only fields the service knows, ids are unique, and tw
   const ev = activityEvents("raft_a", rows);
   must(ev.length === 2 * ACTIVITY_BATCH_MAX && ev.length <= 200, `events ${ev.length}`);
   must(new Set(ev.map((e) => e.eventId)).size === ev.length, "duplicate event ids");
-  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass"]);
+  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass", "status", "detail"]);
   for (const e of ev) for (const k of Object.keys(e)) must(allowed.has(k), `unknown field ${k}`);
+  // The worst case for status-only events: every row a measured model call that asked for tools, each a
+  // thinking start and a working end with no activity event to ride on.
+  const models: TraceOutboxRow[] = [];
+  for (let i = 1; i <= ACTIVITY_BATCH_MAX; i++) models.push(row(i, "model.call", "toolUse", "ok", { ms: 100 }));
+  const worst = activityEvents("raft_a", models);
+  must(worst.length <= 200 && worst.every((e) => e.status && !e.hookEventName), `worst-case batch: ${worst.length}`);
 });
 
 console.log(`\n  activity mapping\n  ${"─".repeat(56)}`);
