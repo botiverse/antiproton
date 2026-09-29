@@ -4,7 +4,7 @@
  * code, holds the token in the agent's own object under a random id, and sends the browser back to
  * Raft as pending, with the id and the initiator — never the credential, and never yet on the mount.
  */
-import { connectCallback, connectLink, connectStart, CONNECT_CALLBACK_PATH, type ConnectDeps } from "../cf/src/provision/connect.ts";
+import { connectCallback, connectLink, connectStart, CONNECT_CALLBACK_PATH, isConnectCallback, type ConnectDeps } from "../cf/src/provision/connect.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -44,7 +44,9 @@ await check("a link starts one flow: to GitHub with the smallest scopes and the 
   const to = new URL(start.headers.get("location")!);
   must(to.origin === "https://github.com" && to.searchParams.get("scope") === "public_repo" &&
     to.searchParams.get("redirect_uri") === `${ORIGIN}${CONNECT_CALLBACK_PATH}` && to.searchParams.get("state"), to.toString());
-  must(/Path=\/login\/github\/callback\/connect/.test(start.headers.get("set-cookie") ?? ""), "the flow cookie is not scoped to the callback");
+  // The registered callback itself: the preview App refused a path under it (2026-09-29).
+  must(to.searchParams.get("redirect_uri") === `${ORIGIN}/login/github/callback`, `redirect_uri ${to.searchParams.get("redirect_uri")}`);
+  must(/Path=\/login\/github\/callback(;|$)/.test(start.headers.get("set-cookie") ?? ""), "the flow cookie is not scoped to the callback");
   const again = await connectStart(new URL(url), x.d);
   must(again.status === 409, `a used link started again: ${again.status}`);
 });
@@ -101,6 +103,19 @@ await check("a person who declines, and a hold the agent cannot keep, go back to
     const loc = new URL(res.headers.get("location")!);
     must(loc.searchParams.get("status") === status && !loc.searchParams.has("pending"), `${status}: ${loc}`);
   }
+});
+
+await check("on the shared callback, only a matching connect cookie makes it a connect flow; a sign-in stays a sign-in", async () => {
+  const x = deps();
+  const { url } = await connectLink(ORIGIN, SECRET, spec, x.d.now());
+  const start = await connectStart(new URL(url), x.d);
+  const state = new URL(start.headers.get("location")!).searchParams.get("state")!;
+  const cookie = (start.headers.get("set-cookie") ?? "").split(";")[0]!;
+  const at = (st: string, c?: string) => isConnectCallback(new Request(`${ORIGIN}/login/github/callback?code=c&state=${st}`, { headers: c ? { cookie: c } : {} }),
+    new URL(`${ORIGIN}/login/github/callback?code=c&state=${st}`), x.d);
+  must(await at(state, cookie), "a connect callback was not recognised");
+  must(!(await at(state)), "a callback without the connect cookie was taken for a connect flow");
+  must(!(await at("a-sign-in-state", cookie)), "a sign-in callback was taken for a connect flow because a connect cookie was also present");
 });
 
 for (const r of results) {
