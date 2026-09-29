@@ -369,6 +369,16 @@ function modelLine(m: RaftMessage): string {
   return line;
 }
 
+/** The batch as a Raft without status knows it: status fields dropped, status-only events left out. */
+function withoutStatus(events: readonly ActivityEvent[]): ActivityEvent[] {
+  return events.flatMap((e) => {
+    if (!e.hookEventName) return [];
+    if (e.status === undefined) return [e];
+    const { status: _status, ...rest } = e;
+    return [rest];
+  });
+}
+
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
@@ -761,7 +771,19 @@ export const raftPlugin: Plugin = {
     // is skipped, not an error, or the alarm would retry every minute for ever.
     if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
     if (events.length === 0) return { sent: 0 };
-    await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
+    try {
+      await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events });
+    } catch (error) {
+      // A Raft that does not know status yet refuses the whole batch (400, unknown field), and the log
+      // holds a refused batch for ever: the activity feed would stop at the first status. So a 400 on a
+      // batch that carries status is tried once more without it — the activity goes through, and status
+      // starts to land on the first pass after Raft accepts it. A second 400 is the batch's own fault
+      // and throws as before.
+      const plain = withoutStatus(events);
+      if (!(error instanceof Error && /HTTP 400\b/.test(error.message)) || plain.length === events.length && plain.every((e, i) => e === events[i])) throw error;
+      if (plain.length) await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: plain });
+      return { sent: plain.length };
+    }
     return { sent: events.length };
   },
 

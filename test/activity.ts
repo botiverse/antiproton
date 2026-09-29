@@ -55,7 +55,7 @@ check("every event carries only fields the service knows, ids are unique, and tw
   const ev = activityEvents("raft_a", rows);
   must(ev.length === 2 * ACTIVITY_BATCH_MAX && ev.length <= 200, `events ${ev.length}`);
   must(new Set(ev.map((e) => e.eventId)).size === ev.length, "duplicate event ids");
-  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass", "status", "detail"]);
+  const allowed = new Set(["eventId", "hookEventName", "occurredAt", "toolName", "durationMs", "errorClass", "status"]);
   for (const e of ev) for (const k of Object.keys(e)) must(allowed.has(k), `unknown field ${k}`);
   // The worst case for status-only events: every row a measured model call that asked for tools, each a
   // thinking start and a working end with no activity event to ride on.
