@@ -366,6 +366,8 @@ export interface StorageAdapter {
   } | null>;
   touchSecret(tenantId: string, agentId: string, name: string, at: number): Promise<void>;
   removeSecret(tenantId: string, agentId: string, name: string): Promise<boolean>;
+  /** The names under a prefix, with their times: never a value, nor anything derived from one. */
+  listSecretNames(tenantId: string, agentId: string, prefix: string): Promise<Array<{ name: string; createdAt: number; updatedAt: number; lastUsedAt: number | null }>>;
   findMountsByPlugin(tenantId: string, agentId: string, plugin: string): Promise<MountRecord[]>;
   listMounts(tenantId: string, agentId: string): Promise<MountRecord[]>;
 

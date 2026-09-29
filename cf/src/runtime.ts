@@ -645,7 +645,8 @@ export class AgentRuntime {
       exaPlugin,
       // The lease reaches the plugin so its tools state the lifetime this deployment gives a box.
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
-      statePlugin(this.store, this.#artifacts as any, deps.bucketName),
+      // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
+      statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       raftPlugin,
       ...(deps.extraPlugins ?? []),
