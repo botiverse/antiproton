@@ -141,6 +141,15 @@ await check("the last status of a turn is sent again on a pass with no new rows 
   must(sentStatuses[1]!.map((x) => x.split("#")[0]).join(",") === "thinking,online", JSON.stringify(sentStatuses));
 });
 
+await check("the pass that runs the alarm is told when a status send failed, so an idle agent gets another pass", async () => {
+  const { sql } = sqliteHost();
+  const g = { ...gateway(), async reportStatus() { throw new Error("status endpoint down"); } };
+  appendTrace(sql, [answered(1)]);
+  const sink = { async put() {}, async list() { return []; } } as any;
+  const r = await flushActivityThenTrace(g as any, sink, sql, OWNER.tenantId, OWNER.agentId);
+  must(r.statusError === "status endpoint down" && r.activityError === null, JSON.stringify(r));
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

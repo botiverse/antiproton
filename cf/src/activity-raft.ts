@@ -114,11 +114,14 @@ export async function flushActivity(
  */
 export async function flushActivityThenTrace(
   gateway: ActivityGateway, sink: TraceSink, sql: Sql, tenantId: string, agentId: string,
-): Promise<{ activityError: string | null; traceError: string | null }> {
+): Promise<{ activityError: string | null; traceError: string | null; statusError: string | null }> {
   let holdThrough: number;
   let activityError: string | null = null;
+  let statusError: string | null = null;
   try {
-    holdThrough = (await flushActivity(gateway, sql, tenantId, agentId)).through;
+    const a = await flushActivity(gateway, sql, tenantId, agentId);
+    holdThrough = a.through;
+    statusError = a.statusError;
   } catch (e) {
     activityError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
     holdThrough = activityCursor(sql);
@@ -129,5 +132,5 @@ export async function flushActivityThenTrace(
   } catch (e) {
     traceError = String((e as { message?: unknown })?.message ?? e).slice(0, 200);
   }
-  return { activityError, traceError };
+  return { activityError, traceError, statusError };
 }
