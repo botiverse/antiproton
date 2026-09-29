@@ -17,6 +17,12 @@ import type { SecretResolver } from "./gateway.ts";
  * store, the credential behind a `secret_ref` that only the server dereferences
  * — so a key never reaches a prompt, a checkpoint or a trajectory.
  */
+/** The operator's reference, and how a binding on it is called. */
+export interface OperatorBinding {
+  ref: string;
+  request(b: { baseUrl: string; model: string }): { baseUrl: string; apiKey: string; model: string; headers: Record<string, string> };
+}
+
 export interface ModelCaller {
   tenantId: string;
   agentId: string;
@@ -29,9 +35,17 @@ export class ModelResolver {
    *  on the next call rather than whenever the cache happens to be dropped. */
   #cache = new Map<string, ModelAdapter>();
 
-  constructor(store: StorageAdapter, secrets: SecretResolver) {
+  #operator?: OperatorBinding;
+
+  /**
+   * `operator`: how a binding on the operator's reference is called. Its key, headers and even whether
+   * a key is sent depend on the model (src/model/operator-request.ts), so it is built whole rather than
+   * from a resolved key.
+   */
+  constructor(store: StorageAdapter, secrets: SecretResolver, operator?: OperatorBinding) {
     this.#store = store;
     this.#secrets = secrets;
+    this.#operator = operator;
   }
 
   async resolve(caller: ModelCaller): Promise<ModelAdapter> {
@@ -51,6 +65,11 @@ export class ModelResolver {
     const hit = this.#cache.get(key);
     if (hit) return hit;
 
+    if (this.#operator && b.secretRef === this.#operator.ref) {
+      const model = new OpenAiCompatibleModel(this.#operator.request({ baseUrl: b.baseUrl, model: b.model }));
+      this.#cache.set(key, model);
+      return model;
+    }
     const apiKey = await this.#secrets.resolve(b.secretRef);
     if (!apiKey) {
       throw new Error(`model credential ${b.secretRef} did not resolve for ${caller.tenantId}`);

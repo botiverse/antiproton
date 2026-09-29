@@ -10,6 +10,7 @@
  * about and never will: which tenant is asking, which mounts they have, which
  * credential each mount resolves to, and who is allowed to spend what.
  */
+import { operatorRequest, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
@@ -378,7 +379,7 @@ export interface RuntimeDeps {
    * binding is refused, because the alternative is every tenant silently
    * spending this key.
    */
-  operatorModel?: { baseUrl: string; apiKey: string; model: string };
+  operatorModel?: OperatorModel;
   /** The operator's sandbox account, behind OPERATOR_RUN9_REF. Absent means the
    *  `node` mount resolves to no credential and its tools refuse to run, which
    *  is the right failure: a deployment without keys should not start boxes. */
@@ -698,12 +699,11 @@ export class AgentRuntime {
     });
     // Credentials come from the same resolver mounts use, so a model key is
     // dereferenced server-side and never travels with the binding.
-    this.#models = new ModelResolver(this.store, {
-      resolve: async (ref) =>
-        ref === OPERATOR_SECRET_REF
-          ? (deps.operatorModel?.apiKey ?? null)
-          : envSecrets.resolve(ref),
-    });
+    // A binding on the operator's reference is called the way the queued call is (operatorRequest):
+    // the key a request would carry is not the same for every provider behind a gateway.
+    const op = deps.operatorModel;
+    this.#models = new ModelResolver(this.store, envSecrets,
+      op ? { ref: OPERATOR_SECRET_REF, request: (b) => operatorRequest({ ...op, baseUrl: b.baseUrl }, b.model) } : undefined);
   }
 
   // ---- inbound events: a service pushes at a mount's hook (src/runtime/inbound.ts).

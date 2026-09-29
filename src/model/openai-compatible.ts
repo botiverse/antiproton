@@ -11,11 +11,17 @@ export class OpenAiCompatibleModel implements ModelAdapter {
   #baseUrl: string;
   #apiKey: string;
   #model: string;
+  #headers: Record<string, string>;
 
-  constructor(cfg: { baseUrl: string; apiKey: string; model: string }) {
+  /**
+   * `apiKey` empty sends no `authorization`: a gateway that holds the provider's key (Cloudflare AI
+   * Gateway's stored keys) adds it itself. `headers` are sent as given, e.g. the gateway's own token.
+   */
+  constructor(cfg: { baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> }) {
     this.#baseUrl = cfg.baseUrl.replace(/\/$/, "");
     this.#apiKey = cfg.apiKey;
     this.#model = cfg.model;
+    this.#headers = cfg.headers ?? {};
     this.id = `${new URL(cfg.baseUrl).host}/${cfg.model}`;
   }
 
@@ -53,7 +59,8 @@ export class OpenAiCompatibleModel implements ModelAdapter {
         const res = await fetch(`${this.#baseUrl}/chat/completions`, {
           method: "POST",
           headers: {
-            authorization: `Bearer ${this.#apiKey}`,
+            ...this.#headers,
+            ...(this.#apiKey ? { authorization: `Bearer ${this.#apiKey}` } : {}),
             "content-type": "application/json",
           },
           body: JSON.stringify({
