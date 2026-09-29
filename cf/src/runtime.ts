@@ -43,7 +43,7 @@ import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, open, seal, secretRefKind } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentRef, importKek, isAgentRef, open, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
   ensureInboundTable, hookSecretName, inboundMessage, newHookId, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
   INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
@@ -929,7 +929,7 @@ export class AgentRuntime {
    * and only for the Raft user it was held for. The held row goes whatever the outcome.
    */
   async confirmConnection(tenantId: string, agentId: string, plugin: string, id: string, raftUserId: string):
-    Promise<{ ok: true; account: string | null } | { ok: false; error: string; missing?: true }> {
+    Promise<{ ok: true; account: string | null; sealed: Sealed } | { ok: false; error: string; missing?: true }> {
     await this.ready();
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
@@ -941,6 +941,17 @@ export class AgentRuntime {
     if (!meta || !sealed || Number(row.name.split(":")[2]) <= Date.now() || meta.account !== raftUserId) {
       return { ok: false, error: "no such pending connection", missing: true };
     }
+    // Handed back sealed: the connection it becomes is the tenant's (cf/migrations/0012_connectors.sql).
+    const r = await this.attachSealedConnection(tenantId, agentId, plugin, sealed);
+    return r.ok ? { ...r, sealed: { ciphertext: sealed.ciphertext, iv: sealed.iv } } : r;
+  }
+
+  /** A connection's credential, sealed under this deployment's key, onto this agent's one mount of that plugin. */
+  async attachSealedConnection(tenantId: string, agentId: string, plugin: string, sealed: Sealed):
+    Promise<{ ok: true; account: string | null } | { ok: false; error: string }> {
+    await this.ready();
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a credential" };
     const mounts = await this.store.findMountsByPlugin(tenantId, agentId, plugin);
     if (mounts.length === 0) return { ok: false, error: `this agent has no ${plugin} mount to connect` };
     // More than one and the choice would be arbitrary; say so rather than attach to one of them.
@@ -955,6 +966,21 @@ export class AgentRuntime {
     await this.ready();
     const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
     return mount ? this.removeCredential(tenantId, agentId, mount.alias) : false;
+  }
+
+  /**
+   * Remove the credential only while it is still the connector's (`sealed`): a key put on the mount
+   * since, in the console, is not the connector's to take when the connector goes. Compared by value,
+   * because each attach seals afresh and the ciphertexts never match.
+   */
+  async detachConnectionIfFrom(tenantId: string, agentId: string, plugin: string, sealed: Sealed): Promise<boolean> {
+    await this.ready();
+    const kek = await this.#kek;
+    const mount = (await this.store.findMountsByPlugin(tenantId, agentId, plugin))[0];
+    if (!kek || !mount || !isAgentRef(mount.secretRef)) return false;
+    const held = await this.store.getSecret(tenantId, agentId, mount.secretRef!.slice(agentRef("").length));
+    if (!held || await open(kek, held) !== await open(kek, sealed)) return false;
+    return this.removeCredential(tenantId, agentId, mount.alias);
   }
 
   /**

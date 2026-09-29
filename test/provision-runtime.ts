@@ -149,6 +149,21 @@ await check("a held connection becomes the GitHub mount's credential once, only 
     const gh = await rt.store.getMountByAlias("t", "raft_c1", "gh");
     must(String(gh?.secretRef).startsWith("agent:"), `the GitHub mount did not get the credential: ${gh?.secretRef}`);
     must(!(await rt.confirmConnection("t", "raft_c1", "github", "pend_bbbbbbbb", "u_owner")).ok, "a hold was confirmed twice");
+    // What confirm hands back is the tenant's connector: sealed under the same key, it goes onto another agent's mount as is.
+    await adoptProvisionedAgent(rt, "t", "raft_c2", SPEC);
+    const seen: string[] = [];
+    const answer = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init?: any) => { seen.push(new Headers(init?.headers ?? {}).get("authorization") ?? ""); return answer(url, init); }) as any;
+    const shared = ok.ok ? await rt.attachSealedConnection("t", "raft_c2", "github", ok.sealed) : { ok: false as const, error: "no sealed" };
+    globalThis.fetch = answer;
+    must(shared.ok && shared.account === "octocat" && seen.some((h) => h.endsWith("gho_two")), `the connector did not reach another agent: ${JSON.stringify(shared)}`);
+    must(String((await rt.store.getMountByAlias("t", "raft_c2", "gh"))?.secretRef).startsWith("agent:"), "the second agent's GitHub mount has no credential");
+    // When the connector goes, a key someone put on the mount since stays; the connector's own copy goes.
+    must((await rt.attachCredential("t", "raft_c2", "gh", { token: "gho_mine" })).ok, "a console key was refused");
+    must(ok.ok && !(await rt.detachConnectionIfFrom("t", "raft_c2", "github", ok.sealed)), "a key put on the mount since was taken with the connector");
+    must(String((await rt.store.getMountByAlias("t", "raft_c2", "gh"))?.secretRef).startsWith("agent:"), "the console key is gone");
+    must(ok.ok && (await rt.detachConnectionIfFrom("t", "raft_c1", "github", ok.sealed)), "the connector's own copy was not taken");
+    must(!String((await rt.store.getMountByAlias("t", "raft_c1", "gh"))?.secretRef).startsWith("agent:"), "the connector's copy is still on the mount");
 
     await rt.holdConnection("t", "raft_c1", "github", "gho_old", "pend_cccccccc", Date.now() - 1, "u_owner");
     must(!(await rt.confirmConnection("t", "raft_c1", "github", "pend_cccccccc", "u_owner")).ok, "an expired hold was confirmed");

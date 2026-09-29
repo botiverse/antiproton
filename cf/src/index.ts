@@ -75,7 +75,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1Connections, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { d1Connections, d1Connectors, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
 import { CONNECT_CALLBACK_PATH, CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
@@ -1704,6 +1704,16 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("connectionConfirm", () => this.runtime().confirmConnection(tenantId, agentId, plugin, id, raftUserId));
   }
 
+  async connectionAttach(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionAttach", () => this.runtime().attachSealedConnection(tenantId, agentId, plugin, sealed));
+  }
+
+  async connectionDetachIfFrom(tenantId: string, agentId: string, plugin: string, sealed: { ciphertext: string; iv: string }) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("connectionDetachIfFrom", () => this.runtime().detachConnectionIfFrom(tenantId, agentId, plugin, sealed));
+  }
+
   async connectionDetach(tenantId: string, agentId: string, plugin: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("connectionDetach", () => this.runtime().detachConnection(tenantId, agentId, plugin));
@@ -2604,9 +2614,10 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   if (!who) return refuse(401, "unauthorized", "the provider token is not one this deployment issued, or was revoked");
   await tokens.touch(hash);
   let body: unknown = undefined;
-  if (request.method === "POST" || request.method === "PATCH" || request.method === "PUT") {
+  if (request.method === "POST" || request.method === "PATCH" || request.method === "PUT" || request.method === "DELETE") {
     const text = await request.text();
-    try { body = text ? JSON.parse(text) : {}; }
+    // A DELETE may carry who is acting (a connector's disconnect); without a body it stays undefined.
+    try { body = text ? JSON.parse(text) : request.method === "DELETE" ? undefined : {}; }
     catch { return refuse(400, "invalid_json", "the body is not JSON"); }
   }
   const deps = provisionDeps(env);
@@ -2654,6 +2665,12 @@ function provisionDeps(env: Env): ProvisionDeps {
         detach: (tenantId, agentId, provider) => stub(tenantId, agentId).connectionDetach(tenantId, agentId, CONNECTION_PLUGIN[provider]),
         confirm: (tenantId, agentId, provider, pending, raftUserId) =>
           stub(tenantId, agentId).connectionConfirm(tenantId, agentId, CONNECTION_PLUGIN[provider], pending, raftUserId),
+        detachIfFrom: (tenantId, agentId, provider, sealed) =>
+          stub(tenantId, agentId).connectionDetachIfFrom(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
+        attach: (tenantId, agentId, provider, sealed) =>
+          stub(tenantId, agentId).connectionAttach(tenantId, agentId, CONNECTION_PLUGIN[provider], sealed),
+        connectors: d1Connectors(env.CONTROL_DB),
+        newId: () => `con_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`,
       },
     } : {}),
   };

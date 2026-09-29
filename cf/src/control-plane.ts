@@ -463,12 +463,16 @@ export interface ProvisionedConnection {
   account: string | null;
   connectedBy: string;
   connectedAt: number;
+  /** The tenant connector it came from (0012); null for one made before connectors. */
+  connectorId: string | null;
 }
 
 export interface ConnectionRegistry {
   get(tenantId: string, raftAgentId: string, provider: string): Promise<ProvisionedConnection | null>;
   put(c: ProvisionedConnection): Promise<void>;
   remove(tenantId: string, raftAgentId: string, provider: string): Promise<boolean>;
+  /** The agents whose connection came from this connector. */
+  boundTo(tenantId: string, connectorId: string): Promise<string[]>;
   /** Record a connect link's nonce as used. False when it was used before: a link starts one flow. */
   consumeLink(nonce: string, at: number): Promise<boolean>;
 }
@@ -477,16 +481,25 @@ export function d1Connections(db: D1Database): ConnectionRegistry {
   return {
     async get(tenantId, raftAgentId, provider) {
       const r = await db.prepare(
-        "SELECT account, connected_by, connected_at FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?",
+        "SELECT account, connected_by, connected_at, connector_id FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?",
       ).bind(tenantId, raftAgentId, provider).first<any>();
       if (!r) return null;
-      return { tenantId, raftAgentId, provider, account: r.account === null ? null : String(r.account), connectedBy: String(r.connected_by), connectedAt: Number(r.connected_at) };
+      return {
+        tenantId, raftAgentId, provider, account: r.account === null ? null : String(r.account), connectedBy: String(r.connected_by),
+        connectedAt: Number(r.connected_at), connectorId: r.connector_id === null || r.connector_id === undefined ? null : String(r.connector_id),
+      };
     },
     async put(c) {
       await db.prepare(
-        `INSERT INTO provisioned_connections (tenant_id, raft_agent_id, provider, account, connected_by, connected_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (tenant_id, raft_agent_id, provider) DO UPDATE SET account = excluded.account, connected_by = excluded.connected_by, connected_at = excluded.connected_at`,
-      ).bind(c.tenantId, c.raftAgentId, c.provider, c.account, c.connectedBy, c.connectedAt).run();
+        `INSERT INTO provisioned_connections (tenant_id, raft_agent_id, provider, account, connected_by, connected_at, connector_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tenant_id, raft_agent_id, provider) DO UPDATE SET account = excluded.account, connected_by = excluded.connected_by,
+           connected_at = excluded.connected_at, connector_id = excluded.connector_id`,
+      ).bind(c.tenantId, c.raftAgentId, c.provider, c.account, c.connectedBy, c.connectedAt, c.connectorId).run();
+    },
+    async boundTo(tenantId, connectorId) {
+      const r = await db.prepare("SELECT raft_agent_id FROM provisioned_connections WHERE tenant_id = ? AND connector_id = ? ORDER BY raft_agent_id")
+        .bind(tenantId, connectorId).all<any>();
+      return (r.results ?? []).map((x) => String(x.raft_agent_id));
     },
     async remove(tenantId, raftAgentId, provider) {
       const r = await db.prepare("DELETE FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?")
@@ -499,6 +512,63 @@ export function d1Connections(db: D1Database): ConnectionRegistry {
       const r = await db.prepare("INSERT INTO connect_links (nonce, used_at) VALUES (?, ?) ON CONFLICT (nonce) DO NOTHING")
         .bind(nonce, at).run();
       return (r.meta?.changes ?? 0) > 0;
+    },
+  };
+}
+
+/** A tenant's connection to a provider (0012_connectors.sql). The sealed credential never leaves the Worker and the agents' objects. */
+export interface Connector {
+  id: string;
+  tenantId: string;
+  provider: string;
+  account: string | null;
+  creatorRaftUserId: string;
+  sealed: { ciphertext: string; iv: string };
+  createdAt: number;
+}
+
+export interface ConnectorEvent {
+  tenantId: string; connectorId: string; raftAgentId: string | null;
+  action: "create" | "bind" | "unbind" | "disconnect";
+  actingRaftUserId: string; actingRole: "creator" | "admin"; at: number;
+}
+
+export interface ConnectorStore {
+  create(c: Connector): Promise<void>;
+  /** Only within the tenant: an id from another tenant is not found. */
+  get(tenantId: string, id: string): Promise<Connector | null>;
+  list(tenantId: string, provider: string): Promise<Connector[]>;
+  remove(tenantId: string, id: string): Promise<boolean>;
+  record(e: ConnectorEvent): Promise<void>;
+}
+
+export function d1Connectors(db: D1Database): ConnectorStore {
+  const row = (r: any): Connector => ({
+    id: String(r.id), tenantId: String(r.tenant_id), provider: String(r.provider), account: r.account === null ? null : String(r.account),
+    creatorRaftUserId: String(r.creator_raft_user_id), sealed: { ciphertext: String(r.ciphertext), iv: String(r.iv) }, createdAt: Number(r.created_at),
+  });
+  return {
+    async create(c) {
+      await db.prepare(
+        "INSERT INTO connectors (id, tenant_id, provider, account, creator_raft_user_id, ciphertext, iv, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(c.id, c.tenantId, c.provider, c.account, c.creatorRaftUserId, c.sealed.ciphertext, c.sealed.iv, c.createdAt).run();
+    },
+    async get(tenantId, id) {
+      const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).first<any>();
+      return r ? row(r) : null;
+    },
+    async list(tenantId, provider) {
+      const r = await db.prepare("SELECT * FROM connectors WHERE tenant_id = ? AND provider = ? ORDER BY created_at, id").bind(tenantId, provider).all<any>();
+      return (r.results ?? []).map(row);
+    },
+    async remove(tenantId, id) {
+      const r = await db.prepare("DELETE FROM connectors WHERE tenant_id = ? AND id = ?").bind(tenantId, id).run();
+      return (r.meta?.changes ?? 0) > 0;
+    },
+    async record(e) {
+      await db.prepare(
+        "INSERT INTO connector_events (tenant_id, connector_id, raft_agent_id, action, acting_raft_user_id, acting_role, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).bind(e.tenantId, e.connectorId, e.raftAgentId, e.action, e.actingRaftUserId, e.actingRole, e.at).run();
     },
   };
 }
