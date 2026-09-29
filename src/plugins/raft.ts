@@ -778,9 +778,9 @@ export const raftPlugin: Plugin = {
       // A Raft that refuses a batch outright because of its status (400: a value it does not accept)
       // would stop the whole feed, because the log holds a refused batch for ever. So a 400 on a batch
       // that carries status is tried once more without it, and said; a second 400 is the batch's own
-      // fault and throws as before. This is a guard, not how today's Raft behaves: Raft production
-      // answers 200 and counts what it will not take in `rejectedCount` (see below), and until Raft
-      // ships the status standard it ignores `status` and refuses status-only events that way.
+      // fault and throws as before. This is a guard, not how Raft behaved when last read: Raft production
+      // answered 200 and counted what it would not take in `rejectedCount` (see below), ignoring `status`
+      // and refusing status-only events that way until it ships the status standard (as read 2026-09-29).
       const plain = withoutStatus(events);
       if (!(error instanceof Error && /HTTP 400\b/.test(error.message)) || plain.length === events.length && plain.every((e, i) => e === events[i])) throw error;
       const dropped = events.filter((e) => e.status !== undefined).length;
