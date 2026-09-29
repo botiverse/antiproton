@@ -11,6 +11,7 @@
  *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
+import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -2095,7 +2096,8 @@ export class AgentDO extends DurableObject<Env> {
   async alarm() {
     const alarmStarted = Date.now();
     const failures = this.#alarmFailures();
-    if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
+    const watchdog = failures < 20 ? Date.now() + 30_000 : null;
+    if (watchdog !== null) await this.ctx.storage.setAlarm(watchdog);
     try {
       await this.#busy("alarm", async () => {
         this.alarmFiredAt = Date.now();
@@ -2138,16 +2140,14 @@ export class AgentDO extends DurableObject<Env> {
         const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
-        if (out.wakeInMs === null && usagePending) {
-          await this.ctx.storage.setAlarm(Date.now() + 60_000);
-        } else if (out.wakeInMs !== null) {
-          // The pass said when to come back — a retry has a time, a model call
-          // has a poll interval. Nothing here waits for either.
-          await this.ctx.storage.setAlarm(Date.now() + Math.max(50, out.wakeInMs));
-        } else {
-          // Genuinely idle: stand down rather than wake every 30s for ever.
-          await this.ctx.storage.deleteAlarm();
-        }
+        // The pass says when to come back — a retry has a time, a model call has a poll interval,
+        // held usage a minute — or nothing, when it is genuinely idle and stands down rather than
+        // waking every 30s for ever. Whatever input asked for during the pass is kept (alarm-next.ts).
+        const planned = out.wakeInMs !== null ? Date.now() + Math.max(50, out.wakeInMs)
+          : usagePending ? Date.now() + 60_000 : null;
+        const next = nextAlarm(watchdog, await this.ctx.storage.getAlarm(), planned);
+        if (next === null) await this.ctx.storage.deleteAlarm();
+        else await this.ctx.storage.setAlarm(next);
         logEvent("alarm.end", {
           tenantId: who.tenantId, agentId: who.agentId, ms: Date.now() - alarmStarted,
           wakeInMs: out.wakeInMs, usagePending, activityError: flushed.activityError ?? undefined, traceError: flushed.traceError ?? undefined,
