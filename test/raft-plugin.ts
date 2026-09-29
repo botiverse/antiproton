@@ -737,6 +737,28 @@ await check("a Raft that does not know status yet gets the same batch without it
   if (five.length !== 1) throw new Error("a 500 was retried without status");
 });
 
+await check("a 200 that counts refused events is said, and sent counts only what Raft took", async () => {
+  const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
+  const events = [
+    { eventId: "raft_x:1", hookEventName: "Stop" as const, occurredAt: "2026-09-29T05:00:02.000Z", status: "online" as const },
+    { eventId: "raft_x:2:status:start", occurredAt: "2026-09-29T05:00:01.000Z", status: "thinking" as const },
+  ];
+  one(json(200, { ok: true, acceptedCount: 1, rejectedCount: 1 }));
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (m: string) => { warned.push(String(m)); };
+  let out: any;
+  try { out = await raftPlugin.reportActivity!(events, on.ctx); } finally { console.warn = warn; }
+  if (out.sent !== 1 || warned.length !== 1 || !/refused 1 of 2/.test(warned[0]!) || !/1 status-only/.test(warned[0]!)) {
+    throw new Error(JSON.stringify({ out, warned }));
+  }
+  one(json(200, { ok: true, acceptedCount: 2, rejectedCount: 0 }));
+  const quiet: string[] = [];
+  console.warn = (m: string) => { quiet.push(String(m)); };
+  try { out = await raftPlugin.reportActivity!(events, on.ctx); } finally { console.warn = warn; }
+  if (out.sent !== 2 || quiet.length !== 0) throw new Error(`a clean answer was reported: ${JSON.stringify({ out, quiet })}`);
+});
+
 await check("activity posts the events as given to Raft's ingest while push is on, and says skipped when it is off", async () => {
   const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const calls = one(json(200, { accepted: 2 }));
