@@ -6,6 +6,8 @@
 import { operatorModelRequest } from "../cf/src/model-request.ts";
 import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
 import { contextWindowFor } from "../src/model/context-windows.ts";
+import { ModelResolver } from "../src/runtime/model-resolver.ts";
+import { operatorRequest } from "../src/model/operator-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void | Promise<void>) {
@@ -37,6 +39,22 @@ await check("the client sends the extra headers, and no authorization when it ha
   } finally { globalThis.fetch = real; }
   must(seen[0]!["cf-aig-authorization"] === "Bearer gt" && !("authorization" in seen[0]!), JSON.stringify(seen[0]));
   must(seen[1]!.authorization === "Bearer dk", JSON.stringify(seen[1]));
+});
+
+await check("an agent bound to the operator's model is called the same way: no DeepSeek key to another provider, the gateway token sent", async () => {
+  const op = { baseUrl: GW, apiKey: "dk", model: "deepseek/deepseek-flash", gatewayToken: "gt" };
+  const store: any = { getModelBinding: async () => ({ provider: "openai-compatible", baseUrl: GW, model: "anthropic/claude-sonnet-5", secretRef: "operator:model" }) };
+  const secrets: any = { resolve: async () => { throw new Error("the operator's binding was resolved as a plain key"); } };
+  const resolver = new ModelResolver(store, secrets, { ref: "operator:model", request: (b) => operatorRequest({ ...op, baseUrl: b.baseUrl }, b.model) });
+  const seen: Array<Record<string, string>> = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (_url: any, init?: any) => {
+    seen.push({ ...Object.fromEntries(new Headers(init?.headers ?? {}).entries()), model: JSON.parse(init.body).model });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} }), { headers: { "content-type": "application/json" } });
+  }) as any;
+  try { await (await resolver.resolve({ tenantId: "t", agentId: "a" })).complete([{ role: "user", content: "hi" }]); }
+  finally { globalThis.fetch = real; }
+  must(seen[0]?.model === "anthropic/claude-sonnet-5" && !("authorization" in seen[0]!) && seen[0]!["cf-aig-authorization"] === "Bearer gt", JSON.stringify(seen));
 });
 
 await check("a `provider/model` name is sized by the model's own window", () => {

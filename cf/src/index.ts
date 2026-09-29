@@ -84,7 +84,7 @@ import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { operatorModelRequest } from "./model-request.ts";
+import { operatorModelOf, operatorModelRequest } from "./model-request.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -407,11 +407,7 @@ export class AgentDO extends DurableObject<Env> {
       loader: this.env.LOADER,
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
-      operatorModel: {
-        baseUrl: this.env.DEEPSEEK_BASE_URL,
-        apiKey: this.env.DEEPSEEK_API_KEY,
-        model: this.env.HARNESS_MODEL,
-      },
+      operatorModel: operatorModelOf(this.env),
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       operatorExa: this.env.EXA_API_KEY,
       secretKek: this.env.SECRET_KEK,
@@ -778,11 +774,7 @@ export class AgentDO extends DurableObject<Env> {
       loader: this.env.LOADER,
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
-      operatorModel: {
-        baseUrl: this.env.DEEPSEEK_BASE_URL,
-        apiKey: this.env.DEEPSEEK_API_KEY,
-        model: this.env.HARNESS_MODEL,
-      },
+      operatorModel: operatorModelOf(this.env),
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       operatorExa: this.env.EXA_API_KEY,
       secretKek: this.env.SECRET_KEK,
