@@ -854,7 +854,14 @@ export function registrationsFor(form: SandboxForm, credential: string, placehol
   }));
 }
 
-/** Every name a form takes in a container: its registrations and its environment variables. */
+/**
+ * Every name a form takes in a container: its registrations and its environment
+ * variables. git's helper is configured through `GIT_CONFIG_COUNT` and
+ * `GIT_CONFIG_KEY_0`, so a second plugin with a git helper would clash with
+ * github and both would be left out, though git takes several helpers. When
+ * that plugin arrives, number the helpers across forms instead of claiming
+ * index 0.
+ */
 function claimedNames(form: SandboxForm): string[] {
   return [...new Set([...form.egress.map((e) => e.name), ...Object.keys(form.env(""))])];
 }
@@ -886,7 +893,7 @@ async function tokenDigest(token: string): Promise<string> {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-type Candidate = { alias: string; plugin: string; form: SandboxForm; credential: string | null };
+type Candidate = Awaited<ReturnType<PluginContext["sandboxForms"]>>[number];
 
 /**
  * The accounts a container of this mount may act as right now: every mount
@@ -923,6 +930,7 @@ async function register(api: Run9Api, project: string, boxId: string, c: Candida
       inject_header_name: g.header, allowed_hosts: g.hosts,
     });
   }
+  await c.used();
   return {
     alias: c.alias, plugin: c.plugin, placeholder, digest: c.digest, names: regs.map((g) => g.name),
     env: c.form.env(placeholder), summary: c.form.summary,

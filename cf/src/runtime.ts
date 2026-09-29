@@ -666,7 +666,7 @@ export class AgentRuntime {
     };
     this.#kek = kekPromise;
     this.#secrets = {
-      resolve: async (ref, scope) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope),
+      resolve: async (ref, scope, opts) => agentSecrets(this.store, await kekPromise, operator).resolve(ref, scope, opts),
     };
     // The operator's catalogue, told to the kernel rather than read by it.
     this.#gateway = new ToolGateway(this.store, plugins, SEEDED_PLUGINS, this.#secrets,

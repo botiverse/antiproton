@@ -281,7 +281,16 @@ export interface PluginContext {
    * plugin that declares a form is wired in with no change to the container.
    * Switched-off plugins are left out. Grants nothing `sibling` does not.
    */
-  sandboxForms(): Promise<Array<{ alias: string; plugin: string; form: SandboxForm; credential: string | null }>>;
+  sandboxForms(): Promise<Array<{
+    alias: string; plugin: string; form: SandboxForm; credential: string | null;
+    /**
+     * Record that the credential was put to work. Reading it here records
+     * nothing, because the container re-reads before every command only to
+     * notice a change; call this when it is registered with a container, so
+     * the mount's "last used" still means used.
+     */
+    used(): Promise<void>;
+  }>>;
 }
 
 /**

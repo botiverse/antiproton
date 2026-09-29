@@ -80,15 +80,15 @@ export function agentSecrets(
   store: StorageAdapter, kek: CryptoKey | null, fallback: SecretResolver,
 ): SecretResolver {
   return {
-    async resolve(ref, scope) {
-      if (!isAgentRef(ref)) return fallback.resolve(ref, scope);
+    async resolve(ref, scope, opts) {
+      if (!isAgentRef(ref)) return fallback.resolve(ref, scope, opts);
       if (!scope) return null;              // no owner, no lookup: the reference alone names nothing
       if (!kek) throw new Error("agent secrets are configured but the Worker has no SECRET_KEK");
       const name = ref.slice(AGENT_REF.length);
       const row = await store.getSecret(scope.tenantId, scope.agentId, name);
       if (!row) return null;
       const value = await open(kek, row);
-      await store.touchSecret(scope.tenantId, scope.agentId, name, Date.now());
+      if (opts?.touch !== false) await store.touchSecret(scope.tenantId, scope.agentId, name, Date.now());
       return value;
     },
   };
