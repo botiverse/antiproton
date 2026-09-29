@@ -290,7 +290,7 @@ await check("prepare_action posts one of the three model-preparable cards and sa
     target: "#general", action: { type: "channel:create", name: "launch-room", draftHint: "for Thursday's launch" },
   }, ctx()) as any;
   if (out.prepared !== true || out.messageId !== "abcdef12-3456" || !/Nothing has happened yet/.test(out.note) ||
-      !/Action card posted to #general/.test(out.text) || /raft message read/.test(JSON.stringify(out))) {
+      !/Action card posted to #general/.test(out.text) || /raft message read/.test(JSON.stringify(out)) || /arrives in your inbox/.test(out.note)) {
     throw new Error(JSON.stringify(out));
   }
   const body = JSON.parse(String(calls[0]!.init.body));
