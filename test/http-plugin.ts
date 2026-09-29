@@ -172,6 +172,44 @@ await test("跳转不带密钥", "a kept secret goes to the first URL's origin o
   } finally { (globalThis as any).fetch = real; }
 });
 
+await test("密钥模板", "a header can wrap a kept secret in text, as most APIs want Bearer <key>", async () => {
+  const real = globalThis.fetch;
+  const sent: Array<Record<string, string>> = [];
+  (globalThis as any).fetch = async (_u: URL | string, init: any) => {
+    sent.push(init.headers);
+    return new Response(`auth was ${init.headers.authorization}`, { status: 200, headers: { "content-type": "text/plain" } });
+  };
+  try {
+    const out: any = await httpPlugin.invoke("get",
+      { url: "https://api.acme.test/v1", secretHeaders: { authorization: "Bearer {{acme}}" } } as any, ctx(["api.acme.test"]) as any);
+    eq(sent[0]?.authorization, "Bearer sk-acme-0123456789", "the template was filled");
+    eq(out.body, "auth was Bearer [secret acme]", "and the echo names the secret");
+    eq(out.secretHeaders?.authorization, "Bearer {{acme}}", "the result shows the template, not the value");
+    let msg = "";
+    try { await httpPlugin.invoke("get", { url: "https://api.acme.test/v1", secretHeaders: { authorization: "Bearer {{nope}}" } } as any, ctx(["api.acme.test"]) as any); }
+    catch (e) { msg = (e as Error).message; }
+    assert(/no secret named nope/.test(msg), `a missing name in a template: ${msg}`);
+  } finally { (globalThis as any).fetch = real; }
+});
+
+await test("跳出后不再带", "once a redirect leaves the first origin, the secret stays behind even when it comes back", async () => {
+  const real = globalThis.fetch;
+  const sent: Array<{ url: string; key?: string }> = [];
+  (globalThis as any).fetch = async (u: URL | string, init: any) => {
+    const s = String(u);
+    sent.push({ url: s, key: init.headers.authorization });
+    if (s === "https://api.acme.test/a") return new Response(null, { status: 302, headers: { location: "https://cdn.other.test/x" } });
+    if (s === "https://cdn.other.test/x") return new Response(null, { status: 302, headers: { location: "https://api.acme.test/b" } });
+    return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+  };
+  try {
+    await httpPlugin.invoke("get",
+      { url: "https://api.acme.test/a", secretHeaders: { authorization: "acme" } } as any, ctx(["api.acme.test", "cdn.other.test"]) as any);
+    eq(sent.length, 3, "three hops");
+    eq(sent[2]?.key, undefined, "the hop back to the first origin went without it");
+  } finally { (globalThis as any).fetch = real; }
+});
+
 console.log(`\n  outbound http — a mount, not a capability\n  ${"─".repeat(66)}`);
 for (const r of results) {
   const label = `${r.row.padEnd(14)} ${r.name}`;

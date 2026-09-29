@@ -201,7 +201,8 @@ export const httpPlugin: Plugin = {
           },
           secretHeaders: {
             type: "object", additionalProperties: { type: "string" },
-            description: "header → the name of a secret you kept with secret_put, e.g. {\"authorization\": \"openai\"}. " +
+            description: "header → the name of a secret you kept with secret_put, or text with {{name}} in it: " +
+              "{\"x-api-key\": \"openai\"}, {\"authorization\": \"Bearer {{openai}}\"}. " +
               "Sent to this URL's host only, never after a redirect elsewhere; the value never comes back to you.",
           },
           raw: { type: "boolean", description: "return the markup instead of extracted text" },
@@ -233,7 +234,8 @@ export const httpPlugin: Plugin = {
           headers: { type: "object", description: "extra request headers; credentials go in secretHeaders instead" },
           secretHeaders: {
             type: "object", additionalProperties: { type: "string" },
-            description: "header → the name of a secret you kept with secret_put, e.g. {\"authorization\": \"openai\"}. " +
+            description: "header → the name of a secret you kept with secret_put, or text with {{name}} in it: " +
+              "{\"x-api-key\": \"openai\"}, {\"authorization\": \"Bearer {{openai}}\"}. " +
               "Sent to this URL's host only, never after a redirect elsewhere; the value never comes back to you.",
           },
           accept: { type: "string" },
@@ -370,27 +372,43 @@ export const httpPlugin: Plugin = {
      * name and filled in server-side, so it never has to pass through the
      * conversation to reach the service. Only on the first URL's own origin, as
      * a browser drops `authorization` on a cross-origin redirect: the model
-     * chose where the key goes, a redirect did not. And any echo of it in the
-     * response is replaced with its name before the model reads it.
+     * chose where the key goes, a redirect did not. And an echo of it in the
+     * response is replaced with its name before the model reads it — only a
+     * verbatim echo: one the server encoded (URL, JSON escapes, base64) is not
+     * recognised, so this narrows the leak and does not close it.
+     *
+     * A value is a name, or text with `{{name}}` in it, because most APIs want
+     * `Bearer <key>` and what an agent keeps is the bare key.
      */
-    const secret: Record<string, { name: string; value: string }> = {};
-    for (const [header, name] of Object.entries(a.secretHeaders ?? {})) {
-      if (typeof name !== "string") throw new Error(`secretHeaders.${header} must be the name of a secret you kept`);
-      const value = await ctx.agentSecret(name);
-      if (value === null) throw new Error(`no secret named ${name}; keep one with secret_put, or see secret_list`);
-      secret[header.toLowerCase()] = { name, value };
+    const kept = new Map<string, string>();
+    const secret: Record<string, { as: string; value: string }> = {};
+    for (const [header, spec] of Object.entries(a.secretHeaders ?? {})) {
+      if (typeof spec !== "string") throw new Error(`secretHeaders.${header} must be the name of a secret you kept, or text with {{name}} in it`);
+      const names = spec.includes("{{") ? [...spec.matchAll(/\{\{([^}]*)\}\}/g)].map((m) => m[1]!.trim()) : [spec];
+      if (!names.length) throw new Error(`secretHeaders.${header} has no {{name}} in it`);
+      for (const name of names) {
+        if (kept.has(name)) continue;
+        const value = await ctx.agentSecret(name);
+        if (value === null) throw new Error(`no secret named ${name}; keep one with secret_put, or see secret_list`);
+        kept.set(name, value);
+      }
+      const value = spec.includes("{{") ? spec.replace(/\{\{([^}]*)\}\}/g, (_, n: string) => kept.get(n.trim())!) : kept.get(spec)!;
+      secret[header.toLowerCase()] = { as: spec, value };
     }
-    const hide = (text: string) => Object.values(secret).reduce(
-      (t, s) => (s.value.length >= 4 ? t.split(s.value).join(`[secret ${s.name}]`) : t), text);
+    const hide = (text: string) => [...kept].reduce(
+      (t, [name, value]) => (value.length >= 4 ? t.split(value).join(`[secret ${name}]`) : t), text);
     const hideHeaders = (h: Record<string, string>) =>
       Object.fromEntries(Object.entries(h).map(([k, v]) => [k, hide(v)]));
     let target = String(a.url ?? "");
     const hops: string[] = [];
     let origin: string | null = null;
+    // Once a hop leaves the first origin the secret stays behind, even if a later hop comes back:
+    // a redirect chain that returns was still steered by somebody else.
+    let carry = true;
     let dropped: string | null = null;
     // Which secret went in which header, by name, and where it was held back.
     const secretNote = () => Object.keys(secret).length ? {
-      secretHeaders: Object.fromEntries(Object.entries(secret).map(([h, s]) => [h, s.name])),
+      secretHeaders: Object.fromEntries(Object.entries(secret).map(([h, s]) => [h, s.as])),
       ...(dropped ? { secretHeadersNotSentTo: dropped } : {}),
     } : {};
     // Redirects are followed by hand so every hop is checked, not just the first.
@@ -399,8 +417,8 @@ export const httpPlugin: Plugin = {
       if (!check.ok) throw new Error(check.why);
       hops.push(check.url.toString());
       origin ??= check.url.origin;
-      const carry = check.url.origin === origin;
-      if (!carry && Object.keys(secret).length) dropped = check.url.host;
+      if (check.url.origin !== origin) carry = false;
+      if (!carry && Object.keys(secret).length) dropped ??= check.url.host;
 
       const method = String(a.method ?? (tool === "send" ? "POST" : "GET")).toUpperCase();
       // The split is what lets the policy layer gate one and not the other, so
