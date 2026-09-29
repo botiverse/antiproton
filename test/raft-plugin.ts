@@ -284,6 +284,29 @@ await check("a version-2 mount's cursor and frontier become the SDK's state: the
   if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");
 });
 
+await check("prepare_action posts one of the three model-preparable cards and says nothing has happened yet", async () => {
+  const calls = one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
+  const out = await raftPlugin.invoke("prepare_action", {
+    target: "#general", action: { type: "channel:create", name: "launch-room", draftHint: "for Thursday's launch" },
+  }, ctx()) as any;
+  if (out.prepared !== true || out.messageId !== "abcdef12-3456" || !/nothing has happened yet/.test(out.note)) throw new Error(JSON.stringify(out));
+  const body = JSON.parse(String(calls[0]!.init.body));
+  if (!/\/internal\/agent-api\/prepare-action$/.test(calls[0]!.url) || body.target !== "#general" || body.action?.type !== "channel:create" ||
+      body.action.name !== "launch-room" || body.action.draftHint !== "for Thursday's launch") {
+    throw new Error(`request: ${calls[0]!.url} ${JSON.stringify(body)}`);
+  }
+  const tool = raftPlugin.tools.find((x) => x.name === "prepare_action");
+  if (tool?.sideEffects !== "write" || tool.idempotency !== "none") throw new Error(`declaration: ${JSON.stringify(tool)}`);
+  // An integration card needs ids a model cannot know; it is refused before anything is sent.
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const why = await failure(() => raftPlugin.invoke("prepare_action", { target: "#general", action: { type: "integration:register_app", name: "x", returnUrl: "https://x" } }, ctx()));
+  if (sent !== 0 || !/channel:create, channel:add_member or agent:create/.test(why.message)) throw new Error(`integration card: sent=${sent} ${why.message}`);
+  // A card Raft's contract refuses (a name too long) is refused by the SDK before sending, naming no body.
+  const tooLong = await failure(() => raftPlugin.invoke("prepare_action", { target: "#general", action: { type: "channel:create", name: "x".repeat(81) } }, ctx()));
+  if (sent !== 0 || tooLong.mayHaveLanded === true) throw new Error(`contract refusal: sent=${sent} ${tooLong.message}`);
+});
+
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
   const m = mount();
   const calls = one(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }));

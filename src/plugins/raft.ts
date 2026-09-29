@@ -413,7 +413,7 @@ export const raftPlugin: Plugin = {
     required: true,
     summary: "A Raft agent credential for the agent account this mount represents.",
     shape: "token",
-    grants: "Send messages, receive queued events, and join visible channels as that Raft agent.",
+    grants: "Send messages, receive queued events, join visible channels, and post action cards as that Raft agent.",
     looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
   },
   tools: [
@@ -473,6 +473,56 @@ export const raftPlugin: Plugin = {
       parameters: { type: "object", additionalProperties: false, properties: {} },
       sideEffects: "write",
       idempotency: "native",
+    },
+    {
+      name: "prepare_action",
+      summary: "Post an action card in a Raft channel or DM for a person to confirm: creating a channel, adding members to one, " +
+        "or creating an agent. Nothing happens until a person clicks it there; they act with their own permissions. " +
+        "Use it for what you cannot or should not do yourself, and say in draftHint why you prepared it.",
+      parameters: {
+        type: "object", additionalProperties: false, required: ["target", "action"],
+        properties: {
+          target: { type: "string", description: "Where the card is posted, for example #general or dm:@name." },
+          action: {
+            oneOf: [
+              {
+                type: "object", additionalProperties: false, required: ["type", "name"],
+                properties: {
+                  type: { const: "channel:create" },
+                  name: { type: "string", maxLength: 80 },
+                  visibility: { enum: ["public", "private"] },
+                  description: { type: "string", maxLength: 500 },
+                  initialHumans: { type: "array", items: { type: "string" }, maxItems: 64, description: "handles or ids" },
+                  initialAgents: { type: "array", items: { type: "string" }, maxItems: 64, description: "handles or ids" },
+                  draftHint: { type: "string", maxLength: 2000 },
+                },
+              },
+              {
+                type: "object", additionalProperties: false, required: ["type", "channel"],
+                properties: {
+                  type: { const: "channel:add_member" },
+                  channel: { type: "string", description: "#name or id" },
+                  humans: { type: "array", items: { type: "string" }, maxItems: 64 },
+                  agents: { type: "array", items: { type: "string" }, maxItems: 64 },
+                  draftHint: { type: "string", maxLength: 2000 },
+                },
+              },
+              {
+                type: "object", additionalProperties: false, required: ["type", "name"],
+                properties: {
+                  type: { const: "agent:create" },
+                  name: { type: "string", maxLength: 60 },
+                  description: { type: "string", maxLength: 500 },
+                  draftHint: { type: "string", maxLength: 2000 },
+                },
+              },
+            ],
+          },
+        },
+      },
+      // Each call posts a card; a repeat posts another.
+      sideEffects: "write",
+      idempotency: "none",
     },
     {
       name: "push_status",
@@ -661,6 +711,27 @@ export const raftPlugin: Plugin = {
         registration: null,
       });
       return { enabled: false, remoteDeregistration, cleanupPending: staleHookIds.length };
+    }
+    if (name === "prepare_action") {
+      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
+      const action = object(a.action);
+      // The three a model may prepare. The integration cards take ids a model has no way to know, and are
+      // made by Raft's own integration commands.
+      if (action.type !== "channel:create" && action.type !== "channel:add_member" && action.type !== "agent:create") {
+        throw new Error("action.type must be channel:create, channel:add_member or agent:create");
+      }
+      const out = await raftFor(ctx).routes.actions.prepare({ target: a.target, action } as never);
+      if (!out.ok) {
+        const e = out.error;
+        // The SDK checks the card against Raft's contract before sending; that refusal names the field, never a body.
+        const unanswered = e.kind === "transport" || (e.kind === "http" && e.status >= 500);
+        throw marked(new Error(e.kind === "http" ? `raft refused the card (HTTP ${e.status}${e.errorCode ? `, ${e.errorCode}` : ""})` : e.message),
+          { mayHaveLanded: unanswered, retryable: unanswered, transient: unanswered });
+      }
+      return {
+        prepared: true, target: a.target, messageId: out.data.messageId,
+        note: "The card is posted; nothing has happened yet. A person confirms it in Raft, acting with their own permissions.",
+      };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);
