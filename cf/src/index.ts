@@ -11,6 +11,7 @@
  *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
+import { adminModels } from "./admin-models.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
 import { canonJson } from "../../src/core/canon-json.ts";
@@ -56,6 +57,7 @@ import {
   constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER, QA_KEY_SUBJECT, serviceViewer, uiAgent,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
+  isAdmin,
 } from "./auth.ts";
 import { adminTranscript } from "./admin-transcript.ts";
 import { refuseSecret } from "./secret-shape.ts";
@@ -75,7 +77,7 @@ import { d1ServiceTokens } from "./control-plane.ts";
 import { adminServiceTokens } from "./admin-service-tokens.ts";
 import { hashServiceToken, looksLikeServiceToken } from "./service-token.ts";
 import { adminProviderTokens } from "./admin-provider-tokens.ts";
-import { d1Connections, d1Connectors, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
+import { d1Connections, d1Connectors, d1ModelOverrides, d1ProviderTokens, d1ProvisionedAgents } from "./control-plane.ts";
 import { CONNECT_START_PATH, CONNECTION_PLUGIN, connectCallback, connectLink, connectStart, isConnectCallback, type ConnectDeps } from "./provision/connect.ts";
 import { hashProviderToken, looksLikeProviderToken } from "./provider-token.ts";
 import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provision/handlers.ts";
@@ -84,7 +86,8 @@ import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { operatorModelOf, operatorModelRequest } from "./model-request.ts";
+import { operatorModelOf } from "./model-request.ts";
+import { operatorRequest } from "../../src/model/operator-request.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel,
@@ -104,6 +107,8 @@ export interface Env {
   CONTROL_DB: D1Database;
   ARTIFACTS: R2Bucket;
   DEEPSEEK_API_KEY: string;
+  /** Who administers the deployment besides the operator's token: comma-separated identity keys (`github:<id>`). */
+  ADMIN_IDENTITIES?: string;
   /** Cloudflare AI Gateway token (AI Gateway: Run), when DEEPSEEK_BASE_URL is a gateway with authentication on. */
   AI_GATEWAY_TOKEN?: string;
   DEEPSEEK_BASE_URL: string;
@@ -251,7 +256,7 @@ async function runQueuedModelCall(m: QueuedModelCall, env: Env) {
   // provider again.
   if (!job) return;
 
-  const model = new OpenAiCompatibleModel(operatorModelRequest(env));
+  const model = new OpenAiCompatibleModel(operatorRequest(operatorModelOf(env), job.operatorModel ?? env.HARNESS_MODEL));
   const { messages, tools } = toRequest(job.context);
   const t0 = Date.now();
   const res = await model.complete(messages, tools ? { tools } : {});
@@ -1283,7 +1288,7 @@ export class AgentDO extends DurableObject<Env> {
       // Not the console's default mounts: an API agent has what its caller declared (agents-api/provisioning.ts).
       const provides = (id: string) => rt.plugins().find((pl) => pl.id === id)?.provides;
       await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment, provides));
-      await rt.bindOperatorModel(tenantId, agentId);
+      await this.#bindModel(rt, tenantId, agentId);
       await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
       await this.ctx.storage.setAlarm(Date.now());
       // The turn is on record now: say so, rather than leaving it for the step that follows.
@@ -1439,10 +1444,7 @@ export class AgentDO extends DurableObject<Env> {
       // creation-only drift that left a mount on a stale config twice already.
       // An agent that brought its own credential is left alone; only the
       // operator's own binding follows the operator's choice.
-      const binding = await rt.store.getModelBinding(tenantId, agentId);
-      const stale = binding?.secretRef === OPERATOR_SECRET_REF &&
-        (binding.model !== this.env.HARNESS_MODEL || binding.baseUrl !== this.env.DEEPSEEK_BASE_URL);
-      if (!binding || stale) await rt.bindOperatorModel(tenantId, agentId);
+      await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
       // The lane is the conversation, and this is where it comes into being:
       // opening the agent reads the transcript back and reports anything the
       // last eviction interrupted.
@@ -1734,7 +1736,8 @@ export class AgentDO extends DurableObject<Env> {
   async provisionAdopt(tenantId: string, agentId: string, specJson: string) {
     this.#claim(tenantId, agentId);
     const spec = JSON.parse(specJson) as { name: string; instructions: string; raftOrigin: string };
-    return this.#busy("provisionAdopt", () => adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }));
+    return this.#busy("provisionAdopt", async () =>
+      adoptProvisionedAgent(this.runtime(), tenantId, agentId, { ...spec, avatar: mintAvatar() }, await this.#modelFor(tenantId, agentId)));
   }
 
   /** One of the raft plugin's push tools, run by the provider rather than the model. */
@@ -1754,6 +1757,32 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
   }
 
+  /** The model this agent's operator binding should name: the admin's choice (model_overrides), else the deployment's. */
+  async #modelFor(tenantId: string, agentId: string): Promise<string> {
+    try {
+      return (await d1ModelOverrides(this.env.CONTROL_DB).effective(tenantId, agentId)) ?? this.env.HARNESS_MODEL;
+    } catch (e) {
+      // The control plane unreachable is no reason to stop an agent: it keeps the default.
+      console.warn(`model choice for ${agentId} could not be read: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+      return this.env.HARNESS_MODEL;
+    }
+  }
+
+  /**
+   * Bind the operator's model as chosen for this agent. `onlyIfStale`: leave a binding alone unless it is
+   * missing, or the operator's and no longer what is chosen (the model or the endpoint changed). An agent
+   * that brought its own credential is never touched.
+   */
+  async #bindModel(rt: AgentRuntime, tenantId: string, agentId: string, opts: { onlyIfStale?: boolean } = {}) {
+    const model = await this.#modelFor(tenantId, agentId);
+    if (opts.onlyIfStale) {
+      const b = await rt.store.getModelBinding(tenantId, agentId);
+      const stale = b?.secretRef === OPERATOR_SECRET_REF && (b.model !== model || b.baseUrl !== this.env.DEEPSEEK_BASE_URL);
+      if (b && !stale) return;
+    }
+    await rt.bindOperatorModel(tenantId, agentId, model);
+  }
+
   async hookReceive(tenantId: string, agentId: string, alias: string, hookId: string,
     event: { headers: Record<string, string>; body: Uint8Array } | null) {
     this.#claim(tenantId, agentId);
@@ -1764,7 +1793,10 @@ export class AgentDO extends DurableObject<Env> {
         // An agent Raft made has the default mounts (provision/steps.ts), and gets one added since on its
         // next wake, the way a console agent gets it when its page opens. Only what is missing is added.
         const agent = await rt.store.loadAgent(tenantId, agentId);
-        if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") await rt.provision(tenantId, agentId);
+        if ((agent?.config as { provisionedBy?: unknown } | undefined)?.provisionedBy === "raft") {
+          await rt.provision(tenantId, agentId);
+          await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
+        }
         await this.ctx.storage.setAlarm(Date.now());
         await this.broadcast();
       }
@@ -1923,7 +1955,7 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("startTask", async () => {
       const rt = this.runtime();
       await rt.provision(tenantId, agentId);
-      await rt.bindOperatorModel(tenantId, agentId);
+      await this.#bindModel(rt, tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, text);
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
       await this.ctx.storage.setAlarm(Date.now());
@@ -2432,8 +2464,11 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       // must produce, and a refusal would hide it.
       const v = await viewer(request, env);
       return Response.json({
-        viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v), tenantId: tenantOf(v) } : null,
+        viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v), tenantId: tenantOf(v), admin: isAdmin(v, env) } : null,
         build: env.GIT_COMMIT ?? null,
+        // The deployment's default model and where it is served from, so a benchmark record can say which
+        // path its run took. An agent may be on another (model_overrides).
+        model: { name: env.HARNESS_MODEL, endpoint: (() => { try { return new URL(env.DEEPSEEK_BASE_URL).host; } catch { return null; } })() },
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
         loginConfigured: githubConfig(env) !== null,
         qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
@@ -2934,6 +2969,18 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (url.pathname.startsWith("/hooks/")) return inboundHook(request, env, url);
     if (url.pathname === "/admin/hooks") return adminHooks(request, env, url);
     if (url.pathname === "/admin/mounts") return adminMounts(request, env);
+    if (url.pathname === "/admin/models") {
+      // A signed-in admin or the operator's token (auth.ts isAdmin); anyone else is told nothing.
+      const v = await viewer(request, env);
+      if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+      let body: unknown;
+      if (request.method === "PUT" || request.method === "DELETE") {
+        try { body = JSON.parse((await request.text()) || "{}"); } catch { return Response.json({ error: { code: "invalid_json", message: "the body is not JSON" } }, { status: 400 }); }
+      }
+      return adminModels(request.method, body, v!.sub ?? v!.email, {
+        overrides: d1ModelOverrides(env.CONTROL_DB), defaults: { model: env.HARNESS_MODEL, baseUrl: env.DEEPSEEK_BASE_URL }, now: Date.now,
+      });
+    }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
     // Conformance gets its own object: the P0 probe created an incompatible
     // `tasks` table in "p0", and CREATE TABLE IF NOT EXISTS silently accepted it.

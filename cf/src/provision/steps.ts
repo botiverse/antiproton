@@ -22,6 +22,7 @@ export const PROVIDER_HOME = "u-raft-provider";
 export async function adoptProvisionedAgent(
   rt: AgentRuntime, tenantId: string, agentId: string,
   spec: { name: string; instructions: string; raftOrigin: string; avatar: string },
+  model?: string | null,
 ): Promise<{ ok: true; avatar: string } | { ok: false; error: string }> {
   await rt.ready();
   const existing = await rt.store.loadAgent(tenantId, agentId);
@@ -30,8 +31,9 @@ export async function adoptProvisionedAgent(
   const persona = { ...config, name: spec.name, description: spec.instructions, avatar, provisionedBy: "raft" };
   if (!existing) await rt.store.createAgent(tenantId, agentId, persona as Json);
   else await rt.store.updateAgentConfig(tenantId, agentId, persona as Json);
-  // The deployment's model, always: the contract offers no choice.
-  await rt.bindOperatorModel(tenantId, agentId);
+  // The operator's model, as the deployment's admin chose it for this agent (model_overrides); Raft's
+  // contract offers no choice of its own.
+  await rt.bindOperatorModel(tenantId, agentId, model);
   // The same default mounts every agent gets — memory (state), artifacts, web, GitHub, sandbox, tools — the way the
   // console and the Agents API seed them. Missed on the first cut: Ant2 on staging had the raft mount and nothing
   // else, so the agent truthfully said it had no memory. Idempotent: adds only what is missing.

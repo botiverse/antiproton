@@ -3,7 +3,7 @@
  * against a local database the migrations in cf/migrations were applied to; see
  * test/control-plane-d1.sh. Each case starts from an empty table.
  */
-import { d1ApiKeys, d1Connections, d1Connectors, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
+import { d1ApiKeys, d1Connections, d1Connectors, d1ModelOverrides, d1Identities, d1InboundHooks, d1ProviderTokens, d1ProvisionedAgents, d1ServiceTokens } from "../../cf/src/control-plane.ts";
 
 export interface SpecCase { name: string; run(): Promise<void> }
 
@@ -245,6 +245,20 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     await k.record({ tenantId: "t", connectorId: "con_b", raftAgentId: "a1", action: "bind", actingRaftUserId: "u9", actingRole: "admin", at: 5 });
     const ev = (await db.prepare("SELECT * FROM connector_events").all()).results as any[];
     assert(ev.length === 1 && ev[0].acting_role === "admin" && ev[0].raft_agent_id === "a1", `events: ${JSON.stringify(ev)}`);
+  });
+
+  add("a model choice: the agent's own, else its tenant's, else the deployment's, else none", async () => {
+    const m = d1ModelOverrides(db);
+    assert((await m.effective("t", "a")) === null, "a choice out of nothing");
+    await m.put({ tenantId: "", agentId: "", model: "deepseek/deepseek-flash", setBy: "u", setAt: 1 });
+    assert((await m.effective("t", "a")) === "deepseek/deepseek-flash", "the deployment's");
+    await m.put({ tenantId: "t", agentId: "", model: "anthropic/claude-sonnet-5", setBy: "u", setAt: 2 });
+    assert((await m.effective("t", "a")) === "anthropic/claude-sonnet-5" && (await m.effective("t2", "a")) === "deepseek/deepseek-flash", "the tenant's, and only for it");
+    await m.put({ tenantId: "t", agentId: "a", model: "openai/gpt-5", setBy: "u", setAt: 3 });
+    assert((await m.effective("t", "a")) === "openai/gpt-5" && (await m.effective("t", "b")) === "anthropic/claude-sonnet-5", "the agent's, and only for it");
+    await m.put({ tenantId: "t", agentId: "a", model: "openai/gpt-5-mini", setBy: "v", setAt: 4 });
+    assert((await m.list()).length === 3 && (await m.effective("t", "a")) === "openai/gpt-5-mini", "a second choice replaced the first");
+    assert((await m.remove("t", "a")) && (await m.effective("t", "a")) === "anthropic/claude-sonnet-5", "removing the agent's falls back to the tenant's");
   });
 
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {
