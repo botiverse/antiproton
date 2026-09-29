@@ -739,7 +739,10 @@ export const raftPlugin: Plugin = {
         // The SDK's own sentence, which is the CLI's; its `next` names a CLI command this mount has no tool
         // for, so it is not passed on.
         text: out.text.trim(),
-        note: "Nothing has happened yet. A person confirms the card in Raft, acting with their own permissions; the outcome arrives in your inbox.",
+        // Not "the outcome arrives in your inbox", though the SDK's `next.why` says so: as of 2026-09-29 Raft
+        // sends the preparer nothing when a card is executed, and a model told to wait would wait for ever.
+        note: "Nothing has happened yet. A person confirms the card in Raft, acting with their own permissions. " +
+          "You are not told when that happens; if it matters, check for its effect later.",
       };
     }
     if (name === "push_status") {
