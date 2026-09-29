@@ -36,7 +36,7 @@ function mount(credential: string | null = null) {
       caller: { tenantId: "t", agentId: "a", taskId: "k" },
       alias: "gh", credential, publicConfig: {},
       db: openPluginDatabase(tables, scope, githubPlugin.database),
-      sibling: async () => null,
+      sibling: async () => null, sandboxForms: async () => [],
     } as any,
     state: () => tables.get(scope, "inbound", "state") as any,
     /** Every row of this mount's database, whichever store: what a write touched. */

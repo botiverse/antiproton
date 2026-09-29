@@ -5,7 +5,7 @@ import { secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
-import { type ActivityEvent, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
+import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
@@ -358,6 +358,7 @@ export class ToolGateway {
             publicConfig: mount.publicConfig,
             db: this.#db(ctx, mount),
             async sibling() { return null; },
+            async sandboxForms() { return []; },
           });
         } catch (e: any) {
           // A plugin that cannot describe itself must not stop the agent from
@@ -401,6 +402,7 @@ export class ToolGateway {
       publicConfig: mount.publicConfig,
       db: this.#db(ctx, mount),
       async sibling() { return null; },
+      async sandboxForms() { return []; },
     });
   }
 
@@ -433,6 +435,7 @@ export class ToolGateway {
       publicConfig: mount.publicConfig,
       db: this.#db(ctx, mount),
       async sibling() { return null; },
+      async sandboxForms() { return []; },
     });
   }
 
@@ -476,6 +479,7 @@ export class ToolGateway {
           publicConfig: mount.publicConfig,
           db: this.#db(ctx, mount),
           async sibling() { return null; },
+          async sandboxForms() { return []; },
         });
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
@@ -830,6 +834,20 @@ export class ToolGateway {
           policy: other.policy ?? null,
         };
       },
+      // Found by what each plugin declares, so the container never matches a plugin's name or an alias.
+      sandboxForms: async () => {
+        const choices = await store.pluginChoices(ctx.tenantId, ctx.agentId);
+        const out: Array<{ alias: string; plugin: string; form: SandboxForm; credential: string | null }> = [];
+        for (const m of await store.listMounts(ctx.tenantId, ctx.agentId)) {
+          const form = this.#plugins.get(m.plugin)?.sandboxForm;
+          if (!form || !pluginEnabled(this.#seeded.has(m.plugin), choices[m.plugin])) continue;
+          out.push({
+            alias: m.alias, plugin: m.plugin, form,
+            credential: m.secretRef ? await secrets.resolve(m.secretRef, { tenantId: m.tenantId, agentId: m.agentId }) : null,
+          });
+        }
+        return out;
+      },
     };
   }
 
@@ -967,6 +985,7 @@ export class ToolGateway {
         alias,
         credential, publicConfig: mount.publicConfig, db: this.#db({ tenantId, agentId }, mount),
         async sibling() { return null; },
+        async sandboxForms() { return []; },
       });
     } catch (e) {
       // A check that threw gave no verdict on the key: the provider was not

@@ -54,7 +54,7 @@ function run9(states: string[], extra: Record<string, unknown> = {}) {
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 0, ...extra },
     db: boxDb(BOX, (v) => { written = v; }),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   };
   return { ctx, calls, written: () => written };
 }
@@ -144,7 +144,7 @@ function killing(kills: number[], states: string[]) {
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 0 },
     db: boxDb(BOX, () => {}),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   };
   return { ctx, calls };
 }

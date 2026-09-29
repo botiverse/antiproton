@@ -38,6 +38,7 @@ export const CAPABILITIES: readonly Capability[] = [
   { label: "holds", tag: "holds something releasable", of: (p) => !!holdingOf(p) },
   { label: "background", tag: "can work in the background", of: (p) => !!backgroundOf(p) },
   { label: "provides", tag: null, of: (p) => !!p.provides?.length },
+  { label: "in a container", tag: "acts in the agent's container", of: (p) => !!p.sandboxForm },
   // A tag and no column: serialisation is DERIVED from `holds` (`isExclusive` is
   // `!!p.holds`), so a column for it would be the `holds` column drawn twice,
   // and two identical columns invite a reader to look for the case where they

@@ -444,6 +444,36 @@ export const githubPlugin: Plugin = {
     docs: "https://github.com/settings/tokens",
   },
   config: [],
+  /**
+   * `gh` and `git` in the agent's container, as this mount's account.
+   *
+   * Two egress entries because the two tools send the token differently.
+   * Measured on run9 (2026-09-15, fake values echoed back by httpbin): the proxy
+   * replaces a placeholder only where it appears verbatim in a header, and only
+   * for the hosts listed. `gh` sends `token P`, which it sees. git sends Basic
+   * auth, `base64(user:P)`, which it does not, so git's header is registered
+   * whole, as exactly what git sends for the helper in `env`.
+   */
+  sandboxForm: {
+    summary: "gh and git work here as this agent's GitHub account, on GitHub only. " +
+      "If gh is missing, `apt-get update && apt-get install -y gh` installs it.",
+    egress: [
+      { name: "GH_TOKEN", header: "authorization", hosts: ["api.github.com", "uploads.github.com"],
+        value: (token) => token, placeholder: (p) => p },
+      { name: "GH_TOKEN_GIT", header: "authorization", hosts: ["github.com"],
+        value: (token) => btoa(`x-access-token:${token}`), placeholder: (p) => btoa(`x-access-token:${p}`) },
+    ],
+    // `gh` reads GH_TOKEN, and git asks a helper scoped to https://github.com,
+    // which answers with the same placeholder. Set per command rather than
+    // written to a file, so it holds for a git installed later and there is no
+    // file to overwrite.
+    env: (p) => ({
+      GH_TOKEN: p,
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
+      GIT_CONFIG_VALUE_0: `!f() { echo username=x-access-token; echo password=${p}; }; f`,
+    }),
+  },
   tools: [
     t("auth_status", "Which account this mount acts as. Check it before a write, the way `gh auth status` does.", {}, [], "read"),
 

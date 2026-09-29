@@ -43,7 +43,7 @@ function fixture(run9: (path: string, method: string) => { status: number; body:
     credential: JSON.stringify({ ak: "AK", sk: "SK", project: "p" }),
     publicConfig: { account: "container" },
     db: openPluginDatabase(tables, scope, sandboxPlugin(null as any, "local").database),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   };
   const real = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any) => {

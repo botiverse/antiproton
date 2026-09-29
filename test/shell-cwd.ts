@@ -84,7 +84,7 @@ function run9(box: Record<string, unknown>, answers: Record<string, Array<Record
     credential: JSON.stringify({ ak: "a", sk: "b" }),
     publicConfig: { endpoint: "https://sandbox.example", graceMs: 10_000 },
     db: boxDb(box, (v) => writes.push(v)),
-    sibling: async () => null,
+    sibling: async () => null, sandboxForms: async () => [],
   };
   return { ctx, posts, writes };
 }

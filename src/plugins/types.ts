@@ -272,6 +272,16 @@ export interface PluginContext {
      */
     policy: MountPolicy | null;
   } | null>;
+  /**
+   * This agent's mounts whose plugin declares a {@link SandboxForm}, with each
+   * one's credential, for the plugin that runs the agent's container.
+   *
+   * Found by the declaration, never by a plugin's name or an alias: which
+   * services a container can act as is decided by what is mounted, and a new
+   * plugin that declares a form is wired in with no change to the container.
+   * Switched-off plugins are left out. Grants nothing `sibling` does not.
+   */
+  sandboxForms(): Promise<Array<{ alias: string; plugin: string; form: SandboxForm; credential: string | null }>>;
 }
 
 /**
@@ -1221,6 +1231,52 @@ export interface Backgrounding {
   cancel(handle: Json, ctx: PluginContext): Promise<void>;
 }
 
+/**
+ * What a mount of this plugin becomes inside the agent's container: the same
+ * account, reached by the service's own command-line tool instead of by this
+ * plugin's tools (`gh` for the github plugin).
+ *
+ * The container never holds the credential. It holds a placeholder, and the
+ * container's egress proxy swaps the credential in on the way out, only in the
+ * header named and only on requests to the hosts named. So a declaring plugin
+ * keeps "the agent never sees the credential" inside the container too.
+ *
+ * Declared rather than asked of the plugin at run time, so which hosts a
+ * credential can reach from a container is readable without running anything.
+ * A container wires in every mount whose plugin declares this and whose
+ * credential is present, except where two of them claim the same name (an
+ * environment variable or an egress entry): a container has one `GH_TOKEN`,
+ * so two GitHub accounts are both left out rather than one picked silently.
+ */
+export interface SandboxForm {
+  /**
+   * What works in the container because of this mount, told to the model in
+   * every container result while it is wired in. Say what the commands are and
+   * how to get them if the image lacks them; the container adds that the
+   * credential is a placeholder.
+   */
+  summary: string;
+  /** One registration per header form the tools send; see {@link SandboxEgress}. */
+  egress: readonly SandboxEgress[];
+  /** The environment every command runs with, given the placeholder that stands for the credential. */
+  env(placeholder: string): Record<string, string>;
+}
+
+/**
+ * One header the container's egress proxy fills in. The proxy replaces
+ * `placeholder(p)` where it appears verbatim in `header` with `value(credential)`,
+ * on requests to `hosts` only; so a tool that encodes the credential (git's Basic
+ * auth) needs its own entry, whose two functions encode both sides the same way.
+ */
+export interface SandboxEgress {
+  /** Unique within a container; the name the registration is kept and deleted under. */
+  name: string;
+  header: string;
+  hosts: readonly string[];
+  value(credential: string): string;
+  placeholder(placeholder: string): string;
+}
+
 export interface Plugin {
   id: string;
   version: string;
@@ -1246,6 +1302,8 @@ export interface Plugin {
   database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */
   credential?: CredentialSpec;
+  /** What a mount of this plugin becomes inside the agent's container; see {@link SandboxForm}. */
+  sandboxForm?: SandboxForm;
   /**
    * Does this credential work, asked at the moment a person supplies it.
    *

@@ -21,7 +21,7 @@ async function check(name: string, fn: () => Promise<void>) {
 
 const ctx = (credential: string | null, credentialRefKind?: string) => ({
   caller: { tenantId: "t", agentId: "a", taskId: "k" }, alias: "gh", credential, credentialRefKind, publicConfig: {},
-  sibling: async () => null,
+  sibling: async () => null, sandboxForms: async () => [],
 }) as any;
 
 /** GitHub answering every request with this one response. */
