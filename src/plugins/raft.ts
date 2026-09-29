@@ -720,17 +720,16 @@ export const raftPlugin: Plugin = {
       if (action.type !== "channel:create" && action.type !== "channel:add_member" && action.type !== "agent:create") {
         throw new Error("action.type must be channel:create, channel:add_member or agent:create");
       }
-      const out = await raftFor(ctx).routes.actions.prepare({ target: a.target, action } as never);
-      if (!out.ok) {
-        const e = out.error;
-        // The SDK checks the card against Raft's contract before sending; that refusal names the field, never a body.
-        const unanswered = e.kind === "transport" || (e.kind === "http" && e.status >= 500);
-        throw marked(new Error(e.kind === "http" ? `raft refused the card (HTTP ${e.status}${e.errorCode ? `, ${e.errorCode}` : ""})` : e.message),
-          { mayHaveLanded: unanswered, retryable: unanswered, transient: unanswered });
-      }
+      const out = await raftFor(ctx).actions.prepare({ target: a.target, action } as never);
+      // A card that got no answer may have been posted; a refusal (Raft's contract, checked before sending,
+      // or the Server's) did nothing.
+      if (!out.ok) throw sdkFailure(out, true);
       return {
-        prepared: true, target: a.target, messageId: out.data.messageId,
-        note: "The card is posted; nothing has happened yet. A person confirms it in Raft, acting with their own permissions.",
+        prepared: true, target: out.data.target, messageId: out.data.messageId,
+        // The SDK's own sentence, which is the CLI's; its `next` names a CLI command this mount has no tool
+        // for, so it is not passed on.
+        text: out.text.trim(),
+        note: "Nothing has happened yet. A person confirms the card in Raft, acting with their own permissions; the outcome arrives in your inbox.",
       };
     }
     if (name === "push_status") {

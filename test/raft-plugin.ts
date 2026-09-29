@@ -289,7 +289,10 @@ await check("prepare_action posts one of the three model-preparable cards and sa
   const out = await raftPlugin.invoke("prepare_action", {
     target: "#general", action: { type: "channel:create", name: "launch-room", draftHint: "for Thursday's launch" },
   }, ctx()) as any;
-  if (out.prepared !== true || out.messageId !== "abcdef12-3456" || !/nothing has happened yet/.test(out.note)) throw new Error(JSON.stringify(out));
+  if (out.prepared !== true || out.messageId !== "abcdef12-3456" || !/Nothing has happened yet/.test(out.note) ||
+      !/Action card posted to #general/.test(out.text) || /raft message read/.test(JSON.stringify(out))) {
+    throw new Error(JSON.stringify(out));
+  }
   const body = JSON.parse(String(calls[0]!.init.body));
   if (!/\/internal\/agent-api\/prepare-action$/.test(calls[0]!.url) || body.target !== "#general" || body.action?.type !== "channel:create" ||
       body.action.name !== "launch-room" || body.action.draftHint !== "for Thursday's launch") {
