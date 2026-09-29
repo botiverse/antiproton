@@ -507,7 +507,7 @@ ${HEAD_ASSETS}
   ${rail("agents", "agents")}
   ${rail("plugins", "plugins")}
   ${rail("usage", "usage")}
-  ${rail("keys", "api keys")}
+  ${rail("keys", "keys")}
   ${viewer?.admin === true ? rail("admin", "admin") : ""}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">

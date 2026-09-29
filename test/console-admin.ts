@@ -31,6 +31,16 @@ check("the rail shows admin only when the viewer is one", () => {
   must(!/data-view="admin"/.test(anon), "no viewer object, no admin item");
 });
 
+check("rail labels are one word — a two-word label wraps inside the 56px rail", () => {
+  // qizhi-wang's report: "api keys" broke onto two lines in the narrow rail. The
+  // view keeps its full name at the top; the rail speaks in single words, like
+  // every other label.
+  const html = page("t", "Op", "a1", adminViewer as any);
+  const labels = [...html.matchAll(/class="rail-item"[^>]*><span class="ico">.*?<\/span><span>([^<]*)<\/span>/g)].map((m) => m[1]);
+  must(labels.length >= 5, `expected the rail items, found ${labels.length}`);
+  for (const label of labels) must(!/\s/.test(label), `"${label}" wraps in the rail — one word, like the view it opens keeps its full name`);
+});
+
 check("the admin view reads the fragment when shown, and show() accepts it", () => {
   const html = page("t", "Op", "a1", adminViewer as any);
   must(/<div class="body" id="admin"[^>]*hx-get="\/ui\/admin"[^>]*hx-trigger="ap:show"/.test(html.replace(/\n/g, " ")),
