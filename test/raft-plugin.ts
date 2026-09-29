@@ -704,37 +704,17 @@ await check("a notice for a mount whose push is off, or for another Raft agent, 
   if (cross.deliver || !/different/.test(cross.reason)) throw new Error(JSON.stringify(cross));
 });
 
-await check("a Raft that does not know status yet gets the same batch without it, so the activity log never stalls on status", async () => {
+await check("a 400 on a batch is the batch's own fault: sent once, status and all, and it throws", async () => {
   const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const events = [
     { eventId: "raft_x:1:pre", hookEventName: "PreToolUse" as const, occurredAt: "2026-09-29T05:00:00.000Z", toolName: "raft__send_message", status: "working" as const },
     { eventId: "raft_x:2:status:start", occurredAt: "2026-09-29T05:00:01.000Z", status: "thinking" as const },
-    { eventId: "raft_x:3", hookEventName: "Stop" as const, occurredAt: "2026-09-29T05:00:02.000Z", status: "online" as const },
   ];
-  const calls = many(json(400, { errorCode: "event_field_unknown" }), json(200, { accepted: 2 }));
-  const warned: string[] = [];
-  const warn = console.warn;
-  console.warn = (m: string) => { warned.push(String(m)); };
-  let out: any;
-  try { out = await raftPlugin.reportActivity!(events, on.ctx); } finally { console.warn = warn; }
-  // The downgrade is said, with what Raft answered and what was lost, so it cannot hide a refusal of status itself.
-  if (warned.length !== 1 || !/raft mount raft/.test(warned[0]!) || !/event_field_unknown/.test(warned[0]!) || !/3 status change\(s\) dropped/.test(warned[0]!)) {
-    throw new Error(`the downgrade was not said: ${JSON.stringify(warned)}`);
+  const once = one(json(400, { errorCode: "event_field_unknown" }));
+  const why = await failure(() => raftPlugin.reportActivity!(events, on.ctx));
+  if (once.length !== 1 || !/HTTP 400/.test(why.message) || JSON.parse(once[0]!.init.body).events.length !== 2) {
+    throw new Error(`400: ${once.length} ${why.message}`);
   }
-  const second = JSON.parse(calls[1]!.init.body);
-  if (!("sent" in out) || out.sent !== 2 || calls.length !== 2 || second.events.length !== 2 ||
-      second.events.some((e: any) => "status" in e || !e.hookEventName) || JSON.parse(calls[0]!.init.body).events.length !== 3) {
-    throw new Error(JSON.stringify({ out, first: calls[0]!.init.body, second }));
-  }
-  // A 400 on a batch without status is the batch's own fault: no second try, it throws.
-  const plain = [{ eventId: "raft_x:9", hookEventName: "Stop" as const, occurredAt: "2026-09-29T05:00:09.000Z" }];
-  const once = one(json(400, { errorCode: "invalid" }));
-  const why = await failure(() => raftPlugin.reportActivity!(plain, on.ctx));
-  if (once.length !== 1 || !/HTTP 400/.test(why.message)) throw new Error(`plain 400: ${once.length} ${why.message}`);
-  // A 500 is not a Raft that lacks status: no second try.
-  const five = one(json(500, {}));
-  await failure(() => raftPlugin.reportActivity!(events, on.ctx));
-  if (five.length !== 1) throw new Error("a 500 was retried without status");
 });
 
 await check("a 200 that counts refused events is said, and sent counts only what Raft took", async () => {

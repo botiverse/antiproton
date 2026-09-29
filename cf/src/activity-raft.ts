@@ -19,7 +19,7 @@
  */
 import { pendingTrace } from "../../src/trace/outbox.ts";
 import { flushTrace, type TraceSink } from "./trace-r2.ts";
-import { ACTIVITY_BATCH_MAX, activityEvents } from "../../src/runtime/activity.ts";
+import { ACTIVITY_BATCH_MAX, activityEvents, orderStatuses } from "../../src/runtime/activity.ts";
 import type { ActivityEvent } from "../../src/plugins/types.ts";
 
 type Sql = { exec(query: string, ...bindings: unknown[]): { toArray(): any[] } };
@@ -40,12 +40,28 @@ function setCursor(sql: Sql, through: number) {
   sql.exec("INSERT INTO activity_sent(id, through_seq) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET through_seq = excluded.through_seq", through);
 }
 
+// The last status instant sent, so the next batch's statuses come strictly after it (orderStatuses).
+// Moved with the cursor, so a batch sent again is dated the same.
+const STATUS_CLOCK = "CREATE TABLE IF NOT EXISTS activity_status_clock (id INTEGER PRIMARY KEY CHECK (id = 1), last_at INTEGER NOT NULL)";
+
+function statusClock(sql: Sql): number {
+  sql.exec(STATUS_CLOCK);
+  const known = sql.exec("SELECT last_at FROM activity_status_clock WHERE id = 1").toArray()[0];
+  return known ? Number(known.last_at) : 0;
+}
+
+function setStatusClock(sql: Sql, lastAt: number) {
+  sql.exec("INSERT INTO activity_status_clock(id, last_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_at = excluded.last_at", lastAt);
+}
+
 export async function flushActivity(
   gateway: ActivityGateway, sql: Sql, tenantId: string, agentId: string, limit = ACTIVITY_BATCH_MAX,
 ): Promise<{ events: number; sent: number; through: number; skipped: string[] }> {
   const sent0 = activityCursor(sql);
   const { rows, through } = pendingTrace(sql, sent0, limit);
   const events = activityEvents(agentId, rows);
+  const clock0 = statusClock(sql);
+  const clock = orderStatuses(events, clock0);
   let sent = 0;
   const skipped: string[] = [];
   if (events.length) {
@@ -55,6 +71,7 @@ export async function flushActivity(
     }
   }
   if (through > sent0) setCursor(sql, through);
+  if (clock > clock0) setStatusClock(sql, clock);
   return { events: events.length, sent, through: Math.max(sent0, through), skipped };
 }
 

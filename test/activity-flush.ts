@@ -111,6 +111,29 @@ await check("status rides the activity log: it goes out on the events, and a fai
   must(statuses.join(",") === "PreToolUse:working,Stop:online", `statuses on the resent batch: ${JSON.stringify(g.batches[0])}`);
 });
 
+await check("statuses go out strictly later than the one before, across passes too, and a resent batch is dated the same", async () => {
+  // As read on production 2026-09-29: the model asks for a tool at X and the tool takes 0 ms, so its
+  // start is X too. Sent in two passes, both say a status at X, and Raft's latest-wins has a tie.
+  const { sql } = sqliteHost(); const g = gateway();
+  const X = 1_790_000_050_000;
+  appendTrace(sql, [
+    { at: X, ...OWNER, kind: "model.call", spanId: "mj_x", status: "toolUse", verdict: "ok", ms: 100, attrs: { model: "m" } },
+    { at: X, ...OWNER, kind: "tool.call", spanId: "op_x", status: "succeeded", verdict: "ok", ms: 0, attrs: { tool: "mounts", mount: "tools" } },
+  ]);
+  await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId, 1);
+  g.mode = "throw";
+  try { await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId, 1); } catch { /* held */ }
+  g.mode = "send";
+  await flushActivity(g, sql, OWNER.tenantId, OWNER.agentId, 1);
+  const again = gateway();
+  const times = g.batches.flat().filter((e) => e.status).map((e) => Date.parse(e.occurredAt));
+  must(times.length === 3 && times.every((t, i) => i === 0 || t > times[i - 1]!), `status instants: ${JSON.stringify(g.batches)}`);
+  must(times[2] === X + 1, `the tool's start moved by more than the millisecond it needed: ${times[2]! - X}`);
+  // The clock moved only with the cursor: a pass with nothing new sends nothing and moves nothing.
+  await flushActivity(again, sql, OWNER.tenantId, OWNER.agentId, 1);
+  must(again.batches.length === 0, "a pass with nothing new sent something");
+});
+
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 const passed = results.filter((r) => r.ok).length;
 console.log(`  ${"─".repeat(56)}\n  ${passed} passed, ${results.length - passed} failed\n`);

@@ -369,16 +369,6 @@ function modelLine(m: RaftMessage): string {
   return line;
 }
 
-/** The batch as a Raft without status knows it: status fields dropped, status-only events left out. */
-function withoutStatus(events: readonly ActivityEvent[]): ActivityEvent[] {
-  return events.flatMap((e) => {
-    if (!e.hookEventName) return [];
-    if (e.status === undefined) return [e];
-    const { status: _status, ...rest } = e;
-    return [rest];
-  });
-}
-
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
@@ -774,26 +764,9 @@ export const raftPlugin: Plugin = {
     // is skipped, not an error, or the alarm would retry every minute for ever.
     if (!ctx.credential) return { skipped: "this mount has no account, so Raft cannot be told" };
     if (events.length === 0) return { sent: 0 };
-    let answer: ObjectValue;
-    try {
-      answer = (await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events })).data;
-    } catch (error) {
-      // A Raft that refuses a batch outright because of its status (400: a value it does not accept)
-      // would stop the whole feed, because the log holds a refused batch for ever. So a 400 on a batch
-      // that carries status is tried once more without it, and said; a second 400 is the batch's own
-      // fault and throws as before. This is a guard, not how Raft behaved when last read: Raft production
-      // answered 200 and counted what it would not take in `rejectedCount` (see below), ignoring `status`
-      // and refusing status-only events that way until it ships the status standard (as read 2026-09-29).
-      const plain = withoutStatus(events);
-      if (!(error instanceof Error && /HTTP 400\b/.test(error.message)) || plain.length === events.length && plain.every((e, i) => e === events[i])) throw error;
-      const dropped = events.filter((e) => e.status !== undefined).length;
-      console.warn(`raft mount ${ctx.alias}: activity with status refused (${error.message}); resent without it, ${dropped} status change(s) dropped`);
-      if (plain.length) await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events: plain });
-      return { sent: plain.length };
-    }
-    // A 200 is not "all taken": Raft counts what it refused and still answers 200 (a Raft before the
-    // status standard refuses status-only events this way). Refused events are not resent — they are
-    // the same events next time too — so they are said, where an operator would look.
+    const answer = (await call(ctx, "POST", ACTIVITY_PATH, { schema: ACTIVITY_SCHEMA, events })).data;
+    // A 200 is not "all taken": Raft counts what it refused and still answers 200. Refused events are
+    // not resent — they are the same events next time too — so they are said, where an operator would look.
     const refused = typeof answer.rejectedCount === "number" ? answer.rejectedCount : 0;
     if (refused > 0) {
       const statusOnly = events.filter((e) => !e.hookEventName).length;
