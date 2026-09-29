@@ -11,6 +11,7 @@
  *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
+import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -513,6 +514,18 @@ export class AgentDO extends DurableObject<Env> {
     return row ? { tenantId: row.tenant_id, agentId: row.agent_id } : null;
   }
 
+  /** The earliest wake anything asked for since the current alarm pass began; null when none (alarm-next.ts). */
+  #wakeAsked: number | null = null;
+
+  /**
+   * Ask for the object to wake at `at` (now by default). Every input does this, and it is written down, so
+   * an alarm pass running meanwhile knows the wake was asked for and does not replace it (alarm-next.ts).
+   */
+  async #wake(at = Date.now()) {
+    this.#wakeAsked = this.#wakeAsked === null ? at : Math.min(this.#wakeAsked, at);
+    await this.ctx.storage.setAlarm(at);
+  }
+
   /** Wraps a billed entry point so we can measure what we are charged for. */
   async #busy<T>(kind: string, fn: () => Promise<T>): Promise<T> {
     const t0 = Date.now();
@@ -673,7 +686,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.broadcast();
       // The answer is what makes the next pass finish, so wake now rather than
       // waiting for the safety-net alarm.
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
     }
     return wrote;
   }
@@ -987,7 +1000,7 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("benchSay", async () => {
       const rt = this.#activeRuntime();
       const r = await rt.postMessage("bench", `b_${taskId}`, text);
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
       return r;
     });
   }
@@ -1290,7 +1303,7 @@ export class AgentDO extends DurableObject<Env> {
       await rt.provision(tenantId, agentId, apiAgentSeeds(AgentRuntime.DEFAULT_MOUNTS, environment, provides));
       await this.#bindModel(rt, tenantId, agentId);
       await rt.postMessage(tenantId, agentId, text, "prompt", sessionId);
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
       // The turn is on record now: say so, rather than leaving it for the step that follows.
       await this.broadcast();
       return { ok: true as const, made };
@@ -1308,7 +1321,7 @@ export class AgentDO extends DurableObject<Env> {
         return { cancelledTurn: null as string | null, stoppedJobs: [] as string[], stillRunning: [] as string[] };
       }
       const out = await rt.cancelSession(tenantId, agentId, sessionId);
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
       await this.broadcast();
       return out;
     });
@@ -1357,7 +1370,7 @@ export class AgentDO extends DurableObject<Env> {
       await rt.ready();
       if (!(await rt.store.getModelBinding(tenantId, agentId))) return { unknown: results.map((r) => r.callId) };
       const out = await rt.submitToolResults(tenantId, agentId, sessionId, results);
-      if (!out.unknown.length) { await this.ctx.storage.setAlarm(Date.now()); await this.broadcast(); }
+      if (!out.unknown.length) { await this.#wake(); await this.broadcast(); }
       return out;
     });
   }
@@ -1800,7 +1813,7 @@ export class AgentDO extends DurableObject<Env> {
           await rt.provision(tenantId, agentId);
           await this.#bindModel(rt, tenantId, agentId, { onlyIfStale: true });
         }
-        await this.ctx.storage.setAlarm(Date.now());
+        await this.#wake();
         await this.broadcast();
       }
       return r;
@@ -1822,7 +1835,7 @@ export class AgentDO extends DurableObject<Env> {
     const session = await this.#conversation(tenantId, agentId, taskId);
     return this.#busy("uiCompact", async () => {
       const r = await this.runtime().requestCompaction(tenantId, agentId, session);
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
       return r;
     });
   }
@@ -1842,7 +1855,7 @@ export class AgentDO extends DurableObject<Env> {
     return this.#busy("uiSay", async () => {
       const rt = this.runtime();
       const r = await rt.postMessage(tenantId, agentId, text, mode, session);
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
       return r;
     });
   }
@@ -1948,7 +1961,7 @@ export class AgentDO extends DurableObject<Env> {
     await this.#busy("uiDecide", async () => {
       await rt.gateway().applyApproval(tenantId, operationId, decision, approver);
       // The decision produced a completion event; let the agent pick it up.
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
     });
     return this.uiApprovals(tenantId, agentId, taskId);
   }
@@ -1961,7 +1974,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.#bindModel(rt, tenantId, agentId);
       const r = await rt.postMessage(tenantId, agentId, text);
       // Wakeup is an alarm, not a poll: nothing spins while the agent has no work.
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#wake();
       return r;
     });
   }
@@ -2075,7 +2088,7 @@ export class AgentDO extends DurableObject<Env> {
   async armAlarm(delayMs: number) {
     this.alarmSetAt = Date.now();
     this.alarmFiredAt = null;
-    await this.ctx.storage.setAlarm(Date.now() + delayMs);
+    await this.#wake(Date.now() + delayMs);
     return { armedAt: this.alarmSetAt, delayMs };
   }
   /**
@@ -2095,6 +2108,7 @@ export class AgentDO extends DurableObject<Env> {
   async alarm() {
     const alarmStarted = Date.now();
     const failures = this.#alarmFailures();
+    this.#wakeAsked = null;
     if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
     try {
       await this.#busy("alarm", async () => {
@@ -2138,16 +2152,14 @@ export class AgentDO extends DurableObject<Env> {
         const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
-        if (out.wakeInMs === null && usagePending) {
-          await this.ctx.storage.setAlarm(Date.now() + 60_000);
-        } else if (out.wakeInMs !== null) {
-          // The pass said when to come back — a retry has a time, a model call
-          // has a poll interval. Nothing here waits for either.
-          await this.ctx.storage.setAlarm(Date.now() + Math.max(50, out.wakeInMs));
-        } else {
-          // Genuinely idle: stand down rather than wake every 30s for ever.
-          await this.ctx.storage.deleteAlarm();
-        }
+        // The pass says when to come back — a retry has a time, a model call has a poll interval,
+        // held usage a minute — or nothing, when it is genuinely idle and stands down rather than
+        // waking every 30s for ever. Whatever input asked for during the pass is kept (alarm-next.ts).
+        const planned = out.wakeInMs !== null ? Date.now() + Math.max(50, out.wakeInMs)
+          : usagePending ? Date.now() + 60_000 : null;
+        const next = nextAlarm(this.#wakeAsked, planned);
+        if (next === null) await this.ctx.storage.deleteAlarm();
+        else await this.ctx.storage.setAlarm(next);
         logEvent("alarm.end", {
           tenantId: who.tenantId, agentId: who.agentId, ms: Date.now() - alarmStarted,
           wakeInMs: out.wakeInMs, usagePending, activityError: flushed.activityError ?? undefined, traceError: flushed.traceError ?? undefined,
