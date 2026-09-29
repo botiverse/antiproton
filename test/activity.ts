@@ -65,8 +65,13 @@ check("every event carries only fields the service knows, ids are unique, and tw
   must(worst.length <= 200 && worst.every((e) => e.status && !e.hookEventName), `worst-case batch: ${worst.length}`);
 });
 
-check("working on a tool call says which tool, as the model names it; other statuses carry no detail", () => {
-  const ev = activityEvents("raft_a", [row(30, "tool.call", "succeeded", "ok", { ms: 5, attrs: { tool: "send_message", mount: "raft" } }), row(31, "model.call", "stop", "ok")]);
+check("in a real turn the tool call says which tool it is working on, on the PreToolUse; other statuses carry no detail", () => {
+  // The model asks for a tool (answer at 30s), the tool runs 30.005–30.2s, the model answers (stop at 31s).
+  const ev = activityEvents("raft_a", [
+    row(30, "model.call", "toolUse", "ok", { ms: 800 }),
+    { ...row(30, "tool.call", "succeeded", "ok", { ms: 195, attrs: { tool: "send_message", mount: "raft" } }), seq: 301, at: T0 + 30_200 },
+    row(31, "model.call", "stop", "ok", { ms: 700 }),
+  ]);
   const pre = ev.find((e) => e.hookEventName === "PreToolUse");
   must(pre?.status === "working" && pre.detail === "Using raft__send_message", JSON.stringify(pre));
   must(ev.filter((e) => e.detail !== undefined).length === 1, `detail on other events: ${JSON.stringify(ev)}`);

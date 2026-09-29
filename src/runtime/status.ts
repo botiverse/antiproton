@@ -25,7 +25,7 @@ import type { ActivityEvent, AgentStatus } from "../plugins/types.ts";
 
 /** The status changes a run of trace rows means, oldest first, with no two consecutive alike. */
 export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], before: AgentStatus | null = null): Array<ActivityEvent & { status: AgentStatus }> {
-  const raw: Array<{ at: number; key: string; status: AgentStatus }> = [];
+  const raw: Array<{ at: number; key: string; status: AgentStatus; detail?: string }> = [];
   for (const row of rows) {
     const id = `${agentId}:${row.seq}:status`;
     const ms = typeof row.ms === "number" ? row.ms : 0;
@@ -33,9 +33,14 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
       case "inbound":
         if (row.status === "delivered") raw.push({ at: row.at, key: id, status: "thinking" });
         break;
-      case "tool.call":
-        raw.push({ at: row.at - ms, key: `${id}:start`, status: "working" });
+      case "tool.call": {
+        // What "working" is working on, named as the model names the tool; shown with the status in Raft.
+        const tool = typeof row.attrs.tool === "string" ? row.attrs.tool : null;
+        const mount = typeof row.attrs.mount === "string" ? row.attrs.mount : null;
+        const name = tool ? (mount ? `${mount}__${tool}` : tool) : null;
+        raw.push({ at: row.at - ms, key: `${id}:start`, status: "working", ...(name ? { detail: `Using ${name}`.slice(0, 200) } : {}) });
         break;
+      }
       case "model.call":
         // A start is only known when the span measured itself; without `ms` it would sit on the end's
         // own instant and say nothing the end does not.
@@ -51,11 +56,14 @@ export function statusEvents(agentId: string, rows: readonly TraceOutboxRow[], b
   // Stable by time: a start dated back can precede an earlier row's end.
   raw.sort((a, b) => a.at - b.at);
   const out: Array<ActivityEvent & { status: AgentStatus }> = [];
-  let current = before;
+  // A change is a new status or, for the same status, a new detail: the model asking for tools says
+  // "working", and each tool that then starts says what it is working on.
+  let current: string | null = before === null ? null : `${before}|`;
   for (const r of raw) {
-    if (r.status === current) continue;
-    current = r.status;
-    out.push({ eventId: r.key, status: r.status, occurredAt: new Date(r.at).toISOString() });
+    const key = `${r.status}|${r.detail ?? ""}`;
+    if (key === current) continue;
+    current = key;
+    out.push({ eventId: r.key, status: r.status, ...(r.detail ? { detail: r.detail } : {}), occurredAt: new Date(r.at).toISOString() });
   }
   return out;
 }

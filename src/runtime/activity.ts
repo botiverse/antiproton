@@ -56,8 +56,7 @@ export function activityEvents(agentId: string, rows: readonly TraceOutboxRow[])
     const host = hosts.get(instant);
     if (host) {
       host.status = s.status;
-      // The tool being run is what "working" is working on; shown with the status in Raft.
-      if (s.status === "working" && host.toolName) host.detail = `Using ${host.toolName}`.slice(0, 200);
+      if (s.detail) host.detail = s.detail;
     } else events.push(s);
   }
   return events;
