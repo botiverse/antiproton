@@ -451,3 +451,52 @@ export function d1ProvisionedAgents(db: D1Database, now: () => number = Date.now
     },
   };
 }
+
+
+// ---- connections a provisioned agent has to other services (migration 0011) ----------------
+
+/** What Raft may show about a connection: never the credential, which is sealed on the agent's mount. */
+export interface ProvisionedConnection {
+  tenantId: string;
+  raftAgentId: string;
+  provider: string;
+  account: string | null;
+  connectedBy: string;
+  connectedAt: number;
+}
+
+export interface ConnectionRegistry {
+  get(tenantId: string, raftAgentId: string, provider: string): Promise<ProvisionedConnection | null>;
+  put(c: ProvisionedConnection): Promise<void>;
+  remove(tenantId: string, raftAgentId: string, provider: string): Promise<boolean>;
+  /** Record a connect link's nonce as used. False when it was used before: a link starts one flow. */
+  consumeLink(nonce: string, at: number): Promise<boolean>;
+}
+
+export function d1Connections(db: D1Database): ConnectionRegistry {
+  return {
+    async get(tenantId, raftAgentId, provider) {
+      const r = await db.prepare(
+        "SELECT account, connected_by, connected_at FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?",
+      ).bind(tenantId, raftAgentId, provider).first<any>();
+      if (!r) return null;
+      return { tenantId, raftAgentId, provider, account: r.account === null ? null : String(r.account), connectedBy: String(r.connected_by), connectedAt: Number(r.connected_at) };
+    },
+    async put(c) {
+      await db.prepare(
+        `INSERT INTO provisioned_connections (tenant_id, raft_agent_id, provider, account, connected_by, connected_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tenant_id, raft_agent_id, provider) DO UPDATE SET account = excluded.account, connected_by = excluded.connected_by, connected_at = excluded.connected_at`,
+      ).bind(c.tenantId, c.raftAgentId, c.provider, c.account, c.connectedBy, c.connectedAt).run();
+    },
+    async remove(tenantId, raftAgentId, provider) {
+      const r = await db.prepare("DELETE FROM provisioned_connections WHERE tenant_id = ? AND raft_agent_id = ? AND provider = ?")
+        .bind(tenantId, raftAgentId, provider).run();
+      return (r.meta?.changes ?? 0) > 0;
+    },
+    async consumeLink(nonce, at) {
+      const r = await db.prepare("INSERT INTO connect_links (nonce, used_at) VALUES (?, ?) ON CONFLICT (nonce) DO NOTHING")
+        .bind(nonce, at).run();
+      return (r.meta?.changes ?? 0) > 0;
+    },
+  };
+}

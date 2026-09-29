@@ -63,6 +63,7 @@
     "test/plugin-enable.ts",
     "test/plugin-hooks.ts",
     "test/provision.ts",
+    "test/connect.ts",
     "test/activity-flush.ts",
     "test/provision-runtime.ts",
     "test/admin-mount.ts",

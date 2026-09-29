@@ -20,7 +20,8 @@
 import type { Json } from "../../../src/core/types.ts";
 import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
-import type { ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
+import type { ConnectionRegistry, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
+import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -66,6 +67,15 @@ export interface ProvisionDeps {
   now(): number;
   registry: ProvisionRegistry;
   agent: ProvisionAgentOps;
+  /** Connecting the agent to other services (connect.ts). Absent: the routes answer 404, as before. */
+  connections?: {
+    registry: Pick<ConnectionRegistry, "get" | "remove">;
+    /** The one-time link the browser opens; signed, ten minutes. */
+    link(spec: { tenantId: string; agentId: string; raftAgentId: string; provider: ConnectionProvider; returnUrl: string; raftUserId: string; scopes: string[] }):
+      Promise<{ url: string; expiresAt: string }>;
+    /** Remove the provider's credential from the agent's mount. */
+    detach(tenantId: string, agentId: string, provider: ConnectionProvider): Promise<boolean>;
+  };
 }
 
 export const PROVIDER_AGENT_PREFIX = "raft_";
@@ -129,6 +139,8 @@ function view(row: ProvisionedAgent, live?: Json) {
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
     deletedAt: row.deletedAt === null ? null : new Date(row.deletedAt).toISOString(),
+    /** The services Raft may offer a Connect button for (connections/:provider). */
+    connections: [...CONNECTION_PROVIDERS],
   };
 }
 
@@ -240,6 +252,7 @@ export async function handleProvision(
   // providerAgentId, and a delete must still reach the agent it made (Tenny's orphan case).
   const byRaft = seg[1] === "by-raft-agent";
   const rest = byRaft ? seg.slice(2) : seg.slice(1);
+  if (rest.length === 3 && rest[1] === "connections") return connection(method, rest, body, tenantId, byRaft, deps);
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
   const gone = () => fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
@@ -293,5 +306,57 @@ export async function handleProvision(
     return ok(view({ ...row, ...patch, updatedAt: t }));
   }
 
+  return null;
+}
+
+
+/**
+ * `…/connections/:provider` (raft-agent-provider.v1, optional): POST a one-time link the browser
+ * opens to connect the agent to a provider, GET what Raft may show about the connection, DELETE it.
+ * The credential never passes here: it is sealed on the agent's mount by the flow in connect.ts.
+ */
+async function connection(
+  method: string, rest: string[], body: unknown, tenantId: string, byRaft: boolean, deps: ProvisionDeps,
+): Promise<Response | null> {
+  const c = deps.connections;
+  if (!c) return null;
+  const provider = rest[2]!;
+  if (!(CONNECTION_PROVIDERS as readonly string[]).includes(provider)) {
+    return fail({ status: 404, code: "unknown_provider", message: `no provider ${provider}; this deployment connects ${CONNECTION_PROVIDERS.join(", ")}` });
+  }
+  const p = provider as ConnectionProvider;
+  const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+  if (!row || row.status === "deleted") return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+
+  if (method === "POST") {
+    const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+    const allowed = new Set(["returnUrl", "initiatedBy", "access"]);
+    const unknown = Object.keys(b).find((k) => !allowed.has(k));
+    if (unknown) return fail({ status: 400, code: "unknown_field", message: `unknown field ${unknown}`, param: unknown });
+    if (typeof b.returnUrl !== "string") return fail({ status: 422, code: "invalid", message: "returnUrl is required", param: "returnUrl" });
+    const where = returnUrlProblem(b.returnUrl, row.raftOrigin);
+    if (where) return fail({ status: 422, code: "invalid", message: where, param: "returnUrl" });
+    const by = b.initiatedBy && typeof b.initiatedBy === "object" ? (b.initiatedBy as Record<string, unknown>).raftUserId : undefined;
+    if (typeof by !== "string" || !RAFT_ID.test(by)) {
+      return fail({ status: 422, code: "invalid", message: "initiatedBy.raftUserId is required: the Raft user the connection is for", param: "initiatedBy" });
+    }
+    if (b.access !== undefined && b.access !== "public" && b.access !== "private") {
+      return fail({ status: 422, code: "invalid", message: "access is public or private", param: "access" });
+    }
+    const scopes = scopesFor(b.access === "private" ? "private" : "public");
+    const link = await c.link({ tenantId, agentId: row.agentId, raftAgentId: row.raftAgentId, provider: p, returnUrl: b.returnUrl, raftUserId: by, scopes });
+    return ok({ ...link, scopes });
+  }
+  if (method === "GET") {
+    const got = await c.registry.get(tenantId, row.raftAgentId, p);
+    return ok(got
+      ? { connected: true, account: got.account, connectedAt: new Date(got.connectedAt).toISOString(), connectedBy: got.connectedBy }
+      : { connected: false, account: null, connectedAt: null, connectedBy: null });
+  }
+  if (method === "DELETE") {
+    await c.detach(tenantId, row.agentId, p);
+    await c.registry.remove(tenantId, row.raftAgentId, p);
+    return new Response(null, { status: 204 });
+  }
   return null;
 }
