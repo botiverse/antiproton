@@ -2420,7 +2420,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
         logEvent("login.refused", {
           cookie: raw === null ? "absent" : st ? "open" : "unopened",
           code: code ? "present" : "absent", error: clip(url.searchParams.get("error")),
-          state: !state ? "absent" : st && state !== st.state ? "different" : "same",
+          state: !state ? "absent" : !st ? "uncompared" : state !== st.state ? "different" : "same",
         });
         return refuse(request, "state", REFUSALS.state, 400);
       }
