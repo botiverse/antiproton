@@ -3384,7 +3384,7 @@ async function route(request: Request, env: Env): Promise<Response> {
           await stub.uiEnsure(gate.tenantId, agentId, taskId);
           // The shell needs to know whether this viewer administers the deployment, so the
           // rail can draw the admin item. Same answer as /ui/whoami, computed at the edge.
-          return new Response(page(taskId, who, agentId, gate.viewer ? { ...gate.viewer, admin: isAdmin(gate.viewer, env) } : undefined), {
+          return new Response(page(taskId, who, agentId, gate.viewer ? { ...gate.viewer, admin: isAdmin(gate.viewer, env) } : undefined, env.ADMIN_ORIGIN), {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         }
