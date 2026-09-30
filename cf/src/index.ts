@@ -2751,6 +2751,9 @@ function provisionDeps(env: Env): ProvisionDeps {
  */
 async function adminHost(request: Request, env: Env, url: URL): Promise<Response | null> {
   const nothing = () => Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+  // A tab left on the console's sign-in address, carried over to this host, starts over from the top,
+  // which signs in the admin host's own way.
+  if (url.pathname === "/login" || url.pathname.startsWith("/login/")) return Response.redirect(`${url.origin}/`, 302);
   if (!adminHostServes(url.pathname)) return nothing();
   if (!env.SESSION_SECRET) return nothing();
   if (url.pathname === "/session") {
