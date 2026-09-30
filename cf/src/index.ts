@@ -3017,14 +3017,14 @@ export default {
 
 async function route(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    // The page's own script and font, public and immutable; the sign-in
-    // page needs them before anyone is signed in.
     // Every cookie here is Secure, so a page served over http can start a sign-in whose cookie the browser
     // refuses to keep. Anything but a local dev server is sent to https first.
     if (url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
       url.protocol = "https:";
       return Response.redirect(url.toString(), 308);
     }
+    // The page's own script and font, public and immutable; the sign-in
+    // page needs them before anyone is signed in.
     const asset = staticAsset(url.pathname);
     if (asset) return asset;
     // The admin area's own host (admin-host.ts): it answers its few paths and nothing else. Matched by
