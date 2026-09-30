@@ -2387,7 +2387,7 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       const now = Date.now();
       // The state alone binds the callback to this browser (GitHub's flow has
       // no nonce or PKCE verifier). Where to land after: a path on this origin only.
-      const st: LoginState = { state: randomToken(), returnTo: safeReturnTo(url.searchParams.get("returnTo")), iat: now, exp: now + LOGIN_TTL_MS };
+      const st: LoginState = { state: randomToken(), returnTo: safeReturnTo(url.searchParams.get("returnTo"), url.origin), iat: now, exp: now + LOGIN_TTL_MS };
       return new Response(null, {
         status: 302,
         headers: {
@@ -2756,7 +2756,11 @@ async function adminHost(request: Request, env: Env, url: URL): Promise<Response
       headers: { location: "/", "set-cookie": await sessionCookieFor(env.SESSION_SECRET, v, v.sub ?? v.email), "cache-control": "no-store" },
     });
   }
-  if (url.pathname === "/logout") return null;
+  if (url.pathname === "/logout") {
+    // The host has no sign-in page of its own: signed out, it lands on "/", which sends the browser to sign in again.
+    if (request.method !== "POST") return Response.json({ error: { code: "method", message: "POST to sign out" } }, { status: 405 });
+    return new Response(null, { status: 302, headers: { location: "/", "set-cookie": clearCookieHeader(SESSION_COOKIE) } });
+  }
   const v = await viewer(request, env);
   if (!v) return Response.redirect(`${env.UI_ORIGIN ?? url.origin}${HANDOFF_PATH}`, 302);
   if (!isAdmin(v, env)) return nothing();

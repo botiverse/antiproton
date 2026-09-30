@@ -45,9 +45,16 @@ export function adminHostServes(path: string): boolean {
   return path === "/" || path === "/session" || path === "/ui/admin" || path === "/admin/models" || path === "/logout";
 }
 
-/** A `returnTo` for sign-in: a path on this origin only, never another site. */
-export function safeReturnTo(value: string | null): string {
-  return value && value.startsWith("/") && !value.startsWith("//") && !value.includes("\\") ? value : "/ui";
+/**
+ * A `returnTo` for sign-in: a path on this origin only, never another site. Judged by how it parses, not
+ * by its characters: the URL parser drops tabs and newlines, so `/\t/evil.com` looks like a path and
+ * resolves to `//evil.com`.
+ */
+export function safeReturnTo(value: string | null, origin: string): string {
+  if (!value) return "/ui";
+  let u: URL;
+  try { u = new URL(value, origin); } catch { return "/ui"; }
+  return u.origin === new URL(origin).origin ? u.pathname + u.search : "/ui";
 }
 
 /** The admin host's page until it has its own shell: the admin panel, loaded as the console loads it. */
