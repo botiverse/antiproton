@@ -75,6 +75,7 @@
     "test/admin-models.ts",
     "test/alarm-next.ts",
     "test/admin-host.ts",
+    "test/do-retry.ts",
     "test/admin-mount.ts",
     "test/prompt-contributions.ts",
     "test/control-plane.ts",

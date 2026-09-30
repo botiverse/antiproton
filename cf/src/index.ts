@@ -11,6 +11,7 @@
  *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
+import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
 import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
@@ -2601,11 +2602,29 @@ async function inboundHook(request: Request, env: Env, url: URL): Promise<Respon
   const hook = await d1InboundHooks(env.CONTROL_DB).lookup(hookId);
   if (!hook) return new Response(null, { status: 404 });
   const read = await readCapped(request);
-  const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(hook.tenantId, hook.agentId)));
-  const r = await stub.hookReceive(hook.tenantId, hook.agentId, hook.alias, hookId,
-    read.ok ? { headers: lowerHeaders(request.headers), body: read.body } : null);
+  const event = read.ok ? { headers: lowerHeaders(request.headers), body: read.body } : null;
+  // A fresh stub each try: Cloudflare can move the object mid-request ("object has moved to a different
+  // machine", seen when four copies of one Raft notice arrived from different edges at once, 2026-09-30),
+  // and says so with `retryable`. One more try reaches it where it now is; a delivery is deduplicated by
+  // its id, so a try that landed before the move is not delivered twice.
+  const deliver = () => env.AGENT.get(env.AGENT.idFromName(agentObjectName(hook.tenantId, hook.agentId)))
+    .hookReceive(hook.tenantId, hook.agentId, hook.alias, hookId, event);
+  let r: Awaited<ReturnType<typeof deliver>>;
+  try {
+    r = await deliver();
+  } catch (e) {
+    if (!objectMoved(e)) throw e;
+    try {
+      r = await deliver();
+    } catch (again) {
+      if (!objectMoved(again)) throw again;
+      // Still moving: say "try again" (503), which the sender retries, rather than a 500.
+      return Response.json({ outcome: "unavailable" }, { status: 503, headers: { "retry-after": "1" } });
+    }
+  }
   return Response.json({ outcome: r.outcome }, { status: inboundStatus(r.outcome) });
 }
+
 
 /**
  * `/admin/hooks`, automation token only, until the console has a page:
