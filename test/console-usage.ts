@@ -45,7 +45,7 @@ check("the rail has a usage item and the view is a lazy, tenant-wide panel", () 
   const panel = html.match(/<div class="body" id="usage"[^>]*>/)?.[0] ?? "";
   must(/data-lazy/.test(panel) && /hx-get="\/ui\/usage"/.test(panel), "the panel reads /ui/usage when shown");
   must(!/agentId/.test(panel), "the panel is not scoped to an agent");
-  must(/\['agents', 'plugins', 'usage', 'keys', 'admin'\]\.includes\(v\)/.test(html), "?view=usage opens the view");
+  must(/\['agents', 'plugins', 'usage', 'keys'\]\.includes\(v\)/.test(html), "?view=usage opens the view");
   must(/usage\(form, changed\)/.test(html) && /setAttribute\('hx-get', '\/ui\/usage\?' \+ q\)/.test(html), "a choice is kept in the URL and in the panel's read");
   must(/body\.shell\[data-view\]:not\(\[data-view=agents\]\) \.inspector\{display:none\}/.test(html), "no inspector sliver beside the view");
 });

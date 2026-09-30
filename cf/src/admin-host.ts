@@ -16,6 +16,7 @@
  */
 import type { Viewer } from "./auth.ts";
 import { open, randomToken, seal } from "./auth.ts";
+import { adminPage } from "./ui.ts";
 
 export const HANDOFF_PATH = "/admin/handoff";
 export const HANDOFF_TTL_MS = 60_000;
@@ -60,10 +61,9 @@ export function safeReturnTo(value: string | null, origin: string): string {
   return u.origin === new URL(origin).origin ? u.href : home;
 }
 
-/** The admin host's page until it has its own shell: the admin panel, loaded as the console loads it. */
-export function adminShell(htmxSrc: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>antiproton admin</title><script src="${htmxSrc}"></script>
-<style>body{font:14px system-ui;margin:2em auto;max-width:60em;padding:0 1em}</style></head>
-<body><h1>antiproton admin</h1><div id="admin" hx-get="/ui/admin" hx-trigger="load">loading…</div></body></html>`;
+/** The admin host's page: the console's shell styles around nothing but the admin panel. */
+export function adminShell(_htmxSrc: string): string {
+  // The htmx script travels in HEAD_ASSETS now; the parameter stays so the call
+  // site on the Worker does not change.
+  return adminPage();
 }
