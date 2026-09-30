@@ -480,7 +480,7 @@ export function viewerBadge(who: string, viewer?: Viewer): string {
         <form method="post" action="/logout"><button type="submit" class="ghost">${ICONS.logout}sign out</button></form></div></details>`;
 }
 
-export function page(_taskId: string, who: string, agentId: string, viewer?: Viewer & { admin?: boolean }): string {
+export function page(_taskId: string, who: string, agentId: string, viewer?: Viewer & { admin?: boolean }, adminOrigin?: string): string {
   // The first argument is the conversation id the route used to pass. An
   // agent has one conversation now, so the page carries no task id; the
   // routes default to the agent's own. The parameter stays so the call site
@@ -511,7 +511,7 @@ ${HEAD_ASSETS}
   ${rail("plugins", "plugins")}
   ${rail("usage", "usage")}
   ${rail("keys", "keys")}
-  ${viewer?.admin === true ? `<a class="rail-item" href="https://admin.antiproton.ai/" title="the admin area, on its own host"><span class="ico">${ICONS.admin}</span><span>admin</span></a>` : ""}
+  ${viewer?.admin === true && adminOrigin ? `<a class="rail-item" href="${esc(adminOrigin)}/" title="the admin area, on its own host"><span class="ico">${ICONS.admin}</span><span>admin</span></a>` : ""}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
@@ -1889,7 +1889,8 @@ ${HEAD_ASSETS}
 <body class="shell" data-view="admin">
 <main>
   <section class="view on" data-view="admin">
-    <div class="view-head"><h1>Admin</h1><span class="sub">who administers the deployment, and which model each agent serves</span></div>
+    <div class="view-head"><h1>Admin</h1><span class="sub">who administers the deployment, and which model each agent serves</span>
+      <form method="post" action="/logout" style="margin-left:auto"><button type="submit" class="ghost">sign out</button></form></div>
     <div class="body" id="admin" hx-get="/ui/admin" hx-swap="innerHTML" hx-trigger="load">loading…</div>
   </section>
 </main>

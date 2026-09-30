@@ -21,16 +21,21 @@ const VIEWER = { email: "o@x.dev", name: "Op", source: "github", agentId: "a1", 
 const adminViewer = { ...VIEWER, admin: true };
 const plainViewer = { ...VIEWER, admin: false };
 
-check("the rail points admins at the admin host, and nobody else sees a trace", () => {
+check("the rail points admins at the deployment's admin origin — nothing hardcoded, nothing without it", () => {
   // The admin area lives on its own host now: the rail item is a link out, not an
-  // embedded view, and the console's markup carries no admin section at all.
-  const on = page("t", "Op", "a1", adminViewer as any);
-  must(/<a class="rail-item" href="https:\/\/admin\.antiproton\.ai\/"/.test(on), "an admin's rail links to the admin host");
+  // embedded view. The href is the deployment's ADMIN_ORIGIN — hardcoding it sends
+  // a preview viewer to production's admin (cody, reviewing #632). No origin named,
+  // no link: the page renders what it is handed.
+  const on = page("t", "Op", "a1", adminViewer as any, "https://admin.preview.example");
+  must(/<a class="rail-item" href="https:\/\/admin\.preview\.example\/"/.test(on), "the link goes to the origin the deployment names");
+  must(!/admin\.antiproton\.ai/.test(on), "no hardcoded production origin in the markup");
   must(!/<section class="view" data-view="admin">/.test(on), "no admin section is embedded in the console");
-  const off = page("t", "Op", "a1", plainViewer as any);
-  must(!/admin\.antiproton\.ai/.test(off), "a non-admin must see no trace of the admin area");
-  const anon = page("t", "Op", "a1");
-  must(!/admin\.antiproton\.ai/.test(anon), "no viewer object, no admin link");
+  const unconfigured = page("t", "Op", "a1", adminViewer as any);
+  must(!/class="rail-item" href="[^"]*admin/.test(unconfigured), "no origin named, no link");
+  const off = page("t", "Op", "a1", plainViewer as any, "https://admin.preview.example");
+  must(!/admin\.preview\.example/.test(off), "a non-admin must see no trace of the admin area");
+  const anon = page("t", "Op", "a1", undefined, "https://admin.preview.example");
+  must(!/admin\.preview\.example/.test(anon), "no viewer object, no admin link");
 });
 
 check("rail labels are one word — a two-word label wraps inside the 56px rail", () => {
@@ -51,6 +56,8 @@ check("the admin host's page is the console's shell around nothing but the panel
     "the panel loads the same fragment, same-origin, on arrival");
   must(!/class="rail"|id="sidebar"|id="inspector"/.test(html), "no rail, no sidebar, no inspector — this host is somewhere else");
   must(/<h1>Admin<\/h1>/.test(html), "the page names itself for a standalone document");
+  must(/<form method="post" action="\/logout"[^>]*><button type="submit" class="ghost">sign out<\/button><\/form>/.test(html.replace(/\n/g, " ")),
+    "a way out: the admin host's /logout only takes POST, so the page carries the form");
 });
 
 check("the model block names the default, the endpoint, and whether the Gateway serves it", () => {
