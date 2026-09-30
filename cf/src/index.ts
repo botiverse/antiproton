@@ -2410,10 +2410,18 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       if (connect && await isConnectCallback(request, url, connect)) return connectCallback(request, url, connect);
       const cfg = githubConfig(env);
       if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
-      const st = await open<LoginState>(env.SESSION_SECRET!, readCookie(request, LOGIN_COOKIE));
+      const raw = readCookie(request, LOGIN_COOKIE);
+      const st = await open<LoginState>(env.SESSION_SECRET!, raw);
       const state = url.searchParams.get("state");
       const code = url.searchParams.get("code");
       if (!st || !state || !code || !constantTimeEqual(state, st.state)) {
+        // Which of the four it was, since one refusal page covers them all: no cookie came back, it did
+        // not open (expired or not ours), GitHub sent no code (it says why in `error`), or the states differ.
+        logEvent("login.refused", {
+          cookie: raw === null ? "absent" : st ? "open" : "unopened",
+          code: code ? "present" : "absent", error: clip(url.searchParams.get("error")),
+          state: !state ? "absent" : !st ? "uncompared" : state !== st.state ? "different" : "same",
+        });
         return refuse(request, "state", REFUSALS.state, 400);
       }
       let profile, emails;
@@ -3784,7 +3792,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 setLogSink((line) => console.log(line));
 
 /** The routes another system calls, or an operator does: logged one line each, and answered with a request id. */
-const OBSERVED = /^\/(provision|hooks|connect|login\/github\/callback|admin|v1)(\/|$)/;
+const OBSERVED = /^\/(provision|hooks|connect|login|admin|v1|session)(\/|$)/;
 
 /**
  * One `http` line per observed request, with Raft's trace id when it sends one (`X-Raft-Trace-Id`), and
