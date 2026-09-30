@@ -37,11 +37,16 @@ await check("an expired, forged or foreign-kind ticket names nobody", async () =
 
 await check("sign-in returns only to a path on this origin", () => {
   const O = "https://antiproton.ai";
-  must(safeReturnTo("/admin/handoff", O) === "/admin/handoff", "a path");
-  must(safeReturnTo("/ui?taskId=t", O) === "/ui?taskId=t", "a path with a query");
-  // The parser drops tab, newline and carriage return, so these read as `//evil.example`.
-  for (const bad of ["https://evil.example/", "//evil.example/x", "/\\evil.example", "/\t/evil.example", "/\n/evil.example", "/\r/evil.example", null]) {
-    must(safeReturnTo(bad as any, O) === "/ui", `${JSON.stringify(bad)} was allowed`);
+  // Judged where it lands: the callback resolves the kept value against this origin and redirects there.
+  const lands = (v: string | null) => new URL(safeReturnTo(v, O), O);
+  must(lands("/admin/handoff").href === `${O}/admin/handoff`, "a path");
+  must(lands("/ui?taskId=t").href === `${O}/ui?taskId=t`, "a path with a query");
+  // The parser drops tab, newline and carriage return, so these read as `//evil.example`; the last three
+  // pass a first resolution on this origin and become `//evil.example` as a path.
+  for (const bad of ["https://evil.example/", "//evil.example/x", "/\\evil.example", "/\t/evil.example", "/\n/evil.example",
+    "/\r/evil.example", "javascript:alert(1)", `${O}//evil.example`, "/.//evil.example", "/a/..//evil.example", null]) {
+    const at = lands(bad as any);
+    must(at.origin === O, `${JSON.stringify(bad)} lands on ${at.href}`);
   }
 });
 
