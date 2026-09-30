@@ -8,7 +8,7 @@
  * is the AI Gateway, and the overrides with their scope spelled out — and its
  * forms post back to the fragment for the same handler to apply.
  */
-import { page, adminPanel } from "../cf/src/ui.ts";
+import { page, adminPanel, adminPage } from "../cf/src/ui.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -21,14 +21,16 @@ const VIEWER = { email: "o@x.dev", name: "Op", source: "github", agentId: "a1", 
 const adminViewer = { ...VIEWER, admin: true };
 const plainViewer = { ...VIEWER, admin: false };
 
-check("the rail shows admin only when the viewer is one", () => {
+check("the rail points admins at the admin host, and nobody else sees a trace", () => {
+  // The admin area lives on its own host now: the rail item is a link out, not an
+  // embedded view, and the console's markup carries no admin section at all.
   const on = page("t", "Op", "a1", adminViewer as any);
-  must(/class="rail-item" data-view="admin"/.test(on), "an admin must see the admin rail item");
-  must(/<section class="view" data-view="admin">/.test(on), "an admin must get the admin view");
+  must(/<a class="rail-item" href="https:\/\/admin\.antiproton\.ai\/"/.test(on), "an admin's rail links to the admin host");
+  must(!/<section class="view" data-view="admin">/.test(on), "no admin section is embedded in the console");
   const off = page("t", "Op", "a1", plainViewer as any);
-  must(!/data-view="admin"/.test(off), "a non-admin must see no trace of the admin area");
+  must(!/admin\.antiproton\.ai/.test(off), "a non-admin must see no trace of the admin area");
   const anon = page("t", "Op", "a1");
-  must(!/data-view="admin"/.test(anon), "no viewer object, no admin item");
+  must(!/admin\.antiproton\.ai/.test(anon), "no viewer object, no admin link");
 });
 
 check("rail labels are one word — a two-word label wraps inside the 56px rail", () => {
@@ -41,11 +43,14 @@ check("rail labels are one word — a two-word label wraps inside the 56px rail"
   for (const label of labels) must(!/\s/.test(label), `"${label}" wraps in the rail — one word, like the view it opens keeps its full name`);
 });
 
-check("the admin view reads the fragment when shown, and show() accepts it", () => {
-  const html = page("t", "Op", "a1", adminViewer as any);
-  must(/<div class="body" id="admin"[^>]*hx-get="\/ui\/admin"[^>]*hx-trigger="ap:show"/.test(html.replace(/\n/g, " ")),
-    "the admin body must lazy-read /ui/admin on show");
-  must(/\['agents', 'plugins', 'usage', 'keys', 'admin'\]/.test(html), "ap.show must accept the admin view");
+check("the admin host's page is the console's shell around nothing but the panel", () => {
+  const html = adminPage();
+  must(/<title>antiproton admin<\/title>/.test(html), "its own title");
+  must(/data-theme/.test(html) && /<style>/.test(html), "the console's theme and styles travel with it");
+  must(/<div class="body" id="admin"[^>]*hx-get="\/ui\/admin"[^>]*hx-trigger="load"/.test(html.replace(/\n/g, " ")),
+    "the panel loads the same fragment, same-origin, on arrival");
+  must(!/class="rail"|id="sidebar"|id="inspector"/.test(html), "no rail, no sidebar, no inspector — this host is somewhere else");
+  must(/<h1>Admin<\/h1>/.test(html), "the page names itself for a standalone document");
 });
 
 check("the model block names the default, the endpoint, and whether the Gateway serves it", () => {

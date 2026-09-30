@@ -85,7 +85,10 @@ font:14px/1.55 var(--mono-font)}
    has all four, while plugins and runtime leave the inspector and sidebar out. */
 body.shell{display:grid;grid-template-columns:56px 264px minmax(0,1fr) 420px;grid-template-areas:"rail side main insp";
 height:100vh;overflow:hidden}
-body.shell[data-view=keys],body.shell[data-view=usage],body.shell[data-view=admin]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+body.shell[data-view=keys],body.shell[data-view=usage]{grid-template-columns:56px 0 minmax(0,1fr) 0}
+/* The admin host's page wears the shell markup without the rail: zero-width rails,
+   the panel takes the whole viewport. */
+body.shell[data-view=admin]{grid-template-columns:0 0 minmax(0,1fr) 0}
 body.shell[data-view=plugins]{grid-template-columns:56px 264px minmax(0,1fr) 0}
 /* A zero-width column still paints its padding and border: without this the
    inspector showed as a sliver of text beside every view but agents. */
@@ -508,7 +511,7 @@ ${HEAD_ASSETS}
   ${rail("plugins", "plugins")}
   ${rail("usage", "usage")}
   ${rail("keys", "keys")}
-  ${viewer?.admin === true ? rail("admin", "admin") : ""}
+  ${viewer?.admin === true ? `<a class="rail-item" href="https://admin.antiproton.ai/" title="the admin area, on its own host"><span class="ico">${ICONS.admin}</span><span>admin</span></a>` : ""}
   <a class="rail-item" href="https://report.antiproton.ai/" target="_blank" rel="noopener"><span class="ico">${ICONS.report}</span><span>report</span></a>
   <div class="rail-foot">
     <div class="mode" role="group" aria-label="theme">
@@ -593,12 +596,6 @@ ${HEAD_ASSETS}
          the new key off the page. That is the shape of "shown once", not a bug: do not keep it around. -->
     <div class="body" id="api-keys" data-lazy hx-get="/ui/api-keys" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
   </section>
-  ${viewer?.admin === true ? `<section class="view" data-view="admin">
-    <div class="view-head"><h2>Admin</h2><span class="sub">who administers the deployment, and which model each agent serves</span></div>
-    <!-- Admin only: the rail item is not even drawn for anyone else, and the fragment route
-         checks again. Read when shown, not polled — an override is a deliberate act, not a feed. -->
-    <div class="body" id="admin" data-lazy hx-get="/ui/admin" hx-swap="innerHTML" hx-trigger="ap:show">loading…</div>
-  </section>` : ""}
 </main>
 <aside class="inspector" id="inspector">
   <button type="button" class="ghost pane-close" onclick="ap.pane('main')">${ICONS.back}back</button>
@@ -794,7 +791,7 @@ ${HEAD_ASSETS}
       const panel = document.getElementById('usage');
       if ([...q].length) { panel.setAttribute('hx-get', '/ui/usage?' + q); delete panel.dataset.ver; htmx.process(panel); }
     }
-    ap.show(['agents', 'plugins', 'usage', 'keys', 'admin'].includes(v) ? v : 'agents');
+    ap.show(['agents', 'plugins', 'usage', 'keys'].includes(v) ? v : 'agents');
     ap.insp(url.searchParams.get('insp') || 'trajectory');
   });
   // Poll without re-rendering. Each panel remembers the version it last drew;
@@ -1872,6 +1869,31 @@ ${d.overrides.length
     both blank is the deployment, the same as the default above</div>
   ${setForm("set-override", `${idField("tenantId", "tenant")}${idField("agentId", "agent")}`, "save override")}
 </details>`;
+}
+
+/**
+ * The admin host's own page (admin.antiproton.ai), served by `/` on that host. The
+ * console's head — fonts, tokens, theme — around nothing but the admin panel: no
+ * rail, no sidebar, no inspector. An admin signed in here is somewhere else, not
+ * inside the console. The panel loads the same /ui/admin fragment, same-origin on
+ * this host, and the fragment checks isAdmin again.
+ */
+export function adminPage(): string {
+  return `<!doctype html><html lang="en" data-theme="brutal"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>antiproton admin</title>
+<link rel="icon" type="image/svg+xml" href="${FAVICON_DATA_URI}">
+<script>(function(){var t='brutal';try{t=localStorage.getItem('ap-theme')||'brutal'}catch(e){}var h=document.documentElement;if(t==='elegant'){h.setAttribute('data-theme','elegant');h.classList.add('light')}else if(t==='elegant-dark'){h.setAttribute('data-theme','elegant');h.classList.add('dark')}else{h.setAttribute('data-theme','brutal')}})()</script>
+${HEAD_ASSETS}
+<style>${FONT_CSS}${RUI_TOKENS}${CSS}${USAGE_CSS}</style></head>
+<body class="shell" data-view="admin">
+<main>
+  <section class="view on" data-view="admin">
+    <div class="view-head"><h1>Admin</h1><span class="sub">who administers the deployment, and which model each agent serves</span></div>
+    <div class="body" id="admin" hx-get="/ui/admin" hx-swap="innerHTML" hx-trigger="load">loading…</div>
+  </section>
+</main>
+</body></html>`;
 }
 
 /** The element a credential route swaps: one mount, re-rendered. */
