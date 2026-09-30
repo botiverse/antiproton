@@ -3019,10 +3019,19 @@ async function route(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     // The page's own script and font, public and immutable; the sign-in
     // page needs them before anyone is signed in.
+    // Every cookie here is Secure, so a page served over http can start a sign-in whose cookie the browser
+    // refuses to keep. Anything but a local dev server is sent to https first.
+    if (url.protocol === "http:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+      url.protocol = "https:";
+      return Response.redirect(url.toString(), 308);
+    }
     const asset = staticAsset(url.pathname);
     if (asset) return asset;
-    // The admin area's own host (admin-host.ts): it answers its few paths and nothing else.
-    if (env.ADMIN_ORIGIN && url.origin === env.ADMIN_ORIGIN) {
+    // The admin area's own host (admin-host.ts): it answers its few paths and nothing else. Matched by
+    // host, not origin: a browser that typed the bare name arrives over http, and matching the https
+    // origin let that request through to the console's routes, whose sign-in then set its cookie on the
+    // admin host where the callback on UI_ORIGIN could not read it (tygg, 2026-09-30).
+    if (env.ADMIN_ORIGIN && url.hostname === new URL(env.ADMIN_ORIGIN).hostname) {
       const early = await adminHost(request, env, url);
       if (early) return early;
     }
