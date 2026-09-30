@@ -11,6 +11,7 @@
  *   6. DO SQLite storage commits the three-gate advance atomically (§7.3).
  *   7. Alarm wakeup actually fires, and how late (§7.3 可靠唤醒).
  */
+import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
 import { nextAlarm } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
@@ -85,7 +86,7 @@ import { handleProvision, type ProvisionDeps, type ProvisionTool } from "./provi
 import { adoptProvisionedAgent, provisionTool, provisionPushStatus, PROVIDER_HOME, PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
 import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
-import { staticAsset } from "./static.ts";
+import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import { operatorModelOf } from "./model-request.ts";
 import { operatorRequest } from "../../src/model/operator-request.ts";
@@ -108,6 +109,8 @@ export interface Env {
   CONTROL_DB: D1Database;
   ARTIFACTS: R2Bucket;
   DEEPSEEK_API_KEY: string;
+  /** The admin area's own origin (admin-host.ts), e.g. https://admin.antiproton.ai; unset, there is none. */
+  ADMIN_ORIGIN?: string;
   /** Who administers the deployment besides the operator's token: comma-separated identity keys (`github:<id>`). */
   ADMIN_IDENTITIES?: string;
   /** Cloudflare AI Gateway token (AI Gateway: Run), when DEEPSEEK_BASE_URL is a gateway with authentication on. */
@@ -2369,13 +2372,22 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       const reason = url.searchParams.get("reason") ?? "";
       return new Response(refusedPage(reason), { status: 403, headers: { "content-type": "text/html; charset=utf-8" } });
     }
+    case HANDOFF_PATH: {
+      // The admin host's sign-in, done here where the OAuth App's callback is (admin-host.ts).
+      if (!env.ADMIN_ORIGIN || !env.SESSION_SECRET) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
+      const v = await viewer(request, env);
+      if (!v) return Response.redirect(new URL(`/login/github?returnTo=${encodeURIComponent(HANDOFF_PATH)}`, url).toString(), 302);
+      if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+      const t = await handoffTicket(env.SESSION_SECRET, v, Date.now());
+      return new Response(null, { status: 302, headers: { location: `${env.ADMIN_ORIGIN}/session?t=${encodeURIComponent(t)}`, "cache-control": "no-store" } });
+    }
     case "/login/github": {
       const cfg = githubConfig(env);
       if (!cfg) return refuse(request, "unconfigured", REFUSALS.unconfigured, 503);
       const now = Date.now();
       // The state alone binds the callback to this browser (GitHub's flow has
-      // no nonce or PKCE verifier).
-      const st: LoginState = { state: randomToken(), returnTo: "/ui", iat: now, exp: now + LOGIN_TTL_MS };
+      // no nonce or PKCE verifier). Where to land after: a path on this origin only.
+      const st: LoginState = { state: randomToken(), returnTo: safeReturnTo(url.searchParams.get("returnTo"), url.origin), iat: now, exp: now + LOGIN_TTL_MS };
       return new Response(null, {
         status: 302,
         headers: {
@@ -2725,6 +2737,37 @@ function provisionDeps(env: Env): ProvisionDeps {
   };
 }
 
+/**
+ * The admin host (admin-host.ts). A response ends the request; null lets the path through to the shared
+ * routes (`/ui/admin`, `/admin/models`, `/logout`), which check isAdmin themselves.
+ */
+async function adminHost(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const nothing = () => Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
+  if (!adminHostServes(url.pathname)) return nothing();
+  if (!env.SESSION_SECRET) return nothing();
+  if (url.pathname === "/session") {
+    const v = await redeemTicket(env.SESSION_SECRET, url.searchParams.get("t"), Date.now(),
+      (nonce, at) => d1Connections(env.CONTROL_DB).consumeLink(`admin:${nonce}`, at));
+    if (!v || !isAdmin(v, env)) {
+      return new Response("This sign-in link is not valid, was used already, or expired. Open this site again to sign in.", { status: 400 });
+    }
+    return new Response(null, {
+      status: 302,
+      headers: { location: "/", "set-cookie": await sessionCookieFor(env.SESSION_SECRET, v, v.sub ?? v.email), "cache-control": "no-store" },
+    });
+  }
+  if (url.pathname === "/logout") {
+    // The host has no sign-in page of its own: signed out, it lands on "/", which sends the browser to sign in again.
+    if (request.method !== "POST") return Response.json({ error: { code: "method", message: "POST to sign out" } }, { status: 405 });
+    return new Response(null, { status: 302, headers: { location: "/", "set-cookie": clearCookieHeader(SESSION_COOKIE) } });
+  }
+  const v = await viewer(request, env);
+  if (!v) return Response.redirect(`${env.UI_ORIGIN ?? url.origin}${HANDOFF_PATH}`, 302);
+  if (!isAdmin(v, env)) return nothing();
+  if (url.pathname === "/") return new Response(adminShell(HTMX_SRC), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  return null;
+}
+
 /** `/v1/...`: the OpenAI-compatible agents API (task #17), authenticated by a Bearer key. */
 async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   const key = bearerKey(request);
@@ -2970,6 +3013,11 @@ async function route(request: Request, env: Env): Promise<Response> {
     // page needs them before anyone is signed in.
     const asset = staticAsset(url.pathname);
     if (asset) return asset;
+    // The admin area's own host (admin-host.ts): it answers its few paths and nothing else.
+    if (env.ADMIN_ORIGIN && url.origin === env.ADMIN_ORIGIN) {
+      const early = await adminHost(request, env, url);
+      if (early) return early;
+    }
     const login = await handleLogin(request, env, url);
     if (login) return login;
     // The OpenAI-compatible agents API and its key issuance answer before any

@@ -9,7 +9,9 @@
   // (tygg, 2026-09-11). Both are listed so a deploy adds without removing.
   "routes": [
     { "pattern": "antiproton.botiverse.dev", "custom_domain": true },
-    { "pattern": "antiproton.ai", "custom_domain": true }
+    { "pattern": "antiproton.ai", "custom_domain": true },
+    // The admin area (cf/src/admin-host.ts): same Worker, its own host, sign-in handed off from UI_ORIGIN.
+    { "pattern": "admin.antiproton.ai", "custom_domain": true }
   ],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AgentDO"] }],
   "durable_objects": {
@@ -61,6 +63,7 @@
     // will tighten when needed (tygg, 2026-09-12 04:54Z). Set to 0 to close.
     "GITHUB_OPEN_SIGNUP": "1",
     "UI_ORIGIN": "https://antiproton.ai",
+    "ADMIN_ORIGIN": "https://admin.antiproton.ai",
     // Where hook URLs a plugin makes point (Raft push). antiproton.ai has no Access gate in front.
     "HOOK_ORIGIN": "https://antiproton.ai",
     // The container lease (tygg, 2026-09-15 11:28Z: a container is destroyed by
