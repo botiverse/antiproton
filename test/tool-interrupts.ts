@@ -410,25 +410,6 @@ for (const [label, exec] of EXECUTORS) {
     if (label === "quickjs") must(also.length === 1 && f.db.cancels.length === 1, `both reached the plugin under QuickJS: ${JSON.stringify(y)}`);
   });
 
-  // QuickJS only: the Dynamic Worker stand-in runs in node's own thread and cannot stop a busy loop.
-  if (label === "quickjs") await check(`${label}: a question that comes back to a run that ended another way (out of time) is dropped, never left unanswered`, async () => {
-    const f = await fixture();
-    const slowHost: ToolHost = {
-      ...f.host,
-      async invoke(call) { await new Promise((r) => setTimeout(r, 300)); return f.host.invoke(call); },
-    };
-    const run: any = runJsTool(exec, slowHost, { tools: f.TOOLS, continuations: f.reg, scope: "s", limits: { wallTimeMs: 50 } });
-    let out: any = null, threw = "";
-    try { out = await run.execute("p1", { source: "tool`db__query ${{ sql: 'DELETE FROM users' }}`.catch(() => {}); while (true) {}" }); }
-    catch (e) { threw = String((e as Error).message); }
-    await new Promise((r) => setTimeout(r, 400));
-    must(f.reg.size === 0 || (out && body(out).state === "yielded"), `held a question for a run that did not stop at it: ${threw} ${out && out.content[0].text}`);
-    // Whatever reached the plugin was either asked (and held) or dropped (and told): never neither.
-    const reached = f.host.calls.length;
-    must(reached === 0 || f.reg.size === 1 || f.db.cancels.length === 1, `a question nobody holds and nobody dropped: ${JSON.stringify({ reached, size: f.reg.size, cancels: f.db.cancels.length, threw })}`);
-    must(f.db.ran.length === 0, "nothing ran");
-  });
-
   await check(`${label}: run_js with nowhere to keep a question drops it and says so; nothing runs`, async () => {
     const f = await fixture();
     const run: any = runJsTool(exec, f.host, { tools: f.TOOLS });
@@ -436,6 +417,40 @@ for (const [label, exec] of EXECUTORS) {
     must(y.state === "interrupted" && !("token" in y) && f.db.cancels.length === 1 && f.db.ran.length === 0, `no keeping: ${JSON.stringify(y)}`);
   });
 }
+
+/** A sandbox that makes one call and ends as told, so when the call comes back is the test's to choose. */
+function scripted(o: { status: "completed" | "failed"; awaitCall: boolean }) {
+  let late!: Promise<unknown>;
+  return {
+    late: () => late,
+    sandbox: {
+      async execute(_src: string, host: any) {
+        late = host.invoke({ tool: "db__query", args: { sql: "DELETE FROM users" } });
+        if (o.awaitCall) await late;
+        return { status: o.status, outputs: [], hostCalls: 1, ...(o.status === "failed" ? { error: { code: "eval_error" } } : {}) };
+      },
+    },
+  };
+}
+
+await check("a question that comes back to a run that ended another way (a failure) is dropped, never held or left unanswered", async () => {
+  const f = await fixture();
+  const s = scripted({ status: "failed", awaitCall: true });
+  const run: any = runJsTool(s.sandbox as any, f.host, { tools: f.TOOLS, continuations: f.reg, scope: "s" });
+  let why = "";
+  try { await run.execute("p1", { source: "" }); } catch (e) { why = String((e as Error).message); }
+  must(/run_js failed/.test(why) && f.reg.size === 0 && f.db.cancels.length === 1 && f.db.ran.length === 0, `failed run: ${why} ${JSON.stringify(f.db)}`);
+});
+
+await check("a question that comes back after its program was reported (the call outlived it) is dropped at once", async () => {
+  const f = await fixture();
+  const s = scripted({ status: "completed", awaitCall: false });
+  const run: any = runJsTool(s.sandbox as any, f.host, { tools: f.TOOLS, continuations: f.reg, scope: "s" });
+  await run.execute("p1", { source: "" });
+  await s.late();
+  await new Promise((r) => setTimeout(r, 10));
+  must(f.reg.size === 0 && f.db.cancels.length === 1 && f.db.ran.length === 0, `late question: ${JSON.stringify({ size: f.reg.size, db: f.db })}`);
+});
 
 // ---- the Raft held send, end to end ----------------------------------------
 

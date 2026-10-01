@@ -519,6 +519,18 @@ interface Asked {
   host: ToolHost;
 }
 
+/**
+ * The questions one program's tool calls were asked, collected as they come
+ * back and drained when a stretch of the program is reported (deliverRun).
+ *
+ * `closed` once a stretch has been reported and no program is left waiting:
+ * a call can still come back after that (a Dynamic Worker's call outstanding
+ * when the program ended, or one that outlived a run stopped for time), and
+ * a question arriving then has nobody to put it to, so it is dropped at once
+ * rather than collected where nothing will ever read it.
+ */
+interface AskedList { items: Asked[]; closed: boolean }
+
 /** Usage callbacks shared by run_js and resume: one program's stretches are counted as they run. */
 interface RunCounting {
   onCalls?: (n: number) => void | Promise<void>;
@@ -543,7 +555,7 @@ async function deliverRun(r: RunResult, o: {
   scope: string;
   cancelling?: boolean;
   /** Questions the program's tool calls were asked, as they came back (runJsTool). Drained here. */
-  asked?: Asked[];
+  asked?: AskedList;
 }) {
   const hostCalls = r.hostCalls ?? 0;
   const operations = r.acceptedOperationIds ?? [];
@@ -563,7 +575,10 @@ async function deliverRun(r: RunResult, o: {
   // come back pending and ended the program there, as it ends one at a held
   // call; what it ended on is a question for the model, not a person, so it
   // is reported as one and kept out of `held`.
-  const asked = o.asked?.splice(0) ?? [];
+  // Closed from here unless a program is held below: anything that comes
+  // back after this drain is past the point where it could be reported.
+  if (o.asked) o.asked.closed = true;
+  const asked = o.asked?.items.splice(0) ?? [];
   if (asked.length) {
     const ids = new Set(asked.map((a) => a.operationId));
     const held = (r.held ?? []).filter((h) => !ids.has(h.operationId));
@@ -604,6 +619,7 @@ async function deliverRun(r: RunResult, o: {
       const asked = r.pause.answer !== undefined ? answerSpecOf(r.pause.answer) : null;
       const spec = asked && "spec" in asked ? asked.spec : undefined;
       const specError = r.pause.answerError ?? (asked && "error" in asked ? asked.error : undefined);
+      if (o.asked) o.asked.closed = false;
       const h = o.continuations.hold({
         continuation: r.continuation, scope: o.scope, callId: o.callId,
         hostCalls, operations: operations.length, question: r.pause.reason, ...(spec ? { answer: spec } : {}),
@@ -778,7 +794,7 @@ export function resumeTool(
       }
       return deliverRun(r, {
         label: "resume", callId: s.callId, started, before: { hostCalls: s.hostCalls, operations: s.operations },
-        counting: opts, continuations, scope, cancelling, ...(s.asked ? { asked: s.asked as Asked[] } : {}),
+        counting: opts, continuations, scope, cancelling, ...(s.asked ? { asked: s.asked as AskedList } : {}),
       });
     },
   } as AgentHarnessTool<undefined>;
@@ -909,7 +925,7 @@ export function runJsTool(
     replay: "never",
     async execute(toolCallId: string, params: { source: string }) {
       let n = 0;
-      const asked: Asked[] = [];
+      const asked: AskedList = { items: [], closed: false };
       const started = Date.now();
       // Counting is never the run's problem: a failure here is dropped.
       const countRun = async (run: { ok: boolean; ms: number; hostCalls: number }) => {
@@ -997,7 +1013,9 @@ export function runJsTool(
             // executor ends the program here, as it would at a held call.
             // deliverRun then reports the question for the model to resume.
             if (res.status !== "interrupted" || !res.interrupt) return res;
-            asked.push({ name: String(call.tool), operationId: res.operationId ?? "", interrupt: res.interrupt, host });
+            const a = { name: String(call.tool), operationId: res.operationId ?? "", interrupt: res.interrupt, host };
+            if (asked.closed) void cancelQuietly(host, a.interrupt);
+            else asked.items.push(a);
             return {
               status: "pending", operationId: res.operationId,
               error: { code: "tool_interrupted", message: `${String(call.tool)} asked you a question; the program ends at this call` },

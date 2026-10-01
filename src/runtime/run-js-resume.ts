@@ -46,7 +46,7 @@ export interface SuspendedProgram extends Waiting {
   hostCalls: number;
   operations: number;
   /** Where the program's tool calls report a question they were asked (pi-tools.ts), carried so a resumed stretch can see them. */
-  asked?: unknown[];
+  asked?: unknown;
 }
 
 /** Where a tool's question goes back to: the runtime's side of the gateway (cf/src/runtime.ts). */
