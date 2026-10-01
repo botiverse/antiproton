@@ -30,6 +30,13 @@
  *
  * Using it moves `lastUsedAt`, and with it the release time, so something in
  * use is never taken and never warned about.
+ *
+ * The deployment sets `maxMs` and `warnMs`, and one held thing may report its
+ * own (`MountActivity.live.lease`, read through `scheduleOf`). A releasing step
+ * can be cheap and reversible for one state of a thing and final for another —
+ * a machine switched off keeps its disk, a deleted one does not — so whether a
+ * warning is worth a model turn, and how long the wait is, belong to whatever
+ * knows which state the thing is in. The schedule stays this file's.
  */
 
 export interface IdleInput {
@@ -51,6 +58,60 @@ export type IdleAction =
   | { do: "warn"; releaseAt: number; idleMs: number; untilReleaseMs: number; wakeInMs: number }
   /** Nothing to say yet. */
   | { do: "wait"; wakeInMs: number };
+
+/** One held thing's own schedule, when it reports one; see `MountActivity.live.lease`. */
+export interface HeldLease {
+  maxMs?: number;
+  warnMs?: number;
+  consequence?: string;
+  advice?: string;
+  maxPostponeMinutes?: number;
+}
+
+/**
+ * The two numbers one held thing is scheduled by: its own where it reports
+ * them, the deployment's otherwise. A value that is not a usable number is not
+ * a schedule, so it falls back rather than releasing at once (a `maxMs` of NaN
+ * would make every pass a release).
+ */
+export function scheduleOf(
+  lease: HeldLease | undefined | null,
+  deployment: { warnMs: number; maxMs: number },
+): { warnMs: number; maxMs: number } {
+  const ok = (v: unknown, min: number): v is number => typeof v === "number" && Number.isFinite(v) && v >= min;
+  return {
+    maxMs: ok(lease?.maxMs, 1) ? lease!.maxMs! : deployment.maxMs,
+    warnMs: ok(lease?.warnMs, 0) ? lease!.warnMs! : deployment.warnMs,
+  };
+}
+
+/**
+ * The decision for one held thing, on its own schedule where it reports one.
+ * What the idle pass calls, so the schedule a thing reports cannot be read and
+ * then not used.
+ */
+export function heldDecision(
+  live: { lastUsedAt: number; lease?: HeldLease },
+  i: { postponedUntil?: number; warnedFor: number; now: number },
+  deployment: { warnMs: number; maxMs: number },
+): IdleAction {
+  const s = scheduleOf(live.lease, deployment);
+  return idleDecision({ lastUsedAt: live.lastUsedAt, ...i, warnMs: s.warnMs, maxMs: s.maxMs });
+}
+
+/**
+ * A duration as a person says it: minutes up to two hours, hours up to two
+ * days, then days. A schedule measured in days printed "10080 minutes", which
+ * is a number nobody reads as a week.
+ */
+export function spanText(ms: number): string {
+  const n = (v: number, unit: string) => `${v} ${unit}${v === 1 ? "" : "s"}`;
+  const m = Math.max(1, Math.round(ms / 60_000));
+  if (m < 120) return n(m, "minute");
+  const h = Math.round(ms / 3_600_000);
+  if (h < 48) return n(h, "hour");
+  return n(Math.round(ms / 86_400_000), "day");
+}
 
 /** When it goes: the idle ceiling, or the agent's postponement if that is later. */
 export function releaseAt(i: Pick<IdleInput, "lastUsedAt" | "postponedUntil" | "maxMs">): number {
@@ -95,8 +156,9 @@ export function warningText(
   idleMs: number,
   untilReleaseMs: number,
   maxPostponeMinutes: number | null,
+  /** What the release does to this thing, and what to do first; the held thing's own words. */
+  said: { consequence?: string | null; advice?: string | null } = {},
 ): string {
-  const mins = (ms: number) => Math.max(1, Math.round(ms / 60_000));
   const keep = names.postpone
     ? `To keep it, call \`${names.postpone}\` with how many more minutes you need`
       + (maxPostponeMinutes ? ` (at most ${maxPostponeMinutes})` : "")
@@ -113,8 +175,9 @@ export function warningText(
   // sentence and the only description here, so what is at stake is still said
   // — by whoever knows it.
   return `[a notice from the harness, not a message from the user] `
-    + `The \`${alias}\` mount has been idle for ${mins(idleMs)} minutes, and what it is holding will be `
-    + `released in ${mins(untilReleaseMs)} minutes`
+    + `The \`${alias}\` mount has been idle for ${spanText(idleMs)}, and `
+    + `${said.consequence || "what it is holding will be released"} in ${spanText(untilReleaseMs)}`
     + (billing ? ` — ${billing}` : "") + `. `
+    + (said.advice ? `${said.advice} ` : "")
     + keep + done;
 }

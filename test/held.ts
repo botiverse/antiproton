@@ -161,6 +161,27 @@ await check("the line is attached to the result, and never replaces what the too
   must(withHeldNote("text", "x") === "text", "a string result must come back as it was");
 });
 
+await check("a thing's own schedule reaches the idle pass with it", async () => {
+  // The pass reads the schedule from what `heldResources` hands it, so a copy of `live` that dropped a field
+  // would put every thing back on the deployment's numbers: a step that loses nothing warned about, and a
+  // final one taken at the short limit with the generic sentence.
+  const lease = { maxMs: 7 * 86_400_000, warnMs: 0, consequence: "the seat will be given away", maxPostponeMinutes: 99 };
+  const own: MountActivity = { ...SEAT, live: { ...SEAT.live!, lease } };
+  const plugin = { ...seats(), holds: { ...seats().holds!, async activity() { return own; } } } as unknown as Plugin;
+  const held = await heldResources(MOUNTS, [plugin, plain], async () => own);
+  must(JSON.stringify(held[0]?.live.lease) === JSON.stringify(lease), `the lease did not come through: ${JSON.stringify(held[0]?.live)}`);
+  // And the pass uses it: its numbers (through `heldDecision`, tested in idle-lease.ts), its words, its
+  // postponement limit, and a wake for the schedule a release leaves behind (a switched-off box is deleted
+  // days later, and nothing else would wake the object for that). A reading of the source, because the pass
+  // needs a live object to run.
+  const src = await readFile(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
+  const at = src.indexOf("async #idlePass(");
+  const body = src.slice(at, src.indexOf("\n  }\n", at));
+  for (const use of ["heldDecision(h.live,", "heldDecision(after,", "soon(d2.wakeInMs)", "h.live.lease?.consequence", "h.live.lease?.maxPostponeMinutes"]) {
+    must(body.includes(use), `the idle pass no longer reads ${use}`);
+  }
+});
+
 await check("the idle pass reaches into nothing that belongs to one plugin", async () => {
   // The rule the rewrite exists to keep. `boxId` is one plugin's word, and for
   // as long as this loop read it, the framework's idle pass was the sandbox's

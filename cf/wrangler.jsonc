@@ -69,7 +69,10 @@
     // The container lease (tygg, 2026-09-15 11:28Z: a container is destroyed by
     // the agent's own release, not by the end of a turn). Kept between turns;
     // after 30 idle minutes it is released, and 5 minutes before that the agent
-    // is told and may postpone it (tygg 11:38Z). Plain vars, never secrets: a
+    // is told and may postpone it (tygg 11:38Z). The sandbox's release switches a
+    // running box off and keeps its disk, so it reports no warning for that step
+    // and its own days-long schedule for the deletion (keepStoppedDays); the
+    // warning here applies to holders that report none. Plain vars, never secrets: a
     // secret of the same name would outlive a deploy that changed these.
     "RUN9_WARN_MINUTES": "5",
     "RUN9_MAX_IDLE_MINUTES": "30"

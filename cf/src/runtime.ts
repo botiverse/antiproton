@@ -15,7 +15,7 @@ import { operatorRequest, type OperatorModel } from "../../src/model/operator-re
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
-import { idleDecision, warningText } from "../../src/runtime/idle-lease.ts";
+import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldLine, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
@@ -1915,17 +1915,20 @@ export class AgentRuntime {
       const row = sql.exec("SELECT release_at FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id)
         .toArray()[0] as any;
       const warnedFor = Number(row?.release_at) || 0;
-      const d = idleDecision({ lastUsedAt: h.live.lastUsedAt, postponedUntil: h.quietUntil ?? 0, warnedFor, now, warnMs, maxMs });
+      // The thing's own schedule where it reports one: a step that loses nothing is taken without a warning,
+      // and a final one can wait longer and say what it will cost (idle-lease.ts `scheduleOf`).
+      const d = heldDecision(h.live, { postponedUntil: h.quietUntil ?? 0, warnedFor, now }, { warnMs, maxMs });
       if (d.do === "wait") { soon(d.wakeInMs); continue; }
       if (d.do === "warn") {
         // The warning is a turn the agent takes, so it is a message rather
         // than a signal: the model has to be able to answer it with a call.
         const mount = mounts.find((m) => m.alias === h.alias);
-        const limit = Number((mount?.publicConfig as any)?.maxQuietMinutes) || null;
+        const limit = Number(h.live.lease?.maxPostponeMinutes) || Number((mount?.publicConfig as any)?.maxQuietMinutes) || null;
         await this.postMessage(tenantId, agentId,
           warningText(h.alias,
             { release: nameOf(h.alias, h.tools.release), postpone: h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null },
-            h.billing, d.idleMs, d.untilReleaseMs, limit), "prompt");
+            h.billing, d.idleMs, d.untilReleaseMs, limit,
+            { consequence: h.live.lease?.consequence, advice: h.live.lease?.advice }), "prompt");
         sql.exec("INSERT INTO held_warnings(alias, live_id, release_at) VALUES (?,?,?) " +
           "ON CONFLICT(alias, live_id) DO UPDATE SET release_at = excluded.release_at", h.alias, h.live.id, d.releaseAt);
         // 0: postMessage only marks the session, so this wake is what runs the warning's turn (idle-lease.ts).
@@ -1939,7 +1942,8 @@ export class AgentRuntime {
       // looks like. The agent was told before this point and had two calls in
       // hand — release and postpone — so reaching here without either is a
       // choice it made on a turn it was given, not something the pass did
-      // behind it. Saving on its behalf would need someone to say what: a
+      // behind it. Or it was not told, because the thing reported this step as
+      // one that loses nothing (`warnMs: 0`) — and then there is nothing to save. Saving on its behalf would need someone to say what: a
       // container's filesystem does not mark which files are the work, so
       // keeping something would be guessing, and a guess nobody comes back to
       // read still costs what the machine costs. Asked and answered as the
@@ -1948,6 +1952,15 @@ export class AgentRuntime {
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias });
       releaseFailed = [...releaseFailed, ...r.failed];
       sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
+      // A release may leave the thing held in another state with a schedule of its own (switched off, and
+      // deleted much later), and nothing else would wake this object for that one. Asked again rather than
+      // assumed: whether anything is still held is the plugin's answer. Not after a failure, which would
+      // only come straight back here; that is reported instead, as it always was.
+      if (r.failed.some((f) => f.alias === h.alias)) continue;
+      const after = (await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, h.alias)).live;
+      if (!after) continue;
+      const d2 = heldDecision(after, { warnedFor: 0, now: Date.now() }, { warnMs, maxMs });
+      if ("wakeInMs" in d2) soon(d2.wakeInMs);
     }
     return { wakeInMs, releaseFailed };
   }

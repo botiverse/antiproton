@@ -960,12 +960,22 @@ await check("run and shell end the container the same way", async () => {
     if (!/until you release it/.test(text) || !/later ones/.test(text)) {
       throw new Error(`${where} does not say the container stays, in later turns, until the agent releases it: ${text.slice(0, 200)}`);
     }
-    if (!/after 30 idle minutes it is released/.test(text) || !/5 minutes before that you are told/.test(text)) {
-      throw new Error(`${where} does not state the lease's own numbers: ${text.slice(0, 240)}`);
+    // Idle only switches the box off, and the files come back with it; the deletion that loses them comes
+    // days later and is announced. Both halves, because an agent told only "it is released after 30 idle
+    // minutes" reinstalls everything after every pause, and one told only "it comes back" plans on forever.
+    if (!/after 30 idle minutes it is switched off/.test(text) || !/switches it back on with its files intact/.test(text)) {
+      throw new Error(`${where} does not state the lease's own numbers, or that idle only switches it off: ${text.slice(0, 300)}`);
+    }
+    if (!/deleted, with everything on its disk, only after 7 days switched off/.test(text)
+      || !/you are told 24 hours before that/.test(text)) {
+      throw new Error(`${where} does not say when a switched-off box is deleted and that the agent is told first: ${text}`);
+    }
+    if (/idle minutes it is released/.test(text)) {
+      throw new Error(`${where} still says an idle box is released, which now only switches it off: ${text.slice(0, 240)}`);
     }
     // The agent can keep the box, and the text says with what.
-    if (!/`quiet` postpones the release/.test(text)) {
-      throw new Error(`${where} does not say the release can be postponed with quiet: ${text.slice(0, 240)}`);
+    if (!/`quiet` postpones either/.test(text)) {
+      throw new Error(`${where} does not say the idle steps can be postponed with quiet: ${text.slice(0, 400)}`);
     }
     // /tmp is a tmpfs in a run9 box and was emptied while the box sat idle; the working directory was not
     // (production, 2026-09-15). An agent told only "files survive" keeps its work where it will vanish.
@@ -1491,7 +1501,7 @@ await check("the container's wording and the lease switch say the same thing", a
     ["save's result", savedNote(lease), false],
   ] as const;
   for (const [where, text, statesMinutes] of says) {
-    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is released|postpones the release|released on its own|keeps it longer|Postpone the release|leave it running/.test(text);
+    const promises = /goes idle|idle long enough|asked whether to keep|idle minutes it is switched off|postpones either|switched off on its own|keeps it longer|Postpone what happens next|leave it running/.test(text);
     if (leaseOn && !promises) {
       throw new Error(`the lease is configured but ${where} still describes a box that only you can end: ${text.slice(0, 140)}`);
     }
@@ -1502,9 +1512,14 @@ await check("the container's wording and the lease switch say the same thing", a
     if (!text.includes(`after ${setting("RUN9_MAX_IDLE_MINUTES")} idle minutes`)) {
       throw new Error(`${where} does not state the configured ceiling (${setting("RUN9_MAX_IDLE_MINUTES")} minutes): ${text.slice(0, 200)}`);
     }
-    // The warning is the other number the lease is built from, and nothing held it (Vera).
-    if (!text.includes(`${setting("RUN9_WARN_MINUTES")} minutes before that you are told`)) {
-      throw new Error(`${where} does not state the configured warning (${setting("RUN9_WARN_MINUTES")} minutes): ${text.slice(0, 260)}`);
+    // The warning used to be the other number the lease is built from (Vera). Switching an idle box off loses
+    // nothing on its disk, so it is not announced and the setting's minutes are not the agent's to plan with; the
+    // deletion is, and the text has to state when it is told about that one.
+    if (text.includes(`${setting("RUN9_WARN_MINUTES")} minutes before that you are told`)) {
+      throw new Error(`${where} promises a warning before the box is switched off, and none is sent: ${text.slice(0, 260)}`);
+    }
+    if (!/you are told 24 hours before that/.test(text)) {
+      throw new Error(`${where} does not say the agent is told before a switched-off box is deleted: ${text}`);
     }
   }
 });
@@ -2607,7 +2622,7 @@ await check("keep and save say a surviving copy is not a reason to release", asy
       if (/survives (its )?release/.test(text)) throw new Error(`${which} still offers survival as the whole story: ${text}`);
       // The side the switch case cannot reach while cf/wrangler.jsonc has the lease on: it only ever builds the
       // deployed plugin, so an unconditional lease promise here passed it once already.
-      if (!l && /leave it running|released on its own|`quiet`/.test(text)) {
+      if (!l && /leave it running|switched off on its own|`quiet`/.test(text)) {
         throw new Error(`${which} promises what only a lease keeps: ${text}`);
       }
     }
@@ -2615,14 +2630,14 @@ await check("keep and save say a surviving copy is not a reason to release", asy
   const leased = sandboxPlugin(null as any, "local", lease)
     .tools.find((t) => t.name === "release")!.summary;
   if (!/leave it running, even after keeping or saving/.test(leased)) throw new Error(`release does not rule out keeping as a reason: ${leased}`);
-  if (leased.indexOf("leave it running") > leased.indexOf("released on its own")) {
+  if (leased.indexOf("leave it running") > leased.indexOf("switched off on its own")) {
     throw new Error(`release says the container goes on its own before it says to leave it running: ${leased}`);
   }
 });
 
 await check("without a lease, release promises nothing a lease would keep", async () => {
   const release = run9.tools.find((t) => t.name === "release")!.summary;
-  if (/leave it running|released on its own|`quiet`/.test(release)) throw new Error(`release promises the lease with none configured: ${release}`);
+  if (/leave it running|switched off on its own|`quiet`/.test(release)) throw new Error(`release promises the lease with none configured: ${release}`);
   if (!/handed back when the turn ends/.test(release)) throw new Error(`release does not say the box ends with the turn: ${release}`);
   if (!/will not be needed again/.test(release)) throw new Error(`release does not say when to release: ${release}`);
 });

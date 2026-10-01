@@ -6,7 +6,7 @@
  * the release itself, and a postponed agent is not bothered
  * again until its new release time is near.
  */
-import { idleDecision, releaseAt, warningText } from "../src/runtime/idle-lease.ts";
+import { heldDecision, idleDecision, releaseAt, scheduleOf, spanText, warningText } from "../src/runtime/idle-lease.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 function check(name: string, fn: () => void) {
@@ -120,6 +120,55 @@ check("a mount that offers no tools still gets a warning that is true", () => {
   // unconditional — the hole reads ` — null.`, which no punctuation check sees.
   must(!/null|undefined/.test(t), `an absent billing sentence must not be printed: ${t}`);
   must(!/— \./.test(t) && !/ \. /.test(t), `a mount with no billing sentence must not leave a dangling separator: ${t}`);
+});
+
+check("a held thing's own schedule wins where it reports one, and a broken one falls back", () => {
+  const deploy = { warnMs: 5 * MIN, maxMs: MAX };
+  const silent = scheduleOf({ warnMs: 0 }, deploy);
+  must(silent.warnMs === 0 && silent.maxMs === MAX, `warnMs 0 must mean no warning at the deployment's limit: ${JSON.stringify(silent)}`);
+  const own = scheduleOf({ maxMs: 7 * 24 * 60 * MIN, warnMs: 24 * 60 * MIN }, deploy);
+  must(own.maxMs === 7 * 24 * 60 * MIN && own.warnMs === 24 * 60 * MIN, `its own numbers: ${JSON.stringify(own)}`);
+  const none = scheduleOf(undefined, deploy);
+  must(none.maxMs === MAX && none.warnMs === 5 * MIN, "no lease is the deployment's schedule");
+  // NaN or a zero ceiling would make every pass a release; it is not a schedule.
+  const broken = scheduleOf({ maxMs: Number.NaN, warnMs: -1 }, deploy);
+  must(broken.maxMs === MAX && broken.warnMs === 5 * MIN, `a broken lease must fall back: ${JSON.stringify(broken)}`);
+  must(scheduleOf({ maxMs: 0 }, deploy).maxMs === MAX, "a zero ceiling must fall back");
+  // A silent schedule is silent through the decision, too: no warning, then the release at the limit.
+  const quiet = idleDecision({ lastUsedAt: base.lastUsedAt, warnedFor: 0, now: ceiling - MIN, ...silent });
+  must(quiet.do === "wait", `warnMs 0 still warned: ${JSON.stringify(quiet)}`);
+});
+
+check("the decision for a held thing uses the schedule it reports", () => {
+  const deploy = { warnMs: WARN, maxMs: MAX };
+  const at = { warnedFor: 0, now: ceiling - MIN };
+  must(heldDecision({ lastUsedAt: base.lastUsedAt }, at, deploy).do === "warn", "no lease: the deployment's warning");
+  must(heldDecision({ lastUsedAt: base.lastUsedAt, lease: { warnMs: 0 } }, at, deploy).do === "wait", "warnMs 0: silent");
+  must(heldDecision({ lastUsedAt: base.lastUsedAt, lease: { warnMs: 0 } }, { warnedFor: 0, now: ceiling }, deploy).do === "release",
+    "silent, and still taken at the deployment's limit");
+  const long = { maxMs: 7 * 24 * 60 * MIN, warnMs: 24 * 60 * MIN };
+  must(heldDecision({ lastUsedAt: base.lastUsedAt, lease: long }, { warnedFor: 0, now: ceiling }, deploy).do === "wait",
+    "its own longer limit holds past the deployment's");
+  const d = heldDecision({ lastUsedAt: base.lastUsedAt, lease: long }, { warnedFor: 0, now: base.lastUsedAt + 6 * 24 * 60 * MIN + MIN }, deploy);
+  must(d.do === "warn", `warned a day before its own limit: ${JSON.stringify(d)}`);
+});
+
+check("durations are said in the unit a person reads them in", () => {
+  must(spanText(5 * MIN) === "5 minutes" && spanText(MIN) === "1 minute", `minutes: ${spanText(5 * MIN)}, ${spanText(MIN)}`);
+  must(spanText(90 * MIN) === "90 minutes", spanText(90 * MIN));
+  must(spanText(24 * 60 * MIN) === "24 hours", spanText(24 * 60 * MIN));
+  must(spanText(7 * 24 * 60 * MIN) === "7 days", `a week is not 10080 minutes: ${spanText(7 * 24 * 60 * MIN)}`);
+});
+
+check("a held thing's own consequence and advice replace the generic sentence", () => {
+  const t = warningText("node", { release: "node__release", postpone: "node__quiet" }, "stopped: only its disk is kept",
+    6 * 24 * 60 * MIN, 24 * 60 * MIN, 10080,
+    { consequence: "the stopped seat and its notes will be deleted", advice: "Copy the notes out first." });
+  must(/idle for 6 days, and the stopped seat and its notes will be deleted in 24 hours/.test(t), `consequence: ${t}`);
+  must(!/will be released/.test(t), `the generic sentence stayed: ${t}`);
+  must(/Copy the notes out first\. To keep it/.test(t), `advice before the postponement: ${t}`);
+  const plain = warningText("node", { release: null, postpone: null }, null, 25 * MIN, 5 * MIN, null, {});
+  must(/what it is holding will be released in 5 minutes\./.test(plain), `without one the generic sentence: ${plain}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
