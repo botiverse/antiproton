@@ -493,7 +493,7 @@ export class ToolGateway {
 
   /** Records and strips a `Released` reported under LEASE_KEY; hands back everything else untouched. */
   async #takeLease(ctx: CallContext, alias: string, result: unknown): Promise<unknown> {
-    if (!result || typeof result !== "object" || Array.isArray(result) || result instanceof Backgrounded || result instanceof Interrupt) return result;
+    if (!result || typeof result !== "object" || Array.isArray(result) || result instanceof Backgrounded) return result;
     const { [LEASE_KEY]: fact, ...rest } = result as Record<string, unknown>;
     if (!isReleased(fact)) return result;
     await this.#lease(ctx, alias, fact);

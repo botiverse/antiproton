@@ -147,7 +147,7 @@ async function fixture(o: { ttlMs?: number; now?: () => number; held?: number[] 
   const tools = bridgeTools(TOOLS, host, keeping) as any[];
   const query = tools.find((t) => t.name === "db__query");
   const resume: any = resumeTool(reg, { scope: "s" });
-  return { db, store, gw, host, reg, TOOLS, tools, query, resume, keeping };
+  return { db, store, gw, host, reg, TOOLS, tools, query, resume, keeping, plugins };
 }
 
 // ---- the direct call -------------------------------------------------------
@@ -292,6 +292,57 @@ await check("resume after the mount was switched off is refused like a call, and
   must(/switched off/.test(why) && f.db.ran.length === 0 && f.db.resumes.length === 0, `switched off: ${why}`);
 });
 
+await check("resume after the mount was re-pinned to another plugin version is refused like a call, and nothing runs", async () => {
+  const f = await fixture();
+  const y = body(await f.query.execute("c1", { sql: "DELETE FROM users" }));
+  // The state was written by the version the mount pinned; another version must not be handed it.
+  (f.plugins[0] as any).version = "2.0.0";
+  let why = "";
+  try { await f.resume.execute("r1", { token: y.token, answer: "confirm" }); } catch (e) { why = String((e as Error).message); }
+  must(/mount pins 1\.0\.0, registry has 2\.0\.0/.test(why) && f.db.ran.length === 0 && f.db.resumes.length === 0, `re-pinned: ${why}`);
+});
+
+await check("resume after the mount is gone (renamed away) is refused, and nothing runs", async () => {
+  const f = await fixture();
+  const y = body(await f.query.execute("c1", { sql: "DELETE FROM users" }));
+  must((await f.store.renameMount("t", "a", "db", "elsewhere", null)).ok, "renamed");
+  let why = "";
+  try { await f.resume.execute("r1", { token: y.token, answer: "confirm" }); } catch (e) { why = String((e as Error).message); }
+  must(/`db` mount no longer exists/.test(why) && f.db.ran.length === 0 && f.db.resumes.length === 0, `gone: ${why}`);
+});
+
+await check("on a mount that holds something, the answer waits its turn behind a call already running there", async () => {
+  const order: string[] = [];
+  let open!: () => void;
+  const gate = new Promise<void>((r) => { open = r; });
+  const box: Plugin = {
+    id: "box", version: "1.0.0",
+    tools: ["slow", "ask"].map((name) => ({ name, summary: "", parameters: { type: "object" }, sideEffects: "write" as const, idempotency: "none" as const })),
+    holds: { tools: { release: "slow" }, async activity() { return { live: null }; }, async release() {} } as any,
+    async invoke(tool) {
+      if (tool === "ask") return interrupt({ question: "go?", answer: { kind: "yes_no" } });
+      order.push("slow:start"); await gate; order.push("slow:end"); return null;
+    },
+    interrupts: { async resume() { order.push("resume"); return { ok: true }; } },
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({ tenantId: "t", agentId: "a", alias: "box", plugin: "box", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const gw = new ToolGateway(store, [box], new Set(["box"]));
+  const asked: any = await gw.invoke(CTX, "box.ask", {});
+  must(asked.status === "interrupted", `asked: ${JSON.stringify(asked)}`);
+  const slow = gw.invoke(CTX, "box.slow", {});
+  await new Promise((r) => setTimeout(r, 10));
+  const answered = gw.resumeInterrupt(CTX, asked.interrupt, true);
+  await new Promise((r) => setTimeout(r, 20));
+  must(order.join() === "slow:start", `the answer ran beside a call on the same mount: ${order}`);
+  open();
+  await Promise.all([slow, answered]);
+  must(order.join() === "slow:start,slow:end,resume", `order: ${order}`);
+});
+
 // ---- inside run_js ---------------------------------------------------------
 
 const standIn = standInLoader();
@@ -357,6 +408,25 @@ for (const [label, exec] of EXECUTORS) {
     must(y.state === "yielded" && also.every((a: any) => a.dropped === true) && f.db.cancels.length === also.length, `two: ${JSON.stringify(y)}`);
     must(f.reg.size === 1 && f.db.ran.length === 0, `one held: ${JSON.stringify(f.db)}`);
     if (label === "quickjs") must(also.length === 1 && f.db.cancels.length === 1, `both reached the plugin under QuickJS: ${JSON.stringify(y)}`);
+  });
+
+  // QuickJS only: the Dynamic Worker stand-in runs in node's own thread and cannot stop a busy loop.
+  if (label === "quickjs") await check(`${label}: a question that comes back to a run that ended another way (out of time) is dropped, never left unanswered`, async () => {
+    const f = await fixture();
+    const slowHost: ToolHost = {
+      ...f.host,
+      async invoke(call) { await new Promise((r) => setTimeout(r, 300)); return f.host.invoke(call); },
+    };
+    const run: any = runJsTool(exec, slowHost, { tools: f.TOOLS, continuations: f.reg, scope: "s", limits: { wallTimeMs: 50 } });
+    let out: any = null, threw = "";
+    try { out = await run.execute("p1", { source: "tool`db__query ${{ sql: 'DELETE FROM users' }}`.catch(() => {}); while (true) {}" }); }
+    catch (e) { threw = String((e as Error).message); }
+    await new Promise((r) => setTimeout(r, 400));
+    must(f.reg.size === 0 || (out && body(out).state === "yielded"), `held a question for a run that did not stop at it: ${threw} ${out && out.content[0].text}`);
+    // Whatever reached the plugin was either asked (and held) or dropped (and told): never neither.
+    const reached = f.host.calls.length;
+    must(reached === 0 || f.reg.size === 1 || f.db.cancels.length === 1, `a question nobody holds and nobody dropped: ${JSON.stringify({ reached, size: f.reg.size, cancels: f.db.cancels.length, threw })}`);
+    must(f.db.ran.length === 0, "nothing ran");
   });
 
   await check(`${label}: run_js with nowhere to keep a question drops it and says so; nothing runs`, async () => {

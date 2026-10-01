@@ -238,6 +238,13 @@ await check("resume \"drop\" sends nothing", async () => {
   if (out.state !== "dropped" || !/new idempotencyKey/.test(out.note)) throw new Error(`drop: ${JSON.stringify(out)}`);
 });
 
+await check("resume refuses an answer that is neither send nor drop, and sends nothing", async () => {
+  const m = mount();
+  globalThis.fetch = (async () => { throw new Error("network reached on a bad answer"); }) as any;
+  const why = await failure(() => raftPlugin.interrupts!.resume("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, "maybe", m.ctx));
+  if (!/must be "send" or "drop"/.test(why.message)) throw why;
+});
+
 await check("the same send again with the same key, outside resume, still attests the held messages and goes through", async () => {
   const m = mount();
   const calls = many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
