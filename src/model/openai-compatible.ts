@@ -1,6 +1,19 @@
 import type { ModelAdapter, ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
 
 /**
+ * How long one `complete` may take, every attempt and backoff included, before it is abandoned.
+ *
+ * The request is not streamed, so there is no first byte or idle gap to watch: a provider that
+ * accepts the request and never answers is only visible as a call that has not finished. Without a
+ * bound that call is ended by the platform instead — the queue consumer that waits on it is killed
+ * at its 15-minute wall-time limit with nothing logged, and each redelivery can hang the same way
+ * (a DeepSeek call held a turn for 899997 ms at ~17 ms CPU, measured 2026-10-01). Ten minutes
+ * leaves the consumer's other steps (taking the job, delivering the answer) room under that limit;
+ * a legitimate answer slower than that would have been at risk of the same kill anyway.
+ */
+export const MODEL_CALL_DEADLINE_MS = 10 * 60_000;
+
+/**
  * Normalises any OpenAI-compatible endpoint. Provider-specific extras
  * (reasoning_content, cache hit counters) are folded into usage rather than
  * leaking into the harness — that is what keeps §11's "provider is replaceable"
@@ -12,16 +25,21 @@ export class OpenAiCompatibleModel implements ModelAdapter {
   #apiKey: string;
   #model: string;
   #headers: Record<string, string>;
+  #deadlineMs: number;
 
   /**
    * `apiKey` empty sends no `authorization`: a gateway that holds the provider's key (Cloudflare AI
    * Gateway's stored keys) adds it itself. `headers` are sent as given, e.g. the gateway's own token.
+   * `deadlineMs` replaces MODEL_CALL_DEADLINE_MS, so a test can hang a call without waiting minutes.
    */
-  constructor(cfg: { baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> }) {
+  constructor(cfg: {
+    baseUrl: string; apiKey: string; model: string; headers?: Record<string, string>; deadlineMs?: number;
+  }) {
     this.#baseUrl = cfg.baseUrl.replace(/\/$/, "");
     this.#apiKey = cfg.apiKey;
     this.#model = cfg.model;
     this.#headers = cfg.headers ?? {};
+    this.#deadlineMs = cfg.deadlineMs ?? MODEL_CALL_DEADLINE_MS;
     this.id = `${new URL(cfg.baseUrl).host}/${cfg.model}`;
   }
 
@@ -53,10 +71,15 @@ export class OpenAiCompatibleModel implements ModelAdapter {
     const reasoningDial = opts.reasoning === "off" ? { thinking: { type: "disabled" } }
       : opts.reasoning ? { reasoning_effort: opts.reasoning } : {};
     let lastErr: Error | null = null;
+    // One signal for the whole call rather than one per attempt: three attempts each under the
+    // deadline would add up past the limit the deadline exists to stay under. It reaches the body
+    // read too, since a response whose headers arrived can still stall before its last byte.
+    const deadline = AbortSignal.timeout(this.#deadlineMs);
 
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const res = await fetch(`${this.#baseUrl}/chat/completions`, {
+          signal: deadline,
           method: "POST",
           headers: {
             ...this.#headers,
@@ -121,6 +144,14 @@ export class OpenAiCompatibleModel implements ModelAdapter {
           },
         };
       } catch (err) {
+        // Thrown rather than retried here: no time is left to retry in. It fails the call the way an
+        // exhausted run of 5xx does, so the queue redelivers it, and the message says which bound
+        // ended it — a bare AbortError would read as a cancel, which nothing on this path issues.
+        if (deadline.aborted) {
+          throw new Error(
+            `model call timed out: no complete response within the ${this.#deadlineMs / 1000} s total deadline` +
+            (lastErr ? ` (last error before it: ${lastErr.message})` : ""));
+        }
         lastErr = err as Error;
         if (attempt === 2) break;
         await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
