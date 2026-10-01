@@ -62,16 +62,19 @@ Write one program for:
 - anything that would otherwise put a large payload into this conversation
 
 For a single lookup, call the tool directly instead. Never wrap one plain call
-in run_js. And make a call that needs \`confirm: true\` directly, on its own:
-inside run_js it fails the program, while the request is still recorded, so
-approving it later runs that one call by itself.
+in run_js. A call that needs \`confirm: true\` inside run_js stops the program
+as paused: the result names the held call, the rest of the program does not
+run, and approving it later runs that one call by itself.
 
 Each run starts from nothing: globals, variables and anything you set on
 globalThis are gone by the next run, so carry what you need in your own output
 or in a tool that stores it.
 
 Inside run_js: every call returns { status, ... }. "succeeded" carries .result,
-"rejected" carries .error.code. run_js code has no fetch, require, fs or process —
+"rejected" carries .error.code. When a branch needs your judgement — an
+unexpected result, a choice that matters — call pause(reason, data) instead of
+guessing: the program ends there, and you get reason, data and the outputs so
+far, then decide what runs next. run_js code has no fetch, require, fs or process —
 the tool tag is its only way out. That is true of run_js alone: a container or
 shell that one of your tools runs commands in is a different machine, with its
 own runtime and network. console.log is not returned; only output() is.

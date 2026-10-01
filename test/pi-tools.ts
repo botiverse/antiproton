@@ -375,6 +375,98 @@ await check("run_js 里写错模型自己那套名字,答'没有这个工具'并
   if (dotted.seen.join() !== "state.gett") throw new Error(`a dotted name was intercepted: ${JSON.stringify(dotted)}`);
 });
 
+await check("run_js 里 pause(): 程序停在那一行,模型拿到的是正常结果(不是错误),带 reason/data/outputs/calls/note", async () => {
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const seen: string[] = [];
+  const runs: any[] = [];
+  const host = { async invoke(call: any) { seen.push(call.tool); return { status: "succeeded", operationId: `op${seen.length}`, result: { n: seen.length } }; } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools: qualifyMountedTools([named("get", "web.get")]), onRun: (r) => { runs.push(r); },
+  });
+  const out = await tool.execute("p1", { source:
+    "const a = await tool`web__get ${{}}`; output(a.result); " +
+    "try { pause('two results disagree', { seen: a.result.n }); } catch (e) { output('swallowed'); } " +
+    "await tool`web__get ${{}}`; output('after');" });
+  const body = JSON.parse(out.content[0].text);
+  if (body.paused !== true || body.reason !== "two results disagree") throw new Error(`not a pause: ${out.content[0].text}`);
+  if (JSON.stringify(body.data) !== '{"seen":1}') throw new Error(`data: ${JSON.stringify(body.data)}`);
+  if (JSON.stringify(body.outputs) !== '[{"n":1}]') throw new Error(`outputs so far: ${JSON.stringify(body.outputs)}`);
+  if (body.calls !== 1 || JSON.stringify(body.held) !== "[]") throw new Error(`calls/held: ${body.calls} ${JSON.stringify(body.held)}`);
+  if (seen.join() !== "web.get") throw new Error(`a call after pause was made: ${seen}`);
+  if (!/nothing after that line ran/.test(body.note) || !/new run starts from nothing/.test(body.note)) {
+    throw new Error(`the note does not say what to do next: ${body.note}`);
+  }
+  if (out.details?.paused !== true) throw new Error(`details: ${JSON.stringify(out.details)}`);
+  if (runs[0]?.ok !== true) throw new Error(`a pause was counted as a failed run: ${JSON.stringify(runs)}`);
+  // Data the sandbox cannot serialise is said, not thrown.
+  const bad = await tool.execute("p2", { source: "const o = {}; o.o = o; pause('loop', o);" });
+  const badBody = JSON.parse(bad.content[0].text);
+  if (badBody.paused !== true || badBody.data !== null || !/not JSON-serialisable/.test(badBody.dataError)) {
+    throw new Error(`non-serialisable data: ${bad.content[0].text}`);
+  }
+});
+
+await check("run_js 里 confirm: true 的调用被挂起: 程序以 paused 结束,held 里有这笔操作,后面的调用不发", async () => {
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  const seen: any[] = [];
+  // What the gateway answers for a call that needs a person (src/runtime/gateway.ts, verdict "approval").
+  const host = { async invoke(call: any) {
+    seen.push({ tool: call.tool, confirm: call.opts?.confirm ?? false, args: call.args });
+    return call.opts?.confirm
+      ? { status: "pending", operationId: "op_wait", error: { code: "awaiting_approval", message: "this call is held for approval" } }
+      : { status: "succeeded", operationId: `op${seen.length}`, result: {} };
+  } };
+  const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, {
+    tools: qualifyMountedTools([named("get", "web.get"), named("send", "web.send")]),
+  });
+  const out = await tool.execute("h1", { source:
+    "await tool`web__get ${{}}`; output('got'); " +
+    "await tool`web__send ${{ to: 'x', confirm: true }}`; " +
+    "output('sent'); await tool`web__get ${{ again: true }}`;" });
+  const body = JSON.parse(out.content[0].text);
+  if (body.paused !== true || body.reason !== "awaiting_approval") throw new Error(`not paused on the hold: ${out.content[0].text}`);
+  if (JSON.stringify(body.data) !== '{"tool":"web__send","operationId":"op_wait"}') throw new Error(`data: ${JSON.stringify(body.data)}`);
+  if (JSON.stringify(body.held) !== '[{"tool":"web__send","operationId":"op_wait","status":"pending"}]') {
+    throw new Error(`held: ${JSON.stringify(body.held)}`);
+  }
+  if (JSON.stringify(body.outputs) !== '["got"]' || body.calls !== 2) throw new Error(`outputs/calls: ${out.content[0].text}`);
+  if (seen.length !== 2 || seen[1].confirm !== true || "confirm" in seen[1].args) {
+    throw new Error(`the held call did not go as a confirm, or a call after it was made: ${JSON.stringify(seen)}`);
+  }
+  if (!/waiting for the person's approval/.test(body.note) || !/rest of your program did not run/.test(body.note)) {
+    throw new Error(`the note: ${body.note}`);
+  }
+  if (!(out.details?.operations ?? []).includes("op_wait")) throw new Error(`details.operations: ${JSON.stringify(out.details)}`);
+});
+
+await check("run_js 里被拒或失败的调用照旧: 不暂停,程序用坏结果时整段失败", async () => {
+  const { QuickJsExecutor } = await import("../src/runtime/executor.ts");
+  for (const answer of [
+    { status: "rejected", error: { code: "policy_denied", message: "denied" } },
+    { status: "failed", operationId: "op_f", error: { code: "boom", message: "boom" } },
+  ]) {
+    const seen: string[] = [];
+    const host = { async invoke(call: any) { seen.push(call.tool); return answer; } };
+    const tool: any = runJsTool(new QuickJsExecutor() as any, host as any, { tools: qualifyMountedTools([named("get", "web.get")]) });
+    let thrown: unknown = null;
+    try {
+      await tool.execute("f1", { source: "const r = await tool`web__get ${{}}`; output(r.status); output(r.result.x);" });
+    } catch (e) { thrown = e; }
+    if (!/^run_js failed/.test(String((thrown as Error)?.message))) throw new Error(`${answer.status}: not a failed run: ${String(thrown)}`);
+  }
+});
+
+await check("提示词: run_js 一节讲 pause(),且不再说 confirm 调用会让程序失败", async () => {
+  const { systemPrompt } = await import("../src/runtime/pi-prompt.ts");
+  const { RUN_JS_DESCRIPTION } = await import("../src/runtime/pi-tools.ts");
+  const p = systemPrompt({ sandbox: true });
+  if (!p.includes("pause(reason, data)")) throw new Error("the sandbox section does not describe pause");
+  if (p.includes("it fails the program")) throw new Error("the old sentence about confirm inside run_js is still there");
+  if (!/confirm: true\` inside run_js stops the program\s+as paused/.test(p)) throw new Error("the confirm sentence does not say it pauses");
+  if (!p.includes("Never wrap one plain call")) throw new Error("the plain-call rule went missing");
+  if (!RUN_JS_DESCRIPTION.includes("pause(")) throw new Error("the tool description does not mention pause");
+});
+
 await check("工具列表为空时,run_js 说'列表是空的',而不是暗示拼错了", async () => {
   // Every plugin switched off still leaves a working run_js with nothing to
   // call. "No tool named X" would read as a typo and invite another name, which
