@@ -321,9 +321,9 @@ export function liftConfirm(args: Json): { args: Json; confirm: boolean } {
 }
 
 export const RUN_JS_DESCRIPTION =
-  "Execute JavaScript in a sandbox to compose several tool calls, loop, filter, " +
-  "or project fields. Use it instead of many separate calls, or to avoid pulling " +
-  "a large payload into the conversation. Not for a single simple call.";
+  "Execute JavaScript in a sandbox that calls your tools. The default whenever more than one " +
+  "tool call is involved: chain calls, loop, filter or project fields in one program instead of " +
+  "separate calls, and output() only what you need. Not for a single simple call.";
 
 export function runJsTool(
   sandbox: Sandbox,

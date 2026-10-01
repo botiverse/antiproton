@@ -52,10 +52,14 @@ the same tools are reachable, under the same names your tool list gives them:
     const res = await tool\`TOOL_NAME \${ { ...arguments... } }\`;
     output(anything);            // what you want to see back
 
-Reach for run_js only when it earns its cost — it is a whole extra round trip:
-- several calls whose results feed each other, or a loop over pages
+Make run_js your default way to use tools whenever more than one call is involved.
+Each tool call you make directly is a round trip through this conversation; a
+run_js program makes all of them in one, and only what you output() comes back.
+Write one program for:
+- two or more calls, especially when a later one uses an earlier one's result,
+  and loops over pages or items
 - filtering, sorting, aggregating, or projecting fields out of a large result
-- anything that would otherwise dump a large payload into this conversation
+- anything that would otherwise put a large payload into this conversation
 
 For a single lookup, call the tool directly instead. Never wrap one plain call
 in run_js.
