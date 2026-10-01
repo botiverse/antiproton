@@ -64,7 +64,8 @@ Write one program for:
 For a single lookup, call the tool directly instead. Never wrap one plain call
 in run_js. A call that needs \`confirm: true\` inside run_js stops the program
 as paused: the result names the held call, the rest of the program does not
-run, and approving it later runs that one call by itself.
+run (there is no resume token for it), and approving it later runs that one
+call by itself.
 
 Each run starts from nothing: globals, variables and anything you set on
 globalThis are gone by the next run, so carry what you need in your own output
@@ -72,10 +73,25 @@ or in a tool that stores it.
 
 Inside run_js: every call returns { status, ... }. "succeeded" carries .result,
 "rejected" carries .error.code. When a branch needs your judgement — an
-unexpected result, a choice that matters — call pause(reason, data) instead of
-guessing: the program ends there, and you get reason, data and the outputs so
-far, then decide what runs next. run_js code has no fetch, require, fs or process —
-the tool tag is its only way out. That is true of run_js alone: a container or
+unexpected result, a choice that matters — ask instead of guessing:
+
+    const answer = await pause(question, data, expected);
+
+The program stops there and asks you: the result is "yielded", with the
+question, data, what ran so far and a token. Reply with the resume tool,
+resume(token, answer), within about a minute, and the program continues from
+that line with your answer as pause()'s value; its result comes back as the
+result of resume, and another pause gives another token. \`expected\` is
+optional and says what answer fits: { choices: ["a", "b"] }, { kind: "yes_no" },
+{ kind: "text" }, or { schema: {...} } (type, enum, required, properties and
+items are checked). An answer that does not fit is refused and the same token
+stays valid. resume with cancel: true ends the program instead. You may make
+other calls before you resume, and several programs can wait at once, each with
+its own token. If a continuation has expired (or the agent restarted), resume
+tells you so: then send a new run_js program, carrying what you need from the
+earlier data and outputs. Only you can call resume; a program cannot.
+
+run_js code has no fetch, require, fs or process — the tool tag is its only way out. That is true of run_js alone: a container or
 shell that one of your tools runs commands in is a different machine, with its
 own runtime and network. console.log is not returned; only output() is.
 The clock does not advance while code runs (it moves only when a tool call

@@ -235,6 +235,7 @@ export async function executorSpec(exec: JsExecutor, only?: (row: string) => boo
     eq(calls.map((c) => c.tool).join(","), "m.first", "the call after pause was never made");
     eq(r.hostCalls, 1, "one call counted");
     eq(r.error, undefined, "not reported as an error");
+    eq(r.continuation, undefined, "a pause the program never awaited ends it: nothing to resume");
   });
 
   test("暂停不可吞", "a try/catch around pause() does not swallow it: later outputs and calls are refused, the run is still paused", async () => {
@@ -304,6 +305,7 @@ export async function executorSpec(exec: JsExecutor, only?: (row: string) => boo
     eq(calls.map((c) => c.tool).join(","), "m.read,m.send", "the call after the held one was never made");
     eq(JSON.stringify(r.outputs), '["read"]', "nothing after the hold was output, caught or not");
     assert(r.acceptedOperationIds.includes("op_held"), "the held operation is among the accepted");
+    eq(r.continuation, undefined, "a hold is not resumable");
   });
 
   test("暂停于未等的调用", "a call the program did not await that comes back held after the program ended still pauses the run", async () => {
@@ -335,6 +337,91 @@ export async function executorSpec(exec: JsExecutor, only?: (row: string) => boo
     eq(JSON.stringify(r.outputs), '[["failed","rejected"]]', "both read as values");
     eq(calls.length, 3, "the program went on calling");
     eq(r.pause, undefined, "no pause");
+  });
+
+
+  // await pause(): the program waits in memory for the model's answer.
+  test("暂停续行", "an awaited pause suspends the program; resume makes the answer pause()'s value and the program goes on, to the next pause and to its end", async () => {
+    calls = [];
+    const r = await exec.execute(
+      `await tool\`m.first \${ {} }\`;
+       output("before");
+       const pick = await pause("which?", { options: ["a", "b"] });
+       output({ picked: pick });
+       await tool\`m.second \${ { pick } }\`;
+       const again = await pause("sure?");
+       output({ again });
+       return 1;`,
+      host(),
+    );
+    eq(r.status, "paused", "paused");
+    assert(r.continuation, "an awaited pause can be resumed");
+    eq(r.pause?.reason, "which?", "reason");
+    eq(JSON.stringify(r.outputs), '["before"]', "outputs so far");
+    eq(r.hostCalls, 1, "one call so far");
+    const r2 = await r.continuation!.resume("b");
+    eq(r2.status, "paused", "the second pause");
+    eq(r2.pause?.reason, "sure?", "its own reason");
+    assert(r2.continuation && r2.continuation !== r.continuation, "a new continuation");
+    eq(JSON.stringify(r2.outputs), '["before",{"picked":"b"}]', "the answer was pause()'s return value; outputs are the whole program's");
+    eq(calls.map((c) => c.tool).join(","), "m.first,m.second", "the program went on calling after the resume");
+    eq(JSON.stringify(calls[1]!.args), '{"pick":"b"}', "with the answer");
+    eq(r2.hostCalls, 2, "calls counted across the stops");
+    let reused: unknown = null;
+    try { await r.continuation!.resume("again"); } catch (e) { reused = e; }
+    assert(reused, "a continuation is used once");
+    const r3 = await r2.continuation!.resume({ yes: true });
+    eq(r3.status, "completed", "ran to its end");
+    eq(r3.continuation, undefined, "nothing left to resume");
+    eq(JSON.stringify(r3.outputs.at(-1)), '{"again":{"yes":true}}', "the second answer too");
+  });
+
+  test("暂停取消", "cancel ends a suspended program: its pause rejects, a try/catch cannot keep it going, the outputs so far come back", async () => {
+    calls = [];
+    const r = await exec.execute(
+      `output("before");
+       try { await pause("go on?"); } catch (e) { output("caught " + e.name); }
+       await tool\`m.after \${ {} }\`.catch(() => {});
+       output("after");
+       return 1;`,
+      host(),
+    );
+    assert(r.continuation, "suspended");
+    const c = await r.continuation!.cancel();
+    eq(c.status, "interrupted", "ended, not completed");
+    eq(c.error?.code, "cancelled", "by the cancel");
+    eq(JSON.stringify(c.outputs), '["before"]', "outputs so far, nothing after the pause");
+    eq(calls.length, 0, "no call after the pause reached the host");
+    eq(c.continuation, undefined, "nothing to resume");
+  });
+
+  test("暂停后的挂起", "a call still out when the program awaits its pause that comes back held ends the run as a hold: no continuation", async () => {
+    calls = [];
+    const gate = host(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return { status: "pending", operationId: "op_late", error: { code: "awaiting_approval", message: "held" } } as any;
+    });
+    const r = await exec.execute(`tool\`m.send \${ {} }\`.catch(() => {}); output("x"); await pause("wait");`, gate);
+    eq(r.status, "paused", "paused");
+    eq(r.continuation, undefined, "not resumable once a call is held");
+    eq(JSON.stringify(r.held), '[{"tool":"m.send","operationId":"op_late","status":"pending"}]', "held lists it");
+    // Held between the pause() and its await: the program has not suspended yet when the hold lands.
+    const between = await exec.execute(
+      `const t = tool\`m.send \${ {} }\`.catch(() => {}); const p = pause("wait"); await t; output("y"); await p;`, gate);
+    eq(between.status, "paused", "paused");
+    eq(between.continuation, undefined, "not resumable once a call is held, however the two interleave");
+  });
+
+  test("暂停不计时", "time suspended at a pause is not taken from the program's wall-time budget", async () => {
+    // The loop after the resume is there so the engine checks its budget at all.
+    const r = await exec.execute(
+      `const a = await pause("p"); let x = 0; for (let i = 0; i < 100000; i++) x += i; output(a);`,
+      host(), { ...DEFAULT_LIMITS, wallTimeMs: 200 });
+    assert(r.continuation, "suspended");
+    await new Promise((res) => setTimeout(res, 400));
+    const r2 = await r.continuation!.resume("late");
+    eq(r2.status, "completed", `completed after a suspension longer than the budget (${JSON.stringify(r2.error ?? null)})`);
+    eq(JSON.stringify(r2.outputs), '["late"]', "with the answer");
   });
 
   const results: SpecResult[] = [];

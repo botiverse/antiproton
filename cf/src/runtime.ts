@@ -21,7 +21,7 @@ import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, runJsTool, type MountedTool,
+  bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, runJsTools, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -64,6 +64,7 @@ export function personaOf(config: unknown): { name?: string; description?: strin
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { HookDirectory } from "./control-plane.ts";
 import { jsRunRows } from "../../src/usage/outbox.ts";
+import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
@@ -461,6 +462,17 @@ export interface RuntimeDeps {
    * before the release the agent is told; `maxMs` is idle time before release.
    */
   idle?: { warnMs: number; maxMs: number };
+  /**
+   * How long a run_js program waiting at `await pause(...)` is kept for the
+   * model's `resume` (src/runtime/run-js-resume.ts). Unset: RUN_JS_RESUME_MS.
+   */
+  runJsResumeMs?: number;
+  /**
+   * Asked to wake the object by `at`, because a run_js program is suspended in
+   * its memory and the object must not be evicted under it. Never later than
+   * a wake already set: it only ever brings the alarm forward.
+   */
+  keepAlive?: (at: number) => void | Promise<void>;
 }
 
 /**
@@ -648,6 +660,8 @@ export class AgentRuntime {
   // first one's transcript, and cached so a wake does not rebuild them all.
   #agents = new Map<string, { agent: PiAgent; builtFrom: string }>();
   #executor: DynamicWorkerExecutor;
+  /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
+  #continuations: RunJsContinuations;
   #models: ModelResolver;
   #artifacts: BoundArtifacts;
   #ready = false;
@@ -698,6 +712,10 @@ export class AgentRuntime {
       loader: deps.loader,
       makeToolBinding: deps.makeToolBinding,
     });
+    this.#continuations = new RunJsContinuations({
+      ttlMs: deps.runJsResumeMs,
+      onHold: (at) => { void Promise.resolve(deps.keepAlive?.(at)).catch(() => {}); },
+    });
     // Credentials come from the same resolver mounts use, so a model key is
     // dereferenced server-side and never travels with the binding.
     // A binding on the operator's reference is called the way the queued call is (operatorRequest):
@@ -706,6 +724,9 @@ export class AgentRuntime {
     this.#models = new ModelResolver(this.store, envSecrets,
       op ? { ref: OPERATOR_SECRET_REF, request: (b) => operatorRequest({ ...op, baseUrl: b.baseUrl }, b.model) } : undefined);
   }
+
+  /** The run_js programs suspended in this object's memory: what keeps it awake (step). */
+  get runJsContinuations(): RunJsContinuations { return this.#continuations; }
 
   // ---- inbound events: a service pushes at a mount's hook (src/runtime/inbound.ts).
 
@@ -1621,7 +1642,7 @@ export class AgentRuntime {
         (id) => !!backgroundOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
       ),
     });
-    const taken = new Set([...offered.map((t) => t.name), "run_js", "jobs"]);
+    const taken = new Set([...offered.map((t) => t.name), "run_js", "resume", "jobs"]);
     const callerTools = Array.isArray(apiTools)
       ? clientTools(
           apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
@@ -1630,19 +1651,25 @@ export class AgentRuntime {
           { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
             branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
       : [];
+    const counting = {
+      onCalls: (n: number) => { void store.consumeQuota(tenantId, "tool_calls", n); },
+      onRun: (run: { ok: boolean; ms: number; hostCalls: number; resumed?: boolean }) => store.recordUsage?.(jsRunRows(
+        { at: Date.now() - run.ms, tenantId, agentId }, run.ok ? "ok" : "failed", run.ms, run.hostCalls, run.resumed === true,
+      )),
+    };
     const extraTools = [
       ...(extras.runJs
-        ? [runJsTool(this.#executor as any, host, {
-            onCalls: (n) => { void store.consumeQuota(tenantId, "tool_calls", n); },
-            onRun: (run) => store.recordUsage?.(jsRunRows(
-              { at: Date.now() - run.ms, tenantId, agentId }, run.ok ? "ok" : "failed", run.ms, run.hostCalls,
-            )),
+        // resume is offered only beside run_js: it answers nothing else.
+        ? runJsTools(this.#executor as any, host, {
+            ...counting,
             // So a script names a tool the way the model's own list names it.
             tools: offered,
             // So a stale name for a mount that cannot be offered is answered with
             // the reason, not as a typo.
             unoffered,
-          })]
+            continuations: this.#continuations,
+            scope: session,
+          })
         : []),
       ...(extras.jobs ? [jobs] : []),
       ...callerTools,
@@ -1843,7 +1870,12 @@ export class AgentRuntime {
     // its containers: releasing now would take the machine out from under the
     // job, which is the normal case, since the model keeps working (task #16).
     const backgroundRunning = runningBackgroundJobs(sql, owner).length > 0;
-    if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning) {
+    // A program suspended at a pause keeps the object awake (and is discarded
+    // here once past its time), and, like background work, has not finished
+    // with the containers it was using.
+    const keep = this.#continuations.wakeInMs();
+    if (keep !== null) wakeInMs = wakeInMs === null ? keep : Math.min(wakeInMs, keep);
+    if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
       if (!this.#deps.idle) {
         if (settled.length) {
           const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });

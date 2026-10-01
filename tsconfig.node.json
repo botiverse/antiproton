@@ -78,6 +78,7 @@
     "test/control-plane.ts",
     "test/spec/control-plane-spec.ts",
     "test/spec/usage-spec.ts",
-    "test/mount-reports.ts"
+    "test/mount-reports.ts",
+    "test/run-js-resume.ts"
   ]
 }

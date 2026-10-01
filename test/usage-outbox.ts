@@ -126,6 +126,9 @@ await check("every run_js is counted, however it ends, and a counting failure do
   must(seen.map((r) => `${r.ok}/${r.hostCalls}`).join(",") === "true/2,false/2,false/0", JSON.stringify(seen));
   must(describe(jsRunRows(base, "ok", 12.6, 2)) === "js.run/run_js/13ms js.run/run_js/1runs js.run/run_js/2tool_calls", describe(jsRunRows(base, "ok", 12.6, 2)));
   must(describe(jsRunRows(base, "failed", 1, 0)) === "js.run/run_js/0tool_calls js.run/run_js/1failed js.run/run_js/1ms js.run/run_js/1runs", describe(jsRunRows(base, "failed", 1, 0)));
+  // A stretch after `resume` is the same run going on: no second `runs` row.
+  must(describe(jsRunRows(base, "ok", 5, 1, true)) === "js.run/run_js/1tool_calls js.run/run_js/5ms", describe(jsRunRows(base, "ok", 5, 1, true)));
+  must(describe(jsRunRows(base, "failed", 5, 0, true)) === "js.run/run_js/0tool_calls js.run/run_js/1failed js.run/run_js/5ms", describe(jsRunRows(base, "failed", 5, 0, true)));
   must(describe(toolCallRows(base, "p.t", "failed", 3)) === "tool.call/p.t/1calls tool.call/p.t/1failed tool.call/p.t/3ms", "tool rows");
   must(describe(toolCallRows(base, "p.t", "ok", 3)) === "tool.call/p.t/1calls tool.call/p.t/3ms", "ok tool rows");
 });

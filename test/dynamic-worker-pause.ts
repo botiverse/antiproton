@@ -11,7 +11,7 @@
  * (a runaway loop would hang node; node has a network) and run on a deployment
  * (bench/cf-conformance.mjs).
  */
-import { DynamicWorkerExecutor, handleSandboxCall } from "../src/runtime/dynamic-worker-executor.ts";
+import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend } from "../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "./spec/executor-spec.ts";
 
 const exec = new DynamicWorkerExecutor({
@@ -28,6 +28,7 @@ const exec = new DynamicWorkerExecutor({
   },
   makeToolBinding: (execId) => ({
     invoke: (strings: string[], values: unknown[]) => handleSandboxCall(execId, strings, values),
+    suspend: (req: any) => handleSandboxSuspend(execId, req),
   }),
 });
 
@@ -67,7 +68,29 @@ await check("after a hold the supervisor refuses further calls itself, whatever 
   }
 });
 
-const PAUSE_ROWS = new Set(["暂停", "暂停不可吞", "暂停数据", "暂停于审批", "暂停于未等的调用", "其它状态照旧", "统一入口", "单一通道"]);
+await check("the supervisor keeps one suspension per execution: a second suspend while one waits ends at once, and the first still waits", async () => {
+  const { executions } = await import("../src/runtime/dynamic-worker-executor.ts");
+  const { DEFAULT_LIMITS } = await import("../src/core/execution.ts");
+  const state: any = { host: okHost, limits: DEFAULT_LIMITS, hostCalls: 0, inFlight: 0, accepted: [], aborted: false, pending: new Set() };
+  executions.set("exec-twice", state);
+  try {
+    const req = { reason: "r", json: "null", problem: null, bytes: 0, outputs: [] };
+    let firstSettled = false;
+    const first = handleSandboxSuspend("exec-twice", req).then((a) => { firstSettled = true; return a; });
+    const second = await handleSandboxSuspend("exec-twice", { ...req, reason: "again" });
+    if (JSON.stringify(second) !== '{"end":"stop"}') throw new Error(`second: ${JSON.stringify(second)}`);
+    await new Promise((r) => setTimeout(r, 5));
+    if (firstSettled || state.suspended?.pause.reason !== "r") throw new Error("the first suspension was replaced or ended");
+    state.suspended.resolve({ answer: 1 });
+    if (JSON.stringify(await first) !== '{"answer":1}') throw new Error("the first did not get its answer");
+  } finally {
+    executions.delete("exec-twice");
+  }
+});
+
+// Not 暂停不计时: node does not enforce the Worker's cpuMs, so it would pass here whatever the code did.
+const PAUSE_ROWS = new Set(["暂停", "暂停不可吞", "暂停数据", "暂停于审批", "暂停于未等的调用", "其它状态照旧", "统一入口", "单一通道",
+  "暂停续行", "暂停取消", "暂停后的挂起"]);
 const results = await executorSpec(exec, (row) => PAUSE_ROWS.has(row));
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.row} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 for (const r of extra) console.log(`${r.ok ? "ok " : "FAIL"} ${r.row} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

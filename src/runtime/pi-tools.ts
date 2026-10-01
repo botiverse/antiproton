@@ -20,7 +20,8 @@
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
 import type { Json } from "../core/types.ts";
-import type { HeldCall, Paused } from "../core/execution.ts";
+import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
+import { answerProblem, answerSpecOf, type AnswerSpec, type RunJsContinuations } from "./run-js-resume.ts";
 
 /** What the model is offered, and the mount-qualified address behind it. */
 export interface MountedTool {
@@ -299,6 +300,8 @@ export interface Sandbox {
     acceptedOperationIds?: string[];
     pause?: Paused;
     held?: HeldCall[];
+    /** A program waiting at `await pause(...)`, resumable (core/execution.ts). */
+    continuation?: Continuation;
   }>;
 }
 
@@ -327,20 +330,46 @@ export const RUN_JS_DESCRIPTION =
   "Execute JavaScript in a sandbox that calls your tools. The default whenever more than one " +
   "tool call is involved: chain calls, loop, filter or project fields in one program instead of " +
   "separate calls, and output() only what you need. Not for a single simple call. " +
-  "Call pause(reason, data) where the program needs your judgement: it stops there and you get " +
-  "the outputs so far.";
+  "Where the program needs your judgement, `const answer = await pause(question, data, expected?)`: " +
+  "it stops there and asks you (state \"yielded\", with a token and what it did so far); call " +
+  "resume(token, answer) within about a minute and the program continues from that line with your answer.";
+
+export const RESUME_DESCRIPTION =
+  "Continue a run_js program that is waiting at `await pause(...)` (a \"yielded\" result). Give the " +
+  "token and your answer: the answer becomes pause()'s return value and the program goes on from " +
+  "that line, and you get its result as run_js would give it (another pause gives another token). " +
+  "If the yielded result names an expected `answer` (choices, yes_no, text or a schema) your answer " +
+  "must fit it; one that does not is refused with invalidAnswer and the same token stays valid. " +
+  "cancel: true ends the program instead and returns its outputs. Several programs can be waiting " +
+  "at once, each with its own token. A token lasts about a minute; if it expired or the agent " +
+  "restarted you are told so, and you send a new run_js program. Only you can call this: a program " +
+  "cannot resume another.";
+
+/** What `resume` answers for a token it cannot find: never an error, because a new program is always a way on. */
+export const EXPIRED_NOTE =
+  "this continuation is gone (expired or the agent restarted); send a new run_js program, " +
+  "carrying what you need from the earlier data/outputs";
 
 /**
  * What the model is told when a run stops paused. Not an error: the program
  * did what it was asked, or a call is waiting on a person, and either way the
- * next move is the model's.
+ * next move is the model's. `resumable` is the program waiting in memory for
+ * `resume`; otherwise it has ended.
  */
-export function pausedNote(p: Paused, held: readonly HeldCall[]): string {
+export function pausedNote(p: Paused, held: readonly HeldCall[], resumable = false): string {
   const rest = "Calls made before that point completed and are not undone.";
   if (p.cause === "hold") {
     return "This call is waiting for the person's approval; if they approve it, it runs on its own exactly " +
-      "as written. The rest of your program did not run. " + rest + " Decide whether to continue without " +
-      "it, wait, or tell the person.";
+      "as written. The rest of your program did not run, and there is nothing to resume: a held call " +
+      "ends the program. " + rest + " Decide whether to continue without it, wait, or tell the person.";
+  }
+  if (resumable) {
+    return "The program is waiting at your pause(); nothing after that line has run yet. " + rest +
+      " Think (other calls in between are fine), then call resume with this token within about a minute: " +
+      "your answer becomes pause()'s return value and the program continues from that line. Where the " +
+      "result has `answer`, give one that fits it; one that does not is refused and the token stays valid. " +
+      "resume with cancel: true ends it. If the continuation has expired you will be told so; then send a " +
+      "new run_js program, carrying what you need from data and soFar.";
   }
   const also = held.length
     ? ` ${held.length === 1 ? "A call is" : `${held.length} calls are`} also waiting for the person's approval ` +
@@ -351,14 +380,245 @@ export function pausedNote(p: Paused, held: readonly HeldCall[]): string {
     "because a new run starts from nothing." + also;
 }
 
+type RunResult = Awaited<ReturnType<Sandbox["execute"]>>;
+
+/** Usage callbacks shared by run_js and resume: one program's stretches are counted as they run. */
+interface RunCounting {
+  onCalls?: (n: number) => void | Promise<void>;
+  /** Every stretch of a program, however it ended: for the usage count. `resumed` is a
+   *  stretch after a resume, which is not a new run. A failure here does not fail the run. */
+  onRun?: (run: { ok: boolean; ms: number; hostCalls: number; resumed?: boolean }) => void | Promise<void>;
+}
+
+/**
+ * One stretch of a program, as the model receives it: from run_js, or from a
+ * resume. The two answer in one shape, so a resumed program reads exactly like
+ * a run — a pause, the outputs, or a failure.
+ */
+async function deliverRun(r: RunResult, o: {
+  label: "run_js" | "resume";
+  callId: string;
+  started: number;
+  /** Counts at the start of this stretch: a resumed program's results are cumulative. */
+  before: { hostCalls: number; operations: number };
+  counting: RunCounting;
+  continuations?: RunJsContinuations;
+  scope: string;
+  cancelling?: boolean;
+}) {
+  const hostCalls = r.hostCalls ?? 0;
+  const operations = r.acceptedOperationIds ?? [];
+  const newCalls = Math.max(0, hostCalls - o.before.hostCalls);
+  const resumed = o.label === "resume";
+  try {
+    // A paused or cancelled run did what it was asked, so it counts as one that went well.
+    const ok = r.status === "completed" || r.status === "paused" || (o.cancelling === true && r.status === "interrupted");
+    await o.counting.onRun?.({ ok, ms: Date.now() - o.started, hostCalls: newCalls, ...(resumed ? { resumed } : {}) });
+  } catch { /* the count is lost, the run is not */ }
+  await o.counting.onCalls?.(newCalls);
+  const details = {
+    hostCalls, operations: resumed ? operations.slice(o.before.operations) : operations,
+    ...(resumed ? { callId: o.callId } : {}),
+  };
+  if (r.status === "paused" && r.pause) {
+    const held = r.held ?? [];
+    if (r.continuation && o.continuations) {
+      // What the program said it expects back, understood once here and kept
+      // with the continuation, so resume checks the answer against the same thing.
+      const asked = r.pause.answer !== undefined ? answerSpecOf(r.pause.answer) : null;
+      const spec = asked && "spec" in asked ? asked.spec : undefined;
+      const specError = r.pause.answerError ?? (asked && "error" in asked ? asked.error : undefined);
+      const h = o.continuations.hold({
+        continuation: r.continuation, scope: o.scope, callId: o.callId,
+        hostCalls, operations: operations.length, question: r.pause.reason, ...(spec ? { answer: spec } : {}),
+      });
+      const answer = yielded({
+        question: r.pause.reason, token: h.token, expiresAt: h.expiresAt, answer: spec,
+        extra: {
+          data: r.pause.data,
+          ...(r.pause.dataError ? { dataError: r.pause.dataError } : {}),
+          ...(specError ? { answerError: specError } : {}),
+          // Under soFar only: the outputs are the bulk of a result, and once is enough.
+          soFar: { outputs: r.outputs ?? [], calls: hostCalls },
+          held,
+        },
+        note: pausedNote(r.pause, held, true),
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(answer) }],
+        details: { ...details, paused: true, held, resumable: true },
+      };
+    }
+    if (r.continuation) {
+      // Nowhere to keep it: end it now, so it ends the way a pause did before.
+      try { await r.continuation.cancel(); } catch { /* ended already */ }
+    }
+    const answer = {
+      paused: true,
+      reason: r.pause.reason,
+      data: r.pause.data,
+      ...(r.pause.dataError ? { dataError: r.pause.dataError } : {}),
+      outputs: r.outputs ?? [],
+      calls: hostCalls,
+      held,
+      note: pausedNote(r.pause, held),
+    };
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(answer) }],
+      details: { ...details, paused: true, held },
+    };
+  }
+  if (o.cancelling && r.status === "interrupted" && (r.error as { code?: string } | undefined)?.code === "cancelled") {
+    const answer = {
+      cancelled: true,
+      outputs: r.outputs ?? [],
+      calls: hostCalls,
+      held: r.held ?? [],
+      note: "The program was ended at its pause(); nothing after that line ran. Calls made before it completed and are not undone.",
+    };
+    return { content: [{ type: "text" as const, text: JSON.stringify(answer) }], details: { ...details, cancelled: true } };
+  }
+  // "completed" is the whole of success here. Both executors return it
+  // (executor.ts, dynamic-worker-executor.ts); "failed" and "interrupted"
+  // are the other two, and each carries its reason.
+  if (r.status !== "completed") {
+    throw new Error(`${o.label} ${r.status}: ${JSON.stringify(r.error ?? null).slice(0, 300)}`);
+  }
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(r.outputs ?? []) }],
+    details,
+  };
+}
+
+/**
+ * A program waiting for the model, in one shape wherever it is reported: from
+ * run_js, from resume when it pauses again, and from resume refusing an answer
+ * that does not fit. `state: "yielded"` is the word; `paused: true` stays for
+ * whatever reads #644's shape.
+ */
+function yielded(o: {
+  question: string; token: string; expiresAt: number; answer?: AnswerSpec;
+  extra?: Record<string, unknown>; note: string;
+}) {
+  return {
+    state: "yielded" as const,
+    paused: true,
+    question: o.question,
+    ...(o.answer ? { answer: o.answer } : {}),
+    token: o.token,
+    expiresAt: new Date(o.expiresAt).toISOString(),
+    ...(o.extra ?? {}),
+    note: o.note,
+  };
+}
+
+/**
+ * run_js and resume, built together so they share one registry and one scope:
+ * built apart, a resume tool given another session's scope (or none) answers
+ * every token from this one as expired, and nothing else would notice.
+ */
+export function runJsTools(
+  sandbox: Sandbox,
+  host: ToolHost,
+  opts: Parameters<typeof runJsTool>[2] & { continuations: RunJsContinuations; scope: string },
+): [AgentHarnessTool<undefined>, AgentHarnessTool<undefined>] {
+  return [
+    runJsTool(sandbox, host, opts),
+    resumeTool(opts.continuations, { onRun: opts.onRun, onCalls: opts.onCalls, scope: opts.scope }),
+  ];
+}
+
+/**
+ * The model's way back into a program waiting at `await pause(...)`.
+ *
+ * Offered only beside run_js, and refused from inside a program (runJsTool's
+ * invoke): a pause asks the MODEL, so only the model may answer it. The
+ * program's later tool calls still go out through run_js's own host, under
+ * the run_js call's id and its `${toolCallId}:${n}` numbering, so a resumed
+ * program's idempotency keys go on from where it paused.
+ */
+export function resumeTool(
+  continuations: RunJsContinuations,
+  opts: RunCounting & { scope?: string } = {},
+): AgentHarnessTool<undefined> {
+  const scope = opts.scope ?? "";
+  return {
+    name: "resume",
+    label: "resume",
+    description: RESUME_DESCRIPTION,
+    parameters: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "The resume.token from a paused run_js (or resume) result." },
+        answer: { description: "Any JSON value: what the program's `await pause(...)` returns." },
+        cancel: { type: "boolean", description: "true ends the program instead of continuing it." },
+      },
+      required: ["token"],
+    } as any,
+    // A program is arbitrary, so a stretch whose outcome was lost must not be repeated.
+    replay: "never",
+    async execute(_toolCallId: string, params: { token?: unknown; answer?: Json; cancel?: unknown }) {
+      const token = typeof params?.token === "string" ? params.token : null;
+      const waiting = token === null ? null : continuations.peek(token, scope);
+      if (!waiting) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ expired: true, note: EXPIRED_NOTE }) }],
+          details: { expired: true },
+        };
+      }
+      const cancelling = params.cancel === true;
+      // Checked before the program sees it, and refused without spending the
+      // token: the program is still waiting, so the model can answer again.
+      const why = !cancelling && waiting.answer ? answerProblem(waiting.answer, params.answer) : null;
+      if (why !== null) {
+        const answer = yielded({
+          question: waiting.question ?? "", token: token!, expiresAt: waiting.expiresAt, answer: waiting.answer,
+          extra: { invalidAnswer: why },
+          note: "That answer does not fit what the program asked for, so it was not delivered. The program is " +
+            "still waiting at its pause(): call resume again with the same token and an answer that fits, or " +
+            "with cancel: true to end it.",
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(answer) }],
+          details: { callId: waiting.callId, invalidAnswer: true },
+        };
+      }
+      const s = continuations.take(token!, scope);
+      if (!s) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ expired: true, note: EXPIRED_NOTE }) }],
+          details: { expired: true },
+        };
+      }
+      const started = Date.now();
+      let r: RunResult;
+      try {
+        r = cancelling ? await s.continuation.cancel() : await s.continuation.resume(params.answer ?? null);
+      } catch (e) {
+        try { await opts.onRun?.({ ok: false, ms: Date.now() - started, hostCalls: 0, resumed: true }); } catch { /* lost count */ }
+        throw e;
+      }
+      return deliverRun(r, {
+        label: "resume", callId: s.callId, started, before: { hostCalls: s.hostCalls, operations: s.operations },
+        counting: opts, continuations, scope, cancelling,
+      });
+    },
+  } as AgentHarnessTool<undefined>;
+}
+
 export function runJsTool(
   sandbox: Sandbox,
   host: ToolHost,
   opts: {
     limits?: unknown;
-    onCalls?: (n: number) => void | Promise<void>;
+    onCalls?: RunCounting["onCalls"];
     /** Every run, however it ended: for the usage count. A failure here does not fail the run. */
-    onRun?: (run: { ok: boolean; ms: number; hostCalls: number }) => void | Promise<void>;
+    onRun?: RunCounting["onRun"];
+    /** Where a program waiting at `await pause(...)` is kept for `resume`. Absent: a
+     *  pause ends the program, as it did before pauses could be resumed. */
+    continuations?: RunJsContinuations;
+    /** The session this tool serves: a token is answered only in the session given it. */
+    scope?: string;
     /** The tools the model was offered, so a script may name them the way the
      *  model's own tool list names them. Without this the prompt asks for two
      *  different strings for one tool: `web__get` outside the sandbox, and the
@@ -411,7 +671,10 @@ export function runJsTool(
           type: "string",
           description: "JavaScript body. Use await tool`name ${args}` and output(value), " +
             "where `name` is the tool's name as it appears in your tool list. " +
-            "pause(reason, data) ends the program there and hands you reason, data and the outputs so far.",
+            "`const answer = await pause(question, data, expected?)` stops there and hands you the question, " +
+            "data, what ran so far and a token; resume(token, answer) continues the program from that line. " +
+            "`expected` is optional: { choices: [...] }, { kind: \"yes_no\" }, { kind: \"text\" } or " +
+            "{ schema: {...} } (type, enum, required, properties, items are checked).",
         },
       },
       required: ["source"],
@@ -437,6 +700,14 @@ export function runJsTool(
           // character slip in a long, truncated name read as a rule it had
           // broken (Piper, 2026-09-13). Dotted names still go on: the gateway
           // answers those as unknown_tool / not_mounted already.
+          // A pause asks the model, so only the model answers it: a program that
+          // could call resume could take the decision it was stopping to ask for.
+          if (call.tool === "resume") {
+            return Promise.resolve({
+              status: "rejected" as const,
+              error: { code: "not_from_a_program", message: "resume is yours to call, not a program's: a program cannot resume or cancel a paused run" },
+            });
+          }
           if (typeof call.tool === "string" && !call.tool.includes(".") && !byName.has(call.tool)) {
             // A mount that exists but cannot be offered: say why, in the gateway's
             // own words, rather than offer neighbours — the next move is a person
@@ -497,36 +768,10 @@ export function runJsTool(
         await countRun({ ok: false, ms: Date.now() - started, hostCalls: n });
         throw e;
       }
-      // A paused run did what it was asked, so it counts as one that went well.
-      await countRun({ ok: r.status === "completed" || r.status === "paused", ms: Date.now() - started, hostCalls: r.hostCalls ?? 0 });
-      await opts.onCalls?.(r.hostCalls ?? 0);
-      if (r.status === "paused" && r.pause) {
-        const held = r.held ?? [];
-        const answer = {
-          paused: true,
-          reason: r.pause.reason,
-          data: r.pause.data,
-          ...(r.pause.dataError ? { dataError: r.pause.dataError } : {}),
-          outputs: r.outputs ?? [],
-          calls: r.hostCalls ?? 0,
-          held,
-          note: pausedNote(r.pause, held),
-        };
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(answer) }],
-          details: { hostCalls: r.hostCalls, operations: r.acceptedOperationIds, paused: true, held },
-        };
-      }
-      // "completed" is the whole of success here. Both executors return it
-      // (executor.ts, dynamic-worker-executor.ts); "failed" and "interrupted"
-      // are the other two, and each carries its reason.
-      if (r.status !== "completed") {
-        throw new Error(`run_js ${r.status}: ${JSON.stringify(r.error ?? null).slice(0, 300)}`);
-      }
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(r.outputs ?? []) }],
-        details: { hostCalls: r.hostCalls, operations: r.acceptedOperationIds },
-      };
+      return deliverRun(r, {
+        label: "run_js", callId: toolCallId, started, before: { hostCalls: 0, operations: 0 },
+        counting: opts, continuations: opts.continuations, scope: opts.scope ?? "",
+      });
     },
   } as AgentHarnessTool<undefined>;
 }

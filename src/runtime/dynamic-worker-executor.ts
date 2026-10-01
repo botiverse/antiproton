@@ -1,8 +1,8 @@
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
-import { DEFAULT_LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
-import type { ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
+import { CANCELLED_NAME, DEFAULT_LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
+import type { Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export interface WorkerCode {
   compatibilityDate: string;
@@ -31,6 +31,31 @@ interface ExecutionState {
   /** Calls that came back `pending`, and the first one, which pauses the run. */
   held?: HeldCall[];
   hold?: Paused;
+  /**
+   * The program waiting at `await pause(...)`: what it handed over, and the
+   * one way to answer the sandbox's pending `suspend` call.
+   */
+  suspended?: { pause: Paused; outputs: Json[]; resolve: (answer: SuspendAnswer) => void };
+  /** Whoever is waiting to hear that the program suspended (the supervisor). */
+  onSuspend?: () => void;
+  /** Set by cancel: calls are refused and the run is reported cancelled however it ends. */
+  cancelled?: boolean;
+}
+
+/** How the sandbox's `await pause(...)` settles: the model's answer, or an end. */
+export type SuspendAnswer = { answer: Json } | { end: "stop" | "cancel" };
+
+/** What the sandbox hands over when its program waits at a pause. */
+export interface SuspendRequest {
+  reason: string;
+  json: string | null;
+  problem: string | null;
+  /** Output room already used when pause() was called, for the data's share of the cap. */
+  bytes: number;
+  /** Everything output so far: the supervisor cannot read the sandbox's. */
+  outputs: Json[];
+  /** pause()'s third argument as JSON text (PAUSE_FACTORY), or null. */
+  answer?: string | null;
 }
 
 /**
@@ -50,9 +75,14 @@ export async function handleSandboxCall(
   if (!state) {
     return { status: "rejected", error: { code: "execution_gone", message: "no such execution" } };
   }
-  if (state.aborted) {
+  if (state.aborted || state.cancelled) {
     // §6.3: after cancellation the gateway refuses new calls.
     return { status: "rejected", error: { code: "execution_cancelled", message: "execution cancelled" } };
+  }
+  if (state.suspended) {
+    // Only a program that did not await its own pause can still call: refused,
+    // as every call after a pause is.
+    return { status: "rejected", error: { code: "execution_paused", message: `run_js paused: ${state.suspended.pause.reason}` } };
   }
   if (state.hold) {
     // Decided here, not in the sandbox: a program that caught the pause and
@@ -101,6 +131,31 @@ export async function handleSandboxCall(
   return p;
 }
 
+/**
+ * Called when the sandbox's program awaits its pause (the runner's `wait`).
+ * Settles when the model resumes or cancels it — or at once with an end, when
+ * nobody will ever answer: no such execution, or one the supervisor has
+ * already given up on (aborted, and only waiting for its calls to settle).
+ * A hold is not refused here: the supervisor decides that where it reports
+ * the suspension (`untilStop`), after the calls still out have settled, which
+ * covers a hold landing before this call as well as after it. The pending
+ * call is what keeps the program alive: its await is this promise, and
+ * nothing in the sandbox runs until it settles.
+ */
+export async function handleSandboxSuspend(execId: string, req: SuspendRequest): Promise<SuspendAnswer> {
+  const state = executions.get(execId);
+  if (!state || state.aborted || state.suspended) return { end: "stop" };
+  const room = state.limits.maxOutputBytes - (Number(req.bytes) || 0);
+  return new Promise<SuspendAnswer>((resolve) => {
+    state.suspended = {
+      pause: pauseFrom(String(req.reason), req.json, req.problem, room, req.answer ?? null),
+      outputs: Array.isArray(req.outputs) ? req.outputs : [],
+      resolve,
+    };
+    state.onSuspend?.();
+  });
+}
+
 const RUNNER = (source: string, maxOutputBytes: number) => `
 // The program is a module-level function, so it sees its three globals and
 // nothing of fetch's scope: not env (it could call TOOLS around the tool tag),
@@ -109,7 +164,7 @@ function makeBox(TOOLS) {
   const outputs = [];
   let bytes = 0;
   // { kind: "hold" } once a call came back held (the supervisor has its
-  // details), or { kind: "pause", reason, json, problem, bytes } from pause().
+  // details), or { kind: "pause", reason, json, problem, bytes, answer } from pause().
   let paused = null;
   const stop = () => {
     const e = new Error("run_js paused" + (paused && paused.kind === "pause" ? ": " + paused.reason : ""));
@@ -142,12 +197,33 @@ function makeBox(TOOLS) {
     // A call the program never awaited would leave the stop unhandled once the
     // program has ended; the run's result already says it paused. Any other
     // rejection is left exactly as unhandled as it was.
-    p.catch((e) => { if (!(e && e.name === "RunJsPaused")) throw e; });
+    p.catch((e) => { if (!(e && (e.name === "RunJsPaused" || e.name === "${CANCELLED_NAME}"))) throw e; });
     return p;
   };
-  const pause = (${PAUSE_FACTORY})((reason, json, problem) => {
-    if (!paused) paused = { kind: "pause", reason, json, problem, bytes };
-  });
+  const cancelled = () => {
+    const e = new Error("run_js cancelled at pause()");
+    e.name = "${CANCELLED_NAME}";
+    return e;
+  };
+  const pause = (${PAUSE_FACTORY})(
+    (reason, json, problem, answer) => {
+      if (paused) return false;
+      paused = { kind: "pause", reason, json, problem, bytes, answer };
+      return true;
+    },
+    // The program is awaiting its pause: hand the supervisor what it needs and
+    // wait for the model. An answer clears the pause here (the supervisor has
+    // cleared its own); an end leaves it set, so nothing after it counts.
+    () => {
+      const p = paused;
+      if (!p || p.kind !== "pause") return Promise.reject(stop());
+      return TOOLS.suspend({ reason: p.reason, json: p.json, problem: p.problem, bytes: p.bytes, answer: p.answer, outputs: outputs.slice() })
+        .then((res) => {
+          if (res && "answer" in res && paused === p) { paused = null; return res.answer; }
+          throw res && res.end === "cancel" ? cancelled() : stop();
+        });
+    },
+  );
   const answer = (ok, error) => Response.json(
     { ok, outputs, ...(paused && paused.kind === "pause" ? { pause: paused } : {}), ...(error ? { error } : {}) },
   );
@@ -225,6 +301,10 @@ export class DynamicWorkerExecutor implements JsExecutor {
       // host work settle before answering.
       await Promise.allSettled([...state.pending]);
       executions.delete(execId);
+      // A cancel decides the result however the program then ended.
+      if (state.cancelled && r.status !== "interrupted") {
+        r = { status: "interrupted", outputs: r.outputs, error: { code: "cancelled", message: "cancelled at pause()" } };
+      }
       // A call that came back held after the program ended still waits on a person.
       const late = state.hold && (r.status === "completed" || r.status === "failed")
         ? { status: "paused" as const, pause: state.hold, error: undefined }
@@ -232,67 +312,9 @@ export class DynamicWorkerExecutor implements JsExecutor {
       return { ...r, ...late, acceptedOperationIds: state.accepted, hostCalls: state.hostCalls, held: state.held ?? [] };
     };
 
-    try {
-      const stub = this.#loader.load({
-        compatibilityDate: this.#compatibilityDate,
-        mainModule: "main.js",
-        modules: { "main.js": RUNNER(source, limits.maxOutputBytes) },
-        globalOutbound: null,
-        env: { TOOLS: this.#makeToolBinding(execId) },
-        limits: {
-          cpuMs: limits.wallTimeMs,
-          // A hard backstop only: the per-call budget is refused in-band above so
-          // the script can see why, rather than being killed without a reason.
-          subRequests: Math.max(limits.maxHostCalls * 2, 16),
-        },
-      });
-
-      const running = stub.getEntrypoint().fetch(new Request("https://sandbox/"));
-      const aborted = new Promise<"aborted">((res) => {
-        if (!signal) return;
-        if (signal.aborted) res("aborted");
-        else signal.addEventListener("abort", () => res("aborted"), { once: true });
-      });
-      let settled: Response | "aborted";
-      try {
-        settled = await Promise.race([running, aborted]);
-      } catch (err) {
-        // Only the load can fail because of the script: a module that does not
-        // parse is rejected here. Reading the answer below is ours, and a
-        // SyntaxError from parsing it is not the script's (Vera, #341).
-        if (isCompileError(err)) {
-          return finish({ status: "failed", outputs: [], error: { code: "eval_error", message: String((err as Error)?.message ?? err) } });
-        }
-        throw err;
-      }
-
-      if (settled === "aborted") {
-        state.aborted = true;
-        return finish({
-          status: "interrupted",
-          outputs: [],
-          error: { code: "cancelled", message: "execution cancelled" },
-        });
-      }
-
-      const body = (await (settled as Response).json()) as {
-        ok: boolean; outputs: Json[]; error?: { code: string; message: string };
-        pause?: { reason: string; json: string | null; problem: string | null; bytes: number };
-      };
-      const asked = body.pause
-        ? pauseFrom(String(body.pause.reason), body.pause.json, body.pause.problem, limits.maxOutputBytes - (Number(body.pause.bytes) || 0))
-        : undefined;
-      return finish(
-        asked || state.hold
-          // A pause decides the result however the program ended (see PAUSE_FACTORY).
-          ? { status: "paused", outputs: body.outputs, pause: asked ?? state.hold }
-          : body.ok
-            ? { status: "completed", outputs: body.outputs }
-            : { status: "failed", outputs: body.outputs, error: body.error },
-      );
-    } catch (err) {
-      // A CPU or subrequest kill is not catchable inside the sandbox: it lands
-      // here, in the supervisor. Unwrapped, it takes down the whole request.
+    // A CPU or subrequest kill is not catchable inside the sandbox: it lands
+    // here, in the supervisor. Unwrapped, it takes down the whole request.
+    const killed = (err: unknown) => {
       const message = String((err as Error)?.message ?? err);
       const code = /CPU/i.test(message)
         ? "wall_time_exceeded"
@@ -301,6 +323,133 @@ export class DynamicWorkerExecutor implements JsExecutor {
           : "host_failure";
       state.aborted = true;
       return finish({ status: "interrupted", outputs: [], error: { code, message } });
+    };
+
+    let running: Promise<Response>;
+    try {
+      const stub = this.#loader.load({
+        compatibilityDate: this.#compatibilityDate,
+        mainModule: "main.js",
+        modules: { "main.js": RUNNER(source, limits.maxOutputBytes) },
+        globalOutbound: null,
+        env: { TOOLS: this.#makeToolBinding(execId) },
+        limits: {
+          // CPU, not wall clock: a program suspended at a pause spends none of
+          // it, so the time it waits for the model is not taken from its budget.
+          cpuMs: limits.wallTimeMs,
+          // A hard backstop only: the per-call budget is refused in-band above so
+          // the script can see why, rather than being killed without a reason.
+          subRequests: Math.max(limits.maxHostCalls * 2, 16),
+        },
+      });
+      running = stub.getEntrypoint().fetch(new Request("https://sandbox/"));
+    } catch (err) {
+      return killed(err);
     }
+    // Read once, however many times a resumed program is waited on.
+    running.catch(() => {});
+    // Only the first stretch has a signal: a resumed program is the continuation holder's.
+    const aborted = new Promise<"aborted">((res) => {
+      if (!signal) return;
+      if (signal.aborted) res("aborted");
+      else signal.addEventListener("abort", () => res("aborted"), { once: true });
+    });
+
+    // Waits for the program to end or to wait at a pause, whichever is first.
+    const untilStop = async (first: boolean): Promise<ExecutionResult> => {
+      try {
+        const suspended = new Promise<"suspended">((res) => {
+          state.onSuspend = () => res("suspended");
+          if (state.suspended) res("suspended");
+        });
+        let settled: Response | "aborted" | "suspended";
+        try {
+          settled = await Promise.race([running, aborted, suspended]);
+        } catch (err) {
+          // Only the load can fail because of the script: a module that does not
+          // parse is rejected here. Reading the answer below is ours, and a
+          // SyntaxError from parsing it is not the script's (Vera, #341).
+          if (first && isCompileError(err)) {
+            return finish({ status: "failed", outputs: [], error: { code: "eval_error", message: String((err as Error)?.message ?? err) } });
+          }
+          throw err;
+        } finally {
+          state.onSuspend = undefined;
+        }
+
+        if (settled === "suspended") {
+          // Accepted operations are reported, not lost: whatever the program
+          // started before it paused settles first.
+          await Promise.allSettled([...state.pending]);
+          const s = state.suspended!;
+          if (!state.hold) {
+            return {
+              status: "paused", outputs: s.outputs, pause: s.pause,
+              acceptedOperationIds: [...state.accepted], hostCalls: state.hostCalls, held: [...(state.held ?? [])],
+              continuation: continuation(),
+            };
+          }
+          // A call that was still out came back held: that ends the run, as a hold always has.
+          state.suspended = undefined;
+          s.resolve({ end: "stop" });
+          settled = await Promise.race([running, aborted]);
+        }
+
+        if (settled === "aborted") {
+          state.aborted = true;
+          // A program waiting at a pause is let go, so its isolate can end.
+          state.suspended?.resolve({ end: "cancel" });
+          return finish({
+            status: "interrupted",
+            outputs: [],
+            error: { code: "cancelled", message: "execution cancelled" },
+          });
+        }
+
+        const body = (await (settled as Response).json()) as {
+          ok: boolean; outputs: Json[]; error?: { code: string; message: string };
+          pause?: { reason: string; json: string | null; problem: string | null; bytes: number; answer?: string | null };
+        };
+        const asked = body.pause
+          ? pauseFrom(String(body.pause.reason), body.pause.json, body.pause.problem, limits.maxOutputBytes - (Number(body.pause.bytes) || 0), body.pause.answer ?? null)
+          : undefined;
+        return finish(
+          asked || state.hold
+            // A pause decides the result however the program ended (see PAUSE_FACTORY).
+            ? { status: "paused", outputs: body.outputs, pause: asked ?? state.hold }
+            : body.ok
+              ? { status: "completed", outputs: body.outputs }
+              : { status: "failed", outputs: body.outputs, error: body.error },
+        );
+      } catch (err) {
+        return killed(err);
+      }
+    };
+
+    // One per suspension: resume or cancel, once.
+    const continuation = (): Continuation => {
+      let used = false;
+      const take = () => {
+        const s = state.suspended;
+        if (used || !s || !executions.has(execId)) throw new Error("this continuation was already used");
+        used = true;
+        state.suspended = undefined;
+        return s;
+      };
+      return {
+        resume: (answer: Json) => {
+          take().resolve({ answer: answer === undefined ? null : answer });
+          return untilStop(false);
+        },
+        cancel: () => {
+          const s = take();
+          state.cancelled = true;
+          s.resolve({ end: "cancel" });
+          return untilStop(false);
+        },
+      };
+    };
+
+    return untilStop(true);
   }
 }
