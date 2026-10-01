@@ -96,20 +96,6 @@ export function reconcileSeed(
   return { update: config };
 }
 
-/**
- * `http`'s keyless search, withheld while the agent has an Exa mount that can search: two search tools
- * would leave the model to pick, and the keyless one answers a few queries and then serves a captcha.
- * An Exa mount with no key to use leaves the keyless one in place, so the agent still has a search.
- * Only the operator's key is checked for presence: an agent's own key (`agent:`) whose row was deleted
- * still counts as able to search, and that agent is left with neither until it keeps the key again.
- */
-export function keylessSearchWithheld(
-  records: ReadonlyArray<Pick<MountRecord, "alias" | "plugin" | "secretRef">>, operatorExa: boolean,
-): string[] {
-  const exa = records.some((m) => m.plugin === "exa" && m.secretRef !== null && (m.secretRef !== OPERATOR_EXA_REF || operatorExa));
-  return exa ? records.filter((m) => m.plugin === "http").map((m) => `${m.alias}.search`) : [];
-}
-
 /** A mount every agent starts with. `account` alone is the older shape the benchmarks still pass. */
 export interface SeedMount {
   alias: string; plugin: string;
@@ -675,8 +661,6 @@ export class AgentRuntime {
       githubPlugin,
       demoPlugin,
       httpPlugin,
-      // Mounted only where an operator attaches a key; `http.search`'s keyless
-      // path stays for everyone else.
       exaPlugin,
       // The lease reaches the plugin so its tools state the lifetime this deployment gives a box.
       sandboxPlugin(this.#artifacts as any, deps.bucketName, deps.idle ?? null),
@@ -1345,8 +1329,8 @@ export class AgentRuntime {
     // something that matters should use it, and use an allowlist too.
     { alias: "web", plugin: "http", config: { account: "open web", maxBytes: 24_000 },
       secretRef: null, policy: null },
-    // Search with the operator's Exa key. The keyless search on `web` answers a few queries and then
-    // serves a captcha; this one's host is fixed by the plugin, so the key can only ever reach Exa.
+    // Search with the operator's Exa key. Its host is fixed by the plugin, so the key can only ever
+    // reach Exa.
     { alias: "search", plugin: "exa", config: { account: "Exa" },
       secretRef: OPERATOR_EXA_REF, policy: null },
     // GitHub, the first real user of the credential page. Seeded with no
@@ -1571,7 +1555,7 @@ export class AgentRuntime {
           reads: t.reads,
           exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
         })),
-      ), [...(this.#deps.withholdTools ?? []), ...keylessSearchWithheld(records, !!this.#deps.operatorExa)])),
+      ), this.#deps.withholdTools ?? [])),
     };
   }
 

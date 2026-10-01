@@ -31,12 +31,6 @@ import type { Plugin, PluginContext } from "./types.ts";
  * by definition. The body is capped and returned as data, never as instructions.
  */
 export interface HttpConfig {
-  /**
-   * Where a search goes. Keyless by default, because a capability that needs an
-   * account before it works is a capability nobody turns on. An operator who
-   * wants a real search API points this at one; the shape is the same.
-   */
-  searchEndpoint?: string;
   /** Exact hostnames; no wildcards, since a wildcard is how an allowlist stops
    *  being one. Omit the field entirely to allow any public host. */
   allowedHosts?: string[];
@@ -66,16 +60,6 @@ function responseHeaders(h: Headers): Record<string, string> {
     out[k.toLowerCase()] = v.length > 400 ? `${v.slice(0, 400)}…` : v;
   });
   return out;
-}
-
-/** Tags out, entities in: search titles and snippets arrive as markup. */
-function stripTags(x: string): string {
-  return x
-    .replace(/<[^>]*>/g, "")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&nbsp;/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 export function checkUrl(
@@ -181,7 +165,6 @@ export const httpPlugin: Plugin = {
     { name: "maxBytes", type: "number", default: DEFAULT_MAX_BYTES,
       summary: "How much of a response body is returned. The rest is cut and discarded, not kept anywhere; `bytes` reports the full size, so a truncated result says how much went." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "How long one request may take." },
-    { name: "searchEndpoint", type: "string", summary: "Where the search tool sends its query." },
   ],
   version: "1.0.0",
   tools: [
@@ -249,27 +232,10 @@ export const httpPlugin: Plugin = {
       sideEffects: "write",
       idempotency: "none",
     },
-    {
-      name: "search",
-      summary:
-        "Search the web and get back titles, urls and snippets. Use it when you do not already " +
-        "know which page to read — guessing a url and fetching it is how a search becomes three " +
-        "wasted turns. Then read the ones that look right with `get`.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          limit: { type: "integer", description: "default 8, at most 20" },
-        },
-        required: ["query"],
-      },
-      sideEffects: "read",
-      idempotency: "native",
-    },
   ],
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
-    if (!["get", "send", "search"].includes(tool)) throw new Error(`unknown tool: ${tool}`);
+    if (!["get", "send"].includes(tool)) throw new Error(`unknown tool: ${tool}`);
     const cfg = (ctx.publicConfig ?? {}) as HttpConfig;
     const allowed = cfg.allowedHosts;
     const maxBytes = cfg.maxBytes ?? DEFAULT_MAX_BYTES;
@@ -293,75 +259,6 @@ export const httpPlugin: Plugin = {
     for (const [k, v] of Object.entries(a.headers ?? {})) {
       if (FORBIDDEN.test(k)) { refused.push(k); continue; }
       if (typeof v === "string" || typeof v === "number") extra[k.toLowerCase()] = String(v);
-    }
-
-    if (tool === "search") {
-      const q = String((args as any)?.query ?? "").trim();
-      if (!q) throw new Error("query is required");
-      const limit = Math.min(Math.max(Number((args as any)?.limit ?? 8), 1), 20);
-      // Two endpoints, because a keyless one is a keyless one: it answers a
-      // few queries and then starts serving a captcha. An operator who wants
-      // reliability points searchEndpoint at an API with a key.
-      const endpoints = cfg.searchEndpoint
-        ? [cfg.searchEndpoint]
-        : ["https://html.duckduckgo.com/html/?q=", "https://lite.duckduckgo.com/lite/?q="];
-      let page = "";
-      let refused = "";
-      for (const endpoint of endpoints) {
-        const res = await fetch(endpoint + encodeURIComponent(q), {
-          headers: {
-            // Without a browser-shaped agent the endpoint answers with a page
-            // that has no results in it.
-            "user-agent":
-              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-            accept: "text/html",
-          },
-          signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-        });
-        if (!res.ok) { refused = `HTTP ${res.status}`; continue; }
-        const body = await res.text();
-        // A challenge page is not an empty result set, and reporting it as one
-        // tells the agent the thing it asked about does not exist. It comes
-        // back as HTTP 202 with a captcha in it, so the status is no help.
-        if (/complete the following challenge|bots use DuckDuckGo|captcha/i.test(body)) {
-          refused = "the search endpoint served a bot challenge";
-          continue;
-        }
-        page = body;
-        break;
-      }
-      if (!page) {
-        throw new Error(
-          `search is unavailable: ${refused}. This is a rate limit, not an empty result — ` +
-          `do not conclude the subject does not exist. Try again, or fetch a likely url directly.`,
-        );
-      }
-      const results: Array<{ title: string; url: string; snippet: string }> = [];
-      const link = /result__a"\s+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-      const snips = [...page.matchAll(/result__snippet"[^>]*>([\s\S]*?)<\/a>/g)]
-        .map((m) => stripTags(m[1]!));
-      for (let m = link.exec(page); m && results.length < limit; m = link.exec(page)) {
-        // The href is a redirector; the real destination is a parameter on it.
-        const direct = /[?&]uddg=([^&"]+)/.exec(m[1]!);
-        const url = direct ? decodeURIComponent(direct[1]!) : m[1]!;
-        if (!/^https?:\/\//.test(url)) continue;
-        // The same rules as a fetch: an allowlisted mount does not get to
-        // search its way around its own allowlist.
-        if (!checkUrl(url, allowed).ok) continue;
-        results.push({ title: stripTags(m[2]!), url, snippet: snips[results.length] ?? "" });
-      }
-      // Zero results has two very different causes, and reporting them the same
-      // way is how an agent concludes a subject does not exist. A real results
-      // page says so itself; a page this parser cannot read says nothing, and
-      // that is the one that must not be called "no results". Endpoint markup
-      // changes, so this is a guard against the future as much as the present.
-      if (!results.length && !/no results|did not match|result__a|result-link/i.test(page)) {
-        throw new Error(
-          "search could not read the results page — the endpoint's format may have changed. " +
-          "This is not an empty result: do not conclude the subject does not exist.",
-        );
-      }
-      return { query: q, count: results.length, results };
     }
 
     /**
