@@ -1213,8 +1213,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  step comes when, and the warning before the deletion, follow from what
      *  `activity` reports for each state. Without a lease the box is handed
      *  back for good, because nothing would ever come back to delete it. */
-    async release(ctx: PluginContext): Promise<Released | false> {
-      if (lease) {
+    async release(ctx: PluginContext, opts?: { reason?: "idle" }): Promise<Released | false> {
+      // Only the idle pass switches a running box off; an operator's or a benchmark's release means delete.
+      if (lease && opts?.reason === "idle") {
         const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
         if (state?.boxId && parkedAt(state) === null) return parkBox(ctx, state);
       }

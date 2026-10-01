@@ -113,7 +113,7 @@ await check("through the idle schedule: a running box is taken silently, a parke
 
 await check("holds.release switches a running box off, keeps it, and records the compute session", async () => {
   const f = fixture({ ...RUNNING, quietUntil: STARTED + 20 * MIN });
-  const out = await leased.holds!.release(f.ctx);
+  const out = await leased.holds!.release(f.ctx, { reason: "idle" });
   must(stops(f.calls).length === 1, `one stop: ${JSON.stringify(f.calls)}`);
   must(deletes(f.calls).length === 0, `a running box was deleted: ${JSON.stringify(f.calls)}`);
   const r = f.record();
@@ -130,7 +130,7 @@ await check("holds.release switches a running box off, keeps it, and records the
 await check("a stop run9 refuses is thrown with its fact, and the box is not marked switched off", async () => {
   const f = fixture({ ...RUNNING }, (m, p) => m === "POST" && /\/stop$/.test(p) ? { status: 500, body: { error: "busy" } } : { status: 200, body: {} });
   let thrown: any = null;
-  try { await leased.holds!.release(f.ctx); } catch (e) { thrown = e; }
+  try { await leased.holds!.release(f.ctx, { reason: "idle" }); } catch (e) { thrown = e; }
   must(thrown && /not switched off/.test(String(thrown.message)), `a refused stop read as success: ${thrown}`);
   must(thrown.released?.status === "error" && thrown.released.id === "b1", `the fact rides on the error: ${JSON.stringify(thrown?.released)}`);
   must((f.record() as any)?.parkedAt === undefined, "a box still running was recorded as switched off");
@@ -138,12 +138,18 @@ await check("a stop run9 refuses is thrown with its fact, and the box is not mar
 
 await check("holds.release deletes a parked box, clears the record, and adds no second compute session", async () => {
   const f = fixture({ ...PARKED, sessions: [{ boxId: "b1", startedAt: STARTED, endedAt: PARKED.parkedAt, lastUsedAt: RUNNING.lastUsedAt, execs: 3, saved: [] }] });
-  const out = await leased.holds!.release(f.ctx) as Released;
+  const out = await leased.holds!.release(f.ctx, { reason: "idle" }) as Released;
   must(deletes(f.calls).length === 1, `a parked box was not deleted: ${JSON.stringify(f.calls)}`);
   const r = f.record();
   must(!r?.boxId, `the record still names the box: ${JSON.stringify(r)}`);
   must(usageOf(r).length === 1, `deleting a parked box added a session: ${JSON.stringify(usageOf(r))}`);
   must(out.status === "freed" && out.startedAt === PARKED.parkedAt, `the span is the time it sat stopped: ${JSON.stringify(out)}`);
+});
+
+await check("a release that is not the idle pass (an operator, a benchmark) deletes a running box at once", async () => {
+  const f = fixture({ ...RUNNING });
+  await leased.holds!.release(f.ctx);
+  must(deletes(f.calls).length === 1 && !f.record()?.boxId, `an explicit release only switched it off: ${JSON.stringify(f.calls)}`);
 });
 
 await check("without a lease, holds.release still deletes a running box", async () => {

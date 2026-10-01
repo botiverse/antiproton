@@ -464,7 +464,7 @@ export class ToolGateway {
      *  per-mount — it is handed the alias and that mount's own database —
      *  and the fan-out is here, so this is where a caller that means one box
      *  says so (Piper, 2026-09-12). */
-    opts?: { alias?: string },
+    opts?: { alias?: string; reason?: "idle" },
   ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
     const released: string[] = [];
     const failed: Array<{ alias: string; error: string }> = [];
@@ -486,7 +486,7 @@ export class ToolGateway {
           async sibling() { return null; },
           async sandboxForms() { return []; },
           async agentSecret() { return null; },
-        });
+        }, opts?.reason ? { reason: opts.reason } : undefined);
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
         // state back, and a `shell` landing between those steps leaves a live

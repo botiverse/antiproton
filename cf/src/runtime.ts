@@ -1949,7 +1949,7 @@ export class AgentRuntime {
       // read still costs what the machine costs. Asked and answered as the
       // whole of an older task (#12); reopening it means first deciding what is
       // worth keeping, not adding a step here.
-      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias });
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias, reason: "idle" });
       releaseFailed = [...releaseFailed, ...r.failed];
       sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
       // A release may leave the thing held in another state with a schedule of its own (switched off, and

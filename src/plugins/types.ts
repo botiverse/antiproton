@@ -1257,8 +1257,12 @@ export interface Holding {
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not
    * be released — a silent failure here is a resource nobody will collect.
+   *
+   * `reason: "idle"` is the framework's idle pass reaching the end of the thing's schedule; a plugin
+   * may answer it with a gentler step (the sandbox switches a running box off and keeps it). Any other
+   * caller (an operator, a benchmark, a settled turn without a lease) means let go now.
    */
-  release(ctx: PluginContext): Promise<Released | boolean | void>;
+  release(ctx: PluginContext, opts?: { reason?: "idle" }): Promise<Released | boolean | void>;
 }
 
 /**
