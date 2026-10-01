@@ -231,23 +231,40 @@ await check("resume \"send\" into a conversation that moved again asks again, wi
   if (!(again instanceof Interrupt) || (again.state as any).idempotencyKey !== "k-held") throw new Error(`a second hold must ask again: ${JSON.stringify(again)}`);
 });
 
-// What the SDK hands back when it drops a held envelope it cannot place: a count with no body to show.
-const HELD_UNSHOWN = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
-  heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "a DM body the SDK cannot place" }] });
+// The Server's held envelope as it is sent today: the message, with no conversation fields of its own.
+const HELD_BARE = (extra: Record<string, unknown> = {}) => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0,
+  freshnessContextMode: "inline", heldMessages: [{ seq: 20, id: "abcdef12-0000", channelId: "c-1", content: "a DM body", sender_type: "agent", sender_name: "cody" }], ...extra });
 
-await check("a held send whose messages are not all shown attests nothing and tells the agent to read them first", async () => {
+await check("a held message with no conversation fields of its own is shown under the send's target, and attested", async () => {
   const m = mount();
-  const calls = many(HELD_UNSHOWN(), HELD_UNSHOWN());
-  const held = await raftPlugin.invoke("send_message", { target: "dm:@cody", content: "done", idempotencyKey: "k-u" }, m.ctx) as any;
-  if (!(held instanceof Interrupt) || !/not shown here: read dm:@cody with receive_events first/.test(held.question) ||
-      (held.context as any)?.unshown !== 1 || (held.state as any).seen !== undefined) {
-    throw new Error(`an unshown message was treated as seen: ${JSON.stringify(held)}`);
+  const calls = many(HELD_BARE(), json(200, { ok: true, state: "sent", messageId: "m-9", messageSeq: 21 }));
+  const held = await raftPlugin.invoke("send_message", { target: "dm:@cody", content: "done", idempotencyKey: "k-b" }, m.ctx) as any;
+  const lines = (held.context as any)?.messages ?? [];
+  if (!(held instanceof Interrupt) || lines.length !== 1 || !/a DM body/.test(lines[0]) || !/send your message anyway/.test(held.question) ||
+      (held.state as any).seen?.upToSeq !== 20) {
+    throw new Error(`the held message was not shown, or not attested: ${JSON.stringify(held)}`);
   }
-  // Neither the answer nor a plain resend may claim the model saw it.
   await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx);
-  const second = JSON.parse(String(calls[1]!.init.body));
-  if (second.seenUpToSeq !== undefined) throw new Error(`the resend attested an unshown message: ${JSON.stringify(second)}`);
+  if (JSON.parse(String(calls[1]!.init.body)).seenUpToSeq !== 20) throw new Error("the resend did not attest what was shown");
 });
+
+for (const [why, extra] of [
+  ["whose messages are not all shown", { newMessageCount: 2 }],
+  ["that came without a boundary", { seenUpToSeq: undefined }],
+] as const) {
+  await check(`a held send ${why} attests nothing and tells the agent to read the conversation first`, async () => {
+    const m = mount();
+    const calls = many(HELD_BARE(extra), HELD_BARE(extra));
+    const held = await raftPlugin.invoke("send_message", { target: "dm:@cody", content: "done", idempotencyKey: "k-u" }, m.ctx) as any;
+    if (!(held instanceof Interrupt) || !/read dm:@cody with receive_events first/.test(held.question) || (held.state as any).seen !== undefined) {
+      throw new Error(`an unattestable hold was treated as seen: ${JSON.stringify(held)}`);
+    }
+    // Neither the answer nor a plain resend may claim the model saw it.
+    await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx);
+    const second = JSON.parse(String(calls[1]!.init.body));
+    if (second.seenUpToSeq !== undefined) throw new Error(`the resend attested what was not shown: ${JSON.stringify(second)}`);
+  });
+}
 
 await check("resume \"drop\" sends nothing", async () => {
   const m = mount();
