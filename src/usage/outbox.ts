@@ -149,13 +149,17 @@ export function toolCallRows(
   ];
 }
 
-/** One run_js: the run, a failure if it failed, its time, and how many tools it called. */
+/**
+ * One run_js: the run, a failure if it failed, its time, and how many tools it called.
+ * `resumed` is a stretch after `resume` (src/runtime/pi-tools.ts): the same run going on,
+ * so its time, calls and failure count and its `runs` row does not.
+ */
 export function jsRunRows(
   base: { at: number; tenantId: string; agentId: string },
-  outcome: "ok" | "failed", ms: number, toolCalls: number,
+  outcome: "ok" | "failed", ms: number, toolCalls: number, resumed = false,
 ): UsageRow[] {
   return [
-    { ...base, resource: "js.run", key: "run_js", quantity: 1, unit: "runs" },
+    ...(resumed ? [] : [{ ...base, resource: "js.run", key: "run_js", quantity: 1, unit: "runs" }]),
     ...(outcome === "failed" ? [{ ...base, resource: "js.run", key: "run_js", quantity: 1, unit: "failed" }] : []),
     { ...base, resource: "js.run", key: "run_js", quantity: Math.max(0, Math.round(ms)), unit: "ms" },
     { ...base, resource: "js.run", key: "run_js", quantity: toolCalls, unit: "tool_calls" },

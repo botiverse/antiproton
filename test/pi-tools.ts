@@ -460,7 +460,7 @@ await check("提示词: run_js 一节讲 pause(),且不再说 confirm 调用会�
   const { systemPrompt } = await import("../src/runtime/pi-prompt.ts");
   const { RUN_JS_DESCRIPTION } = await import("../src/runtime/pi-tools.ts");
   const p = systemPrompt({ sandbox: true });
-  if (!p.includes("pause(reason, data)")) throw new Error("the sandbox section does not describe pause");
+  if (!p.includes("await pause(question, data")) throw new Error("the sandbox section does not describe pause");
   if (p.includes("it fails the program")) throw new Error("the old sentence about confirm inside run_js is still there");
   if (!/confirm: true\` inside run_js stops the program\s+as paused/.test(p)) throw new Error("the confirm sentence does not say it pauses");
   if (!p.includes("Never wrap one plain call")) throw new Error("the plain-call rule went missing");

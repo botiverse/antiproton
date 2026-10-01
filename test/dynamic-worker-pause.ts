@@ -2,34 +2,25 @@
  * The pause rows of the executor contract, against the Dynamic Worker executor,
  * in node.
  *
- * The loader here evaluates the module the executor generates — the real
- * runner, with its pause(), output() and tool tag — as an ES module, and its
- * tool binding goes straight to handleSandboxCall, as the platform's does
- * through SandboxTools. So the Worker's half of pause (the runner) and its
+ * The loader here (spec/worker-stand-in.ts) evaluates the module the executor
+ * generates — the real runner, with its pause(), output() and tool tag — as an
+ * ES module, and its tool binding reaches handleSandboxCall as the platform's
+ * does through SandboxTools: late, out of order, and not at all once the
+ * handler has returned. So the Worker's half of pause (the runner) and its
  * supervisor's half (handleSandboxCall, the answer it reads) are both the
  * shipped code. Only the pause rows: the others need the platform's isolation
  * (a runaway loop would hang node; node has a network) and run on a deployment
  * (bench/cf-conformance.mjs).
  */
-import { DynamicWorkerExecutor, handleSandboxCall } from "../src/runtime/dynamic-worker-executor.ts";
+import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend } from "../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "./spec/executor-spec.ts";
+import { standInLoader } from "./spec/worker-stand-in.ts";
 
-const exec = new DynamicWorkerExecutor({
-  loader: {
-    load: (code: any) => ({
-      getEntrypoint: () => ({
-        fetch: async (req: Request) => {
-          const src = code.modules[code.mainModule] as string;
-          const mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
-          return mod.default.fetch(req, code.env);
-        },
-      }),
-    }),
-  },
-  makeToolBinding: (execId) => ({
-    invoke: (strings: string[], values: unknown[]) => handleSandboxCall(execId, strings, values),
-  }),
-});
+// The platform's binding, as close as node gets: calls arrive late and out of
+// order, and a call outstanding when the handler returns is dropped (spec/worker-stand-in.ts).
+const standIn = standInLoader();
+const exec = new DynamicWorkerExecutor({ loader: standIn.loader, makeToolBinding: standIn.makeToolBinding });
+
 
 const extra: Array<{ ok: boolean; row: string; name: string; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -67,7 +58,81 @@ await check("after a hold the supervisor refuses further calls itself, whatever 
   }
 });
 
-const PAUSE_ROWS = new Set(["暂停", "暂停不可吞", "暂停数据", "暂停于审批", "暂停于未等的调用", "其它状态照旧", "统一入口", "单一通道"]);
+await check("the supervisor keeps one suspension per execution: a second suspend while one waits ends at once, and the first still waits", async () => {
+  const { executions } = await import("../src/runtime/dynamic-worker-executor.ts");
+  const { DEFAULT_LIMITS } = await import("../src/core/execution.ts");
+  const state: any = { host: okHost, limits: DEFAULT_LIMITS, hostCalls: 0, inFlight: 0, accepted: [], aborted: false, pending: new Set() };
+  executions.set("exec-twice", state);
+  try {
+    const req = { reason: "r", json: "null", problem: null, bytes: 0, outputs: [] };
+    let firstSettled = false;
+    const first = handleSandboxSuspend("exec-twice", req).then((a) => { firstSettled = true; return a; });
+    const second = await handleSandboxSuspend("exec-twice", { ...req, reason: "again" });
+    if (JSON.stringify(second) !== '{"end":"stop"}') throw new Error(`second: ${JSON.stringify(second)}`);
+    await new Promise((r) => setTimeout(r, 5));
+    if (firstSettled || state.suspended?.pause.reason !== "r") throw new Error("the first suspension was replaced or ended");
+    state.suspended.resolve({ answer: 1 });
+    if (JSON.stringify(await first) !== '{"answer":1}') throw new Error("the first did not get its answer");
+  } finally {
+    executions.delete("exec-twice");
+  }
+});
+
+await check("the supervisor waits for calls the sandbox says it sent, even when the sandbox answered before they arrived", async () => {
+  // A hand-written isolate standing for a runner whose own wait ran out: it
+  // sends one call that reaches the supervisor 20 ms later and comes back
+  // held, and answers (or suspends) at once, saying it sent one.
+  const held = { async invoke() { return { status: "pending", operationId: "op_late", error: { code: "awaiting_approval", message: "held" } }; } } as any;
+  const isolate = (then: (execId: string) => Promise<Response>) => new DynamicWorkerExecutor({
+    loader: { load: (code: any) => ({ getEntrypoint: () => ({ fetch: () => then(code.env.TOOLS.execId) }) }) },
+    makeToolBinding: (execId) => ({ execId }),
+  });
+  const late = (execId: string) => { setTimeout(() => { void handleSandboxCall(execId, ["m.send ", ""], [{}]); }, 20); };
+  // Waiting out the whole budget (5 s here) would also end on the right answer; the wait ends at the arrival.
+  const t0 = Date.now();
+  const ended = await isolate(async (execId) => {
+    late(execId);
+    return Response.json({ ok: true, outputs: [], sent: 1 });
+  }).execute("", held);
+  if (ended.status !== "paused" || ended.pause?.cause !== "hold") throw new Error(`the end did not wait: ${JSON.stringify(ended)}`);
+  const yielded = await isolate(async (execId) => {
+    late(execId);
+    const a = await handleSandboxSuspend(execId, { reason: "p", json: "null", problem: null, bytes: 0, outputs: [], sent: 1 });
+    return Response.json({ ok: true, outputs: [], sent: 1, ...("end" in a ? { pause: { reason: "p", json: "null", problem: null, bytes: 0 } } : {}) });
+  }).execute("", held);
+  if (yielded.continuation !== undefined || yielded.status !== "paused") throw new Error(`the pause did not wait: ${JSON.stringify(yielded)}`);
+  if (JSON.stringify(yielded.held) !== '[{"tool":"m.send","operationId":"op_late","status":"pending"}]') throw new Error(`held: ${JSON.stringify(yielded.held)}`);
+  if (Date.now() - t0 > 1_000) throw new Error(`waited ${Date.now() - t0} ms: the wait did not end when the call arrived`);
+});
+
+await check("the supervisor's wait for missing calls is bounded by the wall-time budget", async () => {
+  const exec2 = new DynamicWorkerExecutor({
+    loader: { load: () => ({ getEntrypoint: () => ({ fetch: async () => Response.json({ ok: true, outputs: [], sent: 3 }) }) }) },
+    makeToolBinding: () => ({}),
+  });
+  const t0 = Date.now();
+  const r = await exec2.execute("", okHost, { ...(await import("../src/core/execution.ts")).DEFAULT_LIMITS, wallTimeMs: 100 });
+  const ms = Date.now() - t0;
+  if (r.status !== "completed" || ms < 90 || ms > 2_000) throw new Error(`${r.status} after ${ms} ms`);
+});
+
+await check("a call lost on the way holds the run up for the wall-time budget, not for ever", async () => {
+  const lossy = standInLoader({ lose: (t) => t === "m.lost" });
+  const exec3 = new DynamicWorkerExecutor({ loader: lossy.loader, makeToolBinding: lossy.makeToolBinding });
+  const { DEFAULT_LIMITS } = await import("../src/core/execution.ts");
+  const t0 = Date.now();
+  const r = await Promise.race([
+    exec3.execute("tool`m.lost ${ {} }`; output('done');", okHost, { ...DEFAULT_LIMITS, wallTimeMs: 100 }),
+    new Promise<"hung">((res) => setTimeout(() => res("hung"), 3_000)),
+  ]);
+  if (r === "hung") throw new Error("the run waited for a call that will never come back");
+  // The sandbox waits its budget, then the supervisor waits its own for the call it never saw.
+  if (r.status !== "completed" || Date.now() - t0 < 150) throw new Error(`${JSON.stringify(r)} after ${Date.now() - t0} ms`);
+});
+
+// Not 暂停不计时: node does not enforce the Worker's cpuMs, so it would pass here whatever the code did.
+const PAUSE_ROWS = new Set(["暂停", "暂停不可吞", "暂停数据", "暂停于审批", "暂停于未等的调用", "其它状态照旧", "统一入口", "单一通道",
+  "暂停续行", "暂停取消", "暂停后的挂起"]);
 const results = await executorSpec(exec, (row) => PAUSE_ROWS.has(row));
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.row} ${r.name}${r.error ? ` — ${r.error}` : ""}`);
 for (const r of extra) console.log(`${r.ok ? "ok " : "FAIL"} ${r.row} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

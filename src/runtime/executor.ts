@@ -2,8 +2,8 @@ import { getQuickJS, type QuickJSContext, type QuickJSHandle } from "quickjs-ems
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
-import { DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
-import type { ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
+import { CANCELLED_NAME, DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
+import type { Continuation, ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export { DEFAULT_LIMITS } from "../core/execution.ts";
 export type { ExecutionLimits, ExecutorHost, ExecutionResult, JsExecutor } from "../core/execution.ts";
@@ -13,6 +13,11 @@ export type { ExecutionLimits, ExecutorHost, ExecutionResult, JsExecutor } from 
  * the previous execution survives: no variables, no closures, no pending
  * promises. The only way out of the sandbox is the `tool` tag and `output`;
  * `pause` is the only way to stop early on purpose.
+ *
+ * "The end" is when the program ends, not when `execute` returns: a program
+ * waiting at `await pause(...)` is returned as `paused` with a continuation,
+ * and its context lives on in this process until the continuation resumes it
+ * to its end or cancels it.
  */
 export class QuickJsExecutor implements JsExecutor {
   async execute(
@@ -27,10 +32,14 @@ export class QuickJsExecutor implements JsExecutor {
     runtime.setMaxStackSize(limits.maxStackBytes);
 
     const start = Date.now();
+    // Time spent suspended at a pause is the model's, not the program's: it is
+    // taken off the wall-time budget, which only the program's own running
+    // spends. How long a suspension may last is the continuation holder's cap.
+    let suspendedMs = 0;
     let interrupted: string | null = null;
     runtime.setInterruptHandler(() => {
       if (signal?.aborted) interrupted ??= "cancelled";
-      else if (Date.now() - start > limits.wallTimeMs) interrupted ??= "wall_time_exceeded";
+      else if (Date.now() - start - suspendedMs > limits.wallTimeMs) interrupted ??= "wall_time_exceeded";
       return interrupted !== null;
     });
 
@@ -42,9 +51,15 @@ export class QuickJsExecutor implements JsExecutor {
     let outputBytes = 0;
     const pending = new Set<Promise<unknown>>();
     // Host state, out of the program's reach: once set, the run ends paused
-    // whatever the program does next (see PAUSE_FACTORY).
+    // whatever the program does next (see PAUSE_FACTORY) — unless the model
+    // resumes it, which clears it.
     let paused: Paused | null = null;
     const held: HeldCall[] = [];
+    // The program waiting at its pause, and whoever is waiting to hear that it is.
+    let suspension: { deferred: ReturnType<QuickJSContext["newPromise"]>; at: number } | null = null;
+    let onSuspend: (() => void) | null = null;
+    // Set by cancel: pause() rejects, and nothing the program does after counts.
+    let cancelled = false;
 
     // JSON.parse-based marshalling: no eval, no ad-hoc handle construction.
     const jsonHandle = ctx.getProp(ctx.global, "JSON");
@@ -58,8 +73,11 @@ export class QuickJsExecutor implements JsExecutor {
 
     // What the program's await sees once the run is paused: a throw, so the
     // line after it does not run. The host state above is what decides.
-    const rejectPaused = (deferred: ReturnType<QuickJSContext["newPromise"]>) => {
-      const e = ctx.newError({ name: "RunJsPaused", message: `run_js paused: ${paused?.reason ?? ""}` });
+    const rejectPaused = (deferred: ReturnType<QuickJSContext["newPromise"]>, name = "RunJsPaused") => {
+      const e = ctx.newError({
+        name,
+        message: name === CANCELLED_NAME ? "run_js cancelled at pause()" : `run_js paused: ${paused?.reason ?? ""}`,
+      });
       deferred.reject(e);
       e.dispose();
     };
@@ -148,62 +166,124 @@ export class QuickJsExecutor implements JsExecutor {
     ctx.setProp(ctx.global, "output", outputFn);
     outputFn.dispose();
 
-    const recordFn = ctx.newFunction("record", (reasonH, jsonH, problemH) => {
-      if (paused) return ctx.undefined; // the first stop is the one reported
+    const recordFn = ctx.newFunction("record", (reasonH, jsonH, problemH, answerH) => {
+      if (paused) return ctx.false; // the first stop is the one reported, and it is not resumable
       const json = ctx.typeof(jsonH) === "string" ? ctx.getString(jsonH) : null;
       const problem = ctx.typeof(problemH) === "string" ? ctx.getString(problemH) : null;
-      paused = pauseFrom(ctx.getString(reasonH), json, problem, limits.maxOutputBytes - outputBytes);
-      return ctx.undefined;
+      const answer = answerH && ctx.typeof(answerH) === "string" ? ctx.getString(answerH) : null;
+      paused = pauseFrom(ctx.getString(reasonH), json, problem, limits.maxOutputBytes - outputBytes, answer);
+      return ctx.true;
+    });
+    // Called when the program awaits its pause (PAUSE_FACTORY): from here it is suspended.
+    const waitFn = ctx.newFunction("wait", () => {
+      const deferred = ctx.newPromise();
+      if (!paused || suspension) {
+        // Not this run's pause to wait on. A hold that came in after the pause
+        // is decided where the suspension is reported (untilStop), which has
+        // to wait for calls still out in any case.
+        rejectPaused(deferred);
+      } else {
+        suspension = { deferred, at: Date.now() };
+        onSuspend?.();
+      }
+      deferred.settled.then(() => runtime.executePendingJobs());
+      return deferred.handle;
     });
     {
       const factory = ctx.unwrapResult(ctx.evalCode(PAUSE_FACTORY, "pause.js"));
-      const pauseFn = ctx.unwrapResult(ctx.callFunction(factory, ctx.undefined, recordFn));
+      const pauseFn = ctx.unwrapResult(ctx.callFunction(factory, ctx.undefined, recordFn, waitFn));
       ctx.setProp(ctx.global, "pause", pauseFn);
       pauseFn.dispose();
       factory.dispose();
       recordFn.dispose();
+      waitFn.dispose();
     }
-    // A pause recorded on the host wins over however the program ended (see
-    // the end of `finally`).
-    const asPaused = (): ExecutionResult | null =>
-      paused ? { status: "paused", outputs, acceptedOperationIds, hostCalls, pause: paused, held } : null;
 
-    let result: ExecutionResult;
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      // A pause the program never awaited, or one left waiting when the program
+      // ended some other way: its promise is the last handle the context holds.
+      if (suspension) { suspension.deferred.dispose(); suspension = null; }
+      parseHandle.dispose();
+      jsonHandle.dispose();
+      try {
+        ctx.dispose();
+        runtime.dispose();
+      } catch {
+        /* handle bookkeeping only; the execution result stands */
+      }
+    };
+
+    // Wrapped so agent code may use top-level await without module plumbing.
+    let evalResult: ReturnType<QuickJSContext["evalCode"]>;
     try {
-      // Wrapped so agent code may use top-level await without module plumbing.
-      const evalResult = ctx.evalCode(`(async () => {\n${source}\n})()`, "agent.js");
-      if (evalResult.error) {
-        const err = ctx.dump(evalResult.error) as any;
-        evalResult.error.dispose();
-        result = {
-          status: interrupted ? "interrupted" : "failed",
-          outputs,
-          acceptedOperationIds,
-          hostCalls,
-          error: { code: interrupted ?? "eval_error", message: String(err?.message ?? err) },
-        };
-      } else {
-        const promise = ctx.resolvePromise(evalResult.value);
-        evalResult.value.dispose();
-        runtime.executePendingJobs();
-        // The interrupt handler only fires while JS is running; a script parked
-        // on host I/O has to be cut loose from the outside.
-        const aborted = new Promise<"aborted">((res) => {
-          if (!signal) return;
-          if (signal.aborted) res("aborted");
-          else signal.addEventListener("abort", () => res("aborted"), { once: true });
+      evalResult = ctx.evalCode(`(async () => {\n${source}\n})()`, "agent.js");
+    } catch (err) {
+      dispose();
+      return {
+        status: interrupted ? "interrupted" : "failed", outputs, acceptedOperationIds, hostCalls,
+        error: { code: interrupted ?? "host_failure", message: (err as Error).message },
+      };
+    }
+    if (evalResult.error) {
+      const err = ctx.dump(evalResult.error) as any;
+      evalResult.error.dispose();
+      dispose();
+      return {
+        status: interrupted ? "interrupted" : "failed",
+        outputs,
+        acceptedOperationIds,
+        hostCalls,
+        error: { code: interrupted ?? "eval_error", message: String(err?.message ?? err) },
+      };
+    }
+    const program = ctx.resolvePromise(evalResult.value);
+    evalResult.value.dispose();
+    // The interrupt handler only fires while JS is running; a script parked
+    // on host I/O has to be cut loose from the outside. Only the first
+    // stretch has a signal: a resumed program is the continuation holder's.
+    const aborted = new Promise<"aborted">((res) => {
+      if (!signal) return;
+      if (signal.aborted) res("aborted");
+      else signal.addEventListener("abort", () => res("aborted"), { once: true });
+    });
+
+    // Runs the program until it ends or waits at a pause, whichever is first.
+    const untilStop = async (first: boolean): Promise<ExecutionResult> => {
+      let result: ExecutionResult;
+      try {
+        const suspended = new Promise<"suspended">((res) => {
+          onSuspend = () => res("suspended");
+          if (suspension) res("suspended");
         });
-        const settled = await Promise.race([promise, aborted]);
+        if (first) runtime.executePendingJobs();
+        let settled = await Promise.race([program, aborted, suspended]);
+        onSuspend = null;
+        if (settled === "suspended") {
+          // Accepted operations are reported, not lost: whatever the program
+          // started before it paused settles first.
+          await Promise.allSettled([...pending]);
+          if (suspension && !held.length && !interrupted) {
+            return {
+              status: "paused", outputs: [...outputs], acceptedOperationIds: [...acceptedOperationIds], hostCalls,
+              pause: paused!, held: [...held], continuation: continuation(),
+            };
+          }
+          // A call that was still out came back held: that ends the run, as a hold always has.
+          if (suspension) { const s = suspension; suspension = null; rejectPaused(s.deferred); }
+          settled = await Promise.race([program, aborted]);
+        }
         if (settled === "aborted") {
-          return {
+          result = {
             status: "interrupted",
             outputs,
             acceptedOperationIds,
             hostCalls,
             error: { code: "cancelled", message: "execution cancelled" },
           };
-        }
-        if (settled.error) {
+        } else if (settled.error) {
           const err = ctx.dump(settled.error) as any;
           settled.error.dispose();
           result = {
@@ -217,37 +297,69 @@ export class QuickJsExecutor implements JsExecutor {
           settled.value.dispose();
           result = { status: "completed", outputs, acceptedOperationIds, hostCalls, held };
         }
+      } catch (err) {
+        result = {
+          status: interrupted ? "interrupted" : "failed",
+          outputs,
+          acceptedOperationIds,
+          hostCalls,
+          error: { code: interrupted ?? "host_failure", message: (err as Error).message },
+        };
       }
-    } catch (err) {
-      result = {
-        status: interrupted ? "interrupted" : "failed",
-        outputs,
-        acceptedOperationIds,
-        hostCalls,
-        error: { code: interrupted ?? "host_failure", message: (err as Error).message },
-      };
-    } finally {
       // Already-accepted operations keep running and are reported upward; only
       // un-accepted host work is abandoned with the context.
       await Promise.allSettled([...pending]);
+      // A cancel decides the result however the program then ended: it may
+      // have caught the rejection, but nothing it did after counted.
+      if (cancelled && result.status !== "interrupted") {
+        result = {
+          status: "interrupted", outputs, acceptedOperationIds, hostCalls, held,
+          error: { code: "cancelled", message: "cancelled at pause()" },
+        };
+      }
       // A pause recorded on the host decides the result whether the program
       // then returned or threw — a caught pause followed by either is still a
       // pause — and so does a call that was still in flight when the program
       // ended and came back held after it, since it now waits on a person.
       // An interruption (wall time, cancel) stays one, as in the Dynamic
       // Worker, where a kill leaves nothing of the sandbox's pause to read.
-      // (`result` is unset on the cancelled path, which returned already.)
-      const ended = result! as ExecutionResult | undefined;
-      if (paused && ended && (ended.status === "completed" || ended.status === "failed")) result = asPaused()!;
-      parseHandle.dispose();
-      jsonHandle.dispose();
-      try {
-        ctx.dispose();
-        runtime.dispose();
-      } catch {
-        /* handle bookkeeping only; the execution result stands */
+      if (paused && (result.status === "completed" || result.status === "failed")) {
+        result = { status: "paused", outputs, acceptedOperationIds, hostCalls, pause: paused, held };
       }
-    }
-    return result;
+      dispose();
+      return result;
+    };
+
+    // One per suspension: resume or cancel, once.
+    const continuation = (): Continuation => {
+      let used = false;
+      const take = () => {
+        if (used || disposed || !suspension) throw new Error("this continuation was already used");
+        used = true;
+        const s = suspension;
+        suspension = null;
+        suspendedMs += Date.now() - s.at;
+        return s.deferred;
+      };
+      return {
+        resume: (answer: Json) => {
+          const deferred = take();
+          // The program goes on: its later calls and outputs count again.
+          paused = null;
+          const h = toVm(answer === undefined ? null : answer);
+          deferred.resolve(h);
+          h.dispose();
+          return untilStop(false);
+        },
+        cancel: () => {
+          const deferred = take();
+          cancelled = true;
+          rejectPaused(deferred, CANCELLED_NAME);
+          return untilStop(false);
+        },
+      };
+    };
+
+    return untilStop(true);
   }
 }

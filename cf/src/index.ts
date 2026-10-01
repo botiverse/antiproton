@@ -32,7 +32,7 @@ import { chatPanel } from "./chat.ts";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { secretRefKind } from "../../src/runtime/secrets.ts";
-import { DynamicWorkerExecutor, handleSandboxCall } from "../../src/runtime/dynamic-worker-executor.ts";
+import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
   AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal } from "./runtime.ts";
@@ -129,6 +129,8 @@ export interface Env {
   HARNESS_MODE?: string;
   /** Context window of HARNESS_MODEL, in tokens. Compaction is a share of it. */
   HARNESS_CONTEXT_WINDOW?: string;
+  /** How long a run_js program suspended at `await pause(...)` waits for `resume`, in ms (default 60000). */
+  RUN_JS_RESUME_MS?: string;
   /** "1" opens the demo UI with no identity at all. Off by default. */
   UI_ALLOW_ANONYMOUS?: string;
   /** The canonical origin, so the registered callback URL is built from a
@@ -205,6 +207,13 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
     // the object that owns the execution.
     const stub = this.env.AGENT.get(this.env.AGENT.idFromString(String(props.doId)));
     return stub.sandboxCall(String(props.execId ?? ""), strings, values);
+  }
+
+  /** The sandbox's program awaits its pause; settles when the model resumes or cancels it. */
+  async suspend(req: SuspendRequest) {
+    const props = ((this.ctx as any).props ?? {}) as { execId?: string; doId?: string };
+    const stub = this.env.AGENT.get(this.env.AGENT.idFromString(String(props.doId)));
+    return stub.sandboxSuspend(String(props.execId ?? ""), req);
   }
 }
 
@@ -417,6 +426,8 @@ export class AgentDO extends DurableObject<Env> {
       loader: this.env.LOADER,
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
+      runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
+      keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       operatorExa: this.env.EXA_API_KEY,
@@ -796,6 +807,8 @@ export class AgentDO extends DurableObject<Env> {
       loader: this.env.LOADER,
       makeToolBinding: (execId) =>
         (this.ctx as any).exports.SandboxTools({ props: { execId, doId: this.ctx.id.toString() } }),
+      runJsResumeMs: Number(this.env.RUN_JS_RESUME_MS) || undefined,
+      keepAlive: (at) => this.#keepAlive(at),
       operatorModel: operatorModelOf(this.env),
       operatorRun9: this.env.RUN9 ? JSON.parse(this.env.RUN9) : undefined,
       operatorExa: this.env.EXA_API_KEY,
@@ -2073,6 +2086,22 @@ export class AgentDO extends DurableObject<Env> {
   /** Entered from SandboxTools; the sandbox can never reach this directly. */
   async sandboxCall(execId: string, strings: string[], values: unknown[]) {
     return handleSandboxCall(execId, strings, values);
+  }
+
+  /** Entered from SandboxTools: pending for as long as the program is suspended at its pause. */
+  async sandboxSuspend(execId: string, req: SuspendRequest) {
+    return handleSandboxSuspend(execId, req);
+  }
+
+  /**
+   * Bring the alarm forward to `at` if it is set later or not at all: a run_js
+   * program suspended in this object's memory needs it awake. Through #wake, so
+   * a pass running meanwhile keeps the wake (alarm-next.ts); never pushes an
+   * earlier alarm back.
+   */
+  async #keepAlive(at: number) {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > at) await this.#wake(at);
   }
 
   /** The executor contract, unchanged, against Dynamic Workers. */

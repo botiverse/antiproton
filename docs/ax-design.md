@@ -86,8 +86,16 @@ Recorded so the design is not read as a description of today:
 
 - Inside run_js, a call that comes back held (`pending`) ends the program as paused: the model
   gets the outputs so far, the call count and the held operation, and the rest does not run.
-  The program can also stop itself with `pause(reason, data)`. There is no resume or cancel
-  token yet: approval runs the held call alone, and the model continues with a new program.
+  There is no resume or cancel token for a hold yet: approval runs the held call alone, and the
+  model continues with a new program.
+- A program can stop itself and ask: `const answer = await pause(question, data, expected?)`.
+  That pause is resumable — the result is `yielded`, with a token, and the model answers with the
+  one static `resume` tool (or cancels); the program continues from that line. `expected`
+  (choices, yes/no, text, or a small JSON-schema subset) is checked on the server, and an answer
+  that does not fit is refused with the token still valid. The continuation lives only in the agent object's memory,
+  for at most `RUN_JS_RESUME_MS` (a minute by default; the object keeps itself awake meanwhile),
+  so it is not yet the serialisable continuation §3 asks for: once it expires or the object
+  restarts, `resume` says so and the model sends a new program, as it did before.
 - A Raft freshness hold returns the newer messages and asks the model to send again with the
   same key and content; the model restates the call instead of resuming it.
 - A plugin's database writes and the recorded tool result are two transactions (#596); the
