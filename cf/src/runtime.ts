@@ -16,7 +16,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
-import { heldLine, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
+import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
@@ -1036,14 +1036,16 @@ export class AgentRuntime {
     // is what the warning row is keyed by. Through `activity` rather than the
     // stored state, which is the plugin's own and named `boxId` in exactly
     // one plugin.
-    const live = (await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias)).live;
+    // Every thing the mount holds: this release has no id, so it lets go of all of them.
+    const live = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias))
+      .flatMap((a) => a.live ? [a.live] : []);
     const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias });
     const failed = r.failed.find((f) => f.alias === alias);
     if (failed) return { ok: false, error: `${alias} was not released: ${failed.error}` };
 
     // The warning row is keyed by the thing that is now gone. Left behind, the
     // next one under this alias inherits a release time it was never told.
-    if (live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, live.id);
+    for (const l of live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, l.id);
     return { ok: true, released: r.released.includes(alias) };
   }
 
@@ -1580,12 +1582,11 @@ export class AgentRuntime {
     // mount that holds nothing is filtered out before any state is read, so
     // the common call pays nothing for this.
     const activityOf = (alias: string) =>
-      this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias);
+      this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias);
     const nameOf = (alias: string, tool: string) => offeredToolName(offered as MountedTool[], alias, tool);
-    const heldOn = async (alias: string) => {
-      const [h] = await heldResources(records.filter((m) => m.alias === alias), this.#plugins, activityOf);
-      return h ? heldLine(h, nameOf, Date.now()) : null;
-    };
+    // Every thing the mount holds, one line each: a mount holding two machines names both.
+    const heldOn = async (alias: string) =>
+      heldLines(await heldResources(records.filter((m) => m.alias === alias), this.#plugins, activityOf), nameOf, Date.now());
     const host = this.#host(
       { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn);
     const store = this.store;
@@ -1909,8 +1910,10 @@ export class AgentRuntime {
     // from under it (Piper, 2026-09-14). The job table knows; the plugin does not.
     const busy = mountsWithRunningJobs(sql, { tenantId, agentId });
     const mounts = (await this.store.listMounts(tenantId, agentId)).filter((m) => !busy.has(m.alias));
+    // One entry per held thing, not per mount: a mount may hold several, each on its own schedule and
+    // released on its own (`Holding.activities`), and `held_warnings` is already keyed by the thing's id.
     const held = await heldResources(mounts, this.#plugins,
-      (alias) => this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias));
+      (alias) => this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, alias));
     for (const h of held) {
       const row = sql.exec("SELECT release_at FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id)
         .toArray()[0] as any;
@@ -1928,7 +1931,7 @@ export class AgentRuntime {
           warningText(h.alias,
             { release: nameOf(h.alias, h.tools.release), postpone: h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null },
             h.billing, d.idleMs, d.untilReleaseMs, limit,
-            { consequence: h.live.lease?.consequence, advice: h.live.lease?.advice }), "prompt");
+            { consequence: h.live.lease?.consequence, advice: h.live.lease?.advice, name: h.live.name, args: h.live.args }), "prompt");
         sql.exec("INSERT INTO held_warnings(alias, live_id, release_at) VALUES (?,?,?) " +
           "ON CONFLICT(alias, live_id) DO UPDATE SET release_at = excluded.release_at", h.alias, h.live.id, d.releaseAt);
         // 0: postMessage only marks the session, so this wake is what runs the warning's turn (idle-lease.ts).
@@ -1949,7 +1952,8 @@ export class AgentRuntime {
       // read still costs what the machine costs. Asked and answered as the
       // whole of an older task (#12); reopening it means first deciding what is
       // worth keeping, not adding a step here.
-      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias, reason: "idle" });
+      // This thing only, by its id: another thing the same mount holds has its own clock.
+      const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias, reason: "idle", id: h.live.id });
       releaseFailed = [...releaseFailed, ...r.failed];
       sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
       // A release may leave the thing held in another state with a schedule of its own (switched off, and
@@ -1957,7 +1961,8 @@ export class AgentRuntime {
       // assumed: whether anything is still held is the plugin's answer. Not after a failure, which would
       // only come straight back here; that is reported instead, as it always was.
       if (r.failed.some((f) => f.alias === h.alias)) continue;
-      const after = (await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, h.alias)).live;
+      const after = (await this.#gateway.mountActivities({ tenantId, agentId, taskId: LEGACY_TASK }, h.alias))
+        .find((a) => a.live?.id === h.live.id)?.live;
       if (!after) continue;
       const d2 = heldDecision(after, { warnedFor: 0, now: Date.now() }, { warnMs, maxMs });
       if ("wakeInMs" in d2) soon(d2.wakeInMs);

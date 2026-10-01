@@ -45,6 +45,11 @@ export interface SandboxConfig {
    * the agent is told before that.
    */
   keepStoppedDays?: number;
+  /**
+   * How many machines (named containers) the mount may have at once, the
+   * default one included. Switched-off ones count: each still keeps a disk.
+   */
+  maxMachines?: number;
   /** Where commands run. A prepared image usually has its own checkout. */
   workdir?: string;
   shape?: string;
@@ -116,6 +121,8 @@ interface Session {
   lastUsedAt: number;
   execs: number;
   saved: string[];
+  /** Which of the mount's machines it was, when not the default one ("main"). */
+  machine?: string;
 }
 
 /**
@@ -202,6 +209,108 @@ interface BoxState {
    * Absent on a new box, where the first call starts in the working directory.
    */
   cwd?: string;
+}
+
+/**
+ * One machine's part of the record: everything in `BoxState` but the two lists
+ * the whole mount shares.
+ */
+type MachineState = Omit<BoxState, "sessions" | "envs">;
+
+/**
+ * The mount's record: several machines by name, and what they share.
+ *
+ * An agent may need two machines at once (a server in one, a client in the
+ * other, or a build beside a clean checkout), so a mount holds several, each
+ * created on first use and switched off, resumed and deleted on its own
+ * schedule. What is shared is what was never about one container: the kept
+ * environments (a snapshot outlives the box it came from) and the window of
+ * finished sessions. A record written before machines existed has the one
+ * box's fields at the top level, and reads as the machine "main" (`asMountState`).
+ */
+interface MountState {
+  machines: Record<string, MachineState>;
+  sessions?: Session[];
+  envs?: Env[];
+}
+
+/** The machine a call uses when it names none: what the mount's one box always was. */
+export const MAIN_MACHINE = "main";
+
+/** A machine name: short, lowercase, and usable inside a box id. */
+const MACHINE_RE = /^[a-z][a-z0-9-]{0,23}$/;
+
+/** The machine a tool call names, or the default; a name that is not one is refused, not mapped. */
+export function machineOf(args: unknown): string {
+  const m = (args as { machine?: unknown } | null)?.machine;
+  if (m === undefined || m === null || m === "") return MAIN_MACHINE;
+  if (typeof m !== "string" || !MACHINE_RE.test(m)) {
+    throw new Error(`machine must be a short name: a lowercase letter, then up to 23 lowercase letters, digits or dashes; got ${JSON.stringify(m)}`);
+  }
+  return m;
+}
+
+/** The `machine` parameter, the same on every tool that acts on a machine. */
+const MACHINE_PARAM = {
+  type: "string",
+  description: "which of this mount's machines: omit for the default one (\"main\"); another short name " +
+    "(lowercase letters, digits, dashes) uses that separate machine, creating it on first use",
+} as const;
+
+/** The setting, or the default when it is not a usable whole number. */
+function maxMachinesOf(cfg: { maxMachines?: unknown }): number {
+  const n = cfg.maxMachines;
+  return typeof n === "number" && Number.isInteger(n) && n >= 1 ? n : DEFAULTS.maxMachines;
+}
+
+const NO_BOX: MachineState = { boxId: "", createdAt: 0, lastUsedAt: 0 };
+
+/** One machine as the code below has always handled a box: its own fields and the mount's shared lists. */
+function viewOf(mount: MountState | null, machine: string): BoxState {
+  return {
+    ...(mount?.machines[machine] ?? NO_BOX),
+    ...(mount?.sessions ? { sessions: mount.sessions } : {}),
+    ...(mount?.envs ? { envs: mount.envs } : {}),
+  };
+}
+
+/** The machines that have a box (running or switched off), main first, then by name. */
+function boxedMachines(mount: MountState | null): string[] {
+  return Object.keys(mount?.machines ?? {}).filter((n) => mount!.machines[n]!.boxId)
+    .sort((a, b) => a === MAIN_MACHINE ? -1 : b === MAIN_MACHINE ? 1 : a < b ? -1 : a > b ? 1 : 0);
+}
+
+async function readMount(ctx: PluginContext): Promise<MountState | null> {
+  return asMountState(await ctx.db.get(BOX_STORE, BOX_KEY));
+}
+
+/** One machine of this mount, read now; a machine with no box reads with an empty `boxId`. */
+async function readView(ctx: PluginContext, machine: string): Promise<BoxState> {
+  return viewOf(await readMount(ctx), machine);
+}
+
+/**
+ * Write one machine back, in the record's current shape, leaving the others as
+ * they are read now. The shared lists come from the view (the operation that
+ * changed them handed them in) or, absent there, from the record.
+ *
+ * A machine with no box and nothing pending (`startFrom`) is dropped from the
+ * map rather than kept as an empty entry, so the map is the list of machines
+ * that exist or are about to.
+ */
+async function writeView(ctx: PluginContext, machine: string, view: BoxState): Promise<void> {
+  const cur = (await readMount(ctx)) ?? { machines: {} };
+  const { sessions, envs, ...box } = view;
+  const machines = { ...cur.machines };
+  if (box.boxId || box.startFrom) machines[machine] = box;
+  else delete machines[machine];
+  const keptSessions = sessions ?? cur.sessions;
+  const keptEnvs = envs ?? cur.envs;
+  await ctx.db.put(BOX_STORE, {
+    machines,
+    ...(keptSessions ? { sessions: keptSessions } : {}),
+    ...(keptEnvs?.length ? { envs: keptEnvs } : {}),
+  } as unknown as Json, BOX_KEY);
 }
 
 /** Printed after a `shell` command to report where it ended; stripped before the agent sees the output. */
@@ -429,6 +538,7 @@ export function finished(
   rec: any,
   cfg: ReturnType<typeof cfgOf>,
   state: BoxState | null,
+  machine: string = MAIN_MACHINE,
 ): Record<string, unknown> {
   // A `shell` command reports where it ended; the report is ours, not the command's output.
   const { output: out, cwd } = splitCwd(String(rec.output_summary ?? ""));
@@ -454,6 +564,9 @@ export function finished(
     // shell descriptions, where the model is told every turn rather than once.
     ...execOutput(out, cfg.maxOutputBytes),
     box: state?.boxId ?? null,
+    // Which machine, when it is not the default: the agent named it, and a
+    // result that does not say so reads like one from the default machine.
+    ...(machine !== MAIN_MACHINE ? { machine } : {}),
     // So the agent learns the environment from a result it already has,
     // instead of spending turns probing for an interpreter. The container's
     // own image, not the setting: a box from before the default changed, or one
@@ -468,7 +581,64 @@ export function finished(
   };
 }
 
+/**
+ * The default machine's view of the record (see `viewOf`), or null when the
+ * record does not read. What every reader of one box asked before machines,
+ * and what it still means: a record written by any version reads here, an old
+ * single box as "main".
+ */
 export function asBoxState(v: Json): BoxState | null {
+  const mount = asMountState(v);
+  return mount ? viewOf(mount, MAIN_MACHINE) : null;
+}
+
+/**
+ * The record, as machines by name and what they share, or null when it does
+ * not read — under the rules `readBox` states for one box.
+ *
+ * **An old record is the machine "main", never an error.** A record from before
+ * machines has one box at the top level; it reads as that box under the
+ * default name, and the next write stores it in the new shape. That is the
+ * whole migration: no step runs ahead of it, so a row nobody touches again is
+ * still read correctly.
+ *
+ * In the new shape, an entry under a name that is not a machine name, or one
+ * that does not read as a box, is dropped and counted (`unreadableEntries`) —
+ * the same leniency as a bad line of history, for the same reason: one damaged
+ * entry must not lose the other machines, which exist and are billed.
+ */
+export function asMountState(v: Json): MountState | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  if (o.machines === undefined) {
+    const old = readBox(v);
+    if (!old) return null;
+    const { sessions, envs, ...box } = old;
+    return {
+      machines: box.boxId || box.startFrom ? { [MAIN_MACHINE]: box } : {},
+      ...(sessions ? { sessions } : {}),
+      ...(envs ? { envs } : {}),
+    };
+  }
+  const listed = o.machines;
+  if (!listed || typeof listed !== "object" || Array.isArray(listed)) return null;
+  const machines: Record<string, MachineState> = {};
+  for (const [name, entry] of Object.entries(listed as Record<string, unknown>)) {
+    if (!MACHINE_RE.test(name)) continue;
+    const read = readBox(entry as Json);
+    if (!read) continue;
+    const { sessions: _s, envs: _e, ...box } = read;
+    machines[name] = box;
+  }
+  return {
+    machines,
+    ...(Array.isArray(o.sessions) ? { sessions: o.sessions.filter(isSession) } : {}),
+    ...(Array.isArray(o.envs) ? { envs: o.envs.filter(isEnv) } : {}),
+  };
+}
+
+/** One box's record: a whole record before machines, or one machine's entry since. */
+function readBox(v: Json): BoxState | null {
   if (!v || typeof v !== "object") return null;
   const o = v as Record<string, unknown>;
   if (typeof o.boxId !== "string") return null;
@@ -534,7 +704,8 @@ function isSession(v: unknown): v is Session {
   return typeof s.boxId === "string" && typeof s.startedAt === "number"
     && typeof s.endedAt === "number" && typeof s.lastUsedAt === "number"
     && typeof s.execs === "number"
-    && Array.isArray(s.saved) && s.saved.every((x) => typeof x === "string");
+    && Array.isArray(s.saved) && s.saved.every((x) => typeof x === "string")
+    && (s.machine === undefined || typeof s.machine === "string");
 }
 
 function isEnv(v: unknown): v is Env {
@@ -569,8 +740,20 @@ export function unreadableEntries(v: Json): number {
   const o = v as Record<string, unknown>;
   const count = (list: unknown, readable: (x: unknown) => boolean) =>
     list === undefined ? 0 : Array.isArray(list) ? list.filter((x) => !readable(x)).length : 1;
-  return (asBoxState(v) === null ? 1 : 0) + count(o.sessions, isSession) + count(o.envs, isEnv)
-    + count(o.wired, isWired) + count(o.leftOut, isLeftOut);
+  const shared = count(o.sessions, isSession) + count(o.envs, isEnv);
+  if (o.machines === undefined) {
+    return (asBoxState(v) === null ? 1 : 0) + shared + count(o.wired, isWired) + count(o.leftOut, isLeftOut);
+  }
+  // The new shape: the map itself, then each entry as a box record of its own.
+  const listed = o.machines;
+  if (!listed || typeof listed !== "object" || Array.isArray(listed)) return 1 + shared;
+  let bad = 0;
+  for (const [name, entry] of Object.entries(listed as Record<string, unknown>)) {
+    const e = entry as Record<string, unknown> | null;
+    if (!MACHINE_RE.test(name) || readBox(entry as Json) === null) { bad += 1; continue; }
+    bad += count(e?.wired, isWired) + count(e?.leftOut, isLeftOut);
+  }
+  return bad + shared;
 }
 
 const SESSIONS_KEPT = 20;
@@ -611,6 +794,7 @@ const DEFAULTS = {
   maxOutputBytes: 24_000,
   maxQuietMinutes: 60,
   keepStoppedDays: 7,
+  maxMachines: 3,
 };
 
 /**
@@ -626,10 +810,10 @@ const DEFAULTS = {
  * live boxes and a release path that had been announcing success the whole time.
  */
 async function stopBox(
-  ctx: PluginContext,
+  ctx: PluginContext, machine: string,
 ): Promise<{ boxId: string; freed: boolean; error?: string; liveMs: number; lease: Released } | null> {
-  const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-  if (!state?.boxId || !ctx.credential) return null;
+  const state = await readView(ctx, machine);
+  if (!state.boxId || !ctx.credential) return null;
   const cfg = { ...DEFAULTS, ...(ctx.publicConfig as SandboxConfig) };
   providerOf(cfg);
   const cred = JSON.parse(ctx.credential) as Run9Credential;
@@ -660,7 +844,7 @@ async function stopBox(
   // one from `createdAt` would count the days it sat stopped as compute.
   const endedAt = Date.now();
   const stoppedAt = parkedAt(state);
-  const session = sessionOf(state, stoppedAt ?? endedAt);
+  const session = sessionOf(state, stoppedAt ?? endedAt, machine);
   // Read again before overwriting. `releaseTask` does not take the per-mount
   // lock that `invoke` takes, so an operator release or the idle sweep can
   // interleave with a command on this mount: the command finds no container,
@@ -668,20 +852,23 @@ async function stopBox(
   // container alive and billed with nothing naming it — the orphan `asBoxState`
   // refuses to create. A lock in the gateway closes the
   // window inside one object; this half does not depend on the caller.
-  const now = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-  const mine = !now?.boxId || now.boxId === state.boxId;
-  await ctx.db.put(BOX_STORE, mine
+  //
+  // The shared lists are taken from this second read, not the first: another
+  // machine of the mount may have added a session or kept an environment since.
+  const now = await readView(ctx, machine);
+  const mine = !now.boxId || now.boxId === state.boxId;
+  await writeView(ctx, machine, mine
     ? {
       boxId: "", createdAt: 0, lastUsedAt: 0,
-      sessions: stoppedAt ? (state.sessions ?? []) : keepSessions(state.sessions, session),
+      sessions: stoppedAt ? (now.sessions ?? []) : keepSessions(now.sessions, session),
       // Kept environments outlive the container by construction — a forked
       // snapshot is independent of the box it came from — so losing the record of
       // them here would strand real storage under ids nobody can name any more.
-      ...(state.envs?.length ? { envs: state.envs } : {}),
+      ...(now.envs?.length ? { envs: now.envs } : {}),
     }
     // Somebody else's container is in the record. Leave it named, and add only
     // what this release knows: the session the released box just finished.
-    : { ...now, ...(stoppedAt ? {} : { sessions: keepSessions(now.sessions, session) }) } as unknown as Json, BOX_KEY);
+    : { ...now, ...(stoppedAt ? {} : { sessions: keepSessions(now.sessions, session) }) });
   // Both instants travel, not just their difference: the recorder checks that
   // the duration it stores is this fact's own `endedAt - startedAt`, and they
   // all come from `session`, which was built from the state THIS call read.
@@ -713,7 +900,7 @@ async function stopBox(
  * refused is thrown with its fact, as `stopBox` does: a box still running must
  * not read as switched off.
  */
-async function parkBox(ctx: PluginContext, state: BoxState): Promise<Released | false> {
+async function parkBox(ctx: PluginContext, machine: string, state: BoxState): Promise<Released | false> {
   if (!ctx.credential) return false;
   const cfg = cfgOf(ctx);
   providerOf(cfg);
@@ -729,7 +916,7 @@ async function parkBox(ctx: PluginContext, state: BoxState): Promise<Released | 
     error = String((e as Error)?.message ?? e).slice(0, 160);
   }
   const endedAt = Date.now();
-  const session = sessionOf(state, endedAt);
+  const session = sessionOf(state, endedAt, machine);
   const fact: Released = {
     id: state.boxId, startedAt: session.startedAt, endedAt,
     status: error ? "error" : "freed", ...(error ? { error } : {}),
@@ -737,14 +924,12 @@ async function parkBox(ctx: PluginContext, state: BoxState): Promise<Released | 
   if (error) throw markReleased(new Error(`run9 box ${state.boxId} not switched off: ${error}`), fact);
   // Read again before writing, for the reason `stopBox` does: a command may
   // have recorded another box meanwhile, and that one is running.
-  const now = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-  if (now?.boxId === state.boxId) {
+  const now = await readView(ctx, machine);
+  if (now.boxId === state.boxId) {
     // A postponement is spent by the time this runs (the pass waits for the later of the two), and one left
     // in the record would hold off the deletion schedule by its old instant.
     const { quietUntil: _q, ...rest } = now;
-    await ctx.db.put(BOX_STORE, {
-      ...rest, parkedAt: endedAt, sessions: keepSessions(now.sessions, session),
-    } as unknown as Json, BOX_KEY);
+    await writeView(ctx, machine, { ...rest, parkedAt: endedAt, sessions: keepSessions(now.sessions, session) });
   }
   return fact;
 }
@@ -787,6 +972,8 @@ export function activityOf(
   state: BoxState | null | undefined,
   unreadable = 0,
   keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+  /** How the agent names this machine, when the mount has several or it is not the default one. */
+  label: { name?: string; args?: Record<string, Json> } = {},
 ): MountActivity {
   const billing = "billed for every second it exists, not per call";
   if (!state?.boxId) return { live: null, billing, ...(unreadable ? { unreadable } : {}) };
@@ -813,6 +1000,7 @@ export function activityOf(
             + "switch it back on.",
           maxPostponeMinutes: Math.floor(maxMs / 60_000),
         },
+        ...label,
       },
       quietUntil: state.quietUntil ?? null,
       ...(unreadable ? { unreadable } : {}),
@@ -828,11 +1016,53 @@ export function activityOf(
       // disk, so it is taken at the deployment's limit without a warning — a
       // warning is a model turn, and there is nothing to answer it with.
       lease: { warnMs: 0 },
+      ...label,
     },
     quietUntil: state.quietUntil ?? null,
     ...(unreadable ? { unreadable } : {}),
     billing,
   };
+}
+
+/**
+ * How a machine is named to the agent in what the framework says about it: by
+ * name whenever the mount has several or it is not the default, and with the
+ * argument the tools need whenever it is not the default (they act on "main"
+ * without one).
+ */
+function labelOf(machine: string, several: boolean): { name?: string; args?: Record<string, Json> } {
+  if (machine !== MAIN_MACHINE) return { name: machine, args: { machine } };
+  return several ? { name: machine } : {};
+}
+
+/**
+ * One activity per machine that has a box, each on its own schedule; one empty
+ * activity when none has. What `holds.activities` answers.
+ */
+export function activitiesOf(
+  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+): MountActivity[] {
+  const names = boxedMachines(mount);
+  if (!names.length) return [activityOf(null, unreadable, keepStoppedDays)];
+  return names.map((n) => activityOf(viewOf(mount, n), unreadable, keepStoppedDays, labelOf(n, names.length > 1)));
+}
+
+/**
+ * The one answer for "is anything running here" (`holds.activity`): a running
+ * machine before a switched-off one, then the most recently used. A running one
+ * is what bills by the second and what makes a rename unsafe, so it is the one
+ * a single answer must not hide.
+ */
+export function summaryActivity(
+  mount: MountState | null, unreadable = 0, keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+): MountActivity {
+  const names = boxedMachines(mount);
+  const used = (n: string) => { const b = mount!.machines[n]!; return b.lastUsedAt || b.createdAt; };
+  const off = (n: string) => parkedAt(mount!.machines[n]) === null ? 0 : 1;
+  const pick = [...names].sort((a, b) => off(a) - off(b) || used(b) - used(a))[0];
+  return pick === undefined
+    ? activityOf(null, unreadable, keepStoppedDays)
+    : activityOf(viewOf(mount, pick), unreadable, keepStoppedDays, labelOf(pick, names.length > 1));
 }
 
 /** What this mount has finished with, newest first, from its own window. */
@@ -862,8 +1092,10 @@ export function keepSessions(prior: Session[] | undefined, next: Session): Sessi
 export function sessionOf(
   state: { boxId: string; createdAt: number; lastUsedAt?: number; execs?: number; saved?: string[] },
   endedAt: number,
+  machine: string = MAIN_MACHINE,
 ): Session {
   return {
+    ...(machine !== MAIN_MACHINE ? { machine } : {}),
     boxId: state.boxId,
     startedAt: state.createdAt,
     endedAt,
@@ -1100,7 +1332,7 @@ async function register(api: Run9Api, project: string, boxId: string, c: Candida
  */
 async function reconcileAccounts(
   ctx: PluginContext, cfg: ReturnType<typeof cfgOf>, state: BoxState, api: Run9Api,
-  want: Awaited<ReturnType<typeof accountsWanted>>,
+  want: Awaited<ReturnType<typeof accountsWanted>>, machine: string,
 ): Promise<BoxState> {
   const had = state.wired ?? [];
   const same = (w: Wired, c: { alias: string; plugin: string; digest: string }) =>
@@ -1124,12 +1356,91 @@ async function reconcileAccounts(
   // does not leave the record promising access the box no longer has.
   if (!next.wired!.length) delete next.wired;
   if (!next.leftOut!.length) delete next.leftOut;
-  await ctx.db.put(BOX_STORE, next as unknown as Json, BOX_KEY);
+  await writeView(ctx, machine, next);
   for (const c of add) {
     next.wired = [...(next.wired ?? []), await register(api, cfg.project, state.boxId, c)];
-    await ctx.db.put(BOX_STORE, next as unknown as Json, BOX_KEY);
+    await writeView(ctx, machine, next);
   }
   return next;
+}
+
+/**
+ * Let one machine go, as `holds.release` does for each it targets.
+ *
+ * Under a lease it is a step, not an end: a running box is switched off and
+ * kept (parkBox), and only one already switched off is deleted. Which step
+ * comes when, and the warning before the deletion, follow from what `activity`
+ * reports for each state. Without a lease the box is handed back for good,
+ * because nothing would ever come back to delete it. Only the idle pass
+ * switches a running box off; an operator's or a benchmark's release means delete.
+ */
+async function releaseMachine(
+  ctx: PluginContext, machine: string, reason: "idle" | undefined, lease: BoxLease | null,
+): Promise<Released | false> {
+  if (lease && reason === "idle") {
+    const state = await readView(ctx, machine);
+    if (state.boxId && parkedAt(state) === null) return parkBox(ctx, machine, state);
+  }
+  const r = await stopBox(ctx, machine);
+  if (r === null) return false;
+  if (!r.freed) {
+    throw markReleased(new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`), r.lease);
+  }
+  return r.lease;
+}
+
+/**
+ * What the `machines` tool answers: every machine of the mount, the default
+ * one always (as "none" when it has no box), from the record alone.
+ *
+ * The times are the idle schedule's own (`activityOf` and idle-lease.ts
+ * `releaseAt`), so what this says is when the idle pass would act if nothing
+ * used the machine before then — not a promise, since any use moves it. Without
+ * a lease there is no schedule: a box is handed back when the turn ends.
+ */
+export function machinesList(
+  mount: MountState | null, cfg: { keepStoppedDays?: unknown; maxMachines?: unknown }, lease: BoxLease | null,
+): Json {
+  const iso = (t: number | null | undefined) => typeof t === "number" && t > 0 ? new Date(t).toISOString() : null;
+  const names = [...new Set([MAIN_MACHINE, ...Object.keys(mount?.machines ?? {})])]
+    .sort((a, b) => a === MAIN_MACHINE ? -1 : b === MAIN_MACHINE ? 1 : a < b ? -1 : a > b ? 1 : 0);
+  const days = keepDaysOf(cfg);
+  const rows = names.map((name) => {
+    const box = mount?.machines[name];
+    if (!box?.boxId) {
+      const from = box?.startFrom ? mount?.envs?.find((e) => e.snapId === box.startFrom)?.name ?? null : null;
+      return { machine: name, state: "none", ...(from ? { startsFrom: from } : {}) };
+    }
+    const live = activityOf(viewOf(mount, name), 0, days).live!;
+    const stopped = parkedAt(box) !== null;
+    const at = lease
+      ? new Date(Math.max(
+          live.lastUsedAt + (stopped ? live.lease!.maxMs! : lease.maxMs),
+          box.quietUntil ?? 0,
+        )).toISOString()
+      : null;
+    return {
+      machine: name,
+      state: stopped ? "switched off" : "running",
+      box: box.boxId,
+      image: box.image ?? null,
+      created: iso(box.createdAt),
+      lastUsed: iso(box.lastUsedAt || box.createdAt),
+      ...(stopped ? { switchedOff: iso(box.parkedAt) } : {}),
+      ...(box.cwd ? { cwd: box.cwd } : {}),
+      ...(at ? (stopped ? { deletedAfter: at } : { switchedOffAfter: at }) : {}),
+    };
+  });
+  const exist = rows.filter((r) => r.state !== "none").length;
+  const max = maxMachinesOf(cfg);
+  return {
+    machines: rows,
+    limit: max,
+    note: (lease
+      ? "times are when it happens if nothing uses the machine before then; any use moves them. "
+      : "a running machine is handed back when the turn ends. ")
+      + `${exist} of at most ${max} exist; a switched-off one counts until it is released.`,
+  } as unknown as Json;
 }
 
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
@@ -1163,6 +1474,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     : "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
       "in this turn — state, installed packages and files carry over from one call to the next, and " +
       "the container is handed back when the turn ends.";
+  // Said in `run` and `shell`, where a second machine is asked for. "Only when you need two at once"
+  // because each one is billed on its own, and an agent told it may name machines would otherwise name
+  // one per task.
+  const machinesSentence =
+    "Every call uses the mount's one machine unless you pass `machine`: another short name is a separate " +
+    "container with its own files, directory and idle schedule, created on first use and released on its " +
+    "own. Use one unless you need two at once; at most a few (3 unless the operator set `maxMachines`) may " +
+    "exist at once, switched-off ones included, and `machines` lists them.";
   return {
   id: "sandbox",
   /** The box record: that a mount has one is listable; the box id, the kept environments and the sessions are not. */
@@ -1184,11 +1503,17 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {
       const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
-      return activityOf(asBoxState(raw), unreadableEntries(raw), keepDaysOf(cfgOf(ctx)));
+      return summaryActivity(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfgOf(ctx)));
+    },
+    /** Each machine on its own: its own schedule, postponement and cost (see `Holding.activities`). */
+    async activities(ctx: PluginContext): Promise<MountActivity[]> {
+      const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
+      return activitiesOf(asMountState(raw), unreadableEntries(raw), keepDaysOf(cfgOf(ctx)));
     },
     /** The window this mount still holds. Bounded on purpose, which is why it is
      *  the console's history and not anybody's ledger. */
     async usage(ctx: PluginContext): Promise<MountUsage[]> {
+      // The shared window: every machine's sessions, each naming its machine when not the default.
       return usageOf(asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY)));
     },
     /** Hands this mount's box back, so an idle one is not left running on the
@@ -1208,31 +1533,37 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  below reads the mount's box record and never looks at the caller's
      *  task.
      *
-     *  Under a lease it is a step, not an end: a running box is switched off
-     *  and kept (parkBox), and only one already switched off is deleted. Which
-     *  step comes when, and the warning before the deletion, follow from what
-     *  `activity` reports for each state. Without a lease the box is handed
-     *  back for good, because nothing would ever come back to delete it. */
-    async release(ctx: PluginContext, opts?: { reason?: "idle" }): Promise<Released | false> {
-      // Only the idle pass switches a running box off; an operator's or a benchmark's release means delete.
-      if (lease && opts?.reason === "idle") {
-        const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-        if (state?.boxId && parkedAt(state) === null) return parkBox(ctx, state);
+     *  What happens to each machine is `releaseMachine`'s. */
+    async release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | false> {
+      // Which machines: the one whose box the framework named (the idle pass acts on one thing at a
+      // time, each on its own clock), or every one the mount has (an operator releasing the mount, a
+      // benchmark, a settled turn without a lease). An id that names no machine now names nothing to
+      // release: the box it meant is already gone or was replaced.
+      const mount = await readMount(ctx);
+      const targets = boxedMachines(mount).filter((n) => !opts?.id || mount!.machines[n]!.boxId === opts.id);
+      const facts: Released[] = [];
+      const errors: string[] = [];
+      // One after another, each to the end: a machine that would not go must not keep the next from going.
+      for (const machine of targets) {
+        try {
+          const fact = await releaseMachine(ctx, machine, opts?.reason, lease);
+          if (fact) facts.push(fact);
+        } catch (e) {
+          const fact = (e as { released?: Released })?.released;
+          if (fact) facts.push(fact);
+          errors.push(String((e as Error)?.message ?? e));
+        }
       }
-      const r = await stopBox(ctx);
-      if (r === null) return false;
       // A container is the one thing here billed for merely existing, so a
       // release that did not release has to say so. stopBox has reported this
       // since the day thirteen boxes were found alive; nothing was listening.
       //
-      // The throw stays — a survivor must not read as a success — but the fact
-      // rides on it, so the case that matters most (still alive, still
-      // charging) is the one case that does not go unrecorded.
-      if (!r.freed) {
-        throw markReleased(
-          new Error(`run9 box ${r.boxId} not released: ${r.error ?? "unknown"}`), r.lease);
-      }
-      return r.lease;
+      // The throw stays — a survivor must not read as a success — but the facts
+      // ride on it, every one of them, so the case that matters most (still
+      // alive, still charging) is the one case that does not go unrecorded.
+      if (errors.length) throw markReleased(new Error(errors.join("; ")), facts.length === 1 ? facts[0]! : facts);
+      if (!facts.length) return false;
+      return facts.length === 1 ? facts[0]! : facts;
     },
   },
   /** `run_js` and `shell` may only have STARTED the work; see `Backgrounding`. */
@@ -1240,7 +1571,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     /** One look at the execution, with no waiting and nothing written. */
     async poll(handle, ctx) {
       const cfg = cfgOf(ctx);
-      const h = handle as { boxId?: string; execId?: string };
+      const h = handle as { boxId?: string; execId?: string; machine?: string };
       if (!h?.execId) throw new Error("not an execution handle");
       const api = apiFor(cfg, ctx);
       const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${h.execId}`);
@@ -1249,8 +1580,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // writing the box record from here would race a second job finishing at
       // the same moment — the read-modify-write `exclusive` exists to prevent,
       // in a new place (Piper, 2026-09-14, `83f0658d`).
-      const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-      return { done: true, result: finished(rec, cfg, state) as Json };
+      // The machine the work was started on; a handle from before machines names none, which was "main".
+      const machine = typeof h.machine === "string" && MACHINE_RE.test(h.machine) ? h.machine : MAIN_MACHINE;
+      const state = await readView(ctx, machine);
+      return { done: true, result: finished(rec, cfg, state, machine) as Json };
     },
     /**
      * Stop it and stop paying for it — and say so when it did not stop.
@@ -1361,6 +1694,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       summary: "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
     { name: "keepStoppedDays", type: "number", default: DEFAULTS.keepStoppedDays,
       summary: "Days a container switched off for being idle keeps its disk before it is deleted; the agent is told a day before (at most half of this)." },
+    { name: "maxMachines", type: "number", default: DEFAULTS.maxMachines,
+      summary: "How many machines (separate named containers) an agent may have on this mount at once, the default one included. Switched-off ones count, since each keeps a disk; one more is refused until one is released." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
     { name: "endpoint", type: "string", summary: "API endpoint.", default: "https://api.run.sys9.ai" },
     // Who can say whether this mount's credential works, which stops being run9
@@ -1380,11 +1715,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "LAST RESORT for JavaScript. Prefer an ordinary code block, which is instant and free; this " +
         "starts a container that is billed for every second it exists, and it cannot call your other " +
         "tools. Use it only when you genuinely need npm packages, a real filesystem, or more than a " +
-        "few seconds of compute. " + runLifetime,
+        "few seconds of compute. " + runLifetime + " " + machinesSentence,
       parameters: {
         type: "object",
         properties: {
           code: { type: "string", description: "JavaScript, run with `node -e`" },
+          machine: MACHINE_PARAM,
           install: {
             type: "array", items: { type: "string" },
             description: "npm packages to install first, e.g. ['zod']",
@@ -1407,11 +1743,12 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "and a command handed over as a job does not move the directory. Only for what needs a real " +
         "machine (builds, tests, git). " + defaultImageSentence(DEFAULTS.image) + " An operator may have configured a " +
         "different image; every result reports which one this container started from, so read that " +
-        "instead of probing for it. Save anything worth keeping, then release.",
+        "instead of probing for it. Save anything worth keeping, then release. " + machinesSentence,
       parameters: {
         type: "object",
         properties: {
           command: { type: "string" },
+          machine: MACHINE_PARAM,
           workdir: {
             type: "string",
             description: "directory to run this command in; relative paths start from the current one. Omit it to start where the previous command ended",
@@ -1434,6 +1771,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         properties: {
           path: { type: "string", description: "absolute path inside the box" },
           archive: { type: "boolean", description: "true to take a directory as a tar" },
+          machine: MACHINE_PARAM,
         },
         required: ["path"],
       },
@@ -1456,6 +1794,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         properties: {
           name: { type: "string", description: "short name you will recognise later, e.g. 'py-scipy'" },
           note: { type: "string", description: "one line on what is in it" },
+          machine: MACHINE_PARAM,
         },
         required: ["name"],
       },
@@ -1468,10 +1807,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         "Begin from an environment kept earlier instead of a bare image. Naming one releases the " +
         "current container if there is one; the next run or shell starts from the snapshot. Call " +
         "with no name to see what has been kept, which releases nothing. Setting up a machine is usually the slowest and most " +
-        "expensive part of using one, and this is how you stop paying for it twice.",
+        "expensive part of using one, and this is how you stop paying for it twice. Pass `machine` to start that " +
+        "machine from it instead of the default one; kept environments are shared by all of the mount's machines.",
       parameters: {
         type: "object",
-        properties: { name: { type: "string" } },
+        properties: {
+          name: { type: "string", description: "the kept environment to start from; omit to list them" },
+          machine: MACHINE_PARAM,
+        },
       },
       sideEffects: "write",
       idempotency: "none",
@@ -1503,6 +1846,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
             type: "array", items: { type: "string" },
             description: "absolute paths to keep before destroying the box",
           },
+          machine: MACHINE_PARAM,
         },
       },
       // Irreversible, and declared as what it is. `sideEffects` is what the
@@ -1533,6 +1877,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
             type: "number",
             description: "how many more minutes to keep the container, from now; a request over the mount's limit is refused, not shortened",
           },
+          machine: MACHINE_PARAM,
         },
         required: ["minutes"],
       },
@@ -1540,6 +1885,16 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // box costs. Not idempotent, because each call moves the instant.
       sideEffects: "write",
       idempotency: "none",
+    },
+    {
+      name: "machines",
+      summary:
+        "List this mount's machines: each one's name, whether it is running or switched off, its image, " +
+        "when it was created and last used, and when it will be switched off or deleted if nothing uses it. " +
+        "Reads the record only; starts, wakes and bills nothing.",
+      parameters: { type: "object", properties: {} },
+      sideEffects: "read",
+      idempotency: "native",
     },
   ],
 
@@ -1646,11 +2001,20 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
 
 
   async invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json> {
+    if (tool === "machines") return machinesList(await readMount(ctx), cfgOf(ctx), lease);
+    // Which machine this call is about; refused before anything is read or started.
+    const machine = machineOf(args);
+    const named = machine !== MAIN_MACHINE ? { machine } : {};
     // Checked before anything else: neither releasing nor choosing an
     // environment should be the thing that starts a container.
-    const prior = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-    if (tool === "release" && !prior?.boxId) {
-      return { released: false, note: "nothing was running" };
+    const prior = await readView(ctx, machine);
+    if (tool === "release" && !prior.boxId) {
+      return { released: false, note: machine === MAIN_MACHINE ? "nothing was running" : `nothing was running on machine "${machine}"`, ...named };
+    }
+    // Saving out of, or keeping, a named machine that does not exist would start one only to copy its
+    // empty disk; "main" keeps its old behaviour.
+    if ((tool === "save" || tool === "keep") && machine !== MAIN_MACHINE && !prior.boxId) {
+      throw new Error(`there is no machine "${machine}" to ${tool} from; \`machines\` lists the ones that exist`);
     }
 
     if (tool === "start_from") {
@@ -1674,12 +2038,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (!env) throw new Error(`no environment named ${want}; kept: ${envs.map((e) => e.name).join(", ") || "none"}`);
       // Releasing first, because the choice applies to the next container and
       // silently leaving the old one running is how a machine gets forgotten.
-      const released = prior?.boxId ? await stopBox(ctx) : null;
-      const after = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
-      await ctx.db.put(BOX_STORE, { ...(after ?? { boxId: "", createdAt: 0, lastUsedAt: 0 }),
-        startFrom: env.snapId } as unknown as Json, BOX_KEY);
+      const released = prior.boxId ? await stopBox(ctx, machine) : null;
+      const after = await readView(ctx, machine);
+      await writeView(ctx, machine, { ...after, startFrom: env.snapId });
       return {
-        startingFrom: env.name, note: "the next run or shell starts from this environment",
+        startingFrom: env.name, ...named,
+        note: machine === MAIN_MACHINE
+          ? "the next run or shell starts from this environment"
+          : `the next run or shell on machine "${machine}" starts from this environment`,
         released: !!released,
         // The kernel reads this by name; `released` above is the model's
         // boolean and stays what it was.
@@ -1719,7 +2085,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
           note: "this mount has no idle release to postpone: the container is handed back when the turn ends",
         };
       }
-      if (!prior?.boxId) return { quiet: false, note: "nothing is running, so there is no release to postpone" };
+      if (!prior.boxId) return { quiet: false, note: "nothing is running, so there is no release to postpone", ...named };
       const quietUntil = Date.now() + asked * 60_000;
       // The postponement is its own instant, and `lastUsedAt` is deliberately
       // NOT touched, unlike every other handler here: the idle pass keeps the box
@@ -1727,9 +2093,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // still tell "used" from "kept by request". Postponing is not using the
       // machine. There is no total cap: each postponement is a call the agent
       // chose to make, within this mount's limit.
-      await ctx.db.put(BOX_STORE, { ...prior, quietUntil } as unknown as Json, BOX_KEY);
+      await writeView(ctx, machine, { ...prior, quietUntil });
       return {
-        quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString(),
+        quiet: true, box: prior.boxId, ...named, minutes: asked, until: new Date(quietUntil).toISOString(),
         ...(parkedAt(prior) !== null ? { note: "it stays switched off; this postpones its deletion" } : {}),
       };
     }
@@ -1752,22 +2118,38 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       return parsed;
     };
 
-    // One box per mount, remembered, so an install survives to the next call.
-    let state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
+    // One box per machine, remembered, so an install survives to the next call.
+    let state: BoxState | null = await readView(ctx, machine);
     // An emptied record keeps the session history and what was kept, but has no box.
-    const history = state?.sessions ?? [];
-    const kept = state?.envs ?? [];
-    if (state && !state.boxId) state = null;
+    const history = state.sessions ?? [];
+    const kept = state.envs ?? [];
+    if (!state.boxId) state = null;
     let created = false;
     if (!state) {
+      // The limit counts boxes that exist, switched-off ones included: each keeps a disk. Checked before
+      // anything is asked of run9, so a refused machine costs nothing.
+      const mount = await readMount(ctx);
+      const others = boxedMachines(mount).filter((n) => n !== machine);
+      const max = maxMachinesOf(cfg);
+      if (others.length >= max) {
+        const listed = others.map((n) => `${n} (${parkedAt(mount!.machines[n]) === null ? "running" : "switched off"})`).join(", ");
+        throw new Error(
+          `\`${ctx.alias}\` already has ${others.length} machine${others.length === 1 ? "" : "s"}, the most it may have at once ` +
+          `(maxMachines ${max}), so machine "${machine}" was not created: ${listed}. Use one of these by passing its ` +
+          `name as \`machine\`, or \`release\` one (with its \`machine\`) that you no longer need.`,
+        );
+      }
       created = true;
-      const boxId = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`
-        .toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 40) + `-${Date.now().toString(36)}`;
+      // Named machines put their name in the id, inside the same length as before: run9's ids are the
+      // project's, and two machines of one agent created in one millisecond must still differ.
+      const owner = `h-${ctx.caller.tenantId}-${ctx.caller.agentId}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      const boxId = (machine === MAIN_MACHINE ? owner.slice(0, 40) : `${owner.slice(0, 39 - machine.length)}-${machine}`)
+        + `-${Date.now().toString(36)}`;
       // `state` is null in this branch by construction — the line above nulls an
       // emptied record, and `start_from` writes exactly that — so the value can
       // only come from the record read at the top of this call. `BoxState`
       // declares the field, so there is nothing here to cast around either.
-      const from = prior?.startFrom;
+      const from = prior.startFrom;
       // What every result will report this container as: the setting, or the
       // image the kept environment itself started from. Unknown stays unknown.
       const image = from ? kept.find((e) => e.snapId === from)?.image : cfg.image;
@@ -1807,14 +2189,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         ...(image ? { image } : {}),
         ...(kept.length ? { envs: kept } : {}),
       };
-      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
+      await writeView(ctx, machine, state);
       // The value never enters the box and never reaches the model: only the
       // placeholder does, and run9 swaps it in on the way out.
       // `envs` above: release carries them over because a snapshot outlives its
       // box, and a new record written without them erased the list on the next
       // container's first command, stranding the snapshots in run9.
-      state = await reconcileAccounts(ctx, cfg, state, api, want);
-      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
+      state = await reconcileAccounts(ctx, cfg, state, api, want, machine);
+      await writeView(ctx, machine, state);
     }
 
     // A box the idle lease switched off starts again on the next exec on its id, disk intact, so it is reused
@@ -1826,7 +2208,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       const { parkedAt: _p, quietUntil: _q, ...running } = state;
       const t = Date.now();
       state = { ...running, createdAt: t, lastUsedAt: t, execs: 0, saved: [] };
-      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
+      await writeView(ctx, machine, state);
     }
 
     /**
@@ -1864,7 +2246,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // (tygg, 2026-09-14, `64c275ab`).
       const shown = toAgentRef(stored.ref, ctx.caller) ?? stored.ref;
       state = { ...state!, saved: [...(state!.saved ?? []), shown], lastUsedAt: Date.now() };
-      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
+      await writeView(ctx, machine, state);
       return { path, ref: shown, bytes: body.length };
     };
 
@@ -1895,9 +2277,9 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       };
       const envs = [env, ...(state!.envs ?? []).filter((e) => e.name !== name)].slice(0, 20);
       state = { ...state!, envs, lastUsedAt: Date.now() };
-      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
+      await writeView(ctx, machine, state);
       return {
-        kept: name, snapshot: snapId,
+        kept: name, snapshot: snapId, ...named,
         note: keptNote(lease),
       };
     }
@@ -1914,14 +2296,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       for (const path of ((args as any)?.save ?? []) as string[]) {
         kept.push(await saveOut(path, false));
       }
-      const r = await stopBox(ctx);
-      if (!r) return { released: false, note: "nothing was running", saved: kept };
+      const r = await stopBox(ctx, machine);
+      if (!r) return { released: false, note: "nothing was running", saved: kept, ...named };
       // Both outcomes report the lease: a release that failed is the case the
       // recorder most needs, because that box is still alive and still billing.
       return r.freed
-        ? { released: true, box: r.boxId, liveMs: r.liveMs, saved: kept, [LEASE_KEY]: r.lease,
+        ? { released: true, box: r.boxId, ...named, liveMs: r.liveMs, saved: kept, [LEASE_KEY]: r.lease,
             note: "the container and its files are gone; anything saved above is not" }
-        : { released: false, box: r.boxId, error: r.error, saved: kept, [LEASE_KEY]: r.lease };
+        : { released: false, box: r.boxId, ...named, error: r.error, saved: kept, [LEASE_KEY]: r.lease };
     }
 
     const wd = cfg.workdir;
@@ -1988,7 +2370,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       { command: argv, ...(workdir ? { workdir } : {}) },
     )).exec_id as string;
     // The box just created was wired from the mount a moment ago; any other is checked again.
-    if (!created) state = await reconcileAccounts(ctx, cfg, state!, api, await accountsWanted(ctx, cfg));
+    if (!created) state = await reconcileAccounts(ctx, cfg, state!, api, await accountsWanted(ctx, cfg), machine);
     let execId = await start(execArgv(cfg, command, envFor(state)), startIn);
     let movedFrom: string | null = null;
 
@@ -1997,7 +2379,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // one place, because a result built twice is two rules about one shape
     // and they drift (the lesson of #291).
     const afterStart: BoxState = { ...state, lastUsedAt: Date.now(), execs: (state.execs ?? 0) + 1 };
-    await ctx.db.put(BOX_STORE, afterStart as unknown as Json, BOX_KEY);
+    await writeView(ctx, machine, afterStart);
 
     const grace = Date.now() + cfg.graceMs;
     for (;;) {
@@ -2008,7 +2390,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // rather than run the command somewhere it did not ask for.
       if (rec.state === "error" && askedDir && /failed to start/i.test(String(rec.reason ?? ""))) {
         return {
-          ...finished(rec, cfg, state),
+          ...finished(rec, cfg, state, machine),
           note: `${askedDir} does not exist in the container; create it first, or leave workdir out`,
         };
       }
@@ -2019,14 +2401,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         continue;
       }
       if (TERMINAL.includes(rec.state)) {
-        const result = finished(rec, cfg, state);
+        const result = finished(rec, cfg, state, machine);
         // Only the call that ran the command writes the directory: a job finished
         // later through the poll must not write the box record (see pollBackground),
         // so a command handed over does not move the shell, as `&` would not.
         const cwd = tool === "shell" ? splitCwd(String(rec.output_summary ?? "")).cwd : null;
         const moved = movedFrom !== null && (state.cwd ?? null) !== null;
         if (tool === "shell" && (cwd ?? null) !== (state.cwd ?? null)) {
-          await ctx.db.put(BOX_STORE, { ...afterStart, cwd: cwd ?? undefined } as unknown as Json, BOX_KEY);
+          await writeView(ctx, machine, { ...afterStart, cwd: cwd ?? undefined });
         }
         return moved
           ? { ...result, note: `${movedFrom} no longer exists, so this command started in ${wd}` }
@@ -2042,7 +2424,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
         // the cancelling — `timeoutMs` no longer means "how long the Worker
         // holds".
         return backgrounded(
-          { boxId: state.boxId, execId },
+          { boxId: state.boxId, execId, ...named },
           `running in the container; its result arrives on its own, and \`jobs\` lists what is running`,
         );
       }

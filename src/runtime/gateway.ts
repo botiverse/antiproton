@@ -9,7 +9,7 @@ import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclus
 import { Backgrounded } from "../plugins/types.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
-import { isReleased, leaseRow } from "../trace/seams.ts";
+import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
 import { toolCallRows } from "../usage/outbox.ts";
 
@@ -398,7 +398,31 @@ export class ToolGateway {
     // true one: nothing of this mount's is running.
     const holding = plugin ? holdingOf(plugin) : null;
     if (!mount || !holding) return { live: null };
-    return holding.activity({
+    return holding.activity(this.#quietContext(ctx, mount));
+  }
+
+  /**
+   * Every thing one mount is holding, each with its own activity (`Holding.activities`), for the callers
+   * that act on each: the idle pass and the holding sentences. A plugin that holds at most one thing
+   * answers with its one `activity`. Same rules as `mountActivity`: no credential is resolved.
+   */
+  async mountActivities(
+    ctx: { tenantId: string; agentId: string; taskId: string }, alias: string,
+  ): Promise<MountActivity[]> {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) : null;
+    const holding = plugin ? holdingOf(plugin) : null;
+    if (!mount || !holding) return [{ live: null }];
+    const pctx = this.#quietContext(ctx, mount);
+    return holding.activities ? holding.activities(pctx) : [await holding.activity(pctx)];
+  }
+
+  /** The context `activity` and `usage` are asked in: the mount's own database, and no credential. */
+  #quietContext(
+    ctx: { tenantId: string; agentId: string; taskId: string },
+    mount: MountRecord,
+  ): PluginContext {
+    return {
       caller: { tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId },
       alias: mount.alias,
       credential: null,
@@ -407,7 +431,7 @@ export class ToolGateway {
       async sibling() { return null; },
       async sandboxForms() { return []; },
       async agentSecret() { return null; },
-    });
+    };
   }
 
   /**
@@ -464,7 +488,11 @@ export class ToolGateway {
      *  per-mount — it is handed the alias and that mount's own database —
      *  and the fan-out is here, so this is where a caller that means one box
      *  says so (Piper, 2026-09-12). */
-    opts?: { alias?: string; reason?: "idle" },
+    opts?: {
+      alias?: string; reason?: "idle";
+      /** One held thing of that mount, by its `live.id` (`Holding.release`); absent, all it holds. */
+      id?: string;
+    },
   ): Promise<{ released: string[]; failed: Array<{ alias: string; error: string }> }> {
     const released: string[] = [];
     const failed: Array<{ alias: string; error: string }> = [];
@@ -486,7 +514,9 @@ export class ToolGateway {
           async sibling() { return null; },
           async sandboxForms() { return []; },
           async agentSecret() { return null; },
-        }, opts?.reason ? { reason: opts.reason } : undefined);
+        }, opts?.reason || opts?.id
+          ? { ...(opts.reason ? { reason: opts.reason } : {}), ...(opts.id ? { id: opts.id } : {}) }
+          : undefined);
         // Behind the same lock as a call on this mount, for an exclusive
         // plugin: a release reads the state, destroys the box and writes the
         // state back, and a `shell` landing between those steps leaves a live
@@ -499,13 +529,13 @@ export class ToolGateway {
         if (did !== false) released.push(mount.alias);
         // The lease's end, as the plugin reported it from its own read, into the
         // trace outbox (src/trace/seams.ts). A boolean or nothing reports no
-        // fact and writes no row.
-        if (isReleased(did)) await this.#lease(ctx, mount.alias, did);
+        // fact and writes no row; a mount that let go of several things reports
+        // one for each.
+        for (const fact of releasedFacts(did)) await this.#lease(ctx, mount.alias, fact);
       } catch (e) {
         // A release that did not release is still an ended lease, and the most
         // expensive one: the plugin attaches the fact to the error it throws.
-        const fact = (e as { released?: unknown })?.released;
-        if (isReleased(fact)) await this.#lease(ctx, mount.alias, fact);
+        for (const fact of releasedFacts((e as { released?: unknown })?.released)) await this.#lease(ctx, mount.alias, fact);
         // Best effort, but not silent. Swallowing this is how a metered
         // container stays alive with nothing left that would notice — the
         // same failure, one layer up, that stopBox was fixed for.
@@ -758,7 +788,7 @@ export class ToolGateway {
     } catch (err) {
       const e = err as Error & PluginErrorFields & { retryable?: boolean; released?: unknown };
       // A release tool that failed to release still ended a lease (see releaseTask).
-      if (isReleased(e.released)) await this.#lease(ctx, r.mount.alias, e.released);
+      for (const fact of releasedFacts(e.released)) await this.#lease(ctx, r.mount.alias, fact);
       // A request that may have landed is "unknown", not "failed" (§8.3).
       const status = e.retryable ? "unknown" : "failed";
       // The same two fields go onto the RECORD, not only onto what this call returns. The returned

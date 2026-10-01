@@ -113,6 +113,14 @@ export function spanText(ms: number): string {
   return n(Math.round(ms / 86_400_000), "day");
 }
 
+/**
+ * The arguments a held thing's tools need, as said after the tool's name: ` with {"machine":"build"}`, or
+ * nothing when the tools act on it without any (`MountActivity.live.args`).
+ */
+export function withArgs(args: Record<string, unknown> | null | undefined): string {
+  return args && Object.keys(args).length ? ` with ${JSON.stringify(args)}` : "";
+}
+
 /** When it goes: the idle ceiling, or the agent's postponement if that is later. */
 export function releaseAt(i: Pick<IdleInput, "lastUsedAt" | "postponedUntil" | "maxMs">): number {
   return Math.max(i.lastUsedAt + i.maxMs, i.postponedUntil ?? 0);
@@ -156,15 +164,20 @@ export function warningText(
   idleMs: number,
   untilReleaseMs: number,
   maxPostponeMinutes: number | null,
-  /** What the release does to this thing, and what to do first; the held thing's own words. */
-  said: { consequence?: string | null; advice?: string | null } = {},
+  /**
+   * What the release does to this thing, and what to do first; the held thing's own words. With `name`
+   * and `args` when the mount holds several (`MountActivity.live`), so the warning says which one and
+   * the tools are named with what makes them act on it.
+   */
+  said: { consequence?: string | null; advice?: string | null; name?: string | null; args?: Record<string, unknown> | null } = {},
 ): string {
+  const args = withArgs(said.args);
   const keep = names.postpone
-    ? `To keep it, call \`${names.postpone}\` with how many more minutes you need`
+    ? `To keep it, call \`${names.postpone}\`${args} with how many more minutes you need`
       + (maxPostponeMinutes ? ` (at most ${maxPostponeMinutes})` : "")
       + `; you will not be told again until shortly before then. `
     : "";
-  const done = names.release ? `If you are done with it, call \`${names.release}\`.` : "";
+  const done = names.release ? `If you are done with it, call \`${names.release}\`${args}.` : "";
   // Delivered as a message, so it arrives where a person's words go; saying whose it is keeps the warning
   // from being read as the person asking for something (task #19).
   //
@@ -175,7 +188,7 @@ export function warningText(
   // sentence and the only description here, so what is at stake is still said
   // — by whoever knows it.
   return `[a notice from the harness, not a message from the user] `
-    + `The \`${alias}\` mount has been idle for ${spanText(idleMs)}, and `
+    + `The \`${alias}\` mount${said.name ? `'s ${JSON.stringify(said.name)}` : ""} has been idle for ${spanText(idleMs)}, and `
     + `${said.consequence || "what it is holding will be released"} in ${spanText(untilReleaseMs)}`
     + (billing ? ` — ${billing}` : "") + `. `
     + (said.advice ? `${said.advice} ` : "")

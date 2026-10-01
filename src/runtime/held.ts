@@ -16,6 +16,7 @@
  * without touching this file.
  */
 import type { Holding, MountActivity, Plugin } from "../plugins/types.ts";
+import { withArgs } from "./idle-lease.ts";
 
 /** One thing an agent is holding, with everything the three sentences need. */
 export interface Held {
@@ -39,26 +40,36 @@ export interface Held {
 export async function heldResources(
   mounts: readonly { alias: string; plugin: string }[],
   plugins: readonly Plugin[],
-  activityOf: (alias: string) => Promise<MountActivity>,
+  /** One mount's activity, or each of its held things' (`Holding.activities`, `mountActivities`). */
+  activityOf: (alias: string) => Promise<MountActivity | MountActivity[]>,
 ): Promise<Held[]> {
   const byId = new Map(plugins.map((p) => [p.id, p]));
   const out: Held[] = [];
   for (const mount of mounts) {
     const holds = byId.get(mount.plugin)?.holds;
     if (!holds) continue;
-    const activity = await activityOf(mount.alias);
-    // Nothing alive is not something to tell an agent about; it is the answer
-    // to a question nobody asked.
-    if (!activity.live) continue;
-    out.push({
-      alias: mount.alias,
-      live: activity.live,
-      quietUntil: activity.quietUntil ?? null,
-      billing: activity.billing ?? null,
-      tools: holds.tools,
-    });
+    const answer = await activityOf(mount.alias);
+    // One Held per held thing, so a mount holding two machines gets two
+    // schedules, two warnings and two releases, each keyed by its own id.
+    for (const activity of Array.isArray(answer) ? answer : [answer]) {
+      // Nothing alive is not something to tell an agent about; it is the answer
+      // to a question nobody asked.
+      if (!activity.live) continue;
+      out.push({
+        alias: mount.alias,
+        live: activity.live,
+        quietUntil: activity.quietUntil ?? null,
+        billing: activity.billing ?? null,
+        tools: holds.tools,
+      });
+    }
   }
   return out;
+}
+
+/** The thing as the agent knows it: its name beside the id when the plugin gave one. */
+function thingOf(live: Held["live"]): string {
+  return live.name ? `${live.name} (${live.id})` : live.id;
 }
 
 /** How the runtime names a mount's tool to the model, or null when it is not offered. */
@@ -85,10 +96,10 @@ export function heldPrompt(held: readonly Held[], nameOf: NameOf): string | null
     const postpone = h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null;
     const since = new Date(h.live.startedAt).toISOString().slice(11, 16);
     const how = [
-      release ? `\`${release}\` lets it go` : null,
-      postpone ? `\`${postpone}\` keeps it longer` : null,
+      release ? `\`${release}\`${withArgs(h.live.args)} lets it go` : null,
+      postpone ? `\`${postpone}\`${withArgs(h.live.args)} keeps it longer` : null,
     ].filter(Boolean).join("; ");
-    return `- \`${h.alias}\`: ${h.live.id}, held since ${since} UTC${h.billing ? ` — ${h.billing}` : ""}.`
+    return `- \`${h.alias}\`: ${thingOf(h.live)}, held since ${since} UTC${h.billing ? ` — ${h.billing}` : ""}.`
       + (how ? ` ${how}.` : "");
   });
   return `You are already holding these, from before this session began:\n${lines.join("\n")}`;
@@ -107,8 +118,13 @@ export function heldLine(h: Held, nameOf: NameOf, now: number): string {
   const release = nameOf(h.alias, h.tools.release);
   const idleMin = Math.max(0, Math.round((now - h.live.lastUsedAt) / 60_000));
   const idle = idleMin >= 1 ? `, idle ${idleMin} minute${idleMin === 1 ? "" : "s"}` : "";
-  return `[${h.alias} is still holding ${h.live.id}${idle}${h.billing ? `; ${h.billing}` : ""}.`
-    + (release ? ` Call \`${release}\` when you are done with it.]` : "]");
+  return `[${h.alias} is still holding ${thingOf(h.live)}${idle}${h.billing ? `; ${h.billing}` : ""}.`
+    + (release ? ` Call \`${release}\`${withArgs(h.live.args)} when you are done with it.]` : "]");
+}
+
+/** The lines for every thing one mount holds, one per line; null when it holds nothing. */
+export function heldLines(held: readonly Held[], nameOf: NameOf, now: number): string | null {
+  return held.length ? held.map((h) => heldLine(h, nameOf, now)).join("\n") : null;
 }
 
 /**

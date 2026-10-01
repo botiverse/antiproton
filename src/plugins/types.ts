@@ -833,6 +833,18 @@ export interface MountActivity {
       /** The longest single postponement the postpone tool accepts for this thing now, in minutes. */
       maxPostponeMinutes?: number;
     };
+    /**
+     * What the agent calls this thing, when a mount holds several (`Holding.activities`) or this one is
+     * not the mount's default. Said beside the id in the holding sentences, so an agent holding two can
+     * tell which one a warning is about. Absent: the mount's only, default thing.
+     */
+    name?: string;
+    /**
+     * What the release and postpone tools must be passed to act on this thing rather than the mount's
+     * default one; the plugin's own parameter names. The holding sentences quote it after the tool's
+     * name. Absent: the tools act on this thing when called with no such argument.
+     */
+    args?: Record<string, Json>;
   } | null;
   /** Until when the agent asked not to be reminded about it, if it did. */
   quietUntil?: number | null;
@@ -1210,8 +1222,8 @@ export const LEASE_KEY = "__ap_lease__";
  * carries it instead, the way `markIdentity` carries the identity of a failed
  * call.
  */
-export function markReleased<E extends Error>(error: E, fact: Released): E & { released: Released } {
-  const marked = error as E & { released: Released };
+export function markReleased<E extends Error, F extends Released | Released[]>(error: E, fact: F): E & { released: F } {
+  const marked = error as E & { released: F };
   marked.released = fact;
   return marked;
 }
@@ -1248,6 +1260,21 @@ export interface Holding {
    */
   activity(ctx: PluginContext): Promise<MountActivity>;
   /**
+   * Every thing this mount is holding, each with its own activity, when it can hold more than one.
+   *
+   * A separate method rather than siblings inside `MountActivity`, because what differs between two held
+   * things is not only `live`: each has its own postponement (`quietUntil`) and its own cost sentence
+   * (`billing`) — a sandbox mount can hold one machine that is running and billed by the second beside
+   * one that is switched off and only keeps a disk. A list of `live` alone would have to borrow one of
+   * them for the other. `activity` stays the one answer for callers whose question is "is anything here"
+   * (the console's card, rename safety); this is for the callers that act on each thing (the idle pass,
+   * the holding sentences), which pass the thing's `live.id` back to `release` to act on that one only.
+   *
+   * Absent: the mount holds at most one thing, and `activity` is the whole answer. Same rules as
+   * `activity`: no credential, no call to the far end. Entries with `live: null` are allowed and ignored.
+   */
+  activities?(ctx: PluginContext): Promise<MountActivity[]>;
+  /**
    * What it has cost, as far as this mount can still say. A rolling window is a
    * legitimate answer: this is not a ledger, and anything that has to be
    * complete is written where it happens.
@@ -1261,8 +1288,13 @@ export interface Holding {
    * `reason: "idle"` is the framework's idle pass reaching the end of the thing's schedule; a plugin
    * may answer it with a gentler step (the sandbox switches a running box off and keeps it). Any other
    * caller (an operator, a benchmark, a settled turn without a lease) means let go now.
+   *
+   * `id` is one held thing's `live.id`, as `activity`/`activities` reported it: let go of that one only,
+   * and answer `false` when nothing by that id is held any more. Absent: everything the mount holds.
+   * Letting go of several may report a fact for each (an array), and a failure among them throws with
+   * every fact attached (`markReleased`).
    */
-  release(ctx: PluginContext, opts?: { reason?: "idle" }): Promise<Released | boolean | void>;
+  release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | boolean | void>;
 }
 
 /**
