@@ -63,7 +63,8 @@ Write one program for:
 
 For a single lookup, call the tool directly instead. Never wrap one plain call
 in run_js. And make a call that needs \`confirm: true\` directly, on its own:
-inside run_js it is not shown to the user for approval, it fails the program.
+inside run_js it fails the program, while the request is still recorded, so
+approving it later runs that one call by itself.
 
 Each run starts from nothing: globals, variables and anything you set on
 globalThis are gone by the next run, so carry what you need in your own output
