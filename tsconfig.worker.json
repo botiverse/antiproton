@@ -82,7 +82,8 @@
     "test/spec/control-plane-spec.ts",
     "test/spec/usage-spec.ts",
     "test/mount-reports.ts",
-    "test/run-js-resume.ts"
+    "test/run-js-resume.ts",
+    "test/tool-interrupts.ts"
   ],
   "exclude": ["node_modules"]
 }

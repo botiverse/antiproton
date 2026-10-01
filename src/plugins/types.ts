@@ -1,4 +1,5 @@
 import type { Json, MountPolicy } from "../core/types.ts";
+import type { AnswerSpec } from "../core/execution.ts";
 
 export interface ToolSchema {
   name: string;
@@ -513,6 +514,10 @@ export function holdingOf(p: Pick<Plugin, "holds">): Holding | null {
 
 export function backgroundOf(p: Pick<Plugin, "background">): Backgrounding | null {
   return p.background ?? null;
+}
+
+export function interruptsOf(p: Pick<Plugin, "interrupts">): Interrupting | null {
+  return p.interrupts ?? null;
 }
 
 export function isExclusive(p: Pick<Plugin, "holds">): boolean {
@@ -1037,6 +1042,70 @@ export class Backgrounded {
 }
 
 /**
+ * What a tool returns when it needs the AGENT's decision before it acts: a
+ * question, what it found, and what answer it expects. The tool is then a
+ * generator: it yields this, the model answers with `resume`, and the
+ * plugin's {@link Interrupting.resume} takes the next step, which may return a
+ * result or ask again. A model that gives up, or lets the token expire, ends
+ * it through {@link Interrupting.cancel}, and nothing more runs.
+ *
+ * Not a person's approval: a held call (`confirm: true`, a policy) waits for a
+ * human and is unchanged. This asks the model, from inside the tool, because
+ * only the tool can see from its own arguments and findings that the call
+ * needs a second look (a `DELETE` with no `WHERE`; a message whose
+ * conversation moved on).
+ *
+ * A class for the reason {@link Backgrounded} is one: a result is arbitrary
+ * `Json`, and no agreed key is safe from real data; `instanceof` cannot be
+ * produced by data.
+ *
+ * `state` is the plugin's own: kept on the host beside the token, handed back
+ * to `resume`/`cancel`, and never shown to the model or settable by it. It
+ * lives in the object's memory only, like a suspended run_js program, so it
+ * is lost when the object restarts and the model is told the token is gone;
+ * correctness must not depend on it surviving. It must never carry a
+ * credential: `resume` is given the same context a call is.
+ */
+export class Interrupt {
+  readonly question: string;
+  readonly context?: Json;
+  readonly answer: AnswerSpec;
+  readonly state: Json;
+  constructor(o: { question: string; context?: Json; answer: AnswerSpec; state?: Json }) {
+    this.question = o.question;
+    if (o.context !== undefined) this.context = o.context;
+    this.answer = o.answer;
+    this.state = o.state ?? null;
+  }
+}
+
+/** `return interrupt({ question, context, answer: { choices: [...] }, state })` — see {@link Interrupt}. */
+export function interrupt(o: { question: string; context?: Json; answer: AnswerSpec; state?: Json }): Interrupt {
+  return new Interrupt(o);
+}
+
+/**
+ * The other half of a plugin whose tools may return {@link Interrupt}.
+ *
+ * `resume` is called once per answer, with the interrupt's `state` and an
+ * `answer` the host has already checked against the interrupt's spec; it
+ * returns the tool's result, or another `Interrupt`. It runs as its own
+ * recorded operation of the same tool, behind the same mount lock, with the
+ * same context a call gets.
+ *
+ * `cancel` is for a plugin that took something when it asked (a lock, a
+ * reservation) and must give it back when the model cancels or the token
+ * expires. Absent: nothing to give back. Best effort: a throw is reported,
+ * never retried.
+ *
+ * Declaring it is also what tells the runtime to offer the model `resume`.
+ */
+export interface Interrupting {
+  resume(tool: string, state: Json, answer: Json, ctx: PluginContext): Promise<Json | Interrupt>;
+  cancel?(tool: string, state: Json, ctx: PluginContext): Promise<void>;
+}
+
+/**
  * One request a service sent to a mount's inbound URL, as it arrived.
  *
  * The body is bytes, not text, because services sign the bytes: GitHub's
@@ -1368,6 +1437,8 @@ export interface Plugin {
   holds?: Holding;
   /** `invoke` may return {@link Backgrounded}; see {@link Backgrounding}. */
   background?: Backgrounding;
+  /** `invoke` may return {@link Interrupt}; see {@link Interrupting}. */
+  interrupts?: Interrupting;
   /**
    * What environment this plugin can give a session.
    *
@@ -1404,10 +1475,11 @@ export interface Plugin {
   checkCredential?(ctx: PluginContext): Promise<CredentialCheck>;
   /**
    * Do the thing. Returning {@link Backgrounded} means it has started and the
-   * caller should be given a job rather than a result — every other return is
-   * the result itself.
+   * caller should be given a job rather than a result; returning
+   * {@link Interrupt} means the model must decide before it goes on — every
+   * other return is the result itself.
    */
-  invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json | Backgrounded>;
+  invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json | Backgrounded | Interrupt>;
 
 
 

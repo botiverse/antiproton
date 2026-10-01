@@ -29,7 +29,7 @@ import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/sess
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
-import { bridgeTools, type MountedTool, type ToolHost } from "./pi-tools.ts";
+import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 
 const JOBS = `CREATE TABLE IF NOT EXISTS pi_model_jobs (
   id TEXT PRIMARY KEY, request TEXT NOT NULL, answer TEXT,
@@ -157,6 +157,9 @@ export interface PiAgentOptions {
   model: ModelChoice;
   tools: MountedTool[];
   toolHost: ToolHost;
+  /** Where a mounted tool's question waits for `resume` (plugins/types.ts `Interrupt`).
+   *  Absent: a question is dropped at once and the model told so. */
+  interrupts?: InterruptKeeping;
   /** Tools that are not mounts — run_js, whose body is the object itself —
    *  offered beside the bridged ones. They must be here rather than added
    *  after open: open reconciles the names a session remembers against the
@@ -239,7 +242,7 @@ export class PiAgent {
       }],
     }));
 
-    const bridged = [...bridgeTools(opts.tools, opts.toolHost), ...(opts.extraTools ?? [])];
+    const bridged = [...bridgeTools(opts.tools, opts.toolHost, opts.interrupts), ...(opts.extraTools ?? [])];
     const { harness, open } = await AgentHarness.create({
       session: session as any,
       models,

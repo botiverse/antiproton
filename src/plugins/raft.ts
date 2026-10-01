@@ -9,7 +9,7 @@
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
 import { createRaft, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
-import { originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import { interrupt, originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Interrupt, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
@@ -399,6 +399,53 @@ function integer(value: unknown, name: string, min: number, max: number): number
   return value;
 }
 
+
+/**
+ * One send, and what to do when the Server holds it: the conversation has messages this agent has not
+ * seen. A held send is a question for the model — these arrived; send anyway, or drop? — so it comes
+ * back as an `Interrupt` carrying the held messages, and the plugin's `interrupts.resume` takes the answer.
+ *
+ * The held messages are in the question, so the model sees them now: that is recorded before asking, so
+ * the answer "send" (or the model sending the same message again itself, with the same key) attests them
+ * instead of being held again. The SDK records nothing when the context was withheld, and then a send is
+ * held again with the same count; that is the SDK's rule, not something this can attest for the model.
+ *
+ * The state is the send itself plus the SDK's continuation (the key and the `seen` boundary): plain data,
+ * which is what the SDK hands out for a send continued in a later step. Nothing in it is a credential.
+ */
+async function sendMessage(
+  ctx: PluginContext,
+  send: { target: string; content: string; idempotencyKey: string; seen?: { upToSeq: number } },
+): Promise<Json | Interrupt> {
+  const raft = raftFor(ctx);
+  const out = await raft.messages.send(send);
+  if (!out.ok) throw sdkFailure(out, true);
+  if (out.state === "held") {
+    raft.frontier.recordHeld(out.data);
+    await raft.state.save();
+    const n = out.data.newMessageCount;
+    return interrupt({
+      question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${out.data.target} since you last read it; send your message anyway?`,
+      context: {
+        target: out.data.target, newMessages: n,
+        messages: out.data.heldMessages.map(modelLine),
+        ...(out.data.omittedMessageCount ? { omitted: out.data.omittedMessageCount } : {}),
+        ...(out.data.withheld ? { withheld: true } : {}),
+      },
+      answer: { choices: ["send", "drop"] },
+      state: {
+        target: send.target, content: send.content, idempotencyKey: out.data.continuation.idempotencyKey,
+        ...(out.data.continuation.seen ? { seen: { upToSeq: out.data.continuation.seen.upToSeq } } : {}),
+      },
+    });
+  }
+  return {
+    state: "sent", messageId: out.data.messageId,
+    ...(out.data.messageSeq !== null ? { messageSeq: out.data.messageSeq } : {}),
+    ...(out.data.recentUnread.length ? { recentUnread: out.data.recentUnread.map(modelLine) } : {}),
+  };
+}
+
 export const raftPlugin: Plugin = {
   id: "raft",
   version: "1.0.0",
@@ -442,13 +489,15 @@ export const raftPlugin: Plugin = {
     {
       name: "send_message",
       summary: "Send a message to a Raft channel, thread, or DM. The target is explicit; copy it from the `target=` of the message you answer. " +
-        "If newer messages arrived there that you have not seen, the send is held and they are returned: read them, then send again.",
+        "If newer messages arrived there that you have not seen, nothing is sent yet: the result is \"yielded\" with those messages " +
+        "and the question whether to send anyway. Read them, then resume with \"send\" to send it as written or \"drop\" to send " +
+        "nothing; to change the message, drop it and call send_message again with the new content and a new idempotencyKey.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
           target: { type: "string", description: "For example #general, #general:abcd1234, or dm:@name." },
           content: { type: "string" },
-          idempotencyKey: { type: "string", description: "One key per message. After a held answer, send the same content again with the same key; if you change the content, use a new key." },
+          idempotencyKey: { type: "string", description: "One key per message: the same content again uses the same key; changed content uses a new key." },
         },
         required: ["target", "content", "idempotencyKey"],
       },
@@ -555,6 +604,32 @@ export const raftPlugin: Plugin = {
     },
   ],
 
+  /**
+   * A held send's question, answered. "send" sends the same message under the same key, attesting what
+   * the question showed (the continuation's `seen`, and the frontier `recordHeld` saved): so it goes
+   * through unless the conversation moved again since, which asks again with the newer messages. "drop"
+   * sends nothing; the model changes a message by dropping it and sending a new one. Expiry and cancel
+   * need nothing back: holding a send takes nothing on the Server.
+   */
+  interrupts: {
+    async resume(tool, state, answer, ctx) {
+      if (tool !== "send_message") throw new Error(`raft: ${tool} does not ask questions`);
+      const s = object(state);
+      if (typeof s.target !== "string" || typeof s.content !== "string" || typeof s.idempotencyKey !== "string") {
+        throw new Error("raft: the held send's state is incomplete; call send_message again");
+      }
+      if (answer === "drop") {
+        return { state: "dropped", target: s.target, note: "Not sent. To send something else, call send_message with the new content and a new idempotencyKey." };
+      }
+      if (answer !== "send") throw new Error(`raft: the answer must be "send" or "drop", not ${JSON.stringify(answer)}`);
+      const seen = object(s.seen);
+      return sendMessage(ctx, {
+        target: s.target, content: s.content, idempotencyKey: s.idempotencyKey,
+        ...(typeof seen.upToSeq === "number" ? { seen: { upToSeq: seen.upToSeq } } : {}),
+      });
+    },
+  },
+
   async checkCredential(ctx) {
     if (!ctx.credential) return { ok: false, kind: "rejected", reason: "no Raft agent credential was supplied" };
     try {
@@ -577,28 +652,7 @@ export const raftPlugin: Plugin = {
       if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
       if (typeof a.content !== "string" || !a.content.trim()) throw new Error("content is required");
       if (typeof a.idempotencyKey !== "string" || !a.idempotencyKey.trim()) throw new Error("idempotencyKey is required");
-      const raft = raftFor(ctx);
-      const out = await raft.messages.send({ target: a.target, content: a.content, idempotencyKey: a.idempotencyKey });
-      if (!out.ok) throw sdkFailure(out, true);
-      if (out.state === "held") {
-        // The held messages are in this result, so the model sees them now: record that, and the next send
-        // of the same message into this conversation attests it instead of being held again. The SDK records
-        // nothing when the context was withheld.
-        raft.frontier.recordHeld(out.data);
-        await raft.state.save();
-        return {
-          state: "held", target: out.data.target, newMessages: out.data.newMessageCount,
-          messages: out.data.heldMessages.map(modelLine),
-          ...(out.data.omittedMessageCount ? { omitted: out.data.omittedMessageCount } : {}),
-          note: "Not sent: newer messages arrived in this conversation. Read them; to send your message as it is, call send_message " +
-            "again with the same idempotencyKey; to change it, use a new key.",
-        };
-      }
-      return {
-        state: "sent", messageId: out.data.messageId,
-        ...(out.data.messageSeq !== null ? { messageSeq: out.data.messageSeq } : {}),
-        ...(out.data.recentUnread.length ? { recentUnread: out.data.recentUnread.map(modelLine) } : {}),
-      };
+      return sendMessage(ctx, { target: a.target, content: a.content, idempotencyKey: a.idempotencyKey });
     }
     if (name === "receive_events") {
       const limit = integer(a.limit, "limit", 1, MAX_EVENTS);

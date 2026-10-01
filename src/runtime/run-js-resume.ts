@@ -1,5 +1,8 @@
 /**
- * run_js programs waiting at `await pause(...)`, held in memory for the model's `resume`.
+ * Everything waiting for the model's `resume`, held in memory: run_js programs
+ * waiting at `await pause(...)`, and tool calls that asked a question before
+ * acting (plugins/types.ts `Interrupt`). One registry, so one `resume` tool
+ * answers both and one keep-alive covers both.
  *
  * Memory only, on purpose. A suspended program is a live sandbox — a QuickJS
  * context in this process, or a Dynamic Worker isolate whose pending call is
@@ -7,34 +10,69 @@
  * convenience with a short life, never something correctness depends on: an
  * object that is evicted, redeployed or restarted loses every one, and
  * `resume` then says the continuation is gone and asks for a new program,
- * which is exactly what a pause did before it could be resumed.
+ * which is exactly what a pause did before it could be resumed. A tool's
+ * question is kept the same way for the same reason: nothing has been done
+ * yet, so losing it costs the model one more call, never a wrong action.
  *
  * One registry per agent runtime (one per Durable Object), shared by every
  * session's run_js and resume tools; a token is only answered in the session
  * that was given it.
  */
-import type { Continuation } from "../core/execution.ts";
+import type { AnswerSpec, Continuation } from "../core/execution.ts";
 import type { Json } from "../core/types.ts";
+import type { ToolInterrupt } from "../core/tools.ts";
 
 /** How long a suspended program waits for `resume` before it is discarded. */
 export const RUN_JS_RESUME_MS = 60_000;
 /** While anything is suspended, the object wakes at least this often, so it stays in memory. */
 export const RUN_JS_KEEP_ALIVE_MS = 10_000;
 
-export interface Suspended {
-  continuation: Continuation;
+interface Waiting {
   /** Which session's model was given the token. */
   scope: string;
-  /** The run_js call that started the program: its calls go on under this id. */
+  /** The model call that asked: run_js for a program, the tool's own call for a tool. */
   callId: string;
-  /** What had been counted when it suspended, so the next stretch is counted as a difference. */
-  hostCalls: number;
-  operations: number;
-  /** What the program asked, and the answer it said it expects (checked by `resume`). */
+  /** What was asked, and the answer it said it expects (checked by `resume`). */
   question?: string;
   answer?: AnswerSpec;
   expiresAt: number;
 }
+
+/** A run_js program waiting at `await pause(...)`. */
+export interface SuspendedProgram extends Waiting {
+  kind?: "program";
+  continuation: Continuation;
+  /** What had been counted when it suspended, so the next stretch is counted as a difference. */
+  hostCalls: number;
+  operations: number;
+  /** Where the program's tool calls report a question they were asked (pi-tools.ts), carried so a resumed stretch can see them. */
+  asked?: unknown;
+}
+
+/** Where a tool's question goes back to: the runtime's side of the gateway (cf/src/runtime.ts). */
+export interface InterruptHost {
+  /** Delivers a checked answer; settles with the tool's next result (a ToolResult). */
+  resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<unknown>;
+  /** Tells the tool nobody will answer. Returns why that failed, or null. */
+  cancelInterrupt?(i: ToolInterrupt): Promise<string | null>;
+}
+
+/** A tool call that asked the model before acting. */
+export interface SuspendedTool extends Waiting {
+  kind: "tool";
+  /** The tool as the model named it. */
+  tool: string;
+  /** What the gateway handed back, `state` included: kept here, never shown. */
+  interrupt: ToolInterrupt;
+  host: InterruptHost;
+  /** Asked from inside a run_js program, which has ended at that call. */
+  inProgram?: boolean;
+}
+
+export type Suspended = SuspendedProgram | SuspendedTool;
+
+/** What `hold` is given: either kind, without its expiry, which the registry sets. */
+export type ToHold = Omit<SuspendedProgram, "expiresAt"> | Omit<SuspendedTool, "expiresAt">;
 
 export class RunJsContinuations {
   #held = new Map<string, Suspended>();
@@ -55,11 +93,11 @@ export class RunJsContinuations {
 
   get size(): number { return this.#held.size; }
 
-  hold(entry: Omit<Suspended, "expiresAt">): { token: string; expiresAt: number } {
+  hold(entry: ToHold): { token: string; expiresAt: number } {
     this.sweep();
     const token = `rjc_${crypto.randomUUID().replace(/-/g, "")}`;
     const expiresAt = this.#now() + this.ttlMs;
-    this.#held.set(token, { ...entry, expiresAt });
+    this.#held.set(token, { ...entry, expiresAt } as Suspended);
     try { this.#onHold?.(this.#now() + Math.min(RUN_JS_KEEP_ALIVE_MS, this.ttlMs)); } catch { /* the sweep still runs on the next wake */ }
     return { token, expiresAt };
   }
@@ -111,31 +149,22 @@ export class RunJsContinuations {
   }
 }
 
-/** Ends the program; nobody is waiting for what it says. */
+/** Ends the program, or tells the tool nobody will answer; nobody is waiting for what either says. */
 function discard(s: Suspended) {
-  try { void s.continuation.cancel().catch(() => {}); } catch { /* already ended */ }
+  try {
+    if (s.kind === "tool") void s.host.cancelInterrupt?.(s.interrupt).catch(() => {});
+    else void s.continuation.cancel().catch(() => {});
+  } catch { /* already ended */ }
 }
 
 // ---- what answer a pause expects ------------------------------------------
 
 /**
- * pause()'s third argument, understood. One of:
- *
- *   { choices: ["a", "b"] }   the answer is one of these strings
- *   { kind: "yes_no" }        the answer is true or false
- *   { kind: "text" }          the answer is a string
- *   { schema: {...} }         the answer fits this JSON schema — a subset:
- *                             `type` (string, number, integer, boolean,
- *                             object, array, null, or a list of them),
- *                             `enum`, `required`, `properties` and `items`,
- *                             applied recursively; other keywords are not
- *                             checked
+ * What answer a waiting thing expects: pause()'s third argument, or a plugin
+ * interrupt's `answer`. Defined in core/execution.ts so a plugin can name it
+ * without reaching into the runtime; re-exported here, beside its checks.
  */
-export type AnswerSpec =
-  | { choices: string[] }
-  | { kind: "yes_no" }
-  | { kind: "text" }
-  | { schema: { [k: string]: Json } };
+export type { AnswerSpec } from "../core/execution.ts";
 
 const SCHEMA_TYPES = new Set(["string", "number", "integer", "boolean", "object", "array", "null"]);
 const isObject = (v: unknown): v is Record<string, Json> => !!v && typeof v === "object" && !Array.isArray(v);

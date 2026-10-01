@@ -6,7 +6,8 @@ import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
-import { Backgrounded } from "../plugins/types.ts";
+import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
+import { answerSpecOf } from "./run-js-resume.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
 import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
@@ -312,7 +313,24 @@ export class ToolGateway {
     const req = a.request as { tool: string; args: Json };
     const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
     // `approved` bypasses the policy check for this one recorded call only.
-    const result = await this.invoke(ctx, req.tool, req.args, { approved: true, operationId });
+    let result = await this.invoke(ctx, req.tool, req.args, { approved: true, operationId });
+    // An approved call that asks the model a question has nobody to ask: it
+    // runs after a person's decision, not inside a model's tool call, so no
+    // token could reach the model. It is ended as a cancel would end it, and
+    // the question rides back as the result, so the model sees what the tool
+    // found and can call it again. Its `state` never leaves this function.
+    if (result.status === "interrupted") {
+      const i = result.interrupt;
+      await this.cancelInterrupt(ctx, i);
+      result = {
+        status: "succeeded", operationId: result.operationId,
+        result: {
+          state: "interrupted", question: i.question, ...(i.context !== undefined ? { context: i.context } : {}),
+          note: "Approved, but before acting the tool asked for a decision that could not be put to you here, " +
+            "so nothing was done. Call it again if it still applies.",
+        },
+      };
+    }
     await this.#store.completeOperation(
       tenantId, operationId, result.status === "succeeded" ? "succeeded" : "failed", null, result as Json,
     );
@@ -726,6 +744,23 @@ export class ToolGateway {
       } as ToolResult;
     }
 
+    return this.#run(ctx, r, plugin, operationId, facts, (context) => plugin.invoke(r.tool, args, context));
+  }
+
+  /**
+   * One step of a tool on a mount, from the attempt's start to its recorded
+   * end: a call's `invoke`, or a `resume` of a question it asked. Both are
+   * operations with their own row, so a step that may have landed is recorded
+   * the same way whichever it was.
+   */
+  async #run(
+    ctx: CallContext,
+    r: { mount: MountRecord; tool: string },
+    plugin: Plugin,
+    operationId: string,
+    facts: () => { callId?: string },
+    step: (context: PluginContext) => Promise<Json | Backgrounded | Interrupt>,
+  ): Promise<ToolResult> {
     const credential = r.mount.secretRef
       ? await this.#secrets.resolve(r.mount.secretRef, { tenantId: r.mount.tenantId, agentId: r.mount.agentId })
       : null;
@@ -758,7 +793,7 @@ export class ToolGateway {
         return alreadyAttempted(
           operationId, (await this.#store.getOperation(ctx.tenantId, operationId))?.status ?? null);
       }
-      const raw = await plugin.invoke(r.tool, args, this.#contextFor(ctx, r.mount, credential));
+      const raw = await step(this.#contextFor(ctx, r.mount, credential));
       // A tool that ended a container's lease says so under LEASE_KEY. The fact
       // is recorded and the key removed: the result object is serialised whole
       // into what the model reads, so left in place it is tokens in the
@@ -770,6 +805,36 @@ export class ToolGateway {
       // it: the signal is the class, and a copy that went through JSON is data
       // (Piper, 2026-09-14). The work has started and outlives this call; the
       // runtime records the job and the operation stays running until it ends.
+      // The tool asks the model before it acts (plugins/types.ts `Interrupt`).
+      // The call itself ended here, having changed nothing the tool did not
+      // choose to, so its operation completes; what the answer causes runs as
+      // an operation of its own (`resumeInterrupt`). A plugin that cannot take
+      // the answer, or a spec nobody could answer, is the plugin's fault and
+      // fails the call rather than leaving a question no answer can reach.
+      if (result instanceof Interrupt) {
+        const spec = answerSpecOf(result.answer as unknown as Json);
+        const why = !interruptsOf(plugin)
+          ? `${plugin.id} returned a question but cannot take an answer (it has no interrupts.resume)`
+          : "error" in spec ? `${plugin.id} asked a question whose answer spec is unusable: ${spec.error}` : null;
+        if (why !== null) {
+          if (interruptsOf(plugin)?.cancel) {
+            try { await interruptsOf(plugin)!.cancel!(r.tool, result.state, this.#contextFor(ctx, r.mount, credential)); } catch { /* reported below either way */ }
+          }
+          await this.#store.completeOperation(ctx.tenantId, operationId, "failed", null, undefined, facts());
+          await counted("failed");
+          return { status: "failed", operationId, error: { code: "tool_error", message: why } };
+        }
+        await this.#store.completeOperation(ctx.tenantId, operationId, "succeeded", null, undefined, facts());
+        await counted("ok");
+        return {
+          status: "interrupted", operationId,
+          interrupt: {
+            alias: r.mount.alias, tool: r.tool, question: String(result.question),
+            ...(result.context !== undefined ? { context: result.context } : {}),
+            answer: (spec as { spec: Json }).spec, state: result.state,
+          },
+        };
+      }
       if (result instanceof Backgrounded) {
         await this.#store.completeOperation(ctx.tenantId, operationId, "running", null, undefined, facts());
         // Counted as started; the time it runs in the background is the sandbox's to count.
@@ -813,6 +878,76 @@ export class ToolGateway {
           ...(e.credentialRef === undefined ? {} : { credentialRef: e.credentialRef }),
         },
       };
+    }
+  }
+
+  /**
+   * The model's answer to a question a tool asked (`Interrupt`), taken to the
+   * plugin's `interrupts.resume` as a new operation of the same tool.
+   *
+   * The answer has been checked against the question's spec by the caller
+   * (pi-tools.ts `resume`), which holds the token; this only delivers it. The
+   * mount is looked up again, because time has passed: a mount switched off,
+   * re-pinned or removed since the question was asked is refused, as a call
+   * would be. Policy is not asked again — the call it continues was admitted,
+   * and a held call never reaches its plugin, so never asks. Behind the mount's
+   * lock like a call, for the reason a call is.
+   */
+  async resumeInterrupt(
+    ctx: CallContext,
+    i: { alias: string; tool: string; state: Json },
+    answer: Json,
+    opts: { callId?: string } = {},
+  ): Promise<ToolResult> {
+    const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, i.alias);
+    const plugin = mount ? this.#plugins.get(mount.plugin) : undefined;
+    if (!mount) return { status: "rejected", error: { code: "not_mounted", message: `the \`${i.alias}\` mount no longer exists, so the tool cannot go on` } };
+    if (!plugin) return { status: "rejected", error: { code: "plugin_unavailable", message: pluginUnavailableMessage(mount.alias, mount.plugin) } };
+    const choices = await this.#store.pluginChoices(ctx.tenantId, ctx.agentId);
+    if (!pluginEnabled(this.#seeded.has(mount.plugin), choices[mount.plugin])) {
+      return { status: "rejected", error: { code: "plugin_disabled", message: switchedOffMessage(mount.alias) } };
+    }
+    if (plugin.version !== mount.toolVersion) {
+      return { status: "rejected", error: { code: "version_mismatch", message: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` } };
+    }
+    const resuming = interruptsOf(plugin);
+    if (!resuming) return { status: "rejected", error: { code: "not_resumable", message: `${plugin.id} cannot take an answer` } };
+    const go = async () => {
+      const operationId = `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+      await this.#store.recordOperation({
+        operationId, tenantId: ctx.tenantId, agentId: ctx.agentId, taskId: ctx.taskId,
+        mountAlias: mount.alias, tool: `${mount.plugin}.${i.tool}`, toolVersion: mount.toolVersion,
+      });
+      const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
+      return this.#run(ctx, { mount, tool: i.tool }, plugin, operationId, facts,
+        (context) => resuming.resume(i.tool, i.state, answer, context));
+    };
+    return isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, go) : go();
+  }
+
+  /**
+   * A question nobody will answer: the model cancelled it, its token expired,
+   * or there was nobody to ask. The plugin's `interrupts.cancel` gives back
+   * whatever it took when it asked; absent, there is nothing to do. Never
+   * throws: the caller is ending something, and a failure here is reported as
+   * a string for the model, not raised.
+   */
+  async cancelInterrupt(ctx: CallContext, i: { alias: string; tool: string; state: Json }): Promise<string | null> {
+    try {
+      const mount = await this.#store.getMountByAlias(ctx.tenantId, ctx.agentId, i.alias);
+      const plugin = mount ? this.#plugins.get(mount.plugin) : undefined;
+      const cancel = plugin ? interruptsOf(plugin)?.cancel : undefined;
+      if (!mount || !plugin || !cancel) return null;
+      const go = async () => {
+        const credential = mount.secretRef
+          ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+          : null;
+        await cancel.call(plugin.interrupts, i.tool, i.state, this.#contextFor(ctx, mount, credential));
+      };
+      await (isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, go) : go());
+      return null;
+    } catch (e) {
+      return String((e as Error)?.message ?? e).slice(0, 300);
     }
   }
 
