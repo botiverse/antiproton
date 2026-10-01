@@ -2011,6 +2011,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     if (tool === "release" && !prior.boxId) {
       return { released: false, note: machine === MAIN_MACHINE ? "nothing was running" : `nothing was running on machine "${machine}"`, ...named };
     }
+    // Saving out of, or keeping, a named machine that does not exist would start one only to copy its
+    // empty disk; "main" keeps its old behaviour.
+    if ((tool === "save" || tool === "keep") && machine !== MAIN_MACHINE && !prior.boxId) {
+      throw new Error(`there is no machine "${machine}" to ${tool} from; \`machines\` lists the ones that exist`);
+    }
 
     if (tool === "start_from") {
       const envs = prior?.envs ?? [];

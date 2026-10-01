@@ -316,6 +316,16 @@ await check("the idle pass releases one thing at a time, by its id, and finds it
   }
 });
 
+await check("save or keep on a named machine that does not exist is refused, and nothing is started", async () => {
+  for (const tool of ["save", "keep"]) {
+    const f = fixture(null);
+    let thrown: any = null;
+    try { await f.plugin.invoke(tool, { machine: "ghost", path: "/work/x", name: "env" }, f.ctx); } catch (e) { thrown = e; }
+    must(thrown && /no machine "ghost"/.test(String(thrown.message)), `${tool}: ${thrown}`);
+    must(f.calls.length === 0, `${tool} started something: ${JSON.stringify(f.calls)}`);
+  }
+});
+
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`${results.length - failed}/${results.length} passed`);
