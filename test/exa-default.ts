@@ -1,9 +1,8 @@
 /**
  * Every agent's web search goes through Exa on the operator's key: the seeded `search` mount resolves
- * OPERATOR_EXA_REF to the deployment's key server-side, and `http`'s keyless search is withheld from the
- * model while that mount can search.
+ * OPERATOR_EXA_REF to the deployment's key server-side. It is the only web search: `http` has none.
  */
-import { AgentRuntime, keylessSearchWithheld, OPERATOR_EXA_REF } from "../cf/src/runtime.ts";
+import { AgentRuntime, OPERATOR_EXA_REF } from "../cf/src/runtime.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -42,14 +41,16 @@ await check("a new agent gets a `search` mount on Exa, and its search sends the 
   must(seen.length === 1 && seen[0]!.url === "https://api.exa.ai/search" && seen[0]!.key === "exa-operator-key", JSON.stringify(seen));
 });
 
-await check("the keyless search is withheld while an Exa mount can search, and kept when it cannot", async () => {
-  const web = { alias: "web", plugin: "http", secretRef: null };
-  const seeded = { alias: "search", plugin: "exa", secretRef: OPERATOR_EXA_REF };
-  must(keylessSearchWithheld([web, seeded], true).join() === "web.search", "operator key: not withheld");
-  must(keylessSearchWithheld([web, seeded], false).length === 0, "no operator key: withheld anyway, leaving no search");
-  must(keylessSearchWithheld([web, { alias: "mine", plugin: "exa", secretRef: "agent:mine" }], false).join() === "web.search", "own key: not withheld");
-  must(keylessSearchWithheld([web, { alias: "mine", plugin: "exa", secretRef: null }], true).length === 0, "keyless exa mount: withheld");
-  must(keylessSearchWithheld([web], true).length === 0, "no exa mount: withheld");
+await check("a call to `web.search`, which a stored transcript or script may still name, is refused as an unknown tool", async () => {
+  // Refused before any request: a fetch here would mean the removed `http` search still runs.
+  const rt = await runtime("exa-operator-key");
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return new Response("{}"); }) as any;
+  try {
+    const r: any = await rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "a:main" }, "web.search", { query: "q" });
+    must(r.status === "rejected" && r.error?.code === "unknown_tool", JSON.stringify(r));
+  } finally { globalThis.fetch = originalFetch; }
+  must(fetched === 0, `${fetched} request(s) made`);
 });
 
 for (const r of results) console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

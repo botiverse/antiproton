@@ -8,10 +8,6 @@
  * plugin and there is no tool that takes a URL, so the key can only ever reach
  * Exa. That is the same shape every other credential plugin has, and it is why
  * this one may declare a credential while `http` still declares none.
- *
- * The result shape is `http.search`'s, field for field, so moving an agent
- * from the keyless path to this one changes what comes back but not how it is
- * read.
  */
 import type { Json } from "../core/types.ts";
 import type { Plugin, PluginContext } from "./types.ts";
@@ -19,7 +15,7 @@ import { credentialState, identityNote, markIdentity } from "./types.ts";
 
 const API = "https://api.exa.ai/search";
 const DEFAULT_TIMEOUT_MS = 15_000;
-/** `http.search`'s default and ceiling, because the two answer the same tool call. */
+/** How many results a call gets when it does not say, and the most it may ask for. */
 const DEFAULT_LIMIT = 8;
 const MAX_LIMIT = 20;
 /**
@@ -208,8 +204,7 @@ export const exaPlugin: Plugin = {
     const raw = Array.isArray(body.results) ? body.results : null;
     // A body without a `results` array is a shape this parser cannot read, and
     // reporting it as zero results is the same lie as reporting a timeout that
-    // way. `http.search` guards the equivalent case on its HTML; this is the
-    // JSON form of it.
+    // way.
     if (!raw) {
       throw markIdentity(new Error(
         `exa search returned no results array — the response shape may have changed. ` +
