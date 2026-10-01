@@ -12,6 +12,7 @@ check("Cloudflare's retryable flag, or the object moving, and nothing else", () 
   must(objectMoved(Object.assign(new Error("x"), { retryable: true })), "retryable");
   must(objectMoved(new Error("cannot access storage because object has moved to a different machine")), "moved");
   must(!objectMoved(new Error("no such hook")), "an ordinary error was retried");
+  must(!objectMoved(new Error("expected: object has moved to a different machine")), "a message that only mentions it was retried");
   must(!objectMoved(Object.assign(new Error("x"), { retryable: false })), "retryable false");
   must(!objectMoved(null) && !objectMoved("moved"), "not an error");
 });
