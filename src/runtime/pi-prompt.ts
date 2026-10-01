@@ -62,7 +62,8 @@ Write one program for:
 - anything that would otherwise put a large payload into this conversation
 
 For a single lookup, call the tool directly instead. Never wrap one plain call
-in run_js.
+in run_js. And make a call that needs \`confirm: true\` directly, on its own:
+inside run_js it is not shown to the user for approval, it fails the program.
 
 Each run starts from nothing: globals, variables and anything you set on
 globalThis are gone by the next run, so carry what you need in your own output
