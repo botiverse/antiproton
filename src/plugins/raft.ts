@@ -421,21 +421,31 @@ async function sendMessage(
   const out = await raft.messages.send(send);
   if (!out.ok) throw sdkFailure(out, true);
   if (out.state === "held") {
-    raft.frontier.recordHeld(out.data);
-    await raft.state.save();
     const n = out.data.newMessageCount;
+    // Attesting says the model saw what it was held for. A held answer whose messages do not account for
+    // the count (a body the Server left out, or one the SDK dropped as unplaceable) is treated as withheld:
+    // nothing is attested, and the model reads the conversation before its answer can go through.
+    const unshown = out.data.withheld ? n : Math.max(0, n - out.data.heldMessages.length - out.data.omittedMessageCount);
+    if (!unshown) {
+      raft.frontier.recordHeld(out.data);
+      await raft.state.save();
+    }
     return interrupt({
-      question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${out.data.target} since you last read it; send your message anyway?`,
+      question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${out.data.target} since you last read it; ` +
+        (unshown
+          ? `${unshown === n ? "they are" : `${unshown} of them are`} not shown here: read ${out.data.target} with receive_events first, then answer "send" to send your message or "drop".`
+          : "send your message anyway?"),
       context: {
         target: out.data.target, newMessages: n,
         messages: out.data.heldMessages.map(modelLine),
         ...(out.data.omittedMessageCount ? { omitted: out.data.omittedMessageCount } : {}),
         ...(out.data.withheld ? { withheld: true } : {}),
+        ...(unshown ? { unshown } : {}),
       },
       answer: { choices: ["send", "drop"] },
       state: {
         target: send.target, content: send.content, idempotencyKey: out.data.continuation.idempotencyKey,
-        ...(out.data.continuation.seen ? { seen: { upToSeq: out.data.continuation.seen.upToSeq } } : {}),
+        ...(out.data.continuation.seen && !unshown ? { seen: { upToSeq: out.data.continuation.seen.upToSeq } } : {}),
       },
     });
   }
