@@ -3,6 +3,7 @@ import type { Plugin, PluginContext, MountActivity, MountUsage, Released, Sandbo
 import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
+import { spanText } from "../runtime/idle-lease.ts";
 
 /**
  * A real Node runtime, as a mount.
@@ -35,8 +36,15 @@ export interface SandboxConfig {
   maxOutputBytes?: number;
   /** Who verifies the credential: the provider's API, or the endpoint itself. */
   verifyWith?: "provider" | "endpoint";
-  /** Ceiling on one `quiet` request, in minutes. */
+  /** Ceiling on one `quiet` request, in minutes, while the container is running. */
   maxQuietMinutes?: number;
+  /**
+   * How long a container switched off for being idle is kept before it is
+   * deleted, in days. Switched off it bills no compute and keeps its disk, so
+   * an agent coming back finds its machine; deleted, the disk is gone too, so
+   * the agent is told before that.
+   */
+  keepStoppedDays?: number;
   /** Where commands run. A prepared image usually has its own checkout. */
   workdir?: string;
   shape?: string;
@@ -177,6 +185,17 @@ interface BoxState {
    */
   quietUntil?: number;
   /**
+   * When the idle lease switched this container off, or absent while it runs.
+   *
+   * Switched off rather than deleted: run9 keeps a stopped box's disk, and the
+   * next exec on the same id starts it again in about two seconds with its
+   * files intact (measured 2026-10-01; processes do not survive). So the record
+   * keeps naming the box, and this says which of the two schedules it is on —
+   * the short idle one while it bills compute, the long one before deletion
+   * while it only keeps a disk. Cleared by the next command that runs in it.
+   */
+  parkedAt?: number;
+  /**
    * The directory the last `shell` command ended in, so the next one starts
    * there. Each run9 exec is a fresh process: a `cd` does not carry over, and
    * agents were writing `cd /testbed && …` into every call.
@@ -236,15 +255,20 @@ export function splitCwd(out: string): { output: string; cwd: string | null } {
  * filesystem.
  *
  * With the lease on — a container is destroyed by the agent's own `release`,
- * not by the end of a turn; the agent is told before an idle one is taken and
- * may postpone that — the runtime hands the plugin the lease and
- * the sentence names that lifetime instead. The numbers come from the lease,
- * never from here.
+ * not by the end of a turn; an idle one is switched off with its disk kept, and
+ * deleted only after `keepStoppedDays`, with its agent told first and free to
+ * postpone that — the runtime hands the plugin the lease and the sentence
+ * names that lifetime instead. The idle minutes come from the lease, never
+ * from here.
  */
 export interface BoxLease {
-  /** How long before the release the agent is told. */
+  /**
+   * How long before the release the agent is told, for holders that report no
+   * schedule of their own. This plugin reports one for both of its steps
+   * (`activityOf`), so it decides only that the lease is on.
+   */
   warnMs: number;
-  /** Idle this long and the box is released, unless the agent postponed it. */
+  /** Idle this long and a running box is switched off, unless the agent postponed it. */
   maxMs: number;
 }
 
@@ -261,9 +285,11 @@ const leaseMinutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 export function notAReasonToRelease(lease: BoxLease | null): string {
   // "Leave it running" is only something an agent can do under a lease: without one the box is handed back
   // when the turn ends whatever it decides, so that half would be a promise nothing keeps (from the #327 review).
+  // Under the lease, leaving it is cheap because idle only switches it off, which is why the sentence says so.
   return lease
     ? "A copy outliving the container is not a reason to release it: if you or the person you are working for " +
-      "will come back to this machine, leave it running."
+      "will come back to this machine, leave it running — idle, it is only switched off, and the next call " +
+      "brings it back with its files."
     : "A copy outliving the container is not a reason to release it early: it is handed back when the turn " +
       "ends anyway, and until then it is still the machine you are working on.";
 }
@@ -279,10 +305,35 @@ export const savedNote = (lease: BoxLease | null) => "kept outside the box, for 
  * working directory) was still there, in the same box, with no reboot in between. An agent that writes its
  * work to /tmp and comes back after a pause would find it missing, so the sentence says where to keep it.
  */
-export function leaseTerms(lease: BoxLease): string {
-  return `after ${leaseMinutes(lease.maxMs)} idle minutes it is released; ${leaseMinutes(lease.warnMs)} minutes `
-    + `before that you are told, and \`quiet\` postpones the release by as long as you choose, within the mount's limit; `
+export function leaseTerms(lease: BoxLease, keepStoppedDays: number = DEFAULTS.keepStoppedDays): string {
+  return `after ${leaseMinutes(lease.maxMs)} idle minutes it is switched off, and the next call switches it back on `
+    + `with its files intact (running processes do not survive); it is deleted, with everything on its disk, only `
+    + `after ${spanText(keepStoppedDays * DAY)} switched off and unused, and you are told ${spanText(stoppedWarnMs(keepStoppedDays))} `
+    + `before that; \`quiet\` postpones either by as long as you choose, within the mount's limit; `
     + `files under /tmp do not survive while it sits idle, so keep your work in the working directory`;
+}
+
+const DAY = 86_400_000;
+
+/**
+ * How long before a switched-off container is deleted its agent is told: a
+ * day, but never more than half the time it is kept, so a short setting still
+ * leaves the agent half of it to come back in before the warning.
+ */
+export function stoppedWarnMs(keepStoppedDays: number): number {
+  return Math.min(DAY, (keepStoppedDays * DAY) / 2);
+}
+
+/** The setting, or the default when it is not a usable number of days. */
+function keepDaysOf(cfg: { keepStoppedDays?: unknown }): number {
+  const d = cfg.keepStoppedDays;
+  return typeof d === "number" && Number.isFinite(d) && d > 0 ? d : DEFAULTS.keepStoppedDays;
+}
+
+/** When the box was switched off for being idle, or null while it is running. */
+function parkedAt(state: { parkedAt?: unknown } | null | undefined): number | null {
+  const p = state?.parkedAt;
+  return typeof p === "number" && Number.isFinite(p) && p > 0 ? p : null;
 }
 
 /**
@@ -559,6 +610,7 @@ const DEFAULTS = {
   graceMs: 5_000,
   maxOutputBytes: 24_000,
   maxQuietMinutes: 60,
+  keepStoppedDays: 7,
 };
 
 /**
@@ -602,7 +654,13 @@ async function stopBox(
   // the two differ exactly when something else has already recorded another
   // container, and a session describing *that* box would report a container
   // that is still running as finished.
-  const session = sessionOf(state, Date.now());
+  //
+  // A box switched off for being idle already recorded its compute session
+  // when it was switched off (parkBox), so deleting it adds none: a second
+  // one from `createdAt` would count the days it sat stopped as compute.
+  const endedAt = Date.now();
+  const stoppedAt = parkedAt(state);
+  const session = sessionOf(state, stoppedAt ?? endedAt);
   // Read again before overwriting. `releaseTask` does not take the per-mount
   // lock that `invoke` takes, so an operator release or the idle sweep can
   // interleave with a command on this mount: the command finds no container,
@@ -615,7 +673,7 @@ async function stopBox(
   await ctx.db.put(BOX_STORE, mine
     ? {
       boxId: "", createdAt: 0, lastUsedAt: 0,
-      sessions: keepSessions(state.sessions, session),
+      sessions: stoppedAt ? (state.sessions ?? []) : keepSessions(state.sessions, session),
       // Kept environments outlive the container by construction — a forked
       // snapshot is independent of the box it came from — so losing the record of
       // them here would strand real storage under ids nobody can name any more.
@@ -623,17 +681,72 @@ async function stopBox(
     }
     // Somebody else's container is in the record. Leave it named, and add only
     // what this release knows: the session the released box just finished.
-    : { ...now, sessions: keepSessions(now.sessions, session) } as unknown as Json, BOX_KEY);
+    : { ...now, ...(stoppedAt ? {} : { sessions: keepSessions(now.sessions, session) }) } as unknown as Json, BOX_KEY);
   // Both instants travel, not just their difference: the recorder checks that
   // the duration it stores is this fact's own `endedAt - startedAt`, and they
   // all come from `session`, which was built from the state THIS call read.
+  //
+  // For a switched-off box the span is the time it sat stopped: its compute
+  // span was reported when it was switched off, and this release ended the
+  // rest of its life, the disk.
   return {
     boxId: state.boxId, freed: !error, error, liveMs: session.endedAt - session.startedAt,
     lease: {
-      id: state.boxId, startedAt: session.startedAt, endedAt: session.endedAt,
+      id: state.boxId, startedAt: stoppedAt ?? session.startedAt, endedAt,
       status: error ? "error" : "freed", ...(error ? { error } : {}),
     },
   };
+}
+
+/**
+ * Switch an idle box off and keep it: the idle lease's step for a running box.
+ *
+ * `stop` halts the runtime and keeps the box and its disk; the next exec on the
+ * same id starts it again with its files (measured 2026-10-01: about two
+ * seconds, /work intact, processes gone). So an idle machine stops billing
+ * compute without its agent losing anything, which is why no warning comes
+ * before this step and one does come before the deletion that follows much
+ * later (`activityOf`).
+ *
+ * The compute session ends here and is recorded the way `stopBox` records one,
+ * because the next use starts a new one (`createdAt` moves then). A stop run9
+ * refused is thrown with its fact, as `stopBox` does: a box still running must
+ * not read as switched off.
+ */
+async function parkBox(ctx: PluginContext, state: BoxState): Promise<Released | false> {
+  if (!ctx.credential) return false;
+  const cfg = cfgOf(ctx);
+  providerOf(cfg);
+  const cred = JSON.parse(ctx.credential) as Run9Credential;
+  const auth = "Basic " + btoa(`${cred.ak}:${cred.sk}`);
+  let error: string | undefined;
+  try {
+    const res = await fetch(`${cfg.endpoint}/projects/${cfg.project}/workspace/boxes/${state.boxId}/stop`, {
+      method: "POST", headers: { authorization: auth }, signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) error = `stop returned ${res.status}: ${(await res.text()).slice(0, 120)}`;
+  } catch (e) {
+    error = String((e as Error)?.message ?? e).slice(0, 160);
+  }
+  const endedAt = Date.now();
+  const session = sessionOf(state, endedAt);
+  const fact: Released = {
+    id: state.boxId, startedAt: session.startedAt, endedAt,
+    status: error ? "error" : "freed", ...(error ? { error } : {}),
+  };
+  if (error) throw markReleased(new Error(`run9 box ${state.boxId} not switched off: ${error}`), fact);
+  // Read again before writing, for the reason `stopBox` does: a command may
+  // have recorded another box meanwhile, and that one is running.
+  const now = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
+  if (now?.boxId === state.boxId) {
+    // A postponement is spent by the time this runs (the pass waits for the later of the two), and one left
+    // in the record would hold off the deletion schedule by its old instant.
+    const { quietUntil: _q, ...rest } = now;
+    await ctx.db.put(BOX_STORE, {
+      ...rest, parkedAt: endedAt, sessions: keepSessions(now.sessions, session),
+    } as unknown as Json, BOX_KEY);
+  }
+  return fact;
 }
 
 /**
@@ -670,16 +783,51 @@ async function stopBox(
  * places and the reason a mount could only be found by the alias `node`. The
  * adapter is four lines and it is the whole fix: callers ask, this answers.
  */
-export function activityOf(state: BoxState | null | undefined, unreadable = 0): MountActivity {
+export function activityOf(
+  state: BoxState | null | undefined,
+  unreadable = 0,
+  keepStoppedDays: number = DEFAULTS.keepStoppedDays,
+): MountActivity {
   const billing = "billed for every second it exists, not per call";
   if (!state?.boxId) return { live: null, billing, ...(unreadable ? { unreadable } : {}) };
+  // An unused box is idle from when it started, not from zero: the same
+  // rule the release record follows, so the two agree about its age.
+  const used = state.lastUsedAt || state.createdAt;
+  const stopped = parkedAt(state);
+  if (stopped !== null) {
+    // Switched off: the next step deletes the disk, which loses files, so this
+    // one waits days and is announced. Idle from when it was switched off, or
+    // from a later touch (`keep` stamps one without starting it).
+    const days = keepDaysOf({ keepStoppedDays });
+    const maxMs = days * DAY;
+    return {
+      live: {
+        id: state.boxId,
+        startedAt: state.createdAt,
+        lastUsedAt: Math.max(stopped, used),
+        lease: {
+          maxMs,
+          warnMs: stoppedWarnMs(days),
+          consequence: "the stopped machine and everything on its disk will be deleted",
+          advice: "Before then, `save` the files you need or `keep` the environment, or run anything in it to "
+            + "switch it back on.",
+          maxPostponeMinutes: Math.floor(maxMs / 60_000),
+        },
+      },
+      quietUntil: state.quietUntil ?? null,
+      ...(unreadable ? { unreadable } : {}),
+      billing: "stopped: no compute is billed; only its disk is kept until it is deleted",
+    };
+  }
   return {
     live: {
       id: state.boxId,
       startedAt: state.createdAt,
-      // An unused box is idle from when it started, not from zero: the same
-      // rule the release record follows, so the two agree about its age.
-      lastUsedAt: state.lastUsedAt || state.createdAt,
+      lastUsedAt: used,
+      // Running: the idle step only switches it off and loses nothing on its
+      // disk, so it is taken at the deployment's limit without a warning — a
+      // warning is a model turn, and there is nothing to answer it with.
+      lease: { warnMs: 0 },
     },
     quietUntil: state.quietUntil ?? null,
     ...(unreadable ? { unreadable } : {}),
@@ -996,19 +1144,20 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
   // is how it was lost once already.
   //
   // `run` and `shell` state the same lifetime: with a lease, the box stays until
-  // the agent releases it or the idle ceiling takes it; without one, a settled turn hands it back.
+  // the agent releases it, is switched off when idle and deleted only after days
+  // switched off; without one, a settled turn hands it back.
   const runLifetime = lease
     ? "The container is NOT the per-execution sandbox: every call uses the same one, in this turn and later " +
       "ones, so installs and files survive from one call to the next — do not reinstall. It stays until you " +
       `release it; ${leaseTerms(lease)}. Work in as few calls as you can, save what matters with \`save\`, and ` +
-      "release it once the machine will not be needed again. Everything inside is destroyed when it is released."
+      "release it once the machine will not be needed again. Releasing deletes it and everything on its disk."
     : "The container is NOT the per-execution sandbox: every call in this " +
       "turn uses the same one, so installs and files survive from one call to the next — do not " +
       "reinstall. It is handed back when the turn ends, so a later turn starts a new container " +
       "unless you saved this one's filesystem with `keep`. Work in as few calls as you can, save " +
       "what matters with `save`, and release it. Everything inside is destroyed when it is released.";
   const shellLifetime = lease
-    ? "Shell in the same billed-by-the-second container as `run`, and the same one for every call, in this " +
+    ? "Shell in the same container as `run`, billed by the second while it runs, and the same one for every call, in this " +
       "turn and later ones — state, installed packages and files carry over — until you release it; " +
       `${leaseTerms(lease)}.`
     : "Shell in the same billed-by-the-second container as `run`, and the same one for every call " +
@@ -1035,7 +1184,7 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {
       const raw = await ctx.db.get(BOX_STORE, BOX_KEY);
-      return activityOf(asBoxState(raw), unreadableEntries(raw));
+      return activityOf(asBoxState(raw), unreadableEntries(raw), keepDaysOf(cfgOf(ctx)));
     },
     /** The window this mount still holds. Bounded on purpose, which is why it is
      *  the console's history and not anybody's ledger. */
@@ -1057,8 +1206,19 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
      *
      *  Not per task, despite what the gateway's `releaseTask` is called: the body
      *  below reads the mount's box record and never looks at the caller's
-     *  task. */
-    async release(ctx: PluginContext): Promise<Released | false> {
+     *  task.
+     *
+     *  Under a lease it is a step, not an end: a running box is switched off
+     *  and kept (parkBox), and only one already switched off is deleted. Which
+     *  step comes when, and the warning before the deletion, follow from what
+     *  `activity` reports for each state. Without a lease the box is handed
+     *  back for good, because nothing would ever come back to delete it. */
+    async release(ctx: PluginContext, opts?: { reason?: "idle" }): Promise<Released | false> {
+      // Only the idle pass switches a running box off; an operator's or a benchmark's release means delete.
+      if (lease && opts?.reason === "idle") {
+        const state = asBoxState(await ctx.db.get(BOX_STORE, BOX_KEY));
+        if (state?.boxId && parkedAt(state) === null) return parkBox(ctx, state);
+      }
       const r = await stopBox(ctx);
       if (r === null) return false;
       // A container is the one thing here billed for merely existing, so a
@@ -1199,6 +1359,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       summary: "Replaced by accounts. An empty value still turns wiring off, as it did; any other value does nothing." },
     { name: "maxQuietMinutes", type: "number", default: 60,
       summary: "Longest a single postponement of the release may be. The quiet tool refuses a larger one rather than shortening it: an agent that asks for a day and is silently given an hour believes it has a day." },
+    { name: "keepStoppedDays", type: "number", default: DEFAULTS.keepStoppedDays,
+      summary: "Days a container switched off for being idle keeps its disk before it is deleted; the agent is told a day before (at most half of this)." },
     { name: "project", type: "string", summary: "run9 project the boxes belong to.", default: "default" },
     { name: "endpoint", type: "string", summary: "API endpoint.", default: "https://api.run.sys9.ai" },
     // Who can say whether this mount's credential works, which stops being run9
@@ -1322,13 +1484,14 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // nothing keeps (the SWE-bench runner, or a Worker without the two
       // settings). No number here: the minutes are said where they are read.
       summary: lease
-        ? "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
-          "first, in the same call. If you or the person you are working for will come back to it, leave it " +
-          "running, even after keeping or saving what is in it. Release it only when this machine will not be " +
-          "needed again. Leaving it running costs at most its idle time — an idle container is released on its " +
-          "own after a while, you are told before that, and `quiet` keeps it longer — while releasing it early " +
-          "saves little and makes the next visit start over. A kept environment or a saved file is for " +
-          "starting a fresh machine later, not a reason to destroy one someone will use again."
+        ? "Delete the container now: the machine and everything on its disk are destroyed, and the meter " +
+          "stops. Pass save to copy files out first, in the same call. If you or the person you are working for " +
+          "will come back to it, leave it running, even after keeping or saving what is in it. Release it only " +
+          "when this machine will not be needed again. Leaving it costs little: an idle container is only " +
+          "switched off on its own, and the next call brings it back with its files intact; it is deleted on " +
+          "its own only after days switched off, you are told before that, and `quiet` keeps it longer — while " +
+          "releasing it early saves little and makes the next visit start over. A kept environment or a saved " +
+          "file is for starting a fresh machine later, not a reason to destroy one someone will use again."
         : "Destroy the container and everything in it, stopping the meter. Pass save to copy files out " +
           "first, in the same call. It is handed back when the turn ends anyway, so release it sooner once " +
           "this machine will not be needed again in this turn. A later turn starts a fresh machine: what it " +
@@ -1354,11 +1517,13 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     {
       name: "quiet",
       summary: lease
-        ? "Postpone the release of this container: it is kept for at least `minutes` more from now, and " +
-          "you are not told about it again until shortly before then. Use it when you are coming back to " +
-          "the machine — a build you are waiting on, work you return to after reading something. It is " +
-          "billed for every second either way; if you are done with it, `release` is the cheaper answer, " +
-          "and it can save files out in the same call."
+        ? "Postpone what happens next to this container while it sits unused: switching it off, while it is " +
+          "running; deleting it, once it is switched off. It is kept as it is for at least `minutes` more from " +
+          "now, and you are not told about it again until shortly before then. Use it when you are coming back " +
+          "to the machine — a build you are waiting on, work you return to after reading something. The limit " +
+          "is the mount's while it runs and much longer once it is switched off. Running, it is billed for " +
+          "every second either way; if you are done with it, `release` is the cheaper answer, and it can save " +
+          "files out in the same call."
         : "Has no effect here: this mount has no idle release to put off, and the container is handed " +
           "back when the turn ends whatever you ask. To carry work into a later turn, keep or save it.",
       parameters: {
@@ -1527,7 +1692,11 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // Before the credential check on purpose: postponing a release calls
     // nothing at run9, so a mount whose key was removed can still answer it.
     if (tool === "quiet") {
-      const cap = cfg.maxQuietMinutes ?? DEFAULTS.maxQuietMinutes;
+      // Switched off, what is postponed is the deletion, and it may be put off by as long as the box is kept
+      // switched off at all; a running box bills compute, so its ceiling is the mount's own, much shorter one.
+      const cap = parkedAt(prior) !== null
+        ? Math.floor(keepDaysOf(cfg) * DAY / 60_000)
+        : cfg.maxQuietMinutes ?? DEFAULTS.maxQuietMinutes;
       const asked = (args as any)?.minutes;
       // Refused rather than clamped, for the reason the config field states: an
       // agent given less than it asked for, silently, plans against the number
@@ -1538,7 +1707,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       if (asked > cap) {
         throw new Error(
           `\`${ctx.alias}\` allows a quiet request of at most ${cap} minutes and ${asked} was asked for. ` +
-          `Ask for ${cap} or fewer, or release the container — it is billed for every second either way.`,
+          `Ask for ${cap} or fewer, or release the container` +
+          (parkedAt(prior) !== null ? "." : " — it is billed for every second either way."),
         );
       }
       // After the refusals, so a malformed request is refused the same everywhere; before the write, so a
@@ -1558,7 +1728,10 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // machine. There is no total cap: each postponement is a call the agent
       // chose to make, within this mount's limit.
       await ctx.db.put(BOX_STORE, { ...prior, quietUntil } as unknown as Json, BOX_KEY);
-      return { quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString() };
+      return {
+        quiet: true, box: prior.boxId, minutes: asked, until: new Date(quietUntil).toISOString(),
+        ...(parkedAt(prior) !== null ? { note: "it stays switched off; this postpones its deletion" } : {}),
+      };
     }
 
     if (!ctx.credential) throw new Error("run9 mount has no credential");
@@ -1641,6 +1814,18 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
       // box, and a new record written without them erased the list on the next
       // container's first command, stranding the snapshots in run9.
       state = await reconcileAccounts(ctx, cfg, state, api, want);
+      await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
+    }
+
+    // A box the idle lease switched off starts again on the next exec on its id, disk intact, so it is reused
+    // rather than replaced. Recorded as running before the command goes out: from here it bills compute again,
+    // so it has to be back on the short idle schedule even if this call fails. A new compute session starts
+    // (the last one was recorded when it was switched off), and a postponement of its deletion does not carry
+    // over to hold off switching it off. `save` included: reading a file out of a stopped box may start it.
+    if (!created && parkedAt(state) !== null && (tool === "run" || tool === "shell" || tool === "save")) {
+      const { parkedAt: _p, quietUntil: _q, ...running } = state;
+      const t = Date.now();
+      state = { ...running, createdAt: t, lastUsedAt: t, execs: 0, saved: [] };
       await ctx.db.put(BOX_STORE, state as unknown as Json, BOX_KEY);
     }
 

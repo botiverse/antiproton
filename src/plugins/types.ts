@@ -806,7 +806,34 @@ const resolved = (f: CredentialField): CredentialField => ({
  */
 export interface MountActivity {
   /** What this mount is keeping alive at a cost, or null when nothing. */
-  live: { id: string; startedAt: number; lastUsedAt: number } | null;
+  live: {
+    id: string;
+    startedAt: number;
+    lastUsedAt: number;
+    /**
+     * This thing's own idle schedule, where it differs from the deployment's
+     * (src/runtime/idle-lease.ts `scheduleOf`). Absent: the deployment's
+     * numbers and its generic warning.
+     *
+     * Per thing rather than per plugin because what `holds.release` does can
+     * depend on the state the thing is in: a step that loses nothing needs no
+     * warning (`warnMs: 0`), and a final one may need a longer wait and its
+     * own words for what will be lost. The framework keeps the schedule; the
+     * plugin only says which numbers and sentences apply now.
+     */
+    lease?: {
+      /** Idle this long, and `holds.release` is called. */
+      maxMs?: number;
+      /** How long before that the agent is told; 0 means it is not told. */
+      warnMs?: number;
+      /** What the release does, said in place of "what it is holding will be released". */
+      consequence?: string;
+      /** What to do before then, said after the cost; the plugin's own tool names. */
+      advice?: string;
+      /** The longest single postponement the postpone tool accepts for this thing now, in minutes. */
+      maxPostponeMinutes?: number;
+    };
+  } | null;
   /** Until when the agent asked not to be reminded about it, if it did. */
   quietUntil?: number | null;
   /**
@@ -1230,8 +1257,12 @@ export interface Holding {
    * Let go of it. Scoped to the AGENT rather than to one task, safe to call
    * again, and it must throw rather than return if something billed could not
    * be released — a silent failure here is a resource nobody will collect.
+   *
+   * `reason: "idle"` is the framework's idle pass reaching the end of the thing's schedule; a plugin
+   * may answer it with a gentler step (the sandbox switches a running box off and keeps it). Any other
+   * caller (an operator, a benchmark, a settled turn without a lease) means let go now.
    */
-  release(ctx: PluginContext): Promise<Released | boolean | void>;
+  release(ctx: PluginContext, opts?: { reason?: "idle" }): Promise<Released | boolean | void>;
 }
 
 /**
