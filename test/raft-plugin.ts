@@ -231,6 +231,24 @@ await check("resume \"send\" into a conversation that moved again asks again, wi
   if (!(again instanceof Interrupt) || (again.state as any).idempotencyKey !== "k-held") throw new Error(`a second hold must ask again: ${JSON.stringify(again)}`);
 });
 
+// What the SDK hands back when it drops a held envelope it cannot place: a count with no body to show.
+const HELD_UNSHOWN = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+  heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "a DM body the SDK cannot place" }] });
+
+await check("a held send whose messages are not all shown attests nothing and tells the agent to read them first", async () => {
+  const m = mount();
+  const calls = many(HELD_UNSHOWN(), HELD_UNSHOWN());
+  const held = await raftPlugin.invoke("send_message", { target: "dm:@cody", content: "done", idempotencyKey: "k-u" }, m.ctx) as any;
+  if (!(held instanceof Interrupt) || !/not shown here: read dm:@cody with receive_events first/.test(held.question) ||
+      (held.context as any)?.unshown !== 1 || (held.state as any).seen !== undefined) {
+    throw new Error(`an unshown message was treated as seen: ${JSON.stringify(held)}`);
+  }
+  // Neither the answer nor a plain resend may claim the model saw it.
+  await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx);
+  const second = JSON.parse(String(calls[1]!.init.body));
+  if (second.seenUpToSeq !== undefined) throw new Error(`the resend attested an unshown message: ${JSON.stringify(second)}`);
+});
+
 await check("resume \"drop\" sends nothing", async () => {
   const m = mount();
   globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
