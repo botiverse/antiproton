@@ -445,7 +445,7 @@ async function sendMessage(
       answer: { choices: ["send", "drop"] },
       state: {
         target: send.target, content: send.content, idempotencyKey: out.data.continuation.idempotencyKey,
-        ...(out.data.continuation.seen && attested ? { seen: { upToSeq: out.data.continuation.seen.upToSeq } } : {}),
+        ...(out.data.continuation.seen ? { seen: { upToSeq: out.data.continuation.seen.upToSeq } } : {}),
       },
     });
   }
