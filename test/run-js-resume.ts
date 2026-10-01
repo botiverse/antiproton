@@ -5,18 +5,18 @@
  * keep-alive.
  *
  * The Dynamic Worker rows use the same node stand-in as
- * test/dynamic-worker-pause.ts: the generated module is evaluated for real,
- * and its binding goes straight to the supervisor's handlers.
+ * test/dynamic-worker-pause.ts (spec/worker-stand-in.ts): the generated module
+ * is evaluated for real, and its binding reaches the supervisor's handlers
+ * the way the platform's RPC does — late, and not after the handler returns.
  */
 import { QuickJsExecutor } from "../src/runtime/executor.ts";
-import {
-  DynamicWorkerExecutor, executions, handleSandboxCall, handleSandboxSuspend,
-} from "../src/runtime/dynamic-worker-executor.ts";
+import { DynamicWorkerExecutor, executions } from "../src/runtime/dynamic-worker-executor.ts";
 import {
   EXPIRED_NOTE, RESUME_DESCRIPTION, RUN_JS_DESCRIPTION, qualifyMountedTools, resumeTool, runJsTool, runJsTools,
 } from "../src/runtime/pi-tools.ts";
 import { RUN_JS_KEEP_ALIVE_MS, RUN_JS_RESUME_MS, RunJsContinuations, answerProblem, answerSpecOf } from "../src/runtime/run-js-resume.ts";
 import { nextAlarm } from "../cf/src/alarm-next.ts";
+import { standInLoader } from "./spec/worker-stand-in.ts";
 import type { Continuation } from "../src/core/execution.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
@@ -30,23 +30,11 @@ const named = (name: string, address: string) =>
   ({ name, address, description: "", parameters: { type: "object" }, sideEffects: "read" as const });
 const TOOLS = qualifyMountedTools([named("get", "web.get"), named("send", "web.send")]);
 
-const dw = new DynamicWorkerExecutor({
-  loader: {
-    load: (code: any) => ({
-      getEntrypoint: () => ({
-        fetch: async (req: Request) => {
-          const src = code.modules[code.mainModule] as string;
-          const mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
-          return mod.default.fetch(req, code.env);
-        },
-      }),
-    }),
-  },
-  makeToolBinding: (execId) => ({
-    invoke: (strings: string[], values: unknown[]) => handleSandboxCall(execId, strings, values),
-    suspend: (req: any) => handleSandboxSuspend(execId, req),
-  }),
-});
+// The platform's binding, as close as node gets: calls arrive late and out of
+// order, and a call outstanding when the handler returns is dropped (spec/worker-stand-in.ts).
+const standIn = standInLoader();
+const dw = new DynamicWorkerExecutor({ loader: standIn.loader, makeToolBinding: standIn.makeToolBinding });
+
 const EXECUTORS: Array<[string, any]> = [["quickjs", new QuickJsExecutor()], ["worker", dw]];
 
 /** Wraps an executor so every continuation it hands out reports being cancelled. */

@@ -28,6 +28,9 @@ interface ExecutionState {
   accepted: string[];
   aborted: boolean;
   pending: Set<Promise<unknown>>;
+  /** Calls that have reached the supervisor, refused or not; told to `onArrive`. */
+  arrived?: number;
+  onArrive?: () => void;
   /** Calls that came back `pending`, and the first one, which pauses the run. */
   held?: HeldCall[];
   hold?: Paused;
@@ -35,7 +38,7 @@ interface ExecutionState {
    * The program waiting at `await pause(...)`: what it handed over, and the
    * one way to answer the sandbox's pending `suspend` call.
    */
-  suspended?: { pause: Paused; outputs: Json[]; resolve: (answer: SuspendAnswer) => void };
+  suspended?: { pause: Paused; outputs: Json[]; sent: number; resolve: (answer: SuspendAnswer) => void };
   /** Whoever is waiting to hear that the program suspended (the supervisor). */
   onSuspend?: () => void;
   /** Set by cancel: calls are refused and the run is reported cancelled however it ends. */
@@ -52,6 +55,8 @@ export interface SuspendRequest {
   problem: string | null;
   /** Output room already used when pause() was called, for the data's share of the cap. */
   bytes: number;
+  /** How many calls the sandbox had sent: the supervisor waits until it has seen them all. */
+  sent?: number;
   /** Everything output so far: the supervisor cannot read the sandbox's. */
   outputs: Json[];
   /** pause()'s third argument as JSON text (PAUSE_FACTORY), or null. */
@@ -75,15 +80,16 @@ export async function handleSandboxCall(
   if (!state) {
     return { status: "rejected", error: { code: "execution_gone", message: "no such execution" } };
   }
+  state.arrived = (state.arrived ?? 0) + 1;
+  state.onArrive?.();
   if (state.aborted || state.cancelled) {
     // §6.3: after cancellation the gateway refuses new calls.
     return { status: "rejected", error: { code: "execution_cancelled", message: "execution cancelled" } };
   }
-  if (state.suspended) {
-    // Only a program that did not await its own pause can still call: refused,
-    // as every call after a pause is.
-    return { status: "rejected", error: { code: "execution_paused", message: `run_js paused: ${state.suspended.pause.reason}` } };
-  }
+  // Not refused for a suspension: a call can arrive after the pause that was
+  // sent before it (an RPC arrives when it arrives), and that one is owed its
+  // answer. Calls made after a pause are refused in the sandbox, which the
+  // program cannot reach around (RUNNER's `paused`).
   if (state.hold) {
     // Decided here, not in the sandbox: a program that caught the pause and
     // calls again is refused by the side it cannot touch.
@@ -148,6 +154,7 @@ export async function handleSandboxSuspend(execId: string, req: SuspendRequest):
   const room = state.limits.maxOutputBytes - (Number(req.bytes) || 0);
   return new Promise<SuspendAnswer>((resolve) => {
     state.suspended = {
+      sent: Number(req.sent) || 0,
       pause: pauseFrom(String(req.reason), req.json, req.problem, room, req.answer ?? null),
       outputs: Array.isArray(req.outputs) ? req.outputs : [],
       resolve,
@@ -156,7 +163,33 @@ export async function handleSandboxSuspend(execId: string, req: SuspendRequest):
   });
 }
 
-const RUNNER = (source: string, maxOutputBytes: number) => `
+/**
+ * Until every call the sandbox says it sent has reached the supervisor and
+ * settled, or `ms` has passed. The sandbox waits for its own calls before it
+ * answers or suspends (RUNNER's settle); this is the supervisor's half, for a
+ * sandbox whose wait ran out, or whose calls are still on their way: an RPC
+ * reaches the supervisor when it gets there, not when it was sent.
+ */
+export async function untilCallsSettle(state: ExecutionState, sent: number, ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  const left = () => Math.max(0, deadline - Date.now());
+  while ((state.arrived ?? 0) < sent && left() > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await new Promise<void>((res) => { state.onArrive = res; timer = setTimeout(res, left()); });
+    clearTimeout(timer);
+    state.onArrive = undefined;
+  }
+  while (state.pending.size && left() > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled([...state.pending]),
+      new Promise((res) => { timer = setTimeout(res, left()); }),
+    ]);
+    clearTimeout(timer);
+  }
+}
+
+const RUNNER = (source: string, maxOutputBytes: number, settleMs: number) => `
 // The program is a module-level function, so it sees its three globals and
 // nothing of fetch's scope: not env (it could call TOOLS around the tool tag),
 // not the state below (it could unset a pause).
@@ -182,9 +215,32 @@ function makeBox(TOOLS) {
     bytes += size;
     outputs.push(value);
   };
+  // Calls sent and not yet answered. On the platform a call is an RPC: it
+  // reaches the supervisor when it gets there, and one still out when this
+  // handler returns is never answered. So nothing is decided — the run's end,
+  // or a pause handed to the model — until every call sent has come back:
+  // one of them may have been held, which changes what the run is.
+  const inflight = new Set();
+  let sent = 0;
+  const settle = async () => {
+    const deadline = Date.now() + ${settleMs};
+    while (inflight.size && Date.now() < deadline) {
+      let timer;
+      await Promise.race([
+        Promise.allSettled([...inflight]),
+        new Promise((r) => { timer = setTimeout(r, Math.max(0, deadline - Date.now())); }),
+      ]);
+      clearTimeout(timer);
+    }
+  };
   const call = async (strings, values) => {
     if (paused) throw stop();
-    const res = await TOOLS.invoke(Array.from(strings), values);
+    sent++;
+    const out = TOOLS.invoke(Array.from(strings), values);
+    inflight.add(out);
+    const done = () => { inflight.delete(out); };
+    out.then(done, done);
+    const res = await out;
     // The supervisor has recorded the hold already; this only ends the program here.
     if (res && (res.status === "pending" || (res.status === "rejected" && res.error && res.error.code === "execution_paused"))) {
       paused ??= { kind: "hold" };
@@ -217,16 +273,20 @@ function makeBox(TOOLS) {
     () => {
       const p = paused;
       if (!p || p.kind !== "pause") return Promise.reject(stop());
-      return TOOLS.suspend({ reason: p.reason, json: p.json, problem: p.problem, bytes: p.bytes, answer: p.answer, outputs: outputs.slice() })
+      return settle()
+        .then(() => TOOLS.suspend({ reason: p.reason, json: p.json, problem: p.problem, bytes: p.bytes, answer: p.answer, sent, outputs: outputs.slice() }))
         .then((res) => {
           if (res && "answer" in res && paused === p) { paused = null; return res.answer; }
           throw res && res.end === "cancel" ? cancelled() : stop();
         });
     },
   );
-  const answer = (ok, error) => Response.json(
-    { ok, outputs, ...(paused && paused.kind === "pause" ? { pause: paused } : {}), ...(error ? { error } : {}) },
-  );
+  const answer = async (ok, error) => {
+    await settle();
+    return Response.json(
+      { ok, outputs, sent, ...(paused && paused.kind === "pause" ? { pause: paused } : {}), ...(error ? { error } : {}) },
+    );
+  };
   return { tool, output, pause, answer };
 }
 
@@ -243,10 +303,10 @@ export default {
     const box = makeBox(env.TOOLS);
     try {
       await program(box.tool, box.output, box.pause);
-      return box.answer(true);
     } catch (e) {
-      return box.answer(false, { code: "uncaught", message: String((e && e.message) || e) });
+      return await box.answer(false, { code: "uncaught", message: String((e && e.message) || e) });
     }
+    return await box.answer(true);
   }
 };`;
 
@@ -330,7 +390,7 @@ export class DynamicWorkerExecutor implements JsExecutor {
       const stub = this.#loader.load({
         compatibilityDate: this.#compatibilityDate,
         mainModule: "main.js",
-        modules: { "main.js": RUNNER(source, limits.maxOutputBytes) },
+        modules: { "main.js": RUNNER(source, limits.maxOutputBytes, limits.wallTimeMs) },
         globalOutbound: null,
         env: { TOOLS: this.#makeToolBinding(execId) },
         limits: {
@@ -378,10 +438,11 @@ export class DynamicWorkerExecutor implements JsExecutor {
         }
 
         if (settled === "suspended") {
-          // Accepted operations are reported, not lost: whatever the program
-          // started before it paused settles first.
-          await Promise.allSettled([...state.pending]);
+          // Nothing is handed to the model until every call the program sent
+          // has come back: one may have been held, and a held run is not
+          // resumable. Accepted operations are reported, not lost.
           const s = state.suspended!;
+          await untilCallsSettle(state, s.sent, limits.wallTimeMs);
           if (!state.hold) {
             return {
               status: "paused", outputs: s.outputs, pause: s.pause,
@@ -407,9 +468,12 @@ export class DynamicWorkerExecutor implements JsExecutor {
         }
 
         const body = (await (settled as Response).json()) as {
-          ok: boolean; outputs: Json[]; error?: { code: string; message: string };
+          ok: boolean; outputs: Json[]; error?: { code: string; message: string }; sent?: number;
           pause?: { reason: string; json: string | null; problem: string | null; bytes: number; answer?: string | null };
         };
+        // The program has ended; whether it ended paused depends on calls that
+        // may still be on their way to this side (see untilCallsSettle).
+        await untilCallsSettle(state, Number(body.sent) || 0, limits.wallTimeMs);
         const asked = body.pause
           ? pauseFrom(String(body.pause.reason), body.pause.json, body.pause.problem, limits.maxOutputBytes - (Number(body.pause.bytes) || 0), body.pause.answer ?? null)
           : undefined;

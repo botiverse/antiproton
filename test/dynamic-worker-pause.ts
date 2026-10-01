@@ -2,10 +2,11 @@
  * The pause rows of the executor contract, against the Dynamic Worker executor,
  * in node.
  *
- * The loader here evaluates the module the executor generates — the real
- * runner, with its pause(), output() and tool tag — as an ES module, and its
- * tool binding goes straight to handleSandboxCall, as the platform's does
- * through SandboxTools. So the Worker's half of pause (the runner) and its
+ * The loader here (spec/worker-stand-in.ts) evaluates the module the executor
+ * generates — the real runner, with its pause(), output() and tool tag — as an
+ * ES module, and its tool binding reaches handleSandboxCall as the platform's
+ * does through SandboxTools: late, out of order, and not at all once the
+ * handler has returned. So the Worker's half of pause (the runner) and its
  * supervisor's half (handleSandboxCall, the answer it reads) are both the
  * shipped code. Only the pause rows: the others need the platform's isolation
  * (a runaway loop would hang node; node has a network) and run on a deployment
@@ -13,24 +14,13 @@
  */
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend } from "../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "./spec/executor-spec.ts";
+import { standInLoader } from "./spec/worker-stand-in.ts";
 
-const exec = new DynamicWorkerExecutor({
-  loader: {
-    load: (code: any) => ({
-      getEntrypoint: () => ({
-        fetch: async (req: Request) => {
-          const src = code.modules[code.mainModule] as string;
-          const mod = await import(`data:text/javascript;base64,${Buffer.from(src).toString("base64")}`);
-          return mod.default.fetch(req, code.env);
-        },
-      }),
-    }),
-  },
-  makeToolBinding: (execId) => ({
-    invoke: (strings: string[], values: unknown[]) => handleSandboxCall(execId, strings, values),
-    suspend: (req: any) => handleSandboxSuspend(execId, req),
-  }),
-});
+// The platform's binding, as close as node gets: calls arrive late and out of
+// order, and a call outstanding when the handler returns is dropped (spec/worker-stand-in.ts).
+const standIn = standInLoader();
+const exec = new DynamicWorkerExecutor({ loader: standIn.loader, makeToolBinding: standIn.makeToolBinding });
+
 
 const extra: Array<{ ok: boolean; row: string; name: string; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -86,6 +76,44 @@ await check("the supervisor keeps one suspension per execution: a second suspend
   } finally {
     executions.delete("exec-twice");
   }
+});
+
+await check("the supervisor waits for calls the sandbox says it sent, even when the sandbox answered before they arrived", async () => {
+  // A hand-written isolate standing for a runner whose own wait ran out: it
+  // sends one call that reaches the supervisor 20 ms later and comes back
+  // held, and answers (or suspends) at once, saying it sent one.
+  const held = { async invoke() { return { status: "pending", operationId: "op_late", error: { code: "awaiting_approval", message: "held" } }; } } as any;
+  const isolate = (then: (execId: string) => Promise<Response>) => new DynamicWorkerExecutor({
+    loader: { load: (code: any) => ({ getEntrypoint: () => ({ fetch: () => then(code.env.TOOLS.execId) }) }) },
+    makeToolBinding: (execId) => ({ execId }),
+  });
+  const late = (execId: string) => { setTimeout(() => { void handleSandboxCall(execId, ["m.send ", ""], [{}]); }, 20); };
+  // Waiting out the whole budget (5 s here) would also end on the right answer; the wait ends at the arrival.
+  const t0 = Date.now();
+  const ended = await isolate(async (execId) => {
+    late(execId);
+    return Response.json({ ok: true, outputs: [], sent: 1 });
+  }).execute("", held);
+  if (ended.status !== "paused" || ended.pause?.cause !== "hold") throw new Error(`the end did not wait: ${JSON.stringify(ended)}`);
+  const yielded = await isolate(async (execId) => {
+    late(execId);
+    const a = await handleSandboxSuspend(execId, { reason: "p", json: "null", problem: null, bytes: 0, outputs: [], sent: 1 });
+    return Response.json({ ok: true, outputs: [], sent: 1, ...("end" in a ? { pause: { reason: "p", json: "null", problem: null, bytes: 0 } } : {}) });
+  }).execute("", held);
+  if (yielded.continuation !== undefined || yielded.status !== "paused") throw new Error(`the pause did not wait: ${JSON.stringify(yielded)}`);
+  if (JSON.stringify(yielded.held) !== '[{"tool":"m.send","operationId":"op_late","status":"pending"}]') throw new Error(`held: ${JSON.stringify(yielded.held)}`);
+  if (Date.now() - t0 > 1_000) throw new Error(`waited ${Date.now() - t0} ms: the wait did not end when the call arrived`);
+});
+
+await check("the supervisor's wait for missing calls is bounded by the wall-time budget", async () => {
+  const exec2 = new DynamicWorkerExecutor({
+    loader: { load: () => ({ getEntrypoint: () => ({ fetch: async () => Response.json({ ok: true, outputs: [], sent: 3 }) }) }) },
+    makeToolBinding: () => ({}),
+  });
+  const t0 = Date.now();
+  const r = await exec2.execute("", okHost, { ...(await import("../src/core/execution.ts")).DEFAULT_LIMITS, wallTimeMs: 100 });
+  const ms = Date.now() - t0;
+  if (r.status !== "completed" || ms < 90 || ms > 2_000) throw new Error(`${r.status} after ${ms} ms`);
 });
 
 // Not 暂停不计时: node does not enforce the Worker's cpuMs, so it would pass here whatever the code did.
