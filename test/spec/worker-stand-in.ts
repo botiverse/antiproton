@@ -29,7 +29,11 @@ import type { WorkerLoader } from "../../src/runtime/dynamic-worker-executor.ts"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function standInLoader(opts: { callHopMs?: number } = {}): {
+export function standInLoader(opts: {
+  callHopMs?: number;
+  /** Calls that are lost on the way: never delivered, never answered. */
+  lose?: (tool: string) => boolean;
+} = {}): {
   loader: WorkerLoader;
   makeToolBinding: (execId: string) => unknown;
   /** Calls that were dropped because their request had ended, by execution. */
@@ -62,6 +66,7 @@ export function standInLoader(opts: { callHopMs?: number } = {}): {
     makeToolBinding: (execId: string) => ({
       execId,
       async invoke(strings: string[], values: unknown[]) {
+        if (opts.lose?.(String(strings[0] ?? "").trim())) return never();
         await sleep(hop);
         if (live.get(execId) === false) { dropped.push(execId); return never(); }
         const res = await handleSandboxCall(execId, strings, values);

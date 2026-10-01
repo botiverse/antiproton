@@ -116,6 +116,20 @@ await check("the supervisor's wait for missing calls is bounded by the wall-time
   if (r.status !== "completed" || ms < 90 || ms > 2_000) throw new Error(`${r.status} after ${ms} ms`);
 });
 
+await check("a call lost on the way holds the run up for the wall-time budget, not for ever", async () => {
+  const lossy = standInLoader({ lose: (t) => t === "m.lost" });
+  const exec3 = new DynamicWorkerExecutor({ loader: lossy.loader, makeToolBinding: lossy.makeToolBinding });
+  const { DEFAULT_LIMITS } = await import("../src/core/execution.ts");
+  const t0 = Date.now();
+  const r = await Promise.race([
+    exec3.execute("tool`m.lost ${ {} }`; output('done');", okHost, { ...DEFAULT_LIMITS, wallTimeMs: 100 }),
+    new Promise<"hung">((res) => setTimeout(() => res("hung"), 3_000)),
+  ]);
+  if (r === "hung") throw new Error("the run waited for a call that will never come back");
+  // The sandbox waits its budget, then the supervisor waits its own for the call it never saw.
+  if (r.status !== "completed" || Date.now() - t0 < 150) throw new Error(`${JSON.stringify(r)} after ${Date.now() - t0} ms`);
+});
+
 // Not 暂停不计时: node does not enforce the Worker's cpuMs, so it would pass here whatever the code did.
 const PAUSE_ROWS = new Set(["暂停", "暂停不可吞", "暂停数据", "暂停于审批", "暂停于未等的调用", "其它状态照旧", "统一入口", "单一通道",
   "暂停续行", "暂停取消", "暂停后的挂起"]);
