@@ -2,8 +2,8 @@ import { getQuickJS, type QuickJSContext, type QuickJSHandle } from "quickjs-ems
 import { parseTemplateCall } from "../core/tools.ts";
 import type { ToolResult } from "../core/tools.ts";
 import type { Json } from "../core/types.ts";
-import { DEFAULT_LIMITS as LIMITS } from "../core/execution.ts";
-import type { ExecutionLimits, ExecutionResult, ExecutorHost, JsExecutor } from "../core/execution.ts";
+import { DEFAULT_LIMITS as LIMITS, PAUSE_FACTORY, holdFrom, pauseFrom } from "../core/execution.ts";
+import type { ExecutionLimits, ExecutionResult, ExecutorHost, HeldCall, JsExecutor, Paused } from "../core/execution.ts";
 
 export { DEFAULT_LIMITS } from "../core/execution.ts";
 export type { ExecutionLimits, ExecutorHost, ExecutionResult, JsExecutor } from "../core/execution.ts";
@@ -11,7 +11,8 @@ export type { ExecutionLimits, ExecutorHost, ExecutionResult, JsExecutor } from 
 /**
  * One JSRuntime + one context per execution, destroyed at the end. Nothing from
  * the previous execution survives: no variables, no closures, no pending
- * promises. The only way out of the sandbox is the `tool` tag and `output`.
+ * promises. The only way out of the sandbox is the `tool` tag and `output`;
+ * `pause` is the only way to stop early on purpose.
  */
 export class QuickJsExecutor implements JsExecutor {
   async execute(
@@ -40,6 +41,10 @@ export class QuickJsExecutor implements JsExecutor {
     let inFlight = 0;
     let outputBytes = 0;
     const pending = new Set<Promise<unknown>>();
+    // Host state, out of the program's reach: once set, the run ends paused
+    // whatever the program does next (see PAUSE_FACTORY).
+    let paused: Paused | null = null;
+    const held: HeldCall[] = [];
 
     // JSON.parse-based marshalling: no eval, no ad-hoc handle construction.
     const jsonHandle = ctx.getProp(ctx.global, "JSON");
@@ -51,9 +56,23 @@ export class QuickJsExecutor implements JsExecutor {
       return ctx.unwrapResult(r);
     };
 
-    const settleWith = (deferred: ReturnType<QuickJSContext["newPromise"]>, value: ToolResult) => {
+    // What the program's await sees once the run is paused: a throw, so the
+    // line after it does not run. The host state above is what decides.
+    const rejectPaused = (deferred: ReturnType<QuickJSContext["newPromise"]>) => {
+      const e = ctx.newError({ name: "RunJsPaused", message: `run_js paused: ${paused?.reason ?? ""}` });
+      deferred.reject(e);
+      e.dispose();
+    };
+
+    const settleWith = (deferred: ReturnType<QuickJSContext["newPromise"]>, value: ToolResult, tool?: string) => {
       if (value.status !== "rejected" && "operationId" in value) {
         acceptedOperationIds.push(value.operationId);
+      }
+      if (value.status === "pending" && tool !== undefined) {
+        held.push({ tool, operationId: value.operationId, status: "pending" });
+        paused ??= holdFrom(tool, value as { operationId: string; error?: { code?: string } });
+        rejectPaused(deferred);
+        return;
       }
       const h = toVm(value);
       deferred.resolve(h);
@@ -66,7 +85,10 @@ export class QuickJsExecutor implements JsExecutor {
       const deferred = ctx.newPromise();
 
       const parsed = parseTemplateCall(strings, values);
-      if ("error" in parsed) {
+      if (paused) {
+        // Never reaches the host: a program that caught the pause cannot go on calling.
+        rejectPaused(deferred);
+      } else if ("error" in parsed) {
         settleWith(deferred, { status: "rejected", error: parsed.error });
       } else if (hostCalls >= limits.maxHostCalls) {
         settleWith(deferred, {
@@ -85,7 +107,7 @@ export class QuickJsExecutor implements JsExecutor {
         const p = host
           .invoke({ tool: name, args: parsed.args, opts: parsed.opts as Record<string, Json> })
           .then(
-            (res) => settleWith(deferred, res),
+            (res) => settleWith(deferred, res, name),
             (err: Error) =>
               settleWith(deferred, {
                 status: "rejected",
@@ -106,6 +128,8 @@ export class QuickJsExecutor implements JsExecutor {
     toolFn.dispose();
 
     const outputFn = ctx.newFunction("output", (valueHandle) => {
+      // Outputs are "what the program produced before it stopped".
+      if (paused) return ctx.undefined;
       const v = ctx.dump(valueHandle);
       // String.length, UTF-16 code units, like every other `…Bytes` cap on a
       // string in this tree; the one byte-accurate bound is on binary, in
@@ -123,6 +147,26 @@ export class QuickJsExecutor implements JsExecutor {
     });
     ctx.setProp(ctx.global, "output", outputFn);
     outputFn.dispose();
+
+    const recordFn = ctx.newFunction("record", (reasonH, jsonH, problemH) => {
+      if (paused) return ctx.undefined; // the first stop is the one reported
+      const json = ctx.typeof(jsonH) === "string" ? ctx.getString(jsonH) : null;
+      const problem = ctx.typeof(problemH) === "string" ? ctx.getString(problemH) : null;
+      paused = pauseFrom(ctx.getString(reasonH), json, problem, limits.maxOutputBytes - outputBytes);
+      return ctx.undefined;
+    });
+    {
+      const factory = ctx.unwrapResult(ctx.evalCode(PAUSE_FACTORY, "pause.js"));
+      const pauseFn = ctx.unwrapResult(ctx.callFunction(factory, ctx.undefined, recordFn));
+      ctx.setProp(ctx.global, "pause", pauseFn);
+      pauseFn.dispose();
+      factory.dispose();
+      recordFn.dispose();
+    }
+    // A pause recorded on the host wins over however the program ended (see
+    // the end of `finally`).
+    const asPaused = (): ExecutionResult | null =>
+      paused ? { status: "paused", outputs, acceptedOperationIds, hostCalls, pause: paused, held } : null;
 
     let result: ExecutionResult;
     try {
@@ -171,7 +215,7 @@ export class QuickJsExecutor implements JsExecutor {
           };
         } else {
           settled.value.dispose();
-          result = { status: "completed", outputs, acceptedOperationIds, hostCalls };
+          result = { status: "completed", outputs, acceptedOperationIds, hostCalls, held };
         }
       }
     } catch (err) {
@@ -186,6 +230,15 @@ export class QuickJsExecutor implements JsExecutor {
       // Already-accepted operations keep running and are reported upward; only
       // un-accepted host work is abandoned with the context.
       await Promise.allSettled([...pending]);
+      // A pause recorded on the host decides the result whether the program
+      // then returned or threw — a caught pause followed by either is still a
+      // pause — and so does a call that was still in flight when the program
+      // ended and came back held after it, since it now waits on a person.
+      // An interruption (wall time, cancel) stays one, as in the Dynamic
+      // Worker, where a kill leaves nothing of the sandbox's pause to read.
+      // (`result` is unset on the cancelled path, which returned already.)
+      const ended = result! as ExecutionResult | undefined;
+      if (paused && ended && (ended.status === "completed" || ended.status === "failed")) result = asPaused()!;
       parseHandle.dispose();
       jsonHandle.dispose();
       try {

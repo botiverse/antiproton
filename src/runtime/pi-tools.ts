@@ -20,6 +20,7 @@
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
 import type { Json } from "../core/types.ts";
+import type { HeldCall, Paused } from "../core/execution.ts";
 
 /** What the model is offered, and the mount-qualified address behind it. */
 export interface MountedTool {
@@ -291,11 +292,13 @@ export interface Sandbox {
      *  call's. A `string` here let this tool test for a tool call's
      *  "succeeded" — a word no executor has ever returned — so every script
      *  that ran to completion was reported to the model as a failure. */
-    status: "completed" | "failed" | "interrupted";
+    status: "completed" | "failed" | "interrupted" | "paused";
     outputs?: unknown[];
     error?: unknown;
     hostCalls?: number;
     acceptedOperationIds?: string[];
+    pause?: Paused;
+    held?: HeldCall[];
   }>;
 }
 
@@ -323,7 +326,30 @@ export function liftConfirm(args: Json): { args: Json; confirm: boolean } {
 export const RUN_JS_DESCRIPTION =
   "Execute JavaScript in a sandbox that calls your tools. The default whenever more than one " +
   "tool call is involved: chain calls, loop, filter or project fields in one program instead of " +
-  "separate calls, and output() only what you need. Not for a single simple call.";
+  "separate calls, and output() only what you need. Not for a single simple call. " +
+  "Call pause(reason, data) where the program needs your judgement: it stops there and you get " +
+  "the outputs so far.";
+
+/**
+ * What the model is told when a run stops paused. Not an error: the program
+ * did what it was asked, or a call is waiting on a person, and either way the
+ * next move is the model's.
+ */
+export function pausedNote(p: Paused, held: readonly HeldCall[]): string {
+  const rest = "Calls made before that point completed and are not undone.";
+  if (p.cause === "hold") {
+    return "This call is waiting for the person's approval; if they approve it, it runs on its own exactly " +
+      "as written. The rest of your program did not run. " + rest + " Decide whether to continue without " +
+      "it, wait, or tell the person.";
+  }
+  const also = held.length
+    ? ` ${held.length === 1 ? "A call is" : `${held.length} calls are`} also waiting for the person's approval ` +
+      "(see held); approved, each runs on its own exactly as written."
+    : "";
+  return "The program stopped where you called pause(); nothing after that line ran. " + rest +
+    " Think, then send a new run_js program to continue — carry what you need from data and outputs, " +
+    "because a new run starts from nothing." + also;
+}
 
 export function runJsTool(
   sandbox: Sandbox,
@@ -384,7 +410,8 @@ export function runJsTool(
         source: {
           type: "string",
           description: "JavaScript body. Use await tool`name ${args}` and output(value), " +
-            "where `name` is the tool's name as it appears in your tool list.",
+            "where `name` is the tool's name as it appears in your tool list. " +
+            "pause(reason, data) ends the program there and hands you reason, data and the outputs so far.",
         },
       },
       required: ["source"],
@@ -470,8 +497,26 @@ export function runJsTool(
         await countRun({ ok: false, ms: Date.now() - started, hostCalls: n });
         throw e;
       }
-      await countRun({ ok: r.status === "completed", ms: Date.now() - started, hostCalls: r.hostCalls ?? 0 });
+      // A paused run did what it was asked, so it counts as one that went well.
+      await countRun({ ok: r.status === "completed" || r.status === "paused", ms: Date.now() - started, hostCalls: r.hostCalls ?? 0 });
       await opts.onCalls?.(r.hostCalls ?? 0);
+      if (r.status === "paused" && r.pause) {
+        const held = r.held ?? [];
+        const answer = {
+          paused: true,
+          reason: r.pause.reason,
+          data: r.pause.data,
+          ...(r.pause.dataError ? { dataError: r.pause.dataError } : {}),
+          outputs: r.outputs ?? [],
+          calls: r.hostCalls ?? 0,
+          held,
+          note: pausedNote(r.pause, held),
+        };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(answer) }],
+          details: { hostCalls: r.hostCalls, operations: r.acceptedOperationIds, paused: true, held },
+        };
+      }
       // "completed" is the whole of success here. Both executors return it
       // (executor.ts, dynamic-worker-executor.ts); "failed" and "interrupted"
       // are the other two, and each carries its reason.

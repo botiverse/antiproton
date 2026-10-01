@@ -9,7 +9,8 @@ import type { ToolResult } from "../../src/core/tools.ts";
 
 export interface SpecResult { row: string; name: string; ok: boolean; error?: string }
 
-export async function executorSpec(exec: JsExecutor): Promise<SpecResult[]> {
+/** `only` picks rows by name, for a harness that can run some rows and not others (a Node stand-in for the Worker). */
+export async function executorSpec(exec: JsExecutor, only?: (row: string) => boolean): Promise<SpecResult[]> {
   let calls: Array<{ tool: string; args: unknown; opts: unknown }> = [];
 
   const host = (impl?: (c: { tool: string; args: any }) => Promise<ToolResult>): ExecutorHost => ({
@@ -214,9 +215,130 @@ export async function executorSpec(exec: JsExecutor): Promise<SpecResult[]> {
     assert((r.outputs[0] as string).includes("rejected"), "excess calls refused in-band");
   });
 
+  // pause(): the program stops itself. Every row here is about the host's
+  // state deciding, not the throw: the throw can be caught, the state cannot.
+  test("暂停", "pause() ends the program: nothing after it runs, and the run reports paused with what came before", async () => {
+    calls = [];
+    const r = await exec.execute(
+      `await tool\`m.first \${ { i: 1 } }\`;
+       output("before");
+       pause("which one?", { options: ["a", "b"] });
+       output("after");
+       await tool\`m.second \${ {} }\`;`,
+      host(),
+    );
+    eq(r.status, "paused", "paused, not failed or completed");
+    eq(r.pause?.cause, "pause", "the program asked");
+    eq(r.pause?.reason, "which one?", "reason kept");
+    eq(JSON.stringify(r.pause?.data), '{"options":["a","b"]}', "data kept");
+    eq(JSON.stringify(r.outputs), '["before"]', "outputs so far, nothing after");
+    eq(calls.map((c) => c.tool).join(","), "m.first", "the call after pause was never made");
+    eq(r.hostCalls, 1, "one call counted");
+    eq(r.error, undefined, "not reported as an error");
+  });
+
+  test("暂停不可吞", "a try/catch around pause() does not swallow it: later outputs and calls are refused, the run is still paused", async () => {
+    calls = [];
+    const r = await exec.execute(
+      `try { pause("stop here", 1); } catch (e) { output("caught " + e.name); }
+       try { await tool\`m.after \${ {} }\`; } catch (e) { output("caught again"); }
+       output("still going");
+       return 42;`,
+      host(),
+    );
+    eq(r.status, "paused", "paused although the program caught it and returned");
+    eq(r.pause?.reason, "stop here", "the pause is the one reported");
+    eq(JSON.stringify(r.outputs), "[]", "nothing output after pause was kept");
+    eq(calls.length, 0, "no call after pause reached the host");
+    // Ended by a throw of its own, not a return: still the pause.
+    const thrown = await exec.execute(`try { pause("p"); } catch (e) {} throw new Error("mine");`, host());
+    eq(thrown.status, "paused", "a later throw does not turn it into a failure");
+    // The first stop is the one reported.
+    const twice = await exec.execute(`try { pause("first"); } catch (e) {} pause("second");`, host());
+    eq(twice.pause?.reason, "first", "a second pause does not overwrite the first");
+  });
+
+  test("暂停数据", "data that is not JSON-serialisable is reported in the result, not a crash; oversized data is cut like an output", async () => {
+    const circular = await exec.execute(`const o = {}; o.self = o; output("x"); pause("loop", o);`, host());
+    eq(circular.status, "paused", "a circular object still pauses");
+    eq(circular.pause?.data, null, "nothing of it kept");
+    assert(/not JSON-serialisable/.test(String(circular.pause?.dataError)), `the problem is named: ${circular.pause?.dataError}`);
+    eq(JSON.stringify(circular.outputs), '["x"]', "outputs still there");
+    const big = await exec.execute(`pause("b", 10n);`, host());
+    assert(/not JSON-serialisable/.test(String(big.pause?.dataError)), `a BigInt is named: ${big.pause?.dataError}`);
+    const fn = await exec.execute(`pause("f", () => 1);`, host());
+    assert(/not JSON-serialisable/.test(String(fn.pause?.dataError)), `a function is named: ${fn.pause?.dataError}`);
+    const none = await exec.execute(`pause("n");`, host());
+    eq(none.pause?.data, null, "no data is null");
+    eq(none.pause?.dataError, undefined, "no data is not a problem");
+    // Outputs and data share one cap: 60 units of output leave 40 for data.
+    const cut = await exec.execute(`output("y".repeat(58)); pause("c", "z".repeat(50));`, host(), {
+      ...DEFAULT_LIMITS, maxOutputBytes: 100,
+    });
+    eq((cut.pause?.data as any)?.truncated, true, "data past the cap is marked truncated");
+    const fits = await exec.execute(`output("y".repeat(58)); pause("c", "z".repeat(30));`, host(), {
+      ...DEFAULT_LIMITS, maxOutputBytes: 100,
+    });
+    eq(fits.pause?.data, "z".repeat(30), "data within the room is kept");
+  });
+
+  test("暂停于审批", "a call held for approval ends the program as paused, reports the held operation, and the next call is never made", async () => {
+    calls = [];
+    const gate = host(async (c) => c.tool === "m.send"
+      ? ({ status: "pending", operationId: "op_held", error: { code: "awaiting_approval", message: "held" } } as any)
+      : { status: "succeeded", operationId: `op_${calls.length}`, result: {} });
+    const r = await exec.execute(
+      `await tool\`m.read \${ {} }\`;
+       output("read");
+       let res;
+       try { res = await tool\`m.send \${ { confirm: true } }\`; } catch (e) { output("caught"); }
+       output({ after: res && res.status });
+       await tool\`m.next \${ {} }\`;`,
+      gate,
+    );
+    eq(r.status, "paused", "paused");
+    eq(r.pause?.cause, "hold", "a hold, not the program's own pause");
+    eq(r.pause?.reason, "awaiting_approval", "the gateway's code");
+    eq(JSON.stringify(r.pause?.data), '{"tool":"m.send","operationId":"op_held"}', "which call, which operation");
+    eq(JSON.stringify(r.held), '[{"tool":"m.send","operationId":"op_held","status":"pending"}]', "held lists it");
+    eq(calls.map((c) => c.tool).join(","), "m.read,m.send", "the call after the held one was never made");
+    eq(JSON.stringify(r.outputs), '["read"]', "nothing after the hold was output, caught or not");
+    assert(r.acceptedOperationIds.includes("op_held"), "the held operation is among the accepted");
+  });
+
+  test("暂停于未等的调用", "a call the program did not await that comes back held after the program ended still pauses the run", async () => {
+    calls = [];
+    const gate = host(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return { status: "pending", operationId: "op_late", error: { code: "awaiting_approval", message: "held" } } as any;
+    });
+    const r = await exec.execute(`tool\`m.send \${ {} }\`; output("done");`, gate);
+    eq(r.status, "paused", "paused, though the program returned first");
+    eq(r.pause?.cause, "hold", "by the hold");
+    eq(JSON.stringify(r.held), '[{"tool":"m.send","operationId":"op_late","status":"pending"}]', "held lists it");
+    eq(JSON.stringify(r.outputs), '["done"]', "what the program output is kept");
+  });
+
+  test("其它状态照旧", "a call that comes back rejected or failed is still a value the program reads; it does not pause", async () => {
+    calls = [];
+    const gate = host(async (c) => c.tool === "m.bad"
+      ? ({ status: "failed", operationId: "op_f", error: { code: "boom", message: "boom" } } as any)
+      : { status: "rejected", error: { code: "policy_denied", message: "no" } });
+    const r = await exec.execute(
+      `const a = await tool\`m.bad \${ {} }\`;
+       const b = await tool\`m.denied \${ {} }\`;
+       output([a.status, b.status]);
+       await tool\`m.more \${ {} }\`;`,
+      gate,
+    );
+    eq(r.status, "completed", "completed, not paused");
+    eq(JSON.stringify(r.outputs), '[["failed","rejected"]]', "both read as values");
+    eq(calls.length, 3, "the program went on calling");
+    eq(r.pause, undefined, "no pause");
+  });
 
   const results: SpecResult[] = [];
-  for (const t of tests) {
+  for (const t of tests.filter((t) => !only || only(t.row))) {
     try { await t.fn(); results.push({ row: t.row, name: t.name, ok: true }); }
     catch (err) { results.push({ row: t.row, name: t.name, ok: false, error: (err as Error).message }); }
   }

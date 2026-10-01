@@ -84,8 +84,10 @@ The operating-system analogy holds and is worth keeping in mind:
 
 Recorded so the design is not read as a description of today:
 
-- A mount-policy hold returns an ordinary `{ status: "pending" }` value, and agent-written code
-  keeps running past it. This is the gap §3 closes.
+- Inside run_js, a call that comes back held (`pending`) ends the program as paused: the model
+  gets the outputs so far, the call count and the held operation, and the rest does not run.
+  The program can also stop itself with `pause(reason, data)`. There is no resume or cancel
+  token yet: approval runs the held call alone, and the model continues with a new program.
 - A Raft freshness hold returns the newer messages and asks the model to send again with the
   same key and content; the model restates the call instead of resuming it.
 - A plugin's database writes and the recorded tool result are two transactions (#596); the
