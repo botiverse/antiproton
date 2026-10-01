@@ -42,9 +42,12 @@ const run9 = sandboxPlugin(null as any, "local");
  * record back through the closure rather than through rows. The plugins under
  * test read and write one key, so `get` and `put` are all that answers.
  */
+// What is written is handed back as the default machine's view (`asBoxState`), the reader every
+// consumer of one box uses: the stored shape (machines by name) is the plugin's own business, and the
+// view written back reads as that same machine, an old single-box record being "main".
 const recordDb = (get: () => unknown, set: (v: unknown) => void = () => {}): any => ({
   get: async () => get() ?? undefined,
-  put: async (_store: string, v: unknown) => { set(v); return "state"; },
+  put: async (_store: string, v: unknown) => { set(asBoxState(v as any) ?? v); return "state"; },
 });
 
 /**
@@ -58,7 +61,9 @@ function dbFor(plugin: Plugin, alias: string, seed: unknown = null, onPut: (v: u
   const record = Object.keys(plugin.database?.stores ?? {})[0];
   if (seed !== null && record) tables.put(scope, record, "state", seed, null);
   const db = openPluginDatabase(tables, scope, plugin.database);
-  return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(value); return db.put(store, value as any, key); } };
+  // The sandbox's record through its reader, as `recordDb` does.
+  const seen = (v: unknown) => plugin.id === "sandbox" ? asBoxState(v as any) ?? v : v;
+  return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(seen(value)); return db.put(store, value as any, key); } };
 }
 
 await check("拼错的键会被拒绝,并给出最接近的那个", () => {
@@ -403,8 +408,11 @@ await check("an approval-gated mount holds every run9 tool, because every one of
   // All six touch the container: run and shell execute in it, save writes to
   // object storage, keep and start_from fork and switch its filesystem, and
   // release destroys it. None is a read, so none may fall to `policy.read`.
+  // `machines` is the one exception, by name: it reads the mount's record and
+  // asks run9 nothing, so it changes nothing to gate.
   const gated = { write: "approval" as const };
   const through = run9.tools
+    .filter((t) => t.name !== "machines")
     .filter((t) => policyFor(gated, t.name, t.sideEffects) !== "approval")
     .map((t) => `${t.name} (${t.sideEffects})`);
   if (through.length) {

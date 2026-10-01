@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BOX_KEY, BOX_STORE, sandboxPlugin, splitCwd, withCwdTrailer } from "../src/plugins/sandbox.ts";
+import { BOX_KEY, BOX_STORE, asBoxState, sandboxPlugin, splitCwd, withCwdTrailer } from "../src/plugins/sandbox.ts";
 import { Backgrounded } from "../src/plugins/types.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -94,7 +94,8 @@ function boxDb(box: unknown, onPut: (v: unknown) => void) {
   const scope = { tenantId: "t", agentId: "a", alias: "sandbox", plugin: "sandbox" };
   if (box) tables.put(scope, BOX_STORE, BOX_KEY, box, null);
   const db = openPluginDatabase(tables, scope, plugin.database);
-  return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(value); return db.put(store, value as any, key); } };
+  // Handed over as the default machine's view: the stored shape (machines by name) is the plugin's own.
+  return { ...db, put: async (store: string, value: unknown, key?: any) => { onPut(asBoxState(value as any)); return db.put(store, value as any, key); } };
 }
 
 const BOX = { boxId: "b1", createdAt: 1, lastUsedAt: 1, execs: 0, sessions: [], envs: [] };

@@ -164,3 +164,12 @@ export function leaseRow(o: { tenantId: string; agentId: string; alias: string }
     attrs: { mount: o.alias, ...(fact.error ? { error: fact.error } : {}) },
   };
 }
+
+/**
+ * Every `Released` in what a release handed back or threw: one fact, a list of them (a mount letting go
+ * of several things at once), or nothing. Each is checked as `isReleased` checks one; what is not a fact
+ * is dropped rather than recorded.
+ */
+export function releasedFacts(x: unknown): Released[] {
+  return Array.isArray(x) ? x.filter(isReleased) : isReleased(x) ? [x] : [];
+}

@@ -133,6 +133,47 @@ await check("a tool that failed to release reports the lease on the error it thr
   joins(rows[0], bad, "svc");
 });
 
+await check("a mount that let go of several things records a row for each, returned or thrown", async () => {
+  // A sandbox mount with several machines releases all of them when no id is given (Holding.release).
+  const other: Released = { ...FACT, id: "box-8" };
+  const f = await fixture([plugin("held", { release: async () => [FACT, other] as any })]);
+  const r = await f.gw.releaseTask(caller);
+  must(r.released.includes("held"), "the release was not counted");
+  must(f.leases().map((x: any) => x.spanId).sort().join() === "box-7,box-8", `rows: ${JSON.stringify(f.leases())}`);
+  const bad: Released = { ...other, status: "error", error: "delete returned 500" };
+  const g = await fixture([plugin("held", { release: async () => { throw markReleased(new Error("box-8 not released"), [FACT, bad]); } })]);
+  const r2 = await g.gw.releaseTask(caller);
+  must(r2.failed.length === 1, "the failure was not reported");
+  const rows = g.leases();
+  must(rows.length === 2 && rows.some((x: any) => x.spanId === "box-8" && x.verdict === "failed"), `rows: ${JSON.stringify(rows)}`);
+});
+
+await check("a release of one held thing passes its id to the plugin; activities fall back to the one activity", async () => {
+  const seen: unknown[] = [];
+  const p: Plugin = {
+    ...plugin("held", { release: async () => FACT }),
+    holds: {
+      tools: { release: "go" },
+      async release(_ctx: unknown, opts?: unknown) { seen.push(opts); return FACT; },
+      async activity() { return { live: { id: "box-7", startedAt: 1, lastUsedAt: 2 } }; },
+    },
+  } as unknown as Plugin;
+  const f = await fixture([p]);
+  await f.gw.releaseTask(caller, { alias: "held", reason: "idle", id: "box-7" });
+  await f.gw.releaseTask(caller, { alias: "held" });
+  must(JSON.stringify(seen[0]) === '{"reason":"idle","id":"box-7"}', `the id did not reach the plugin: ${JSON.stringify(seen[0])}`);
+  must(seen[1] === undefined, `a release of the whole mount carried options: ${JSON.stringify(seen[1])}`);
+  const acts = await f.gw.mountActivities(caller, "held");
+  must(acts.length === 1 && acts[0]!.live?.id === "box-7", `fallback: ${JSON.stringify(acts)}`);
+  // A plugin that holds several answers through its own list, one entry each.
+  const two = { ...p, holds: { ...p.holds!, async activities() {
+    return [{ live: { id: "box-7", startedAt: 1, lastUsedAt: 2 } }, { live: { id: "box-8", startedAt: 1, lastUsedAt: 3 } }];
+  } } } as unknown as Plugin;
+  const g = await fixture([two]);
+  const both = await g.gw.mountActivities(caller, "held");
+  must(both.map((a) => a.live?.id).join() === "box-7,box-8", `the plugin's list was not used: ${JSON.stringify(both)}`);
+});
+
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
 }
