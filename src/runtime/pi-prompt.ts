@@ -91,6 +91,12 @@ its own token. If a continuation has expired (or the agent restarted), resume
 tells you so: then send a new run_js program, carrying what you need from the
 earlier data and outputs. Only you can call resume; a program cannot.
 
+Any tool, called directly or from run_js, may also answer "yielded": before
+acting it wants your decision (the question, what it found as context, the
+answer it expects, a token). Answer it the same way, with resume; cancel: true
+drops it and the tool does nothing. From run_js the program ends at that call:
+resume answers the tool, then send a new program for the rest.
+
 run_js code has no fetch, require, fs or process — the tool tag is its only way out. That is true of run_js alone: a container or
 shell that one of your tools runs commands in is a different machine, with its
 own runtime and network. console.log is not returned; only output() is.

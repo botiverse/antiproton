@@ -56,6 +56,26 @@ export interface Continuation {
   cancel(): Promise<ExecutionResult>;
 }
 
+/**
+ * What answer a waiting thing expects — pause()'s third argument, or a plugin
+ * interrupt's `answer` (plugins/types.ts `Interrupt`). One of:
+ *
+ *   { choices: ["a", "b"] }   the answer is one of these strings
+ *   { kind: "yes_no" }        the answer is true or false
+ *   { kind: "text" }          the answer is a string
+ *   { schema: {...} }         the answer fits this JSON schema — a subset:
+ *                             `type` (string, number, integer, boolean,
+ *                             object, array, null, or a list of them),
+ *                             `enum`, `required`, `properties` and `items`,
+ *                             applied recursively; other keywords are not
+ *                             checked
+ */
+export type AnswerSpec =
+  | { choices: string[] }
+  | { kind: "yes_no" }
+  | { kind: "text" }
+  | { schema: { [k: string]: Json } };
+
 export interface HeldCall { tool: string; operationId: string; status: "pending" }
 
 export interface Paused {

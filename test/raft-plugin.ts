@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { raftPlugin, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
-import type { PluginErrorFields } from "../src/plugins/types.ts";
+import { Interrupt, type PluginErrorFields } from "../src/plugins/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -182,18 +182,66 @@ await check("a message with no conversation identity never reaches the model as 
   if (/undefined|no channel fields/.test(JSON.stringify(out))) throw new Error(`an unplaceable message reached the result: ${JSON.stringify(out)}`);
 });
 
-await check("a held send returns the newer messages as lines, and the same send again attests them and goes through", async () => {
+const HELD = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+  heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
+const HELD_LINE = "[target=#general msg=abcdef12 time=2026-09-28 10:00:00Z type=human] @tygg: wait, one more thing";
+
+await check("a held send is a question for the agent: send or drop, with the newer messages as lines, and nothing sent", async () => {
   const m = mount();
-  const calls = many(
-    json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
-      heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] }),
-    json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }),
-  );
+  const calls = many(HELD());
   const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
-  if (held.state !== "held" || held.messages?.[0] !== "[target=#general msg=abcdef12 time=2026-09-28 10:00:00Z type=human] @tygg: wait, one more thing" ||
-      !/same idempotencyKey/.test(held.note)) {
-    throw new Error(`held: ${JSON.stringify(held)}`);
+  if (!(held instanceof Interrupt)) throw new Error(`a held send must interrupt, got ${JSON.stringify(held)}`);
+  if (!/newer message arrived in #general/.test(held.question) || JSON.stringify(held.answer) !== '{"choices":["send","drop"]}' ||
+      (held.context as any)?.messages?.[0] !== HELD_LINE) {
+    throw new Error(`the question: ${JSON.stringify(held)}`);
   }
+  const st = held.state as any;
+  if (st.target !== "#general" || st.content !== "done" || st.idempotencyKey !== "k-held" || st.seen?.upToSeq !== 20) {
+    throw new Error(`the state must carry the send and its continuation: ${JSON.stringify(st)}`);
+  }
+  if (calls.length !== 1) throw new Error(`only the held attempt reached Raft: ${calls.length}`);
+});
+
+await check("resume \"send\" sends the same message under the same key and attests what the question showed", async () => {
+  const m = mount();
+  const calls = many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
+  // A fresh client, as it would be in a new process: the state is all it has.
+  const sent = await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx) as any;
+  const second = JSON.parse(String(calls[1]!.init.body));
+  if (sent.state !== "sent" || second.seenUpToSeq !== 20 || second.idempotencyKey !== "k-held" || second.content !== "done") {
+    throw new Error(`the resumed send did not attest what the model saw: ${JSON.stringify({ sent, second })}`);
+  }
+});
+
+await check("resume \"send\" attests from the state alone, even when the frontier was not saved", async () => {
+  const m = mount();
+  const calls = many(json(200, { ok: true, state: "sent", messageId: "m-3", messageSeq: 22 }));
+  const sent = await raftPlugin.interrupts!.resume("send_message",
+    { target: "#general", content: "done", idempotencyKey: "k-x", seen: { upToSeq: 20 } }, "send", m.ctx) as any;
+  const body = JSON.parse(String(calls[0]!.init.body));
+  if (sent.state !== "sent" || body.seenUpToSeq !== 20 || body.idempotencyKey !== "k-x") throw new Error(`not attested: ${JSON.stringify(body)}`);
+});
+
+await check("resume \"send\" into a conversation that moved again asks again, with the newer messages", async () => {
+  const m = mount();
+  many(HELD(), HELD());
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
+  const again = await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx) as any;
+  if (!(again instanceof Interrupt) || (again.state as any).idempotencyKey !== "k-held") throw new Error(`a second hold must ask again: ${JSON.stringify(again)}`);
+});
+
+await check("resume \"drop\" sends nothing", async () => {
+  const m = mount();
+  globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
+  const out = await raftPlugin.interrupts!.resume("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, "drop", m.ctx) as any;
+  if (out.state !== "dropped" || !/new idempotencyKey/.test(out.note)) throw new Error(`drop: ${JSON.stringify(out)}`);
+});
+
+await check("the same send again with the same key, outside resume, still attests the held messages and goes through", async () => {
+  const m = mount();
+  const calls = many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
+  await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx);
   // A second invocation is a fresh client, as it would be in a new process: what the model was shown survives in the database.
   const sent = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
   const second = JSON.parse(String(calls[1]!.init.body));

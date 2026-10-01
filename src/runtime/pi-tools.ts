@@ -21,7 +21,10 @@ import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import { pluginUnavailableMessage, switchedOffMessage } from "./gateway.ts";
 import type { Json } from "../core/types.ts";
 import type { Continuation, HeldCall, Paused } from "../core/execution.ts";
-import { answerProblem, answerSpecOf, type AnswerSpec, type RunJsContinuations } from "./run-js-resume.ts";
+import type { ToolInterrupt } from "../core/tools.ts";
+import {
+  answerProblem, answerSpecOf, type AnswerSpec, type InterruptHost, type RunJsContinuations,
+} from "./run-js-resume.ts";
 
 /** What the model is offered, and the mount-qualified address behind it. */
 export interface MountedTool {
@@ -68,12 +71,29 @@ export interface ToolResult {
   operationId?: string;
   result?: unknown;
   error?: { code?: string; message?: string } | string;
+  /** With `status: "interrupted"`: the tool's question, `state` included — kept host-side, never shown. */
+  interrupt?: ToolInterrupt;
 }
 
 export interface ToolHost {
   /** `callId` is the model's id for this tool call, passed to be RECORDED. It is
    *  not `opts.idempotencyKey`: one call can make several requests. */
   invoke(call: { tool: string; args: Json; opts?: unknown; callId?: string }): Promise<ToolResult>;
+  /**
+   * A checked answer to a question a tool asked, delivered to its plugin
+   * (gateway `resumeInterrupt`); `callId` is the resume call's. Absent: no
+   * tool's question can be answered through this host, so one is cancelled
+   * at once and the model told so.
+   */
+  resumeInterrupt?(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult>;
+  /** The tool is told nobody will answer (gateway `cancelInterrupt`); why that failed, or null. */
+  cancelInterrupt?(i: ToolInterrupt): Promise<string | null>;
+}
+
+/** Where a tool's question is kept for `resume`, and whose model may answer it. */
+export interface InterruptKeeping {
+  continuations: RunJsContinuations;
+  scope: string;
 }
 
 /**
@@ -238,7 +258,12 @@ export function replayPolicy(t: MountedTool): "never" | "safe" {
   return t.idempotency === "native" ? "safe" : "never";
 }
 
-export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessTool<undefined>[] {
+export function bridgeTools(
+  tools: MountedTool[],
+  host: ToolHost,
+  /** Where a tool's question waits for `resume`. Absent: a question is cancelled and the model told why. */
+  keeping?: InterruptKeeping,
+): AgentHarnessTool<undefined>[] {
   return qualifyMountedTools(tools).map((t) => ({
     name: t.name,
     label: t.name,
@@ -257,22 +282,92 @@ export function bridgeTools(tools: MountedTool[], host: ToolHost): AgentHarnessT
       // The model's id for this call travels with it, so the operation it starts can be lined up
       // with the `tool.result` the console already pairs by that same id (cf/src/ui.ts).
       const res = await host.invoke({ tool: t.address, args: lifted.args, callId: toolCallId, ...(lifted.confirm ? { opts: { confirm: true } } : {}) });
-      if (res.status !== "succeeded") {
-        // pi asks tools to throw rather than encode failure in content, so the
-        // harness can tell a refusal from an answer.
-        const e = res.error;
-        const message = typeof e === "string" ? e : (e?.message ?? e?.code ?? res.status);
-        // The model reads this, so it is named the way the model can name it
-        // back. The address is still in `details`, where the transcript and the
-        // audit record want it.
-        throw new Error(`${t.name}: ${message}`);
-      }
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(res.result ?? null) }],
-        details: { address: t.address, operationId: res.operationId },
-      };
+      return deliverToolResult(res, { name: t.name, address: t.address, callId: toolCallId, host, keeping });
     },
   })) as AgentHarnessTool<undefined>[];
+}
+
+/**
+ * One tool result as the model receives it: from a direct call, or from
+ * `resume` taking a tool's question back to it. The two answer in one shape,
+ * so a resumed tool reads exactly like a call — a result, a refusal, or
+ * another question.
+ */
+async function deliverToolResult(res: ToolResult, o: {
+  name: string; address?: string; callId: string; host: ToolHost; keeping?: InterruptKeeping; inProgram?: boolean;
+}) {
+  if (res.status === "interrupted" && res.interrupt) {
+    return toolQuestion(res.interrupt, { ...o, operationId: res.operationId });
+  }
+  if (res.status !== "succeeded") {
+    // pi asks tools to throw rather than encode failure in content, so the
+    // harness can tell a refusal from an answer.
+    const e = res.error;
+    const message = typeof e === "string" ? e : (e?.message ?? e?.code ?? res.status);
+    // The model reads this, so it is named the way the model can name it
+    // back. The address is still in `details`, where the transcript and the
+    // audit record want it.
+    throw new Error(`${o.name}: ${message}`);
+  }
+  // A question asked inside a program ended it; the answer's result comes
+  // back here, not into the program, and the model has to know that.
+  const shown = o.inProgram
+    ? { tool: o.name, result: res.result ?? null, note: AFTER_PROGRAM_NOTE }
+    : res.result ?? null;
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(shown) }],
+    details: { ...(o.address ? { address: o.address } : {}), operationId: res.operationId },
+  };
+}
+
+/**
+ * A tool's question, put to the model: held for `resume` under a token, in
+ * the same `yielded` shape a program's pause has. `state` stays in the
+ * registry entry and is never in what this returns.
+ *
+ * With nowhere to keep it, or no way to deliver an answer, the question is
+ * cancelled at once and the model is shown it with a note that nothing was
+ * done: a token that nothing can redeem would be an invitation to wait.
+ */
+async function toolQuestion(i: ToolInterrupt, o: {
+  name: string; callId: string; host: ToolHost; keeping?: InterruptKeeping; inProgram?: boolean;
+  operationId?: string; extra?: Record<string, unknown>;
+}) {
+  const asked = answerSpecOf(i.answer);
+  const resumeInterrupt = o.host.resumeInterrupt;
+  if (!("spec" in asked) || !o.keeping || !resumeInterrupt) {
+    const failed = await cancelQuietly(o.host, i);
+    const answer = {
+      state: "interrupted", tool: o.name, question: i.question,
+      ...(i.context !== undefined ? { context: i.context } : {}),
+      ...(o.extra ?? {}),
+      note: "The tool asked you this before acting, but it cannot be answered here (no resume), so it was " +
+        "dropped and the tool did nothing. Call it again if it still applies." + (failed ? ` Dropping it reported: ${failed}` : ""),
+    };
+    return { content: [{ type: "text" as const, text: JSON.stringify(answer) }], details: { interrupted: true, resumable: false, operationId: o.operationId } };
+  }
+  const interruptHost: InterruptHost = {
+    resumeInterrupt: (x, a, callId) => resumeInterrupt.call(o.host, x, a, callId),
+    cancelInterrupt: (x) => cancelQuietly(o.host, x),
+  };
+  const h = o.keeping.continuations.hold({
+    kind: "tool", scope: o.keeping.scope, callId: o.callId, tool: o.name, question: i.question, answer: asked.spec,
+    interrupt: i, host: interruptHost, ...(o.inProgram ? { inProgram: true } : {}),
+  });
+  const answer = yielded({
+    question: i.question, token: h.token, expiresAt: h.expiresAt, answer: asked.spec,
+    extra: { tool: o.name, ...(i.context !== undefined ? { context: i.context } : {}), ...(o.extra ?? {}) },
+    note: o.inProgram ? TOOL_IN_PROGRAM_NOTE : TOOL_QUESTION_NOTE,
+  });
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(answer) }],
+    details: { interrupted: true, resumable: true, operationId: o.operationId },
+  };
+}
+
+/** A cancel is the end of something; its failure is a line for the model, never a throw. */
+async function cancelQuietly(host: ToolHost, i: ToolInterrupt): Promise<string | null> {
+  try { return (await host.cancelInterrupt?.(i)) ?? null; } catch (e) { return String((e as Error)?.message ?? e).slice(0, 300); }
 }
 
 /**
@@ -332,23 +427,56 @@ export const RUN_JS_DESCRIPTION =
   "separate calls, and output() only what you need. Not for a single simple call. " +
   "Where the program needs your judgement, `const answer = await pause(question, data, expected?)`: " +
   "it stops there and asks you (state \"yielded\", with a token and what it did so far); call " +
-  "resume(token, answer) within about a minute and the program continues from that line with your answer.";
+  "resume(token, answer) within about a minute and the program continues from that line with your answer. " +
+  "A tool the program calls may also ask you a question (\"yielded\" naming the tool): the program ends " +
+  "at that call, and resume answers the tool.";
 
 export const RESUME_DESCRIPTION =
-  "Continue a run_js program that is waiting at `await pause(...)` (a \"yielded\" result). Give the " +
-  "token and your answer: the answer becomes pause()'s return value and the program goes on from " +
-  "that line, and you get its result as run_js would give it (another pause gives another token). " +
+  "Answer something waiting for you (a \"yielded\" result): a run_js program at `await pause(...)`, or " +
+  "a tool that asked you a question before acting. Give the token and your answer. A program goes on from " +
+  "its pause with your answer as pause()'s value, and you get its result as run_js would give it; a tool " +
+  "goes on with your answer and you get its result. Either may yield again, with another token. " +
   "If the yielded result names an expected `answer` (choices, yes_no, text or a schema) your answer " +
   "must fit it; one that does not is refused with invalidAnswer and the same token stays valid. " +
-  "cancel: true ends the program instead and returns its outputs. Several programs can be waiting " +
-  "at once, each with its own token. A token lasts about a minute; if it expired or the agent " +
-  "restarted you are told so, and you send a new run_js program. Only you can call this: a program " +
-  "cannot resume another.";
+  "cancel: true ends a program (returning its outputs) or drops a tool's question (the tool does nothing). " +
+  "Several can be waiting at once, each with its own token. A token lasts about a minute; if it expired or " +
+  "the agent restarted you are told so, and you call again (a new run_js program, or the tool). Only you " +
+  "can call this: a program cannot resume another.";
+
+/** What the model is told with a tool's question. */
+export const TOOL_QUESTION_NOTE =
+  "The tool asked you this before acting and has done nothing yet. Decide, then call resume with this token " +
+  "and an answer that fits `answer`, within about a minute: the tool goes on with your answer and its result " +
+  "comes back as resume's result. resume with cancel: true drops it and the tool does nothing. If the token " +
+  "has expired you are told so; then call the tool again if it still applies.";
+
+/**
+ * What the model is told when a tool called inside run_js asks a question.
+ *
+ * The program does not wait at that call: the executors suspend a program
+ * only at its own `await pause()`, and a tool call's await is not one. So the
+ * program ends there, as it does at a held call, and the question is the
+ * model's to answer directly; the tool's result comes back as resume's
+ * result, and the rest of the program is a new one.
+ */
+export const TOOL_IN_PROGRAM_NOTE =
+  "A tool your program called asked you this before acting; the tool has done nothing yet. Your program " +
+  "ended at that call: nothing after it ran, and calls before it completed and are not undone. Call resume " +
+  "with this token and an answer that fits `answer`, within about a minute: the tool goes on with your " +
+  "answer and its result comes back as resume's result, not into the program. Then send a new run_js " +
+  "program for the rest, carrying what you need from soFar. resume with cancel: true drops it and the tool " +
+  "does nothing.";
+
+/** With a resumed tool's result when the question was asked inside a program. */
+export const AFTER_PROGRAM_NOTE =
+  "This is that tool call's result. The program that made the call ended there; send a new run_js program " +
+  "for whatever came after it.";
 
 /** What `resume` answers for a token it cannot find: never an error, because a new program is always a way on. */
 export const EXPIRED_NOTE =
-  "this continuation is gone (expired or the agent restarted); send a new run_js program, " +
-  "carrying what you need from the earlier data/outputs";
+  "this continuation is gone (expired, already answered, or the agent restarted); nothing more ran. For a " +
+  "program, send a new run_js program carrying what you need from the earlier data/outputs; for a tool's " +
+  "question, call the tool again";
 
 /**
  * What the model is told when a run stops paused. Not an error: the program
@@ -382,6 +510,15 @@ export function pausedNote(p: Paused, held: readonly HeldCall[], resumable = fal
 
 type RunResult = Awaited<ReturnType<Sandbox["execute"]>>;
 
+/** A question one of a program's tool calls was asked, with where its answer goes. */
+interface Asked {
+  /** The tool as the program named it. */
+  name: string;
+  operationId: string;
+  interrupt: ToolInterrupt;
+  host: ToolHost;
+}
+
 /** Usage callbacks shared by run_js and resume: one program's stretches are counted as they run. */
 interface RunCounting {
   onCalls?: (n: number) => void | Promise<void>;
@@ -405,6 +542,8 @@ async function deliverRun(r: RunResult, o: {
   continuations?: RunJsContinuations;
   scope: string;
   cancelling?: boolean;
+  /** Questions the program's tool calls were asked, as they came back (runJsTool). Drained here. */
+  asked?: Asked[];
 }) {
   const hostCalls = r.hostCalls ?? 0;
   const operations = r.acceptedOperationIds ?? [];
@@ -420,6 +559,43 @@ async function deliverRun(r: RunResult, o: {
     hostCalls, operations: resumed ? operations.slice(o.before.operations) : operations,
     ...(resumed ? { callId: o.callId } : {}),
   };
+  // A tool the program called asked a question. The executor saw that call
+  // come back pending and ended the program there, as it ends one at a held
+  // call; what it ended on is a question for the model, not a person, so it
+  // is reported as one and kept out of `held`.
+  const asked = o.asked?.splice(0) ?? [];
+  if (asked.length) {
+    const ids = new Set(asked.map((a) => a.operationId));
+    const held = (r.held ?? []).filter((h) => !ids.has(h.operationId));
+    if (r.continuation) {
+      // Not reachable today (a pending call means no continuation), but a
+      // program left waiting while its question is answered elsewhere would
+      // be one nobody resumes.
+      try { await r.continuation.cancel(); } catch { /* ended already */ }
+    }
+    if (r.status !== "paused") {
+      // Ended some other way (a limit, a failure) after the question came
+      // back: nobody is asked, the tools are told so, and the run is
+      // reported as what it was.
+      for (const a of asked) await cancelQuietly(a.host, a.interrupt);
+    } else {
+      const [first, ...rest] = asked;
+      // One question at a time: each token is one decision, and a model asked
+      // two at once from one program would be answering them out of context.
+      for (const a of rest) await cancelQuietly(a.host, a.interrupt);
+      const out = await toolQuestion(first!.interrupt, {
+        name: first!.name, callId: o.callId, host: first!.host, inProgram: true, operationId: first!.operationId,
+        ...(o.continuations ? { keeping: { continuations: o.continuations, scope: o.scope } } : {}),
+        extra: {
+          soFar: { outputs: r.outputs ?? [], calls: hostCalls },
+          held,
+          ...(rest.length ? { alsoAsked: rest.map((a) => ({ tool: a.name, question: a.interrupt.question, dropped: true })) } : {}),
+          ...(r.pause?.cause === "pause" ? { programPause: { question: r.pause.reason, data: r.pause.data, resumable: false } } : {}),
+        },
+      });
+      return { content: out.content, details: { ...details, ...out.details, paused: true, held } };
+    }
+  }
   if (r.status === "paused" && r.pause) {
     const held = r.held ?? [];
     if (r.continuation && o.continuations) {
@@ -431,6 +607,7 @@ async function deliverRun(r: RunResult, o: {
       const h = o.continuations.hold({
         continuation: r.continuation, scope: o.scope, callId: o.callId,
         hostCalls, operations: operations.length, question: r.pause.reason, ...(spec ? { answer: spec } : {}),
+        ...(o.asked ? { asked: o.asked } : {}),
       });
       const answer = yielded({
         question: r.pause.reason, token: h.token, expiresAt: h.expiresAt, answer: spec,
@@ -557,7 +734,7 @@ export function resumeTool(
     } as any,
     // A program is arbitrary, so a stretch whose outcome was lost must not be repeated.
     replay: "never",
-    async execute(_toolCallId: string, params: { token?: unknown; answer?: Json; cancel?: unknown }) {
+    async execute(toolCallId: string, params: { token?: unknown; answer?: Json; cancel?: unknown }) {
       const token = typeof params?.token === "string" ? params.token : null;
       const waiting = token === null ? null : continuations.peek(token, scope);
       if (!waiting) {
@@ -567,6 +744,7 @@ export function resumeTool(
         };
       }
       const cancelling = params.cancel === true;
+      if (waiting.kind === "tool") return answerTool(toolCallId, token!, cancelling, params.answer);
       // Checked before the program sees it, and refused without spending the
       // token: the program is still waiting, so the model can answer again.
       const why = !cancelling && waiting.answer ? answerProblem(waiting.answer, params.answer) : null;
@@ -584,7 +762,7 @@ export function resumeTool(
         };
       }
       const s = continuations.take(token!, scope);
-      if (!s) {
+      if (!s || s.kind === "tool") {
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ expired: true, note: EXPIRED_NOTE }) }],
           details: { expired: true },
@@ -600,10 +778,59 @@ export function resumeTool(
       }
       return deliverRun(r, {
         label: "resume", callId: s.callId, started, before: { hostCalls: s.hostCalls, operations: s.operations },
-        counting: opts, continuations, scope, cancelling,
+        counting: opts, continuations, scope, cancelling, ...(s.asked ? { asked: s.asked as Asked[] } : {}),
       });
     },
   } as AgentHarnessTool<undefined>;
+
+  /**
+   * A tool's question, answered. The same three outcomes as a program's: an
+   * answer that does not fit is refused and the token kept; cancel tells the
+   * tool nobody will answer; a fitting answer goes to the plugin, whose next
+   * result — or next question — is this call's result.
+   */
+  async function answerTool(callId: string, token: string, cancelling: boolean, given: Json | undefined) {
+    const waiting = continuations.peek(token, scope);
+    if (!waiting || waiting.kind !== "tool") {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ expired: true, note: EXPIRED_NOTE }) }], details: { expired: true } };
+    }
+    const why = !cancelling && waiting.answer ? answerProblem(waiting.answer, given) : null;
+    if (why !== null) {
+      const answer = yielded({
+        question: waiting.question ?? "", token, expiresAt: waiting.expiresAt, answer: waiting.answer,
+        extra: {
+          tool: waiting.tool,
+          ...(waiting.interrupt.context !== undefined ? { context: waiting.interrupt.context } : {}),
+          invalidAnswer: why,
+        },
+        note: "That answer does not fit what the tool asked for, so it was not delivered and the tool has done " +
+          "nothing. Call resume again with the same token and an answer that fits, or with cancel: true to drop it.",
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(answer) }], details: { callId: waiting.callId, invalidAnswer: true } };
+    }
+    const s = continuations.take(token, scope);
+    if (!s || s.kind !== "tool") {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ expired: true, note: EXPIRED_NOTE }) }], details: { expired: true } };
+    }
+    if (cancelling) {
+      const failed = await (s.host.cancelInterrupt?.(s.interrupt) ?? Promise.resolve(null)).catch((e) => String((e as Error)?.message ?? e));
+      const answer = {
+        cancelled: true, tool: s.tool,
+        note: "Dropped: the tool did nothing." + (failed ? ` Dropping it reported: ${failed}` : ""),
+      };
+      return { content: [{ type: "text" as const, text: JSON.stringify(answer) }], details: { callId: s.callId, cancelled: true } };
+    }
+    const res = await s.host.resumeInterrupt(s.interrupt, given ?? null, callId) as ToolResult;
+    // Its next question, if any, is held as the first was, and reads the same.
+    const host: ToolHost = {
+      invoke: () => Promise.reject(new Error("not a call")),
+      resumeInterrupt: (i, a, c) => s.host.resumeInterrupt(i, a, c) as Promise<ToolResult>,
+      ...(s.host.cancelInterrupt ? { cancelInterrupt: s.host.cancelInterrupt } : {}),
+    };
+    return deliverToolResult(res, {
+      name: s.tool, callId, host, keeping: { continuations, scope }, ...(s.inProgram ? { inProgram: true } : {}),
+    });
+  }
 }
 
 export function runJsTool(
@@ -682,6 +909,7 @@ export function runJsTool(
     replay: "never",
     async execute(toolCallId: string, params: { source: string }) {
       let n = 0;
+      const asked: Asked[] = [];
       const started = Date.now();
       // Counting is never the run's problem: a failure here is dropped.
       const countRun = async (run: { ok: boolean; ms: number; hostCalls: number }) => {
@@ -761,6 +989,19 @@ export function runJsTool(
             // per request, and this one has to be the same for all of them.
             callId: toolCallId,
             opts: { ...(call.opts ?? {}), ...(lifted.confirm ? { confirm: true } : {}), idempotencyKey: `${toolCallId}:${n++}` },
+          }).then((res) => {
+            // A tool asking the model a question. The program never sees it —
+            // the interrupt carries the plugin's `state`, which is not the
+            // program's to read — and it cannot wait at this call (only its own
+            // `await pause()` suspends), so the call answers as pending and the
+            // executor ends the program here, as it would at a held call.
+            // deliverRun then reports the question for the model to resume.
+            if (res.status !== "interrupted" || !res.interrupt) return res;
+            asked.push({ name: String(call.tool), operationId: res.operationId ?? "", interrupt: res.interrupt, host });
+            return {
+              status: "pending", operationId: res.operationId,
+              error: { code: "tool_interrupted", message: `${String(call.tool)} asked you a question; the program ends at this call` },
+            };
           });
         },
       }, opts.limits);
@@ -770,7 +1011,7 @@ export function runJsTool(
       }
       return deliverRun(r, {
         label: "run_js", callId: toolCallId, started, before: { hostCalls: 0, operations: 0 },
-        counting: opts, continuations: opts.continuations, scope: opts.scope ?? "",
+        counting: opts, continuations: opts.continuations, scope: opts.scope ?? "", asked,
       });
     },
   } as AgentHarnessTool<undefined>;

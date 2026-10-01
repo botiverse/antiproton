@@ -21,7 +21,7 @@ import {
   admitBackground, jobsTool, mountsWithRunningJobs, recordBackgroundJob, refuseOverCap, runBackgroundPass, runningBackgroundJobs, startedResult, stopSessionJobs,
 } from "../../src/runtime/background-jobs.ts";
 import {
-  bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, runJsTools, type MountedTool,
+  bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
@@ -116,7 +116,7 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -128,7 +128,7 @@ import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/a
 import { raftPlugin } from "../../src/plugins/raft.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
-import type { ToolResult } from "../../src/core/tools.ts";
+import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
 import type { Json } from "../../src/core/types.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 
@@ -1211,9 +1211,15 @@ export class AgentRuntime {
     const store = this.store;
     const artifacts = this.#artifacts;
     const sql = this.#deps.ctx.storage.sql;
-    const dispatch = async (call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> => {
-        const res = await gw.invoke(ctx, call.tool, call.args,
-          { ...(call.opts ?? {}), ...(call.callId === undefined ? {} : { callId: call.callId }) });
+    // `send` is the gateway step behind this result: a call by default, or the
+    // answer to a question a tool asked, whose result is the tool's own and is
+    // finished exactly as a call's is (a job, a parked result, the held line).
+    const dispatch = async (
+      call: { tool: string; args: any; opts?: any; callId?: string },
+      send: () => Promise<ToolResult> = () => gw.invoke(ctx, call.tool, call.args,
+        { ...(call.opts ?? {}), ...(call.callId === undefined ? {} : { callId: call.callId }) }),
+    ): Promise<ToolResult> => {
+        const res = await send();
         // Work that has started and outlives this call (task #16). The model is
         // told at once that it may keep going; the job is checked on the alarm
         // and its result comes back as a message.
@@ -1268,6 +1274,12 @@ export class AgentRuntime {
           }),
         };
     };
+    const held = async (address: string, out: ToolResult): Promise<ToolResult> => {
+      if (out.status !== "succeeded") return out;
+      const line = await heldOn(address.split(".")[0] ?? "");
+      if (!line) return out;
+      return { ...out, result: withHeldNote(out.result, line) as Json };
+    };
     return {
       /**
        * A mounted call, plus the one sentence a call on a holding mount has to
@@ -1286,11 +1298,15 @@ export class AgentRuntime {
        * parked into storage along with the body the model cannot see.
        */
       async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
-        const out = await dispatch(call);
-        if (out.status !== "succeeded") return out;
-        const line = await heldOn(call.tool.split(".")[0] ?? "");
-        if (!line) return out;
-        return { ...out, result: withHeldNote(out.result, line) as Json };
+        return held(call.tool, await dispatch(call));
+      },
+      /** The model's answer to a tool's question (pi-tools.ts `resume`), finished as a call's result is. */
+      async resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult> {
+        const call = { tool: `${i.alias}.${i.tool}`, args: null, callId };
+        return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(ctx, i, answer, { callId })));
+      },
+      async cancelInterrupt(i: ToolInterrupt): Promise<string | null> {
+        return gw.cancelInterrupt(ctx, i);
       },
     };
   }
@@ -1657,9 +1673,18 @@ export class AgentRuntime {
         { at: Date.now() - run.ms, tenantId, agentId }, run.ok ? "ok" : "failed", run.ms, run.hostCalls, run.resumed === true,
       )),
     };
+    // A tool that can ask the model a question needs `resume` to be answered,
+    // with run_js or without it (an Agents API agent has no run_js). Asked as
+    // a capability, like `jobs`, so a plugin that declares `interrupts` is
+    // answerable without anyone coming back here.
+    const asks = offersCapability(
+      records, offered as MountedTool[],
+      (id) => !!interruptsOf(this.#plugins.find((pl) => pl.id === id) ?? {}),
+    );
+    const keeping = extras.runJs || asks ? { continuations: this.#continuations, scope: session } : undefined;
     const extraTools = [
       ...(extras.runJs
-        // resume is offered only beside run_js: it answers nothing else.
+        // resume beside run_js answers its programs and every tool's question.
         ? runJsTools(this.#executor as any, host, {
             ...counting,
             // So a script names a tool the way the model's own list names it.
@@ -1670,7 +1695,7 @@ export class AgentRuntime {
             continuations: this.#continuations,
             scope: session,
           })
-        : []),
+        : asks ? [resumeTool(this.#continuations, { ...counting, scope: session })] : []),
       ...(extras.jobs ? [jobs] : []),
       ...callerTools,
     ];
@@ -1721,6 +1746,7 @@ export class AgentRuntime {
       tools: offered,
       extraTools: extraTools as any,
       toolHost: host,
+      ...(keeping ? { interrupts: keeping } : {}),
       dispatch: async (jobId) => {
         const send = this.#deps.offloadModel;
         if (!send) throw new Error("no dispatcher configured");

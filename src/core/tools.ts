@@ -13,7 +13,27 @@ export type ToolResult =
   /** `background`: the work has started and outlives the call (see Backgrounded). */
   | { status: "running"; operationId: string; background?: { alias: string; tool: string; handle: Json; note?: string } }
   | { status: "failed" | "cancelled" | "unknown"; operationId: string; error?: ToolError }
-  | { status: "rejected"; error: ToolError };
+  | { status: "rejected"; error: ToolError }
+  /** `interrupted`: the tool asked the model a question before acting (plugins/types.ts `Interrupt`). */
+  | { status: "interrupted"; operationId: string; interrupt: ToolInterrupt };
+
+/**
+ * A tool's question to the model, as the gateway hands it to the runtime.
+ *
+ * `state` is the plugin's own and goes back to it on resume or cancel; it
+ * must never reach the model or a program, so whoever receives this keeps it
+ * host-side and shows only the question, the context and the answer spec
+ * (pi-tools.ts). `alias` and `tool` say where to send the answer.
+ */
+export interface ToolInterrupt {
+  alias: string;
+  tool: string;
+  question: string;
+  context?: Json;
+  /** An AnswerSpec (core/execution.ts), already checked by the gateway. */
+  answer: Json;
+  state: Json;
+}
 
 import type { CredentialRefKind, CredentialState } from "../plugins/types.ts";
 
