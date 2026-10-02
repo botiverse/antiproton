@@ -202,7 +202,9 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     try { await a.step(); } catch (e) { thrown = e; }
     check(thrown instanceof Error && thrown.message.includes("injected"), `the first step should fail: ${String(thrown)}`);
     // Not the old rejected promise: a fresh pass, which resumes the generation and parks.
-    const parked = await a.step();
+    const parked = await a.step().catch((e: unknown) => {
+      throw new Error(`the step after a failed one was handed the old rejection instead of a fresh pass: ${String(e)}`);
+    });
     check(parked.wakeInMs !== null, `the step after a failed one: ${show(parked)}`);
     const [row] = jobs(storage);
     check(row, "no job after the fresh pass");
