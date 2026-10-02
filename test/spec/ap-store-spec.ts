@@ -125,6 +125,11 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     await throws("ATTACH DATABASE ':memory:' AS other", "are admitted");
     await throws("DETACH other", "are admitted");
     await throws("SELECT 1 FROM meta; DROP TABLE tasks", outside);
+    await throws("SELECT * FROM meta do, sqlite_master", outside);
+    await throws("SELECT * FROM meta AS window, sqlite_master s", outside);
+    await throws("UPDATE meta SET v = 1 FROM meta do, pd_tasks", outside);
+    await throws("SELECT k, v FROM meta WHERE $a(') IS NULL UNION SELECT type, name FROM sqlite_master WHERE $b(') IS NULL", "only ? and ?NNN are admitted");
+    await throws("SELECT v FROM meta WHERE k = :k", "only ? and ?NNN are admitted");
     check(show(master(host)) === show(before), "a refused statement changed the schema");
   }));
 

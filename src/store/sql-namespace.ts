@@ -1,6 +1,10 @@
 /**
  * Where a component's tables live, kept apart from the SQL that names them.
  *
+ * This is a fail-closed tripwire for the SQL we run ourselves — pi-durable's fixed statements and our
+ * own — catching an upstream schema or statement change and our own bugs; it is not a sandbox for
+ * untrusted SQL, and nothing passes untrusted SQL to it.
+ *
  * Two components that each own a schema can share one database only if their
  * names cannot meet: pi-durable and AgentDO both have a `tasks` table, and a
  * Durable Object has exactly one SQLite database with no `ATTACH` and no
@@ -56,9 +60,15 @@ const CONFLICT_WORDS = new Set(["rollback", "abort", "replace", "fail", "ignore"
  * statements address the database rather than a listed object, so they are refused whatever they name.
  */
 const STATEMENT_KINDS = new Set(["select", "insert", "replace", "update", "delete", "create", "drop", "alter"]);
-/** Words that end a FROM or JOIN list at their own parenthesis depth: after them a comma is not a new table. */
+/**
+ * Words that end a FROM or JOIN list at their own parenthesis depth: after them a comma is not a new
+ * table. Ending a list early is the unsafe direction, so each is a reserved word SQLite refuses as an
+ * alias, with or without AS. `do` and `window` are not here for that reason: SQLite accepts both as
+ * an alias (`FROM meta do, sqlite_master`). A WINDOW clause after FROM therefore leaves the list
+ * open, and its second window name reads as an unlisted table and throws, which is the safe failure.
+ */
 const FROM_LIST_ENDS = new Set([
-  "where", "group", "having", "window", "order", "limit", "union", "intersect", "except", "returning", "set", "do", "values", "select",
+  "where", "group", "having", "order", "limit", "union", "intersect", "except", "returning", "set", "values", "select",
 ]);
 /** What can open a parenthesis at a FROM item and make it a subquery rather than a parenthesised join. */
 const SUBQUERY_STARTS = new Set(["select", "with", "values"]);
@@ -148,13 +158,11 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
       push("quoted", sql.slice(i + 1, end), i, end + 1); i = end + 1;
       continue;
     }
-    // Named parameters (`:x`, `@x`, `$x`) and numbers are not identifiers, whatever their letters spell.
-    if ((c === ":" || c === "@" || c === "$") && i + 1 < sql.length && isIdentStart(sql[i + 1])) {
-      let j = i + 1;
-      while (j < sql.length && isIdentPart(sql[j])) j++;
-      push("literal", "param", i, j); i = j;
-      continue;
-    }
+    // Only `?` and `?NNN` parameters. A named one (`:x`, `@x`, `$x`, `#x`) is refused: SQLite's TCL
+    // form `$a(...)` runs to the next `)`, quotes included, so tokenizing it as a name would put a
+    // quote inside it out of step with SQLite's and let a string hide a statement. Nothing we run
+    // uses them.
+    if (c === ":" || c === "@" || c === "$" || c === "#") throw refuse(`a named parameter ("${c}"); only ? and ?NNN are admitted`);
     if (/[0-9]/.test(c)) {
       let j = i + 1;
       while (j < sql.length && /[0-9A-Za-z_.]/.test(sql[j])) j++;
