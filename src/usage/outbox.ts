@@ -118,15 +118,24 @@ export function toHourly(rows: readonly UsageRow[]): HourlyRow[] {
   return [...out.values()];
 }
 
-/** A model reply's usage, one row per kind of token it counted. */
+/** A model reply's usage, one row per kind of token it counted.
+ *
+ * `cacheWrite1h` is its own key, not folded into `cache_write`: cache reads
+ * and writes are already separate keys because providers price them
+ * differently, and a 1-hour cache write is a third price where it exists.
+ * Models that never report it (DeepSeek today) drop out at the zero filter,
+ * so the key appears only when something measured it — like every other row
+ * this function makes.
+ */
 export function modelTokenRows(
   base: { at: number; tenantId: string; agentId: string },
   model: string,
-  usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number },
+  usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cacheWrite1h?: number; reasoning?: number },
 ): UsageRow[] {
   const kinds: Array<[string, number | undefined]> = [
     ["input", usage.input], ["output", usage.output], ["cache_read", usage.cacheRead],
-    ["cache_write", usage.cacheWrite], ["reasoning", usage.reasoning],
+    ["cache_write", usage.cacheWrite], ["cache_write_1h", usage.cacheWrite1h],
+    ["reasoning", usage.reasoning],
   ];
   return kinds
     .filter(([, n]) => typeof n === "number" && n !== 0)

@@ -57,6 +57,14 @@ await check("a model reply counts each kind of token it reported, under its mode
   const got = describe(modelTokenRows(base, "deepseek-chat", { input: 100, output: 20, cacheRead: 50, cacheWrite: 0, reasoning: 7 }));
   must(got === "model.tokens/deepseek-chat:cache_read/50tokens model.tokens/deepseek-chat:input/100tokens model.tokens/deepseek-chat:output/20tokens model.tokens/deepseek-chat:reasoning/7tokens", got);
   must(modelTokenRows(base, "", { input: 1 })[0].key === "unknown:input", "an unnamed model");
+  // The 1-hour cache write is its own key, not folded into cache_write: reads
+  // and writes are already separate keys because providers price them
+  // differently, and a 1-hour write is a third price where it exists. A model
+  // that never reports it (DeepSeek) produces no row at all — the zero filter
+  // drops the absent kind, so the key appears only when something measured it.
+  const longCache = describe(modelTokenRows(base, "claude-opus", { input: 5, cacheWrite: 2, cacheWrite1h: 3 }));
+  must(longCache === "model.tokens/claude-opus:cache_write/2tokens model.tokens/claude-opus:cache_write_1h/3tokens model.tokens/claude-opus:input/5tokens", longCache);
+  must(!describe(modelTokenRows(base, "deepseek-chat", { input: 1 })).includes("cache_write_1h"), "absent means no row, like every other kind");
 });
 
 await check("a committed model reply lands in the outbox with its model, in the same commit, and only when an owner is set", async () => {
