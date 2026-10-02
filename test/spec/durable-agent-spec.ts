@@ -338,13 +338,15 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(thrown instanceof Error && thrown.message.includes("one agent per object"), `second agent: ${String(thrown)}`);
   });
 
-  add("engine", "what a later step owns says so instead of doing something else", async (storage) => {
+  add("engine", "compact with nothing to compact: an operation that ends with no model job and no entry (test/pd-compaction.ts has the rest)", async (storage) => {
     const a = object(storage).agent();
-    for (const [what, call, step] of [["compact", () => a.compact(), "not supported"]] as const) {
-      let thrown: unknown;
-      try { await call(); } catch (e) { thrown = e; }
-      check(thrown instanceof Error && thrown.message.includes("pd engine") && thrown.message.includes(step), `${what}: ${String(thrown)}`);
-    }
+    const started = await a.compact();
+    check(typeof started.operationId === "string", `compact returned ${show(started)}`);
+    const out = await a.step();
+    check(out.wakeInMs === null, `step ${show(out)}`);
+    const jobs = storage.sql.exec("SELECT COUNT(*) AS n FROM ap_model_jobs").toArray()[0]?.n;
+    check(Number(jobs) === 0, `model jobs ${String(jobs)}`);
+    check((await a.entries({})).every((e) => e.type !== "compaction"), "a compaction entry was written");
     // Cancel and client calls are step 8's (test/pd-cancel.ts); with nothing recorded, resuming finds nothing to do.
     check(await a.resumeClientCalls() === false, "resumeClientCalls must be false with no client call: runtime.step calls it every pass");
   });

@@ -9,6 +9,10 @@
  * What changed (marked "antiproton patch"):
  * - Passes `HarnessOptions.onSleep` to the scheduler, and imports the vendored ./scheduler.js
  *   (see its header for the change and why).
+ * - Imports the vendored ./compaction.js (`createCompaction`, a manual compaction) and ./registry.js
+ *   (`BUILTIN_TASKS`), whose compaction task can poll a deferred summary (see ./compaction.js), and `open`
+ *   refuses a registry whose built-in task of a name is not that one: the package's `createRegistry()` makes such
+ *   a registry. Import `createRegistry` from ./registry.js.
  * - Relative imports of unchanged modules point into the installed package; the source map comment is dropped.
  *
  * Only here so the patched scheduler is the one a Harness runs: the package's own harness.js imports its
@@ -23,11 +27,12 @@ import { ResetEntry } from "../../../../../../node_modules/@earendil-works/pi-du
 import { SessionImpl } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/session/session.js";
 import { ROOT_CONVERSATION_ID } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/types.js";
 import { AgentDoc, configure, createAgent, resolveAgent, resolveSettings } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/agent.js";
-import { createCompaction } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/compaction.js";
+// antiproton patch: the vendored compaction (a `poll` phase for a deferred summary) and the registry holding it.
+import { createCompaction } from "./compaction.js";
 import { readContext } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/context.js";
 import { InboxDoc, withdrawQueuedInputs } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/inbox.js";
 import { LiveDoc, settleSchedulerOutcome } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/live.js";
-import { BUILTIN_TASKS } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/registry.js";
+import { BUILTIN_TASKS } from "./registry.js";
 import { TaskScheduler } from "./scheduler.js";
 import { Submissions } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/submissions.js";
 import { TaskGraphView } from "../../../../../../node_modules/@earendil-works/pi-durable/dist/harness/task-graph.js";
@@ -301,10 +306,13 @@ export const Harness = {
     async open(storage, options, context) {
         context.abortSignal?.throwIfAborted();
         const snapshot = options.registry.snapshot();
-        const missing = BUILTIN_TASKS.filter((task) => snapshot.task(task.definition.name) === undefined);
+        // antiproton patch: the built-in task must be this file's, not only one of the same name: a registry made by
+        // the package's createRegistry() holds the package's compaction, which cannot summarize on a deferred-only
+        // provider, and would run in its place silently. The error names the vendored registry.
+        const missing = BUILTIN_TASKS.filter((task) => snapshot.task(task.definition.name) !== task);
         if (missing.length > 0) {
             const names = missing.map((task) => task.definition.name).join(", ");
-            throw new Error(`Registry lacks built-in tasks ${names}; create it with createRegistry()`);
+            throw new Error(`Registry lacks built-in tasks ${names}; create it with createRegistry() of src/vendor/pi/pi-durable/dist/harness/registry.js`);
         }
         const harness = new HarnessImpl(storage, options, context);
         try {
