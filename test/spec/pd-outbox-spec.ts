@@ -65,11 +65,12 @@ const pdJobs = (storage: DurableSqlHost): Jobs => {
 };
 
 type Fault = (writes: readonly StorageWrite[]) => void;
-function pdObject(storage: DurableSqlHost, extra: { commitFault?: Fault; dispatch?: (id: string) => Promise<void> } = {}) {
+function pdObject(storage: DurableSqlHost, extra: { commitFault?: Fault; dispatch?: (id: string) => Promise<void>; redeliveryMs?: number } = {}) {
   const dispatched: string[] = [];
   const host = new PdHost({
     storage, pollAfterMs: POLL_MS, minParkMs: 1,
     ...(extra.commitFault ? { commitFault: extra.commitFault } : {}),
+    ...(extra.redeliveryMs === undefined ? {} : { redeliveryMs: extra.redeliveryMs }),
   });
   const agent = DurableAgent.open({
     host, ...OWNER, model: MODEL, systemPrompt: PROMPT,
@@ -294,18 +295,24 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await next.agent.close();
   });
 
-  add("jobs", "a crash after the commit that records a job, before its dispatch: the next object dispatches it exactly once", async (storage) => {
-    const first = pdObject(storage, { dispatch: async () => { throw new Error("the object died before the dispatch"); } });
+  add("jobs", "a crash after the commit that records a job, before its dispatch: the next object dispatches it exactly once, at its redelivery", async (storage) => {
+    const REDELIVERY = 400;
+    const first = pdObject(storage, { redeliveryMs: REDELIVERY, dispatch: async () => { throw new Error("the object died before the dispatch"); } });
     await first.agent.say("Q1");
     const parked = await first.agent.step();
     check(parked.wakeInMs !== null, `step: ${show(parked)}`);
     await first.agent.close();
     const [job] = pdJobs(storage);
-    check(job && job.dispatched_at === null && job.state === null && first.dispatched.length === 1, `after the crash: ${show(pdJobs(storage))}, tried ${show(first.dispatched)}`);
+    // Marked dispatched by its insert, so a sweep in the meantime does not send it a second time.
+    check(job && job.dispatched_at !== null && job.state === null && first.dispatched.length === 1, `after the crash: ${show(pdJobs(storage))}, tried ${show(first.dispatched)}`);
 
-    const next = pdObject(storage);
+    const next = pdObject(storage, { redeliveryMs: REDELIVERY });
+    const resumed = await next.agent.step();
+    check(next.dispatched.length === 0, `dispatched inside the redelivery interval: ${show(next.dispatched)}`);
+    check(resumed.wakeInMs !== null && resumed.wakeInMs <= REDELIVERY, `the park passes the redelivery: ${show(resumed)}`);
+    await sleep(Number(job.dispatched_at) + REDELIVERY - Date.now());
     for (let i = 0; i < 3; i++) await next.agent.step();
-    check(show(next.dispatched) === show([job.id]), `dispatched on resume: ${show(next.dispatched)}`);
+    check(show(next.dispatched) === show([job.id]), `dispatched at the redelivery: ${show(next.dispatched)}`);
     await pdTurn(storage, next.agent, null, [replying(SCRIPT[0]!.reply)]);
     check(show(next.dispatched) === show([job.id]), `dispatched by the end: ${show(next.dispatched)}`);
     check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
