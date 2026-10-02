@@ -262,10 +262,10 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       check(show(v.after) === show({ status: "idle", turns: ["cancelled"], pending: [] }), `${name}: after the cancel ${show(v.after)}`);
       check(show(v.invoked) === show(["web.slow"]), `${name}: the plugin ran ${show(v.invoked)}`);
     }
-    // The one difference, and why it stays. pi085's abort waits for the call to return and records its real result;
-    // pd's does not wait, and pi-durable refuses a run-mode commit once the abort mark is down, so the call's late
-    // outcome cannot be recorded and its result is pi-durable's "aborted" (dist/harness/tool.js, `abort`). The rest of
-    // the request — the call, the note, the next message — is the same.
+    // The one difference, and why it stays. pi085's abort waits for the call to return and records its real result.
+    // pd's waits for it too, but its abort mark commits first, and pi-durable then refuses the call's own result: the
+    // result is pi-durable's "aborted" (@earendil-works/pi-durable 1.0.0 dist/harness/tool.js, the task's `abort`).
+    // The rest of the request — the call, the note, the next message — is the same.
     const c1 = (m: string) => JSON.parse(m) as { role: string; tool_call_id?: string; content: string };
     sameRequests(r.pi085.requests, r.pd.requests, "after a cancel mid tool call", (pi, pdm) =>
       c1(pi).tool_call_id === "c1" && c1(pi).content === show({ slow: "done" }) && c1(pdm).tool_call_id === "c1"
