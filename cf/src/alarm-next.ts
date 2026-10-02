@@ -19,3 +19,15 @@ export function nextAlarm(asked: number | null, planned: number | null): number 
   if (asked === null) return planned;
   return planned === null ? asked : Math.min(asked, planned);
 }
+
+/**
+ * When a delivered model answer should wake a `pd` object (src/runtime/durable-agent.ts), given the alarm
+ * already pending. pi-durable reads the answer at the `pollAt` its checkpoint fixed, and the park that
+ * closed the harness armed the alarm for exactly that time; a wake now would reopen the harness only to
+ * find the poll still ahead and park again. So: no wake while an alarm is pending, and now when none is
+ * (nothing else would come back for the answer). A pi085 object wakes now, as it always has; the caller
+ * does not ask this for one.
+ */
+export function pdDeliveryWake(pendingAlarm: number | null, now: number): number | null {
+  return pendingAlarm === null ? now : null;
+}

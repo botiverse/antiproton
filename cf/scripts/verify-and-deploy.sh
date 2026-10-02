@@ -77,6 +77,8 @@ run_suite pi-durable-do bash test/pi-durable-do.sh
 run_suite ap-store-do bash test/ap-store-do.sh
 # The park contract: a pi-durable harness closed while it sleeps and reopened, on real Durable Object SQLite (local workerd, no network).
 run_suite durable-drive-do bash test/durable-drive-do.sh
+# The pd engine (DurableAgent over PdHost): a turn through ap_model_jobs, parked, reopened, on real Durable Object SQLite (local workerd, no network).
+run_suite durable-agent-do bash test/durable-agent-do.sh
 # The control plane's queries on real D1 SQLite, after the migrations in cf/migrations (local workerd, no network).
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 # Captured, then printed, then tested. It used to be piped through

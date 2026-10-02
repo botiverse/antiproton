@@ -16,6 +16,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import type { AgentEngine } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
+import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
@@ -673,6 +674,10 @@ export class AgentRuntime {
   // credentials and memory. Keyed so a second conversation never reads the
   // first one's transcript, and cached so a wake does not rebuild them all.
   #agents = new Map<string, { agent: AgentEngine; builtFrom: string }>();
+  /** The object's one pi-durable harness, made when a `pd` agent is first opened (src/runtime/durable-agent.ts). */
+  #pd: PdHost | null = null;
+  /** Whether a pd agent was opened in this object: what a delivered answer's wake depends on (cf/src/index.ts). */
+  get servesPd(): boolean { return this.#pd !== null; }
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
@@ -1618,6 +1623,11 @@ export class AgentRuntime {
 
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
+    // Which kernel runs this agent: `pd` (src/runtime/durable-agent.ts) only where the object's `ap_meta`
+    // says so, and nothing in this step writes that row outside the tests — every creation path still
+    // leaves it absent, so every production agent is opened as `PiAgent`, exactly as before. An object
+    // with no `ap_meta` table is read without creating one.
+    const engine = recordedEngine(this.#deps.ctx.storage.sql);
     // Before the catalogue is read: a stale pin is a mount whose every call
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
@@ -1720,6 +1730,59 @@ export class AgentRuntime {
       ...callerTools,
     ];
 
+    // Read here rather than inside the harness, so the harness keeps holding
+    // no I/O of its own.
+    const prompt = systemPrompt({
+      // The agent's own record: a person named and described it at creation,
+      // and that is the first thing the prompt says after the core.
+      persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
+      // Whatever the mounted plugins have to say, in registry order. The
+      // framework no longer reaches into any one plugin for this (Piper,
+      // tygg, 2026-09-12).
+      contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
+      // `release` is scoped to the agent, not to a task, so a new session
+      // inherits whatever the last one left alive — and until now nothing
+      // told it, which is how a container billed overnight for a
+      // conversation that had ended (tygg, 2026-09-22). Session-stable facts
+      // only; the durations are in the two message-side sentences.
+      held: heldPrompt(await heldResources(records, this.#plugins, activityOf), nameOf),
+      policy: this.#deps.policy,
+      // Each paragraph appears only where the thing it describes is really
+      // there — telling an agent to read a result back with a tool it has not
+      // got is a wrong instruction competing with the right ones. That used
+      // to be a question this file asked about one plugin; the artifacts
+      // paragraph is now the artifacts mount's own contribution, so the
+      // condition is "the mount is there" and nobody has to check it.
+      // `sandbox` stays: run_js is the harness's, not a mount's. The pd engine offers no tool yet.
+      sandbox: extras.runJs && engine !== "pd",
+    });
+    const model = {
+      provider: binding.provider,
+      id: binding.model,
+      // The bound model's own window when the table knows it: an agent can be on another model than
+      // the deployment's (model_overrides).
+      contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
+    };
+    const dispatch = async (jobId: string) => {
+      const send = this.#deps.offloadModel;
+      if (!send) throw new Error("no dispatcher configured");
+      await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
+    };
+
+    if (engine === "pd") {
+      // Mounted tools, run_js, jobs and caller functions are not bridged to pi-durable yet (steps 7 and 8):
+      // this agent is offered no tool, and its prompt says so by leaving the sandbox out.
+      this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
+      // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
+      await this.#pd.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
+      const pd = DurableAgent.open({
+        host: this.#pd, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
+        unknownJob: (id) => new UnknownJob(id),
+      });
+      this.#agents.set(cacheKey, { agent: pd, builtFrom });
+      return pd;
+    }
+
     const agent = await PiAgent.open({
       // A cancelled turn's request stays in the history, so the model is told it was cancelled; otherwise the
       // next turn finishes it (QA, 2026-09-15).
@@ -1730,48 +1793,13 @@ export class AgentRuntime {
       usageOwner: { tenantId, agentId },
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       session,
-      // Read here rather than inside the harness, so the harness keeps holding
-      // no I/O of its own.
-      systemPrompt: systemPrompt({
-        // The agent's own record: a person named and described it at creation,
-        // and that is the first thing the prompt says after the core.
-        persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
-        // Whatever the mounted plugins have to say, in registry order. The
-        // framework no longer reaches into any one plugin for this (Piper,
-        // tygg, 2026-09-12).
-        contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
-        // `release` is scoped to the agent, not to a task, so a new session
-        // inherits whatever the last one left alive — and until now nothing
-        // told it, which is how a container billed overnight for a
-        // conversation that had ended (tygg, 2026-09-22). Session-stable facts
-        // only; the durations are in the two message-side sentences.
-        held: heldPrompt(await heldResources(records, this.#plugins, activityOf), nameOf),
-        policy: this.#deps.policy,
-        // Each paragraph appears only where the thing it describes is really
-        // there — telling an agent to read a result back with a tool it has not
-        // got is a wrong instruction competing with the right ones. That used
-        // to be a question this file asked about one plugin; the artifacts
-        // paragraph is now the artifacts mount's own contribution, so the
-        // condition is "the mount is there" and nobody has to check it.
-        // `sandbox` stays: run_js is the harness's, not a mount's.
-        sandbox: extras.runJs,
-      }),
-      model: {
-        provider: binding.provider,
-        id: binding.model,
-        // The bound model's own window when the table knows it: an agent can be on another model than
-        // the deployment's (model_overrides).
-        contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
-      },
+      systemPrompt: prompt,
+      model,
       tools: offered,
       extraTools: extraTools as any,
       toolHost: host,
       ...(keeping ? { interrupts: keeping } : {}),
-      dispatch: async (jobId) => {
-        const send = this.#deps.offloadModel;
-        if (!send) throw new Error("no dispatcher configured");
-        await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
-      },
+      dispatch,
     });
     agentRef.current = agent;
     this.#agents.set(cacheKey, { agent, builtFrom });
@@ -1802,7 +1830,8 @@ export class AgentRuntime {
     const agent = await this.agent(tenantId, agentId, session);
     // A conversation that has just been spoken to has work until a step says
     // otherwise, so the next wake steps it.
-    markSession(this.#deps.ctx.storage.sql, session, true);
+    const marked = this.#ownWrite(() => markSession(this.#deps.ctx.storage.sql, session, true));
+    if (marked instanceof Promise) await marked;
     const res: any = await agent.say(text, mode);
     return { ...messageLanded(res, mode), result: res };
   }
@@ -1873,21 +1902,27 @@ export class AgentRuntime {
   async step(tenantId: string, agentId: string) {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    ensureAgentTables(sql);
+    const ensured = this.#ownWrite(() => ensureAgentTables(sql));
+    if (ensured instanceof Promise) await ensured;
     // Background work first (task #16). A job that ended is delivered as a
     // message, which marks its session as having work, so the loop below steps
     // it in this same pass; the rest say when they want checking again.
     const owner = { tenantId, agentId };
     const jobCtx = (job: { session: string }) =>
       ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
-    const bg = await runBackgroundPass({
+    // Not on a pd object whose harness may be open: the pass writes `background_jobs` with plain SQL across
+    // awaits, which could join a pi-durable transaction, and nothing the pd engine offers starts background
+    // work yet (tools are step 7). `#pd` is set only once a pd agent was opened, so before that no harness
+    // exists, and the pass runs as it always has.
+    const bg = this.#pd ? { wakeInMs: null } : await runBackgroundPass({
       sql, owner,
       poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json),
       cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
       deliver: async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); },
     });
-    const sessions = sessionsWithWork(sql);
+    const listed = this.#ownWrite(() => sessionsWithWork(sql));
+    const sessions = listed instanceof Promise ? await listed : listed;
     if (!sessions.length) sessions.push(MAIN_SESSION);
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
@@ -1901,7 +1936,8 @@ export class AgentRuntime {
       settled.push(...out.settled);
       const wake = resumed ? 0 : out.wakeInMs;
       if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
-      markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
+      const marked = this.#ownWrite(() => markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null));
+      if (marked instanceof Promise) await marked;
     }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
@@ -1910,13 +1946,16 @@ export class AgentRuntime {
     // A turn that settled while background work runs has not finished using
     // its containers: releasing now would take the machine out from under the
     // job, which is the normal case, since the model keeps working (task #16).
-    const backgroundRunning = runningBackgroundJobs(sql, owner).length > 0;
+    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) and the pd
+    // engine offers no tool that could hold or start anything yet (step 7).
+    const pd = this.#pd !== null;
+    const backgroundRunning = !pd && runningBackgroundJobs(sql, owner).length > 0;
     // A program suspended at a pause keeps the object awake (and is discarded
     // here once past its time), and, like background work, has not finished
     // with the containers it was using.
     const keep = this.#continuations.wakeInMs();
     if (keep !== null) wakeInMs = wakeInMs === null ? keep : Math.min(wakeInMs, keep);
-    if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
+    if (!pd && this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
       if (!this.#deps.idle) {
         if (settled.length) {
           const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
@@ -2047,7 +2086,7 @@ export class AgentRuntime {
    *  session asked, so the answer lands in the transcript that is waiting. */
   async takeJob(tenantId: string, agentId: string, jobId: string) {
     await this.ready();
-    const session = this.#jobSession(jobId);
+    const session = this.#jobSessionFor(jobId);
     const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId);
     if (!job) return job;
     // The model the queued call asks for, when it spends the operator's account; null leaves it at the
@@ -2058,8 +2097,27 @@ export class AgentRuntime {
 
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
     await this.ready();
-    const session = this.#jobSession(jobId);
+    const session = this.#jobSessionFor(jobId);
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
+  }
+
+  /**
+   * A write of the runtime's own tables. On an object where a pd agent was opened it waits out any
+   * pi-durable transaction open on the object's one connection (`PdHost.exclusive`), which a plain
+   * `sql.exec` would join and be rolled back with; the promise is returned to await. Elsewhere it runs at
+   * once and returns nothing, so a pi085 object takes exactly the path it always took.
+   */
+  #ownWrite<T>(fn: () => T): Promise<T> | T {
+    return this.#pd ? this.#pd.exclusive(fn) : fn();
+  }
+
+  /**
+   * On a `pd` object every session's jobs are in one table the shared harness answers from
+   * (src/runtime/durable-agent.ts), so any session's agent takes and delivers them, and that agent
+   * throws `UnknownJob` for an id with no row. Elsewhere, the `pi_model_jobs` row says which session.
+   */
+  #jobSessionFor(jobId: string): string {
+    return recordedEngine(this.#deps.ctx.storage.sql) === "pd" ? MAIN_SESSION : this.#jobSession(jobId);
   }
 
   /** The session whose job this is. No row means no session holds it, so the main

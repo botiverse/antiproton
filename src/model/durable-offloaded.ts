@@ -161,6 +161,14 @@ export function durableOffloadedProvider(opts: {
   models: DurableOffloadedModel[];
   /** How long pi-durable sleeps before polling again: the `pollAt` a park waits for. */
   pollAfterMs?: number;
+  /**
+   * When set, each not-ready poll answers with the handle's `pollAfterMs` doubled, up to this. pi-durable
+   * stores the handle it was last given in the `poll` checkpoint and takes the next `pollAt` from it, so
+   * the handle is the one place the interval can move: a delivered answer cannot shorten a sleep already
+   * committed, and a short interval for a long call is a wake per interval. Doubling keeps a quick answer
+   * waited for briefly and a slow one polled rarely.
+   */
+  maxPollAfterMs?: number;
 }): Provider {
   const api = opts.api ?? "offloaded";
   const baseUrl = opts.baseUrl ?? "https://offloaded.invalid";
@@ -176,6 +184,11 @@ export function durableOffloadedProvider(opts: {
     contextWindow: d.contextWindow,
     maxTokens: d.maxTokens ?? 8192,
   }));
+
+  const max = opts.maxPollAfterMs;
+  /** The handle a not-ready poll answers with: the same job, asked again after twice as long (capped), when `maxPollAfterMs` is set. */
+  const later = (handle: DeferredHandle): DeferredHandle =>
+    max === undefined || handle.pollAfterMs === undefined ? handle : { ...handle, pollAfterMs: Math.min(max, handle.pollAfterMs * 2) };
 
   const stream = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
     settledLater(model, async () => {
@@ -201,7 +214,7 @@ export function durableOffloadedProvider(opts: {
       streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) => stream(model, context, options),
       // Not ready answers with the same handle: that is how pi says "not yet", and why nothing here blocks.
       fetchDeferred: (model: Model<Api>, handle: DeferredHandle) =>
-        settledLater(model, async () => (await opts.port.poll(handle.id)) ?? messageOf(model, { stopReason: "deferred", deferred: handle })),
+        settledLater(model, async () => (await opts.port.poll(handle.id)) ?? messageOf(model, { stopReason: "deferred", deferred: later(handle) })),
       cancelDeferred: async (_model: Model<Api>, handle: DeferredHandle) => { await opts.port.cancel?.(handle.id); },
     },
   });
