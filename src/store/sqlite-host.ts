@@ -26,18 +26,6 @@ export function sqliteHost(): SqlHost & DurableSqlHost & { dispose(): void } {
       try { const result = cb(); db.exec("COMMIT"); return result; }
       catch (e) { db.exec("ROLLBACK"); throw e; }
     },
-    // The async form, as `ctx.storage.transaction` behaves: one transaction on
-    // the one connection, held across awaits, so a statement issued by anyone
-    // while it is open joins it — the same hazard the Durable Object has, which
-    // is what lets test/pi-durable.ts show the facade's queue keeping it out.
-    async transaction<T>(cb: () => Promise<T>): Promise<T> {
-      db.exec("BEGIN");
-      let result: T;
-      try { result = await cb(); }
-      catch (e) { db.exec("ROLLBACK"); throw e; }
-      db.exec("COMMIT");
-      return result;
-    },
     dispose() { db.close(); },
   };
 }

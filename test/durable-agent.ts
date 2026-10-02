@@ -8,10 +8,9 @@ import { AgentRuntime } from "../cf/src/runtime.ts";
 import { UnknownJob } from "../cf/src/model-queue.ts";
 import { pdDeliveryWake } from "../cf/src/alarm-next.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
-import { DurableAgent, guardJoinedWrites } from "../src/runtime/durable-agent.ts";
+import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
-import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
@@ -28,7 +27,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 async function runtime(host: ReturnType<typeof sqliteHost>) {
   const sent: string[] = [];
   const rt = new AgentRuntime({
-    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync, transaction: host.transaction } },
+    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
     operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
@@ -67,9 +66,9 @@ const runtimeCases: DriveCase[] = [
     run: async () => {
       const host = sqliteHost();
       try {
-        const ap = new ApStore(host.sql, new PiDurableSqlite(host, prefixedNamespace("pd")), prefixedNamespace("ap"));
-        await ap.ensure();
-        await ap.setEngineOnce("pd");
+        const ap = new ApStore(host, prefixedNamespace("ap"));
+        ap.ensure();
+        ap.setEngineOnce("pd");
         const { rt, sent } = await runtime(host);
         const agent = await rt.agent("t", "a");
         check(agent instanceof DurableAgent, `opened ${agent.constructor.name}`);
@@ -107,41 +106,28 @@ const runtimeCases: DriveCase[] = [
     },
   },
   {
-    group: "runtime", name: "engine pd: messages and steps together make no write of the runtime's join an open pi-durable transaction",
+    group: "runtime", name: "engine pd: a message and a step started as a pi-durable commit ends both complete",
     run: async () => {
       const raw = sqliteHost();
       try {
-        // The interleaving, pinned: the first pi-durable transaction after `armed` is held open across a
-        // macrotask, and a message and a step are started from inside it — so their writes are issued
-        // while it is open. Fixed, they wait for it; joined, the guard refuses and records them.
+        // The interleaving, pinned: as the first pi-durable commit after `armed` ends (`afterPdCommits`), a message
+        // and a step are started, alongside the step that made the commit.
         let armed = false;
         let started: Array<Promise<unknown>> = [];
         let rt: AgentRuntime | undefined;
-        // A synchronous pi-durable transaction cannot be held open: there, they start as it ends (`afterPdCommits`).
         const start = () => { armed = false; started = [rt!.postMessage("t", "a", "Q2", "steer"), rt!.step("t", "a")]; };
-        const slow = afterPdCommits({
-          sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
-          transaction: (cb) => raw.transaction(async () => {
-            if (armed) {
-              start();
-              await sleep(20);
-            }
-            return cb();
-          }),
-        }, () => { if (armed) start(); });
-        const guarded = guardJoinedWrites(slow);
-        const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
-        const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
-        await ap.ensure();
-        await ap.setEngineOnce("pd");
+        const host = { ...raw, ...afterPdCommits(raw, () => { if (armed) start(); }) };
+        const ap = new ApStore(raw, prefixedNamespace("ap"));
+        ap.ensure();
+        ap.setEngineOnce("pd");
         ({ rt } = await runtime(host));
         await rt.postMessage("t", "a", "Q1");
         armed = true;
         const first = await Promise.allSettled([rt.step("t", "a")]);
-        check(started.length === 2, "control: no pi-durable transaction was opened after arming, so nothing ran inside one");
+        check(started.length === 2, "control: no pi-durable commit ended after arming, so nothing was started");
         const results = [...first, ...await Promise.allSettled(started)];
         const failed = results.filter((r) => r.status === "rejected").map((r) => String((r as PromiseRejectedResult).reason));
-        check(guarded.joined.length === 0 && failed.length === 0, `joined ${show(guarded.joined)}; failed ${show(failed)}`);
+        check(failed.length === 0, `failed ${show(failed)}`);
         await (await rt.agent("t", "a")).close();
       } finally { raw.dispose(); }
     },

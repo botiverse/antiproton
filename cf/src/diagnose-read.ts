@@ -44,8 +44,6 @@ export interface DiagnosisDeps {
   /** When the object's alarm is set for, read from the platform. */
   alarm: () => Promise<number | null>;
   now?: () => number;
-  /** Runs a synchronous read after any pi-durable transaction open on the object (`AgentRuntime.afterPdTransactions`). */
-  outsidePd?: <T>(fn: () => T) => Promise<T> | T;
 }
 
 const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): any[] =>
@@ -137,8 +135,8 @@ export async function readDiagnosis(
   const now = deps.now?.() ?? Date.now();
   const owner = { tenantId, agentId };
   const { store } = deps;
-  const read = () => ({ entries: readEntries(sql, session), transcript: readTranscript(sql, tenantId, agentId, taskId)! });
-  const { entries, transcript } = await (deps.outsidePd ? deps.outsidePd(read) : read());
+  const entries = readEntries(sql, session);
+  const transcript = readTranscript(sql, tenantId, agentId, taskId)!;
   const kinds: Record<string, number> = {};
   for (const e of transcript.events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
   const compactions = entries.filter((e) => e.type === "compaction");

@@ -149,11 +149,7 @@ export class RunJsContinuations {
   }
 }
 
-/**
- * Ends the program, or tells the tool nobody will answer; nobody is waiting for what either says.
- * What either writes goes through the gateway and the store, which on a pd object keep it out of
- * pi-durable's commits themselves (cf/src/runtime.ts `#openPd`), so it can start here, at once.
- */
+/** Ends the program, or tells the tool nobody will answer; nobody is waiting for what either says. */
 function discard(s: Suspended) {
   try {
     if (s.kind === "tool") void s.host.cancelInterrupt?.(s.interrupt).catch(() => {});

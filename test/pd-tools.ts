@@ -14,7 +14,6 @@ import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { PI085_INTERRUPTED, pdInterruptedBlock } from "../src/runtime/durable-tools.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
-import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
@@ -46,13 +45,13 @@ async function firstRequest(engine: "pi085" | "pd") {
   const host = sqliteHost();
   try {
     if (engine === "pd") {
-      const ap = new ApStore(host.sql, new PiDurableSqlite(host, prefixedNamespace("pd")), prefixedNamespace("ap"));
-      await ap.ensure();
-      await ap.setEngineOnce("pd");
+      const ap = new ApStore(host, prefixedNamespace("ap"));
+      ap.ensure();
+      ap.setEngineOnce("pd");
     }
     const sent: string[] = [];
     const rt = new AgentRuntime({
-      ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync, transaction: host.transaction } },
+      ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
       bucket: {} as never, bucketName: "b", models: { resolve: () => null },
       autoRelease: false, extraPlugins: [kv],
       operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
@@ -113,11 +112,10 @@ const nodeCases: DriveCase[] = [
 ];
 
 const results = await runDriveCases([
-  // Twice: with each pi-durable commit held open 5 ms (the widest window for a write to join it), and as is.
-  ...[5, 0].flatMap((slowCommitMs) => pdToolsCases(async (use) => {
+  ...pdToolsCases(async (use) => {
     const host = sqliteHost();
     try { await use(host); } finally { host.dispose(); }
-  }, { slowCommitMs }).map((c) => ({ ...c, group: `${c.group}${slowCommitMs ? ", slow commits" : ""}` }))),
+  }),
   ...nodeCases,
 ]);
 

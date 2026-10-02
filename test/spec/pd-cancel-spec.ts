@@ -15,7 +15,7 @@
 import { BACKGROUND_CONTEXT as BACKGROUND } from "@earendil-works/chord/context";
 import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import { CLIENT_PENDING, clientTools } from "../../src/runtime/client-calls.ts";
-import { DurableAgent, guardJoinedWrites, PdHost } from "../../src/runtime/durable-agent.ts";
+import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
 import { pdAbortedBlock } from "../../src/runtime/durable-tools.ts";
 import { parkVerdict, readSnapshot } from "../../src/runtime/durable-drive.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
@@ -162,26 +162,9 @@ function sameRequests(a: Request[], b: Request[], what: string, differs?: (pi: s
 
 const texts = (req: Request) => req.messages.filter((m) => m.role !== "system").map((m) => (typeof m.content === "string" ? m.content : show(m.content)));
 
-/** `slowCommitMs`: each pi-durable transaction held open that long first, as in pd-tools-spec (0 on a Durable Object). */
-export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: number } = { slowCommitMs: 0 }): DriveCase[] {
+export function pdCancelCases(withHost: WithDriveHost): DriveCase[] {
   const cases: DriveCase[] = [];
-  /** As in pd-tools-spec: every case asserts that nothing of ours was written inside an open pi-durable transaction. */
-  const joined: string[] = [];
-  const withHost: WithDriveHost = (use) => withRawHost(async (raw) => {
-    const slow: DurableSqlHost = opts.slowCommitMs === 0 ? raw : {
-      sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
-      transaction: (cb) => raw.transaction(async () => { await sleep(opts.slowCommitMs); return cb(); }),
-    };
-    const g = guardJoinedWrites(slow, { throwOnJoin: true });
-    try { await use({ sql: g.sql, transaction: g.transaction, transactionSync: g.transactionSync }); } finally { joined.push(...g.joined); }
-  });
-  const add = (group: string, name: string, run: () => Promise<void>) => cases.push({
-    group, name, run: async () => {
-      joined.length = 0;
-      await run();
-      check(joined.length === 0, `${joined.length} writes joined an open pi-durable transaction: ${show(joined.slice(0, 5))}`);
-    },
-  });
+  const add = (group: string, name: string, run: () => Promise<void>) => cases.push({ group, name, run });
 
   /** Run `body` once per engine, each on fresh storage, and hand back what each returned. */
   async function each<T>(body: (e: Eng, w: World, storage: DurableSqlHost) => Promise<T>, pdOpts?: { stepDeadlineMs?: number }): Promise<{ pi085: T; pd: T }> {
@@ -241,10 +224,8 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       const taken = await e.agent.takeJob(job!) as Job;
       await e.agent.deliver(job!, fromResponse(calls(["c1", "web__slow", {}])({ messages: [] }), taken.model, job!));
       const { step } = await stepUntil(e, w.slow.arrived);
-      // Both engines' cancels wait for the gateway call in flight (measured: neither resolves while the plugin holds
-      // it). pi085's abort waits for the tool; on pd the call runs inside `apart`, which holds pi-durable's commits off,
-      // the abort mark's among them (durable-tools.ts, "Our writes"). So the plugin is let go a moment after the
-      // cancel starts, as a real one eventually returns.
+      // pi085's abort waits for the gateway call in flight; the plugin is let go a moment after the cancel starts,
+      // as a real one eventually returns.
       const cancelling = cancelSession(e);
       await sleep(50);
       w.slow.open();
@@ -263,8 +244,8 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       check(show(v.invoked) === show(["web.slow"]), `${name}: the plugin ran ${show(v.invoked)}`);
     }
     // The one difference, and why it stays. pi085's abort waits for the call to return and records its real result.
-    // pd's waits for it too, but its abort mark commits first, and pi-durable then refuses the call's own result: the
-    // result is pi-durable's "aborted" (@earendil-works/pi-durable 1.0.0 dist/harness/tool.js, the task's `abort`).
+    // pd's abort mark commits first, and pi-durable then refuses the call's own result: the result is pi-durable's
+    // "aborted" (@earendil-works/pi-durable 1.0.0 dist/harness/tool.js, the task's `abort`).
     // The rest of the request — the call, the note, the next message — is the same.
     const c1 = (m: string) => JSON.parse(m) as { role: string; tool_call_id?: string; content: string };
     sameRequests(r.pi085.requests, r.pd.requests, "after a cancel mid tool call", (pi, pdm) =>
@@ -409,7 +390,7 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
         const { step } = await stepUntil(e, w.slow.arrived);
         for (let i = 0; i < 100 && (await e.agent.waitingClientCalls()).length === 0; i++) await sleep(10);
         check(e.pd!.open && (await e.agent.waitingClientCalls()).length === 1, "control: the caller's function is not waiting in an open harness");
-        // The slow call holds pi-durable's commits off until it returns (see "mid tool call"), so it is let go a moment after.
+        // The slow call is let go a moment after the cancel starts (see "mid tool call").
         const cancelling = cancelSession(e);
         await sleep(50);
         w.slow.open();

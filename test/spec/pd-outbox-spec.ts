@@ -13,7 +13,7 @@
 import { setLogSink } from "../../src/core/log.ts";
 import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
-import { DurableAgent, guardJoinedWrites, PdHost } from "../../src/runtime/durable-agent.ts";
+import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
 import { OUTBOX_MARK, type DerivePass } from "../../src/runtime/pd-outbox.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { statusEvents } from "../../src/runtime/status.ts";
@@ -61,15 +61,13 @@ const pdJobs = (storage: DurableSqlHost): Jobs =>
 function pdObject(storage: DurableSqlHost, extra: { outboxFault?: (stage: "appended") => void } = {}) {
   const dispatched: string[] = [];
   const passes: DerivePass[] = [];
-  // Every write the engine and its outbox passes make while a pi-durable transaction is open lands in `joined`.
-  const guarded = guardJoinedWrites(storage);
-  const host = new PdHost({ storage: guarded, poll: POLL, minParkMs: 1, onOutboxPass: (p) => passes.push(p), ...extra });
+  const host = new PdHost({ storage, poll: POLL, minParkMs: 1, onOutboxPass: (p) => passes.push(p), ...extra });
   const agent = DurableAgent.open({
     host, ...OWNER, model: MODEL, systemPrompt: PROMPT,
     dispatch: async (id) => { dispatched.push(id); },
     unknownJob: (id) => new UnknownJob(id),
   });
-  return { host, agent, dispatched, passes, joined: guarded.joined };
+  return { host, agent, dispatched, passes };
 }
 /** How the passes so far compared with pi.usage, those that compared anything. */
 const checks = (passes: readonly DerivePass[]) => passes.flatMap((p) => (p.check ? [p.check.state] : []));
@@ -172,7 +170,7 @@ function measured(storage: DurableSqlHost) {
     },
   } as DurableSqlHost["sql"];
   const host: DurableSqlHost = {
-    sql, transaction: (closure) => storage.transaction(closure), transactionSync: (closure) => storage.transactionSync(closure),
+    sql, transactionSync: (closure) => storage.transactionSync(closure),
   };
   return { host, reads };
 }
@@ -199,7 +197,6 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
       check(r.kind === "model.call" && r.spanId === job.id && r.ms === job.answered_at! - job.created_at, `pd trace row ${i} ${show(r)} for job ${show(job)}`);
     });
     check(checks(o.passes).length >= SCRIPT.length && checks(o.passes).every((c) => c === "match"), `pi.usage compared ${show(checks(o.passes))}`);
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
 
     storage.sql.exec("DELETE FROM usage_outbox");
@@ -230,7 +227,6 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     const pass = await again.host.deriveOutbox();
     check(pass && pass.entries === 0 && pass.through === at, `a new object's pass: ${show(pass)}`);
     check(show(outboxes(storage)) === show(before), `rows changed: ${show(outboxes(storage))}`);
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
   });
 
@@ -262,7 +258,6 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(show(outboxes(storage).usage.slice(usageBefore).map((r) => [r.key, r.quantity])) === show(EXPECTED_USAGE.slice(7)),
       `the turn's usage ${show(outboxes(storage).usage.slice(usageBefore))}`);
     check(inversions(storage) === 0, `entry ids out of commit order: ${inversions(storage)} inversions`);
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
   });
 
@@ -285,7 +280,6 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(show(rows.trace.map((r) => [r.status, r.spanId])) === show([["stop", pdJobs(storage)[0]!.id]]), `trace after recovery ${show(rows.trace)}`);
     await next.host.deriveOutbox();
     check(show(outboxes(storage)) === show(rows), "a second pass after recovery added rows");
-    check(next.joined.length === 0, `writes joined a pi-durable transaction: ${show(next.joined)}`);
     await next.agent.close();
   });
 
@@ -300,7 +294,6 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await o.host.drive();
     for (let i = 0; i < 100 && outboxes(storage).trace.length === 0; i++) await sleep(5);
     check(outboxes(storage).trace.length === 1, `no pass ran after the commit: ${show(outboxes(storage))}`);
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
   });
 
@@ -318,14 +311,12 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(sums && JSON.parse(String(sums.v)).models["queue/m1"].input === 131, `derived totals ${show(sums)}`);
     // Every pass that compared, from the failed attempt's commit on, agreed with pi.usage.
     check(checks(o.passes).length >= 2 && checks(o.passes).every((c) => c === "match"), `pi.usage compared ${show(checks(o.passes))}`);
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
   });
 
   add("pi.usage", "a disagreement with pi.usage is a structured warning, and the rows are left as derived", async (storage) => {
     const o = pdObject(storage);
     await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
     check(checks(o.passes).every((c) => c === "match"), `control: before the damage ${show(checks(o.passes))}`);
     // Damage our side of the comparison: the totals say fewer input tokens than pi-durable counted.
@@ -345,7 +336,6 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
       && JSON.parse(warned[0].derived).models["queue/m1"].input === 119 && JSON.parse(warned[0].counted).models["queue/m1"].input === 120,
     `log ${show(lines)}`);
     check(show(outboxes(storage)) === show(before), "a mismatch changed the rows");
-    check(o.joined.length === 0, `writes joined a pi-durable transaction: ${show(o.joined)}`);
     await o.agent.close();
   });
 

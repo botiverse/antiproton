@@ -1,15 +1,13 @@
 /**
- * The `ap` namespace (src/store/ap-store.ts) and `PiDurableSqlite.exclusive`.
- * Run over node:sqlite by test/ap-store.ts and inside workerd, on a real Durable
- * Object's storage, by cf/src/conformance.ts (test/ap-store-do.sh) — the run that
- * reads `exclusive` against the savepoint semantics it exists for.
+ * The `ap` namespace (src/store/ap-store.ts). Run over node:sqlite by test/ap-store.ts and inside
+ * workerd, on a real Durable Object's storage, by cf/src/conformance.ts (test/ap-store-do.sh).
  */
 import { SqliteStorage } from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 import { applySqliteMigrations } from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js";
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ApStore, AP_INDEXES, AP_OBJECTS, AP_TABLES } from "../../src/store/ap-store.ts";
-import { PiDurableSqlite, SerialQueue } from "../../src/store/pi-durable-sqlite.ts";
+import { PiDurableSqlite } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace, qualifySql, type SqlNamespace } from "../../src/store/sql-namespace.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { vitestLikeAssertions as is, type PiDurableCase, type WithHost } from "./pi-durable-spec.ts";
@@ -19,7 +17,6 @@ const PD = prefixedNamespace("pd");
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 type MasterRow = { type: string; name: string; tbl_name: string; sql: string | null };
 const master = (host: { sql: { exec(q: string): { toArray(): unknown[] } } }) =>
@@ -44,9 +41,9 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     ];
     const rowsBefore = show(rows());
 
-    const ap = new ApStore(host.sql, new PiDurableSqlite(host, PD), AP);
-    await ap.ensure();
-    await ap.ensure();
+    const ap = new ApStore(host, AP);
+    ap.ensure();
+    ap.ensure();
     const after = master(host);
     const beforeKeys = new Set(before.map(key));
     const fresh = after.filter((r) => !beforeKeys.has(key(r)));
@@ -76,10 +73,10 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
         return host.sql.exec(q.replace(/\bap\.(\w+)/g, "ap_$1").replace(/INDEX IF NOT EXISTS (\w+)/, "INDEX IF NOT EXISTS ap_$1"), ...b);
       },
     };
-    const ap = new ApStore(recording, new PiDurableSqlite(host, PD), schema);
-    await ap.ensure();
-    is.strictEqual(await ap.setEngineOnce("pd"), "pd");
-    await ap.openConversation({ taskId: "t_a", tenantId: "t", agentId: "a", conversationId: 1, createdAt: 1 });
+    const ap = new ApStore({ sql: recording, transactionSync: (cb) => host.transactionSync(cb) }, schema);
+    ap.ensure();
+    is.strictEqual(ap.setEngineOnce("pd"), "pd");
+    ap.openConversation({ taskId: "t_a", tenantId: "t", agentId: "a", conversationId: 1, createdAt: 1 });
     is.strictEqual(ap.conversation("t_a")?.conversationId, 1);
     check(seen.length >= 10, `only ${seen.length} statements were recorded`);
     for (const q of seen) {
@@ -98,11 +95,11 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
   add("ap namespace", "a name not on the list throws and touches nothing: pd's, AgentDO's, the catalogue", () => withHost(async (host) => {
     await new DurableObjectStore({ storage: host }).init();
     await applySqliteMigrations(new PiDurableSqlite(host, PD));
-    const ap = new ApStore(host.sql, new PiDurableSqlite(host, PD), AP);
-    await ap.ensure();
+    const ap = new ApStore(host, AP);
+    ap.ensure();
     const before = master(host);
     const outside = "is not on the namespace's list";
-    const throws = (sql: string, why: string) => is.rejects(ap.query(sql), why);
+    const throws = (sql: string, why: string) => is.rejects(Promise.resolve().then(() => ap.query(sql)), why);
     await throws("SELECT * FROM tasks", outside);
     await throws("SELECT * FROM pd_tasks", outside);
     await throws("DELETE FROM ap_meta", outside);
@@ -135,32 +132,32 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
   }));
 
   add("ap store", "the engine is written once: the second write is ignored and the first stays in force", () => withHost(async (host) => {
-    const ap = new ApStore(host.sql, new PiDurableSqlite(host, PD), AP);
-    await ap.ensure();
+    const ap = new ApStore(host, AP);
+    ap.ensure();
     is.strictEqual(ap.engine(), null);
-    is.strictEqual(await ap.setEngineOnce("pd"), "pd");
-    is.strictEqual(await ap.setEngineOnce("pi085"), "pd");
+    is.strictEqual(ap.setEngineOnce("pd"), "pd");
+    is.strictEqual(ap.setEngineOnce("pi085"), "pd");
     is.strictEqual(ap.engine(), "pd");
     is.deepEqual(host.sql.exec("SELECT k, v FROM ap_meta").toArray(), [{ k: "engine", v: "pd" }]);
-    await is.rejects(ap.setEngineOnce("pi999" as never), "unknown engine");
+    await is.rejects(Promise.resolve().then(() => ap.setEngineOnce("pi999" as never)), "unknown engine");
     host.sql.exec("UPDATE ap_meta SET v = 'bogus' WHERE k = 'engine'");
     await is.rejects(Promise.resolve().then(() => ap.engine()), "unknown engine recorded");
   }));
 
   add("ap store", "the conversation directory keeps the first row for a task id and refuses a second id for one conversation", () => withHost(async (host) => {
-    const ap = new ApStore(host.sql, new PiDurableSqlite(host, PD), AP);
-    await ap.ensure();
+    const ap = new ApStore(host, AP);
+    ap.ensure();
     is.strictEqual(ap.conversation("t_a"), null);
     const first = { taskId: "t_a", tenantId: "t", agentId: "a", conversationId: ROOT_CONVERSATION_ID as number, createdAt: 10 };
-    is.deepEqual(await ap.openConversation(first), first);
-    is.deepEqual(await ap.openConversation({ ...first, conversationId: 7, createdAt: 20 }), first);
-    await is.rejects(ap.openConversation({ ...first, taskId: "s_other" }), "already listed under another task id");
+    is.deepEqual(ap.openConversation(first), first);
+    is.deepEqual(ap.openConversation({ ...first, conversationId: 7, createdAt: 20 }), first);
+    await is.rejects(Promise.resolve().then(() => ap.openConversation({ ...first, taskId: "s_other" })), "already listed under another task id");
     is.strictEqual(ap.conversation("s_other"), null);
   }));
 
   add("ap store", "openConversation refuses a field that is not a non-empty string or a safe integer, and writes nothing", () => withHost(async (host) => {
-    const ap = new ApStore(host.sql, new PiDurableSqlite(host, PD), AP);
-    await ap.ensure();
+    const ap = new ApStore(host, AP);
+    ap.ensure();
     const good = { taskId: "t_a", tenantId: "t", agentId: "a", conversationId: 3, createdAt: 10 };
     // NaN binds as NULL, and OR IGNORE skips the NOT NULL violation: unchecked, each of these came
     // back as "already listed under another task id".
@@ -175,228 +172,29 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
       [{ tenantId: null }, "tenantId must be a non-empty string, not null"],
       [{ agentId: 7 }, "agentId must be a non-empty string, not 7"],
     ];
-    for (const [patch, why] of bad) await is.rejects(ap.openConversation({ ...good, ...patch } as never), why);
+    for (const [patch, why] of bad) await is.rejects(Promise.resolve().then(() => ap.openConversation({ ...good, ...patch } as never)), why);
     is.deepEqual(host.sql.exec("SELECT * FROM ap_conversations").toArray(), []);
-    is.deepEqual(await ap.openConversation(good), good);
+    is.deepEqual(ap.openConversation(good), good);
   }));
 
-  add("ap store", "a write issued while a pi-durable transaction is open waits for it, and survives its rollback", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const ap = new ApStore(host.sql, db, AP);
-    await ap.ensure();
-    const boom = new Error("boom");
-    let opened!: () => void;
-    const isOpen = new Promise<void>((r) => { opened = r; });
-    const order: string[] = [];
-    const txn = db.transaction(async (tx) => {
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 100);
-      opened();
-      await sleep(20);
-      order.push("transaction throws");
-      throw boom;
-    }).catch((e: unknown) => { order.push(e === boom ? "transaction rejected" : `rejected with ${String(e)}`); });
-    await isOpen;
-    const engine = ap.setEngineOnce("pd").then((v) => { order.push("engine written"); return v; });
-    const listed = ap.openConversation({ taskId: "t_a", tenantId: "t", agentId: "a", conversationId: 1, createdAt: 1 });
-    // Read while the transaction is open, asserted once everything has settled (see above).
-    const whileOpen = { order: [...order], engine: ap.engine() };
-    await Promise.allSettled([txn, engine, listed]);
-    is.deepEqual(whileOpen, { order: [], engine: null });
-    is.deepEqual(order, ["transaction throws", "transaction rejected", "engine written"]);
-    is.strictEqual(await engine, "pd");
-    is.strictEqual(ap.engine(), "pd");
-    is.strictEqual(ap.conversation("t_a")?.conversationId, 1);
-    is.deepEqual(await db.all("SELECT id FROM record_ids"), []);
-  }));
-
-  add("PiDurableSqlite.exclusive", "waits for an open pi-durable transaction, then commits even though that transaction rolls back", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const ap = new ApStore(host.sql, db, AP);
-    await ap.ensure();
-    const boom = new Error("boom");
-    const order: string[] = [];
-    let opened!: () => void;
-    const isOpen = new Promise<void>((r) => { opened = r; });
-    const txn = db.transaction(async (tx) => {
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 100);
-      opened();
-      await sleep(20);
-      order.push("transaction throws");
-      throw boom;
-    }).then(() => { order.push("transaction resolved"); }, (e: unknown) => { order.push(e === boom ? "transaction rejected" : `rejected with ${String(e)}`); });
-    await isOpen;
-    const ours = db.exclusive(() => { order.push("exclusive runs"); return host.sql.exec("INSERT INTO ap_meta (k, v) VALUES ('engine', 'pd') RETURNING v").toArray()[0]?.v; });
-    // Queued, not run: the transaction is still open. Read now, asserted once both have settled, so
-    // a failure here cannot leave the transaction open under the next case (on a Durable Object
-    // that wedges the object instead of naming the assertion).
-    const whileOpen = [...order];
-    await Promise.allSettled([txn, ours]);
-    is.deepEqual(whileOpen, []);
-    is.deepEqual(order, ["transaction throws", "transaction rejected", "exclusive runs"]);
-    is.strictEqual(await ours, "pd");
-    is.strictEqual(ap.engine(), "pd");
-    is.deepEqual(await db.all("SELECT id FROM record_ids"), []);
-  }));
-
-  add("PiDurableSqlite.exclusive", "control: the same write issued straight to the host while the transaction is open is rolled back with it", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const ap = new ApStore(host.sql, db, AP);
-    await ap.ensure();
-    await db.transaction(async () => {
-      host.sql.exec("INSERT INTO ap_meta (k, v) VALUES ('engine', 'pd')");
-      await sleep(5);
-      throw new Error("boom");
-    }).catch(() => {});
-    is.strictEqual(ap.engine(), null);
-  }));
-
-  add("PiDurableSqlite.exclusive", "is atomic: a throw inside leaves nothing written, and a function that returns a thenable is refused and rolled back", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    const ap = new ApStore(host.sql, db, AP);
-    await ap.ensure();
-    const setEngine = (v: string) => host.sql.exec("INSERT OR IGNORE INTO ap_meta (k, v) VALUES ('engine', ?)", v);
+  add("ap store", "unit is one transaction: a throw inside leaves nothing written, and one that returns commits", () => withHost(async (host) => {
+    const ap = new ApStore(host, AP);
+    ap.ensure();
     const boom = new Error("inside");
     let error: unknown;
     try {
-      await db.exclusive(() => {
-        setEngine("pd");
+      ap.unit((t) => {
+        t.run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', 'pd')");
+        // Whatever else runs on the host's connection inside the unit is in it too.
         host.sql.exec("INSERT INTO ap_conversations VALUES ('t_a', 't', 'a', 1, 1)");
         throw boom;
       });
     } catch (e) { error = e; }
-    check(error === boom, `exclusive rejected with ${String(error)}, not the closure's error`);
+    check(error === boom, `unit threw ${String(error)}, not the closure's error`);
     is.strictEqual(ap.engine(), null);
     is.strictEqual(ap.conversation("t_a"), null);
-    // A plain function that returns a thenable: its synchronous part is rolled back.
-    await is.rejects(db.exclusive(() => { setEngine("pd"); return Promise.resolve(); }), "returned a thenable");
-    is.strictEqual(ap.engine(), null);
-    // And one that returns commits.
-    is.strictEqual(await db.exclusive(() => { setEngine("pi085"); return ap.engine(); }), "pi085");
+    is.strictEqual(ap.unit((t) => { t.run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', 'pi085')"); return ap.engine(); }), "pi085");
     is.strictEqual(ap.engine(), "pi085");
-  }));
-
-  add("PiDurableSqlite.exclusive", "refuses an async or generator function before calling it, so nothing after its first await lands, not even inside a later transaction", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const ap = new ApStore(host.sql, db, AP);
-    await ap.ensure();
-    const ran: string[] = [];
-    const write = (v: string) => { ran.push(v); host.sql.exec("INSERT OR IGNORE INTO ap_meta (k, v) VALUES ('engine', ?)", v); };
-    // Without the up-front check this one ran: rejected after the fact, and its write landed after
-    // the await, once inside the pi-durable transaction opened below and rolled back with it.
-    await is.rejects(db.exclusive((async () => { await null; write("pd"); }) as () => unknown), "is not called");
-    await is.rejects(db.exclusive((async function () { write("pd"); }) as () => unknown), "is not called");
-    await is.rejects(db.exclusive((async function* () { write("pd"); }) as unknown as () => unknown), "is not called");
-    await is.rejects(db.exclusive((function* () { write("pd"); }) as unknown as () => unknown), "is not called");
-    await db.transaction(async (tx) => {
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (1, 'task')");
-      await sleep(5);
-    });
-    await sleep(5);
-    is.deepEqual(ran, []);
-    is.strictEqual(ap.engine(), null);
-  }));
-
-  add("PiDurableSqlite.exclusive", "inTransaction is true only while a pi-durable transaction is open", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const seen: boolean[] = [db.inTransaction];
-    let opened!: () => void;
-    const isOpen = new Promise<void>((r) => { opened = r; });
-    const committed = db.transaction(async (tx) => {
-      seen.push(db.inTransaction);
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (1, 'task')");
-      opened();
-      await sleep(5);
-    });
-    await isOpen;
-    seen.push(db.inTransaction);
-    await committed;
-    seen.push(db.inTransaction);
-    await db.transaction(async () => { seen.push(db.inTransaction); throw new Error("x"); }).catch(() => {});
-    seen.push(db.inTransaction);
-    await db.exclusive(() => { seen.push(db.inTransaction); });
-    is.deepEqual(seen, [false, true, true, false, true, false, false]);
-  }));
-
-  add("PiDurableSqlite.outside", "waits for an open pi-durable transaction like exclusive, but is no unit of its own: a throw keeps what ran before it", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const ap = new ApStore(host.sql, db, AP);
-    await ap.ensure();
-    const order: string[] = [];
-    let opened!: () => void;
-    const isOpen = new Promise<void>((r) => { opened = r; });
-    const txn = db.transaction(async (tx) => {
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 100);
-      opened();
-      await sleep(20);
-      order.push("transaction throws");
-      throw new Error("boom");
-    }).catch(() => { order.push("transaction rejected"); });
-    await isOpen;
-    const ours = db.outside(() => {
-      order.push("outside runs");
-      host.sql.exec("INSERT INTO ap_meta (k, v) VALUES ('engine', 'pd')");
-      throw new Error("after the write");
-    });
-    const whileOpen = [...order];
-    await Promise.allSettled([txn, ours]);
-    is.deepEqual(whileOpen, []);
-    is.deepEqual(order, ["transaction throws", "transaction rejected", "outside runs"]);
-    await is.rejects(ours, "after the write");
-    // No unit: the write before the throw stays, which is what lets a store method keep its own transactionSync.
-    is.strictEqual(ap.engine(), "pd");
-    await is.rejects(db.outside((async () => {}) as () => unknown), "is not called");
-  }));
-
-  add("PiDurableSqlite.apart", "facades on one queue: a section on one holds off a transaction on another, which a facade with its own queue does not", () => withHost(async (host) => {
-    await applySqliteMigrations(new PiDurableSqlite(host, PD));
-    const run = async (queue: (n: number) => SerialQueue | undefined) => {
-      const ours = new PiDurableSqlite(host, PD, { queue: queue(0) });
-      const harness = new PiDurableSqlite(host, PD, { queue: queue(1) });
-      const order: string[] = [];
-      let entered!: () => void;
-      const inside = new Promise<void>((r) => { entered = r; });
-      const section = ours.apart(async () => { entered(); await sleep(20); order.push("section ends"); });
-      await inside;
-      const txn = harness.transaction(async () => { order.push("transaction runs"); });
-      await Promise.all([section, txn]);
-      return order;
-    };
-    const shared = new SerialQueue();
-    is.deepEqual(await run(() => shared), ["section ends", "transaction runs"]);
-    // Control: a queue each, as every harness had before the queue was the object's.
-    const own = [new SerialQueue(), new SerialQueue()];
-    is.deepEqual(await run((n) => own[n]), ["transaction runs", "section ends"]);
-  }));
-
-  add("PiDurableSqlite.apart", "inside a section, our own SQL and another section start at once, ahead of a transaction queued behind it", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const order: string[] = [];
-    let txn: Promise<unknown> = Promise.resolve();
-    let read: Promise<unknown> = Promise.resolve();
-    await db.apart(async () => {
-      // Queued now, and held until this section ends; pi-durable's own read queues behind it.
-      txn = db.transaction(async () => { order.push("transaction"); });
-      read = db.get("SELECT 1 AS one").then(() => { order.push("pi-durable read"); });
-      await sleep(5);
-      // Queued behind that transaction, each of these would wait on a transaction that waits on this
-      // section — the deadlock a store write inside a tool call, or an approval's call, would meet.
-      const ours = Promise.all([
-        db.exclusive(() => { order.push("exclusive()"); }),
-        db.outside(() => { order.push("outside()"); }),
-        db.apart(async () => { order.push("apart()"); }),
-      ]);
-      order.push(await Promise.race([ours.then(() => "ours done"), sleep(500).then(() => "ours deadlocked")]));
-      order.push("section ends");
-    });
-    await Promise.all([txn, read]);
-    is.deepEqual(order, ["exclusive()", "outside()", "apart()", "ours done", "section ends", "transaction", "pi-durable read"]);
   }));
 
   return cases;

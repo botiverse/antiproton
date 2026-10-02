@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Runs the ap namespace cases and PiDurableSqlite.exclusive (test/spec/ap-store-spec.ts) against
-# real Durable Object SQLite, in a worker that is never deployed. See cf/src/conformance.ts for why
-# it is separate. This is the run that reads `exclusive` against the savepoint it keeps our SQL out
-# of; test/ap-store.ts reads it on node's imitation.
+# Runs the ap namespace cases (test/spec/ap-store-spec.ts) against real Durable Object SQLite, in a
+# worker that is never deployed. See cf/src/conformance.ts for why it is separate; test/ap-store.ts
+# runs them on node:sqlite.
 # The port and the server it starts are this run's own (test/local-worker.sh).
 set -euo pipefail
 . "$(dirname "$0")/local-worker.sh"

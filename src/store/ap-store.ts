@@ -29,7 +29,7 @@
  *   entries. A watermark is pi-durable's commit sequence (`entries.commit_seq`,
  *   strictly increasing per atomic commit), so "through seq N" never splits a
  *   commit. Written by src/runtime/pd-outbox.ts through `unit`, in the same
- *   commit as the rows it accounts for.
+ *   transaction as the rows it accounts for.
  *
  * The engine, the directory, `unit` and the client calls have operations here; the
  * other tables are declared so that the namespace's list is complete from the start,
@@ -75,10 +75,11 @@ export type ApClientCall = {
 
 export type ApConversation = { taskId: string; tenantId: string; agentId: string; conversationId: number; createdAt: number };
 
-/** The slice of `ctx.storage.sql` this needs. */
-export type ApSqlHost = { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
-/** What runs every write: `PiDurableSqlite.exclusive` on the facade pi-durable itself is opened on. */
-export type ApWriter = { exclusive<T>(fn: () => T): Promise<T> };
+/** The slice of `ctx.storage` this needs: its SQL, and the transaction `unit` runs in. */
+export type ApSqlHost = {
+  sql: { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
+  transactionSync<T>(closure: () => T): T;
+};
 
 type Binding = string | number | null;
 
@@ -86,55 +87,41 @@ type Binding = string | number | null;
 export type ApUnit = { run(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> };
 
 /**
- * Every write goes through `writer.exclusive`, so it waits behind an open pi-durable transaction and
- * commits on its own instead of joining that transaction's savepoint and rolling back with it. A
- * caller cannot forget this: no method here writes any other way, and `query` writes through it too.
- *
- * Reads go straight to `sql`, synchronously, also while a pi-durable transaction is open. That is
- * safe because the only uncommitted state such a read could see is that transaction's, and it holds
- * none in our tables: pi-durable's facade is confined to the `pd` namespace, and every write to
- * ours runs through `exclusive`, which never runs while it is open. A read therefore sees exactly
- * what is committed in `ap`. The one way around that is code writing our tables with a raw
- * `sql.exec` inside the transaction, which is what this class exists to make unnecessary.
+ * Every statement runs when it is called, reads and writes alike. Nothing of pi-durable's can be open
+ * meanwhile: each of its commits is one synchronous transaction (src/store/pi-durable-sqlite.ts), so
+ * code of ours never runs inside one. A method whose statements must land together runs them in one
+ * host `transactionSync` (`ensure`, `unit`); the rest are one write each, or a read and a write with
+ * no await between them.
  */
 export class ApStore {
-  #sql: ApSqlHost;
-  #writer: ApWriter;
+  #host: ApSqlHost;
   #names: SqlQualifier;
 
-  /**
-   * `writer` is the `PiDurableSqlite` pi-durable runs on in this object, so that its queue orders our
-   * writes after its transactions; `namespace` places the tables: `prefixedNamespace("ap")` on a
-   * Durable Object.
-   */
-  constructor(sql: ApSqlHost, writer: ApWriter, namespace: SqlNamespace) {
-    this.#sql = sql;
-    this.#writer = writer;
+  /** `namespace` places the tables: `prefixedNamespace("ap")` on a Durable Object. */
+  constructor(host: ApSqlHost, namespace: SqlNamespace) {
+    this.#host = host;
     this.#names = new SqlQualifier(AP_OBJECTS, namespace);
   }
 
   #run(sql: string, bindings: Binding[]): Array<Record<string, unknown>> {
-    return this.#sql.exec(this.#names.rewrite(sql), ...bindings).toArray();
+    return this.#host.sql.exec(this.#names.rewrite(sql), ...bindings).toArray();
   }
 
-  /**
-   * Any statement over the `ap` objects, run as a write through `exclusive`; a name outside them
-   * throws before anything runs.
-   */
-  query(sql: string, ...bindings: Binding[]): Promise<Array<Record<string, unknown>>> {
-    return this.#writer.exclusive(() => this.#run(sql, bindings));
+  /** Any statement over the `ap` objects; a name outside them throws before anything runs. */
+  query(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> {
+    return this.#run(sql, bindings);
   }
 
-  ensure(): Promise<void> { return this.#writer.exclusive(() => { for (const s of SCHEMA) this.#run(s, []); }); }
+  ensure(): void { this.#host.transactionSync(() => { for (const s of SCHEMA) this.#run(s, []); }); }
 
   /**
-   * One synchronous unit through `exclusive`: `ap.run` reaches only the `ap` objects, and whatever
-   * else `fn` runs on the host's connection before it returns commits or rolls back with it. That is
-   * what lets the outbox derivation (src/runtime/pd-outbox.ts) append its rows and advance its
-   * watermark in `outbox_marks` as one commit.
+   * One host `transactionSync`: `ap.run` reaches only the `ap` objects, and whatever else `fn` runs on the
+   * host's connection before it returns commits or rolls back with it. That is what lets the outbox
+   * derivation (src/runtime/pd-outbox.ts) append its rows and advance its watermark in `outbox_marks` as
+   * one commit.
    */
-  unit<T>(fn: (ap: ApUnit) => T): Promise<T> {
-    return this.#writer.exclusive(() => fn({ run: (sql, ...bindings) => this.#run(sql, bindings) }));
+  unit<T>(fn: (ap: ApUnit) => T): T {
+    return this.#host.transactionSync(() => fn({ run: (sql, ...bindings) => this.#run(sql, bindings) }));
   }
 
   /** The engine recorded at creation, or null for an agent that predates the choice. */
@@ -146,12 +133,10 @@ export class ApStore {
   }
 
   /** Records the engine if none is; resolves to the one in force, which is the first ever written. */
-  setEngineOnce(engine: AgentEngineName): Promise<AgentEngineName> {
-    if (!(AGENT_ENGINES as readonly string[]).includes(engine)) return Promise.reject(new Error(`unknown engine: ${engine}`));
-    return this.#writer.exclusive(() => {
-      this.#run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', ?)", [engine]);
-      return this.engine()!;
-    });
+  setEngineOnce(engine: AgentEngineName): AgentEngineName {
+    if (!(AGENT_ENGINES as readonly string[]).includes(engine)) throw new Error(`unknown engine: ${engine}`);
+    this.#run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', ?)", [engine]);
+    return this.engine()!;
   }
 
   conversation(taskId: string): ApConversation | null {
@@ -167,23 +152,21 @@ export class ApStore {
    * first one. Its fields are checked first: `OR IGNORE` would also skip a NOT NULL violation, and
    * NaN binds as NULL, so a bad value would otherwise be reported as a conflict that is not there.
    */
-  openConversation(c: ApConversation): Promise<ApConversation> {
+  openConversation(c: ApConversation): ApConversation {
     for (const field of ["taskId", "tenantId", "agentId"] as const) {
       const v: unknown = c[field];
-      if (typeof v !== "string" || v === "") return Promise.reject(new TypeError(`openConversation: ${field} must be a non-empty string, not ${describe(v)}`));
+      if (typeof v !== "string" || v === "") throw new TypeError(`openConversation: ${field} must be a non-empty string, not ${describe(v)}`);
     }
     for (const field of ["conversationId", "createdAt"] as const) {
       const v: unknown = c[field];
-      if (!Number.isSafeInteger(v)) return Promise.reject(new TypeError(`openConversation: ${field} must be a safe integer, not ${describe(v)}`));
+      if (!Number.isSafeInteger(v)) throw new TypeError(`openConversation: ${field} must be a safe integer, not ${describe(v)}`);
     }
-    return this.#writer.exclusive(() => {
-      this.#run("INSERT OR IGNORE INTO conversations (task_id, tenant_id, agent_id, conversation_id, created_at) VALUES (?, ?, ?, ?, ?)",
-        [c.taskId, c.tenantId, c.agentId, c.conversationId, c.createdAt]);
-      const row = this.conversation(c.taskId);
-      // With the fields checked, the only thing OR IGNORE can have skipped is the UNIQUE conversation id.
-      if (row === null) throw new Error(`conversation ${c.conversationId} is already listed under another task id`);
-      return row;
-    });
+    this.#run("INSERT OR IGNORE INTO conversations (task_id, tenant_id, agent_id, conversation_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      [c.taskId, c.tenantId, c.agentId, c.conversationId, c.createdAt]);
+    const row = this.conversation(c.taskId);
+    // With the fields checked, the only thing OR IGNORE can have skipped is the UNIQUE conversation id.
+    if (row === null) throw new Error(`conversation ${c.conversationId} is already listed under another task id`);
+    return row;
   }
 
   // ---- client_calls -------------------------------------------------------------
@@ -197,37 +180,31 @@ export class ApStore {
    * A tool's call, recorded as waiting for the caller unless the caller already answered it. Resolves to the row in
    * force: an `answered` or `used` row is returned as it is (gaining its name, so a reader can tell it was called).
    */
-  recordClientCall(c: { conversationId: number; callId: string; name: string; arguments: string; at: number }): Promise<ApClientCall> {
-    return this.#writer.exclusive(() => {
-      this.#run(
-        `INSERT INTO client_calls (conversation_id, call_id, name, arguments, state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)
-         ON CONFLICT (conversation_id, call_id) DO UPDATE SET name = excluded.name, arguments = excluded.arguments`,
-        [c.conversationId, c.callId, c.name, c.arguments, c.at]);
-      return this.clientCall(c.conversationId, c.callId)!;
-    });
+  recordClientCall(c: { conversationId: number; callId: string; name: string; arguments: string; at: number }): ApClientCall {
+    this.#run(
+      `INSERT INTO client_calls (conversation_id, call_id, name, arguments, state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)
+       ON CONFLICT (conversation_id, call_id) DO UPDATE SET name = excluded.name, arguments = excluded.arguments`,
+      [c.conversationId, c.callId, c.name, c.arguments, c.at]);
+    return this.clientCall(c.conversationId, c.callId)!;
   }
 
   /** The caller's result, kept also before the tool has run. False when the call already has one. */
-  answerClientCall(conversationId: number, callId: string, result: { output: string; isError: boolean }, at: number): Promise<boolean> {
-    return this.#writer.exclusive(() => {
-      const row = this.clientCall(conversationId, callId);
-      if (row && row.state !== "pending") return false;
-      if (row) {
-        this.#run("UPDATE client_calls SET state = 'answered', output = ?, is_error = ? WHERE conversation_id = ? AND call_id = ?",
-          [result.output, result.isError ? 1 : 0, conversationId, callId]);
-      } else {
-        this.#run("INSERT INTO client_calls (conversation_id, call_id, state, output, is_error, created_at) VALUES (?, ?, 'answered', ?, ?, ?)",
-          [conversationId, callId, result.output, result.isError ? 1 : 0, at]);
-      }
-      return true;
-    });
+  answerClientCall(conversationId: number, callId: string, result: { output: string; isError: boolean }, at: number): boolean {
+    const row = this.clientCall(conversationId, callId);
+    if (row && row.state !== "pending") return false;
+    if (row) {
+      this.#run("UPDATE client_calls SET state = 'answered', output = ?, is_error = ? WHERE conversation_id = ? AND call_id = ?",
+        [result.output, result.isError ? 1 : 0, conversationId, callId]);
+    } else {
+      this.#run("INSERT INTO client_calls (conversation_id, call_id, state, output, is_error, created_at) VALUES (?, ?, 'answered', ?, ?, ?)",
+        [conversationId, callId, result.output, result.isError ? 1 : 0, at]);
+    }
+    return true;
   }
 
   /** The tool returned the caller's answer. Kept, not deleted: a replay of the same call returns it again. */
-  useClientCall(conversationId: number, callId: string): Promise<void> {
-    return this.#writer.exclusive(() => {
-      this.#run("UPDATE client_calls SET state = 'used' WHERE conversation_id = ? AND call_id = ? AND state = 'answered'", [conversationId, callId]);
-    });
+  useClientCall(conversationId: number, callId: string): void {
+    this.#run("UPDATE client_calls SET state = 'used' WHERE conversation_id = ? AND call_id = ? AND state = 'answered'", [conversationId, callId]);
   }
 
   /** Calls of the conversation a tool is waiting on the caller for, oldest first. Every conversation's when none is named. */
@@ -245,12 +222,10 @@ export class ApStore {
   }
 
   /** Forget a conversation's calls, when its turn is cancelled. How many were still waiting. */
-  dropClientCalls(conversationId: number): Promise<number> {
-    return this.#writer.exclusive(() => {
-      const waiting = this.pendingClientCalls(conversationId).length;
-      this.#run("DELETE FROM client_calls WHERE conversation_id = ?", [conversationId]);
-      return waiting;
-    });
+  dropClientCalls(conversationId: number): number {
+    const waiting = this.pendingClientCalls(conversationId).length;
+    this.#run("DELETE FROM client_calls WHERE conversation_id = ?", [conversationId]);
+    return waiting;
   }
 }
 
