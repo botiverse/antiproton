@@ -46,7 +46,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 type JobRow = { id: string; request: string; answer: string | null };
 
 /** `pi_model_jobs`, reduced to what the provider and the consumer touch, in the case's own database. */
-function jobTable(host: DurableSqlHost) {
+function jobTable(host: DurableSqlHost, pollDelayMs = 0) {
   host.sql.exec("CREATE TABLE IF NOT EXISTS drive_jobs (id TEXT PRIMARY KEY, request TEXT NOT NULL, answer TEXT)");
   let seq = 0;
   const rows = () => host.sql.exec("SELECT id, request, answer FROM drive_jobs ORDER BY rowid").toArray()
@@ -60,6 +60,7 @@ function jobTable(host: DurableSqlHost) {
     },
     async poll(id: string) {
       polls++;
+      if (pollDelayMs > 0) await sleep(pollDelayMs);
       const row = rows().find((r) => r.id === id);
       return row?.answer ? readAnswer(row.answer) : null;
     },
@@ -97,8 +98,8 @@ const extension = defineExtension({
   tools: [countTool],
 });
 
-function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimers?: TimerProbe) {
-  const jobs = jobTable(host);
+function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimers?: TimerProbe, pollDelayMs = 0) {
+  const jobs = jobTable(host, pollDelayMs);
   const models = createModels();
   models.setProvider(durableOffloadedProvider({
     port: jobs.port, id: PROVIDER, pollAfterMs: POLL_AFTER_MS, models: [{ id: MODEL, contextWindow: 100_000 }],
@@ -220,7 +221,9 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("park", "(4) pollAt already past at reopen: polls instead of parking at a past T", async (host) => {
-    const w = world(host);
+    // A fetch that takes a while, so the harness is read while it is in flight: the window in which
+    // the checkpoint still says `poll` with a `pollAt` that has passed.
+    const w = world(host, {}, undefined, 150);
     const r = parked(await w.submit("Q1"));
     await sleep(r.parkedUntil - Date.now() + 2 * POLL_AFTER_MS);
     const polls = w.jobs.polls();
