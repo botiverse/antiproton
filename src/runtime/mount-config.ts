@@ -16,7 +16,7 @@
  * is a typo that survives, and there is no case where silently ignoring a
  * setting someone deliberately wrote is the helpful thing to do.
  */
-import { originProblem, type ConfigField, type Plugin } from "../plugins/types.ts";
+import { headerLinesProblem, originProblem, type ConfigField, type Plugin } from "../plugins/types.ts";
 import type { Json } from "../core/types.ts";
 
 export interface MountProblem {
@@ -90,6 +90,13 @@ export function validateMount(
     }
     const bad = field.format === "origin" && typeof value === "string" ? originProblem(value) : null;
     if (bad) problems.push({ key, message: `"${key}" ${bad}` });
+    if (field.format === "header-lines") {
+      const lines = headerLinesProblem(value);
+      if (lines) problems.push({ key, message: `"${key}": ${lines}` });
+    }
+    if (typeof value === "number" && ((field.min !== undefined && value < field.min) || (field.max !== undefined && value > field.max))) {
+      problems.push({ key, message: `"${key}" must be between ${field.min ?? "-∞"} and ${field.max ?? "∞"}, got ${value}` });
+    }
   }
 
   for (const f of fields) {

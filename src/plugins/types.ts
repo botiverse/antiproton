@@ -19,6 +19,20 @@ export interface ToolSchema {
    * plugin may offer the same service.
    */
   reads?: "parked-result";
+  /**
+   * `"never"`: do not run this tool again on its own after an interruption,
+   * whatever `sideEffects` and `idempotency` say.
+   *
+   * `sideEffects: "read"` normally means a repeat is harmless, and the runtime
+   * replays reads freely (`replayPolicy`, src/runtime/pi-tools.ts). That rests
+   * on whoever wrote the declaration being the one who knows. A tool whose
+   * schema came from a remote server was declared by that server — its
+   * `readOnlyHint` is a claim, not something this repository reviewed — so the
+   * kernel sets this on every snapshot tool (`admitTools`) and the claim keeps
+   * the read policy without earning a silent second run. Checked before
+   * anything else wherever a replay is decided.
+   */
+  replay?: "never";
 }
 
 /**
@@ -640,6 +654,9 @@ export interface ConfigField {
    * refuse a credential-shaped name that does not carry it.
    */
   references?: "credential";
+  /** For a `number`: the smallest and largest value a mount may set, checked when the mount is written. */
+  min?: number;
+  max?: number;
   /**
    * What a `string` value has to look like, checked when the mount is written.
    *
@@ -652,8 +669,72 @@ export interface ConfigField {
    *
    * The plugin should read the value through the same `originProblem` at call
    * time too, so the two checks cannot disagree.
+   *
+   * `"header-lines"` is for a `string[]` of HTTP headers the plugin sends on
+   * the mount's behalf, one `"Name: value"` per entry; see
+   * `headerLinesProblem`, which the plugin reads the value through too.
    */
-  format?: "origin";
+  format?: "origin" | "header-lines";
+}
+
+/**
+ * Headers the client writes itself: HTTP framing, and the Streamable HTTP
+ * session headers. A mount that set one would be overwritten or would break the
+ * protocol underneath — a session id set here resumes nothing, since an MCP
+ * client initializes on every connection regardless.
+ */
+const CLIENT_HEADER = /^(accept|content-type|content-length|host|mcp-session-id|mcp-protocol-version|last-event-id)$/i;
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** `{{name}}`: a slot filled from a secret the agent kept, at the moment of the request. */
+const SECRET_SLOT = /\{\{[^}]*\}\}/;
+/** Header names whose value is a credential by convention. */
+const CREDENTIAL_HEADER = /^(authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth-token)$/i;
+/** A value written as an HTTP auth scheme followed by a token. */
+const AUTH_SCHEME_VALUE = /^(bearer|basic|token)\s+\S/i;
+
+/**
+ * `"Name: value"` lines as pairs, or why one is not acceptable. One function
+ * for the mount-time check (`format: "header-lines"`) and the plugin's own.
+ *
+ * A setting is public — shown in the console and handed to the agent by
+ * `tools.mounts` — so a credential written into one is published. The rule is
+ * deliberately narrow, so it refuses what is certainly a key and nothing
+ * else: a value with **no** `{{name}}` in it is refused when its header is one
+ * that carries a credential by convention (`Authorization`,
+ * `Proxy-Authorization`, `Cookie`, `X-Api-Key`, `Api-Key`, `X-Auth-Token`), or
+ * when the value itself reads as an auth scheme and a token (`Bearer …`,
+ * `Basic …`, `Token …`) under any header name. A value with a slot in it is
+ * accepted as written: `Bearer {{key}}` is the form this is steering toward.
+ * A key under an unconventional name with no scheme word is not recognised;
+ * nothing here can tell it from an ordinary value.
+ */
+export function headerLines(lines: unknown): { ok: true; headers: Array<[string, string]> } | { ok: false; error: string } {
+  if (lines === undefined || lines === null) return { ok: true, headers: [] };
+  if (!Array.isArray(lines)) return { ok: false, error: "headers must be a list of \"Name: value\" lines" };
+  const out: Array<[string, string]> = [];
+  for (const line of lines) {
+    const text = String(line);
+    const at = text.indexOf(":");
+    const name = at > 0 ? text.slice(0, at).trim() : "";
+    if (!HEADER_NAME.test(name)) return { ok: false, error: `header "${text.slice(0, 40)}" is not "Name: value"` };
+    if (CLIENT_HEADER.test(name)) return { ok: false, error: `header ${name} is written by the client itself and cannot be set` };
+    const value = text.slice(at + 1).trim();
+    if (!SECRET_SLOT.test(value) && (CREDENTIAL_HEADER.test(name) || AUTH_SCHEME_VALUE.test(value))) {
+      return {
+        ok: false,
+        error: `header ${name} carries a credential written out, and settings are public; keep the value as a secret ` +
+          `(secret_put) and write its name instead, such as "${name}: ${/authorization$/i.test(name) ? "Bearer {{name}}" : "{{name}}"}"`,
+      };
+    }
+    out.push([name, value]);
+  }
+  return { ok: true, headers: out };
+}
+
+/** Why a `"header-lines"` value is not acceptable, or null. */
+export function headerLinesProblem(lines: unknown): string | null {
+  const r = headerLines(lines);
+  return r.ok ? null : r.error;
 }
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);

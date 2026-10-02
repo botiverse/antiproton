@@ -64,6 +64,9 @@ export interface MountedTool {
    *  to find the reader by rebuilding the string `artifacts` + `.read`, which
    *  a rename of either silently broke. */
   reads?: "parked-result";
+  /** Carried from {@link ToolSchema}: `"never"` overrides everything else
+   *  `replayPolicy` would conclude. */
+  replay?: "never";
 }
 
 export interface ToolResult {
@@ -252,8 +255,13 @@ export function qualifyMountedTools<T extends MountedTool>(tools: T[]): T[] {
   });
 }
 
-/** A read repeats safely; a write repeats only if the plugin makes it so. */
-export function replayPolicy(t: MountedTool): "never" | "safe" {
+/**
+ * A read repeats safely; a write repeats only if the plugin makes it so. A tool
+ * that says `replay: "never"` never does, asked first: its `sideEffects` is a
+ * claim this repository did not write (a remote server's annotation).
+ */
+export function replayPolicy(t: Pick<MountedTool, "sideEffects" | "idempotency" | "replay">): "never" | "safe" {
+  if (t.replay === "never") return "never";
   if (t.sideEffects === "read") return "safe";
   return t.idempotency === "native" ? "safe" : "never";
 }

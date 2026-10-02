@@ -1194,7 +1194,15 @@ export class ToolGateway {
       return { ok: false, error: `could not list ${alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
     }
     const changed = mount.toolSnapshot?.hash !== snapshot.hash;
-    if (changed) await this.#store.updateMountToolSnapshot(tenantId, agentId, alias, snapshot);
+    // A write that fails is a failed snapshot, answered like one: the mount and
+    // whatever list it had stay as they were, and the operator reads why.
+    if (changed) {
+      try {
+        await this.#store.updateMountToolSnapshot(tenantId, agentId, alias, snapshot);
+      } catch (e) {
+        return { ok: false, error: `could not keep ${alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
+      }
+    }
     const kept = changed ? snapshot : mount.toolSnapshot!;
     return { ok: true, changed, hash: kept.hash, tools: kept.tools.map((t) => t.name), skipped: kept.skipped };
   }

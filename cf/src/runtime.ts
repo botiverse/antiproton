@@ -552,6 +552,7 @@ export function mountedToolEntries(records: MountRecord[], byId: ReadonlyMap<str
       // plugin that knows, not guessed at the point of use.
       sideEffects: t.sideEffects, idempotency: t.idempotency,
       reads: t.reads,
+      ...(t.replay ? { replay: t.replay } : {}),
       exclusive: pl ? isExclusive(pl) : undefined,
     }));
   });

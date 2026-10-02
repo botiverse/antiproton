@@ -13,12 +13,15 @@ import { readFileSync } from "node:fs";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { agentRef, KEPT_PREFIX } from "../src/runtime/secrets.ts";
-import { qualifyMountedTools } from "../src/runtime/pi-tools.ts";
+import { qualifyMountedTools, replayPolicy } from "../src/runtime/pi-tools.ts";
 import { validateMount } from "../src/runtime/mount-config.ts";
-import { admitTools } from "../src/runtime/mount-tools.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
-import { mcpPlugin, parseHeaderLines, serverUrlProblem, toolSchemaOf } from "../src/plugins/mcp.ts";
-import { toolsOf, type Plugin } from "../src/plugins/types.ts";
+import { mcpPlugin, serverUrlProblem, toolSchemaOf } from "../src/plugins/mcp.ts";
+import { headerLines, toolsOf, type Plugin } from "../src/plugins/types.ts";
+import {
+  admitTools, MAX_DESCRIPTION_BYTES, MAX_SCHEMA_BYTES, MAX_SKIPPED, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_TOOLS,
+} from "../src/runtime/mount-tools.ts";
+import { httpPlugin } from "../src/plugins/http.ts";
 import { AgentRuntime, catalogueKey, installedRows, mountedToolEntries } from "../cf/src/runtime.ts";
 import { catalogue, mountFragment } from "../cf/src/ui.ts";
 import { DurableObjectStore } from "../src/store/durable-object.ts";
@@ -46,6 +49,8 @@ function fakeServer(opts: {
   tools: () => RemoteTool[];
   call?: (name: string, args: any, headers: Record<string, string>) => unknown;
   failCall?: "http-503" | "rpc-error";
+  /** An answer to `initialize` in place of the normal one, when it returns one. */
+  initAnswer?: (headers: Record<string, string>) => Response | undefined;
 }) {
   const seen: Seen[] = [];
   let sessions = 0;
@@ -63,6 +68,8 @@ function fakeServer(opts: {
     const json = (result: unknown, extra: Record<string, string> = {}) => new Response(
       JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }), { status: 200, headers: { "content-type": "application/json", ...extra } });
     if (msg.method === "initialize") {
+      const instead = opts.initAnswer?.(headers);
+      if (instead) return instead;
       sessions++;
       return json({ protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } },
         { "mcp-session-id": `s${sessions}` });
@@ -120,7 +127,7 @@ async function fixture(config: Record<string, unknown> = { url: URL_ }, secrets:
 
 // ---- mapping ---------------------------------------------------------------
 
-await check("only readOnlyHint: true makes a read; destructive, missing or false annotations make a write; idempotency is always none", () => {
+await check("only readOnlyHint: true makes a read; destructive, missing or false annotations make a write", () => {
   const schema = { type: "object" };
   const of = (annotations?: Record<string, boolean>) => toolSchemaOf({ name: "x", inputSchema: schema, annotations } as any);
   must(of({ readOnlyHint: true }).sideEffects === "read", "readOnlyHint: true is a read");
@@ -130,9 +137,43 @@ await check("only readOnlyHint: true makes a read; destructive, missing or false
   must(of({ destructiveHint: true }).sideEffects === "write", "destructiveHint must be a write");
   must(of({ readOnlyHint: true, destructiveHint: true }).sideEffects === "write",
     "read-only and destructive at once must resolve to the conservative side");
-  for (const a of [undefined, { readOnlyHint: true }, { idempotentHint: true }]) {
-    must(of(a as any).idempotency === "none", `idempotency must be none for ${JSON.stringify(a)}`);
-  }
+});
+
+await check("a read-only MCP tool is never replayed, while a static plugin's read still is", async () => {
+  serve(fakeServer({ tools: () => [ECHO] }));
+  try {
+    const { store, gw, plugins } = await fixture();
+    await gw.refreshMountTools("t", "a", "srv");
+    const byId = new Map<string, Plugin>([...plugins, httpPlugin].map((p) => [p.id, p]));
+    const web = { tenantId: "t", agentId: "a", alias: "web", plugin: "http", installationId: "w", connectionId: null,
+      toolVersion: httpPlugin.version, publicConfig: {}, secretRef: null, policy: null };
+    const entries = mountedToolEntries([...(await store.listMounts("t", "a")), web], byId);
+    const echo = entries.find((e) => e.address === "srv.echo")!;
+    must(echo.sideEffects === "read", "the read-only tool lost its read (the policy half)");
+    must(replayPolicy(echo) === "never", `a read-only MCP tool replays: ${replayPolicy(echo)}`);
+    must(replayPolicy(entries.find((e) => e.address === "web.get")!) === "safe", "a static read no longer replays");
+    // A remote list cannot opt out: the kernel sets the flag, not the plugin.
+    const admitted = await admitTools({ tools: [{ name: "x", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }] }, 0);
+    must(admitted.tools[0]!.replay === "never", "admitTools let a tool through without replay: never");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+// The gateway's own road: under one key a started operation is never started
+// again, a read included (`startOperation`, #528). So `replay: "never"` needs no
+// second check there; this case keeps that true for a snapshot tool.
+await check("under one idempotency key a read-only MCP tool runs once; the repeat is refused, not re-run", async () => {
+  const server = fakeServer({ tools: () => [ECHO] });
+  serve(server);
+  try {
+    const { gw } = await fixture();
+    await gw.refreshMountTools("t", "a", "srv");
+    const first: any = await gw.invoke(ctx, "srv.echo", { text: "1" }, { idempotencyKey: "k1" });
+    must(first.status === "succeeded", JSON.stringify(first));
+    const again: any = await gw.invoke(ctx, "srv.echo", { text: "1" }, { idempotencyKey: "k1" });
+    const calls = server.seen.filter((s) => s.rpc === "tools/call").length;
+    must(calls === 1, `the repeat reached the server (${calls} calls): ${JSON.stringify(again)}`);
+    must(again.status !== "succeeded", `the repeat answered as a fresh success: ${JSON.stringify(again)}`);
+  } finally { globalThis.fetch = realFetch; }
 });
 
 // ---- settings --------------------------------------------------------------
@@ -145,9 +186,41 @@ await check("settings: a complete mount is accepted, a misspelt key is refused, 
   must(serverUrlProblem(URL_) === null, "an https endpoint with a path was refused");
   must(serverUrlProblem("http://mcp.example.test/mcp") !== null, "plain http to a public host was accepted");
   must(serverUrlProblem("http://127.0.0.1:8799/mcp") === null, "http to loopback was refused");
-  const reserved = parseHeaderLines(["Mcp-Session-Id: s1"]);
-  must(!reserved.ok && /written by the MCP transport/.test(reserved.error), "a session id header was accepted");
-  must(!parseHeaderLines(["no colon here"]).ok, "a line without a name was accepted");
+  const reserved = headerLines(["Mcp-Session-Id: s1"]);
+  must(!reserved.ok && /written by the client itself/.test(reserved.error), "a session id header was accepted");
+  must(!headerLines(["no colon here"]).ok, "a line without a name was accepted");
+  must(validateMount(mcpPlugin, { url: URL_, headers: ["Mcp-Session-Id: s1"] }, null).length === 1,
+    "a client-owned header was accepted when the mount was written");
+});
+
+await check("timeoutMs is bounded: above 60000 or below 1 is refused when written, and refused at call time if stored anyway", async () => {
+  must(validateMount(mcpPlugin, { url: URL_, timeoutMs: 60_000 }, null).length === 0, "60000 was refused");
+  for (const bad of [60_001, 3_600_000, 0]) {
+    must(validateMount(mcpPlugin, { url: URL_, timeoutMs: bad }, null).some((p) => p.key === "timeoutMs"), `timeoutMs ${bad} was accepted`);
+  }
+  const server = fakeServer({ tools: () => [ECHO] });
+  serve(server);
+  try {
+    const { gw } = await fixture({ url: URL_, timeoutMs: 3_600_000 });
+    const r = await gw.refreshMountTools("t", "a", "srv");
+    must(!r.ok && /timeoutMs must be between 1 and 60000/.test(r.error), `a stored hour-long timeout was used: ${JSON.stringify(r)}`);
+    must(server.seen.length === 0, "a request went out under the refused timeout");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+await check("a header with a credential written out is refused with the way to fix it; slots and plain values are accepted", () => {
+  for (const ok of [["Authorization: Bearer {{tok}}"], ["X-Api-Key: {{key}}"], ["X-Plain: v", "X-Trace: abc-123"], ["Cookie: session={{sess}}"]]) {
+    const r = headerLines(ok);
+    must(r.ok, `refused ${JSON.stringify(ok)}: ${!r.ok && r.error}`);
+    must(validateMount(mcpPlugin, { url: URL_, headers: ok }, null).length === 0, `validateMount refused ${JSON.stringify(ok)}`);
+  }
+  for (const bad of ["Authorization: Bearer sk-live-123", "Proxy-Authorization: Basic Zm9vOmJhcg==", "X-Api-Key: abc123",
+    "Cookie: session=s1", "X-Custom: Bearer abc", "X-Custom: basic Zm9v", "authorization: sk-raw"]) {
+    const r = headerLines([bad]);
+    must(!r.ok && /keep the value as a secret/.test(r.error) && /\{\{name\}\}/.test(r.error), `accepted or unhelpful for "${bad}": ${JSON.stringify(r)}`);
+    const problems = validateMount(mcpPlugin, { url: URL_, headers: [bad] }, null);
+    must(problems.some((p) => p.key === "headers" && /secret_put/.test(p.message)), `validateMount accepted "${bad}"`);
+  }
 });
 
 // ---- snapshot, catalogue, gateway, discovery --------------------------------
@@ -341,6 +414,89 @@ await check("a call lost on the way (5xx) is unknown, since it may have run; a p
       must(r.status === want && r.error?.code === "tool_error", `${failCall}: ${JSON.stringify(r)}`);
     } finally { globalThis.fetch = realFetch; }
   }
+});
+
+await check("a failing initialize whose body echoes the secret header leaks it nowhere, on refresh or on a call", async () => {
+  // 401 is answered by pi-mcp with a fixed sentence; other statuses carry the body, which is where an echo lands.
+  for (const status of [403, 500]) {
+    let failing = false;
+    const server = fakeServer({
+      tools: () => [ECHO],
+      initAnswer: (headers) => (failing ? new Response(`denied: you sent ${headers["authorization"]}`, { status }) : undefined),
+    });
+    serve(server);
+    try {
+      const { gw, store } = await fixture({ url: URL_, headers: ["Authorization: Bearer {{tok}}"] }, { tok: "sk-very-secret" });
+      must((await gw.refreshMountTools("t", "a", "srv")).ok, "the first refresh failed");
+      failing = true;
+      const refreshed = await gw.refreshMountTools("t", "a", "srv");
+      must(!refreshed.ok, `refresh succeeded against a failing initialize (${status})`);
+      must(server.seen.some((x) => x.headers["authorization"] === "Bearer sk-very-secret"), "the server never saw the secret, so this proves nothing");
+      must(!JSON.stringify(refreshed).includes("sk-very-secret"), `the refresh answer leaks the secret (${status}): ${JSON.stringify(refreshed)}`);
+      must(JSON.stringify(refreshed).includes("[secret tok]"), `the echo did not reach the answer at all (${status}), so this proves nothing: ${JSON.stringify(refreshed)}`);
+      const called: any = await gw.invoke(ctx, "srv.echo", { text: "x" });
+      must(called.status === "failed", `a call through a failing initialize (${status}): ${JSON.stringify(called)}`);
+      must(!JSON.stringify(called).includes("sk-very-secret"), `the call result leaks the secret (${status}): ${JSON.stringify(called)}`);
+      must(JSON.stringify(called).includes("[secret tok]"), `the call's echo was not replaced by the name (${status}): ${JSON.stringify(called)}`);
+      must(!JSON.stringify(store.dumpTables()).includes("sk-very-secret"), `the store kept the secret (${status})`);
+    } finally { globalThis.fetch = realFetch; }
+  }
+});
+
+// ---- bounds on what a server can make a mount keep -------------------------
+
+const tool = (name: string, over: Partial<{ summary: string; parameters: unknown }> = {}) =>
+  ({ name, summary: over.summary ?? "", parameters: over.parameters ?? { type: "object" }, sideEffects: "read" as const, idempotency: "none" as const });
+
+await check("bounds: tool count, description, schema and total size each skip with a reason; the skipped list is bounded too", async () => {
+  const many = await admitTools({ tools: Array.from({ length: MAX_SNAPSHOT_TOOLS + 5 }, (_, i) => tool(`t${i}`)) }, 0);
+  must(many.tools.length === MAX_SNAPSHOT_TOOLS, `kept ${many.tools.length} of ${MAX_SNAPSHOT_TOOLS + 5}`);
+  must(many.skipped.length === 5 && many.skipped.every((s) => /more than 128 tools/.test(s.reason)), `count: ${JSON.stringify(many.skipped[0])}`);
+
+  const long = await admitTools({ tools: [tool("ok", { summary: "x".repeat(MAX_DESCRIPTION_BYTES) }), tool("long", { summary: "x".repeat(MAX_DESCRIPTION_BYTES + 1) })] }, 0);
+  must(long.tools.map((t) => t.name).join() === "ok", `description: kept ${long.tools.map((t) => t.name)}`);
+  must(/description is 2049 characters/.test(long.skipped[0]?.reason ?? ""), `description reason: ${JSON.stringify(long.skipped)}`);
+
+  const pad = (n: number) => ({ type: "object", description: "y".repeat(n) });
+  const fat = await admitTools({ tools: [tool("fat", { parameters: pad(MAX_SCHEMA_BYTES) }), tool("thin")] }, 0);
+  must(fat.tools.map((t) => t.name).join() === "thin", `schema: kept ${fat.tools.map((t) => t.name)}`);
+  must(/input schema is \d+ characters/.test(fat.skipped[0]?.reason ?? ""), `schema reason: ${JSON.stringify(fat.skipped)}`);
+
+  const heavy = await admitTools({ tools: Array.from({ length: 60 }, (_, i) => tool(`h${i}`, { parameters: pad(MAX_SCHEMA_BYTES - 100) })) }, 0);
+  must(heavy.tools.length > 0 && heavy.tools.length < 60, `total: kept ${heavy.tools.length} of 60`);
+  must(JSON.stringify(heavy.tools).length <= MAX_SNAPSHOT_BYTES, "the kept tools exceed the total budget");
+  must(heavy.skipped.some((s) => /budget/.test(s.reason)), `total reason: ${JSON.stringify(heavy.skipped[0])}`);
+
+  const bad = await admitTools({ tools: Array.from({ length: 100 }, (_, i) => tool(`bad-${i}-${"z".repeat(200)}`)) }, 0);
+  must(bad.skipped.length === MAX_SKIPPED + 1, `the skipped list holds ${bad.skipped.length}`);
+  must(/68 more/.test(bad.skipped[MAX_SKIPPED]!.name), `no summary line: ${JSON.stringify(bad.skipped[MAX_SKIPPED])}`);
+  must(bad.skipped.every((s) => s.name.length <= 81), "a skipped name was kept at full length");
+});
+
+await check("a snapshot write that throws is a failed snapshot: refresh says so, and adding the mount still adds it with no tools", async () => {
+  serve(fakeServer({ tools: () => [ECHO] }));
+  try {
+    const { store, gw } = await fixture();
+    (store as any).updateMountToolSnapshot = async () => { throw new Error("string or blob too big"); };
+    const r = await gw.refreshMountTools("t", "a", "srv");
+    must(!r.ok && /could not keep srv's tools: string or blob too big/.test(r.error), `refresh: ${JSON.stringify(r)}`);
+    must((await store.getMountByAlias("t", "a", "srv"))!.toolSnapshot === null, "a snapshot was kept anyway");
+
+    const host = sqliteHost();
+    const rt: any = new AgentRuntime({
+      ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
+      bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any, extraPlugins: [],
+    } as any);
+    await rt.store.init();
+    rt.ready = async () => {};
+    await rt.store.createAgent("t", "a");
+    await rt.store.setPluginChoice("t", "a", "mcp", "enable");
+    rt.store.updateMountToolSnapshot = async () => { throw new Error("string or blob too big"); };
+    const added = await rt.addMount("t", "a", { alias: "srv", plugin: "mcp", config: { url: URL_ } });
+    must(added.ok && added.added && added.tools && !added.tools.ok && /could not keep/.test(added.tools.error), `add: ${JSON.stringify(added)}`);
+    const m = await rt.store.getMountByAlias("t", "a", "srv");
+    must(m && !m.toolSnapshot, `the mount: ${JSON.stringify(m)}`);
+  } finally { globalThis.fetch = realFetch; }
 });
 
 // ---- pi-mcp's behavioural contracts (docs/pi-upstream.md) --------------------

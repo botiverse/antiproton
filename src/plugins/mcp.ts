@@ -31,19 +31,18 @@
  */
 import { McpClient, StreamableHttpTransport, toLlmContent } from "@earendil-works/pi-mcp";
 import type { Json, MountRecord } from "../core/types.ts";
-import type { ListedTools, Plugin, PluginContext, ToolSchema } from "./types.ts";
+import { headerLines, type ListedTools, type Plugin, type PluginContext, type ToolSchema } from "./types.ts";
 import { fillSecrets, hideSecrets } from "./http.ts";
 
 const VERSION = "1.0.0";
 const DEFAULT_TIMEOUT_MS = 30_000;
-
 /**
- * Headers the transport writes itself. A mount that set one would either be
- * overwritten or would break the protocol under the transport — a session id
- * given here would not resume anything, since `connect` initializes regardless.
+ * The longest one request may wait. A call holds the agent's turn while it
+ * waits, and the gateway has no deadline of its own for a plugin, so an
+ * unbounded setting would let one slow server hold a turn for as long as it
+ * likes.
  */
-const RESERVED_HEADER = /^(accept|content-type|content-length|host|mcp-session-id|mcp-protocol-version|last-event-id)$/i;
-const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const MAX_TIMEOUT_MS = 60_000;
 
 /** Why `value` is not a server URL this plugin will call, or null. https, or http to this machine; a path is allowed. */
 export function serverUrlProblem(value: unknown): string | null {
@@ -55,22 +54,6 @@ export function serverUrlProblem(value: unknown): string | null {
   if (url.username || url.password) return "url must not carry a user name or password; put a key in a header with {{name}}";
   if (url.hash) return "url must not have a fragment";
   return null;
-}
-
-/** `"Name: value"` lines as pairs, or the first line that is not one. */
-export function parseHeaderLines(lines: unknown): { ok: true; headers: Array<[string, string]> } | { ok: false; error: string } {
-  if (lines === undefined || lines === null) return { ok: true, headers: [] };
-  if (!Array.isArray(lines)) return { ok: false, error: "headers must be a list of \"Name: value\" lines" };
-  const out: Array<[string, string]> = [];
-  for (const line of lines) {
-    const text = String(line);
-    const at = text.indexOf(":");
-    const name = at > 0 ? text.slice(0, at).trim() : "";
-    if (!HEADER_NAME.test(name)) return { ok: false, error: `header "${text.slice(0, 40)}" is not "Name: value"` };
-    if (RESERVED_HEADER.test(name)) return { ok: false, error: `header ${name} is written by the MCP transport and cannot be set` };
-    out.push([name, text.slice(at + 1).trim()]);
-  }
-  return { ok: true, headers: out };
 }
 
 /** The tool as the gateway knows it. Remote annotations may only make it more conservative. */
@@ -88,23 +71,36 @@ export function toolSchemaOf(t: {
   };
 }
 
-type Connection = { client: McpClient; kept: Map<string, string> };
-
-/** Open a connection and initialize. Every caller closes it in a `finally`. */
-async function connect(ctx: PluginContext): Promise<Connection> {
+/**
+ * Open a connection and initialize, filling `{{name}}` headers into `kept`.
+ *
+ * `kept` belongs to the caller and is filled before anything is sent, so every
+ * failure from here on — `initialize` included, whose error carries up to 500
+ * characters of the server's response body, which may echo the header back —
+ * is hidden by the caller's `failure`. A client that failed to initialize is
+ * closed here, since the caller never receives it.
+ */
+async function connect(ctx: PluginContext, kept: Map<string, string>): Promise<McpClient> {
   const cfg = ctx.publicConfig ?? {};
   const bad = serverUrlProblem(cfg.url);
   if (bad) throw new Error(`the ${ctx.alias} mount is misconfigured: ${bad}`);
-  const parsed = parseHeaderLines(cfg.headers);
+  const parsed = headerLines(cfg.headers);
   if (!parsed.ok) throw new Error(`the ${ctx.alias} mount is misconfigured: ${parsed.error}`);
-  const kept = new Map<string, string>();
+  const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (typeof timeoutMs !== "number" || !(timeoutMs >= 1 && timeoutMs <= MAX_TIMEOUT_MS)) {
+    throw new Error(`the ${ctx.alias} mount is misconfigured: timeoutMs must be between 1 and ${MAX_TIMEOUT_MS}`);
+  }
   const headers: Record<string, string> = {};
   for (const [name, spec] of parsed.headers) headers[name] = await fillSecrets(spec, kept, ctx);
-  const timeoutMs = typeof cfg.timeoutMs === "number" && cfg.timeoutMs > 0 ? cfg.timeoutMs : DEFAULT_TIMEOUT_MS;
   const client = new McpClient({ name: "antiproton", version: VERSION, requestTimeoutMs: timeoutMs });
-  // No GET stream: nothing here listens between calls, and the connection is closed after one.
-  await client.connect(new StreamableHttpTransport({ url: String(cfg.url), headers, openGetStream: false }));
-  return { client, kept };
+  try {
+    // No GET stream: nothing here listens between calls, and the connection is closed after one.
+    await client.connect(new StreamableHttpTransport({ url: String(cfg.url), headers, openGetStream: false }));
+  } catch (e) {
+    await client.close().catch(() => {});
+    throw e;
+  }
+  return client;
 }
 
 /** A failure as the model reads it, with every kept secret replaced by its name. */
@@ -126,9 +122,10 @@ export const mcpPlugin: Plugin = {
   config: [
     { name: "url", type: "string", required: true,
       summary: "The server's Streamable HTTP endpoint, such as https://mcp.example.com/mcp. https only (http only for localhost)." },
-    { name: "headers", type: "string[]",
+    { name: "headers", type: "string[]", format: "header-lines",
       summary: "Sent with every request, one \"Name: value\" per line. A value may contain {{name}}, filled in on each request from a secret the agent kept under that name; the value is never written here." },
-    { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, summary: "How long one request to the server may take." },
+    { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1, max: MAX_TIMEOUT_MS,
+      summary: "How long one request to the server may take, in milliseconds; at most 60000." },
   ],
 
   mountTools(mount: MountRecord): ToolSchema[] {
@@ -136,15 +133,16 @@ export const mcpPlugin: Plugin = {
   },
 
   async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
-    let conn: Connection | null = null;
+    const kept = new Map<string, string>();
+    let client: McpClient | null = null;
     try {
-      conn = await connect(ctx);
-      const listed = await conn.client.listTools();
+      client = await connect(ctx, kept);
+      const listed = await client.listTools();
       return { tools: listed.map(toolSchemaOf) };
     } catch (e) {
-      throw failure(e, conn?.kept ?? new Map(), `listing ${ctx.alias}'s tools failed`, false);
+      throw failure(e, kept, `listing ${ctx.alias}'s tools failed`, false);
     } finally {
-      await conn?.client.close().catch(() => {});
+      await client?.close().catch(() => {});
     }
   },
 
@@ -152,19 +150,18 @@ export const mcpPlugin: Plugin = {
     if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) {
       throw new Error(`${tool} takes an object of arguments`);
     }
-    let conn: Connection | null = null;
-    let sent = false;
+    const kept = new Map<string, string>();
+    let client: McpClient | null = null;
     let result;
     try {
-      conn = await connect(ctx);
-      sent = true;
-      result = await conn.client.callTool(tool, (args ?? {}) as Record<string, unknown>);
+      client = await connect(ctx, kept);
+      result = await client.callTool(tool, (args ?? {}) as Record<string, unknown>);
     } catch (e) {
-      throw failure(e, conn?.kept ?? new Map(), `${tool} on ${ctx.alias} failed`, sent);
+      // Only a call that got past `initialize` may have run on the far end.
+      throw failure(e, kept, `${tool} on ${ctx.alias} failed`, client !== null);
     } finally {
-      await conn?.client.close().catch(() => {});
+      await client?.close().catch(() => {});
     }
-    const kept = conn.kept;
     const content = toLlmContent(result).map((c) => (c.type === "text" ? { ...c, text: hideSecrets(c.text, kept) } : c));
     // The tool ran and said it failed: the model's to read, and not a transport failure to retry.
     if (result.isError) {
