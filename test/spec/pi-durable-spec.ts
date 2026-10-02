@@ -14,10 +14,12 @@
  * arrive as the same value.
  */
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { ROOT_CONVERSATION_ID, type StorageWrite } from "@earendil-works/pi-durable";
+import { ROOT_CONVERSATION_ID, StorageRejected, type StorageWrite } from "@earendil-works/pi-durable";
+import type { SqliteExecutor } from "@earendil-works/pi-durable/storage/sqlite";
 import {
-  SqliteStorage, SQLITE_MIGRATIONS, applySqliteMigrations, type SqliteDatabase, type SqliteExecutor,
-} from "@earendil-works/pi-durable/storage/sqlite";
+  SqliteStorage, type SqliteSyncDatabase, type SqliteSyncExecutor,
+} from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
+import { SQLITE_MIGRATIONS, applySqliteMigrations } from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js";
 import { createStorageConformance, type StorageConformanceAssertions } from "@earendil-works/pi-durable/testing";
 import {
   PiDurableSqlite, PI_DURABLE_INDEXES, PI_DURABLE_OBJECTS, PI_DURABLE_TABLES, type DurableSqlHost,
@@ -177,19 +179,19 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     // statements are the ones pi-durable issued through the prefixed facade during its own suite.
     const schema: SqlNamespace = { name: "pd", qualify: (o, kind) => (kind === "table" ? `pd.${o}` : o) };
     const seen = new Set<string>();
-    const recording = (inner: SqliteExecutor): SqliteExecutor => ({
-      exec: (sql) => { seen.add(sql); return inner.exec(sql); },
-      run: (sql, ...p) => { seen.add(sql); return inner.run(sql, ...p); },
-      get: <T extends object>(sql: string, ...p: Parameters<SqliteExecutor["get"]>[1][]) => { seen.add(sql); return inner.get<T>(sql, ...p); },
-      all: <T extends object>(sql: string, ...p: Parameters<SqliteExecutor["all"]>[1][]) => { seen.add(sql); return inner.all<T>(sql, ...p); },
-    });
+    const recording = <E extends SqliteExecutor | SqliteSyncExecutor>(inner: E): E => ({
+      exec: (sql: string) => { seen.add(sql); return inner.exec(sql); },
+      run: (sql: string, ...p: Parameters<SqliteExecutor["run"]>[1][]) => { seen.add(sql); return inner.run(sql, ...p); },
+      get: (sql: string, ...p: Parameters<SqliteExecutor["get"]>[1][]) => { seen.add(sql); return inner.get(sql, ...p); },
+      all: (sql: string, ...p: Parameters<SqliteExecutor["all"]>[1][]) => { seen.add(sql); return inner.all(sql, ...p); },
+    }) as E;
     for (const c of createStorageConformance({
       assertions: vitestLikeAssertions,
       withStorage: (use) => withHost(async (host) => {
         const db = new PiDurableSqlite(host, PD);
-        const recorder: SqliteDatabase = {
-          ...recording(db),
-          transaction: (cb) => db.transaction((tx) => cb(recording(tx))),
+        const recorder: SqliteSyncDatabase = {
+          ...recording<SqliteExecutor>(db),
+          transactionSync: (cb) => db.transactionSync((tx) => cb(recording(tx))),
           close: () => db.close(),
         };
         const storage = await SqliteStorage.open(recorder);
@@ -328,6 +330,79 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     ];
     for (const [sql, want] of rewrites) vitestLikeAssertions.strictEqual(q(sql), want);
   });
+
+  /**
+   * The host, with a hook on pi-durable's first `pd_entries` insert: from inside that statement it schedules
+   * `probe` twice, as a microtask and as a timer — the two ways other code of the object gets to run while
+   * something is in progress. `probe` writes with the raw `sql.exec`, past the facade and its queue.
+   */
+  const probing = (host: PiDurableHost, probe: (how: string) => void): PiDurableHost => {
+    let armed = true;
+    return {
+      sql: {
+        exec(query, ...bindings) {
+          const result = host.sql.exec(query, ...bindings);
+          if (armed && /^\s*INSERT INTO pd_entries\b/.test(query)) {
+            armed = false;
+            queueMicrotask(() => probe("microtask"));
+            setTimeout(() => probe("timer"), 0);
+          }
+          return result;
+        },
+      },
+      transaction: (closure) => host.transaction(closure),
+      transactionSync: (closure) => host.transactionSync(closure),
+    };
+  };
+  const entry = (id: number) => ({ type: "entry", value: { id, conversationId: ROOT_CONVERSATION_ID, kind: "probe" } }) as StorageWrite;
+  const probes = (host: PiDurableHost) => host.sql.exec("SELECT how, entries, next_seq FROM probe ORDER BY how").toArray();
+  const probeTable = (host: PiDurableHost) => host.sql.exec("CREATE TABLE probe (how TEXT, entries INTEGER, next_seq INTEGER)");
+  /** What the probe saw of pi-durable's tables when it ran, written beside it. */
+  const probeWrite = (host: PiDurableHost) => (how: string) => {
+    const entries = Number(host.sql.exec("SELECT count(*) AS n FROM pd_entries").toArray()[0]!.n);
+    const nextSeq = Number(host.sql.exec("SELECT next_seq FROM pd_durable_metadata").toArray()[0]!.next_seq);
+    host.sql.exec("INSERT INTO probe (how, entries, next_seq) VALUES (?, ?, ?)", how, entries, nextSeq);
+  };
+
+  add("a raw sql.exec scheduled from inside a commit runs after it: it sees the commit whole, never half", () => withHost(async (host) => {
+    probeTable(host);
+    const storage = await SqliteStorage.open(new PiDurableSqlite(probing(host, probeWrite(host)), PD));
+    await storage.commit([{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }], context);
+    const id = await storage.mintId<StoredTask["id"]>();
+    const seq = await storage.commit([entry(id), entry(id + 1)], context);
+    await sleep(10);
+    await storage.close(context);
+    // Inside the commit a probe would see the first entry and the old next_seq; after it, both entries and seq + 1.
+    vitestLikeAssertions.deepEqual(probes(host), [
+      { how: "microtask", entries: 2, next_seq: seq + 1 },
+      { how: "timer", entries: 2, next_seq: seq + 1 },
+    ]);
+  }));
+
+  add("a commit that fails after its writes rolls back only its own: a raw write scheduled from inside it survives", () => withHost(async (host) => {
+    probeTable(host);
+    const storage = await SqliteStorage.open(new PiDurableSqlite(probing(host, probeWrite(host)), PD));
+    await storage.commit([{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }], context);
+    const id = await storage.mintId<StoredTask["id"]>();
+    // The entry is written, then copying a document from a source that does not exist is rejected, after it.
+    const copy = {
+      type: "document.copy",
+      record: { id: id + 1, kind: "probe.doc", scope: { kind: "conversation", conversationId: ROOT_CONVERSATION_ID }, history: "latest", fork: "copy" },
+      source: { id: id + 99, at: 1 },
+    } as unknown as StorageWrite;
+    let error: unknown;
+    await storage.commit([entry(id), copy], context).catch((e: unknown) => { error = e; });
+    await sleep(10);
+    await storage.close(context);
+    check(error instanceof StorageRejected, `the commit rejected with ${show(String(error))}, not pi-durable's StorageRejected`);
+    const left = host.sql.exec("SELECT count(*) AS n FROM pd_entries").toArray()[0];
+    check(left?.n === 0, `the failed commit left ${show(left)} entries`);
+    // Both probes ran after the rollback (no entry, seq unmoved) and are still there.
+    vitestLikeAssertions.deepEqual(probes(host), [
+      { how: "microtask", entries: 0, next_seq: 2 },
+      { how: "timer", entries: 0, next_seq: 2 },
+    ]);
+  }));
 
   add("a transaction that throws after an await leaves no rows, and a write queued meanwhile survives", () => withHost(async (host) => {
     const db = new PiDurableSqlite(host, PD);

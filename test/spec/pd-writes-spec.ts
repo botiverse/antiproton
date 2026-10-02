@@ -19,6 +19,7 @@ import { ApStore } from "../../src/store/ap-store.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
+import { afterPdCommits } from "./pd-commits.ts";
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
@@ -114,16 +115,17 @@ export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
   const seen: Seen = [];
   const held = { lastUsedAt: null as number | null };
   const hooks: PluginHooks = {};
-  // What `during` armed: started inside the next pi-durable transaction, before its work.
+  // What `during` armed: started inside the next pi-durable transaction that spans awaits, before its work, or
+  // as the next synchronous one ends (`afterPdCommits`: no other code can run inside that).
   const armed: Array<() => unknown> = [];
-  const slow: DurableSqlHost = {
+  const slow: DurableSqlHost = afterPdCommits({
     sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
     transaction: (cb) => raw.transaction(async () => {
       for (const start of armed.splice(0)) start();
       if (o.slowCommitMs > 0) await sleep(o.slowCommitMs);
       return cb();
     }),
-  };
+  }, () => { for (const start of armed.splice(0)) start(); });
   const g = guardJoinedWrites(slow, { throwOnJoin: true });
   const storage = { sql: g.sql, transaction: g.transaction, transactionSync: g.transactionSync };
   // The engine choice, as a creation path writes it.
@@ -218,15 +220,19 @@ export function pdWritesCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       } finally { await w.close(); }
     });
 
-  add("control: a write straight at the storage, started inside a pd commit, is seen joining it", () =>
+  // pi-durable commits in one synchronous transaction (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js), so
+  // `during` starts its work as the commit ends: even a write past every gate lands after it, and stays.
+  add("a write straight at the storage, started from a pd commit, cannot join it: it lands after, and stays", () =>
     withRawHost(async (raw) => {
       const w = await pdWorld(raw, { slowCommitMs: opts.slowCommitMs });
       try {
         const r = w.during(() => w.storage.sql.exec("INSERT INTO agents(tenant_id, agent_id, config, created_at) VALUES ('x', 'y', '{}', 0)"));
         await w.rt.postMessage(T, A, "hello");
         const got = await r;
-        check(!got.ok && /joined write/.test(got.error), `the ungated write: ${show(got)}`);
-        check(w.joined.length === 1, `the guard saw ${show(w.joined)}`);
+        check(got.ok, `the ungated write: ${show(got)}`);
+        check(w.joined.length === 0, `the guard saw ${show(w.joined)}`);
+        const row = raw.sql.exec("SELECT count(*) AS n FROM agents WHERE tenant_id = 'x'").toArray()[0];
+        check(row?.n === 1, `the write left ${show(row)}`);
       } finally { await w.close(); }
     }));
 

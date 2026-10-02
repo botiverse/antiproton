@@ -3,8 +3,9 @@
  * (test/spec/pd-writes-spec.ts) over node:sqlite, and, node's only, the whole `AgentDO`: a pd agent
  * driven through the object's own entry points — a console message, the alarm, the model queue's
  * take and deliver, an approval, an API input that rebinds the model, a question left to expire, a
- * background job, the idle lease — with some of them started from inside an open pi-durable commit,
- * and every write the object makes, its own bookkeeping included, checked against joining one.
+ * background job, the idle lease — with some of them started from a pi-durable commit (as it ends: it is
+ * synchronous, test/spec/pd-commits.ts), and every write the object makes, its own bookkeeping included,
+ * checked against joining one.
  * `npm run pd-writes:do` runs the spec's cases on a real Durable Object; the whole object needs the
  * `cloudflare:workers` module, which node has only as the stand-in below.
  */
@@ -17,6 +18,7 @@ import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
 import { pdWritesCases, testPlugins, type Seen } from "./spec/pd-writes-spec.ts";
+import { afterPdCommits } from "./spec/pd-commits.ts";
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
@@ -47,10 +49,11 @@ const wholeObject: DriveCase = {
     const raw = sqliteHost();
     try {
       let armed: Array<() => void> = [];
-      const slow: DurableSqlHost = {
+      // Started inside the next pi-durable transaction that spans awaits, or as the next synchronous one ends.
+      const slow: DurableSqlHost = afterPdCommits({
         sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
         transaction: (cb) => raw.transaction(async () => { for (const start of armed.splice(0)) start(); await sleep(5); return cb(); }),
-      };
+      }, () => { for (const start of armed.splice(0)) start(); });
       const g = guardJoinedWrites(slow, { throwOnJoin: true });
       const during = <R>(fn: () => Promise<R>) => new Promise<{ ok: boolean; value?: R; error?: string }>((resolve) => {
         armed.push(() => { fn().then((value) => resolve({ ok: true, value }), (e) => resolve({ ok: false, error: String(e?.message ?? e) })); });
@@ -107,8 +110,11 @@ const wholeObject: DriveCase = {
         requests.push(JSON.stringify(job));
         await D.deliverAnswer(T, A, id, { role: "assistant", content, api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: stop, timestamp: 0 }, 5);
       };
+      // Bounded by time, not passes: a pass costs whatever the commits in it cost, and the agent's own waits
+      // (each poll is 2 s after its job) are what decide how long settling takes.
       const drain = async () => {
-        for (let i = 0; i < 60; i++) {
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
           if (jobs.length > answered) { await answer([{ type: "text", text: "ok" }], "stop"); continue; }
           await D.alarm();
           if (jobs.length > answered) continue;

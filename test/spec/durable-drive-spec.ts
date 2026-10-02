@@ -19,7 +19,7 @@ import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
   createRegistry, defineExtension, defineTask, defineTool, section, type HarnessSettings, type TaskInspection,
 } from "@earendil-works/pi-durable";
-import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { SqliteStorage } from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 import { Type } from "pi-ai-1";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type ModelJobRequest } from "../../src/model/durable-offloaded.ts";

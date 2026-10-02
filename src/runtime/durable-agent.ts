@@ -50,7 +50,7 @@ import {
   AgentDoc, createRegistry, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID, ToolTask,
   type Conversation, type ConversationId, type EntryRecord, type HarnessInspection,
 } from "@earendil-works/pi-durable";
-import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { SqliteStorage } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 // The vendored Harness: pi-durable 1.0.0's with a scheduler that reports a sleeping task (`sleepingUntil`).
 import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
 import { createModels } from "pi-ai-1/models";

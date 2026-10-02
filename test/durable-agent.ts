@@ -16,6 +16,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
 import { durableAgentCases } from "./spec/durable-agent-spec.ts";
+import { afterPdCommits } from "./spec/pd-commits.ts";
 
 const activeTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
 
@@ -116,17 +117,18 @@ const runtimeCases: DriveCase[] = [
         let armed = false;
         let started: Array<Promise<unknown>> = [];
         let rt: AgentRuntime | undefined;
-        const slow: typeof raw = {
-          ...raw,
+        // A synchronous pi-durable transaction cannot be held open: there, they start as it ends (`afterPdCommits`).
+        const start = () => { armed = false; started = [rt!.postMessage("t", "a", "Q2", "steer"), rt!.step("t", "a")]; };
+        const slow = afterPdCommits({
+          sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
           transaction: (cb) => raw.transaction(async () => {
             if (armed) {
-              armed = false;
-              started = [rt!.postMessage("t", "a", "Q2", "steer"), rt!.step("t", "a")];
+              start();
               await sleep(20);
             }
             return cb();
           }),
-        };
+        }, () => { if (armed) start(); });
         const guarded = guardJoinedWrites(slow);
         const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
         const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));

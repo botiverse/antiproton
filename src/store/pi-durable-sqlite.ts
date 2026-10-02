@@ -25,8 +25,14 @@
  * SQLite, and on a store with real schemas it could be `pd.tasks` with nothing
  * here changing. The rewrite is an allowlist of the names below, and a
  * statement that would create any other name throws.
+ *
+ * `transactionSync` is the transaction nothing can join: the host's `transactionSync`, with a synchronous
+ * handle, so the whole unit runs before any other code does. The vendored pi-durable storage
+ * (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js) commits, migrates and reads documents through
+ * it, and calls `transaction` no more; `transaction` stays for a caller of upstream's storage.
  */
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/pi-durable/storage/sqlite";
+import type { SqliteSyncDatabase, SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
 /** The slice of `ctx.storage` this needs, and all that a test must fake. */
@@ -191,7 +197,24 @@ class TransactionHandle implements SqliteExecutor {
   all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
 }
 
-export class PiDurableSqlite implements SqliteDatabase {
+/** `TransactionHandle` for `transactionSync`: each call has run its statement when it returns. */
+class SyncTransactionHandle implements SqliteSyncExecutor {
+  #connection: Connection;
+  #active = true;
+  constructor(connection: Connection) { this.#connection = connection; }
+  revoke() { this.#active = false; }
+
+  #use<T>(operation: (connection: Connection) => T): T {
+    if (!this.#active) throw new Error("SQLite transaction handle is no longer active");
+    return operation(this.#connection);
+  }
+  exec(sql: string) { this.#use((c) => { query(c, sql, []); }); }
+  run(sql: string, ...params: SqliteValue[]) { this.#use((c) => { query(c, sql, params); }); }
+  get<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))[0]); }
+  all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
+}
+
+export class PiDurableSqlite implements SqliteDatabase, SqliteSyncDatabase {
   #connection: Connection;
   #queue: SerialQueue;
   #closed = false;
@@ -232,6 +255,32 @@ export class PiDurableSqlite implements SqliteDatabase {
           try { return await callback(handle); } finally { handle.revoke(); }
         });
       } finally { handle.revoke(); this.#inTransaction = false; }
+    }, { transaction: true });
+  }
+
+  /**
+   * `callback` as one host `transactionSync`, every statement in it synchronous: no other code runs between
+   * its first statement and its commit or rollback, so no statement of anyone else's can join it, and a
+   * rollback removes only what `callback` wrote. A throw rolls back and rejects with the thrown error. It is
+   * scheduled as `transaction` is — after whatever is queued, held off by `apart` sections — so the queue's
+   * order is unchanged; the transaction itself needs none of it. Refused like `exclusive`: a function
+   * declared async or as a generator is not called, and a returned thenable rolls back and rejects.
+   */
+  transactionSync<T>(callback: (transaction: SqliteSyncExecutor) => T): Promise<T> {
+    const refused = refuseAsync(callback, "transactionSync()");
+    if (refused) return refused;
+    return this.#queue.enqueue(async () => {
+      if (this.#closed) throw new Error("database is closed");
+      const handle = new SyncTransactionHandle(this.#connection);
+      try {
+        return this.#connection.host.transactionSync(() => {
+          const result = callback(handle);
+          if (typeof (result as { then?: unknown } | null)?.then === "function") {
+            throw new TypeError("transactionSync() takes a synchronous function; this one returned a thenable, whose work would run outside its transaction");
+          }
+          return result;
+        });
+      } finally { handle.revoke(); }
     }, { transaction: true });
   }
 
