@@ -1944,6 +1944,10 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * A read of this object's SQL after any pi-durable transaction open on it. Only a runtime that opened a pd
    * agent can have one open, so the runtime already built is asked and none is built for the read.
+   *
+   * Known exposure, the same as `AgentRuntime.#ownWrite`'s: `simulateEviction` and `setOffload` drop
+   * `#runtime` while the old runtime's harness may still be running a transaction, and a read after that
+   * runs at once, so it can see that transaction's uncommitted rows. Both are operator and bench paths.
    */
   #outsidePd<T>(fn: () => T): Promise<T> | T {
     return this.#runtime ? this.#runtime.afterPdTransactions(fn) : fn();
