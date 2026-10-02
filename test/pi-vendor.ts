@@ -168,6 +168,37 @@ add("the vendored SqliteStorage refuses a database without transactionSync, and 
   check(closed, "the database was not closed");
 });
 
+add("the vendored commit calls onCommit inside its transaction, before the batch: what it writes lands with the batch, and a throw or a thenable rolls both back", async () => {
+  const host = sqliteHost();
+  try {
+    host.sql.exec("CREATE TABLE hooked (seq INTEGER, writes INTEGER, saw INTEGER)");
+    let mode: "write" | "throw" | "thenable" = "write";
+    const storage = await SqliteStorage.open(new PiDurableSqlite(host, prefixedNamespace("pd")), {
+      onCommit: (exec, writes, seq) => {
+        // Before the batch: the conversation it writes is not there yet.
+        const saw = exec.all("SELECT id FROM conversations").length;
+        host.sql.exec("INSERT INTO hooked VALUES (?, ?, ?)", seq, writes.length, saw);
+        if (mode === "throw") throw new Error("hook refused");
+        if (mode === "thenable") return Promise.resolve() as never;
+      },
+    });
+    const rows = () => host.sql.exec("SELECT seq, writes, saw FROM hooked ORDER BY seq").toArray().map((r) => [r.seq, r.writes, r.saw]);
+    const conversations = () => host.sql.exec("SELECT COUNT(*) AS n FROM pd_conversations").toArray()[0]!.n;
+    const seq = await storage.commit([{ type: "conversation", value: { id: 1 as never } }], bg);
+    check(show(rows()) === show([[seq, 1, 0]]) && conversations() === 1, `after a commit: hooked ${show(rows())}, conversations ${conversations()}`);
+    for (const m of ["throw", "thenable"] as const) {
+      mode = m;
+      const error = await storage.commit([{ type: "conversation", value: { id: 2 as never } }], bg).then(() => null, (e: unknown) => e);
+      check(error !== null, `a ${m} hook did not fail the commit`);
+      check(show(rows()) === show([[seq, 1, 0]]) && conversations() === 1, `after a ${m} hook: hooked ${show(rows())}, conversations ${conversations()}`);
+    }
+    mode = "write";
+    const next = await storage.commit([{ type: "conversation", value: { id: 2 as never } }], bg);
+    check(next === seq + 1 && conversations() === 2, `the sequence after two rollbacks: ${next}, after ${seq}`);
+    await storage.close(bg);
+  } finally { host.dispose(); }
+});
+
 /** A task that sleeps once until `NAP_UNTIL` and completes. */
 let napUntil = 0;
 const Nap = defineTask<Record<string, never>, { phase: "nap" }, null>({

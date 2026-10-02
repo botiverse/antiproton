@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the pd engine's usage and trace outbox cases (test/spec/pd-outbox-spec.ts) against real Durable
+# Runs the pd engine's commit-hook cases (usage, trace, model jobs) (test/spec/pd-outbox-spec.ts) against real Durable
 # Object SQLite, in the conformance worker, which is never deployed (cf/src/conformance.ts).
 # test/pd-outbox.ts runs them over node:sqlite; this is the run on the storage and runtime the object
 # will have, PiAgent's parity run included.
@@ -23,7 +23,7 @@ if [ -z "$answered" ]; then
 fi
 node -e '
 const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-console.log(`\n  pd outbox: usage and trace from pi-durable entries — ${r.backend}\n  ${"─".repeat(56)}`);
+console.log(`\n  pd outbox: usage, trace and jobs inside the pi-durable commit — ${r.backend}\n  ${"─".repeat(56)}`);
 let g = "";
 for (const c of r.results) {
   if (c.group !== g) { g = c.group; console.log(`  ${g}`); }

@@ -111,10 +111,13 @@ async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Reques
   throw new Error(`${e.name}: did not settle`);
 }
 
-/** The model's job rows still in the engine's table: what a late answer could land on. */
+/**
+ * The model's jobs still out: what a poll could take a late answer from. pi085 deletes a cancelled job's row; pd
+ * keeps it marked `cancelled`, so a late answer is billed rather than lost (test/spec/pd-outbox-spec.ts).
+ */
 function jobRows(storage: DurableSqlHost, e: Eng): number {
-  const table = e.name === "pd" ? "ap_model_jobs" : "pi_model_jobs";
-  return Number(storage.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]!.n);
+  const query = e.name === "pd" ? "SELECT COUNT(*) AS n FROM ap_model_jobs WHERE state IS NULL" : "SELECT COUNT(*) AS n FROM pi_model_jobs";
+  return Number(storage.sql.exec(query).toArray()[0]!.n);
 }
 
 /** The Agents API's view of the session: its turns' statuses, and whether it is running. */
@@ -208,7 +211,7 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       check(before.status === "in_progress", `${e.name}: before the cancel ${show(before)}`);
       const cancelled = await cancelSession(e);
       check(typeof cancelled === "string" && cancelled.length > 0, `${e.name}: a running turn was not cancelled (${show(cancelled)})`);
-      check(jobRows(storage, e) === 0, `${e.name}: the model call's row is still there, so its answer could land`);
+      check(jobRows(storage, e) === 0, `${e.name}: the model call is still out, so its answer could land`);
       check(!(await e.agent.running()), `${e.name}: still running after the cancel`);
       check(await markers(e) === 1, `${e.name}: ${await markers(e)} cancel markers`);
       const after = await apiView(e);

@@ -16,20 +16,17 @@
  *   adopt that rebuilds the agent's config cannot move an agent between
  *   kernels. A missing row means the agent predates the choice (pi 0.85).
  * - `model_jobs`: `pi_model_jobs` (src/runtime/pi-agent.ts), with the session
- *   replaced by pi-durable's conversation id. That id is nullable because the
- *   offloaded provider's port (src/model/durable-offloaded.ts) is handed only
- *   `{ model, context, options }`.
+ *   replaced by pi-durable's conversation id, and a `state`: null while the job
+ *   is out, `consumed` once a commit appended its answer, `cancelled` once its
+ *   generation was aborted (the row is kept, so a late answer is still billed).
+ *   The row is inserted inside pi-durable's commit (src/runtime/pd-outbox.ts),
+ *   which knows the conversation; a row from before that may hold null.
  * - `client_calls`: `api_client_calls` (src/runtime/client-calls.ts), keyed by
  *   pi-durable's conversation id instead of a session name.
  * - `conversations`: the directory from the id a caller addresses (a task id:
  *   `t_<agent>` or an Agents API session id, which `#conversation` and
  *   `#openTask` in cf/src/index.ts accept through AgentDO's `tasks` rows) to the
  *   pi-durable conversation that holds it.
- * - `outbox_marks`: how far the usage and trace outboxes have read pi-durable's
- *   entries. A watermark is pi-durable's commit sequence (`entries.commit_seq`,
- *   strictly increasing per atomic commit), so "through seq N" never splits a
- *   commit. Written by src/runtime/pd-outbox.ts through `unit`, in the same
- *   commit as the rows it accounts for.
  *
  * The engine, the directory, `unit` and the client calls have operations here; the
  * other tables are declared so that the namespace's list is complete from the start,
@@ -37,7 +34,7 @@
  */
 import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
-export const AP_TABLES = ["meta", "model_jobs", "client_calls", "conversations", "outbox_marks"] as const;
+export const AP_TABLES = ["meta", "model_jobs", "client_calls", "conversations"] as const;
 export const AP_INDEXES = ["model_jobs_open"] as const;
 export const AP_OBJECTS: SqlObjects = { tables: AP_TABLES, indexes: AP_INDEXES };
 
@@ -45,7 +42,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT`,
   `CREATE TABLE IF NOT EXISTS model_jobs (
      id TEXT PRIMARY KEY, conversation_id INTEGER, request TEXT NOT NULL, answer TEXT,
-     created_at INTEGER NOT NULL, dispatched_at INTEGER, answered_at INTEGER) STRICT`,
+     created_at INTEGER NOT NULL, dispatched_at INTEGER, answered_at INTEGER, state TEXT) STRICT`,
   // What a sweep for lost and unanswered calls reads.
   `CREATE INDEX IF NOT EXISTS model_jobs_open ON model_jobs (answered_at, created_at)`,
   `CREATE TABLE IF NOT EXISTS client_calls (
@@ -55,7 +52,10 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS conversations (
      task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
      conversation_id INTEGER NOT NULL UNIQUE, created_at INTEGER NOT NULL) STRICT`,
-  `CREATE TABLE IF NOT EXISTS outbox_marks (outbox TEXT PRIMARY KEY, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`,
+];
+/** Columns added after a table was first made: each is added where it is missing (an object made before it). */
+const ADDED_COLUMNS = [
+  { table: "model_jobs", column: "state", sql: "ALTER TABLE model_jobs ADD COLUMN state TEXT" },
 ];
 
 /** The kernels an agent can run on. `pi085` is every agent created before the choice existed. */
@@ -82,7 +82,7 @@ export type ApWriter = { exclusive<T>(fn: () => T): Promise<T> };
 
 type Binding = string | number | null;
 
-/** The `ap` tables inside a unit (`ApStore.unit`): only valid until the unit's function returns. */
+/** The `ap` tables on the connection as it is (`ApStore.direct`): inside whatever transaction is open. */
 export type ApUnit = { run(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> };
 
 /**
@@ -125,17 +125,22 @@ export class ApStore {
     return this.#writer.exclusive(() => this.#run(sql, bindings));
   }
 
-  ensure(): Promise<void> { return this.#writer.exclusive(() => { for (const s of SCHEMA) this.#run(s, []); }); }
+  ensure(): Promise<void> {
+    return this.#writer.exclusive(() => {
+      for (const s of SCHEMA) this.#run(s, []);
+      // A select of a missing column fails as it is prepared, before it runs, so it writes nothing either way.
+      for (const a of ADDED_COLUMNS) {
+        try { this.#run(`SELECT ${a.column} FROM ${a.table} WHERE 0`, []); } catch { this.#run(a.sql, []); }
+      }
+    });
+  }
 
   /**
-   * One synchronous unit through `exclusive`: `ap.run` reaches only the `ap` objects, and whatever
-   * else `fn` runs on the host's connection before it returns commits or rolls back with it. That is
-   * what lets the outbox derivation (src/runtime/pd-outbox.ts) append its rows and advance its
-   * watermark in `outbox_marks` as one commit.
+   * The `ap` tables for a caller already inside a transaction on this connection — pi-durable's commit hook
+   * (src/runtime/pd-outbox.ts) or a host `transactionSync` — or reading: each statement runs at once, in
+   * whatever transaction is open, and commits or rolls back with it.
    */
-  unit<T>(fn: (ap: ApUnit) => T): Promise<T> {
-    return this.#writer.exclusive(() => fn({ run: (sql, ...bindings) => this.#run(sql, bindings) }));
-  }
+  direct(): ApUnit { return { run: (sql, ...bindings) => this.#run(sql, bindings) }; }
 
   /** The engine recorded at creation, or null for an agent that predates the choice. */
   engine(): AgentEngineName | null {

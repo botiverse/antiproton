@@ -1,230 +1,245 @@
 /**
- * The usage and trace outboxes for an agent on the `pd` engine, derived from what pi-durable
- * committed.
+ * The bookkeeping an agent on the `pd` engine writes inside pi-durable's own commit: its usage and
+ * trace outbox rows, and its `ap_model_jobs` rows.
  *
- * On pi 0.85 the rows are written by our `Storage.commit` (src/store/pi-storage.ts), inside the
- * transaction that commits the answer: a `model.tokens` usage row per kind of token a usage write
- * counts, and a `model.call` trace row for an assistant entry that carries the job id it answers
- * and ended. pi-durable's commits are its own, and nothing of ours may run inside them
- * (src/store/pi-durable-sqlite.ts), so here the same rows are derived afterwards from the committed
- * entries, past a watermark: pi-durable's `entries.commit_seq`, kept in `ap_outbox_marks` with the
- * entry id that bounds the read (`OUTBOX_ENTRY_MARK`).
+ * The vendored storage (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js) calls a commit hook
+ * inside the one synchronous transaction that applies a batch, before the batch is applied. `bookCommit`
+ * is that hook's body. What it writes on the object's connection commits or rolls back with the batch,
+ * so a row here exists exactly when the state it accounts for does — the property pi 0.85 gives its own
+ * `Storage.commit` (src/store/pi-storage.ts), which writes the same rows with the same builders
+ * (`modelTokenRows`, `modelCallRow`), so the flushers (cf/src/usage-d1.ts, cf/src/trace-r2.ts,
+ * cf/src/activity-raft.ts), billing and the status derived from trace rows (src/runtime/status.ts) read a
+ * pd agent as they read a pi085 one.
  *
- * The rows are the same rows from the same facts, built by the same functions (`modelTokenRows`,
- * `modelCallRow`), so the flushers (cf/src/usage-d1.ts, cf/src/trace-r2.ts, cf/src/activity-raft.ts),
- * billing and the status derived from trace rows (src/runtime/status.ts) read a pd agent exactly as
- * they read a pi085 one. Which entries are counted mirrors which usage writes pi 0.85 makes:
+ * - **Usage** is the batch's change to the `pi.usage` documents, pi-durable's own ledger: every writer
+ *   that records spend (`appendAssistant` in harness/generation.js, a failed attempt it retries included;
+ *   compaction's model call in harness/compaction.js, which appends no entry) adds to it in the commit
+ *   that records the response. A `model.tokens` row per counter that moved, per key: a model's under its
+ *   name, a tool's under `unknown` (what pi-storage's `#modelOf` makes of a usage row that is not an
+ *   assistant's). A batch that does not touch `pi.usage` — an importer's `appendEntry` — bills nothing;
+ *   a document copied into a fork is not spend, and is not counted.
+ * - **Trace**: a `model.call` row for an assistant entry that names the job it answers and ended.
+ * - **Model jobs**: the provider's port only stages a job in memory (`PdHost.#startJob`). Its row is
+ *   inserted here, by the batch whose `poll` checkpoint carries its handle, and dispatched after that
+ *   commit; a commit that never lands leaves no row and nothing dispatched. The batch that appends a
+ *   job's answer marks it `consumed`.
  *
- * - every assistant entry, whatever it ended with. pi 0.85 writes a usage row for every response it
- *   settles, an error included (`drive/response.js`); pi-durable appends every response as an
- *   assistant entry, a failed attempt that it then retries included (`appendAssistant` in
- *   harness/generation.js, "every built-in writer of assistant entries goes through here").
- * - a tool result whose message carries usage, under the model `unknown`: what pi-storage's
- *   `#modelOf` makes of a usage row whose entry is not an assistant's. No tool on either engine sets
- *   one today; it is mirrored so that the two cannot drift when one does.
+ * Usage, the job rows and the consumed mark are all-or-nothing with the batch: a failure there throws,
+ * and the commit rolls back. The trace row is not billing, so a failure building it is logged and the
+ * batch commits without it.
  *
- * One pass is one unit (`ApStore.unit`, i.e. `exclusive`): read the mark, read the entries committed
- * after it, append their rows, advance the mark. A crash anywhere in it leaves nothing; a pass run
- * twice derives nothing the second time. That the mark moves in the same unit as the rows is the
- * whole of the idempotency — two units would bill a pass twice after a crash between them.
- *
- * Each pass also compares what has been derived in total with pi-durable's own `pi.usage` documents,
- * read in the same unit and so at the same commit. Their expected relation is equality: `pi.usage`
- * counts each assistant entry's usage in the commit that appends it (failed attempts too, as above)
- * and each tool result's in the commit that appends that. Two things would make `pi.usage` the
- * larger, and both are reported rather than hidden: compaction, which records its model call's
- * usage with no entry (harness/compaction.js; off on pd, `compaction: { enabled: false }` in
- * src/runtime/durable-agent.ts), and a conversation whose document was retired. A mismatch is a
- * structured warning (`pd.outbox.usage_mismatch`), never a correction: the rows are what is billed,
- * and which side is wrong is a question for a person.
- *
- * What differs from pi085, deliberately: a row's `at` is the pass's clock, not the commit's. A
- * pi-durable entry has no time of its own, and the pass runs after every commit (`PdHost`), so the two
- * differ by the length of a commit. After a crash it is the time of the pass that recovered it, which
- * can put tokens in a later hour than they were spent: late, never lost and never twice.
+ * A row's `at` is the commit's time, as pi085's is.
  */
+import { apply } from "@earendil-works/chord/delta";
+import type { StorageWrite } from "@earendil-works/pi-durable";
+import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 import { logEvent } from "../core/log.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
 import { appendUsage, modelTokenRows, type UsageRow } from "../usage/outbox.ts";
 import type { ApUnit } from "../store/ap-store.ts";
-import { PI_DURABLE_OBJECTS } from "../store/pi-durable-sqlite.ts";
-import { SqlQualifier, type SqlNamespace } from "../store/sql-namespace.ts";
 
-/** The `ap_outbox_marks` row: both outboxes are derived in one pass, so they share one mark. */
-export const OUTBOX_MARK = "usage+trace";
-/**
- * The same mark as an entry id, which is what bounds the read. `entries` has no index on `commit_seq`
- * and we may not add one (its tables are pi-durable's), so a read by sequence scans every entry the
- * object ever committed, on every pass. The id is the table's INTEGER PRIMARY KEY, so `id > ?` is a
- * range on the rowid, and it is monotonic with commit order: ids are minted from one counter only
- * inside a commit callback on the Session's mutation line, which runs one commit at a time
- * (session/session.js `#runCommit`, session/transaction.js), and a reopened storage resumes the
- * counter from `durable_metadata.next_id`, past every committed id. So every entry committed after
- * the last pass has a larger id than every entry it read. docs/pi-upstream.md lists this contract;
- * test/spec/pd-outbox-spec.ts checks it on every run and counts what a pass reads.
- */
-export const OUTBOX_ENTRY_MARK = "usage+trace:entry-id";
-/** The `ap_meta` row holding what every pass so far has derived, for the comparison with `pi.usage`. */
-const TOTALS_KEY = "outbox.usage";
-
-/** The counters a usage row bills (`modelTokenRows`), and so the ones compared. */
+/** The counters a usage row bills (`modelTokenRows`). */
 const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning"] as const;
-type Tokens = Record<(typeof COUNTERS)[number], number>;
+export type Tokens = Partial<Record<(typeof COUNTERS)[number], number>>;
 /** Keyed as `pi.usage` keys them: `models` by `provider/model`, `tools` by tool name. */
 export type UsageTotals = { models: Record<string, Tokens>; tools: Record<string, Tokens> };
 
-export type UsageCheck =
-  | { state: "match" }
-  | { state: "mismatch"; derived: UsageTotals; counted: UsageTotals }
-  /** The documents were not in the shape this reads; nothing was compared. */
-  | { state: "unreadable"; reason: string };
-
-export interface DerivePass {
-  /** The mark before the pass, and after it: pi-durable's commit sequence. */
-  from: number;
-  through: number;
-  /** Entries that produced rows, and the rows. */
-  entries: number;
-  usage: number;
-  trace: number;
-  /** Null when nothing was committed since the last pass: there was nothing new to compare. */
-  check: UsageCheck | null;
-}
-
 type Raw = { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
-type UsageLike = Partial<Record<(typeof COUNTERS)[number] | "totalTokens", number>>;
-type MessageLike = { role?: string; model?: string; provider?: string; jobId?: unknown; stopReason?: string; usage?: UsageLike; toolName?: string };
+type MessageLike = { role?: unknown; model?: unknown; provider?: unknown; jobId?: unknown; stopReason?: unknown; usage?: Tokens };
 
-const emptyTotals = (): UsageTotals => ({ models: {}, tools: {} });
-
-function add(bucket: Record<string, Tokens>, key: string, usage: UsageLike): void {
-  // Own keys only, as pi-durable keeps them: a tool may be called `__proto__`.
-  const have = Object.hasOwn(bucket, key) ? bucket[key]! : undefined;
-  const into: Tokens = have ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0 };
-  for (const c of COUNTERS) into[c] += typeof usage[c] === "number" ? usage[c]! : 0;
-  if (!have) Object.defineProperty(bucket, key, { value: into, enumerable: true, writable: true });
+export interface BookContext {
+  /** Whose rows these are. Null when the host is not bound yet: then a batch that bills anything throws. */
+  owner: { tenantId: string; agentId: string } | null;
+  /** The commit's time: every row's `at`. */
+  now: number;
+  /** The object's connection, for the outbox tables; inside the commit's transaction. */
+  raw: Raw;
+  /** The `ap` tables on the same connection, inside the same transaction. */
+  ap: ApUnit;
+  /** Jobs the provider's port started and no commit has recorded yet: id to request JSON. */
+  staged: ReadonlyMap<string, string>;
+  /** A test seam, called last inside the transaction: a throw rolls the whole commit back. */
+  fault?: (writes: readonly StorageWrite[]) => void;
 }
 
-function sameTotals(a: UsageTotals, b: UsageTotals): boolean {
-  for (const bucket of ["models", "tools"] as const) {
-    const keys = new Set([...Object.keys(a[bucket]), ...Object.keys(b[bucket])]);
-    for (const k of keys) {
-      const x = Object.hasOwn(a[bucket], k) ? a[bucket][k] : undefined;
-      const y = Object.hasOwn(b[bucket], k) ? b[bucket][k] : undefined;
-      for (const c of COUNTERS) if ((x?.[c] ?? 0) !== (y?.[c] ?? 0)) return false;
-    }
-  }
-  return true;
+export interface Booked {
+  /** Jobs this batch recorded: dispatch each once the commit has landed. */
+  jobs: string[];
+  usage: UsageRow[];
+  trace: TraceRow[];
+  consumed: string[];
 }
 
-/** Every live `pi.usage` document summed, as `Harness.usage()` sums them, read from the tables in this unit. */
-function countedUsage(raw: Raw, pd: SqlQualifier): UsageTotals | string {
-  const out = emptyTotals();
-  // pi-durable stores an indexed string as its JSON text (`encodeIndexedString` in storage/sqlite/storage.js).
-  const docs = raw.exec(pd.rewrite("SELECT id FROM documents WHERE kind = ? AND scope_kind = 'conversation' AND retired_at IS NULL"), JSON.stringify("pi.usage")).toArray();
-  for (const d of docs) {
-    const [rev] = raw.exec(pd.rewrite("SELECT kind, content FROM document_revisions WHERE document_id = ? ORDER BY seq DESC LIMIT 1"), Number(d.id)).toArray();
-    // `pi.usage` checkpoints on every change (`checkpointWhen: () => true`, harness/usage.js), so its newest
-    // revision is a whole value. A delta means that changed upstream, and reading it as a value would be wrong.
-    if (!rev || rev.kind !== "base") return `pi.usage document ${String(d.id)} has no base as its newest revision`;
-    const value = JSON.parse(String(rev.content)) as { models?: Record<string, UsageLike>; tools?: Record<string, UsageLike> };
+const PI_USAGE = "pi.usage";
+const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const own = <T>(o: Record<string, T>, k: string): T | undefined => (Object.hasOwn(o, k) ? o[k] : undefined);
+
+/** A `pi.usage` value as the two buckets, whatever was stored: a missing or malformed bucket is empty. */
+function totalsOf(value: unknown): UsageTotals {
+  const v = isObject(value) ? value : {};
+  const bucket = (b: unknown) => (isObject(b) ? b as Record<string, Tokens> : {});
+  return { models: bucket(v.models), tools: bucket(v.tools) };
+}
+
+/** A document's current value, read through the commit's executor: the state the batch is applied to. */
+function currentValue(exec: SqliteSyncExecutor, id: number): unknown {
+  const base = exec.get<{ seq: number; content: string }>(
+    "SELECT seq, content FROM document_revisions WHERE document_id = ? AND kind = 'base' ORDER BY seq DESC LIMIT 1", id);
+  if (base === undefined) return undefined;
+  let value = JSON.parse(base.content) as unknown;
+  const tail = exec.all<{ content: string }>(
+    "SELECT content FROM document_revisions WHERE document_id = ? AND seq > ? ORDER BY seq", id, base.seq);
+  for (const t of tail) value = apply(value as never, JSON.parse(t.content));
+  return value;
+}
+
+/**
+ * What this batch adds to the `pi.usage` documents, summed over them: each changed or created one's new
+ * value minus its value before the batch. Copies and retirements add nothing.
+ */
+export function usageDelta(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): UsageTotals {
+  const out: UsageTotals = { models: {}, tools: {} };
+  for (const w of writes) {
+    let before: unknown;
+    let after: unknown;
+    if (w.type === "document.create") {
+      if (w.record.kind !== PI_USAGE) continue;
+      before = undefined;
+      after = w.content.value;
+    } else if (w.type === "document.change") {
+      const row = exec.get<{ record: string }>("SELECT record FROM documents WHERE id = ?", w.id);
+      if (row === undefined || (JSON.parse(row.record) as { kind?: unknown }).kind !== PI_USAGE) continue;
+      before = currentValue(exec, w.id);
+      after = w.content.kind === "base" ? w.content.value : apply(structuredClone(before) as never, w.content.ops as never);
+    } else continue;
+    const was = totalsOf(before), now = totalsOf(after);
     for (const bucket of ["models", "tools"] as const) {
-      for (const [k, u] of Object.entries(value[bucket] ?? {})) add(out[bucket], k, u);
+      for (const [key, usage] of Object.entries(now[bucket])) {
+        const prev = own(was[bucket], key) ?? {};
+        const into = own(out[bucket], key) ?? {};
+        for (const c of COUNTERS) {
+          const d = num(usage?.[c]) - num(prev[c]);
+          if (d !== 0) into[c] = (into[c] ?? 0) + d;
+        }
+        // Defined, not assigned: a tool may be called `__proto__`.
+        Object.defineProperty(out[bucket], key, { value: into, enumerable: true, writable: true, configurable: true });
+      }
     }
   }
   return out;
 }
 
-export interface DeriveContext {
-  owner: { tenantId: string; agentId: string };
-  /** pi-durable's namespace (`pd`) and ours (`ap`) as the object places them. */
-  pd: SqlNamespace;
-  ap: SqlNamespace;
-  now: number;
-  /** A test seam: called after the rows are appended and before the mark moves. A throw rolls the pass back. */
-  fault?: (stage: "appended") => void;
+/** The assistant messages of the batch's new entries. */
+function assistantMessages(writes: readonly StorageWrite[]): MessageLike[] {
+  const out: MessageLike[] = [];
+  for (const w of writes) {
+    if (w.type !== "entry" || w.value.kind !== "pi.assistant") continue;
+    for (const m of (w.value.model ?? []) as readonly MessageLike[]) if (m?.role === "assistant") out.push(m);
+  }
+  return out;
+}
+
+/** The jobs whose handle a `poll` checkpoint of this batch carries and that are staged, not yet recorded. */
+function pollHandles(writes: readonly StorageWrite[], staged: ReadonlyMap<string, string>): Array<{ id: string; conversationId: number }> {
+  const out: Array<{ id: string; conversationId: number }> = [];
+  for (const w of writes) {
+    if (w.type !== "task") continue;
+    const checkpoint = (w.value.state as { checkpoint?: unknown }).checkpoint;
+    if (!isObject(checkpoint) || checkpoint.phase !== "poll" || !isObject(checkpoint.handle)) continue;
+    const id = checkpoint.handle.id;
+    if (typeof id === "string" && staged.has(id)) out.push({ id, conversationId: Number(w.value.conversationId) });
+  }
+  return out;
+}
+
+/** Subtract `usage` from `delta[bucket][key]`: spend already billed elsewhere. */
+function subtract(delta: UsageTotals, key: string, usage: Tokens | undefined): void {
+  const into = own(delta.models, key);
+  if (!into || !usage) return;
+  for (const c of COUNTERS) if (num(usage[c]) !== 0) into[c] = (into[c] ?? 0) - num(usage[c]);
+}
+
+/** The model named by a `pi.usage` models key, `provider/model`: as an entry of the batch names it, else after the first `/`. */
+function modelOf(key: string, named: ReadonlyMap<string, string>): string {
+  const known = named.get(key);
+  if (known !== undefined) return known;
+  const slash = key.indexOf("/");
+  return slash === -1 ? key : key.slice(slash + 1);
+}
+
+/** The commit hook's body. Synchronous, inside the commit's transaction; see the header for what it writes. */
+export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], ctx: BookContext): Booked {
+  const booked: Booked = { jobs: [], usage: [], trace: [], consumed: [] };
+
+  // Model jobs: recorded by the batch whose poll checkpoint carries the handle.
+  for (const job of pollHandles(writes, ctx.staged)) {
+    ctx.ap.run("INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+      job.id, Number.isSafeInteger(job.conversationId) ? job.conversationId : null, ctx.staged.get(job.id)!, ctx.now);
+    booked.jobs.push(job.id);
+  }
+
+  // Answers: the job is consumed. One whose cancel already billed a delivered answer is not billed again.
+  const delta = usageDelta(exec, writes);
+  const messages = assistantMessages(writes);
+  const named = new Map<string, string>();
+  const jobs = new Map<string, { created_at: unknown; answered_at: unknown }>();
+  for (const m of messages) {
+    if (typeof m.provider === "string" && typeof m.model === "string") named.set(`${m.provider}/${m.model}`, m.model);
+    if (typeof m.jobId !== "string") continue;
+    const row = ctx.ap.run("SELECT state, answer, created_at, answered_at FROM model_jobs WHERE id = ?", m.jobId)[0];
+    if (!row) continue;
+    jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown });
+    if (row.state === "cancelled" && row.answer !== null) {
+      subtract(delta, `${String(m.provider)}/${String(m.model)}`, m.usage);
+      logEvent("pd.jobs.consumed_after_cancel", { ...(ctx.owner ?? {}), jobId: m.jobId });
+      continue;
+    }
+    ctx.ap.run("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL", m.jobId);
+    booked.consumed.push(m.jobId);
+  }
+
+  // Usage: the pi.usage delta, as rows.
+  const base = { at: ctx.now, tenantId: ctx.owner?.tenantId ?? "", agentId: ctx.owner?.agentId ?? "" };
+  for (const [key, usage] of Object.entries(delta.models)) booked.usage.push(...modelTokenRows(base, modelOf(key, named), usage));
+  for (const usage of Object.values(delta.tools)) booked.usage.push(...modelTokenRows(base, "unknown", usage));
+  if (booked.usage.length > 0 && ctx.owner === null) {
+    throw new Error("the pd host is not bound to an agent, so the usage this commit records cannot be attributed");
+  }
+  appendUsage(ctx.raw as Parameters<typeof appendUsage>[0], booked.usage);
+
+  // Trace: not billing, so a failure here is logged and the batch commits without it.
+  if (ctx.owner !== null) {
+    const owner = ctx.owner;
+    try {
+      for (const m of messages) {
+        if (typeof m.jobId !== "string" || !answerEnded(m.stopReason as Parameters<typeof answerEnded>[0])) continue;
+        const job = jobs.get(m.jobId);
+        booked.trace.push(modelCallRow({
+          ...owner, jobId: m.jobId, stopReason: m.stopReason as Parameters<typeof modelCallRow>[0]["stopReason"],
+          model: typeof m.model === "string" ? m.model : "unknown", at: ctx.now,
+          createdAt: job ? Number(job.created_at) : null,
+          answeredAt: job && job.answered_at !== null ? Number(job.answered_at) : null,
+        }));
+      }
+      appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], booked.trace);
+    } catch (error) {
+      logEvent("pd.commit.trace_error", { ...owner, error: String((error as Error)?.message ?? error).slice(0, 200) });
+      booked.trace = [];
+    }
+  }
+
+  ctx.fault?.(writes);
+  return booked;
 }
 
 /**
- * One pass, synchronously. Must run inside `ApStore.unit` — the unit is what makes its writes one
- * commit, and what keeps them out of a pi-durable transaction.
+ * The usage rows of an answer that no commit will bill: one delivered to a job that was cancelled, or a
+ * job cancelled after its answer was delivered and before any commit appended it. Written by the caller in
+ * the same transaction as the write that made it so (`PdHost.deliver`, `PdHost.#dropJob`).
  */
-export function derivePdOutbox(raw: Raw, ap: ApUnit, ctx: DeriveContext): DerivePass {
-  const pd = new SqlQualifier(PI_DURABLE_OBJECTS, ctx.pd);
-  const from = Number(ap.run("SELECT through_seq FROM outbox_marks WHERE outbox = ?", OUTBOX_MARK)[0]?.through_seq ?? 0);
-  // A storage pi-durable never opened has no tables yet, and nothing to derive.
-  const opened = raw.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", ctx.pd.qualify("durable_metadata", "table")).toArray().length > 0;
-  if (!opened) return { from, through: from, entries: 0, usage: 0, trace: 0, check: null };
-  // Every commit below `next_seq` is committed: this runs after any pi-durable transaction, never in one.
-  // One row read, so a pass after a commit that changed nothing costs no scan.
-  const through = Number(raw.exec(pd.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq ?? 1) - 1;
-  if (through <= from) return { from, through: from, entries: 0, usage: 0, trace: 0, check: null };
-
-  const fromId = Number(ap.run("SELECT through_seq FROM outbox_marks WHERE outbox = ?", OUTBOX_ENTRY_MARK)[0]?.through_seq ?? 0);
-  // `commit_seq` stays in the predicate as the statement of what is read; the id range is what bounds it.
-  const fresh = raw.exec(pd.rewrite(
-    "SELECT id, commit_seq, record FROM entries WHERE id > ? AND commit_seq <= ? ORDER BY id"), fromId, through).toArray();
-  const throughId = fresh.reduce((max, r) => Math.max(max, Number(r.id)), fromId);
-  const records = fresh.filter((r) => {
-    const kind = (JSON.parse(String(r.record)) as { kind?: unknown }).kind;
-    return kind === "pi.assistant" || kind === "pi.tool-result";
-  });
-  const usage: UsageRow[] = [];
-  const trace: TraceRow[] = [];
-  const totalsRow = ap.run("SELECT v FROM meta WHERE k = ?", TOTALS_KEY)[0];
-  const totals: UsageTotals = totalsRow ? JSON.parse(String(totalsRow.v)) : emptyTotals();
-  let entries = 0;
-  const base = { at: ctx.now, ...ctx.owner };
-  for (const r of records) {
-    const record = JSON.parse(String(r.record)) as { kind: string; model?: MessageLike[] };
-    let produced = false;
-    for (const m of record.model ?? []) {
-      if (record.kind === "pi.assistant" && m.role === "assistant") {
-        const model = typeof m.model === "string" ? m.model : "unknown";
-        if (m.usage) {
-          usage.push(...modelTokenRows(base, model, m.usage));
-          add(totals.models, `${m.provider}/${m.model}`, m.usage);
-        }
-        // pi-storage's rule exactly: an ended answer that names its job.
-        if (typeof m.jobId === "string" && answerEnded(m.stopReason as Parameters<typeof answerEnded>[0])) {
-          const job = ap.run("SELECT created_at, answered_at FROM model_jobs WHERE id = ?", m.jobId)[0];
-          trace.push(modelCallRow({
-            ...ctx.owner, jobId: m.jobId, stopReason: m.stopReason as Parameters<typeof modelCallRow>[0]["stopReason"],
-            model, at: ctx.now,
-            createdAt: job ? Number(job.created_at) : null,
-            answeredAt: job && job.answered_at !== null ? Number(job.answered_at) : null,
-          }));
-        }
-        produced = true;
-      } else if (record.kind === "pi.tool-result" && m.role === "toolResult" && m.usage) {
-        usage.push(...modelTokenRows(base, "unknown", m.usage));
-        add(totals.tools, String(m.toolName), m.usage);
-        produced = true;
-      }
-    }
-    if (produced) entries++;
-  }
-
-  appendTrace(raw as Parameters<typeof appendTrace>[0], trace);
-  appendUsage(raw as Parameters<typeof appendUsage>[0], usage);
-  ctx.fault?.("appended");
-  ap.run("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", TOTALS_KEY, JSON.stringify(totals));
-  for (const [outbox, value] of [[OUTBOX_MARK, through], [OUTBOX_ENTRY_MARK, throughId]] as const) {
-    ap.run("INSERT INTO outbox_marks (outbox, through_seq, updated_at) VALUES (?, ?, ?) " +
-      "ON CONFLICT (outbox) DO UPDATE SET through_seq = excluded.through_seq, updated_at = excluded.updated_at", outbox, value, ctx.now);
-  }
-
-  const counted = countedUsage(raw, pd);
-  let check: UsageCheck;
-  if (typeof counted === "string") {
-    check = { state: "unreadable", reason: counted };
-    logEvent("pd.outbox.usage_unreadable", { ...ctx.owner, through, reason: counted });
-  } else if (!sameTotals(totals, counted)) {
-    check = { state: "mismatch", derived: totals, counted };
-    logEvent("pd.outbox.usage_mismatch", { ...ctx.owner, through, derived: JSON.stringify(totals), counted: JSON.stringify(counted) });
-  } else {
-    check = { state: "match" };
-  }
-  return { from, through, entries, usage: usage.filter((u) => Number.isFinite(u.quantity) && u.quantity !== 0).length, trace: trace.length, check };
+export function strandedAnswerRows(owner: { tenantId: string; agentId: string }, now: number, answer: string): UsageRow[] {
+  const m = JSON.parse(answer) as MessageLike;
+  return m.usage ? modelTokenRows({ at: now, ...owner }, typeof m.model === "string" ? m.model : "unknown", m.usage) : [];
 }

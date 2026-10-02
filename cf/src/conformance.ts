@@ -31,9 +31,9 @@
  * PdHost, a turn through `ap_model_jobs`, parked and reopened, on this object's storage
  * (test/durable-agent-do.sh).
  *
- * /pd-outbox runs the pd engine's usage and trace outbox cases (test/spec/pd-outbox-spec.ts): rows
- * derived from pi-durable's entries past a watermark, compared field for field with PiAgent's on the
- * same storage (test/pd-outbox-do.sh).
+ * /pd-outbox runs the pd engine's commit-hook cases (test/spec/pd-outbox-spec.ts): usage, trace and
+ * model job rows written inside pi-durable's commit, compared field for field with PiAgent's on the
+ * same storage, and the jobs' crash, cancel and rollback cases (test/pd-outbox-do.sh).
  *
  * /pd-writes runs the runtime's writes on a pd object (test/spec/pd-writes-spec.ts): an approval, an
  * expired question, a model binding, a background pass and the idle lease, each started inside an open

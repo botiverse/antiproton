@@ -1,5 +1,5 @@
 /**
- * The pd engine's usage and trace outboxes (test/spec/pd-outbox-spec.ts) over node:sqlite.
+ * The pd engine's commit-hook bookkeeping: usage, trace and model jobs (test/spec/pd-outbox-spec.ts) over node:sqlite.
  * `npm run pd-outbox:do` runs the same cases on a real Durable Object.
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -11,7 +11,7 @@ const results = await runDriveCases(pdOutboxCases(async (use) => {
   try { await use(host); } finally { host.dispose(); }
 }));
 
-console.log(`\n  pd outbox: usage and trace from pi-durable's entries — node:sqlite\n  ${"─".repeat(56)}`);
+console.log(`\n  pd outbox: usage, trace and jobs inside pi-durable's commit — node:sqlite\n  ${"─".repeat(56)}`);
 let group = "";
 for (const r of results) {
   if (r.group !== group) { group = r.group; console.log(`  ${group}`); }
