@@ -14,7 +14,7 @@
  * the transcript, rather than a `Context` with `systemPrompt` and `tools`
  * fields — and each one takes effect where it stands. pi-durable writes the
  * prompt after the first input, and a patch to it after a later input. The
- * queue consumer (`runQueuedModelCall` in cf/src/index.ts) reads a job's
+ * queue consumer (`modelQueueDeps` in cf/src/index.ts) reads a job's
  * `context` through `toRequest` in src/model/pi-bridge.ts, so `jobContext`
  * below writes the transcript as job wire format version 2 (`JobContextV2`
  * there): every system message inline at its place, and the current tools as
