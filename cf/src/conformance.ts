@@ -20,6 +20,9 @@
  * (test/spec/pi-durable-spec.ts) on this object's storage, through the async
  * `transaction` node can only imitate (test/pi-durable-do.sh).
  *
+ * /ap-store runs the `ap` namespace's cases and `PiDurableSqlite.exclusive`'s
+ * (test/spec/ap-store-spec.ts) on this object's storage (test/ap-store-do.sh).
+ *
  * /durable-drive runs the park contract's cases (test/spec/durable-drive-spec.ts):
  * a pi-durable harness on that facade, closed while it sleeps and reopened, on
  * this object's storage (test/durable-drive-do.sh).
@@ -30,6 +33,7 @@ import { PiSqliteStorage } from "../../src/store/pi-storage.ts";
 import { controlPlaneCases } from "../../test/spec/control-plane-spec.ts";
 import { usageCases } from "../../test/spec/usage-spec.ts";
 import { piDurableCases, runPiDurableCases, type PiDurableHost } from "../../test/spec/pi-durable-spec.ts";
+import { apStoreCases } from "../../test/spec/ap-store-spec.ts";
 import { durableDriveCases, runDriveCases } from "../../test/spec/durable-drive-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
@@ -56,6 +60,27 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
       for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
     };
     const results = await runPiDurableCases(piDurableCases(async (use) => {
+      wipe();
+      try { await use(host); } finally { wipe(); }
+    }));
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
+  async runApStoreSpec() {
+    const host: PiDurableHost = this.ctx.storage;
+    const t0 = Date.now();
+    const wipe = () => {
+      const names = host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()
+        .map((r) => String(r.name)).filter((n) => !n.startsWith("_cf_") && !n.startsWith("sqlite_"));
+      for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
+    };
+    const results = await runPiDurableCases(apStoreCases(async (use) => {
       wipe();
       try { await use(host); } finally { wipe(); }
     }));
@@ -148,6 +173,9 @@ export default {
     }
     if (new URL(request.url).pathname === "/durable-drive") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("durable-drive")).runDurableDriveSpec());
+    }
+    if (new URL(request.url).pathname === "/ap-store") {
+      return Response.json(await env.PROBE.get(env.PROBE.idFromName("ap-store")).runApStoreSpec());
     }
     if (new URL(request.url).pathname === "/pi-durable") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("pi-durable")).runPiDurableSpec());

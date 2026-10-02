@@ -12,8 +12,9 @@
  * table, joins it and rolls back with it. Every call through this facade waits
  * behind an open transaction (the queue below), but the queue orders only this
  * facade's calls — other code in the object that runs `sql.exec` while one is
- * open is not kept out. `test/pi-durable.ts` pins the facade's half: a throwing
- * transaction leaves no rows, and a write queued behind it survives.
+ * open is not kept out, unless it runs through `exclusive` below. `test/pi-durable.ts`
+ * pins the facade's half: a throwing transaction leaves no rows, and a write queued
+ * behind it survives; `test/ap-store.ts` pins `exclusive`.
  *
  * pi-durable's schema names a table `tasks`, and so does `AgentDO`'s
  * (src/store/durable-object.ts). Its migrations say `CREATE TABLE tasks` with no
@@ -32,6 +33,8 @@ import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespac
 export type DurableSqlHost = {
   sql: { exec(query: string, ...bindings: SqlBinding[]): { toArray(): Array<Record<string, SqlCell>> } };
   transaction<T>(closure: () => Promise<T>): Promise<T>;
+  /** Only `exclusive` uses it: a transaction that cannot span an await, and so cannot be joined. */
+  transactionSync<T>(closure: () => T): T;
 };
 type SqlBinding = string | number | null | Uint8Array;
 /** A Durable Object returns blobs as `ArrayBuffer`; node:sqlite returns `Uint8Array` and may return `bigint`. */
@@ -133,6 +136,7 @@ export class PiDurableSqlite implements SqliteDatabase {
   #connection: Connection;
   #queue = new SerialQueue();
   #closed = false;
+  #inTransaction = false;
 
   /** `namespace` places pi-durable's tables: `prefixedNamespace("pd")` on a Durable Object. */
   constructor(host: DurableSqlHost, namespace: SqlNamespace) {
@@ -159,12 +163,39 @@ export class PiDurableSqlite implements SqliteDatabase {
     return this.#queue.enqueue(async () => {
       if (this.#closed) throw new Error("database is closed");
       const handle = new TransactionHandle(this.#connection);
+      this.#inTransaction = true;
       try {
         return await this.#connection.host.transaction(async () => {
           try { return await callback(handle); } finally { handle.revoke(); }
         });
-      } finally { handle.revoke(); }
+      } finally { handle.revoke(); this.#inTransaction = false; }
     });
+  }
+
+  /** True while a pi-durable transaction is open on the host: any `sql.exec` issued now would join it. */
+  get inTransaction(): boolean { return this.#inTransaction; }
+
+  /**
+   * Runs a synchronous unit of our own SQL (src/store/ap-store.ts) as one transaction of its own,
+   * after any pi-durable transaction that is open or queued has settled.
+   *
+   * Our SQL cannot simply call `sql.exec`: while a pi-durable transaction is open it is a savepoint
+   * over the object's one connection, so our statements would join it, and be rolled back with it
+   * when pi-durable's commit fails — a write we believed done, gone. Going through this facade's
+   * queue keeps them out of it; `transactionSync` makes the unit atomic (a throw inside leaves
+   * nothing written). `fn` must not be async: a promise would be returned after the transaction had
+   * already committed, and whatever it awaited would run outside it, so a thenable result throws
+   * and rolls the unit back. It does not check `close()`: closing pi-durable's storage does not close
+   * the object's database, and our tables outlive it.
+   */
+  exclusive<T>(fn: () => T): Promise<T> {
+    return this.#queue.run(() => this.#connection.host.transactionSync(() => {
+      const result = fn();
+      if (typeof (result as { then?: unknown } | null)?.then === "function") {
+        throw new TypeError("exclusive() takes a synchronous function; an async one would run outside its transaction");
+      }
+      return result;
+    }));
   }
 
   close() { return this.#queue.run(() => { this.#closed = true; }); }
