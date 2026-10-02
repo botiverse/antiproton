@@ -118,15 +118,26 @@ export function toHourly(rows: readonly UsageRow[]): HourlyRow[] {
   return [...out.values()];
 }
 
-/** A model reply's usage, one row per kind of token it counted. */
+/** A model reply's usage, one row per kind of token it counted.
+ *
+ * `cacheWrite1h` is a SUBSET of `cacheWrite`, not a sibling: pi-ai's own
+ * type says "Subset of `cacheWrite` written with 1h retention", and pi's
+ * cost function prices the two parts as `cacheWrite − cacheWrite1h` and
+ * `cacheWrite1h` at a higher rate. So `cache_write` stays the TOTAL and
+ * `cache_write_1h` measures the part of it that carries long retention —
+ * the relation `reasoning` has to `output`. A pricer must NOT add the two
+ * keys (that double-counts the subset); it subtracts the subset and prices
+ * each part, the way pi's own cost function does.
+ */
 export function modelTokenRows(
   base: { at: number; tenantId: string; agentId: string },
   model: string,
-  usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number },
+  usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cacheWrite1h?: number; reasoning?: number },
 ): UsageRow[] {
   const kinds: Array<[string, number | undefined]> = [
     ["input", usage.input], ["output", usage.output], ["cache_read", usage.cacheRead],
-    ["cache_write", usage.cacheWrite], ["reasoning", usage.reasoning],
+    ["cache_write", usage.cacheWrite], ["cache_write_1h", usage.cacheWrite1h],
+    ["reasoning", usage.reasoning],
   ];
   return kinds
     .filter(([, n]) => typeof n === "number" && n !== 0)

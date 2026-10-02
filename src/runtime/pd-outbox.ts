@@ -69,7 +69,7 @@ export const OUTBOX_ENTRY_MARK = "usage+trace:entry-id";
 const TOTALS_KEY = "outbox.usage";
 
 /** The counters a usage row bills (`modelTokenRows`), and so the ones compared. */
-const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "reasoning"] as const;
+const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning"] as const;
 type Tokens = Record<(typeof COUNTERS)[number], number>;
 /** Keyed as `pi.usage` keys them: `models` by `provider/model`, `tools` by tool name. */
 export type UsageTotals = { models: Record<string, Tokens>; tools: Record<string, Tokens> };
@@ -101,7 +101,7 @@ const emptyTotals = (): UsageTotals => ({ models: {}, tools: {} });
 function add(bucket: Record<string, Tokens>, key: string, usage: UsageLike): void {
   // Own keys only, as pi-durable keeps them: a tool may be called `__proto__`.
   const have = Object.hasOwn(bucket, key) ? bucket[key]! : undefined;
-  const into: Tokens = have ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+  const into: Tokens = have ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0 };
   for (const c of COUNTERS) into[c] += typeof usage[c] === "number" ? usage[c]! : 0;
   if (!have) Object.defineProperty(bucket, key, { value: into, enumerable: true, writable: true });
 }

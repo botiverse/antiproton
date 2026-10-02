@@ -6,8 +6,9 @@
  */
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { UnknownJob } from "../cf/src/model-queue.ts";
+import { pdDeliveryWake } from "../cf/src/alarm-next.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
-import { DurableAgent } from "../src/runtime/durable-agent.ts";
+import { DurableAgent, guardJoinedWrites } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
@@ -49,7 +50,7 @@ const runtimeCases: DriveCase[] = [
       try {
         const { rt } = await runtime(host);
         const agent = await rt.agent("t", "a");
-        check(agent instanceof PiAgent, `opened ${agent.constructor.name}`);
+        check(agent instanceof PiAgent && !rt.servesPd, `opened ${agent.constructor.name}, servesPd ${rt.servesPd}`);
         check(objects(host, "ap_").length === 0 && objects(host, "pd_").length === 0,
           `created ${show([...objects(host, "ap_"), ...objects(host, "pd_")])}`);
         // The control for the probe: the pi085 tables are there, so the query sees what opening created.
@@ -74,6 +75,8 @@ const runtimeCases: DriveCase[] = [
         await rt.postMessage("t", "a", "Capital of France?");
         const parked = await rt.step("t", "a");
         check(parked.wakeInMs !== null && parked.wakeInMs > 0, `step: ${show(parked)}`);
+        // What AgentDO arms at the end of that pass (index.ts `alarm`): the park's time.
+        const parkAlarm = Date.now() + parked.wakeInMs;
         check(sent.length === 1, `dispatched ${show(sent)}`);
         const job = await rt.takeJob("t", "a", sent[0]!) as { model: { api: string; provider: string; id: string }; context: Parameters<typeof toRequest>[0] };
         check(toRequest(job.context).messages.some((m) => m.role === "user" && m.content === "Capital of France?"), `job ${show(job)}`);
@@ -83,9 +86,16 @@ const runtimeCases: DriveCase[] = [
         let thrown: unknown;
         try { await rt.deliverAnswer("t", "a", "mj_nope", answer); } catch (e) { thrown = e; }
         check(thrown instanceof UnknownJob, `pd unknown job: ${String(thrown)}`);
-        await sleep(parked.wakeInMs!);
+        // The delivery's wake (index.ts `deliverAnswer`): none while the park alarm is pending.
+        check(rt.servesPd && pdDeliveryWake(parkAlarm, Date.now()) === null, "a delivery on pd asked for a wake while the park alarm was pending");
+        const now = Date.now();
+        check(pdDeliveryWake(null, now) === now, "with no alarm pending a delivery must wake now");
+        // The control: the wake a delivery used to ask for, now, finds the poll still ahead and parks again.
+        const early = await rt.step("t", "a");
+        check(early.wakeInMs !== null && early.wakeInMs > 0, `a wake at delivery was productive after all: ${show(early)}`);
+        await sleep(parkAlarm - Date.now());
         const done = await rt.step("t", "a");
-        check(done.wakeInMs === null, `after the answer: ${show(done)}`);
+        check(done.wakeInMs === null, `the one wake at the park alarm did not finish the turn: ${show(done)}`);
         // The other half of the first case's probe: on this object the same query does see ap_ and pd_ objects.
         check(objects(host, "ap_").length > 0 && objects(host, "pd_").length > 0, "control: ap_/pd_ objects not seen");
         const branch = await rt.branchEntries("t", "a", "main");
@@ -93,6 +103,45 @@ const runtimeCases: DriveCase[] = [
         check(last?.role === "assistant" && last.content?.[0]?.text === "Paris", `branch ${show(branch)}`);
         await agent.close();
       } finally { host.dispose(); }
+    },
+  },
+  {
+    group: "runtime", name: "engine pd: messages and steps together make no write of the runtime's join an open pi-durable transaction",
+    run: async () => {
+      const raw = sqliteHost();
+      try {
+        // The interleaving, pinned: the first pi-durable transaction after `armed` is held open across a
+        // macrotask, and a message and a step are started from inside it — so their writes are issued
+        // while it is open. Fixed, they wait for it; joined, the guard refuses and records them.
+        let armed = false;
+        let started: Array<Promise<unknown>> = [];
+        let rt: AgentRuntime | undefined;
+        const slow: typeof raw = {
+          ...raw,
+          transaction: (cb) => raw.transaction(async () => {
+            if (armed) {
+              armed = false;
+              started = [rt!.postMessage("t", "a", "Q2", "steer"), rt!.step("t", "a")];
+              await sleep(20);
+            }
+            return cb();
+          }),
+        };
+        const guarded = guardJoinedWrites(slow);
+        const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
+        const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
+        await ap.ensure();
+        await ap.setEngineOnce("pd");
+        ({ rt } = await runtime(host));
+        await rt.postMessage("t", "a", "Q1");
+        armed = true;
+        const first = await Promise.allSettled([rt.step("t", "a")]);
+        check(started.length === 2, "control: no pi-durable transaction was opened after arming, so nothing ran inside one");
+        const results = [...first, ...await Promise.allSettled(started)];
+        const failed = results.filter((r) => r.status === "rejected").map((r) => String((r as PromiseRejectedResult).reason));
+        check(guarded.joined.length === 0 && failed.length === 0, `joined ${show(guarded.joined)}; failed ${show(failed)}`);
+        await (await rt.agent("t", "a")).close();
+      } finally { raw.dispose(); }
     },
   },
 ];
