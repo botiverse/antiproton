@@ -32,17 +32,9 @@
  *   which is what "interrupted" says, and what an evicted isolate does to it anyway. A park never
  *   gets here: it waits for every tool slot to be done (src/runtime/durable-drive.ts).
  * - **Our writes.** A call through the gateway writes the object's SQL as it goes (operation,
- *   approval, usage rows) across awaits. On pi085 nothing else was mid-transaction then. On pd, a
- *   commit of another call in the round, or of another conversation, is a pi-durable transaction held
- *   open across awaits, and a write issued meanwhile joins it (src/store/pi-durable-sqlite.ts) — or,
- *   for the store's own `transactionSync`, fails ("cannot start a transaction within a transaction",
- *   measured under node:sqlite with commits held open a few ms). So each call runs inside the
- *   facade's `apart`: it starts with no transaction open, and none opens until it returns. The price
- *   is that pi-durable's commits, and what queues behind them, wait for the calls running. One of
- *   those commits is each call's own intent, recorded before it runs, so a call that went first would
- *   hold its siblings' intents off and a parallel round would run one call at a time (measured); a
- *   call therefore waits, briefly and bounded, for every sibling of its round to have recorded its
- *   intent (`roundStarted`), and then they run together.
+ *   approval, usage rows) across awaits, as on pi085. Each pi-durable commit is one synchronous
+ *   transaction (the vendored src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js), so no write
+ *   of ours can land inside one, and a call runs alongside its round's commits with nothing held off.
  * - **Sequential.** `executionMode: "sequential"` (an exclusive mount) is passed through. pi-durable
  *   honours it for the whole round: one sequential call makes every call of that round run in turn
  *   (dist/harness/generation.js, `startToolRound`). pi-agent-core 0.85's harness reads only its
@@ -59,9 +51,8 @@
  *   pi085's: the call, then the caller's result as its result, with no placeholder in between.
  */
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
-import type { Context } from "@earendil-works/chord";
 import {
-  defineExtension, GenerationTask, hook, LiveDoc, type Extension, type ToolExecutionApi, type ToolRegistration,
+  defineExtension, GenerationTask, hook, type Extension, type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { Message, ToolResultMessage } from "pi-ai-1";
 import { CLIENT_PENDING } from "./client-calls.ts";
@@ -120,28 +111,8 @@ export const pi085View = <M extends Message>(m: M): M => pi085ClientAborted(pi08
 /** No bound of pi-durable's own: see "Output limits" above. */
 const UNBOUNDED = { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER } as const;
 
-/**
- * Until every started call of this round has recorded its intent (its `pi.live` slot is no longer
- * `pending`), or `ROUND_START_MS` passed. Only an optimisation: `apart` keeps the writes out of the
- * transactions either way, and past the bound the round simply runs one call at a time.
- */
-const ROUND_START_MS = 2_000;
-async function roundStarted(api: ToolExecutionApi, context: Context): Promise<void> {
-  const until = Date.now() + ROUND_START_MS;
-  for (let i = 0; Date.now() < until; i++) {
-    const live = await api.snapshot(LiveDoc, api.conversationId, context);
-    if (!(live?.tools ?? []).some((slot) => slot.taskId !== undefined && slot.status === "pending")) return;
-    context.abortSignal?.throwIfAborted();
-    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(2 ** i, 20)));
-  }
-}
-
-/** Runs a call's work with no pi-durable transaction open (`PiDurableSqlite.apart`). */
-export type Apart = <T>(fn: (release: () => void) => Promise<T>) => Promise<T>;
-const together: Apart = (fn) => fn(() => {});
-
 /** A pi085 tool, run by pi-durable. */
-export function durableTool(t: AgentHarnessTool<undefined>, apart: Apart = together): ToolRegistration {
+export function durableTool(t: AgentHarnessTool<undefined>): ToolRegistration {
   const tool = t as AgentHarnessTool<undefined> & { replay?: string; executionMode?: string };
   return {
     name: tool.name,
@@ -154,12 +125,8 @@ export function durableTool(t: AgentHarnessTool<undefined>, apart: Apart = toget
       try {
         // The model's id for the call, which pi085 hands every tool first: the gateway records it, run_js
         // numbers its idempotency keys from it, and a question is held under it.
-        await roundStarted(api, context);
-        const r = await apart((release) => {
-          const running = (tool.execute as (id: string, params: unknown) => Promise<{ content: ToolResultMessage["content"]; details?: unknown }>)(api.callId, args);
-          // An abandoned call stops holding pi-durable's commits off: the close that abandoned it is waiting for them.
-          return untilAborted(running, context.abortSignal, release);
-        });
+        const running = (tool.execute as (id: string, params: unknown) => Promise<{ content: ToolResultMessage["content"]; details?: unknown }>)(api.callId, args);
+        const r = await untilAborted(running, context.abortSignal);
         return {
           content: r.content,
           // Stored as JSON: a field set to undefined is dropped, as pi085's storage drops it.
@@ -175,12 +142,12 @@ export function durableTool(t: AgentHarnessTool<undefined>, apart: Apart = toget
 }
 
 /** `running`, or a rejection as soon as `signal` aborts, leaving `running` to finish on its own. */
-function untilAborted<T>(running: Promise<T>, signal: AbortSignal | undefined, onAbort: () => void): Promise<T> {
+function untilAborted<T>(running: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return running;
   running.catch(() => { /* detached: nobody reads its outcome */ });
-  if (signal.aborted) { onAbort(); return Promise.reject(signal.reason); }
+  if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise<T>((resolve, reject) => {
-    const abort = () => { onAbort(); reject(signal.reason); };
+    const abort = () => { reject(signal.reason); };
     signal.addEventListener("abort", abort, { once: true });
     running.then(
       (v) => { signal.removeEventListener("abort", abort); resolve(v); },
@@ -231,13 +198,13 @@ export function clientTool(def: ClientToolDef, port: ClientCallPort): ToolRegist
 
 /** The extension a session's conversation selects: its tools, and the hook that shows the model pi085's texts (`pi085View`). */
 export function toolsExtension(
-  name: string, tools: readonly AgentHarnessTool<undefined>[], apart?: Apart,
+  name: string, tools: readonly AgentHarnessTool<undefined>[],
   client?: { defs: readonly ClientToolDef[]; port: ClientCallPort },
 ): Extension {
   return defineExtension({
     name,
     // The caller's functions last, as pi085 lists them (cf/src/runtime.ts `agent()`).
-    tools: [...tools.map((t) => durableTool(t, apart)), ...(client?.defs ?? []).map((d) => clientTool(d, client!.port))],
+    tools: [...tools.map((t) => durableTool(t)), ...(client?.defs ?? []).map((d) => clientTool(d, client!.port))],
     hooks: [hook(GenerationTask, {
       beforeRequest: ({ messages }) => {
         const shown = messages.map(pi085View);

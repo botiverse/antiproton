@@ -20,7 +20,7 @@ import type { Json } from "../../src/core/types.ts";
 import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "../../src/model/types.ts";
 import { interrupt, type Plugin } from "../../src/plugins/types.ts";
-import { DurableAgent, guardJoinedWrites, PdHost } from "../../src/runtime/durable-agent.ts";
+import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
 import { PI085_INTERRUPTED, pdInterruptedBlock } from "../../src/runtime/durable-tools.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
@@ -30,8 +30,7 @@ import {
 } from "../../src/runtime/pi-tools.ts";
 import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
-import { PiDurableSqlite, type DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
-import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
+import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { UnknownJob } from "../../cf/src/model-queue.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 
@@ -362,56 +361,9 @@ export const toolMessages = (req: Request) => req.messages.filter((m) => m.role 
 
 // ---- the cases ----------------------------------------------------------------------
 
-/**
- * `slowCommitMs`: how long each pi-durable transaction is held open before its work, a timer inside
- * the transaction. node:sqlite allows it; a Durable Object's `transaction()` blocks the object's
- * concurrency while it is open and resets the object when that lasts (measured: "blockConcurrencyWhile()
- * ... waited for too long" within the first case), so the DO run passes 0.
- */
-export function pdToolsCases(withRawHost: WithDriveHost, opts: { slowCommitMs: number }): DriveCase[] {
-  const SLOW_COMMIT_MS = opts.slowCommitMs;
+export function pdToolsCases(withHost: WithDriveHost): DriveCase[] {
   const cases: DriveCase[] = [];
-  /**
-   * Every case's storage goes through `guardJoinedWrites` (src/runtime/durable-agent.ts), and every case
-   * ends by asserting that nothing of ours — the gateway's operation and approval rows, the store's
-   * agent rows, ap_ rows — was written while a pi-durable transaction was open.
-   */
-  const joined: string[] = [];
-  const withHost: WithDriveHost = (use) => withRawHost(async (raw) => {
-    // Every pi-durable transaction held open across a macrotask: what a slow commit on a busy object
-    // looks like, and the widest window for anything else to write into it.
-    const slow: DurableSqlHost = SLOW_COMMIT_MS === 0 ? raw : {
-      sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
-      transaction: (cb) => raw.transaction(async () => { await sleep(SLOW_COMMIT_MS); return cb(); }),
-    };
-    const g = guardJoinedWrites(slow);
-    try { await use({ sql: g.sql, transaction: g.transaction, transactionSync: g.transactionSync }); } finally { joined.push(...g.joined); }
-  });
-  const add = (group: string, name: string, run: () => Promise<void>, opts: { joins?: true } = {}) => cases.push({
-    group, name, run: async () => {
-      joined.length = 0;
-      await run();
-      if (opts.joins) check(joined.length > 0, "control: the guard saw no write");
-      else check(joined.length === 0, `${joined.length} writes joined an open pi-durable transaction: ${show(joined.slice(0, 5))}`);
-    },
-  });
-
-  add("joined", "control: a gateway call made inside an open pi-durable transaction is seen joining it", async () => {
-    await withHost(async (storage) => {
-      const w = await world(storage);
-      const db = new PiDurableSqlite(storage, prefixedNamespace("pd"));
-      let failed = "";
-      await db.transaction(async () => {
-        try {
-          const r = await w.host.invoke({ tool: "web.read_page", args: { url: "u" } });
-          if (r.status !== "succeeded") failed = show(r);
-        } catch (e) { failed = String(e); }
-      });
-      // Under node:sqlite the store's own transactionSync cannot nest and the call fails; on a Durable
-      // Object it nests. Either way its writes were issued inside, which is what the guard records.
-      void failed;
-    });
-  }, { joins: true });
+  const add = (group: string, name: string, run: () => Promise<void>) => cases.push({ group, name, run });
 
   add("parity", "the model is offered the same tools — names, descriptions, schemas, order — run_js and resume among them", async () => {
     const r = await both(withHost, "hello", [say("hi")]);

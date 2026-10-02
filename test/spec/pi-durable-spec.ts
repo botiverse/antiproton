@@ -334,7 +334,7 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
   /**
    * The host, with a hook on pi-durable's first `pd_entries` insert: from inside that statement it schedules
    * `probe` twice, as a microtask and as a timer — the two ways other code of the object gets to run while
-   * something is in progress. `probe` writes with the raw `sql.exec`, past the facade and its queue.
+   * something is in progress. `probe` writes with the raw `sql.exec`, past the facade.
    */
   const probing = (host: PiDurableHost, probe: (how: string) => void): PiDurableHost => {
     let armed = true;
@@ -350,7 +350,6 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
           return result;
         },
       },
-      transaction: (closure) => host.transaction(closure),
       transactionSync: (closure) => host.transactionSync(closure),
     };
   };
@@ -404,39 +403,35 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     ]);
   }));
 
-  add("a transaction that throws after an await leaves no rows, and a write queued meanwhile survives", () => withHost(async (host) => {
+  add("transactionSync: a throw leaves no rows, a commit keeps them, and the handle dies with it", () => withHost(async (host) => {
     const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     const boom = new Error("boom");
-    const order: string[] = [];
-    let wrote!: () => void;
-    const firstRowWritten = new Promise<void>((r) => { wrote = r; });
-    const txn = db.transaction(async (tx) => {
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 100);
-      wrote();
-      await sleep(20);
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 101);
-      order.push("transaction throws");
+    const failed = await db.transactionSync((tx) => {
+      tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 100);
       throw boom;
-    }).then(() => { order.push("transaction resolved"); }, (e: unknown) => { order.push(e === boom ? "transaction rejected with its error" : `rejected with ${String(e)}`); });
-    await firstRowWritten;
-    const outside = db.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'entry')", 200).then(() => { order.push("outside write done"); });
-    await Promise.all([txn, outside]);
-    vitestLikeAssertions.deepEqual(await recordIds(db), [200]);
-    vitestLikeAssertions.deepEqual(order, ["transaction throws", "transaction rejected with its error", "outside write done"]);
-  }));
-
-  add("a transaction that commits keeps writes made across awaits, and its handle dies with it", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host, PD);
-    await applySqliteMigrations(db);
-    const handle = await db.transaction(async (tx) => {
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 300);
-      await sleep(5);
-      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 301);
+    }).then(() => null, (e: unknown) => e);
+    check(failed === boom, `transactionSync rejected with ${String(failed)}, not the callback's error`);
+    const handle = await db.transactionSync((tx) => {
+      tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 300);
+      tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 301);
       return tx;
     });
     vitestLikeAssertions.deepEqual(await recordIds(db), [300, 301]);
-    await vitestLikeAssertions.rejects(handle.get("SELECT 1 AS one"), "no longer active");
+    vitestLikeAssertions.strictEqual((() => { try { handle.get("SELECT 1 AS one"); return "ran"; } catch (e) { return String(e); } })().includes("no longer active"), true);
+  }));
+
+  add("transactionSync refuses an async or generator callback before calling it, and rolls back one that returns a thenable", () => withHost(async (host) => {
+    const db = new PiDurableSqlite(host, PD);
+    await applySqliteMigrations(db);
+    const ran: string[] = [];
+    const write = (tx: { run(sql: string, ...p: number[]): void }, id: number) => { ran.push(String(id)); tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", id); };
+    await vitestLikeAssertions.rejects(db.transactionSync((async (tx: never) => { await null; write(tx, 1); }) as never), "is not called");
+    await vitestLikeAssertions.rejects(db.transactionSync((function* (tx: never) { write(tx, 2); }) as never), "is not called");
+    await vitestLikeAssertions.rejects(db.transactionSync((tx) => { write(tx, 3); return Promise.resolve(); }), "returned a thenable");
+    await sleep(5);
+    vitestLikeAssertions.deepEqual(ran, ["3"]);
+    vitestLikeAssertions.deepEqual(await recordIds(db), []);
   }));
 
   add("bigint binds as the same integer, an unsafe one is refused, and a blob comes back as bytes", () => withHost(async (host) => {

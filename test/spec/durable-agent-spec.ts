@@ -223,7 +223,6 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
         if (armed && /INSERT INTO pd_submissions/i.test(q)) { armed = false; closes++; queueMicrotask(() => { void host!.close(); }); }
         return storage.sql.exec(q, ...b);
       } },
-      transaction: (c) => storage.transaction(c),
       transactionSync: (c) => storage.transactionSync(c),
     };
     const o = object(closing);
@@ -253,7 +252,6 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
         if (failNext && q.includes("dispatched_at IS NULL OR")) { failNext = false; throw new Error("injected: the sweep's read failed"); }
         return storage.sql.exec(q, ...b);
       } },
-      transaction: (c) => storage.transaction(c),
       transactionSync: (c) => storage.transactionSync(c),
     };
     const o = object(flaky);

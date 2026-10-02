@@ -134,15 +134,17 @@ add("the vendored migrations are the package's schema, statement for statement",
 });
 
 /** Open, commit, read a document and close over a facade that counts which transaction each step asks for. */
-async function transactionsAsked(open: (db: PiDurableSqlite) => Promise<upstreamSqlite.SqliteStorage>) {
+async function transactionsAsked(open: (db: PiDurableSqlite & upstreamSqlite.SqliteDatabase) => Promise<upstreamSqlite.SqliteStorage>) {
   const host = sqliteHost();
   const db = new PiDurableSqlite(host, prefixedNamespace("pd"));
   const asked = { transaction: 0, transactionSync: 0 };
-  const { transaction, transactionSync } = db;
-  db.transaction = (cb) => { asked.transaction++; return transaction.call(db, cb) as never; };
+  const { transactionSync } = db;
+  // The facade has no async transaction; upstream's storage (the control) asks for one, and is handed the
+  // facade's own statements, which is enough to count what it asks.
+  (db as PiDurableSqlite & upstreamSqlite.SqliteDatabase).transaction = (cb) => { asked.transaction++; return cb(db as never); };
   db.transactionSync = (cb) => { asked.transactionSync++; return transactionSync.call(db, cb) as never; };
   try {
-    const storage = await open(db);
+    const storage = await open(db as PiDurableSqlite & upstreamSqlite.SqliteDatabase);
     await storage.commit([{ type: "conversation", value: { id: 1 as never } }], bg);
     await storage.document(1 as never, "current", bg);
     await storage.close(bg);

@@ -115,7 +115,6 @@ tests only) and `@earendil-works/chord` (types, and `chord/context` in
 |---|---|---|
 | `emptyUsage`, `addUsage` | `harness/utils/usage.js` | `src/store/pi-storage.ts` |
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
-| the facade's serial operation queue (re-implemented, smaller: a transaction always queues; and ours: one queue per object, shared by every facade the object opens, with our own SQL let ahead of a queued transaction while an `apart` section holds, since none can be open then) | pi-durable `storage/sqlite/node.js` (`SerialOperationQueue`) | `src/store/pi-durable-sqlite.ts` |
 | the interrupted-call line (`INTERRUPTION_MARKER`), and the shape of pi-durable's interrupted result | pi-agent-core `harness/runtime/drive/tools.js`; pi-durable `harness/tool.js` (`fromSlot`, `renderDiagnostics`) | `src/runtime/durable-tools.ts` (`PI085_INTERRUPTED`, `pdInterruptedBlock`); `test/pd-tools.ts` reads both installed files |
 | starting a run with no input (`live.run` set to a new conversation-owned `GenerationTask`), and the context-edit rule (newest edit of a target wins) | pi-durable `harness/generation.js` (`startRun`); `harness/context.js` (`deriveContext`) | `src/runtime/durable-agent.ts` (`#resumeLeftCalls`, `withEdits`); `test/pd-cancel.ts` compares the requests and branch with pi085's after a caller answers a call its turn left |
 | the shape of pi-durable's aborted result (`Tool <name> was aborted`, the slot's `details` kept) | pi-durable `harness/tool.js` (the task's `abort`, `fromSlot`) | `src/runtime/durable-tools.ts` (`pdAbortedBlock`, `pi085ClientAborted`); `test/pd-cancel.ts` compares what each engine sends the model after a cancel |
@@ -183,9 +182,9 @@ Cancel and the API caller's functions (`DurableAgent.cancel`, `clientTool`;
   tool published before (`api.details`) are kept. pi085's abort instead waits
   for the tool and records its real result — the one request that differs
   after a cancel mid-call.
-- A gateway call runs inside `apart`, which holds pi-durable's commits off, the
-  abort mark's among them: a cancel waits for the call in flight, as pi085's
-  does.
+- Nothing holds pi-durable's commits off while a gateway call runs, so the
+  abort mark commits with the call still in flight, and the call's late result
+  is not committed (above).
 - A tool may wait in `execute()` as long as it likes; `close()` aborts it. A
   `safe` one is run again on reopen, which is what lets a harness whose only
   pending work is the caller's function close with no alarm
@@ -242,6 +241,31 @@ sets an alarm in the past that reopens, fetches, parks again — a spike measure
 one fetch, the wake that parks again with one fetch, the wake whose `pollAt` has
 passed, input while parked, and the retry backoff, and judge one parked
 snapshot at T−1, T and T+1.
+
+#### On pi-durable: one synchronous commit, and plain writes beside it
+
+A pi-durable commit is one host `transactionSync` (the vendored `storage.js`, see
+*Changing upstream files*): every statement in it synchronous, so no other code
+of the object runs between its first statement and its commit or rollback.
+Nothing of ours can land inside one, and a failed commit rolls back only its
+own writes. That is the whole of the coordination between pi-durable and the
+rest of the object: the facade (`src/store/pi-durable-sqlite.ts`) runs each
+statement when it is called, with no queue; the runtime, the store, the
+gateway, the plugins and `AgentDO` write the object's SQL with plain
+statements, before, after and alongside pi-durable's commits; a tool call runs
+alongside its round's commits. Where several writes of ours must land together
+they run in their own `transactionSync` (`ApStore.unit`, the store's methods
+that had one). It rests on:
+
+- **No pi-durable transaction spans an await.** The vendored `storage.js` and
+  `migrations.js` ask only for `transactionSync`, `storage.js` refuses a
+  database without it, and the facade has no async `transaction`. `test/pi-vendor.ts` counts what the
+  vendored storage asks for (no async transaction) against upstream's (three).
+- A raw `sql.exec` scheduled from inside a commit — a microtask or a timer —
+  runs after it, sees it whole, and survives its rollback. `test/pi-durable.ts`
+  and `npm run pi-durable:do` probe both; `test/spec/pd-commits.ts` starts work
+  as each commit ends, which is how `test/pd-writes.ts`, `test/pd-cancel.ts` and
+  `test/durable-agent.ts` drive the runtime's writes against commits.
 
 #### On pi-durable: usage and trace are derived after the commit
 

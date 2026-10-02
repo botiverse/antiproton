@@ -1,20 +1,14 @@
 /**
- * pi-durable's `SqliteDatabase` facade over a Durable Object's own SQLite.
+ * pi-durable's SQLite database facade over a Durable Object's own SQLite.
  *
- * `@earendil-works/pi-durable/storage/sqlite` is a portable storage core that
- * asks for four async statements and an async `transaction(callback)`. A Durable
- * Object offers neither directly: `transactionSync` takes only a synchronous
- * callback, and the runtime rejects SQL `BEGIN` and `SAVEPOINT`. What it does
- * offer is `ctx.storage.transaction(async () => ...)`, which commits `sql.exec`
- * writes made across awaits and rolls them back when the closure throws — a
- * savepoint over the object's one connection. Being a savepoint over the one
- * connection is also its hazard: any `sql.exec` issued while it is open, on any
- * table, joins it and rolls back with it. Every call through this facade waits
- * behind an open transaction (the queue below), but the queue orders only this
- * facade's calls — other code in the object that runs `sql.exec` while one is
- * open is not kept out, unless it runs through `exclusive` below. `test/pi-durable.ts`
- * pins the facade's half: a throwing transaction leaves no rows, and a write queued
- * behind it survives; `test/ap-store.ts` pins `exclusive`.
+ * `@earendil-works/pi-durable/storage/sqlite` is a portable storage core that asks for four async
+ * statements and an async `transaction(callback)`. A Durable Object's only transaction that spans an
+ * await, `ctx.storage.transaction`, is a savepoint over the object's one connection that any `sql.exec`
+ * issued meanwhile joins and rolls back with. So we run a vendored storage
+ * (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js) that asks instead for `transactionSync`:
+ * the host's `transactionSync`, with a synchronous handle, so each commit, migration and document read
+ * runs whole before any other code does. Nothing of ours can join it, and nothing here orders, queues
+ * or holds anything: every statement runs when it is called. `test/pi-durable.ts` pins the facade.
  *
  * pi-durable's schema names a table `tasks`, and so does `AgentDO`'s
  * (src/store/durable-object.ts). Its migrations say `CREATE TABLE tasks` with no
@@ -25,21 +19,15 @@
  * SQLite, and on a store with real schemas it could be `pd.tasks` with nothing
  * here changing. The rewrite is an allowlist of the names below, and a
  * statement that would create any other name throws.
- *
- * `transactionSync` is the transaction nothing can join: the host's `transactionSync`, with a synchronous
- * handle, so the whole unit runs before any other code does. The vendored pi-durable storage
- * (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js) commits, migrates and reads documents through
- * it, and calls `transaction` no more; `transaction` stays for a caller of upstream's storage.
  */
-import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/pi-durable/storage/sqlite";
+import type { SqliteValue } from "@earendil-works/pi-durable/storage/sqlite";
 import type { SqliteSyncDatabase, SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
 /** The slice of `ctx.storage` this needs, and all that a test must fake. */
 export type DurableSqlHost = {
   sql: { exec(query: string, ...bindings: SqlBinding[]): { toArray(): Array<Record<string, SqlCell>> } };
-  transaction<T>(closure: () => Promise<T>): Promise<T>;
-  /** Only `exclusive` uses it: a transaction that cannot span an await, and so cannot be joined. */
+  /** A transaction that cannot span an await, and so cannot be joined. */
   transactionSync<T>(closure: () => T): T;
 };
 type SqlBinding = string | number | null | Uint8Array;
@@ -87,117 +75,20 @@ function readRow(row: Record<string, SqlCell>): Record<string, SqliteValue> {
 
 type Connection = { host: DurableSqlHost; names: SqlQualifier };
 
-/** Not globals: the constructors of `async function`, `function*` and `async function*`, which `exclusive` refuses. */
+/** Not globals: the constructors of `async function`, `function*` and `async function*`, which `transactionSync` refuses. */
 const ASYNC_FUNCTION = (async () => {}).constructor;
 const GENERATOR_FUNCTION = function* () {}.constructor;
 const ASYNC_GENERATOR_FUNCTION = async function* () {}.constructor;
 
-/** The refusal `exclusive` and `outside` give a function declared async or as a generator, before calling it. */
-function refuseAsync(fn: unknown, name: string): Promise<never> | null {
-  if (fn instanceof ASYNC_FUNCTION || fn instanceof ASYNC_GENERATOR_FUNCTION || fn instanceof GENERATOR_FUNCTION) {
-    return Promise.reject(new TypeError(`${name} takes a synchronous function; an async or generator one would run outside its transaction, so it is not called`));
-  }
-  return null;
-}
-
 function query(c: Connection, sql: string, params: readonly SqliteValue[]): Array<Record<string, SqliteValue>> {
   return c.host.sql.exec(c.names.rewrite(sql), ...params.map(bindValue)).toArray().map(readRow);
-}
-
-/**
- * One operation at a time, in call order. A plain statement runs at once when nothing is queued,
- * so a read outside a transaction costs no extra turn; anything issued while a transaction is open
- * waits for it to settle.
- *
- * One queue per object, not per facade: `PdHost` opens a fresh facade for every harness it opens, and
- * hands each the same queue (`PiDurableSqlite`'s `queue` option), so that `apart` and `exclusive` asked
- * while no harness is open still hold off the transactions of one opened meanwhile. A queue per facade
- * held off only its own facade's, and a section that started with no harness open was not held against
- * the next one at all.
- */
-export class SerialQueue {
-  #tail: Promise<unknown> = Promise.resolve();
-  #pending = 0;
-  /** Async sections of ours running now (`apart`); a transaction does not open while any is. */
-  #apart = 0;
-  #apartDone: Array<() => void> = [];
-  /** A transaction is running now: between its start and its settling. */
-  #open = false;
-
-  /**
-   * Whether work of ours may start at once, ahead of whatever is queued: true while an `apart` section
-   * holds transactions off and none is open. A transaction cannot open while any section is held, so
-   * nothing that starts now can join one, and waiting behind a queued transaction would wait on a
-   * transaction that waits on the section — which is how a store write inside a tool call, or an
-   * `apart` inside another, would deadlock. Only our own entry points (`ours`) take this; pi-durable's
-   * statements keep their order behind its transactions.
-   */
-  get #clear(): boolean { return this.#apart > 0 && !this.#open; }
-
-  run<T>(operation: () => T, opts: { ours?: boolean } = {}): Promise<T> {
-    // Sound only because a plain statement is synchronous: `query` has no await, so it cannot yield
-    // and cannot interleave with anything. Only a transaction spans awaits, and it goes through
-    // `enqueue`, which raises #pending so every other call queues behind it. This check is that
-    // ordering, not an optimisation; without it a statement could run between
-    // a transaction's statements and be committed or rolled back with them.
-    if (this.#pending > 0 && !(opts.ours && this.#clear)) return this.enqueue(async () => operation());
-    try { return Promise.resolve(operation()); } catch (error) { return Promise.reject(error); }
-  }
-
-  enqueue<T>(operation: () => Promise<T>, opts: { transaction?: boolean } = {}): Promise<T> {
-    this.#pending++;
-    const start = opts.transaction
-      ? async () => {
-        while (this.#apart > 0) await new Promise<void>((r) => this.#apartDone.push(r));
-        this.#open = true;
-        try { return await operation(); } finally { this.#open = false; }
-      }
-      : operation;
-    const settled = this.#tail.then(start).finally(() => { this.#pending--; });
-    this.#tail = settled.then(() => undefined, () => undefined);
-    return settled;
-  }
-
-  /**
-   * `fn` once no transaction is open or queued ahead of it, with every transaction queued after it held
-   * until it settles. Sections run alongside one another: they keep transactions off, not each other,
-   * and one asked while another holds starts at once (`#clear`). `release` ends the hold early (see
-   * `PiDurableSqlite.apart`).
-   */
-  async apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> {
-    if (this.#clear) this.#apart++;
-    else await this.enqueue(async () => { this.#apart++; });
-    let held = true;
-    const release = () => {
-      if (!held) return;
-      held = false;
-      if (--this.#apart === 0) for (const wake of this.#apartDone.splice(0)) wake();
-    };
-    try { return await fn(release); } finally { release(); }
-  }
 }
 
 // The row type is the caller's claim about its own SELECT; nothing here can check it, which is the
 // contract pi-durable's `get<T>`/`all<T>` declare.
 const asRows = <T extends object>(rows: Array<Record<string, SqliteValue>>) => rows as unknown as T[];
 
-class TransactionHandle implements SqliteExecutor {
-  #connection: Connection;
-  #active = true;
-  constructor(connection: Connection) { this.#connection = connection; }
-  revoke() { this.#active = false; }
-
-  #use<T>(operation: (connection: Connection) => T): Promise<T> {
-    if (!this.#active) return Promise.reject(new Error("SQLite transaction handle is no longer active"));
-    try { return Promise.resolve(operation(this.#connection)); } catch (error) { return Promise.reject(error); }
-  }
-  exec(sql: string) { return this.#use((c) => { query(c, sql, []); }); }
-  run(sql: string, ...params: SqliteValue[]) { return this.#use((c) => { query(c, sql, params); }); }
-  get<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))[0]); }
-  all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
-}
-
-/** `TransactionHandle` for `transactionSync`: each call has run its statement when it returns. */
+/** The handle `transactionSync` hands its callback: each call has run its statement when it returns. */
 class SyncTransactionHandle implements SqliteSyncExecutor {
   #connection: Connection;
   #active = true;
@@ -214,26 +105,20 @@ class SyncTransactionHandle implements SqliteSyncExecutor {
   all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
 }
 
-export class PiDurableSqlite implements SqliteDatabase, SqliteSyncDatabase {
+export class PiDurableSqlite implements SqliteSyncDatabase {
   #connection: Connection;
-  #queue: SerialQueue;
   #closed = false;
-  #inTransaction = false;
 
-  /**
-   * `namespace` places pi-durable's tables: `prefixedNamespace("pd")` on a Durable Object. `queue` is the
-   * object's one queue when several facades are opened on it over time (`SerialQueue`); absent, a fresh one.
-   */
-  constructor(host: DurableSqlHost, namespace: SqlNamespace, opts: { queue?: SerialQueue } = {}) {
+  /** `namespace` places pi-durable's tables: `prefixedNamespace("pd")` on a Durable Object. */
+  constructor(host: DurableSqlHost, namespace: SqlNamespace) {
     this.#connection = { host, names: new SqlQualifier(PI_DURABLE_OBJECTS, namespace) };
-    this.#queue = opts.queue ?? new SerialQueue();
   }
 
   #use<T>(operation: (connection: Connection) => T): Promise<T> {
-    return this.#queue.run(() => {
+    try {
       if (this.#closed) throw new Error("database is closed");
-      return operation(this.#connection);
-    });
+      return Promise.resolve(operation(this.#connection));
+    } catch (error) { return Promise.reject(error); }
   }
   exec(sql: string) { return this.#use((c) => { query(c, sql, []); }); }
   run(sql: string, ...params: SqliteValue[]) { return this.#use((c) => { query(c, sql, params); }); }
@@ -241,119 +126,29 @@ export class PiDurableSqlite implements SqliteDatabase, SqliteSyncDatabase {
   all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
 
   /**
-   * The host's transaction rejects with the closure's own error after rolling back. If the rollback
-   * itself failed, the Durable Object gives no separate signal, so the "different error" pi-durable's
-   * contract asks for in that case cannot be produced here.
-   */
-  transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
-    return this.#queue.enqueue(async () => {
-      if (this.#closed) throw new Error("database is closed");
-      const handle = new TransactionHandle(this.#connection);
-      this.#inTransaction = true;
-      try {
-        return await this.#connection.host.transaction(async () => {
-          try { return await callback(handle); } finally { handle.revoke(); }
-        });
-      } finally { handle.revoke(); this.#inTransaction = false; }
-    }, { transaction: true });
-  }
-
-  /**
    * `callback` as one host `transactionSync`, every statement in it synchronous: no other code runs between
    * its first statement and its commit or rollback, so no statement of anyone else's can join it, and a
-   * rollback removes only what `callback` wrote. A throw rolls back and rejects with the thrown error. It is
-   * scheduled as `transaction` is — after whatever is queued, held off by `apart` sections — so the queue's
-   * order is unchanged; the transaction itself needs none of it. Refused like `exclusive`: a function
-   * declared async or as a generator is not called, and a returned thenable rolls back and rejects.
+   * rollback removes only what `callback` wrote. A throw rolls back and rejects with the thrown error. A
+   * function declared async or as a generator is not called, and a returned thenable rolls back and rejects:
+   * the work behind either would run outside the transaction.
    */
   transactionSync<T>(callback: (transaction: SqliteSyncExecutor) => T): Promise<T> {
-    const refused = refuseAsync(callback, "transactionSync()");
-    if (refused) return refused;
-    return this.#queue.enqueue(async () => {
-      if (this.#closed) throw new Error("database is closed");
-      const handle = new SyncTransactionHandle(this.#connection);
-      try {
-        return this.#connection.host.transactionSync(() => {
-          const result = callback(handle);
-          if (typeof (result as { then?: unknown } | null)?.then === "function") {
-            throw new TypeError("transactionSync() takes a synchronous function; this one returned a thenable, whose work would run outside its transaction");
-          }
-          return result;
-        });
-      } finally { handle.revoke(); }
-    }, { transaction: true });
+    if (callback instanceof ASYNC_FUNCTION || callback instanceof ASYNC_GENERATOR_FUNCTION || callback instanceof GENERATOR_FUNCTION) {
+      return Promise.reject(new TypeError("transactionSync() takes a synchronous function; an async or generator one would run outside its transaction, so it is not called"));
+    }
+    if (this.#closed) return Promise.reject(new Error("database is closed"));
+    const handle = new SyncTransactionHandle(this.#connection);
+    try {
+      return Promise.resolve(this.#connection.host.transactionSync(() => {
+        const result = callback(handle);
+        if (typeof (result as { then?: unknown } | null)?.then === "function") {
+          throw new TypeError("transactionSync() takes a synchronous function; this one returned a thenable, whose work would run outside its transaction");
+        }
+        return result;
+      }));
+    } catch (error) { return Promise.reject(error); }
+    finally { handle.revoke(); }
   }
 
-  /** True while a pi-durable transaction is open on the host: any `sql.exec` issued now would join it. */
-  get inTransaction(): boolean { return this.#inTransaction; }
-
-  /**
-   * Runs a synchronous unit of our own SQL (src/store/ap-store.ts) as one transaction of its own,
-   * after any pi-durable transaction that is open or queued has settled.
-   *
-   * Our SQL cannot simply call `sql.exec`: while a pi-durable transaction is open it is a savepoint
-   * over the object's one connection, so our statements would join it, and be rolled back with it
-   * when pi-durable's commit fails — a write we believed done, gone. Going through this facade's
-   * queue keeps them out of it; `transactionSync` makes the unit atomic (a throw inside leaves
-   * nothing written). It does not check `close()`: closing pi-durable's storage does not close the
-   * object's database, and our tables outlive it.
-   *
-   * `fn` must be synchronous, because only what it does before it returns is inside the unit. What
-   * is caught:
-   * - a function declared `async` (function, arrow or method) or as a generator, async or not, is
-   *   refused before it is called: none of its body runs, so nothing after its first `await` can
-   *   land later, outside the unit or inside whatever transaction is open by then;
-   * - a plain function that returns a thenable has its synchronous part rolled back and is refused.
-   * What is not: the work behind that returned thenable (an async function it called, a `.then`
-   * callback) still runs later, outside the unit, as does any promise `fn` starts and does not
-   * return. Neither can be stopped once started, only not started; `fn` must not start them.
-   */
-  exclusive<T>(fn: () => T): Promise<T> {
-    const refused = refuseAsync(fn, "exclusive()");
-    if (refused) return refused;
-    return this.#queue.run(() => this.#connection.host.transactionSync(() => {
-      const result = fn();
-      if (typeof (result as { then?: unknown } | null)?.then === "function") {
-        throw new TypeError("exclusive() takes a synchronous function; this one returned a thenable, whose work would run outside its transaction");
-      }
-      return result;
-    }), { ours: true });
-  }
-
-  /**
-   * `exclusive`'s timing without its transaction: synchronous SQL of ours that already decides its own
-   * atomicity — a store method with its own `transactionSync`, which inside `exclusive` would nest one
-   * transaction in another (node:sqlite refuses that; a Durable Object would make it a savepoint) — run
-   * once no pi-durable transaction is open or queued ahead of it. The same refusals as `exclusive`; a
-   * thenable it returns is refused after the fact, with whatever its synchronous part wrote kept, since
-   * there is no unit here to roll back.
-   */
-  outside<T>(fn: () => T): Promise<T> {
-    const refused = refuseAsync(fn, "outside()");
-    if (refused) return refused;
-    return this.#queue.run(() => {
-      const result = fn();
-      if (typeof (result as { then?: unknown } | null)?.then === "function") {
-        throw new TypeError("outside() takes a synchronous function; this one returned a thenable, whose work would run unguarded");
-      }
-      return result;
-    }, { ours: true });
-  }
-
-  /**
-   * Async work of ours that writes the object's SQL across awaits — a tool call through the gateway,
-   * whose store writes operation, approval and usage rows as it goes — kept out of every pi-durable
-   * transaction: it starts once none is open or queued ahead of it, and no transaction opens until
-   * it settles. `exclusive` is the same guarantee for a synchronous unit; this is it for one that
-   * awaits, at the price that pi-durable's commits wait for it.
-   *
-   * `fn` must not wait for a pi-durable transaction itself (a commit through the harness, opening one):
-   * that transaction waits for `fn`, so neither would finish. Our own SQL is not that: `exclusive`,
-   * `outside` and another `apart` asked while a section holds start at once (`SerialQueue`), since no
-   * transaction can be open then. It may call `release` to end the hold before it settles — for work it
-   * stops waiting for, whose later writes are then unguarded.
-   */
-  apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> { return this.#queue.apart(fn); }
-
-  close() { return this.#queue.run(() => { this.#closed = true; }); }
+  close() { this.#closed = true; return Promise.resolve(); }
 }

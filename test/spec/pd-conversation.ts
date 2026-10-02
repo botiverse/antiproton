@@ -9,7 +9,6 @@
 import { AgentRuntime } from "../../cf/src/runtime.ts";
 import { fromResponse } from "../../src/model/pi-bridge.ts";
 import { ApStore } from "../../src/store/ap-store.ts";
-import { PiDurableSqlite } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import type { sqliteHost } from "../../src/store/sqlite-host.ts";
 
@@ -34,13 +33,13 @@ export async function agentRuntime(host: Host, engine: Engine) {
   host.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
   host.sql.exec("INSERT INTO owner(k, tenant_id, agent_id) VALUES ('self','demo','u-a')");
   if (engine === "pd") {
-    const ap = new ApStore(host.sql, new PiDurableSqlite(host, prefixedNamespace("pd")), prefixedNamespace("ap"));
-    await ap.ensure();
-    await ap.setEngineOnce("pd");
+    const ap = new ApStore(host, prefixedNamespace("ap"));
+    ap.ensure();
+    ap.setEngineOnce("pd");
   }
   const sent: string[] = [];
   const rt = new AgentRuntime({
-    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync, transaction: host.transaction } },
+    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
     operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
