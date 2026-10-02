@@ -30,6 +30,10 @@ import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
+import { resumeClientCalls } from "./client-calls.ts";
+import type { AgentEngine, EngineEntry, EngineEntryScan, EngineStatus, StepOutcome } from "./engine.ts";
+
+export type { StepOutcome } from "./engine.ts";
 
 const JOBS = `CREATE TABLE IF NOT EXISTS pi_model_jobs (
   id TEXT PRIMARY KEY, request TEXT NOT NULL, answer TEXT,
@@ -174,15 +178,8 @@ export interface PiAgentOptions {
   now?: () => number;
 }
 
-export interface StepOutcome {
-  /** Operations still open after this pass. */
-  open: number;
-  /** When to come back, in ms from now, or null if nothing is pending. */
-  wakeInMs: number | null;
-  settled: Array<{ operationId: string; status: string }>;
-}
-
-export class PiAgent {
+/** The `pi085` engine. */
+export class PiAgent implements AgentEngine {
   #opts: PiAgentOptions;
   #sql: SqlHost["sql"];
   #storage: PiSqliteStorage;
@@ -513,6 +510,39 @@ export class PiAgent {
       wakeInMs: after.current ? (wake ?? REDELIVERY_MS) : null,
       settled,
     };
+  }
+
+  async markCancelled(marker: string): Promise<void> {
+    await this.#lane.appendCustomEntry(marker, { operationId: null }, CTX);
+  }
+
+  resumeClientCalls(): Promise<boolean> {
+    return resumeClientCalls({
+      sql: this.#sql, session: this.#opts.session ?? MAIN_SESSION, lane: this.#lane,
+      branch: (tip) => this.#storage.scanBranch({ start: tip, order: "oldestFirst" }, CTX),
+    });
+  }
+
+  async running(): Promise<boolean> {
+    return (await this.#lane.inspectExecution(CTX)).current !== null;
+  }
+
+  async status(): Promise<EngineStatus> {
+    const execution = await this.#lane.inspectExecution(CTX);
+    return { running: execution.current !== null, model: execution.configuredModel, detail: execution };
+  }
+
+  entries(query: EngineEntryScan): Promise<EngineEntry[]> {
+    return this.#storage.scanEntries(query, CTX);
+  }
+
+  async branch(): Promise<EngineEntry[]> {
+    const tip = (await this.#lane.inspectExecution(CTX)).tipId;
+    return tip ? this.#storage.scanBranch({ start: tip, order: "oldestFirst" }, CTX) : [];
+  }
+
+  tools(): Promise<Array<{ name: string }>> {
+    return this.#harness.getTools(CTX);
   }
 
   async close() { await this.#harness.close(CTX); }

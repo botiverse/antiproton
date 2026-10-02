@@ -548,14 +548,14 @@ await check("runtime: resume is offered without run_js when a mounted plugin can
   await rt.store.setPluginChoice("t", "a", "sql", "enable");
   await rt.store.addMount({ tenantId: "t", agentId: "a", alias: "db", plugin: "sql", installationId: "i", connectionId: null,
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
-  const tools = await (await rt.agent("t", "a")).harness.getTools(BACKGROUND_CONTEXT as any) as any[];
+  const tools = await (await rt.agent("t", "a")).tools() as any[];
   const names = tools.map((t) => t.name);
   must(names.includes("resume") && !names.includes("run_js") && names.includes("db__query"), `offered: ${names}`);
   const y = body(await tools.find((t) => t.name === "db__query").execute("c1", { sql: "DELETE FROM users" }));
   must(y.state === "yielded" && typeof y.token === "string" && rt.runJsContinuations.size === 1, `yielded: ${JSON.stringify(y)}`);
   const done = body(await tools.find((t) => t.name === "resume").execute("r1", { token: y.token, answer: "confirm" }));
   must(done.deleted === 2 && JSON.stringify(db.rows.get("users")) === "[]", `resumed through the runtime's host: ${JSON.stringify(done)}`);
-  const other = (await (await rt.agent("t", "b")).harness.getTools(BACKGROUND_CONTEXT as any) as any[]).map((t) => t.name);
+  const other = (await (await rt.agent("t", "b")).tools()).map((t) => t.name);
   must(!other.includes("resume"), `resume offered with nothing that can ask: ${other}`);
   host.dispose();
 });

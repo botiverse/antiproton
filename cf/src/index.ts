@@ -92,7 +92,6 @@ import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import { operatorModelOf } from "./model-request.ts";
 import { operatorRequest } from "../../src/model/operator-request.ts";
-import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
@@ -617,8 +616,7 @@ export class AgentDO extends DurableObject<Env> {
    */
   async #entries(tenantId: string, agentId: string, fromSeq?: number) {
     const agent = await this.#activeRuntime().agent(tenantId, agentId);
-    return agent.storage.scanEntries(
-      { order: "asc", ...(fromSeq === undefined ? {} : { fromSeq }) }, BACKGROUND_CONTEXT);
+    return agent.entries({ order: "asc", ...(fromSeq === undefined ? {} : { fromSeq }) });
   }
 
   /**
@@ -944,7 +942,7 @@ export class AgentDO extends DurableObject<Env> {
     await rt.ready();
     const agentId = `b_${taskId}`;
     const agent = await rt.agent("bench", agentId);
-    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[];
+    const entries = await agent.entries({ order: "asc" }) as any[];
     const usage = entries.reduce((a: any, e: any) => {
       const m = e.message;
       if (m?.role !== "assistant" || m.stopReason === "deferred") return a;
@@ -1030,9 +1028,9 @@ export class AgentDO extends DurableObject<Env> {
 
   async #benchPollInner(taskId: string) {
     const agent = await this.#activeRuntime().agent("bench", `b_${taskId}`);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const running = await agent.running();
     const events = entriesToEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
+      await agent.entries({ order: "asc" }));
     // One builder for the body, shared with the runner's tests: a fixture cannot then have a shape this
     // endpoint never sends, which is how the poll fallback stayed inert for four days (src/bench/poll-body.ts).
     return benchPollBody(events, running);
@@ -1042,12 +1040,12 @@ export class AgentDO extends DurableObject<Env> {
    *  bench runs; it is cheaper to be able to look. */
   async benchDebug(taskId: string) {
     const agent = await this.#activeRuntime().agent("bench", this.#benchAgentId(taskId));
-    const tools = await agent.harness.getTools(BACKGROUND_CONTEXT);
-    const entries = await agent.storage.scanEntries({ order: "desc", limit: 4 }, BACKGROUND_CONTEXT);
-    const execution = await agent.lane.inspectExecution(BACKGROUND_CONTEXT);
+    const tools = await agent.tools();
+    const entries = await agent.entries({ order: "desc", limit: 4 });
+    const execution = await agent.status();
     return {
-      status: execution.current ? "running" : "idle",
-      model: execution.configuredModel,
+      status: execution.running ? "running" : "idle",
+      model: execution.model,
       toolCount: tools.length,
       toolNames: tools.map((t: any) => t.name),
       lastMessages: entries.reverse().map((e: any) => ({
@@ -1068,8 +1066,7 @@ export class AgentDO extends DurableObject<Env> {
       .toArray();
     let execution: unknown = null;
     if (who) {
-      execution = await (await rt.agent(who.tenantId, who.agentId))
-        .lane.inspectExecution(BACKGROUND_CONTEXT);
+      execution = (await (await rt.agent(who.tenantId, who.agentId)).status()).detail;
     }
     return { owner: who, execution, modelJobs: jobs, alarm: await this.ctx.storage.getAlarm() };
   }
@@ -1162,7 +1159,7 @@ export class AgentDO extends DurableObject<Env> {
     const agentId = this.#benchAgentId(taskId);
     const agent = await rt.agent("bench", agentId);
     const events = entriesToEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)) as any[];
+      await agent.entries({ order: "asc" })) as any[];
     const usage = events.reduce(
       (a: any, e: any) => {
         const u = e.payload?.usage;
@@ -1175,7 +1172,7 @@ export class AgentDO extends DurableObject<Env> {
     // to answer — does anything reach for run_js — with no on-object evidence.
     const byTool: Record<string, number> = {};
     let toolErrors = 0;
-    for (const e of await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[]) {
+    for (const e of await agent.entries({ order: "asc" }) as any[]) {
       const name = e.message?.role === "toolResult" ? e.message.toolName : null;
       if (name) byTool[name] = (byTool[name] ?? 0) + 1;
       if (name && e.message.isError) toolErrors += 1;
@@ -1354,7 +1351,7 @@ export class AgentDO extends DurableObject<Env> {
     const agent = await rt.agent(tenantId, agentId, sessionId);
     // The branch, not every entry: resuming a paused call leaves its placeholder result on the branch it left.
     const entries = await rt.branchEntries(tenantId, agentId, sessionId);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const running = await agent.running();
     const pending = running ? [] : await rt.waitingClientCalls(tenantId, agentId, sessionId);
     return JSON.stringify({ entries, running, pending });
   }
@@ -1372,7 +1369,7 @@ export class AgentDO extends DurableObject<Env> {
     // 2026-09-14: "no model binding" on a fresh session).
     if (!(await rt.store.getModelBinding(tenantId, agentId))) return { status: "idle", pending: [] };
     const agent = await rt.agent(tenantId, agentId, sessionId);
-    if ((await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null) return { status: "in_progress", pending: [] };
+    if (await agent.running()) return { status: "in_progress", pending: [] };
     const pending = await rt.waitingClientCalls(tenantId, agentId, sessionId);
     return { status: pending.length ? "requires_action" : "idle", pending };
   }
@@ -1595,7 +1592,7 @@ export class AgentDO extends DurableObject<Env> {
     const used: Record<string, number> = {};
     try {
       const agent = await rt.agent(tenantId, agentId);
-      const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+      const entries = await agent.entries({ order: "asc" });
       for (const e of entries as any[]) {
         const n = e.message?.role === "toolResult" ? e.message.toolName : null;
         if (n) used[n] = (used[n] ?? 0) + 1;
@@ -1932,8 +1929,8 @@ export class AgentDO extends DurableObject<Env> {
     const rt = this.runtime();
     const agent = await rt.agent(tenantId, agentId, session);
     const shown = transcriptEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT), this.sql, session, { tenantId, agentId }, tail);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+      await agent.entries({ order: "asc" }), this.sql, session, { tenantId, agentId }, tail);
+    const running = await agent.running();
     const pendingApproval = (await rt.store.listApprovals(tenantId, "pending")).length > 0;
     const busy: UiTranscript["busy"] = pendingApproval ? "waiting-for-approval" : running ? "thinking" : null;
     return { ...shown, byOp: approvalsByOp(await rt.store.listApprovals(tenantId)), busy };
@@ -2012,8 +2009,8 @@ export class AgentDO extends DurableObject<Env> {
     this.#claim(tenantId, agentId);
     const agent = await this.runtime().agent(tenantId, agentId);
     const events = entriesToEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+      await agent.entries({ order: "asc" }));
+    const running = await agent.running();
     const last = [...events].reverse()
       .find((e) => e.kind === "model.response" && !(e.payload as any).toolCalls);
     return {
