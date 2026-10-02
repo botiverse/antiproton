@@ -6,7 +6,6 @@
  */
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { UnknownJob } from "../cf/src/model-queue.ts";
-import { pdDeliveryWake } from "../cf/src/alarm-next.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
 import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
@@ -21,7 +20,6 @@ const activeTimers = () => process.getActiveResourcesInfo().filter((r) => r === 
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
 /** An AgentRuntime over node:sqlite, as test/provision-runtime.ts builds one, with the dispatches it makes. */
 async function runtime(host: ReturnType<typeof sqliteHost>) {
@@ -86,16 +84,12 @@ const runtimeCases: DriveCase[] = [
         let thrown: unknown;
         try { await rt.deliverAnswer("t", "a", "mj_nope", answer); } catch (e) { thrown = e; }
         check(thrown instanceof UnknownJob, `pd unknown job: ${String(thrown)}`);
-        // The delivery's wake (index.ts `deliverAnswer`): none while the park alarm is pending.
-        check(rt.servesPd && pdDeliveryWake(parkAlarm, Date.now()) === null, "a delivery on pd asked for a wake while the park alarm was pending");
-        const now = Date.now();
-        check(pdDeliveryWake(null, now) === now, "with no alarm pending a delivery must wake now");
-        // The control: the wake a delivery used to ask for, now, finds the poll still ahead and parks again.
-        const early = await rt.step("t", "a");
-        check(early.wakeInMs !== null && early.wakeInMs > 0, `a wake at delivery was productive after all: ${show(early)}`);
-        await sleep(parkAlarm - Date.now());
+        // The delivery's wake (index.ts `deliverAnswer`), now, as on pi085: that step reads the answer, long before
+        // the park alarm, which is only the backstop for a lost wake.
+        check(rt.servesPd, "control: not a pd runtime");
         const done = await rt.step("t", "a");
-        check(done.wakeInMs === null, `the one wake at the park alarm did not finish the turn: ${show(done)}`);
+        check(done.wakeInMs === null, `the wake at delivery did not finish the turn: ${show(done)}`);
+        check(Date.now() < parkAlarm - 60_000, "the turn finished only near the park alarm");
         // The other half of the first case's probe: on this object the same query does see ap_ and pd_ objects.
         check(objects(host, "ap_").length > 0 && objects(host, "pd_").length > 0, "control: ap_/pd_ objects not seen");
         const branch = await rt.branchEntries("t", "a", "main");

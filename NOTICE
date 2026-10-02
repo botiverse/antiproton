@@ -18,8 +18,9 @@ storage conformance suite against it.
 It also includes four files of pi-durable 1.0.0's compiled package, copied and
 modified, each with a header saying what was changed:
 src/vendor/pi/pi-durable/dist/harness/scheduler.js (reports a task's sleep to
-the host), src/vendor/pi/pi-durable/dist/harness/harness.js (passes that
-option through), src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js
+the host, and ends it on the host's wake),
+src/vendor/pi/pi-durable/dist/harness/harness.js (passes that option and the
+wake through), src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js
 (commits in one synchronous transaction) and
 src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js (migrates in one).
 They are pi's, under the MIT License below.

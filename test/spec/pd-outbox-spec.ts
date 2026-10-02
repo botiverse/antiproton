@@ -23,7 +23,7 @@ import { pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
 import { UnknownJob } from "../../cf/src/model-queue.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 
-const POLL = { firstMs: 200, maxMs: 800 };
+const POLL_MS = 200;
 const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
 const OWNER = { tenantId: "t", agentId: "a" };
 const PROMPT = "You are a terse test assistant.";
@@ -61,7 +61,7 @@ const pdJobs = (storage: DurableSqlHost): Jobs =>
 function pdObject(storage: DurableSqlHost, extra: { outboxFault?: (stage: "appended") => void } = {}) {
   const dispatched: string[] = [];
   const passes: DerivePass[] = [];
-  const host = new PdHost({ storage, poll: POLL, minParkMs: 1, onOutboxPass: (p) => passes.push(p), ...extra });
+  const host = new PdHost({ storage, pollAfterMs: POLL_MS, minParkMs: 1, onOutboxPass: (p) => passes.push(p), ...extra });
   const agent = DurableAgent.open({
     host, ...OWNER, model: MODEL, systemPrompt: PROMPT,
     dispatch: async (id) => { dispatched.push(id); },

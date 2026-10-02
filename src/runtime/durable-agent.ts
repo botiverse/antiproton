@@ -11,7 +11,8 @@
  *   (src/runtime/durable-drive.ts) until the harness is idle or only sleeping —
  *   which the vendored scheduler reports itself (src/vendor/pi/pi-durable/) —
  *   closes it, and returns the sleep's end as `wakeInMs`. A parked object has
- *   no harness open and no timer alive.
+ *   no harness open and no timer alive. A delivered answer ends the sleep
+ *   early (`#wakeAnswered`): `pollAt` is only the backstop for a lost wake.
  * - The model call is the offloaded provider on pi-ai 1.0
  *   (src/model/durable-offloaded.ts). Its port writes `ap_model_jobs`
  *   (src/store/ap-store.ts) instead of `pi_model_jobs`, and the worker reads and
@@ -48,7 +49,7 @@
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
   AgentDoc, createRegistry, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID, ToolTask,
-  type Conversation, type ConversationId, type EntryRecord, type HarnessInspection,
+  type Conversation, type ConversationId, type EntryRecord, type HarnessInspection, type TaskId,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 // The vendored Harness: pi-durable 1.0.0's with a scheduler that reports a sleeping task (`sleepingUntil`).
@@ -80,12 +81,12 @@ const MAIN_SESSION = "main";
 const REDELIVERY_MS = 120_000;
 
 /**
- * The poll interval: 2 s for the first look, doubling to 30 s. pi-durable fixes `pollAt` in the
- * checkpoint when a poll comes back not ready, so a delivered answer cannot shorten a sleep already
- * committed; a short first interval keeps a quick answer quick, and the doubling keeps a slow call
- * from costing a wake every two seconds.
+ * How long a generation sleeps before it polls its job again, every time. It is not what makes a turn
+ * go on: `deliver` wakes the task that waits for the answer (`#wakeAnswered`), and so does every `drive`,
+ * so the answer is read as soon as it is written. This is the backstop for a wake that was lost (an
+ * isolate gone between the answer and the wake): the park's alarm, and the latest a turn can stall.
  */
-export const DEFAULT_POLL = { firstMs: 2_000, maxMs: 30_000 } as const;
+export const POLL_BACKSTOP_MS = 300_000;
 
 /** How long one `step()` keeps the harness open waiting for work that is neither idle nor sleeping. */
 const STEP_DEADLINE_MS = 30_000;
@@ -97,10 +98,13 @@ export interface PdHostOptions {
   /** The object's storage: `ctx.storage` on a Durable Object, `sqliteHost()` under node. */
   storage: DurableSqlHost;
   now?: () => number;
-  poll?: { firstMs: number; maxMs: number };
+  /** The poll interval; `POLL_BACKSTOP_MS` when absent. */
+  pollAfterMs?: number;
   /** A sleeper due sooner than this is waited for in-process instead of parked (settle's `minParkMs`). */
   minParkMs?: number;
   stepDeadlineMs?: number;
+  /** Never wake a task for a delivered answer: a lost wake, which the poll interval must cover. For tests. */
+  noWake?: boolean;
   /** Each provider poll of a job, and whether it found the answer. For tests and traces. */
   onPoll?: (jobId: string, ready: boolean) => void;
   /** A test seam into the outbox pass (src/runtime/pd-outbox.ts, `DeriveContext.fault`). */
@@ -175,7 +179,6 @@ export class PdHost {
         `not ${binding.tenantId}/${binding.agentId} (an object reused across agents is not supported yet, step 10)`);
     }
     this.#binding = binding;
-    const poll = this.#opts.poll ?? DEFAULT_POLL;
     // Registered again on every bind: the binding's model is the truth, as PiAgent's `open` treats it.
     this.#models.setProvider(durableOffloadedProvider({
       port: {
@@ -184,8 +187,7 @@ export class PdHost {
         cancel: (id) => this.#dropJob(id),
       },
       id: binding.model.provider,
-      pollAfterMs: poll.firstMs,
-      maxPollAfterMs: poll.maxMs,
+      pollAfterMs: this.#opts.pollAfterMs ?? POLL_BACKSTOP_MS,
       models: [{
         id: binding.model.id, contextWindow: binding.model.contextWindow,
         ...(binding.model.maxTokens === undefined ? {} : { maxTokens: binding.model.maxTokens }),
@@ -395,6 +397,9 @@ export class PdHost {
       await this.ensureSessions();
       const ap = await this.#store();
       const h = await this.harness();
+      // Before the resume, so a task whose answer came while the object was parked skips its sleep (a wake kept
+      // for a task not sleeping yet is used by its next sleep).
+      await this.#wakeAnswered(h);
       h.resume();
       return settle(h, {
         context: bg, now: this.#now,
@@ -527,6 +532,29 @@ export class PdHost {
     (await this.#store()).query("DELETE FROM model_jobs WHERE id = ?", id);
   }
 
+  /**
+   * Wake every task whose `poll` checkpoint waits for a job that has its answer (only `jobId`'s, when given): its
+   * sleep ends now, or its next one does not wait (`Harness.wake`). Read from storage rather than remembered, so a
+   * reopened harness finds what was delivered while it was closed. A wake too early costs one poll, which comes
+   * back not ready and commits a new `pollAt`.
+   */
+  async #wakeAnswered(h: Harness, jobId?: string): Promise<void> {
+    if (this.#opts.noWake) return;
+    const polling = new Map<string, TaskId[]>();
+    for (const t of (await h.inspect(bg)).tasks) {
+      const checkpoint = (t.record.state as { checkpoint?: { phase?: unknown; handle?: { id?: unknown } } }).checkpoint;
+      const job = checkpoint?.phase === "poll" ? checkpoint.handle?.id : undefined;
+      if (typeof job !== "string" || (jobId !== undefined && job !== jobId)) continue;
+      polling.set(job, [...(polling.get(job) ?? []), t.record.id]);
+    }
+    if (polling.size === 0) return;
+    const ids = [...polling.keys()];
+    const answered = (await this.#store()).query(
+      `SELECT id FROM model_jobs WHERE answer IS NOT NULL AND id IN (${ids.map(() => "?").join(", ")})`, ...ids);
+    const tasks = answered.flatMap((r) => polling.get(String(r.id)) ?? []);
+    if (tasks.length > 0) h.wake(tasks);
+  }
+
   /** The worker's question: the request, or null once answered so a redelivered message does not call twice. */
   async takeJob(id: string): Promise<unknown> {
     const [row] = (await this.#store()).query("SELECT request, answer FROM model_jobs WHERE id = ?", id);
@@ -534,14 +562,26 @@ export class PdHost {
     return row.answer === null ? JSON.parse(String(row.request)) : null;
   }
 
-  /** The worker's answer. False when one is already in. Writing it is what the next poll reads. */
+  /**
+   * The worker's answer. False when one is already in. Writing it is what the next poll reads, and when the
+   * harness is open the task waiting for it is woken now. When it is not, the caller wakes the object
+   * (cf/src/index.ts `deliverAnswer`), and that step's `drive` wakes the task.
+   */
   async deliver(id: string, answer: AnsweredMessage): Promise<boolean> {
     const json = JSON.stringify(answer);
     const now = this.#now();
     const ap = await this.#store();
     // One statement decides it, so two deliveries cannot both see the row unanswered.
     const won = ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING id", json, now, id);
-    if (won.length > 0) return true;
+    if (won.length > 0) {
+      const open = this.#harness;
+      if (open) {
+        // The answer is durable: a wake that fails (the harness closed under it) leaves it to the next step's.
+        try { await this.#wakeAnswered(await open, id); }
+        catch (error) { logEvent("pd.wake.error", { jobId: id, error: String((error as Error)?.message ?? error).slice(0, 200) }); }
+      }
+      return true;
+    }
     if (ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length === 0) throw this.#bound().unknownJob(id);
     return false;
   }

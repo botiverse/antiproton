@@ -62,7 +62,7 @@ const STEP_DEADLINE_MS = 3_000;
 
 function pd(storage: DurableSqlHost, w: World, opts: { stepDeadlineMs?: number } = {}): Eng {
   const dispatched: string[] = [];
-  const host = new PdHost({ storage, poll: { firstMs: 20, maxMs: 40 }, minParkMs: 1, stepDeadlineMs: opts.stepDeadlineMs ?? STEP_DEADLINE_MS });
+  const host = new PdHost({ storage, pollAfterMs: 20, minParkMs: 1, stepDeadlineMs: opts.stepDeadlineMs ?? STEP_DEADLINE_MS });
   const agent = DurableAgent.open({
     host, tenantId: "t", agentId: "a", model: MODEL, systemPrompt: SYSTEM,
     dispatch: async (id) => { dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),

@@ -13,13 +13,17 @@ import { BACKGROUND_CONTEXT as BACKGROUND } from "@earendil-works/chord/context"
 import { durableOffloadedProvider } from "../../src/model/durable-offloaded.ts";
 import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
-import { DEFAULT_POLL, DurableAgent, PdHost, type DurableAgentOptions } from "../../src/runtime/durable-agent.ts";
+import { DurableAgent, PdHost, POLL_BACKSTOP_MS, type DurableAgentOptions, type PdHostOptions } from "../../src/runtime/durable-agent.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { createModels } from "pi-ai-1/models";
 import { replyingUnknownJob, UnknownJob } from "../../cf/src/model-queue.ts";
 import type { DriveCase, TimerProbe, WithDriveHost } from "./durable-drive-spec.ts";
 
-const POLL = { firstMs: 300, maxMs: 1_200 };
+/**
+ * The poll interval of these objects: longer than a case may take, so a turn that completes after an answer
+ * completed because the answer woke it. A case about the interval itself passes its own (`object`'s `opts`).
+ */
+const POLL_MS = 60_000;
 const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
@@ -41,10 +45,10 @@ const CASE_DEADLINE_MS = 15_000;
 let caseHosts: PdHost[] = [];
 
 /** One object's engine, as AgentRuntime builds it, with what a case reads: dispatches and polls. */
-function object(storage: DurableSqlHost, polls: Array<{ id: string; ready: boolean }> = []) {
+function object(storage: DurableSqlHost, polls: Array<{ id: string; ready: boolean }> = [], opts: Partial<PdHostOptions> = {}) {
   const dispatched: string[] = [];
   const host = new PdHost({
-    storage, poll: POLL, minParkMs: 1, stepDeadlineMs: STEP_DEADLINE_MS, onPoll: (id, ready) => polls.push({ id, ready }),
+    storage, pollAfterMs: POLL_MS, minParkMs: 1, stepDeadlineMs: STEP_DEADLINE_MS, onPoll: (id, ready) => polls.push({ id, ready }), ...opts,
   });
   caseHosts.push(host);
   const agent = (session?: string, extra: Partial<DurableAgentOptions> = {}) => DurableAgent.open({
@@ -81,6 +85,14 @@ async function untilPolling(host: PdHost) {
   }
   throw new Error("the generation never reached its poll sleep");
 }
+/** Wait until the transcript ends with the answer `text`; how long after `t0` that was. */
+async function untilAnswer(agent: DurableAgent, text: string, t0: number): Promise<number> {
+  for (let i = 0; i < 400; i++) {
+    if (turns(await agent.entries({})).at(-1) === `assistant(stop): ${text}`) return Date.now() - t0;
+    await sleep(5);
+  }
+  throw new Error(`the answer ${text} never reached the transcript`);
+}
 const turns = (entries: Array<{ type: string; message?: unknown }>) => entries.map((e) => {
   const m = (e as { message: { role: string; content: unknown; stopReason?: string } }).message;
   const text = typeof m.content === "string" ? m.content
@@ -112,23 +124,26 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const a = o.agent();
     const said = await a.say("Capital of France?") as { value: { operationId?: string } };
     check(said.value.operationId, `an idle conversation did not start a run: ${show(said)}`);
+    const t0 = Date.now();
     const parked = await a.step();
-    check(parked.wakeInMs !== null && parked.wakeInMs > 0 && parked.wakeInMs <= POLL.firstMs && parked.open === 1, `step: ${show(parked)}`);
+    const took = Date.now() - t0;
+    check(parked.wakeInMs !== null && parked.wakeInMs > 0 && parked.wakeInMs <= POLL_MS && parked.open === 1, `step: ${show(parked)}`);
     check(!o.host.open, "the harness is still open after a park");
     if (activeTimers) check(activeTimers() === 0, `live timers after the park: ${activeTimers()}`);
     const rows = jobs(storage);
     check(rows.length === 1 && rows[0]!.answer === null && rows[0]!.dispatched_at !== null, `jobs ${show(rows)}`);
     check(show(o.dispatched) === show([rows[0]!.id]), `dispatched ${show(o.dispatched)}`);
     // Also what pins PdHost passing no `onSleep`: the poll sleep must be seen by the read its checkpoint's commit
-    // brings. Seen only at settle's 1 s recheck, the 300 ms sleep would be over and the job fetched before the park.
-    check(o.polls.length === 0, `polled before the park ended (the park waited for settle's recheck?): ${show(o.polls)}`);
+    // brings. Seen only at settle's 1 s recheck, the step would take that second.
+    check(o.polls.length === 0, `polled before the park ended: ${show(o.polls)}`);
+    check(took < 900, `the park took ${took} ms (did it wait for settle's 1 s recheck?)`);
     const id = rows[0]!.id;
     const asked = await consume(a, id, "Paris");
     check(asked.some((m) => m.role === "user" && m.content === "Capital of France?") && asked.some((m) => m.role === "system" && m.content.includes("terse test assistant")),
       `the model was asked ${show(asked)}`);
     check(await a.takeJob(id) === null, "an answered job was handed out again");
     check(await a.deliver(id, fromResponse(reply("again"), { api: "x", provider: "queue", id: "m1" }, id)) === false, "a second answer was accepted");
-    await sleep(parked.wakeInMs);
+    // The wake the delivery asks of the object: at once, not at the park's time.
     const done = await a.step();
     check(done.wakeInMs === null && done.open === 0, `after the answer: ${show(done)}`);
     check(show(o.polls) === show([{ id, ready: true }]), `polls ${show(o.polls)}`);
@@ -141,7 +156,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await a.close();
   });
 
-  add("turn", "close mid-poll, reopen as a new object: the turn completes with one job and exactly one fetch", async (storage) => {
+  add("turn", "close mid-poll, reopen as a new object, answer: its first step completes the turn with one job and exactly one fetch", async (storage) => {
     const polls: Array<{ id: string; ready: boolean }> = [];
     const first = object(storage, polls);
     const a = first.agent();
@@ -155,9 +170,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const second = object(storage, polls);
     const b = second.agent();
     await consume(b, row.id, "A1");
-    const parked = await b.step();
-    check(parked.wakeInMs !== null && polls.length === 0, `reopened before pollAt: ${show(parked)}, polls ${show(polls)}`);
-    await sleep(parked.wakeInMs);
+    check(!second.host.open && polls.length === 0, `the delivery opened a harness or polled: polls ${show(polls)}`);
     const done = await b.step();
     check(done.wakeInMs === null, `after the answer: ${show(done)}`);
     check(jobs(storage).length === 1, `a reopen called the model again: ${jobs(storage).length} jobs`);
@@ -177,7 +190,6 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const rows = jobs(storage);
     check(rows.length === 1 && o.dispatched.length === 1, `jobs ${rows.length}, dispatches ${o.dispatched.length}: the generation ran twice`);
     await consume(a, rows[0]!.id, "A1");
-    await sleep(x.wakeInMs);
     const [p, q] = await Promise.all([a.step(), again.step()]);
     check(p.wakeInMs === null && q.wakeInMs === null, `after the answer: ${show([p, q])}`);
     check(o.polls.length === 1, `fetches ${show(o.polls)}`);
@@ -193,8 +205,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(parked.wakeInMs !== null, `step: ${show(parked)}`);
     const [first] = jobs(storage);
     await consume(a, first!.id, "A1");
-    await sleep(parked.wakeInMs);
-    // The step's pass is in flight — its poll is due — when the message arrives. A second harness
+    // The step's pass is in flight — the answer woke its poll — when the message arrives. A second harness
     // opened for the message would be a second scheduler running the same poll.
     const [stepped] = await Promise.all([a.step(), a.say("Q2", "steer")]);
     check(stepped.wakeInMs !== null && !o.host.open, `step: ${show(stepped)}, open ${o.host.open}`);
@@ -203,7 +214,6 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(o.polls.filter((p) => p.id === first!.id).length === 1, `fetches of the first job: ${show(o.polls)}`);
     check(rows.length === 2, `jobs ${rows.length}: the steer should be one more call`);
     await consume(a, rows[1]!.id, "A2");
-    await sleep(stepped.wakeInMs);
     check((await a.step()).wakeInMs === null, "did not finish");
     check(o.polls.length === 2, `fetches ${show(o.polls)}`);
     check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1", "user: Q2", "assistant(stop): A2"]), `entries ${show(turns(await a.entries({})))}`);
@@ -236,7 +246,6 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
       const out = await a.step();
       if (out.wakeInMs === null) break;
       for (const row of jobs(storage).filter((r) => r.answer === null)) await consume(a, row.id, "A");
-      await sleep(out.wakeInMs);
     }
     const t = turns(await a.entries({}));
     check(show(t) === show(["user: Q1", "assistant(stop): A"]), `transcript ${show(t)}`);
@@ -270,14 +279,13 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const [row] = jobs(storage);
     check(row, "no job after the fresh pass");
     await consume(a, row.id, "A1");
-    await sleep(parked.wakeInMs);
     check((await a.step()).wakeInMs === null, "did not finish");
     check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
     await a.close();
   });
 
-  add("turn", "with no answer the poll interval doubles to its cap, one fetch per wake, one job", async (storage) => {
-    const o = object(storage);
+  add("turn", "with no answer every poll waits the same interval, no doubling: one fetch per wake, one job", async (storage) => {
+    const o = object(storage, [], { pollAfterMs: 300 });
     const a = o.agent();
     await a.say("Q1");
     let out = await a.step();
@@ -291,10 +299,123 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
       check(out.wakeInMs !== null, `wake ${i} did not park: ${show(out)}`);
       waits.push(out.wakeInMs);
     }
-    // 600, 1200, then the cap: read with slack for the time a step takes.
-    const near = (got: number, want: number) => got <= want && got > want - 250;
-    check(near(waits[0]!, 600) && near(waits[1]!, 1_200) && near(waits[2]!, 1_200), `waits ${show(waits)}`);
+    // Read with slack for the time a step takes.
+    check(waits.every((w) => w <= 300 && w > 50), `waits ${show(waits)}`);
     check(jobs(storage).length === 1, `a not-ready poll started a new call: ${jobs(storage).length} jobs`);
+    await a.close();
+  });
+
+  // ---- the delivery wakes the task waiting for it (the poll interval is only the backstop) -------------------------
+
+  add("wake", "an answer while the harness is open and the generation sleeps: the delivery wakes it, and the answer is in at once, with no step", async (storage) => {
+    const o = object(storage);
+    const a = o.agent();
+    await a.say("Q1");
+    await untilPolling(o.host);
+    const [row] = jobs(storage);
+    check(row && o.host.open, "control: the harness is not open with a job out");
+    const t0 = Date.now();
+    await consume(a, row.id, "A1");
+    const ms = await untilAnswer(a, "A1", t0);
+    check(ms < 1_000, `the answer took ${ms} ms to reach the transcript (the poll is ${POLL_MS} ms away)`);
+    check(show(o.polls) === show([{ id: row.id, ready: true }]), `polls ${show(o.polls)}`);
+    const done = await a.step();
+    check(done.wakeInMs === null && done.open === 0, `after the answer: ${show(done)}`);
+    await a.close();
+  });
+
+  add("wake", `an answer while parked: the object's next step wakes the generation, which does not wait for its pollAt${activeTimers ? ", and nothing is left running" : ""}`, async (storage) => {
+    const o = object(storage);
+    const a = o.agent();
+    await a.say("Q1");
+    const parked = await a.step();
+    check(parked.wakeInMs !== null && parked.wakeInMs > POLL_MS / 2 && !o.host.open, `control: not parked for the poll: ${show(parked)}`);
+    const [row] = jobs(storage);
+    const t0 = Date.now();
+    await consume(a, row!.id, "A1");
+    const done = await a.step();
+    const ms = Date.now() - t0;
+    check(done.wakeInMs === null && done.open === 0, `the step after the answer: ${show(done)}`);
+    check(ms < 1_000, `deliver to the answer took ${ms} ms`);
+    check(show(o.polls) === show([{ id: row!.id, ready: true }]), `polls ${show(o.polls)}`);
+    check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
+    if (activeTimers) check(activeTimers() === 0, `live timers after the turn: ${activeTimers()}`);
+    await a.close();
+  });
+
+  add("wake", "a wake with no answer is harmless: one more fetch, not ready, a new pollAt committed; the answer then completes the turn", async (storage) => {
+    const o = object(storage);
+    const a = o.agent();
+    await a.say("Q1");
+    await untilPolling(o.host);
+    const pollAt = () => o.host.withHarness(async (h) => {
+      const t = (await h.inspect(BACKGROUND)).tasks.find((x) => (x.record.state as { checkpoint?: { phase?: string } }).checkpoint?.phase === "poll");
+      return { id: t?.record.id, at: (t?.record.state as { checkpoint?: { pollAt?: number } } | undefined)?.checkpoint?.pollAt };
+    });
+    const before = await pollAt();
+    check(before.id !== undefined && before.at !== undefined, `control: no poll checkpoint ${show(before)}`);
+    await o.host.withHarness(async (h) => { h.wake([before.id!]); });
+    let after = before;
+    for (let i = 0; i < 200 && (after.at === before.at || o.polls.length === 0); i++) { await sleep(5); after = await pollAt(); }
+    const [row] = jobs(storage);
+    check(show(o.polls) === show([{ id: row!.id, ready: false }]), `the early wake's fetches: ${show(o.polls)}`);
+    check(after.id === before.id && after.at! > before.at!, `pollAt ${before.at} -> ${after.at}`);
+    check(jobs(storage).length === 1 && o.dispatched.length === 1, "the early wake called the model again");
+    const t0 = Date.now();
+    await consume(a, row!.id, "A1");
+    check(await untilAnswer(a, "A1", t0) < 1_000, "the answer after the early wake was slow");
+    check(show(o.polls.map((p) => p.ready)) === show([false, true]), `polls ${show(o.polls)}`);
+    check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
+    await a.close();
+  });
+
+  add("wake", "a lost wake (none asked): the step after the answer parks for the poll, and the poll at the backstop completes the turn", async (storage) => {
+    const o = object(storage, [], { noWake: true, pollAfterMs: 400 });
+    const a = o.agent();
+    await a.say("Q1");
+    const parked = await a.step();
+    check(parked.wakeInMs !== null, `control: not parked ${show(parked)}`);
+    const [row] = jobs(storage);
+    await consume(a, row!.id, "A1");
+    const early = await a.step();
+    check(early.wakeInMs !== null && o.polls.length === 0, `with no wake the step should park for the poll: ${show(early)}, polls ${show(o.polls)}`);
+    check(show(turns(await a.entries({}))) === show(["user: Q1"]), "control: the answer arrived with no wake");
+    await sleep(early.wakeInMs);
+    const done = await a.step();
+    check(done.wakeInMs === null, `the backstop's step did not finish: ${show(done)}`);
+    check(show(o.polls) === show([{ id: row!.id, ready: true }]), `polls ${show(o.polls)}`);
+    check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
+    await a.close();
+  });
+
+  add("wake", "a cancel as the delivery wakes the generation: the turn ends once, nothing runs on, and the next turn works", async (storage) => {
+    const o = object(storage);
+    const a = o.agent();
+    await a.say("Q1");
+    await untilPolling(o.host);
+    const [row] = jobs(storage);
+    const job = await a.takeJob(row!.id) as { model: { api: string; provider: string; id: string } };
+    // Not awaited: the cancel lands while the woken generation fetches and classifies.
+    const delivered = a.deliver(row!.id, fromResponse(reply("A1"), job.model, row!.id));
+    const cancelled = await a.cancel("ap.turn_cancelled");
+    await delivered;
+    const idle = await a.step();
+    check(idle.wakeInMs === null && idle.open === 0 && !(await a.running()), `after the cancel: ${show(idle)}`);
+    if (activeTimers) check(activeTimers() === 0, `live timers after the cancel: ${activeTimers()}`);
+    const t = turns((await a.entries({})).filter((e) => e.type === "message"));
+    const answered = t.includes("assistant(stop): A1");
+    // Either the answer was classified before the abort mark (the cancel then found the turn done) or not (cancelled).
+    check(answered ? cancelled === null : typeof cancelled === "string", `answer in ${answered}, cancel said ${show(cancelled)}: ${show(t)}`);
+    check(t.filter((x) => x.startsWith("assistant")).length <= 1, `answered twice: ${show(t)}`);
+    await a.say("Q2");
+    const parked = await a.step();
+    check(parked.wakeInMs !== null, `the next turn: ${show(parked)}`);
+    const next = jobs(storage).filter((r) => r.answer === null);
+    check(next.length === 1, `jobs out ${show(next.map((r) => r.id))}`);
+    await consume(a, next[0]!.id, "A2");
+    check((await a.step()).wakeInMs === null, "the next turn did not finish");
+    const after = turns((await a.entries({})).filter((e) => e.type === "message"));
+    check(after.at(-1) === "assistant(stop): A2", `entries ${show(after)}`);
     await a.close();
   });
 
@@ -312,11 +433,11 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(jobs(storage).length === 0, "an unknown id wrote a row");
   });
 
-  add("jobs", "the default poll interval: 2 s, doubling per not-ready poll, capped at 30 s", async () => {
+  add("jobs", "the default poll interval is the lost-wake backstop, 5 min, the same after every not-ready poll", async () => {
     const models = createModels();
     models.setProvider(durableOffloadedProvider({
       port: { async start() { return "mj_1"; }, async poll() { return null; } },
-      id: "queue", pollAfterMs: DEFAULT_POLL.firstMs, maxPollAfterMs: DEFAULT_POLL.maxMs, models: [{ id: "m1", contextWindow: 1_000 }],
+      id: "queue", pollAfterMs: POLL_BACKSTOP_MS, models: [{ id: "m1", contextWindow: 1_000 }],
     }));
     const model = models.getModel("queue", "m1");
     check(model, "model not registered");
@@ -327,7 +448,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
       handle = (await models.fetchDeferred(model, handle)).deferred;
       seen.push(handle?.pollAfterMs);
     }
-    check(show(seen) === show([2_000, 4_000, 8_000, 16_000, 30_000, 30_000]), `intervals ${show(seen)}`);
+    check(POLL_BACKSTOP_MS === 300_000 && show(seen) === show(Array(6).fill(300_000)), `intervals ${show(seen)}`);
   });
 
   add("engine", "the host serves one agent: a second agent on the same object is refused", async (storage) => {
