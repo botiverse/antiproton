@@ -18,6 +18,7 @@ import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
   createRegistry, defineExtension, defineTask, defineTool, section, Harness, type HarnessOptions, type HarnessSettings,
+  type TaskInspection,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "pi-ai-1";
@@ -25,7 +26,7 @@ import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type ModelJobRequest } from "../../src/model/durable-offloaded.ts";
 import { fromResponse, errorMessage, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "../../src/model/types.ts";
-import { DEFAULT_MIN_PARK_MS, parkVerdict, readSnapshot, settle, type ParkVerdict, type SettleResult } from "../../src/runtime/durable-drive.ts";
+import { DEFAULT_MIN_PARK_MS, parkVerdict, readSnapshot, type DriveSnapshot, settle, type ParkVerdict, type SettleResult } from "../../src/runtime/durable-drive.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 
@@ -369,11 +370,12 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     const [task] = base.inspection.tasks;
     check(task && task.record.state.status === "running", "no running task in the parked snapshot");
     const T = Date.now() + 60_000;
-    const withCheckpoint = (checkpoint: JsonValue) => ({
-      ...base,
-      inspection: { ...base.inspection, tasks: [{ ...task, record: { ...task.record, state: { ...task.record.state, checkpoint } } }] },
-    });
-    for (const checkpoint of [{ phase: "ready" }, { phase: "pol", pollAt: T }, { pollAt: T }, { phase: "poll" }, { phase: "poll", pollAt: String(T) }, "poll", null]) {
+    const withCheckpoint = (checkpoint: JsonValue): DriveSnapshot => {
+      const record: TaskInspection["record"] = { ...task.record, state: { status: "running", checkpoint } };
+      return { ...base, inspection: { ...base.inspection, tasks: [{ ...task, record }] } };
+    };
+    const malformed: JsonValue[] = [{ phase: "ready" }, { phase: "pol", pollAt: T }, { pollAt: T }, { phase: "poll" }, { phase: "poll", pollAt: String(T) }, "poll", null];
+    for (const checkpoint of malformed) {
       const v = parkVerdict(withCheckpoint(checkpoint), 1);
       check(v.verdict === "wait" && v.reason.includes("unrecognised checkpoint"), `${show(checkpoint)}: ${show(v)}`);
     }
