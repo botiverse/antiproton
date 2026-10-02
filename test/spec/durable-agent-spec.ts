@@ -11,7 +11,7 @@
  */
 import { BACKGROUND_CONTEXT as BACKGROUND } from "@earendil-works/chord/context";
 import { durableOffloadedProvider } from "../../src/model/durable-offloaded.ts";
-import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
+import { errorMessage, fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost, POLL_BACKSTOP_MS, type DurableAgentOptions, type PdHostOptions } from "../../src/runtime/durable-agent.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
@@ -416,6 +416,77 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check((await a.step()).wakeInMs === null, "the next turn did not finish");
     const after = turns((await a.entries({})).filter((e) => e.type === "message"));
     check(after.at(-1) === "assistant(stop): A2", `entries ${show(after)}`);
+    await a.close();
+  });
+
+  for (const order of ["together", "deliver then step"] as const) add("wake", `a retryable error answer, delivered ${order === "together" ? "with" : "then"} the object's step: the retry keeps its backoff (no wake left over for it)`, async (storage) => {
+    {
+      const o = object(storage);
+      const a = o.agent();
+      await a.say(`Q ${order}`);
+      await untilPolling(o.host);
+      const [row] = jobs(storage).filter((r) => r.answer === null);
+      const job = await a.takeJob(row!.id) as { model: { api: string; provider: string; id: string } };
+      const err = { ...errorMessage("429 rate limit exceeded", job.model as never), jobId: row!.id };
+      const before = o.dispatched.length;
+      const t0 = Date.now();
+      // What AgentDO does: deliver, then the step it asks for at once.
+      const out = order === "together"
+        ? (await Promise.all([a.deliver(row!.id, err as never), a.step()]))[1]
+        : (await a.deliver(row!.id, err as never), await a.step());
+      await sleep(100);
+      check(o.dispatched.length === before, `${order}: the retry was dispatched ${Date.now() - t0} ms after the error, inside its backoff`);
+      check(out.wakeInMs !== null && out.wakeInMs > 1_000, `${order}: the step did not park for the backoff: ${show(out)}`);
+      await sleep(out.wakeInMs);
+      await a.step();
+      check(o.dispatched.length === before + 1, `${order}: the retry was not dispatched after its backoff (${o.dispatched.length - before})`);
+      await a.close();
+    }
+  });
+
+  add("wake", "an answer delivered while the poll is fetching (not sleeping, so not woken) is found when the poll's next sleep starts", async (storage) => {
+    let onFetch: (() => void) | null = null;
+    const polls: Array<{ id: string; ready: boolean }> = [];
+    const o = object(storage, polls, { onPoll: (id, ready) => { polls.push({ id, ready }); const f = onFetch; onFetch = null; f?.(); } });
+    const a = o.agent();
+    await a.say("Q1");
+    await untilPolling(o.host);
+    const [row] = jobs(storage);
+    const job = await a.takeJob(row!.id) as { model: { api: string; provider: string; id: string } };
+    let t0 = 0;
+    // The answer lands right after the fetch read the row and found nothing: the poll is not asleep.
+    onFetch = () => { t0 = Date.now(); void a.deliver(row!.id, fromResponse(reply("A1"), job.model, row!.id)); };
+    const id = await o.host.withHarness(async (h) => (await h.inspect(BACKGROUND)).tasks[0]!.record.id);
+    await o.host.withHarness(async (h) => { h.wake([id]); });
+    const ms = await untilAnswer(a, "A1", 0).then(() => Date.now() - t0);
+    check(ms < 1_000, `the answer took ${ms} ms (the poll is ${POLL_MS} ms away)`);
+    check(show(polls.map((p) => p.ready)) === show([false, true]), `polls ${show(polls)}`);
+    await a.close();
+  });
+
+  add("jobs", "a lost dispatch is resent within the redelivery interval while parked, not at the poll backstop", async (storage) => {
+    const o = object(storage, [], { pollAfterMs: POLL_BACKSTOP_MS, redeliveryMs: 400 });
+    let fail = true;
+    const sent: string[] = [];
+    const a = o.agent(undefined, { dispatch: async (id) => { if (fail) { fail = false; throw new Error("queue down"); } sent.push(id); } });
+    await a.say("Q1");
+    const parked = await a.step();
+    check(sent.length === 0 && jobs(storage).length === 1 && jobs(storage)[0]!.dispatched_at === null, `control: the dispatch was not lost: ${show(jobs(storage))}`);
+    check(parked.wakeInMs !== null && parked.wakeInMs <= 400, `parked for ${parked.wakeInMs} ms, past the redelivery`);
+    await sleep(parked.wakeInMs);
+    const again = await a.step();
+    check(sent.length === 1 && jobs(storage)[0]!.dispatched_at !== null, `not resent: ${show(jobs(storage))}`);
+    // Dispatched now: the park comes back at its redelivery, still before the backstop.
+    check(again.wakeInMs !== null && again.wakeInMs <= 400 && again.wakeInMs > 200, `after the resend: ${show(again)}`);
+    await a.close();
+  });
+
+  add("jobs", "the default park while a job is out is its redelivery, 2 min, not the 5 min backstop", async (storage) => {
+    const o = object(storage, [], { pollAfterMs: POLL_BACKSTOP_MS });
+    const a = o.agent();
+    await a.say("Q1");
+    const parked = await a.step();
+    check(parked.wakeInMs !== null && parked.wakeInMs <= 120_000 && parked.wakeInMs > 110_000, `parked ${show(parked)}`);
     await a.close();
   });
 

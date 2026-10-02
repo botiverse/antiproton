@@ -10,9 +10,11 @@
  * - `#sleep` records the wake time on the invocation while its timer is pending, and calls the new
  *   scheduler option `onSleep({ taskId, conversationId, until })` once when the sleep starts.
  * - `inspect()` reports such a task as `{ kind: "running", sleepingUntil }` instead of `{ kind: "running" }`.
- * - A new `wake(taskIds)` ends the listed tasks' sleeps now: one in progress returns at once, and for a live task not
- *   sleeping the wake is kept and its next `#sleep` returns at once (kept until it is used or the task ends). `delay`
- *   takes a callback that is handed its early end, beside its abort.
+ * - A new `wake(taskIds)` ends the listed tasks' sleeps now: one in progress returns at once, and for a live task with
+ *   no invocation yet (not started since open) the wake is kept and its first `#sleep` returns at once (kept until it
+ *   is used or the task ends). A task whose invocation is running but not sleeping is not woken: a kept wake would
+ *   end whatever sleep came next, such as a retry's backoff. `delay` takes a callback that is handed its early end,
+ *   beside its abort.
  * - Relative imports of unchanged modules point into the installed package; the source map comment is dropped.
  *
  * Why: a Durable Object is billed while a harness sleeps in-process. Closing the harness mid-sleep is safe
@@ -142,8 +144,9 @@ export class TaskScheduler {
     }
     /**
      * antiproton patch: end the listed tasks' sleeps now. A task sleeping returns from `runtime.sleep` at once; a live
-     * task that is not (not started yet, or between sleeps) keeps the wake, and its next sleep returns at once. Ids of
-     * tasks that are not live are ignored. Writes nothing.
+     * task with no invocation (not started yet) keeps the wake, and its first sleep returns at once. A task whose
+     * invocation runs but does not sleep is left alone: its next sleep may be one the wake is not about (a retry's
+     * backoff after the answer it was woken for). Ids of tasks that are not live are ignored. Writes nothing.
      */
     wake(taskIds) {
         if (this.#closing)
@@ -152,7 +155,7 @@ export class TaskScheduler {
             const invocation = this.#invocations.get(id);
             if (invocation?.endSleep !== undefined)
                 invocation.endSleep();
-            else if (this.#live.has(id))
+            else if (invocation === undefined && this.#live.has(id))
                 this.#wakes.add(id);
         }
     }

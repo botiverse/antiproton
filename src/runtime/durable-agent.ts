@@ -83,14 +83,17 @@ const MAIN_SESSION = "main";
 /**
  * How long a dispatched call may be silent before the sweep sends it again. PiAgent's
  * `REDELIVERY_MS`, for the same reasons: longer than any completion, shorter than a caller's patience.
+ * The sweep runs at the start of each `drive`, so a parked object comes back for it: `step` parks no
+ * later than the earliest job's redelivery (`PdHost.redeliveryDue`), not only at the poll backstop.
  */
 const REDELIVERY_MS = 120_000;
 
 /**
  * How long a generation sleeps before it polls its job again, every time. It is not what makes a turn
- * go on: `deliver` wakes the task that waits for the answer (`#wakeAnswered`), and so does every `drive`,
- * so the answer is read as soon as it is written. This is the backstop for a wake that was lost (an
- * isolate gone between the answer and the wake): the park's alarm, and the latest a turn can stall.
+ * go on: `deliver` wakes the task that waits for the answer (`#wakeAnswered`), and so do every `drive`
+ * and the start of the poll's sleep, so the answer is read as soon as it is written. This is the backstop
+ * for a wake that was lost (an isolate gone between the answer and the wake). While a job is out the park
+ * comes back sooner anyway, at its redelivery (`REDELIVERY_MS`).
  */
 export const POLL_BACKSTOP_MS = 300_000;
 
@@ -112,6 +115,8 @@ export interface PdHostOptions {
   /** A sleeper due sooner than this is waited for in-process instead of parked (settle's `minParkMs`). */
   minParkMs?: number;
   stepDeadlineMs?: number;
+  /** `REDELIVERY_MS` when absent. For tests. */
+  redeliveryMs?: number;
   /** Never wake a task for a delivered answer: a lost wake, which the poll interval must cover. For tests. */
   noWake?: boolean;
   /** Each provider poll of a job, and whether it found the answer. For tests and traces. */
@@ -264,9 +269,12 @@ export class PdHost {
           compaction: { enabled: false },
         },
         now: this.#now,
-        // No `onSleep`: every sleep this harness runs (pi-durable's generation poll and retry; the registry holds
+        // Not for settle: every sleep this harness runs (pi-durable's generation poll and retry; the registry holds
         // only tool extensions, and a tool cannot sleep) starts right after the commit of its checkpoint, and the
         // read that commit brings already sees it. settle's 1 s recheck is the backstop if that ever changes.
+        // For the wake: an answer delivered while its poll was fetching (not sleeping, so `Harness.wake` passes it
+        // by) is found when the poll's next sleep starts.
+        onSleep: ({ taskId }) => { void this.#wakeOnSleep(taskId); },
       }, bg);
       // Settle closes the harness when it parks; whoever asks next opens a fresh one.
       h.subscribeClose(() => {
@@ -389,8 +397,8 @@ export class PdHost {
       await this.ensureSessions();
       const ap = await this.#store();
       const h = await this.harness();
-      // Before the resume, so a task whose answer came while the object was parked skips its sleep (a wake kept
-      // for a task not sleeping yet is used by its next sleep).
+      // Before the resume, so a task whose answer came while the object was parked skips its sleep (a wake asked
+      // for a task with no invocation yet is kept for its first sleep).
       await this.#wakeAnswered(h);
       h.resume();
       return settle(h, {
@@ -502,13 +510,33 @@ export class PdHost {
     return true;
   }
 
+  get #redeliveryMs(): number { return this.#opts.redeliveryMs ?? REDELIVERY_MS; }
+
+  /**
+   * When the sweep must run again for the jobs still out: the earliest one's dispatch plus the redelivery
+   * interval. One already due, or never dispatched, was just tried by this step's sweep and failed, so it is
+   * due one interval from now rather than at once. Null with no job out.
+   */
+  async redeliveryDue(): Promise<number | null> {
+    if (!this.#binding) return null;
+    const now = this.#now();
+    const rows = (await this.#store()).query("SELECT dispatched_at FROM model_jobs WHERE answer IS NULL AND state IS NULL");
+    let due: number | null = null;
+    for (const r of rows) {
+      const at = r.dispatched_at === null ? now : Number(r.dispatched_at) + this.#redeliveryMs;
+      const next = at > now ? at : now + this.#redeliveryMs;
+      due = due === null ? next : Math.min(due, next);
+    }
+    return due;
+  }
+
   /** Jobs nobody is carrying: never dispatched, or silent longer than a call could take. */
   async #sweep(limit = 20): Promise<number> {
     if (!this.#binding) return 0;
     const now = this.#now();
     const ids = (await this.#store()).query(
       "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
-      now - REDELIVERY_MS, limit).map((r) => String(r.id));
+      now - this.#redeliveryMs, limit).map((r) => String(r.id));
     let sent = 0;
     for (const id of ids) if (await this.#dispatch(id)) sent++;
     return sent;
@@ -543,10 +571,11 @@ export class PdHost {
    * reopened harness finds what was delivered while it was closed. A wake too early costs one poll, which comes
    * back not ready and commits a new `pollAt`.
    */
-  async #wakeAnswered(h: Harness, jobId?: string): Promise<void> {
+  async #wakeAnswered(h: Harness, jobId?: string, taskId?: TaskId): Promise<void> {
     if (this.#opts.noWake) return;
     const polling = new Map<string, TaskId[]>();
     for (const t of (await h.inspect(bg)).tasks) {
+      if (taskId !== undefined && t.record.id !== taskId) continue;
       const checkpoint = (t.record.state as { checkpoint?: { phase?: unknown; handle?: { id?: unknown } } }).checkpoint;
       const job = checkpoint?.phase === "poll" ? checkpoint.handle?.id : undefined;
       if (typeof job !== "string" || (jobId !== undefined && job !== jobId)) continue;
@@ -558,6 +587,14 @@ export class PdHost {
       `SELECT id FROM model_jobs WHERE answer IS NOT NULL AND state IS NULL AND id IN (${ids.map(() => "?").join(", ")})`, ...ids);
     const tasks = answered.flatMap((r) => polling.get(String(r.id)) ?? []);
     if (tasks.length > 0) h.wake(tasks);
+  }
+
+  /** A task started sleeping: if it is a poll whose answer is in, end the sleep. Failure leaves it to the next step. */
+  async #wakeOnSleep(taskId: TaskId): Promise<void> {
+    const open = this.#harness;
+    if (!open || this.#opts.noWake) return;
+    try { await this.#wakeAnswered(await open, undefined, taskId); }
+    catch (error) { logEvent("pd.wake.error", { taskId, error: String((error as Error)?.message ?? error).slice(0, 200) }); }
   }
 
   /** The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice. */
@@ -819,7 +856,10 @@ export class DurableAgent implements AgentEngine {
     const result = await this.#host.drive();
     if (result.state === "idle") return { open: 0, wakeInMs: null, settled: [] };
     if (result.state === "parked") {
-      return { open: result.sleepers.length, wakeInMs: Math.max(0, result.parkedUntil - this.#host.now), settled: [] };
+      // Back for the sweep too: a lost dispatch is resent within the redelivery interval, not at the poll backstop.
+      const redeliver = await this.#host.redeliveryDue();
+      const at = redeliver === null ? result.parkedUntil : Math.min(result.parkedUntil, redeliver);
+      return { open: result.sleepers.length, wakeInMs: Math.max(0, at - this.#host.now), settled: [] };
     }
     // Closed, waiting on the API caller: nothing is open in the object, and nothing to wake for. pi085's run ended at
     // the same pause, so `open` is 0 as there; the caller's results wake it (`answerClientCalls`, `resumeClientCalls`).

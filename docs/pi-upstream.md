@@ -215,7 +215,7 @@ rests on:
   the task's invocation is inside `runtime.sleep`. It also calls
   `HarnessOptions.onSleep` when a sleep starts, for a task that works without
   committing and then sleeps — no commit brings the read that would see it.
-  `PdHost` does not wire it: its harness runs only pi-durable's poll and retry
+  `settle` does not need it: its harness runs only pi-durable's poll and retry
   sleeps (its registry holds tool extensions, and a tool cannot sleep), each the
   first act after its checkpoint's commit, and the read that commit brings sees
   the sleep; `test/spec/durable-agent-spec.ts` fails if a park waits for the
@@ -229,15 +229,20 @@ rests on:
 - What wakes a poll sleeper early is the delivered answer. 1.0.0 has no way to
   end a sleep before its time, so the vendored scheduler adds
   `Harness.wake(taskIds)`: a task inside `runtime.sleep` returns from it at
-  once, and a live task not sleeping yet keeps the wake for its next sleep.
+  once, and a live task with no invocation yet keeps the wake for its first
+  sleep. A task running but not sleeping is not woken: a kept wake would end
+  whatever sleep came next, such as a retry's backoff after an error answer.
   `PdHost` calls it for every task whose `poll` checkpoint names a job that has
   its answer (`#wakeAnswered`, read from `ap_model_jobs`, not remembered): in
-  `deliver` when the harness is open, and in every `drive` before `resume()`, so
+  `deliver` when the harness is open, in every `drive` before `resume()`, so
   the step the delivery asks of a parked object (cf/src/index.ts
-  `deliverAnswer`, as on pi085) reads the answer at once. A wake that comes too
-  early costs one fetch, which commits a new `pollAt` (the contract above). The
-  handle's `pollAfterMs` is then only the backstop for a lost wake:
-  `POLL_BACKSTOP_MS`, 5 min, the same for every poll.
+  `deliverAnswer`, as on pi085) reads the answer at once, and from the harness's
+  `onSleep` when a poll starts sleeping, for an answer that landed while the
+  poll was fetching. A wake that comes too early costs one fetch, which commits
+  a new `pollAt` (the contract above). The handle's `pollAfterMs` is then only
+  the backstop for a lost wake: `POLL_BACKSTOP_MS`, 5 min, the same for every
+  poll. While a job is out, a park comes back by its redelivery time
+  (`REDELIVERY_MS`, 2 min) anyway, for the sweep that resends a lost dispatch.
 
 The park predicate, `parkVerdict`, says "park" only when all of these hold:
 every live task is a sleeper or `waiting` on other tasks; every sleeper is

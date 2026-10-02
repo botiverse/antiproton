@@ -365,6 +365,45 @@ add("the vendored Harness: a wake for another task leaves a sleep alone", async 
   } finally { await h.close(bg); }
 });
 
+/** A task that runs (waits on `busyGate`) before it sleeps a minute: a wake while it runs is not one for that sleep. */
+let busyGate: Promise<void> = Promise.resolve();
+let busyRunning: () => void = () => {};
+const Busy = defineTask<Record<string, never>, { phase: "busy" }, null>({
+  name: "vendor-test.busy", version: 1, initial: () => ({ phase: "busy" }),
+  phases: {
+    busy: async (_task, runtime, context) => {
+      busyRunning();
+      await busyGate;
+      await runtime.sleep(Date.now() + 60_000, context);
+      await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+    },
+  },
+  abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
+});
+
+add("the vendored Harness: a wake for a task that runs but does not sleep is not kept for its next sleep", async () => {
+  const registry = createRegistry();
+  registry.install(defineExtension({ name: "vendor-test", tasks: [Busy] }));
+  const h = await Harness.open(new MemoryStorage(), { models: createModels(), registry }, bg);
+  let open!: () => void;
+  busyGate = new Promise<void>((r) => { open = r; });
+  const running = new Promise<void>((r) => { busyRunning = r; });
+  try {
+    const root = await h.root(bg);
+    const taskId = await root.commit((tx) => tx.createTask(Busy, {}, { ownership: { kind: "conversation" } }), bg);
+    h.resume();
+    await running;
+    h.wake([taskId]);
+    open();
+    let state: { sleepingUntil?: number } | undefined;
+    for (let i = 0; i < 100 && state?.sleepingUntil === undefined; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+      state = (await h.inspect(bg)).tasks[0]?.state as { sleepingUntil?: number } | undefined;
+    }
+    check(state?.sleepingUntil !== undefined, `the sleep after the wake did not wait: ${show(state)}`);
+  } finally { open(); await h.close(bg); }
+});
+
 add("the control: pi-durable's own Harness has no wake", async () => {
   const { h } = await napping(UpstreamHarness.open as typeof Harness.open, []);
   try { check(typeof (h as { wake?: unknown }).wake === "undefined", "upstream's Harness has a wake: re-check the patch"); }

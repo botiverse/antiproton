@@ -21,9 +21,9 @@ export type RunningSleep = { readonly kind: "running"; readonly sleepingUntil?: 
 
 export type Harness = UpstreamHarness & {
   /**
-   * End the listed tasks' sleeps now: a task inside `runtime.sleep` returns from it at once, and a live task that is
-   * not sleeping returns at once from its next sleep. Ids of tasks that are not live are ignored. Writes nothing;
-   * throws once the harness is closed.
+   * End the listed tasks' sleeps now: a task inside `runtime.sleep` returns from it at once, and a live task with no
+   * invocation yet returns at once from its first sleep. A task running but not sleeping is not woken. Ids of tasks
+   * that are not live are ignored. Writes nothing; throws once the harness is closed.
    */
   wake(taskIds: Iterable<TaskId>): void;
 };
