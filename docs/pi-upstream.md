@@ -9,6 +9,11 @@ MIT, © 2025 Mario Zechner. The MCP client, `@earendil-works/pi-mcp`, comes from
 the same repository and is held to the same rules; its contracts are in their
 own section below.
 
+`@earendil-works/pi-durable` 1.0.0 is installed beside it, for the move of the
+agent loop onto pi's durable harness. Only its SQLite storage core is used so
+far, through `src/store/pi-durable-sqlite.ts`, and nothing in `cf/src` or
+`src/runtime` reaches it yet; the runtime still runs on `pi-agent-core`.
+
 ## The pin is exact, on purpose
 
 `package.json` pins `0.85.1`, not `^0.85.1`. A caret on a `0.x` package still
@@ -20,6 +25,22 @@ Check for movement with `npm view @earendil-works/pi-agent-core version`.
 
 `@earendil-works/pi-mcp` is pinned the same way, at `1.0.0`; check it with
 `npm view @earendil-works/pi-mcp version`.
+
+pi-durable is pinned the same way, and so is what it needs: `chord` 1.0.0 as a
+direct dependency, and `pi-ai` 1.0.0 through `overrides`, scoped to pi-durable.
+The override is not a style choice. Our own code imports `@earendil-works/pi-ai`
+by its bare name and gets whatever is installed at the top level, which has to
+stay pi-agent-core's 0.85.1 until the runtime moves; a top-level 1.0.0 would
+swap the provider contract under the running loop. Scoped, it installs under
+`node_modules/@earendil-works/pi-durable/`. Nothing of ours imports `chord`
+outside the pi-durable tests, and pi-agent-core gets its own 0.85.1 copy, so
+`chord` can sit at the top level. `npm ls @earendil-works/pi-ai
+@earendil-works/chord` shows the layout.
+
+The override yields two physical pi-ai copies: the top-level 0.85.1 for the live
+runtime, and 1.0.0 nested under pi-durable. That is safe only while no pi-ai
+value crosses between the two: they may share types, never runtime objects
+(messages, streams, errors), or `instanceof` and identity checks break.
 
 ## What we depend on
 
@@ -39,6 +60,10 @@ tests only) — plus `@earendil-works/pi-ai` for the provider contract
 (`createProvider`, `createAssistantMessageEventStream`) and the faux provider
 in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
 (`McpClient`, `StreamableHttpTransport`, `toLlmContent`; see §4).
+pi-durable adds `storage/sqlite` (the `SqliteDatabase` types, and
+`SqliteStorage` and its migrations in tests), and, in tests only, its root
+(`ROOT_CONVERSATION_ID`), `testing` (`createStorageConformance`) and
+`@earendil-works/chord/context`.
 
 ### 2. Copied source — this breaks silently
 
@@ -46,13 +71,14 @@ in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
 |---|---|---|
 | `emptyUsage`, `addUsage` | `harness/utils/usage.js` | `src/store/pi-storage.ts` |
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
+| the facade's serial operation queue (re-implemented, smaller: a transaction always queues) | pi-durable `storage/sqlite/node.js` (`SerialOperationQueue`) | `src/store/pi-durable-sqlite.ts` |
 
 The usage arithmetic is copied because pi's export map does not publish it. The
 scan semantics are re-implemented against a reference we can read; pi's own
 conformance suite is what keeps them honest, which is the whole reason we run
 upstream's suite rather than ours.
 
-**Re-diff both on every upgrade.** They will not fail to compile.
+**Re-diff each on every upgrade.** They will not fail to compile.
 
 ### 3. Behavioural contracts — these break silently and worst
 
@@ -114,6 +140,7 @@ These are not bugs and must survive an upgrade:
 | the provider has **no non-deferred path** | Cloudflare bills Durable Objects for wall clock with no exemption for network I/O; a completion is ~94% waiting | `test/pi-offload.ts` |
 | `step()` polls only when an answer already exists | pi records what the provider says, and "not ready" is something it said — correct for a batch API, but our provider is a table in the same object, so asking costs a transcript row for nothing | `test/pi-agent.ts` |
 | a `steer` on an idle lane **starts a run** | pi keeps the three gestures separate because its front end is a TUI that knows the lane's state; an HTTP request does not, and the page sends every message as a steer | `test/pi-agent.ts` |
+| pi-durable's SQLite tables and indexes are **placed in a namespace** by our facade (`src/store/sql-namespace.ts`), from a fixed list — `pd_tasks` on a Durable Object; any other CREATE throws | its schema creates `tasks` with no `IF NOT EXISTS`, and `AgentDO` already has a `tasks` table in the same object (`src/store/durable-object.ts`) — un-namespaced, pi-durable's migration fails on an object that has ours, and on one that had pi-durable's first, our `CREATE TABLE IF NOT EXISTS` would silently adopt a table of another shape. The namespace is an interface rather than a prefix so a store with real schemas can address them as `pd.tasks` without the facade changing | `test/pi-durable.ts`, `npm run pi-durable:do` |
 
 If an upgrade makes one of these unnecessary, delete it deliberately and strike
 the row — do not leave it as a divergence nobody can explain.
@@ -147,6 +174,9 @@ before the expensive one.
 3. `npm run pi-storage` and `npm run pi-storage:do` — pi's own 21 conformance
    cases, on node:sqlite and on real Durable Object storage. This is the canary
    for the `Storage` contract, and it is upstream's suite rather than ours.
+   For pi-durable, `npm run pi-durable` and `npm run pi-durable:do` do the same
+   with its suite, plus the facade's own cases; a new migration fails them
+   until the list of names in `src/store/pi-durable-sqlite.ts` is updated.
 4. `npm run pi-loop`, `pi-offload`, `pi-tools`, `pi-agent`, `pi-bridge` — the
    behavioural contracts and every divergence above.
 5. Re-diff the copied source in the table in §2.

@@ -71,6 +71,7 @@ for f in test/*.ts; do
   run_suite "$t" node "$f"
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
+run_suite pi-durable-do bash test/pi-durable-do.sh
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 
 # `|| true`: see (2). Under `set -e` a failing assignment would stop the script
