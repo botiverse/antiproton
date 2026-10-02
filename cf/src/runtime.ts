@@ -1753,8 +1753,8 @@ export class AgentRuntime {
       // to be a question this file asked about one plugin; the artifacts
       // paragraph is now the artifacts mount's own contribution, so the
       // condition is "the mount is there" and nobody has to check it.
-      // `sandbox` stays: run_js is the harness's, not a mount's. The pd engine offers no tool yet.
-      sandbox: extras.runJs && engine !== "pd",
+      // `sandbox` stays: run_js is the harness's, not a mount's. Both engines offer it.
+      sandbox: extras.runJs,
     });
     const model = {
       provider: binding.provider,
@@ -1770,14 +1770,18 @@ export class AgentRuntime {
     };
 
     if (engine === "pd") {
-      // Mounted tools, run_js, jobs and caller functions are not bridged to pi-durable yet (steps 7 and 8):
-      // this agent is offered no tool, and its prompt says so by leaving the sandbox out.
+      // The same catalogue PiAgent gets, through the same host and the same continuations
+      // (src/runtime/durable-tools.ts), less the caller's functions: those pause the turn through
+      // PiAgent's lane (client-calls.ts) and are step 8's.
       this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
       // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
       await this.#pd.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
       const pd = DurableAgent.open({
         host: this.#pd, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
         unknownJob: (id) => new UnknownJob(id),
+        openSession: (other) => this.agent(tenantId, agentId, other),
+        tools: offered as MountedTool[], toolHost: host, ...(keeping ? { interrupts: keeping } : {}),
+        extraTools: extraTools.filter((t) => !(callerTools as unknown[]).includes(t)) as never,
       });
       this.#agents.set(cacheKey, { agent: pd, builtFrom });
       return pd;
@@ -1911,8 +1915,9 @@ export class AgentRuntime {
     const jobCtx = (job: { session: string }) =>
       ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
     // Not on a pd object whose harness may be open: the pass writes `background_jobs` with plain SQL across
-    // awaits, which could join a pi-durable transaction, and nothing the pd engine offers starts background
-    // work yet (tools are step 7). `#pd` is set only once a pd agent was opened, so before that no harness
+    // awaits, which could join a pi-durable transaction. Not yet made safe: wrapping it in `PdHost.apart`
+    // would deadlock, since its delivery submits through the harness. Until it is, background work a pd
+    // agent starts is recorded and never polled. `#pd` is set only once a pd agent was opened, so before that no harness
     // exists, and the pass runs as it always has.
     const bg = this.#pd ? { wakeInMs: null } : await runBackgroundPass({
       sql, owner,
@@ -1946,8 +1951,8 @@ export class AgentRuntime {
     // A turn that settled while background work runs has not finished using
     // its containers: releasing now would take the machine out from under the
     // job, which is the normal case, since the model keeps working (task #16).
-    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) and the pd
-    // engine offers no tool that could hold or start anything yet (step 7).
+    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) across
+    // awaits. pd agents have tools that can hold or start things now, so this is a gap still owed.
     const pd = this.#pd !== null;
     const backgroundRunning = !pd && runningBackgroundJobs(sql, owner).length > 0;
     // A program suspended at a pause keeps the object awake (and is discarded

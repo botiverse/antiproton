@@ -17,8 +17,10 @@
  * |-------------------|-------------------------------------------------------------------------|
  * | `pi.user`         | `message`, the user message                                             |
  * | `pi.assistant`    | `message`, the assistant message (content, usage, stopReason as stored) |
- * | `pi.tool-result`  | `message`, the tool result; content verbatim, so a diagnostics block    |
- * |                   | pi-durable appended is shown, as the model saw it                       |
+ * | `pi.tool-result`  | `message`, the tool result as the model saw it: content verbatim, so a  |
+ * |                   | diagnostics block pi-durable appended is shown, except an interrupted   |
+ * |                   | call's, which the model is sent as pi085's line (`pi085Interrupted`,    |
+ * |                   | src/runtime/durable-tools.ts) and is shown so                           |
  * | `pi.compaction`   | `compaction`, the summary unwrapped from its `<summary>` wrapper        |
  * | `pi.reset`        | `custom` `pi.reset`, its handoff text (if any) as `data.handoff`        |
  * | `pi.system`       | nothing: the prompt and tool set are configuration, which a 0.85        |
@@ -31,6 +33,7 @@
  * has gaps. `timestamp` is the entry's first model message's; an entry with none takes `data.at` when that
  * is a number, else the previous entry's, so the order of times follows the order of entries.
  */
+import { pi085Interrupted } from "./durable-tools.ts";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { prefixedNamespace, SqlQualifier } from "../store/sql-namespace.ts";
 import { PI_DURABLE_OBJECTS } from "../store/pi-durable-sqlite.ts";
@@ -74,7 +77,7 @@ export function projectEntries(records: readonly EntryRecord[]): EngineEntry[] {
     let entry: EngineEntry | null = null;
     if (r.kind === "pi.user" || r.kind === "pi.assistant" || r.kind === "pi.tool-result") {
       // Each of these carries exactly one message (pi-durable's entries.d.ts); a record without one shows nothing.
-      if (first && first.role !== "system") entry = { ...base, type: "message", message: plain(first) };
+      if (first && first.role !== "system") entry = { ...base, type: "message", message: plain(pi085Interrupted(first)) };
     } else if (r.kind === "pi.compaction") {
       entry = {
         ...base, type: "compaction", summary: unwrapSummary(textOf(first?.content)),

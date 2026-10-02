@@ -108,7 +108,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const e = await a.entries({ order: "desc", limit: 1 });
     check(e.length === 1 && turns(e)[0] === "assistant(stop): Paris" && e[0]!.type === "message", `desc/limit ${show(e)}`);
     check(!(await a.running()), "still running after the answer");
-    check(show(await a.tools()) === "[]", "the pd engine offers tools before step 7");
+    check(show(await a.tools()) === "[]", "an agent opened with no tools is offered some");
     await a.close();
   });
 

@@ -36,7 +36,7 @@
  */
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
-  createRegistry, Harness, ROOT_CONVERSATION_ID,
+  AgentDoc, createRegistry, Harness, ROOT_CONVERSATION_ID,
   type Conversation, type ConversationId, type EntryRecord,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
@@ -49,6 +49,8 @@ import { logEvent } from "../core/log.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../store/sql-namespace.ts";
 import { settle, type SettleResult } from "./durable-drive.ts";
+import { toolsExtension } from "./durable-tools.ts";
+import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { projectEntries } from "./pd-transcript.ts";
 import type { AgentEngine, EngineEntry, EngineEntryScan, EngineStatus, StepOutcome } from "./engine.ts";
 
@@ -103,6 +105,14 @@ export interface PdBinding {
   dispatch(jobId: string): Promise<void>;
   /** The error for a job id with no row: the runtime's `UnknownJob`. */
   unknownJob(jobId: string): Error;
+  /**
+   * Build the agent for a session whose tools are not installed in this isolate yet: the runtime's
+   * `agent()` for it, which opens a `DurableAgent` and so installs them. The one harness runs every
+   * session's tasks, so before it is resumed every listed session must have its tools — a tool task of
+   * a session nobody opened would otherwise resolve no tool and write "not available" as the result.
+   * Absent (a test with one session): nothing is opened.
+   */
+  openSession?(session: string): Promise<unknown>;
 }
 
 /**
@@ -120,6 +130,8 @@ export class PdHost {
   #harness: Promise<Harness> | null = null;
   #driving: Promise<SettleResult> | null = null;
   #conversations = new Map<string, Promise<ConversationId>>();
+  /** Sessions whose tools are installed in the registry, this isolate. */
+  readonly #installed = new Set<string>();
   /** The `ap` tables, written through whichever facade is in use (`#writer`). */
   readonly #ap: ApStore;
   #ensured: Promise<ApStore> | null = null;
@@ -169,6 +181,36 @@ export class PdHost {
   #bound(): PdBinding {
     if (!this.#binding) throw new Error("the pd host is not bound to an agent");
     return this.#binding;
+  }
+
+  // ---- tools ----------------------------------------------------------------
+
+  /**
+   * A session's tools, installed under its own extension name, which its conversation selects
+   * (`DurableAgent.#conversation`). Installing again replaces the extension in place: the catalogue
+   * moved, or the runtime rebuilt the agent.
+   */
+  installTools(session: string, tools: Parameters<typeof toolsExtension>[1]): string {
+    const name = toolsExtensionName(session);
+    this.#registry.install(toolsExtension(name, tools, (fn) => this.apart(fn)));
+    this.#installed.add(session);
+    return name;
+  }
+
+  /** A tool call's work, kept out of the open harness's transactions (`PiDurableSqlite.apart`). */
+  apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> {
+    return this.#db ? this.#db.apart(fn) : fn(() => {});
+  }
+
+  extension(session: string) { return this.#registry.snapshot().extension(toolsExtensionName(session)); }
+
+  /** Every listed session has its tools before anything runs their tasks (`PdBinding.openSession`). */
+  async ensureSessions(): Promise<void> {
+    const open = this.#binding?.openSession;
+    if (!open) return;
+    const listed = (await (await this.#store()).query("SELECT task_id FROM conversations ORDER BY created_at"))
+      .map((r) => String(r.task_id));
+    for (const session of listed) if (!this.#installed.has(session)) await open(session);
   }
 
   // ---- our own SQL, kept out of pi-durable's transactions --------------------
@@ -353,6 +395,7 @@ export class PdHost {
     if (this.#driving) return this.#driving;
     const driving = (async () => {
       await this.#sweep();
+      await this.ensureSessions();
       const h = await this.harness();
       h.resume();
       return settle(h, {
@@ -439,7 +482,15 @@ export interface DurableAgentOptions extends PdBinding {
   /** Which of the agent's transcripts this is. Absent: the first. */
   session?: string;
   systemPrompt: string;
+  /** PiAgent's four tool options, meaning the same: the runtime hands both engines one catalogue (cf/src/runtime.ts `agent()`). */
+  tools?: MountedTool[];
+  toolHost?: ToolHost;
+  interrupts?: InterruptKeeping;
+  extraTools?: ReturnType<typeof bridgeTools>;
 }
+
+/** The extension holding a session's tools. */
+export const toolsExtensionName = (session: string) => `ap.tools:${session}`;
 
 /** The `pd` engine for one session. */
 export class DurableAgent implements AgentEngine {
@@ -456,20 +507,39 @@ export class DurableAgent implements AgentEngine {
   /** Binds the host to this agent and its model. Opens nothing: the harness opens on first use. */
   static open(opts: DurableAgentOptions): DurableAgent {
     opts.host.bind(opts);
+    // pi085's list, in pi085's order: the bridged mounts, then run_js, resume, jobs (PiAgent.open).
+    const bridged = [
+      ...(opts.tools && opts.toolHost ? bridgeTools(opts.tools, opts.toolHost, opts.interrupts) : []),
+      ...(opts.extraTools ?? []),
+    ];
+    opts.host.installTools(opts.session ?? MAIN_SESSION, bridged);
     return new DurableAgent(opts);
   }
 
   get host(): PdHost { return this.#host; }
 
-  /** This session's conversation, configured with the current model and prompt (each written only when it moved). */
+  /**
+   * This session's conversation, configured with the current model, prompt and tools (each written
+   * only when it moved). The tools are selected by extension: exactly this session's, so another
+   * session's — installed in the same registry — are never offered here.
+   */
   async #conversation(h: Harness): Promise<Conversation> {
     const c = await this.#host.handle(h, await this.#host.conversation(this.#session));
     const agent = await c.agent(bg);
     const model = { provider: this.#opts.model.provider, modelId: this.#opts.model.id };
     const moved = agent.model?.provider !== model.provider || agent.model?.modelId !== model.modelId;
     const prompt = agent.instructions !== this.#opts.systemPrompt;
-    if (moved || prompt) {
-      await c.configure({ ...(moved ? { model } : {}), ...(prompt ? { instructions: this.#opts.systemPrompt } : {}) }, bg);
+    const own = this.#host.extension(this.#session);
+    // The stored choice, not the resolved one: an unset choice resolves to every installed extension,
+    // which is this session's alone only while nothing else is installed — and then reads as chosen.
+    const stored = (await h.snapshot(AgentDoc, c.id, bg))?.extensions;
+    const tools = own !== undefined && !(Array.isArray(stored) && stored.length === 1 && stored[0] === own.name);
+    if (moved || prompt || tools) {
+      await c.configure({
+        ...(moved ? { model } : {}),
+        ...(prompt ? { instructions: this.#opts.systemPrompt } : {}),
+        ...(tools ? { extensions: [own] } : {}),
+      }, bg);
     }
     return c;
   }
@@ -486,6 +556,8 @@ export class DurableAgent implements AgentEngine {
     // fails ("Session is closed" from `status`); the retry then finds it by this id (pi-durable dedupes
     // a submission per conversation and request id) instead of submitting it a second time.
     const requestId = `say:${crypto.randomUUID()}`;
+    // Submitting starts the scheduler, which runs every session's tasks.
+    await this.#host.ensureSessions();
     return this.#host.withHarness(async (h) => {
       const c = await this.#conversation(h);
       const submission = await c.submit({ type: "input", content: text, whenBusy: mode === "followUp" ? "followUp" : "steer", requestId }, bg);
@@ -579,10 +651,9 @@ export class DurableAgent implements AgentEngine {
     return this.#host.withHarness(async (h) => projectEntries((await (await this.#host.handle(h, id)).context(bg)).entries));
   }
 
-  /** The tools the model is offered: none until mounts are bridged (step 7). */
+  /** The tools the model is offered, as this conversation's agent resolves them. */
   async tools(): Promise<Array<{ name: string }>> {
-    const id = await this.#host.conversation(this.#session);
-    return this.#host.withHarness(async (h) => (await (await this.#host.handle(h, id)).agent(bg)).tools.map((t) => ({ name: t.name })));
+    return this.#host.withHarness(async (h) => (await (await this.#conversation(h)).agent(bg)).tools.map((t) => ({ name: t.name })));
   }
 
   takeJob(id: string): Promise<unknown> { return this.#host.takeJob(id); }
