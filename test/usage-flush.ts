@@ -309,6 +309,21 @@ await check("an idle object with nothing to send arms nothing: not on a handler,
   o.raw.dispose();
 });
 
+await check("rows left by a handler on an object whose alarm is already armed leave that alarm where it is", async () => {
+  const o = await object();
+  await adopt(o);
+  // A pass planned two minutes out (a model poll, a parked pd harness): it will send the rows, and
+  // pulling it in would be a pass the turn did not ask for.
+  const planned = clock + 120_000;
+  o.state.alarmAt = planned;
+  appendUsage(o.raw.sql as any, [{ at: clock, tenantId: T, agentId: A, resource: "tool.call", key: "k", quantity: 1, unit: "calls" }]);
+  await o.D.uiRenameMount(T, A, "web", "web2").catch(() => undefined);
+  must(o.state.alarmAt === planned, `the armed alarm moved by ${o.state.alarmAt === null ? "deletion" : o.state.alarmAt - planned} ms`);
+  await o.settle();
+  must(o.outbox() === 0, "its pass did not send them");
+  o.raw.dispose();
+});
+
 // One console message and one answer, counted by `--measure` on master d499204 (before this change): two
 // passes on either engine, and the second, the one that stood down, left its own active time uncounted
 // (18 ms on the default engine, 21 ms on pd, on this clock).
