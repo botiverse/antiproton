@@ -32,7 +32,7 @@ is `502`, `code: "upstream_unavailable"`.
 | Parameter | |
 |---|---|
 | `from` | Required. ISO 8601 time with a zone (`2026-10-01T00:00:00Z`, `2026-10-01T08:00:00+08:00`). An unencoded `+` that arrives as a space before the offset is read as the `+`. |
-| `to` | Required, the same form, later than `from`. The window, once widened to whole buckets (below), is at most 31 days: a `1d` request from noon to noon 31 days later covers 32 and is refused. |
+| `to` | Required, the same form, later than `from`. The window asked for, `to − from`, is at most 31 days; widening to whole buckets (below) can make the answer cover one bucket more. |
 | `bucket` | `1h` (default) or `1d`. Days are cut at 00:00 UTC. `1h` is refused for a `from` more than 35 days ago (hourly rows past that may have been folded into days); use `1d`. |
 
 The window is widened to whole buckets — `from` down and `to` up to a bucket boundary — and the answer
