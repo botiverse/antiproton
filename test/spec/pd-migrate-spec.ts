@@ -192,9 +192,6 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
       const out = await migrateToPd({ storage, host, markerNotes: NOTES });
       check(out.ok && out.action === "migrated" && out.engine === "pd", `not migrated: ${show(out)}`);
-      const main = out.sessions.find((s) => s.session === "main")!;
-      check(main.counts.toolResult === 1 && main.counts.compaction === 1 && main.counts.notes[TURN_CANCELLED] === 1 && main.counts.user === 5 && main.counts.assistant === 5,
-        `main's import: ${show(main)}`);
       check(out.sessions.map((s) => s.session).join() === "main,s2", `sessions: ${show(out.sessions)}`);
       check(new ApStore(storage, prefixedNamespace("ap")).engine() === "pd", "the engine did not move");
       check(dump(storage, isPi) === pi, "pi 0.85's tables were written");
@@ -217,6 +214,10 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       check(seen(req).messages.some((m) => m.includes(CANCELLED_NOTE.slice(0, 30))), "the next request lacks the cancel's note");
       check(!seen(req).messages.some((m) => m.includes("an early question")), "the next request carries what the compaction summarised");
       check(count(storage, "usage_outbox") > usage, "pd's own turn was not billed");
+      // What the import reports, checked last: the behaviour above is what it is about.
+      const main = out.sessions.find((s) => s.session === "main")!;
+      check(main.counts.toolResult === 1 && main.counts.compaction === 1 && main.counts.notes[TURN_CANCELLED] === 1 && main.counts.user === 5 && main.counts.assistant === 5,
+        `main's import: ${show(main)}`);
     });
   });
 
