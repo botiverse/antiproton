@@ -279,6 +279,17 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     await throws("DELETE FROM tasks WHERE EXISTS (SELECT 1 FROM tasks t, agents)", outside);
     await throws("SELECT * FROM (sqlite_master)", outside);
     await throws("SELECT * FROM tasks JOIN (entries e, agents) ON 1", outside);
+    // `do` and `window` are aliases to SQLite, so they must not end the list.
+    await throws("SELECT * FROM tasks do, sqlite_master", outside);
+    await throws("SELECT * FROM tasks AS window, sqlite_master s", outside);
+    await throws("UPDATE tasks SET kind = 1 FROM tasks do, ap_meta", outside);
+    // Named parameters: SQLite's `$a(...)` runs to the next `)`, quote and all, so a quote in it once
+    // hid a whole UNION from this tokenizer.
+    const named = "only ? and ?NNN are admitted";
+    await throws("SELECT id FROM tasks WHERE $a(') IS NULL UNION SELECT type, name FROM sqlite_master WHERE $b(') IS NULL", named);
+    await throws("SELECT id FROM tasks WHERE id = :id", named);
+    await throws("SELECT id FROM tasks WHERE id = @id", named);
+    await throws("SELECT id FROM tasks WHERE id = #id", named);
     // Statements that address the database rather than a listed object, whatever they name.
     const kind = "are admitted";
     await throws("PRAGMA table_info(pd_tasks)", kind);
