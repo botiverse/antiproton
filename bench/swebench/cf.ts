@@ -29,6 +29,7 @@ import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
+import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -49,7 +50,12 @@ const BUDGET_MS = Number(process.env.BUDGET_MS ?? 900_000);
 const TRACE = process.env.TRACE === "1";
 /** Each run gets its own object, so one run's meter is never read as another's. */
 const OBJ = process.env.OBJ ?? "swe1";
-const withObj = (path: string) => path + (path.includes("?") ? "&" : "?") + `obj=${OBJ}`;
+// Which kernel runs the agent, and so whether each instance needs an object of its own (bench/objects.ts).
+const ENGINE = benchEngine(process.env.ENGINE);
+const OBJECTS = objectsShape(ENGINE, process.env.OBJECTS);
+/** The object an instance runs in: the run's own, or the instance's (OBJECTS=per-task, and always on pd). */
+const objOf = (taskId: string) => taskObject(OBJ, OBJECTS, taskId);
+const withObj = (path: string, obj = OBJ) => path + (path.includes("?") ? "&" : "?") + `obj=${obj}`;
 
 interface Instance {
   instance_id: string; repo: string; base_commit: string;
@@ -57,8 +63,8 @@ interface Instance {
   FAIL_TO_PASS: string; PASS_TO_PASS: string;
 }
 
-async function api(path: string, init: RequestInit = {}, timeoutMs = 120_000): Promise<any> {
-  const r = await fetch(BASE + withObj(path), {
+async function api(path: string, init: RequestInit = {}, timeoutMs = 120_000, obj = OBJ): Promise<any> {
+  const r = await fetch(BASE + withObj(path, obj), {
     ...init,
     headers: { "x-harness-token": TOKEN, ...(init.headers ?? {}) },
     signal: AbortSignal.timeout(timeoutMs),
@@ -67,8 +73,8 @@ async function api(path: string, init: RequestInit = {}, timeoutMs = 120_000): P
   if (!r.ok) throw new Error(`${path} → ${r.status}: ${text.slice(0, 200)}`);
   return text ? JSON.parse(text) : null;
 }
-const post = (path: string, body: unknown, timeoutMs?: number) =>
-  api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, timeoutMs);
+const post = (path: string, body: unknown, timeoutMs?: number, obj = OBJ) =>
+  api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, timeoutMs, obj);
 
 // ------------------------------------------------------------------ instances
 
@@ -129,7 +135,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
   // refused upgrade reaches a WebSocket client only as close 1006 with no body,
   // which this runner then scored as a stalled agent (Vera, 2026-09-14).
   const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
-    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
+    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`, objOf(taskId)), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
   return new Promise<string | null>((resolve) => {
     let done = false;
     const stop = (v: string | null) => {
@@ -142,7 +148,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
     const keepalive = setInterval(() => {
       try { ws.send("ping"); } catch { /* closing */ }
       // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
-      void api(`/bench/poll?taskId=${taskId}`).then((poll: any) => {
+      void api(`/bench/poll?taskId=${taskId}`, {}, undefined, objOf(taskId)).then((poll: any) => {
         const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
         if (!d) return;
         seen.set(taskId, d.seq);
@@ -176,11 +182,12 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
  *  test suite of a real repository is behind it, so the timeout is the
  *  mount's own (300 s) plus the trip. */
 const shell = (taskId: string, command: string) =>
-  post("/bench/swe/shell", { taskId, command }, 360_000);
+  post("/bench/swe/shell", { taskId, command }, 360_000, objOf(taskId));
 
 async function runOne(inst: Instance) {
   const t0 = Date.now();
   const taskId = `${inst.instance_id.replace(/[^A-Za-z0-9._-]/g, "_")}_${Date.now().toString(36)}`.slice(0, 58);
+  const obj = objOf(taskId);
   const started = await post("/bench/swe/start", {
     taskId,
     policy: POLICY,
@@ -195,7 +202,12 @@ async function runOne(inst: Instance) {
     // The object defaults to "none". NETWORK=open reproduces the contaminated
     // condition on purpose, and the record says which one ran.
     ...(process.env.NETWORK ? { network: process.env.NETWORK } : {}),
-  });
+    // Named only when it is not the default, so a pi085 run sends what it always sent.
+    ...(ENGINE === "pi085" ? {} : { engine: ENGINE }),
+  }, undefined, obj);
+  // What the object says it runs, not what was asked: an older Worker ignores `engine` and answers without one.
+  const engine = started?.engine ?? (ENGINE === "pi085" ? "pi085" : null);
+  if (engine !== ENGINE) throw new Error(`asked for ${ENGINE}, the object runs ${engine ?? "an engine it did not name"}`);
   const network = String(started?.network ?? "open");
   if (TRACE) console.log(`    started ${JSON.stringify(started)}`);
 
@@ -210,10 +222,10 @@ async function runOne(inst: Instance) {
   let stall: string | undefined, stallWhy: StallEvidence | undefined;
   try {
     await post("/bench/say", { taskId,
-      text: `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}` });
+      text: `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}` }, undefined, obj);
     answered = await waitForAnswer(taskId, t0 + BUDGET_MS);
     if (answered === null && !failed.has(taskId)) {
-      ({ stall, stallWhy } = await stallAtDeadline(() => api(`/bench/poll?taskId=${taskId}`), seen.get(taskId) ?? 0));
+      ({ stall, stallWhy } = await stallAtDeadline(() => api(`/bench/poll?taskId=${taskId}`, {}, undefined, obj), seen.get(taskId) ?? 0));
     }
     agentSeconds = Math.round((Date.now() - t0) / 1000);
     if (TRACE) console.log(`    agent > ${(answered ?? "(no answer)").replace(/\s+/g, " ").slice(0, 160)}`);
@@ -242,7 +254,7 @@ async function runOne(inst: Instance) {
       failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
     };
   } finally {
-    const release: any = await post("/bench/swe/release", { taskId }).catch((e) => ({ failed: [{ alias: "sandbox", error: String(e) }] }));
+    const release: any = await post("/bench/swe/release", { taskId }, undefined, obj).catch((e) => ({ failed: [{ alias: "sandbox", error: String(e) }] }));
     for (const f of release?.failed ?? []) {
       console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
     }
@@ -250,16 +262,18 @@ async function runOne(inst: Instance) {
 
   // Read after release: the container's session is written into the mount's
   // connection state when the box is handed back, so the meter outlives it.
-  const stats: any = await api(`/bench/swe/stats?taskId=${taskId}&wallMs=${Date.now() - t0}`);
+  const stats: any = await api(`/bench/swe/stats?taskId=${taskId}&wallMs=${Date.now() - t0}`, {}, undefined, obj);
   // What the object was billed for this instance alone, the runner's grading
   // shown apart: the activity log is per object and keeps every kind, so the
   // window since this instance started is this instance.
-  const act: any = await api(`/bench/activity?since=${t0}`).catch(() => null);
+  const act: any = await api(`/bench/activity?since=${t0}`, {}, undefined, obj).catch(() => null);
   const gradingMs = (act?.byKind ?? []).filter((k: any) => k.kind === "benchSweShell")
     .reduce((a: number, k: any) => a + Number(k.ms), 0);
   const objectMs = Number(act?.activeMs ?? 0);
   return {
-    id: inst.instance_id, taskId,
+    id: inst.instance_id, taskId, engine, object: `bench-${obj}`,
+    // Per task, the run's activity is the sum of its objects' (bench/objects.ts), so each one's is kept.
+    ...(OBJECTS === "per-task" ? { activity: act } : {}),
     resolved: grade.failToPass && grade.passToPass,
     ...grade,
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds,
@@ -274,14 +288,14 @@ async function runOne(inst: Instance) {
 
 // ------------------------------------------------------------ the run
 
-await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
+if (OBJECTS === "shared") await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
 // Before the first line of output: the log path has to exist while there is
 // still something to write to it.
 const run = beginRun("swebench", OBJ);
 teeRun(run);
 console.log(`\n  SWE-bench Verified — ${instances.length} instance(s), inside the deployed object, container network ${process.env.NETWORK ?? "none"}` +
-  `\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(80)}`);
+  `, engine ${ENGINE}\n  on ${BASE} ${OBJECTS === "shared" ? `object bench-${OBJ}` : `one object per instance, bench-${OBJ}-<task>`}\n  ${"─".repeat(80)}`);
 const out: any[] = [];
 const t0Run = Date.now();
 const RATES = ratesFromEnv();
@@ -290,7 +304,7 @@ for (const inst of instances) {
   let r: any;
   try { r = await runOne(inst); }
   catch (e) {
-    r = { id: inst.instance_id, resolved: false, error: (e as Error).message.slice(0, 200),
+    r = { id: inst.instance_id, engine: ENGINE, resolved: false, error: (e as Error).message.slice(0, 200),
           seconds: 0, calls: 0, prompt: 0, out: 0, cached: 0, byTool: {} };
   }
   out.push(r);
@@ -328,7 +342,9 @@ console.log(`  ${"─".repeat(80)}\n  resolved ${solved}/${out.length}   ${wall}
  * produce. Grading is the runner's work and is reported apart from the agent's,
  * because it is the object awaiting a test suite, not the loop.
  */
-const act = await api("/bench/activity").catch(() => null);
+const act = OBJECTS === "shared"
+  ? await api("/bench/activity").catch(() => null)
+  : sumActivity(out.map((r: any) => r.activity));
 if (act) {
   const grading = (act.byKind ?? []).filter((k: any) => k.kind === "benchSweShell")
     .reduce((a: number, k: any) => a + Number(k.ms), 0);
@@ -337,7 +353,7 @@ if (act) {
     (grading ? `, of which ${(grading / 1000).toFixed(1)}s is this runner grading` : ""));
 }
 const recorded = recordRun(run, {
-  bench: "swebench-verified", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, offset: OFFSET, n: instances.length,
+  bench: "swebench-verified", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: OBJECTS === "shared" ? `bench-${OBJ}` : `bench-${OBJ}-<task>`, engine: ENGINE, objects: OBJECTS, offset: OFFSET, n: instances.length,
   network: out.map((r: any) => r.network).find(Boolean) ?? null,
   startedAt: new Date(t0Run).toISOString(), results: out, totals, activity: act,
 });
