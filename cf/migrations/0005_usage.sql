@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS usage_cursor (
 -- delta pricing keeps that sum correct — short×shortRate + subset×(longRate − shortRate) equals
 -- pricing the parts separately, which is how pi's own cost function does it. Pricing a subset key
 -- at its full rate double-counts it, because the total key already carries it.
+-- Corollary for the wildcard below: priceFor tries an exact key before '*', so explicit rows
+-- override the fallback — a resource that HAS subset keys (model.tokens) must give those keys
+-- explicit delta-priced rows, and must never let '*' be their only price, or the wildcard
+-- charges the subset at the full rate and the double count is back.
 CREATE TABLE IF NOT EXISTS usage_prices (
   resource         TEXT NOT NULL,
   key              TEXT NOT NULL,  -- '*' for every key of the resource
