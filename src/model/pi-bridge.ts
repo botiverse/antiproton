@@ -13,8 +13,51 @@
  * reasoning trace is kept on the way back but not replayed on the way out: the
  * next request carries the reply, not the thinking behind it.
  */
-import type { AssistantMessage, Context as PiContext, Message as PiMessage, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context as PiContext, Message as PiMessage, Tool as PiTool, Usage } from "@earendil-works/pi-ai";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
+
+/**
+ * The job wire format, version 2: a system message keeps its place in the conversation.
+ *
+ * Version 1 is pi-ai 0.85's `Context` as it is — `{ systemPrompt?, messages, tools? }`, no tag —
+ * and it is what the live runtime (src/model/pi-offloaded.ts) writes. It has one system prompt,
+ * at the top. pi-ai 1.0 writes the prompt as system messages in the transcript, each where it
+ * took effect: pi-durable writes the first one after the first input and a patch after a later
+ * input whenever a section or the tool set changed. Folded into one top prompt, every one of
+ * them lost its position.
+ *
+ * Version 2 carries the tag and has no `systemPrompt`: every system message is an entry of
+ * `messages`, where it stands. The writer renders each to its text first
+ * (src/model/durable-offloaded.ts `jobContext`), so the consumer needs no pi-ai 1.0 code and the
+ * Worker stays small. `tools` is the tool set current at the end of the conversation, because our
+ * provider client sends one top-level tool list per request.
+ */
+export const JOB_WIRE_V2 = 2;
+
+/** A system message at its position in the conversation, already rendered to its text. */
+export type InlineSystemMessage = { role: "system"; content: string };
+
+/** `M` and `T` are the writer's message and tool types; the shape is all the consumer reads. */
+export interface JobContextV2<M = PiMessage, T = PiTool> {
+  version: typeof JOB_WIRE_V2;
+  messages: Array<M | InlineSystemMessage>;
+  tools?: T[];
+}
+
+/** What a `pi_model_jobs` row's `context` may hold: version 1 (untagged) or version 2. */
+export type JobContext = PiContext | JobContextV2;
+
+/**
+ * The version a stored context declares. Untagged is version 1. Any other tag is refused rather
+ * than read as the nearest known one: a format this consumer does not know may carry turns it
+ * would drop, and a request built without them is a wrong conversation that fails nowhere.
+ */
+function wireVersion(context: JobContext): 1 | 2 {
+  const version: unknown = Reflect.get(context, "version");
+  if (version === undefined) return 1;
+  if (version === JOB_WIRE_V2) return 2;
+  throw new Error(`a model job's context declares wire version ${JSON.stringify(version)}, which this consumer cannot read`);
+}
 
 const textOf = (content: unknown): string => {
   if (typeof content === "string") return content;
@@ -25,14 +68,33 @@ const textOf = (content: unknown): string => {
     .join("");
 };
 
-export function toRequest(context: PiContext): {
+/**
+ * A stored job's context as our provider client's request. A version 1 context builds exactly
+ * the request it always did. A version 2 context's inline system message becomes an inline
+ * `role: "system"` message at the same position: OpenAiCompatibleModel sends `messages` as
+ * given, and DeepSeek's chat completions (deepseek-flash, deepseek-v4-pro) accepted and followed
+ * one between turns, after a user turn as the last message, and after a tool result (probed
+ * 2026-10-02 through OpenAiCompatibleModel; pi-ai 1.0's catalog marks only deepseek-v4-pro as
+ * verified, which is why the reading is cited rather than the catalog). No other provider was
+ * probed. One that refuses a mid-conversation system message needs these folded into the leading
+ * message, as pi-ai's `collapseSystemMessages` does, for that provider only.
+ */
+export function toRequest(context: JobContext): {
   messages: ModelMessage[];
   tools?: ToolDefinition[];
 } {
+  const inline = wireVersion(context) === 2;
   const messages: ModelMessage[] = [];
-  if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
+  if ("systemPrompt" in context && context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
 
-  for (const m of context.messages as PiMessage[]) {
+  for (const m of context.messages) {
+    if (m.role === "system") {
+      // Only version 2 may carry one. In version 1 it was never written, and passing it on would
+      // put an instruction into a request whose format says it has none.
+      if (!inline) throw new Error("a version 1 model job carries a system message in its conversation");
+      messages.push({ role: "system", content: m.content });
+      continue;
+    }
     if (m.role === "user") {
       messages.push({ role: "user", content: textOf(m.content) });
       continue;
