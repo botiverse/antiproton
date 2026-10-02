@@ -125,7 +125,7 @@ export const mcpPlugin: Plugin = {
     { name: "headers", type: "string[]", format: "header-lines",
       summary: "Sent with every request, one \"Name: value\" per line. A value may contain {{name}}, filled in on each request from a secret the agent kept under that name; the value is never written here." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1, max: MAX_TIMEOUT_MS,
-      summary: "How long one request to the server may take, in milliseconds; at most 60000." },
+      summary: "How long one request to the server may take, in milliseconds; at most 60000. Listing the server's tools gets the same budget in total, however many pages it takes." },
   ],
 
   mountTools(mount: MountRecord): ToolSchema[] {
