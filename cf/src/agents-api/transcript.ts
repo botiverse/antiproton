@@ -14,6 +14,8 @@
  *   stopReason values including "deferred"). When pi is upgraded, re-check turn grouping and statuses.
  */
 
+import { CLIENT_PENDING } from "../../../src/runtime/client-calls.ts";
+
 type Json = Record<string, unknown>;
 
 /**
@@ -86,14 +88,23 @@ export function sessionTranscript(
     const replies = group.filter((x) => x.m.role === "assistant" && x.m.stopReason !== "deferred");
     const final = replies[replies.length - 1];
     const cancelled = group.some((x) => x.m.role === "cancelled");
-    const ended = cancelled || (!!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running));
-
     const waits = group.some((x) => x.m.role === "assistant"
       && (Array.isArray(x.m.content) ? x.m.content : []).some((c: any) => c?.type === "toolCall" && waiting.has(String(c.id))));
+    // A later user message was placed while this turn's run went on (a steer, or input queued behind the caller's
+    // functions on pd): the run continues in the next turn, so this one is over rather than in progress for ever.
+    // Read from the transcript alone, never from `pending` (blanked while the session runs): a turn with a call that
+    // has no result, or only pi085's placeholder for the caller (answered or not, until its turn is resumed), is not
+    // over, so the status never goes terminal and back.
+    const resolved = new Set(group.filter((x) => x.m.role === "toolResult" && textOf(x.m.content) !== CLIENT_PENDING)
+      .map((x) => String(x.m.toolCallId)));
+    const open = group.some((x) => x.m.role === "assistant"
+      && (Array.isArray(x.m.content) ? x.m.content : []).some((c: any) => c?.type === "toolCall" && !resolved.has(String(c.id))));
+    const superseded = !last && !open;
+    const ended = cancelled || superseded || (!!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running));
 
     let status: TurnStatus;
     if (cancelled || final?.m.stopReason === "aborted") status = "cancelled";
-    else if (ended) status = final!.m.stopReason === "error" ? "failed" : "completed";
+    else if (ended) status = final?.m.stopReason === "error" ? "failed" : "completed";
     else if (waits && !(last && source.running)) status = "waiting";
     else status = source.running || replies.length ? "in_progress" : "queued";
 
