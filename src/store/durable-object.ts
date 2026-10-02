@@ -168,6 +168,26 @@ export class DurableObjectStore implements StorageAdapter {
   #one(q: string, ...b: unknown[]) { return this.#all(q, ...b)[0]; }
   #tx<T>(fn: () => T): T { return this.#ctx.storage.transactionSync(fn); }
 
+  /**
+   * How every write method runs its SQL: through the gate when one is set, at once otherwise.
+   *
+   * Set on an object whose agent runs on pi-durable (cf/src/runtime.ts), where a commit is a savepoint
+   * held open across awaits on the object's one connection, and a write issued while it is open joins
+   * it — rolled back with it, or, for a method with its own `transactionSync`, refused as a transaction
+   * within a transaction. The gate runs the body once no such commit is open or queued
+   * (`PiDurableSqlite.outside`). Without one the body runs where it always ran, and returns its value
+   * rather than a promise, so a method's caller sees exactly what it saw before the gate existed.
+   *
+   * Each body is synchronous, so the whole of it is behind the gate; a method that awaits between
+   * statements (`createTask`, `flushFollowUps`) gates each synchronous stretch, and one made only of
+   * other methods (`appendState`) is gated by theirs.
+   */
+  #gate: (<T>(fn: () => T) => Promise<T> | T) | null = null;
+  #write<T>(fn: () => T): Promise<T> | T { return this.#gate ? this.#gate(fn) : fn(); }
+
+  /** Route every write through `gate` from now on (see `#write`). */
+  gateWrites(gate: <T>(fn: () => T) => Promise<T> | T): void { this.#gate = gate; }
+
   #nextCounter(name: string): number {
     this.#sql.exec("INSERT OR IGNORE INTO counters(name, value) VALUES (?, 0)", name);
     this.#sql.exec("UPDATE counters SET value = value + 1 WHERE name = ?", name);
@@ -175,8 +195,10 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async createAgent(tenantId: string, agentId: string, config: Json = {}) {
-    this.#sql.exec("INSERT INTO agents(tenant_id, agent_id, config, created_at) VALUES (?,?,?,?)",
-      tenantId, agentId, j(config), this.#now());
+    return this.#write(() => {
+      this.#sql.exec("INSERT INTO agents(tenant_id, agent_id, config, created_at) VALUES (?,?,?,?)",
+        tenantId, agentId, j(config), this.#now());
+    });
   }
 
   async loadAgent(tenantId: string, agentId: string) {
@@ -185,20 +207,23 @@ export class DurableObjectStore implements StorageAdapter {
     return r ? { agentId: String(r.agent_id), config: JSON.parse(String(r.config ?? "{}")) as Json, createdAt: Number(r.created_at) } : null;
   }
   async updateAgentConfig(tenantId: string, agentId: string, config: Json = {}) {
-    const before = this.#one("SELECT 1 AS x FROM agents WHERE tenant_id=? AND agent_id=?", tenantId, agentId);
-    if (!before) return false;
-    this.#sql.exec("UPDATE agents SET config=? WHERE tenant_id=? AND agent_id=?", j(config), tenantId, agentId);
-    return true;
+    return this.#write(() => {
+      const before = this.#one("SELECT 1 AS x FROM agents WHERE tenant_id=? AND agent_id=?", tenantId, agentId);
+      if (!before) return false;
+      this.#sql.exec("UPDATE agents SET config=? WHERE tenant_id=? AND agent_id=?", j(config), tenantId, agentId);
+      return true;
+    });
   }
 
 
   async createTask(
     tenantId: string, agentId: string, taskId: string, checkpoint: Json, stateVersion = 0,
   ) {
-    this.#sql.exec(
+    const inserted = this.#write(() => this.#sql.exec(
       `INSERT INTO tasks(tenant_id, task_id, agent_id, status, generation, checkpoint_version,
          fencing_token, checkpoint, state_version, updated_at) VALUES (?,?,?,'runnable',0,0,0,?,?,?)`,
-      tenantId, taskId, agentId, j(checkpoint), stateVersion, this.#now());
+      tenantId, taskId, agentId, j(checkpoint), stateVersion, this.#now()));
+    if (inserted instanceof Promise) await inserted;
     // The log alone cannot rebuild a task without somewhere to start.
     await this.putSnapshot(tenantId, taskId, 0, checkpoint, stateVersion);
   }
@@ -206,26 +231,30 @@ export class DurableObjectStore implements StorageAdapter {
   async putSnapshot(
     tenantId: string, taskId: string, throughSequence: number, state: Json, stateVersion: number,
   ) {
-    this.#sql.exec(
-      `INSERT INTO snapshots(tenant_id, task_id, through_sequence, state, state_version, created_at)
-       VALUES (?,?,?,?,?,?)
-       ON CONFLICT(tenant_id, task_id, through_sequence) DO UPDATE SET
-         state=excluded.state, state_version=excluded.state_version`,
-      tenantId, taskId, throughSequence, j(state), stateVersion, this.#now());
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO snapshots(tenant_id, task_id, through_sequence, state, state_version, created_at)
+         VALUES (?,?,?,?,?,?)
+         ON CONFLICT(tenant_id, task_id, through_sequence) DO UPDATE SET
+           state=excluded.state, state_version=excluded.state_version`,
+        tenantId, taskId, throughSequence, j(state), stateVersion, this.#now());
+    });
   }
 
   async pruneSnapshots(tenantId: string, taskId: string, keep: number) {
-    return this.#tx(() => {
-      const rows = this.#all(
-        "SELECT through_sequence FROM snapshots WHERE tenant_id=? AND task_id=? ORDER BY through_sequence ASC",
-        tenantId, taskId) as any[];
-      if (rows.length <= keep + 1) return 0;
-      const doomed = rows.slice(1, rows.length - keep);
-      for (const r of doomed) {
-        this.#sql.exec("DELETE FROM snapshots WHERE tenant_id=? AND task_id=? AND through_sequence=?",
-          tenantId, taskId, r.through_sequence);
-      }
-      return doomed.length;
+    return this.#write(() => {
+      return this.#tx(() => {
+        const rows = this.#all(
+          "SELECT through_sequence FROM snapshots WHERE tenant_id=? AND task_id=? ORDER BY through_sequence ASC",
+          tenantId, taskId) as any[];
+        if (rows.length <= keep + 1) return 0;
+        const doomed = rows.slice(1, rows.length - keep);
+        for (const r of doomed) {
+          this.#sql.exec("DELETE FROM snapshots WHERE tenant_id=? AND task_id=? AND through_sequence=?",
+            tenantId, taskId, r.through_sequence);
+        }
+        return doomed.length;
+      });
     });
   }
 
@@ -287,7 +316,7 @@ export class DurableObjectStore implements StorageAdapter {
     return { inserted: true, sequence, eventId };
   }
 
-  async appendEvent(e: any) { return this.#tx(() => this.#insertEvent(e)); }
+  async appendEvent(e: any) { return this.#write(() => this.#tx(() => this.#insertEvent(e))); }
 
   #cursor(tenantId: string, taskId: string, consumer: string): number {
     const r = this.#one(
@@ -309,129 +338,143 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async acquireLease(tenantId: string, taskId: string, holder: string, ttlMs: number): Promise<Lease | null> {
-    return this.#tx(() => {
-      const t = this.#now();
-      const cur = this.#one("SELECT * FROM leases WHERE task_id = ?", taskId);
-      if (cur && Number(cur.expires_at) > t && cur.holder !== holder) return null;
-      const token = this.#nextCounter("fencing");
-      this.#sql.exec(
-        `INSERT INTO leases(task_id, tenant_id, holder, fencing_token, expires_at) VALUES (?,?,?,?,?)
-         ON CONFLICT(task_id) DO UPDATE SET holder=excluded.holder,
-           fencing_token=excluded.fencing_token, expires_at=excluded.expires_at`,
-        taskId, tenantId, holder, token, t + ttlMs);
-      return { tenantId, taskId, holder, fencingToken: token, expiresAt: t + ttlMs };
+    return this.#write(() => {
+      return this.#tx(() => {
+        const t = this.#now();
+        const cur = this.#one("SELECT * FROM leases WHERE task_id = ?", taskId);
+        if (cur && Number(cur.expires_at) > t && cur.holder !== holder) return null;
+        const token = this.#nextCounter("fencing");
+        this.#sql.exec(
+          `INSERT INTO leases(task_id, tenant_id, holder, fencing_token, expires_at) VALUES (?,?,?,?,?)
+           ON CONFLICT(task_id) DO UPDATE SET holder=excluded.holder,
+             fencing_token=excluded.fencing_token, expires_at=excluded.expires_at`,
+          taskId, tenantId, holder, token, t + ttlMs);
+        return { tenantId, taskId, holder, fencingToken: token, expiresAt: t + ttlMs };
+      });
     });
   }
 
   async commitAdvance(txn: AdvanceTxn): Promise<CommitResult> {
-    return this.#tx(() => {
-      const t = this.#one("SELECT * FROM tasks WHERE tenant_id=? AND task_id=?", txn.tenantId, txn.taskId);
-      if (!t) return { ok: false, reason: "no_task" } as const;
-      if (txn.fencingToken < Number(t.fencing_token)) return { ok: false, reason: "fenced" } as const;
-      if (txn.generation !== Number(t.generation)) return { ok: false, reason: "stale_generation" } as const;
-      if (txn.expectedCheckpointVersion !== Number(t.checkpoint_version))
-        return { ok: false, reason: "version_conflict" } as const;
+    return this.#write(() => {
+      return this.#tx(() => {
+        const t = this.#one("SELECT * FROM tasks WHERE tenant_id=? AND task_id=?", txn.tenantId, txn.taskId);
+        if (!t) return { ok: false, reason: "no_task" } as const;
+        if (txn.fencingToken < Number(t.fencing_token)) return { ok: false, reason: "fenced" } as const;
+        if (txn.generation !== Number(t.generation)) return { ok: false, reason: "stale_generation" } as const;
+        if (txn.expectedCheckpointVersion !== Number(t.checkpoint_version))
+          return { ok: false, reason: "version_conflict" } as const;
 
-      const nextVersion = Number(t.checkpoint_version) + 1;
-      this.#sql.exec(
-        `UPDATE tasks SET status=?, checkpoint=?, checkpoint_version=?, fencing_token=?,
-           state_version=?, updated_at=? WHERE tenant_id=? AND task_id=?`,
-        txn.status, j(txn.checkpoint), nextVersion, txn.fencingToken, txn.stateVersion ?? 0,
-        this.#now(), txn.tenantId, txn.taskId);
+        const nextVersion = Number(t.checkpoint_version) + 1;
+        this.#sql.exec(
+          `UPDATE tasks SET status=?, checkpoint=?, checkpoint_version=?, fencing_token=?,
+             state_version=?, updated_at=? WHERE tenant_id=? AND task_id=?`,
+          txn.status, j(txn.checkpoint), nextVersion, txn.fencingToken, txn.stateVersion ?? 0,
+          this.#now(), txn.tenantId, txn.taskId);
 
-      if (txn.consumedThrough !== null) {
-        this.#sql.exec(
-          `INSERT INTO cursors(tenant_id, task_id, consumer, consumed_through) VALUES (?,?,'harness',?)
-           ON CONFLICT(tenant_id, task_id, consumer) DO UPDATE SET
-             consumed_through = MAX(cursors.consumed_through, excluded.consumed_through)`,
-          txn.tenantId, txn.taskId, txn.consumedThrough);
-      }
-      this.#sql.exec("DELETE FROM waits WHERE tenant_id=? AND task_id=? AND resolved=1",
-        txn.tenantId, txn.taskId);
-      for (const w of txn.waits) {
-        this.#sql.exec(
-          `INSERT INTO waits(wait_id, tenant_id, task_id, generation, kind, operation_id, deadline)
-           VALUES (?,?,?,?,?,?,?)`,
-          crypto.randomUUID(), txn.tenantId, txn.taskId, txn.generation, w.kind,
-          w.operationId ?? null, w.deadline ?? null);
-      }
-      for (const c of txn.commands) {
-        this.#sql.exec(
-          `INSERT OR IGNORE INTO outbox(command_id, tenant_id, task_id, generation, kind, payload,
-             state, created_at) VALUES (?,?,?,?,?,?,'pending',?)`,
-          c.commandId, txn.tenantId, txn.taskId, txn.generation, c.kind, j(c.payload), this.#now());
-      }
-      return { ok: true, checkpointVersion: nextVersion } as const;
+        if (txn.consumedThrough !== null) {
+          this.#sql.exec(
+            `INSERT INTO cursors(tenant_id, task_id, consumer, consumed_through) VALUES (?,?,'harness',?)
+             ON CONFLICT(tenant_id, task_id, consumer) DO UPDATE SET
+               consumed_through = MAX(cursors.consumed_through, excluded.consumed_through)`,
+            txn.tenantId, txn.taskId, txn.consumedThrough);
+        }
+        this.#sql.exec("DELETE FROM waits WHERE tenant_id=? AND task_id=? AND resolved=1",
+          txn.tenantId, txn.taskId);
+        for (const w of txn.waits) {
+          this.#sql.exec(
+            `INSERT INTO waits(wait_id, tenant_id, task_id, generation, kind, operation_id, deadline)
+             VALUES (?,?,?,?,?,?,?)`,
+            crypto.randomUUID(), txn.tenantId, txn.taskId, txn.generation, w.kind,
+            w.operationId ?? null, w.deadline ?? null);
+        }
+        for (const c of txn.commands) {
+          this.#sql.exec(
+            `INSERT OR IGNORE INTO outbox(command_id, tenant_id, task_id, generation, kind, payload,
+               state, created_at) VALUES (?,?,?,?,?,?,'pending',?)`,
+            c.commandId, txn.tenantId, txn.taskId, txn.generation, c.kind, j(c.payload), this.#now());
+        }
+        return { ok: true, checkpointVersion: nextVersion } as const;
+      });
     });
   }
 
   async releaseIfNoWork(tenantId: string, taskId: string, fencingToken: number, consumer: string) {
-    return this.#tx(() => {
-      const lease = this.#one("SELECT * FROM leases WHERE task_id=?", taskId);
-      if (lease && Number(lease.fencing_token) > fencingToken) return "fenced" as const;
-      const from = this.#cursor(tenantId, taskId, consumer);
-      const pending = this.#one(
-        "SELECT COUNT(*) AS n FROM events WHERE tenant_id=? AND task_id=? AND sequence > ?",
-        tenantId, taskId, from);
-      if (Number(pending.n) > 0) return "has_work" as const;
-      const resolved = this.#one(
-        "SELECT COUNT(*) AS n FROM waits WHERE tenant_id=? AND task_id=? AND resolved=1", tenantId, taskId);
-      if (Number(resolved.n) > 0) return "has_work" as const;
-      this.#sql.exec("DELETE FROM leases WHERE task_id=? AND fencing_token=?", taskId, fencingToken);
-      return "released" as const;
+    return this.#write(() => {
+      return this.#tx(() => {
+        const lease = this.#one("SELECT * FROM leases WHERE task_id=?", taskId);
+        if (lease && Number(lease.fencing_token) > fencingToken) return "fenced" as const;
+        const from = this.#cursor(tenantId, taskId, consumer);
+        const pending = this.#one(
+          "SELECT COUNT(*) AS n FROM events WHERE tenant_id=? AND task_id=? AND sequence > ?",
+          tenantId, taskId, from);
+        if (Number(pending.n) > 0) return "has_work" as const;
+        const resolved = this.#one(
+          "SELECT COUNT(*) AS n FROM waits WHERE tenant_id=? AND task_id=? AND resolved=1", tenantId, taskId);
+        if (Number(resolved.n) > 0) return "has_work" as const;
+        this.#sql.exec("DELETE FROM leases WHERE task_id=? AND fencing_token=?", taskId, fencingToken);
+        return "released" as const;
+      });
     });
   }
 
   async claimOutbox(limit: number, tenantId?: string) {
-    return this.#tx(() => {
-      const rows = tenantId
-        ? this.#all("SELECT * FROM outbox WHERE state='pending' AND tenant_id=? ORDER BY created_at ASC LIMIT ?",
-            tenantId, limit)
-        : this.#all("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at ASC LIMIT ?", limit);
-      // Stamp the claim too: a dispatch that throws leaves the row 'claimed'
-      // for ever, and claimOutbox only ever looks at 'pending'.
-      for (const r of rows) {
-        this.#sql.exec("UPDATE outbox SET state='claimed', dispatched_at=? WHERE command_id=?",
-          this.#now(), r.command_id);
-      }
-      return rows.map((r) => ({
-        commandId: r.command_id, taskId: r.task_id, kind: r.kind, payload: JSON.parse(r.payload),
-      }));
+    return this.#write(() => {
+      return this.#tx(() => {
+        const rows = tenantId
+          ? this.#all("SELECT * FROM outbox WHERE state='pending' AND tenant_id=? ORDER BY created_at ASC LIMIT ?",
+              tenantId, limit)
+          : this.#all("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at ASC LIMIT ?", limit);
+        // Stamp the claim too: a dispatch that throws leaves the row 'claimed'
+        // for ever, and claimOutbox only ever looks at 'pending'.
+        for (const r of rows) {
+          this.#sql.exec("UPDATE outbox SET state='claimed', dispatched_at=? WHERE command_id=?",
+            this.#now(), r.command_id);
+        }
+        return rows.map((r) => ({
+          commandId: r.command_id, taskId: r.task_id, kind: r.kind, payload: JSON.parse(r.payload),
+        }));
+      });
     });
   }
 
   async markDispatched(commandId: string) {
-    this.#sql.exec("UPDATE outbox SET state='dispatched', dispatched_at=? WHERE command_id=?",
-      this.#now(), commandId);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE outbox SET state='dispatched', dispatched_at=? WHERE command_id=?",
+        this.#now(), commandId);
+    });
   }
 
   async recordOperation(op: Omit<OperationRecord, "status" | "resultRef">) {
-    this.#sql.exec(
-      `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias, tool, tool_version,
-         status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?)
-       ON CONFLICT(operation_id) DO NOTHING`,
-      op.operationId, op.tenantId, op.agentId, op.taskId, op.mountAlias, op.tool, op.toolVersion,
-      this.#now(), this.#now());
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO operations(operation_id, tenant_id, agent_id, task_id, mount_alias, tool, tool_version,
+           status, result_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?)
+         ON CONFLICT(operation_id) DO NOTHING`,
+        op.operationId, op.tenantId, op.agentId, op.taskId, op.mountAlias, op.tool, op.toolVersion,
+        this.#now(), this.#now());
+    });
   }
 
   async startOperation(tenantId: string, operationId: string) {
-    // From pending or rejected only; a terminal row is never revived. No event:
-    // the moment is a start, not also a completion (src/core/store.ts).
-    //
-    // Read, check, write in one transaction, as `decideApproval` does below and
-    // for the same reason it gives — two callers must not both be told they
-    // took this. The condition is written twice on purpose: the `WHERE` is the
-    // invariant (a terminal row is never demoted) and holds wherever this
-    // statement is read, while the `SELECT` is what makes "did it match" an
-    // answer this method can return. Nothing here reads a cursor's written-row
-    // count, which no other query in this file does either.
-    return this.#tx(() => {
-      const r = this.#one("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
-      if (!r || (r.status !== "pending" && r.status !== "rejected")) return false;
-      this.#sql.exec(
-        "UPDATE operations SET status='running', updated_at=? WHERE tenant_id=? AND operation_id=? AND status IN ('pending','rejected')",
-        this.#now(), tenantId, operationId);
-      return true;
+    return this.#write(() => {
+      // From pending or rejected only; a terminal row is never revived. No event:
+      // the moment is a start, not also a completion (src/core/store.ts).
+      //
+      // Read, check, write in one transaction, as `decideApproval` does below and
+      // for the same reason it gives — two callers must not both be told they
+      // took this. The condition is written twice on purpose: the `WHERE` is the
+      // invariant (a terminal row is never demoted) and holds wherever this
+      // statement is read, while the `SELECT` is what makes "did it match" an
+      // answer this method can return. Nothing here reads a cursor's written-row
+      // count, which no other query in this file does either.
+      return this.#tx(() => {
+        const r = this.#one("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+        if (!r || (r.status !== "pending" && r.status !== "rejected")) return false;
+        this.#sql.exec(
+          "UPDATE operations SET status='running', updated_at=? WHERE tenant_id=? AND operation_id=? AND status IN ('pending','rejected')",
+          this.#now(), tenantId, operationId);
+        return true;
+      });
     });
   }
 
@@ -446,70 +489,80 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async recordUsage(rows: readonly UsageRow[]) {
-    appendUsage(this.#sql as any, rows);
+    return this.#write(() => {
+      appendUsage(this.#sql as any, rows);
+    });
   }
 
   async recordTrace(rows: readonly TraceRow[]) {
-    appendTrace(this.#sql, rows);
+    return this.#write(() => {
+      appendTrace(this.#sql, rows);
+    });
   }
 
   async completeOperation(
     tenantId: string, operationId: string, status: OperationStatus, resultRef: string | null,
     result?: Json, facts?: CompletedFacts,
   ) {
-    this.#tx(() => {
-      const endedAt = this.#now();
-      this.#sql.exec(
-        "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
-        status, resultRef, endedAt, tenantId, operationId);
-      this.#sql.exec("UPDATE waits SET resolved=1 WHERE tenant_id=? AND operation_id=? AND resolved=0",
-        tenantId, operationId);
-      const op = this.#one(
-        "SELECT agent_id, task_id, mount_alias, tool, created_at FROM operations WHERE tenant_id=? AND operation_id=?",
-        tenantId, operationId);
-      if (op) {
-        this.#insertEvent({
-          tenantId, agentId: op.agent_id, taskId: op.task_id, kind: "operation.completed",
-          payload: completedPayload(operationId, status, resultRef, result, facts), dedupKey: `op:${operationId}:completed`,
-        });
-        // The trace row, in the same transaction as the fact it joins back to
-        // (src/trace/seams.ts). "running" is not an end and writes none.
-        if (operationEnded(status)) {
-          appendTrace(this.#sql, [toolCallRow({
-            tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
-            mountAlias: op.mount_alias, tool: op.tool, status,
-            createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
-          })]);
+    return this.#write(() => {
+      this.#tx(() => {
+        const endedAt = this.#now();
+        this.#sql.exec(
+          "UPDATE operations SET status=?, result_ref=?, updated_at=? WHERE tenant_id=? AND operation_id=?",
+          status, resultRef, endedAt, tenantId, operationId);
+        this.#sql.exec("UPDATE waits SET resolved=1 WHERE tenant_id=? AND operation_id=? AND resolved=0",
+          tenantId, operationId);
+        const op = this.#one(
+          "SELECT agent_id, task_id, mount_alias, tool, created_at FROM operations WHERE tenant_id=? AND operation_id=?",
+          tenantId, operationId);
+        if (op) {
+          this.#insertEvent({
+            tenantId, agentId: op.agent_id, taskId: op.task_id, kind: "operation.completed",
+            payload: completedPayload(operationId, status, resultRef, result, facts), dedupKey: `op:${operationId}:completed`,
+          });
+          // The trace row, in the same transaction as the fact it joins back to
+          // (src/trace/seams.ts). "running" is not an end and writes none.
+          if (operationEnded(status)) {
+            appendTrace(this.#sql, [toolCallRow({
+              tenantId, agentId: op.agent_id, taskId: op.task_id, operationId,
+              mountAlias: op.mount_alias, tool: op.tool, status,
+              createdAt: Number(op.created_at), endedAt, callId: facts?.callId ?? null,
+            })]);
+          }
         }
-      }
+      });
     });
   }
 
   async registerWait(tenantId: string, taskId: string, generation: number, wait: WaitSpec) {
-    return this.#tx(() => {
-      if (wait.kind === "operation" && wait.operationId) {
-        const op = this.#one("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?",
-          tenantId, wait.operationId);
-        if (op && ["succeeded", "failed", "cancelled", "unknown"].includes(op.status)) {
-          return "already_satisfied" as const;
+    return this.#write(() => {
+      return this.#tx(() => {
+        if (wait.kind === "operation" && wait.operationId) {
+          const op = this.#one("SELECT status FROM operations WHERE tenant_id=? AND operation_id=?",
+            tenantId, wait.operationId);
+          if (op && ["succeeded", "failed", "cancelled", "unknown"].includes(op.status)) {
+            return "already_satisfied" as const;
+          }
         }
-      }
-      this.#sql.exec(
-        `INSERT INTO waits(wait_id, tenant_id, task_id, generation, kind, operation_id, deadline)
-         VALUES (?,?,?,?,?,?,?)`,
-        crypto.randomUUID(), tenantId, taskId, generation, wait.kind,
-        wait.operationId ?? null, wait.deadline ?? null);
-      return "registered" as const;
+        this.#sql.exec(
+          `INSERT INTO waits(wait_id, tenant_id, task_id, generation, kind, operation_id, deadline)
+           VALUES (?,?,?,?,?,?,?)`,
+          crypto.randomUUID(), tenantId, taskId, generation, wait.kind,
+          wait.operationId ?? null, wait.deadline ?? null);
+        return "registered" as const;
+      });
     });
   }
 
   async interrupt(tenantId: string, taskId: string): Promise<number> {
-    return this.#tx(() => {
-      this.#sql.exec(
-        "UPDATE tasks SET generation = generation + 1, status='interrupted', updated_at=? WHERE tenant_id=? AND task_id=?",
-        this.#now(), tenantId, taskId);
-      return Number(this.#one("SELECT generation FROM tasks WHERE tenant_id=? AND task_id=?",
-        tenantId, taskId).generation);
+    return this.#write(() => {
+      return this.#tx(() => {
+        this.#sql.exec(
+          "UPDATE tasks SET generation = generation + 1, status='interrupted', updated_at=? WHERE tenant_id=? AND task_id=?",
+          this.#now(), tenantId, taskId);
+        return Number(this.#one("SELECT generation FROM tasks WHERE tenant_id=? AND task_id=?",
+          tenantId, taskId).generation);
+      });
     });
   }
 
@@ -528,36 +581,40 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async setQuota(tenantId: string, resource: string, limit: number | null, windowMs: number | null = null) {
-    this.#sql.exec(
-      `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
-       VALUES (?,?,?,?,0,?)
-       ON CONFLICT(tenant_id, resource) DO UPDATE SET
-         limit_value=excluded.limit_value, window_ms=excluded.window_ms`,
-      tenantId, resource, limit, windowMs, this.#now(),
-    );
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+         VALUES (?,?,?,?,0,?)
+         ON CONFLICT(tenant_id, resource) DO UPDATE SET
+           limit_value=excluded.limit_value, window_ms=excluded.window_ms`,
+        tenantId, resource, limit, windowMs, this.#now(),
+      );
+    });
   }
 
   async consumeQuota(tenantId: string, resource: string, amount: number) {
-    return this.#tx(() => {
-      const own = this.#quotaRow(tenantId, resource);
-      const fallback = own?.limit_value != null ? null : this.#quotaRow("*", resource);
-      const limit: number | null = own?.limit_value ?? fallback?.limit_value ?? null;
-      const windowMs: number | null = own?.window_ms ?? fallback?.window_ms ?? null;
-      const t = this.#now();
+    return this.#write(() => {
+      return this.#tx(() => {
+        const own = this.#quotaRow(tenantId, resource);
+        const fallback = own?.limit_value != null ? null : this.#quotaRow("*", resource);
+        const limit: number | null = own?.limit_value ?? fallback?.limit_value ?? null;
+        const windowMs: number | null = own?.window_ms ?? fallback?.window_ms ?? null;
+        const t = this.#now();
 
-      let used = Number(own?.used ?? 0);
-      let windowStart = Number(own?.window_start ?? t);
-      if (windowMs != null && t - windowStart >= windowMs) { used = 0; windowStart = t; }
+        let used = Number(own?.used ?? 0);
+        let windowStart = Number(own?.window_start ?? t);
+        if (windowMs != null && t - windowStart >= windowMs) { used = 0; windowStart = t; }
 
-      const allowed = limit == null || used + amount <= limit;
-      if (allowed) used += amount;
-      this.#sql.exec(
-        `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
-         VALUES (?,?,?,?,?,?)
-         ON CONFLICT(tenant_id, resource) DO UPDATE SET used=excluded.used, window_start=excluded.window_start`,
-        tenantId, resource, own?.limit_value ?? null, own?.window_ms ?? null, used, windowStart,
-      );
-      return { allowed, used, limit };
+        const allowed = limit == null || used + amount <= limit;
+        if (allowed) used += amount;
+        this.#sql.exec(
+          `INSERT INTO quotas(tenant_id, resource, limit_value, window_ms, used, window_start)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(tenant_id, resource) DO UPDATE SET used=excluded.used, window_start=excluded.window_start`,
+          tenantId, resource, own?.limit_value ?? null, own?.window_ms ?? null, used, windowStart,
+        );
+        return { allowed, used, limit };
+      });
     });
   }
 
@@ -572,14 +629,16 @@ export class DurableObjectStore implements StorageAdapter {
   // ------------------------------------------------------------ agent state
 
   async putState(tenantId: string, agentId: string, key: string, entry: StateEntry) {
-    this.#sql.exec(
-      `INSERT INTO agent_state(tenant_id, agent_id, key, value, ref, bytes, updated_at)
-         VALUES (?,?,?,?,?,?,?)
-         ON CONFLICT(tenant_id, agent_id, key) DO UPDATE SET
-           value=excluded.value, ref=excluded.ref, bytes=excluded.bytes,
-           updated_at=excluded.updated_at`,
-      tenantId, agentId, key, entry.value === null ? null : j(entry.value),
-      entry.ref, entry.bytes, this.#now());
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO agent_state(tenant_id, agent_id, key, value, ref, bytes, updated_at)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(tenant_id, agent_id, key) DO UPDATE SET
+             value=excluded.value, ref=excluded.ref, bytes=excluded.bytes,
+             updated_at=excluded.updated_at`,
+        tenantId, agentId, key, entry.value === null ? null : j(entry.value),
+        entry.ref, entry.bytes, this.#now());
+    });
   }
 
   async appendState(
@@ -608,9 +667,11 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async deleteState(tenantId: string, agentId: string, key: string) {
-    const had = !!this.#one("SELECT * FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key) as any;
-    this.#sql.exec("DELETE FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key);
-    return had;
+    return this.#write(() => {
+      const had = !!this.#one("SELECT * FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key) as any;
+      this.#sql.exec("DELETE FROM agent_state WHERE tenant_id=? AND agent_id=? AND key=?", tenantId, agentId, key);
+      return had;
+    });
   }
 
   async listState(tenantId: string, agentId: string, prefix = "", limit = 100) {
@@ -631,9 +692,11 @@ export class DurableObjectStore implements StorageAdapter {
   // ---------------------------------------------------------- follow-ups
 
   async queueFollowUp(tenantId: string, agentId: string, taskId: string, text: string) {
-    this.#sql.exec(
-      "INSERT INTO follow_ups(tenant_id, agent_id, task_id, text, created_at) VALUES (?,?,?,?,?)",
-      tenantId, agentId, taskId, text, this.#now());
+    return this.#write(() => {
+      this.#sql.exec(
+        "INSERT INTO follow_ups(tenant_id, agent_id, task_id, text, created_at) VALUES (?,?,?,?,?)",
+        tenantId, agentId, taskId, text, this.#now());
+    });
   }
 
   async flushFollowUps(tenantId: string, agentId: string, taskId: string) {
@@ -646,19 +709,24 @@ export class DurableObjectStore implements StorageAdapter {
         payload: { text: (r as any).text, followUp: true },
       });
     }
-    if (rows.length) this.#sql.exec("DELETE FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=?", tenantId, agentId, taskId);
+    if (rows.length) {
+      const deleted = this.#write(() => this.#sql.exec("DELETE FROM follow_ups WHERE tenant_id=? AND agent_id=? AND task_id=?", tenantId, agentId, taskId));
+      if (deleted instanceof Promise) await deleted;
+    }
     return rows.length;
   }
 
   async setModelBinding(b: ModelBinding) {
-    this.#sql.exec(
-      `INSERT INTO model_bindings(tenant_id, agent_id, provider, model, base_url, secret_ref, updated_at)
-       VALUES (?,?,?,?,?,?,?)
-       ON CONFLICT(tenant_id, agent_id) DO UPDATE SET
-         provider=excluded.provider, model=excluded.model, base_url=excluded.base_url,
-         secret_ref=excluded.secret_ref, updated_at=excluded.updated_at`,
-      b.tenantId, b.agentId ?? "", b.provider, b.model, b.baseUrl, b.secretRef, this.#now(),
-    );
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO model_bindings(tenant_id, agent_id, provider, model, base_url, secret_ref, updated_at)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(tenant_id, agent_id) DO UPDATE SET
+           provider=excluded.provider, model=excluded.model, base_url=excluded.base_url,
+           secret_ref=excluded.secret_ref, updated_at=excluded.updated_at`,
+        b.tenantId, b.agentId ?? "", b.provider, b.model, b.baseUrl, b.secretRef, this.#now(),
+      );
+    });
   }
 
   async getModelBinding(tenantId: string, agentId: string): Promise<ModelBinding | null> {
@@ -675,13 +743,15 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async requireApproval(a: Omit<ApprovalRecord, "state" | "approver" | "decidedAt" | "createdAt">) {
-    this.#sql.exec(
-      `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
-         request, state, approver, decided_at, created_at)
-       VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
-       ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
-      a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool,
-      j(a.request), this.#now());
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO approvals(tenant_id, operation_id, agent_id, task_id, mount_alias, tool,
+           request, state, approver, decided_at, created_at)
+         VALUES (?,?,?,?,?,?,?,'pending',NULL,NULL,?)
+         ON CONFLICT(tenant_id, operation_id) DO NOTHING`,
+        a.tenantId, a.operationId, a.agentId, a.taskId, a.mountAlias, a.tool,
+        j(a.request), this.#now());
+    });
   }
 
   async getApproval(tenantId: string, operationId: string): Promise<ApprovalRecord | null> {
@@ -692,22 +762,24 @@ export class DurableObjectStore implements StorageAdapter {
   async decideApproval(
     tenantId: string, operationId: string, decision: "approved" | "denied", approver: string,
   ) {
-    return this.#tx(() => {
-      const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
-      if (!r) return { ok: false as const, reason: "not_found" as const };
-      // Deciding twice would let one approval authorise two executions.
-      if (r.state !== "pending") return { ok: false as const, reason: "already_decided" as const };
-      const at = this.#now();
-      this.#sql.exec(
-        "UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?",
-        decision, approver, at, tenantId, operationId);
-      // The wait is over either way; the row says how long and which way.
-      appendTrace(this.#sql, [approvalRow({
-        tenantId, agentId: r.agent_id, taskId: r.task_id, operationId,
-        mountAlias: r.mount_alias, tool: r.tool, decision, approver,
-        createdAt: Number(r.created_at), decidedAt: at,
-      })]);
-      return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at }) };
+    return this.#write(() => {
+      return this.#tx(() => {
+        const r = this.#one("SELECT * FROM approvals WHERE tenant_id=? AND operation_id=?", tenantId, operationId);
+        if (!r) return { ok: false as const, reason: "not_found" as const };
+        // Deciding twice would let one approval authorise two executions.
+        if (r.state !== "pending") return { ok: false as const, reason: "already_decided" as const };
+        const at = this.#now();
+        this.#sql.exec(
+          "UPDATE approvals SET state=?, approver=?, decided_at=? WHERE tenant_id=? AND operation_id=?",
+          decision, approver, at, tenantId, operationId);
+        // The wait is over either way; the row says how long and which way.
+        appendTrace(this.#sql, [approvalRow({
+          tenantId, agentId: r.agent_id, taskId: r.task_id, operationId,
+          mountAlias: r.mount_alias, tool: r.tool, decision, approver,
+          createdAt: Number(r.created_at), decidedAt: at,
+        })]);
+        return { ok: true as const, record: mapApproval({ ...r, state: decision, approver, decided_at: at }) };
+      });
     });
   }
 
@@ -719,41 +791,51 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async addMount(m: MountRecord) {
-    this.#sql.exec(
-      `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id, plugin,
-         tool_version, public_config, secret_ref, policy, tool_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId, m.plugin, m.toolVersion,
-      j(m.publicConfig), m.secretRef, m.policy ? j(m.policy) : null, m.toolSnapshot ? j(m.toolSnapshot) : null);
+    return this.#write(() => {
+      this.#sql.exec(
+        `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id, plugin,
+           tool_version, public_config, secret_ref, policy, tool_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId, m.plugin, m.toolVersion,
+        j(m.publicConfig), m.secretRef, m.policy ? j(m.policy) : null, m.toolSnapshot ? j(m.toolSnapshot) : null);
+    });
   }
 
   async updateMountToolSnapshot(tenantId: string, agentId: string, alias: string, snapshot: ToolSnapshot | null) {
-    this.#sql.exec("UPDATE mounts SET tool_snapshot=? WHERE tenant_id=? AND agent_id=? AND alias=?",
-      snapshot ? j(snapshot) : null, tenantId, agentId, alias);
-    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
-      tenantId, agentId, alias);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE mounts SET tool_snapshot=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+        snapshot ? j(snapshot) : null, tenantId, agentId, alias);
+      return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+        tenantId, agentId, alias);
+    });
   }
 
   async updateMountPolicy(
     tenantId: string, agentId: string, alias: string, policy: MountPolicy | null,
   ) {
-    this.#sql.exec("UPDATE mounts SET policy=? WHERE tenant_id=? AND agent_id=? AND alias=?",
-      policy ? j(policy) : null, tenantId, agentId, alias);
-    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
-      tenantId, agentId, alias);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE mounts SET policy=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+        policy ? j(policy) : null, tenantId, agentId, alias);
+      return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+        tenantId, agentId, alias);
+    });
   }
 
   async updateMountToolVersion(tenantId: string, agentId: string, alias: string, toolVersion: string) {
-    this.#sql.exec("UPDATE mounts SET tool_version=? WHERE tenant_id=? AND agent_id=? AND alias=?",
-      toolVersion, tenantId, agentId, alias);
-    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
-      tenantId, agentId, alias);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE mounts SET tool_version=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+        toolVersion, tenantId, agentId, alias);
+      return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+        tenantId, agentId, alias);
+    });
   }
 
   async updateMountConfig(tenantId: string, agentId: string, alias: string, publicConfig: Json) {
-    this.#sql.exec("UPDATE mounts SET public_config=? WHERE tenant_id=? AND agent_id=? AND alias=?",
-      j(publicConfig), tenantId, agentId, alias);
-    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
-      tenantId, agentId, alias);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE mounts SET public_config=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+        j(publicConfig), tenantId, agentId, alias);
+      return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+        tenantId, agentId, alias);
+    });
   }
 
   async getMountByAlias(tenantId: string, agentId: string, alias: string) {
@@ -780,15 +862,17 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async setPluginChoice(tenantId: string, agentId: string, plugin: string, choice: PluginChoice) {
-    if (choice === "inherit") {
-      this.#sql.exec("DELETE FROM agent_plugins WHERE tenant_id=? AND agent_id=? AND plugin=?",
-        tenantId, agentId, plugin);
-      return;
-    }
-    this.#sql.exec(
-      `INSERT INTO agent_plugins(tenant_id, agent_id, plugin, state, updated_at) VALUES (?,?,?,?,?)
-       ON CONFLICT(tenant_id, agent_id, plugin) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`,
-      tenantId, agentId, plugin, choice, this.#now());
+    return this.#write(() => {
+      if (choice === "inherit") {
+        this.#sql.exec("DELETE FROM agent_plugins WHERE tenant_id=? AND agent_id=? AND plugin=?",
+          tenantId, agentId, plugin);
+        return;
+      }
+      this.#sql.exec(
+        `INSERT INTO agent_plugins(tenant_id, agent_id, plugin, state, updated_at) VALUES (?,?,?,?,?)
+         ON CONFLICT(tenant_id, agent_id, plugin) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`,
+        tenantId, agentId, plugin, choice, this.#now());
+    });
   }
 
   /** One transaction: the mount, its databases, and its own secret. */
@@ -796,56 +880,62 @@ export class DurableObjectStore implements StorageAdapter {
     tenantId: string, agentId: string, from: string, to: string,
     secret: { newRef: string } | null,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    if (from === to) return { ok: true };
-    if (!to.trim()) return { ok: false, error: "a mount needs a name" };
-    try {
-      return this.#tx(() => {
-        if (!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, from)) {
-          return { ok: false as const, error: `no mount named ${from}` };
-        }
-        if (this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, to)) {
-          return { ok: false as const, error: `this agent already has a mount named ${to}` };
-        }
-        // Checked rather than left to the primary key, because a constraint
-        // failure inside the transaction would roll the whole rename back with
-        // a message about SQL rather than about the mount.
-        if (secret && this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, to)) {
-          return { ok: false as const, error: `a credential is already stored under the name ${to}` };
-        }
-        this.#sql.exec("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
-        this.pluginDb.rename(tenantId, agentId, from, to);
-        if (secret) {
-          this.#sql.exec("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?", to, tenantId, agentId, from);
-          this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?", secret.newRef, tenantId, agentId, to);
-        }
-        return { ok: true as const };
-      });
-    } catch (e) {
-      // The transaction is undone by the failure; say so, because "it failed"
-      // and "it half happened" are the two things a person needs told apart.
-      return { ok: false, error: `rename was not applied: ${String((e as Error)?.message ?? e)}` };
-    }
+    return this.#write(() => {
+      if (from === to) return { ok: true };
+      if (!to.trim()) return { ok: false, error: "a mount needs a name" };
+      try {
+        return this.#tx(() => {
+          if (!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, from)) {
+            return { ok: false as const, error: `no mount named ${from}` };
+          }
+          if (this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, to)) {
+            return { ok: false as const, error: `this agent already has a mount named ${to}` };
+          }
+          // Checked rather than left to the primary key, because a constraint
+          // failure inside the transaction would roll the whole rename back with
+          // a message about SQL rather than about the mount.
+          if (secret && this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, to)) {
+            return { ok: false as const, error: `a credential is already stored under the name ${to}` };
+          }
+          this.#sql.exec("UPDATE mounts SET alias=? WHERE tenant_id=? AND agent_id=? AND alias=?", to, tenantId, agentId, from);
+          this.pluginDb.rename(tenantId, agentId, from, to);
+          if (secret) {
+            this.#sql.exec("UPDATE secrets SET name=? WHERE tenant_id=? AND agent_id=? AND name=?", to, tenantId, agentId, from);
+            this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?", secret.newRef, tenantId, agentId, to);
+          }
+          return { ok: true as const };
+        });
+      } catch (e) {
+        // The transaction is undone by the failure; say so, because "it failed"
+        // and "it half happened" are the two things a person needs told apart.
+        return { ok: false, error: `rename was not applied: ${String((e as Error)?.message ?? e)}` };
+      }
+    });
   }
 
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
-    this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?",
-      secretRef, tenantId, agentId, alias);
-    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
-      tenantId, agentId, alias);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+        secretRef, tenantId, agentId, alias);
+      return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+        tenantId, agentId, alias);
+    });
   }
 
   // ---- secrets: ciphertext in, ciphertext out; metadata is all a page gets.
   async putSecret(tenantId: string, agentId: string, name: string, s: {
     ciphertext: string; iv: string; account?: string | null; verified?: boolean;
   }) {
-    const t = this.#now();
-    this.#sql.exec(
-      `INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, account, verified, created_at, updated_at, last_used_at)
-       VALUES (?,?,?,?,?,?,?,?,?,NULL)
-       ON CONFLICT(tenant_id, agent_id, name) DO UPDATE SET
-         ciphertext=excluded.ciphertext, iv=excluded.iv, account=excluded.account,
-         verified=excluded.verified, updated_at=excluded.updated_at, last_used_at=NULL`,
-      tenantId, agentId, name, s.ciphertext, s.iv, s.account ?? null, s.verified ? 1 : 0, t, t);
+    return this.#write(() => {
+      const t = this.#now();
+      this.#sql.exec(
+        `INSERT INTO secrets(tenant_id, agent_id, name, ciphertext, iv, account, verified, created_at, updated_at, last_used_at)
+         VALUES (?,?,?,?,?,?,?,?,?,NULL)
+         ON CONFLICT(tenant_id, agent_id, name) DO UPDATE SET
+           ciphertext=excluded.ciphertext, iv=excluded.iv, account=excluded.account,
+           verified=excluded.verified, updated_at=excluded.updated_at, last_used_at=NULL`,
+        tenantId, agentId, name, s.ciphertext, s.iv, s.account ?? null, s.verified ? 1 : 0, t, t);
+    });
   }
 
   async getSecret(tenantId: string, agentId: string, name: string) {
@@ -866,8 +956,10 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async touchSecret(tenantId: string, agentId: string, name: string, at: number) {
-    this.#sql.exec("UPDATE secrets SET last_used_at=? WHERE tenant_id=? AND agent_id=? AND name=?",
-      at, tenantId, agentId, name);
+    return this.#write(() => {
+      this.#sql.exec("UPDATE secrets SET last_used_at=? WHERE tenant_id=? AND agent_id=? AND name=?",
+        at, tenantId, agentId, name);
+    });
   }
 
   async listSecretNames(tenantId: string, agentId: string, prefix: string) {
@@ -879,9 +971,11 @@ export class DurableObjectStore implements StorageAdapter {
   }
 
   async removeSecret(tenantId: string, agentId: string, name: string) {
-    const before = this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
-    this.#sql.exec("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
-    return !!before;
+    return this.#write(() => {
+      const before = this.#one("SELECT name FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
+      this.#sql.exec("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, name);
+      return !!before;
+    });
   }
 
   /** What the alarm needs: which tasks still have unconsumed events. */
@@ -914,24 +1008,26 @@ export class DurableObjectStore implements StorageAdapter {
    * `failed` is deliberately not reopened: that is a permanent state.
    */
   async reopenTask(tenantId: string, taskId: string): Promise<boolean> {
-    const r = this.#all("SELECT status FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId)[0] as any;
-    if (!r) return false;
-    if (["completed", "blocked"].includes(r.status)) {
-      this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
-        this.#now(), tenantId, taskId);
-      return true;
-    }
-    // `waiting` means "something outstanding will wake this". When nothing is
-    // outstanding that is not a wait, it is a strand: the reply that was going
-    // to arrive never will, and no message could rescue the task because this
-    // method used to refuse the status outright. Reopen only when the task is
-    // genuinely orphaned, so a real approval gate is never bypassed by typing.
-    if (r.status === "waiting" && !this.#outstanding(tenantId, taskId)) {
-      this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
-        this.#now(), tenantId, taskId);
-      return true;
-    }
-    return false;
+    return this.#write(() => {
+      const r = this.#all("SELECT status FROM tasks WHERE tenant_id=? AND task_id=?", tenantId, taskId)[0] as any;
+      if (!r) return false;
+      if (["completed", "blocked"].includes(r.status)) {
+        this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
+          this.#now(), tenantId, taskId);
+        return true;
+      }
+      // `waiting` means "something outstanding will wake this". When nothing is
+      // outstanding that is not a wait, it is a strand: the reply that was going
+      // to arrive never will, and no message could rescue the task because this
+      // method used to refuse the status outright. Reopen only when the task is
+      // genuinely orphaned, so a real approval gate is never bypassed by typing.
+      if (r.status === "waiting" && !this.#outstanding(tenantId, taskId)) {
+        this.#sql.exec("UPDATE tasks SET status='runnable', updated_at=? WHERE tenant_id=? AND task_id=?",
+          this.#now(), tenantId, taskId);
+        return true;
+      }
+      return false;
+    });
   }
 
   /** Anything that could still wake a waiting task: a command not yet answered,
@@ -956,26 +1052,28 @@ export class DurableObjectStore implements StorageAdapter {
    * subquery. Keeping the row's state true makes a stall visible at a glance.
    */
   async settleAnswered(): Promise<number> {
-    const done = this.#all(
-      `SELECT command_id FROM outbox
-        WHERE state IN ('pending','claimed','dispatched')
-          AND (
-            -- A reply arrived.
-            EXISTS (SELECT 1 FROM events e
-                     WHERE e.tenant_id = outbox.tenant_id
-                       AND e.dedup_key IN ('cmd:' || outbox.command_id || ':response',
-                                           'cmd:' || outbox.command_id || ':result'))
-            -- Or none was ever coming. message.out answers nothing by design,
-            -- so nothing retired it: the row said dispatched for the life of
-            -- the object, the console reported a command still in flight, and
-            -- worse, it counted as outstanding, which would stop a message
-            -- from rescuing a stranded task.
-            OR (kind = 'message.out' AND state = 'dispatched')
-          )`);
-    for (const r of done) {
-      this.#sql.exec("UPDATE outbox SET state='done' WHERE command_id=?", (r as any).command_id);
-    }
-    return done.length;
+    return this.#write(() => {
+      const done = this.#all(
+        `SELECT command_id FROM outbox
+          WHERE state IN ('pending','claimed','dispatched')
+            AND (
+              -- A reply arrived.
+              EXISTS (SELECT 1 FROM events e
+                       WHERE e.tenant_id = outbox.tenant_id
+                         AND e.dedup_key IN ('cmd:' || outbox.command_id || ':response',
+                                             'cmd:' || outbox.command_id || ':result'))
+              -- Or none was ever coming. message.out answers nothing by design,
+              -- so nothing retired it: the row said dispatched for the life of
+              -- the object, the console reported a command still in flight, and
+              -- worse, it counted as outstanding, which would stop a message
+              -- from rescuing a stranded task.
+              OR (kind = 'message.out' AND state = 'dispatched')
+            )`);
+      for (const r of done) {
+        this.#sql.exec("UPDATE outbox SET state='done' WHERE command_id=?", (r as any).command_id);
+      }
+      return done.length;
+    });
   }
 
   /**
@@ -1016,34 +1114,38 @@ export class DurableObjectStore implements StorageAdapter {
    * executing twice.
    */
   async requeueStale(olderThanMs: number, kinds: string[]): Promise<number> {
-    const marks = kinds.map(() => "?").join(",");
-    const doomed = this.#all(
-      `SELECT o.command_id FROM outbox o
-         JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
-        WHERE o.state = 'dispatched' AND o.kind IN (${marks})
-          AND t.status NOT IN ('completed','failed')
-          AND o.dispatched_at < ?
-          AND NOT EXISTS (SELECT 1 FROM events e
-                           WHERE e.tenant_id = o.tenant_id
-                             AND e.dedup_key = 'cmd:' || o.command_id || ':result')`,
-      ...kinds, this.#now() - olderThanMs);
-    for (const r of doomed) {
-      this.#sql.exec("UPDATE outbox SET state='pending', dispatched_at=NULL WHERE command_id=?",
-        (r as any).command_id);
-    }
-    return doomed.length;
+    return this.#write(() => {
+      const marks = kinds.map(() => "?").join(",");
+      const doomed = this.#all(
+        `SELECT o.command_id FROM outbox o
+           JOIN tasks t ON t.tenant_id = o.tenant_id AND t.task_id = o.task_id
+          WHERE o.state = 'dispatched' AND o.kind IN (${marks})
+            AND t.status NOT IN ('completed','failed')
+            AND o.dispatched_at < ?
+            AND NOT EXISTS (SELECT 1 FROM events e
+                             WHERE e.tenant_id = o.tenant_id
+                               AND e.dedup_key = 'cmd:' || o.command_id || ':result')`,
+        ...kinds, this.#now() - olderThanMs);
+      for (const r of doomed) {
+        this.#sql.exec("UPDATE outbox SET state='pending', dispatched_at=NULL WHERE command_id=?",
+          (r as any).command_id);
+      }
+      return doomed.length;
+    });
   }
 
   /** A claim whose dispatch threw is invisible to claimOutbox; hand it back. */
   async reclaimStuckClaims(olderThanMs: number): Promise<number> {
-    const stuck = this.#all(
-      "SELECT command_id FROM outbox WHERE state='claimed' AND dispatched_at < ?",
-      this.#now() - olderThanMs,
-    );
-    for (const r of stuck) {
-      this.#sql.exec("UPDATE outbox SET state='pending' WHERE command_id=?", (r as any).command_id);
-    }
-    return stuck.length;
+    return this.#write(() => {
+      const stuck = this.#all(
+        "SELECT command_id FROM outbox WHERE state='claimed' AND dispatched_at < ?",
+        this.#now() - olderThanMs,
+      );
+      for (const r of stuck) {
+        this.#sql.exec("UPDATE outbox SET state='pending' WHERE command_id=?", (r as any).command_id);
+      }
+      return stuck.length;
+    });
   }
 
   async listTasks(tenantId: string, agentId: string) {
