@@ -7,7 +7,7 @@
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { UnknownJob } from "../cf/src/model-queue.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
-import { DurableAgent } from "../src/runtime/durable-agent.ts";
+import { DurableAgent, guardJoinedWrites } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
@@ -93,6 +93,33 @@ const runtimeCases: DriveCase[] = [
         check(last?.role === "assistant" && last.content?.[0]?.text === "Paris", `branch ${show(branch)}`);
         await agent.close();
       } finally { host.dispose(); }
+    },
+  },
+  {
+    group: "runtime", name: "engine pd: messages and steps together make no write of the runtime's join an open pi-durable transaction",
+    run: async () => {
+      const raw = sqliteHost();
+      try {
+        // Every pi-durable transaction is held open across a macrotask, so whatever runs concurrently
+        // runs while one is open; the guard refuses (and records) any write of ours made then.
+        const slow: typeof raw = {
+          ...raw,
+          transaction: (cb) => raw.transaction(async () => { await sleep(3); return cb(); }),
+        };
+        const guarded = guardJoinedWrites(slow);
+        const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
+        const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
+        await ap.ensure();
+        await ap.setEngineOnce("pd");
+        const { rt } = await runtime(host);
+        await rt.postMessage("t", "a", "Q1");
+        const results = await Promise.allSettled([
+          rt.step("t", "a"), rt.postMessage("t", "a", "Q2", "steer"), rt.step("t", "a"), rt.postMessage("t", "a", "Q3", "followUp"), rt.step("t", "a"),
+        ]);
+        const failed = results.filter((r) => r.status === "rejected").map((r) => String((r as PromiseRejectedResult).reason));
+        check(guarded.joined.length === 0 && failed.length === 0, `joined ${show(guarded.joined)}; failed ${show(failed)}`);
+        await (await rt.agent("t", "a")).close();
+      } finally { raw.dispose(); }
     },
   },
 ];
