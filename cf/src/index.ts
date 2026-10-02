@@ -13,7 +13,7 @@
  */
 import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
-import { nextAlarm } from "./alarm-next.ts";
+import { nextAlarm, pdDeliveryWake } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -683,8 +683,13 @@ export class AgentDO extends DurableObject<Env> {
     if (wrote) {
       await this.broadcast();
       // The answer is what makes the next pass finish, so wake now rather than
-      // waiting for the safety-net alarm.
-      await this.#wake();
+      // waiting for the safety-net alarm. Not on a pd object, whose park alarm
+      // is already set for when the answer will be read (alarm-next.ts).
+      if (!rt.servesPd) await this.#wake();
+      else {
+        const at = pdDeliveryWake(await this.ctx.storage.getAlarm(), Date.now());
+        if (at !== null) await this.#wake(at);
+      }
     }
     return wrote;
   }
@@ -708,6 +713,7 @@ export class AgentDO extends DurableObject<Env> {
       store: new DurableObjectStore(this.ctx as any),
       plugins: this.#activeRuntime().plugins(),
       alarm: () => this.ctx.storage.getAlarm(),
+      outsidePd: (fn) => this.#outsidePd(fn),
     });
   }
 
@@ -1890,7 +1896,7 @@ export class AgentDO extends DurableObject<Env> {
     const session = await this.#conversation(tenantId, agentId, taskId);
     // A pd agent's entries and jobs are pi-durable's and `ap_model_jobs`; pi's tables exist for it and stay
     // empty, so a version read from them would never move and the console would never redraw.
-    const moved = isPd(this.sql) ? pdVersion(this.sql, session) : (() => {
+    const moved = isPd(this.sql) ? await this.#outsidePd(() => pdVersion(this.sql, session)) : (() => {
       ensureAgentTables(this.sql, session);
       const t = piTables(session);
       const row = this.sql.exec(`SELECT MAX(seq) AS s, COUNT(*) AS n FROM ${t.entries}`)
@@ -1932,7 +1938,15 @@ export class AgentDO extends DurableObject<Env> {
    * conversation this object does not hold.
    */
   async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<TranscriptEvents | null> {
-    return readTranscript(this.sql, tenantId, agentId, taskId);
+    return this.#outsidePd(() => readTranscript(this.sql, tenantId, agentId, taskId));
+  }
+
+  /**
+   * A read of this object's SQL after any pi-durable transaction open on it. Only a runtime that opened a pd
+   * agent can have one open, so the runtime already built is asked and none is built for the read.
+   */
+  #outsidePd<T>(fn: () => T): Promise<T> | T {
+    return this.#runtime ? this.#runtime.afterPdTransactions(fn) : fn();
   }
 
   #ownerAgent(): string | null {

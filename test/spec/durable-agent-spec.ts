@@ -181,6 +181,74 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await a.close();
   });
 
+  add("turn", "a message whose harness closes as it is admitted is submitted once", async (storage) => {
+    // The interleaving, pinned: the moment the submission's row is written, the harness starts to close
+    // (what a park does). The admitted commit completes, so the input is durable — and the harness is
+    // closed before `say` reads the submission back, which is when a retry would submit it again.
+    let host: PdHost | undefined;
+    let armed = false;
+    let closes = 0;
+    const closing: DurableSqlHost = {
+      ...storage,
+      sql: { exec: (q, ...b) => {
+        if (armed && /INSERT INTO pd_submissions/i.test(q)) { armed = false; closes++; queueMicrotask(() => { void host!.close(); }); }
+        return storage.sql.exec(q, ...b);
+      } },
+      transaction: (c) => storage.transaction(c),
+      transactionSync: (c) => storage.transactionSync(c),
+    };
+    const o = object(closing);
+    host = o.host;
+    const a = o.agent();
+    armed = true;
+    await a.say("Q1");
+    check(closes === 1, `control: the close was ${closes === 0 ? "never triggered" : "triggered more than once"}`);
+    // Run the conversation to rest, answering every call it makes.
+    for (let i = 0; i < 6; i++) {
+      const out = await a.step();
+      if (out.wakeInMs === null) break;
+      for (const row of jobs(storage).filter((r) => r.answer === null)) await consume(a, row.id, "A");
+      await sleep(out.wakeInMs);
+    }
+    const t = turns(await a.entries({}));
+    check(show(t) === show(["user: Q1", "assistant(stop): A"]), `transcript ${show(t)}`);
+    await a.close();
+  });
+
+  add("turn", "a step whose pass failed does not stick: the next step runs a fresh pass and completes the turn", async (storage) => {
+    // The sweep's read fails once, so the first pass rejects before it opens a harness.
+    let failNext = false;
+    const flaky: DurableSqlHost = {
+      ...storage,
+      sql: { exec: (q, ...b) => {
+        if (failNext && q.includes("dispatched_at IS NULL OR")) { failNext = false; throw new Error("injected: the sweep's read failed"); }
+        return storage.sql.exec(q, ...b);
+      } },
+      transaction: (c) => storage.transaction(c),
+      transactionSync: (c) => storage.transactionSync(c),
+    };
+    const o = object(flaky);
+    const a = o.agent();
+    await a.say("Q1");
+    await a.close();
+    failNext = true;
+    let thrown: unknown;
+    try { await a.step(); } catch (e) { thrown = e; }
+    check(thrown instanceof Error && thrown.message.includes("injected"), `the first step should fail: ${String(thrown)}`);
+    // Not the old rejected promise: a fresh pass, which resumes the generation and parks.
+    const parked = await a.step().catch((e: unknown) => {
+      throw new Error(`the step after a failed one was handed the old rejection instead of a fresh pass: ${String(e)}`);
+    });
+    check(parked.wakeInMs !== null, `the step after a failed one: ${show(parked)}`);
+    const [row] = jobs(storage);
+    check(row, "no job after the fresh pass");
+    await consume(a, row.id, "A1");
+    await sleep(parked.wakeInMs);
+    check((await a.step()).wakeInMs === null, "did not finish");
+    check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
+    await a.close();
+  });
+
   add("turn", "with no answer the poll interval doubles to its cap, one fetch per wake, one job", async (storage) => {
     const o = object(storage);
     const a = o.agent();

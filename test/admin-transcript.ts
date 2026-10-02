@@ -121,7 +121,7 @@ await check("the object's half only reads: adminTranscript opens no agent, runti
     assert(!body.includes(call), `adminTranscript calls ${call}`);
   }
   // The read itself, and that it changes nothing, is test/transcript-read.ts, on a real database.
-  assert(body.includes("return readTranscript(this.sql,"), "adminTranscript no longer reads through readTranscript");
+  assert(body.includes("readTranscript(this.sql,"), "adminTranscript no longer reads through readTranscript");
 });
 
 await check("a pd agent's conversation comes back through the route, read from the object's pi-durable entries", async () => {

@@ -230,6 +230,11 @@ await check("a pd agent's report counts pi-durable's entries and lists ap_model_
     assert(host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0]!.n === 0, "pi_model_jobs is not empty");
     assert(r.rendered.ok === true && r.rendered.steps > 0, `rendered: ${JSON.stringify(r.rendered)}`);
     assert(dump(host) === before, "the database changed while the report was read");
+    // The transcript read is handed to the object's "after any pd transaction" route, and its answer is the one used.
+    let routed = 0;
+    const viaRoute = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { store: rt.store as any, plugins: [], alarm: async () => null,
+      outsidePd: async (fn) => { routed++; return rt.afterPdTransactions(fn); } }) as any;
+    assert(routed === 1 && viaRoute.entries === 4, `routed ${routed}, entries ${viaRoute.entries}`);
   } finally { host.dispose(); }
 });
 

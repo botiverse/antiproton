@@ -283,6 +283,9 @@ export class PdHost {
       });
     })();
     this.#driving = driving;
+    // Cleared on failure too: a pass that rejected and stayed here would be handed to every later step,
+    // and the object would never move again. The identity check is defensive — no newer pass can start
+    // while this one is set, since `drive()` returns it — so it guards a future refactor, not a live race.
     const clear = () => { if (this.#driving === driving) this.#driving = null; };
     driving.then(clear, clear);
     return driving;
@@ -399,9 +402,14 @@ export class DurableAgent implements AgentEngine {
    * isolate; the wake the caller sets runs `step()`, which settles and parks it.
    */
   async say(text: string, mode: "prompt" | "steer" | "followUp" = "prompt") {
+    // One id for this message, kept across `withHarness`'s retry. A harness that closes while the input
+    // is being admitted still completes the admitted commit, so the input can be durable when the call
+    // fails ("Session is closed" from `status`); the retry then finds it by this id (pi-durable dedupes
+    // a submission per conversation and request id) instead of submitting it a second time.
+    const requestId = `say:${crypto.randomUUID()}`;
     return this.#host.withHarness(async (h) => {
       const c = await this.#conversation(h);
-      const submission = await c.submit({ type: "input", content: text, whenBusy: mode === "followUp" ? "followUp" : "steer" }, bg);
+      const submission = await c.submit({ type: "input", content: text, whenBusy: mode === "followUp" ? "followUp" : "steer", requestId }, bg);
       const record = await submission.status(bg);
       // `messageLanded` (cf/src/runtime.ts) reads an operation id as "a run started".
       return record.status === "placed"
@@ -514,4 +522,34 @@ export function recordedEngine(sql: DurableSqlHost["sql"]): "pi085" | "pd" | nul
   if (sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", meta).toArray().length === 0) return null;
   const readOnly = { exclusive: () => Promise.reject(new Error("recordedEngine only reads")) };
   return new ApStore(sql as ConstructorParameters<typeof ApStore>[0], readOnly, AP).engine();
+}
+
+/**
+ * The object's storage, with a check on the hazard `PiDurableSqlite` describes: while a pi-durable
+ * transaction is open it is a savepoint over the one connection, and any other write joins it and is
+ * rolled back with it. Every write made while one is open that does not address pi-durable's own `pd_`
+ * objects is recorded in `joined` (pi-durable's own statements, all rewritten to `pd_` names, are not).
+ * Recorded rather than thrown: a throw inside someone else's transaction surfaces as whatever that
+ * transaction's owner does with it — a crashed task, an unhandled rejection — not as the write. For
+ * tests: assert `joined` is empty.
+ */
+export function guardJoinedWrites(storage: DurableSqlHost): DurableSqlHost & { readonly joined: string[] } {
+  let open = 0;
+  const joined: string[] = [];
+  return {
+    joined,
+    sql: {
+      exec(query, ...bindings) {
+        if (open > 0 && /^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i.test(query) && !/\bpd_/.test(query)) {
+          joined.push(query.replace(/\s+/g, " ").slice(0, 160));
+        }
+        return storage.sql.exec(query, ...bindings);
+      },
+    },
+    async transaction(closure) {
+      open++;
+      try { return await storage.transaction(closure); } finally { open--; }
+    },
+    transactionSync: (closure) => storage.transactionSync(closure),
+  };
 }
