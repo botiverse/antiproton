@@ -37,6 +37,11 @@ outside the pi-durable tests, and pi-agent-core gets its own 0.85.1 copy, so
 `chord` can sit at the top level. `npm ls @earendil-works/pi-ai
 @earendil-works/chord` shows the layout.
 
+The override yields two physical pi-ai copies: the top-level 0.85.1 for the live
+runtime, and 1.0.0 nested under pi-durable. That is safe only while no pi-ai
+value crosses between the two: they may share types, never runtime objects
+(messages, streams, errors), or `instanceof` and identity checks break.
+
 ## What we depend on
 
 ### 1. Imported symbols — these break loudly

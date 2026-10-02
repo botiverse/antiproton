@@ -198,6 +198,8 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     })) await c.run();
     check(seen.size >= 40, `only ${seen.size} distinct statements were recorded`);
 
+    // Every statement pi-durable issued in its whole suite rewrites under the fail-closed position
+    // rule, in both namespaces: a listed name it uses outside a table or index position would throw here.
     for (const sql of seen) {
       const out = qualifySql(sql, PI_DURABLE_OBJECTS, schema);
       const code = out.replace(/'(?:[^']|'')*'/g, "''");
@@ -220,8 +222,55 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
       one("INSERT INTO tasks (id, kind) VALUES (?, 'tasks') ON CONFLICT(id) DO UPDATE SET kind = excluded.kind"),
       "INSERT INTO pd.tasks (id, kind) VALUES (?, 'tasks') ON CONFLICT(id) DO UPDATE SET kind = excluded.kind",
     );
-    vitestLikeAssertions.strictEqual(one("SELECT tasks.record FROM tasks WHERE tasks.id = ?"), "SELECT pd.tasks.record FROM pd.tasks WHERE pd.tasks.id = ?");
     await vitestLikeAssertions.rejects(Promise.resolve().then(() => qualifySql("CREATE TABLE events (x)", PI_DURABLE_OBJECTS, schema)), `would create "events"`);
+  });
+
+  add("a listed name is rewritten only where the grammar admits only a table or index name, and throws elsewhere", async () => {
+    const q = (sql: string) => qualifySql(sql, PI_DURABLE_OBJECTS, PD);
+    const throws = (sql: string, why: string) => vitestLikeAssertions.rejects(Promise.resolve().then(() => q(sql)), why);
+    const notTable = "not a table or index name";
+    // A column that shares a listed table's name would otherwise be renamed with it.
+    await throws("SELECT tasks FROM entries", notTable);
+    await throws("SELECT x, tasks FROM entries", notTable);
+    await throws("UPDATE entries SET tasks = 1", notTable);
+    await throws("INSERT INTO entries (tasks) VALUES (1)", notTable);
+    await throws("SELECT count(tasks) FROM entries", notTable);
+    await throws("SELECT id FROM entries WHERE tasks = 1 ORDER BY tasks", notTable);
+    await throws("CREATE TABLE entries (tasks INTEGER)", notTable);
+    await throws("SELECT 1 FROM entries JOIN documents ON tasks = 1", notTable);
+    await throws("WITH tasks AS (SELECT 1) SELECT * FROM entries", notTable);
+    await throws("SELECT * FROM entries tasks", notTable);
+    await throws("SELECT a IS DISTINCT FROM tasks FROM entries", notTable);
+    // Qualified either way round, quoted, an alias, a table-valued function, or the wrong kind.
+    await throws("SELECT tasks.record FROM tasks", `before "."`);
+    await throws("SELECT * FROM tasks.x", `before "."`);
+    await throws("SELECT * FROM main.tasks", `after "."`);
+    await throws('SELECT "tasks" FROM entries', "quoted");
+    await throws("SELECT id AS tasks FROM entries", "alias");
+    await throws("SELECT * FROM tasks(1)", "table-valued function");
+    await throws("SELECT * FROM tasks_by_status", "where the grammar wants a table");
+    await throws("SELECT * FROM tasks INDEXED BY entries", "where the grammar wants a index");
+
+    const rewrites: [string, string][] = [
+      ["SELECT id FROM tasks WHERE id = ?", "SELECT id FROM pd_tasks WHERE id = ?"],
+      ["SELECT 1 FROM tasks, entries , documents", "SELECT 1 FROM pd_tasks, pd_entries , pd_documents"],
+      ["SELECT 1 FROM tasks LEFT JOIN entries ON entries_id = id", "SELECT 1 FROM pd_tasks LEFT JOIN pd_entries ON entries_id = id"],
+      ["INSERT OR IGNORE INTO tasks (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET kind = excluded.kind",
+        "INSERT OR IGNORE INTO pd_tasks (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET kind = excluded.kind"],
+      ["UPDATE tasks SET kind = 'tasks'", "UPDATE pd_tasks SET kind = 'tasks'"],
+      ["UPDATE OR ROLLBACK tasks SET kind = 1", "UPDATE OR ROLLBACK pd_tasks SET kind = 1"],
+      ["DELETE FROM tasks WHERE id = ?", "DELETE FROM pd_tasks WHERE id = ?"],
+      ["CREATE TABLE IF NOT EXISTS tasks (id INTEGER)", "CREATE TABLE IF NOT EXISTS pd_tasks (id INTEGER)"],
+      ["CREATE UNIQUE INDEX IF NOT EXISTS tasks_by_status ON tasks (status)", "CREATE UNIQUE INDEX IF NOT EXISTS pd_tasks_by_status ON pd_tasks (status)"],
+      ["DROP TABLE IF EXISTS tasks", "DROP TABLE IF EXISTS pd_tasks"],
+      ["DROP INDEX tasks_by_status", "DROP INDEX pd_tasks_by_status"],
+      ["ALTER TABLE tasks RENAME TO entries", "ALTER TABLE pd_tasks RENAME TO pd_entries"],
+      ["CREATE TABLE entries (task INTEGER REFERENCES tasks(id))", "CREATE TABLE pd_entries (task INTEGER REFERENCES pd_tasks(id))"],
+      ["SELECT 1 FROM tasks INDEXED BY tasks_by_status", "SELECT 1 FROM pd_tasks INDEXED BY pd_tasks_by_status"],
+      ["REINDEX tasks_by_status", "REINDEX pd_tasks_by_status"],
+      ["ANALYZE tasks", "ANALYZE pd_tasks"],
+    ];
+    for (const [sql, want] of rewrites) vitestLikeAssertions.strictEqual(q(sql), want);
   });
 
   add("a transaction that throws after an await leaves no rows, and a write queued meanwhile survives", () => withHost(async (host) => {

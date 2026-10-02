@@ -92,6 +92,11 @@ class SerialQueue {
   #pending = 0;
 
   run<T>(operation: () => T): Promise<T> {
+    // Sound only because a plain statement is synchronous: `query` has no await, so it cannot yield
+    // and cannot interleave with anything. Only a transaction spans awaits, and it goes through
+    // `enqueue`, which raises #pending so every other call queues behind it. This check is that
+    // ordering, not an optimisation; without it a statement could run between
+    // a transaction's statements and be committed or rolled back with them.
     if (this.#pending > 0) return this.enqueue(async () => operation());
     try { return Promise.resolve(operation()); } catch (error) { return Promise.reject(error); }
   }

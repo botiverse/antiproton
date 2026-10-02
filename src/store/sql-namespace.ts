@@ -14,8 +14,10 @@
  *
  * The rewrite is an allowlist, not a pattern. A component declares every table
  * and index its schema creates; an identifier is rewritten only when it is one
- * of those names; string literals, comments and bound values are never touched;
- * and a statement that would create any name not on the list throws, so a
+ * of those names and stands where the grammar admits only a table or index
+ * name; the same name anywhere else throws, since it could be a column or an
+ * alias; string literals, comments and bound values are never touched; and a
+ * statement that would create any name not on the list throws, so a
  * schema change upstream cannot land outside the namespace — it has to be read
  * and listed before it can land at all.
  */
@@ -42,23 +44,45 @@ export function prefixedNamespace(name: string): SqlNamespace {
 /** A component's logical schema: every table and index it creates. */
 export type SqlObjects = { readonly tables: readonly string[]; readonly indexes: readonly string[] };
 
-/** Words after which the next identifier is the name of something being created. */
+/** Words that may stand between CREATE and the kind of object it creates. */
+const CREATE_MODIFIERS = new Set(["temp", "temporary", "unique", "virtual"]);
+/** The kinds of object a CREATE names; a view or trigger name is never on a list, so creating one always throws. */
 const CREATED_KINDS = new Set(["table", "index", "view", "trigger"]);
-const CREATE_MODIFIERS = new Set(["temp", "temporary", "unique", "virtual", "if", "not", "exists"]);
+/** The conflict clause words in `UPDATE OR <word> <table>`. */
+const CONFLICT_WORDS = new Set(["rollback", "abort", "replace", "fail", "ignore"]);
 
 const isIdentStart = (c: string) => /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 0x80;
 const isIdentPart = (c: string) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 0x80;
 
+type Token = {
+  /** `word` is a bare identifier or keyword; `quoted` an identifier in quotes; `punct` one character. */
+  type: "word" | "quoted" | "punct" | "literal";
+  /** Lowercased for words and punctuation; the unquoted name for `quoted`. */
+  text: string;
+  raw: string;
+  start: number;
+  end: number;
+};
+
+/**
+ * What the grammar admits at a word's position. `from` is a table in a FROM or JOIN item, where a
+ * following `(` would make it a table-valued function instead; `either` is REINDEX and ANALYZE.
+ */
+type Role = "from" | "table" | "index" | "either" | "created-table" | "created-index" | "created-other" | "renamed";
+
 /**
  * Rewrites the logical names in one SQL text to the namespace's physical ones.
  *
- * A listed name is rewritten wherever it stands as a bare identifier, including as
- * the qualifier in `tasks.id`. Three positions are refused rather than guessed
- * at, because in each one the same word could be something the rewrite must not
- * touch: after `.` (a column, or `main.tasks`), after `AS` (an alias, which
- * would rename a key in the returned row), and in quotes. A `CREATE` of any
- * table, index, view or trigger, or a `RENAME TO`, whose name is not on the
- * list throws.
+ * A listed name is rewritten only where SQLite's grammar admits nothing but a table or index name:
+ * after FROM (not `IS DISTINCT FROM`), JOIN, a comma continuing a FROM or JOIN list, INTO, UPDATE
+ * [OR <conflict>], TABLE in CREATE / DROP / ALTER [IF [NOT] EXISTS], INDEX in CREATE / DROP,
+ * `ON` directly after the index name of a CREATE INDEX, REFERENCES, INDEXED BY, REINDEX, ANALYZE,
+ * and RENAME TO. Anywhere else a listed name could be a column, an alias, a CTE or a function, so
+ * it throws rather than being rewritten or passed through — a column that shares a table's name
+ * would otherwise be renamed with it. It also throws when quoted, before or after a `.` (a
+ * qualified column or a schema-qualified name), when it names a table where an index belongs or
+ * the reverse, and when a FROM item is followed by `(`. A CREATE of any table, index, view or
+ * trigger, or a `RENAME TO`, whose name is not on the list throws.
  */
 export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNamespace): string {
   const known = new Map<string, SqlObjectKind>();
@@ -67,33 +91,14 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
   const refuse = (why: string) =>
     new Error(`SQL refused by the "${namespace.name}" namespace: ${why}\n  in: ${sql.slice(0, 200)}`);
 
-  let out = "";
+  // Tokens, without whitespace or comments. String literals, comments and bound values are never touched.
+  const tokens: Token[] = [];
+  const push = (type: Token["type"], text: string, start: number, end: number) =>
+    tokens.push({ type, text, raw: sql.slice(start, end), start, end });
   let i = 0;
-  // The last significant token, lowercased: a word, or a single punctuation character.
-  let prev = "";
-  // Set while the next identifier names an object being created or renamed.
-  let naming = false;
-  let creating = false;
-  // The previous identifier was a created name, so a following `.` means it was a schema qualifier.
-  let namedLast = false;
-
-  const identifier = (raw: string, quoted: boolean) => {
-    const kind = known.get(raw.toLowerCase());
-    if (naming) {
-      if (kind === undefined) throw refuse(`it would create "${raw}", which is not on the namespace's list`);
-      naming = false;
-      namedLast = true;
-    } else namedLast = false;
-    if (kind === undefined) return raw;
-    if (quoted) throw refuse(`the quoted identifier "${raw}" is a listed name`);
-    if (prev === ".") throw refuse(`"${raw}" after "." is a column or a schema-qualified name, not a table to rewrite`);
-    if (prev === "as") throw refuse(`"${raw}" after AS is an alias, and rewriting it would rename a row key`);
-    return namespace.qualify(raw, kind);
-  };
-
   while (i < sql.length) {
     const c = sql[i];
-    // String literals and comments are copied untouched: data is never rewritten.
+    if (/\s/.test(c)) { i++; continue; }
     if (c === "'") {
       let j = i + 1;
       for (;;) {
@@ -101,68 +106,144 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
         if (sql[j] === "'") { if (sql[j + 1] === "'") { j += 2; continue; } break; }
         j++;
       }
-      out += sql.slice(i, j + 1); i = j + 1; prev = "'"; namedLast = false;
+      push("literal", "'", i, j + 1); i = j + 1;
       continue;
     }
     if (c === "-" && sql[i + 1] === "-") {
       const end = sql.indexOf("\n", i);
-      const j = end === -1 ? sql.length : end;
-      out += sql.slice(i, j); i = j;
+      i = end === -1 ? sql.length : end;
       continue;
     }
     if (c === "/" && sql[i + 1] === "*") {
       const end = sql.indexOf("*/", i + 2);
       if (end === -1) throw refuse("an unterminated comment");
-      out += sql.slice(i, end + 2); i = end + 2;
+      i = end + 2;
       continue;
     }
     if (c === '"' || c === "`" || c === "[") {
       const close = c === "[" ? "]" : c;
       const end = sql.indexOf(close, i + 1);
       if (end === -1) throw refuse("an unterminated quoted identifier");
-      out += sql.slice(i, end + 1);
-      identifier(sql.slice(i + 1, end), true);
-      prev = "ident"; i = end + 1;
+      push("quoted", sql.slice(i + 1, end), i, end + 1); i = end + 1;
       continue;
     }
     // Named parameters (`:x`, `@x`, `$x`) and numbers are not identifiers, whatever their letters spell.
     if ((c === ":" || c === "@" || c === "$") && i + 1 < sql.length && isIdentStart(sql[i + 1])) {
       let j = i + 1;
       while (j < sql.length && isIdentPart(sql[j])) j++;
-      out += sql.slice(i, j); i = j; prev = "param"; namedLast = false;
+      push("literal", "param", i, j); i = j;
       continue;
     }
     if (/[0-9]/.test(c)) {
       let j = i + 1;
       while (j < sql.length && /[0-9A-Za-z_.]/.test(sql[j])) j++;
-      out += sql.slice(i, j); i = j; prev = "number"; namedLast = false;
+      push("literal", "number", i, j); i = j;
       continue;
     }
     if (isIdentStart(c)) {
       let j = i + 1;
       while (j < sql.length && isIdentPart(sql[j])) j++;
-      const word = sql.slice(i, j);
-      const lower = word.toLowerCase();
-      i = j;
-      if (lower === "create") { creating = true; out += word; prev = lower; namedLast = false; continue; }
-      if (creating && !naming && CREATED_KINDS.has(lower)) { naming = true; creating = false; out += word; prev = lower; continue; }
-      if (naming && CREATE_MODIFIERS.has(lower)) { out += word; prev = lower; continue; }
-      if (creating && CREATE_MODIFIERS.has(lower)) { out += word; prev = lower; continue; }
-      if (lower === "to" && prev === "rename") { naming = true; out += word; prev = lower; continue; }
-      creating = false;
-      out += identifier(word, false);
-      prev = lower;
+      push("word", sql.slice(i, j).toLowerCase(), i, j); i = j;
       continue;
     }
-    if (!/\s/.test(c)) {
-      if (c === "." && namedLast) throw refuse("a schema-qualified name in a CREATE or RENAME");
-      namedLast = false;
-      prev = c;
-    }
-    out += c; i++;
+    push("punct", c, i, i + 1); i++;
   }
-  if (naming) throw refuse("a CREATE or RENAME with no name");
-  return out;
+
+  const roles: (Role | undefined)[] = [];
+  const at = (k: number) => (k >= 0 ? tokens[k] : undefined);
+  const word = (k: number, ...texts: string[]) => {
+    const t = at(k);
+    return t !== undefined && t.type === "word" && texts.includes(t.text);
+  };
+  /** Index of the keyword before an optional `IF EXISTS` / `IF NOT EXISTS` that ends just before `k`. */
+  const beforeIfExists = (k: number) => {
+    if (word(k - 1, "exists") && word(k - 2, "if")) return k - 3;
+    if (word(k - 1, "exists") && word(k - 2, "not") && word(k - 3, "if")) return k - 4;
+    return k - 1;
+  };
+  /** True when the CREATE that `kindAt` belongs to stands directly before it, past its modifiers. */
+  const createdAt = (kindAt: number) => {
+    let k = kindAt - 1;
+    while (word(k, ...CREATE_MODIFIERS)) k--;
+    return word(k, "create");
+  };
+  const roleOf = (k: number): Role | undefined => {
+    // The words of an `IF [NOT] EXISTS` are the clause, not the name it precedes.
+    if (word(k, "if") && (word(k + 1, "exists") || (word(k + 1, "not") && word(k + 2, "exists")))) return undefined;
+    if (word(k, "not") && word(k - 1, "if") && word(k + 1, "exists")) return undefined;
+    if (word(k, "exists") && (word(k - 1, "if") || (word(k - 1, "not") && word(k - 2, "if")))) return undefined;
+    const p1 = at(k - 1);
+    if (p1 === undefined) return undefined;
+    if (p1.type === "punct") {
+      // `FROM a, b` and `JOIN a, b`: a comma straight after a FROM item continues the list.
+      if (p1.text === "," && roles[k - 2] === "from") return "from";
+      return undefined;
+    }
+    if (p1.type !== "word") return undefined;
+    switch (p1.text) {
+      case "from": return word(k - 2, "distinct") ? undefined : "from";
+      case "join": return "from";
+      case "into": return "table";
+      case "update": return "table";
+      case "references": return "table";
+      case "reindex": case "analyze": return "either";
+      case "on":
+        // Only `CREATE INDEX <name> ON <table>`; `JOIN ... ON <expr>` is an expression.
+        return roles[k - 2] === "created-index" ? "table" : undefined;
+      case "by": return word(k - 2, "indexed") ? "index" : undefined;
+      case "to": return word(k - 2, "rename") ? "renamed" : undefined;
+    }
+    if (CONFLICT_WORDS.has(p1.text) && word(k - 2, "or") && word(k - 3, "update")) return "table";
+    const kindAt = beforeIfExists(k);
+    const kind = at(kindAt);
+    if (kind?.type !== "word" || !CREATED_KINDS.has(kind.text)) return undefined;
+    if (createdAt(kindAt)) return kind.text === "table" ? "created-table" : kind.text === "index" ? "created-index" : "created-other";
+    // DROP TABLE / ALTER TABLE / DROP INDEX, with IF EXISTS only where the grammar allows it.
+    if (kind.text === "table" && word(kindAt - 1, "drop", "alter")) return "table";
+    if (kind.text === "index" && word(kindAt - 1, "drop")) return "index";
+    return undefined;
+  };
+
+  let out = "";
+  let copied = 0;
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (t.type !== "word" && t.type !== "quoted") continue;
+    const role = roleOf(k);
+    roles[k] = role;
+    const name = t.type === "word" ? t.text : t.text.toLowerCase();
+    const kind = known.get(name);
+    const next = at(k + 1);
+    if (role === "created-table" || role === "created-index" || role === "created-other" || role === "renamed") {
+      if (kind === undefined) throw refuse(`it would create "${t.type === "word" ? t.raw : t.text}", which is not on the namespace's list`);
+      if (next?.type === "punct" && next.text === ".") throw refuse("a schema-qualified name in a CREATE or RENAME");
+    }
+    if (kind === undefined) continue;
+    const shown = t.type === "word" ? t.raw : t.text;
+    if (t.type === "quoted") throw refuse(`the quoted identifier "${shown}" is a listed name`);
+    const p1 = at(k - 1);
+    if (p1?.type === "punct" && p1.text === ".") throw refuse(`"${shown}" after "." is a column or a schema-qualified name, not a table to rewrite`);
+    if (p1?.type === "word" && p1.text === "as") throw refuse(`"${shown}" after AS is an alias, and rewriting it would rename a row key`);
+    if (next?.type === "punct" && next.text === ".") throw refuse(`"${shown}" before "." qualifies a column or names a schema; only a bare table name is rewritten`);
+    if (role === undefined) throw refuse(`"${shown}" is a listed name in a position that is not a table or index name (a column, alias or function with the same name would be renamed)`);
+    if (role === "from" && next?.type === "punct" && next.text === "(") throw refuse(`"${shown}" followed by "(" in FROM is a table-valued function, not a table`);
+    const wants = role === "from" || role === "table" || role === "created-table" ? "table"
+      : role === "index" || role === "created-index" ? "index"
+      : role === "renamed" ? "table" : undefined;
+    if (wants !== undefined && wants !== kind) throw refuse(`"${shown}" is a listed ${kind} where the grammar wants a ${wants}`);
+    if (role === "created-other") throw refuse(`"${shown}" would be created as a view or trigger`);
+    out += sql.slice(copied, t.start) + namespace.qualify(t.raw, kind);
+    copied = t.end;
+  }
+  // A CREATE or RENAME TO that ends before its name.
+  const last = tokens.at(-1);
+  if (last !== undefined) {
+    const k = tokens.length;
+    if (word(k - 1, "to") && word(k - 2, "rename")) throw refuse("a CREATE or RENAME with no name");
+    const kindAt = beforeIfExists(k);
+    if (word(kindAt, ...CREATED_KINDS) && createdAt(kindAt)) throw refuse("a CREATE or RENAME with no name");
+  }
+  return out + sql.slice(copied);
 }
 
 /**
