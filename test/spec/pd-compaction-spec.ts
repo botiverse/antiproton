@@ -56,7 +56,7 @@ const usagePairs = (storage: DurableSqlHost) => pendingUsage(storage.sql as neve
 const traceRows = (storage: DurableSqlHost) => pendingTrace(storage.sql as never, 0).rows;
 /** The compaction tasks' records, for a failure message: what a compaction that started no job ended as. */
 const compactionTasks = (storage: DurableSqlHost) =>
-  storage.sql.exec("SELECT record FROM pd_tasks WHERE kind = 'pi.compaction'").toArray().map((r) => JSON.parse(String(r.record)).state);
+  storage.sql.exec("SELECT record FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.compaction'").toArray().map((r) => JSON.parse(String(r.record)).state);
 
 type Fault = (writes: readonly StorageWrite[]) => void;
 function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault } = {}) {
