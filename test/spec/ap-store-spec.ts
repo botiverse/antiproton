@@ -156,9 +156,12 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     }).then(() => { order.push("transaction resolved"); }, (e: unknown) => { order.push(e === boom ? "transaction rejected" : `rejected with ${String(e)}`); });
     await isOpen;
     const ours = db.exclusive(() => { order.push("exclusive runs"); return ap.setEngineOnce("pd"); });
-    // Queued, not run: the transaction is still open.
-    is.deepEqual(order, []);
-    await Promise.all([txn, ours]);
+    // Queued, not run: the transaction is still open. Read now, asserted once both have settled, so
+    // a failure here cannot leave the transaction open under the next case (on a Durable Object
+    // that wedges the object instead of naming the assertion).
+    const whileOpen = [...order];
+    await Promise.allSettled([txn, ours]);
+    is.deepEqual(whileOpen, []);
     is.deepEqual(order, ["transaction throws", "transaction rejected", "exclusive runs"]);
     is.strictEqual(await ours, "pd");
     is.strictEqual(ap.engine(), "pd");
