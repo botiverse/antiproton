@@ -1915,8 +1915,9 @@ export class AgentRuntime {
     const jobCtx = (job: { session: string }) =>
       ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
     // Not on a pd object whose harness may be open: the pass writes `background_jobs` with plain SQL across
-    // awaits, which could join a pi-durable transaction, and nothing the pd engine offers starts background
-    // work yet (tools are step 7). `#pd` is set only once a pd agent was opened, so before that no harness
+    // awaits, which could join a pi-durable transaction. Not yet made safe: wrapping it in `PdHost.apart`
+    // would deadlock, since its delivery submits through the harness. Until it is, background work a pd
+    // agent starts is recorded and never polled. `#pd` is set only once a pd agent was opened, so before that no harness
     // exists, and the pass runs as it always has.
     const bg = this.#pd ? { wakeInMs: null } : await runBackgroundPass({
       sql, owner,
@@ -1950,8 +1951,8 @@ export class AgentRuntime {
     // A turn that settled while background work runs has not finished using
     // its containers: releasing now would take the machine out from under the
     // job, which is the normal case, since the model keeps working (task #16).
-    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) and the pd
-    // engine offers no tool that could hold or start anything yet (step 7).
+    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) across
+    // awaits. pd agents have tools that can hold or start things now, so this is a gap still owed.
     const pd = this.#pd !== null;
     const backgroundRunning = !pd && runningBackgroundJobs(sql, owner).length > 0;
     // A program suspended at a pause keeps the object awake (and is discarded

@@ -113,10 +113,11 @@ const nodeCases: DriveCase[] = [
 ];
 
 const results = await runDriveCases([
-  ...pdToolsCases(async (use) => {
+  // Twice: with each pi-durable commit held open 5 ms (the widest window for a write to join it), and as is.
+  ...[5, 0].flatMap((slowCommitMs) => pdToolsCases(async (use) => {
     const host = sqliteHost();
     try { await use(host); } finally { host.dispose(); }
-  }),
+  }, { slowCommitMs }).map((c) => ({ ...c, group: `${c.group}${slowCommitMs ? ", slow commits" : ""}` }))),
   ...nodeCases,
 ]);
 

@@ -38,8 +38,6 @@ import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
 const SYSTEM = "You are a test agent.";
 const CTX = { tenantId: "t", agentId: "a", taskId: "t_a" };
-/** How long each pi-durable transaction is held open before its work (see `withHost` in the cases). */
-const SLOW_COMMIT_MS = Number((globalThis as { process?: { env?: Record<string, string> } }).process?.env?.PDT_SLOW_MS ?? 5);
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
@@ -364,7 +362,14 @@ const toolMessages = (req: Request) => req.messages.filter((m) => m.role === "to
 
 // ---- the cases ----------------------------------------------------------------------
 
-export function pdToolsCases(withRawHost: WithDriveHost): DriveCase[] {
+/**
+ * `slowCommitMs`: how long each pi-durable transaction is held open before its work, a timer inside
+ * the transaction. node:sqlite allows it; a Durable Object's `transaction()` blocks the object's
+ * concurrency while it is open and resets the object when that lasts (measured: "blockConcurrencyWhile()
+ * ... waited for too long" within the first case), so the DO run passes 0.
+ */
+export function pdToolsCases(withRawHost: WithDriveHost, opts: { slowCommitMs: number }): DriveCase[] {
+  const SLOW_COMMIT_MS = opts.slowCommitMs;
   const cases: DriveCase[] = [];
   /**
    * Every case's storage goes through `guardJoinedWrites` (src/runtime/durable-agent.ts), and every case
@@ -375,7 +380,7 @@ export function pdToolsCases(withRawHost: WithDriveHost): DriveCase[] {
   const withHost: WithDriveHost = (use) => withRawHost(async (raw) => {
     // Every pi-durable transaction held open across a macrotask: what a slow commit on a busy object
     // looks like, and the widest window for anything else to write into it.
-    const slow: DurableSqlHost = {
+    const slow: DurableSqlHost = SLOW_COMMIT_MS === 0 ? raw : {
       sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
       transaction: (cb) => raw.transaction(async () => { await sleep(SLOW_COMMIT_MS); return cb(); }),
     };

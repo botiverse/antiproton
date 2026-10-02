@@ -158,7 +158,7 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     const results = await runDriveCases(pdToolsCases(async (use) => {
       wipe();
       try { await use(host); } finally { wipe(); }
-    }));
+    }, { slowCommitMs: 0 }));
     return {
       backend: "durable-object",
       ms: Date.now() - t0,
