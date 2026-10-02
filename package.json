@@ -10,6 +10,8 @@
     "pi-storage:do": "bash test/pi-storage-do.sh",
     "pi-durable": "node test/pi-durable.ts",
     "pi-durable:do": "bash test/pi-durable-do.sh",
+    "ap-store": "node test/ap-store.ts",
+    "ap-store:do": "bash test/ap-store-do.sh",
     "durable-drive": "node test/durable-drive.ts",
     "durable-drive:do": "bash test/durable-drive-do.sh",
     "pi-loop": "node test/pi-loop.ts",

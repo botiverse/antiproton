@@ -1,6 +1,10 @@
 /**
  * Where a component's tables live, kept apart from the SQL that names them.
  *
+ * This is a fail-closed tripwire for the SQL we run ourselves — pi-durable's fixed statements and our
+ * own — catching an upstream schema or statement change and our own bugs; it is not a sandbox for
+ * untrusted SQL, and nothing passes untrusted SQL to it.
+ *
  * Two components that each own a schema can share one database only if their
  * names cannot meet: pi-durable and AgentDO both have a `tasks` table, and a
  * Durable Object has exactly one SQLite database with no `ATTACH` and no
@@ -50,6 +54,24 @@ const CREATE_MODIFIERS = new Set(["temp", "temporary", "unique", "virtual"]);
 const CREATED_KINDS = new Set(["table", "index", "view", "trigger"]);
 /** The conflict clause words in `UPDATE OR <word> <table>`. */
 const CONFLICT_WORDS = new Set(["rollback", "abort", "replace", "fail", "ignore"]);
+/**
+ * The statements a component may run: the kinds pi-durable 1.0's SQLite storage and src/store/ap-store.ts
+ * issue, and nothing else. PRAGMA, VACUUM, ATTACH, DETACH, REINDEX, ANALYZE, EXPLAIN and the transaction
+ * statements address the database rather than a listed object, so they are refused whatever they name.
+ */
+const STATEMENT_KINDS = new Set(["select", "insert", "replace", "update", "delete", "create", "drop", "alter"]);
+/**
+ * Words that end a FROM or JOIN list at their own parenthesis depth: after them a comma is not a new
+ * table. Ending a list early is the unsafe direction, so each is a reserved word SQLite refuses as an
+ * alias, with or without AS. `do` and `window` are not here for that reason: SQLite accepts both as
+ * an alias (`FROM meta do, sqlite_master`). A WINDOW clause after FROM therefore leaves the list
+ * open, and its second window name reads as an unlisted table and throws, which is the safe failure.
+ */
+const FROM_LIST_ENDS = new Set([
+  "where", "group", "having", "order", "limit", "union", "intersect", "except", "returning", "set", "values", "select",
+]);
+/** What can open a parenthesis at a FROM item and make it a subquery rather than a parenthesised join. */
+const SUBQUERY_STARTS = new Set(["select", "with", "values"]);
 
 const isIdentStart = (c: string) => /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 0x80;
 const isIdentPart = (c: string) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 0x80;
@@ -66,18 +88,26 @@ type Token = {
 
 /**
  * What the grammar admits at a word's position. `from` is a table in a FROM or JOIN item, where a
- * following `(` would make it a table-valued function instead; `either` is REINDEX and ANALYZE.
+ * following `(` would make it a table-valued function instead.
  */
-type Role = "from" | "table" | "index" | "either" | "created-table" | "created-index" | "created-other" | "renamed";
+type Role = "from" | "table" | "index" | "created-table" | "created-index" | "created-other" | "renamed";
 
 /**
  * Rewrites the logical names in one SQL text to the namespace's physical ones.
  *
+ * Only SELECT, INSERT, REPLACE, UPDATE, DELETE, CREATE, DROP and ALTER statements are admitted, and
+ * DROP VIEW / DROP TRIGGER are not (no view or trigger can be listed); anything else throws.
+ *
  * A listed name is rewritten only where SQLite's grammar admits nothing but a table or index name:
- * after FROM (not `IS DISTINCT FROM`), JOIN, a comma continuing a FROM or JOIN list, INTO, UPDATE
- * [OR <conflict>], TABLE in CREATE / DROP / ALTER [IF [NOT] EXISTS], INDEX in CREATE / DROP,
- * `ON` directly after the index name of a CREATE INDEX, REFERENCES, INDEXED BY, REINDEX, ANALYZE,
- * and RENAME TO. Anywhere else a listed name could be a column, an alias, a CTE or a function, so
+ * the start of every item of a FROM or JOIN list, INTO, UPDATE [OR <conflict>], TABLE in CREATE /
+ * DROP / ALTER [IF [NOT] EXISTS], INDEX in CREATE / DROP, `ON` directly after the index name of a
+ * CREATE INDEX, REFERENCES, INDEXED BY, and RENAME TO. A FROM or JOIN list is followed per
+ * parenthesis depth: it starts at FROM (not `IS DISTINCT FROM`) or JOIN, a comma at its depth starts
+ * a new item whatever came before it — an alias with or without AS, a parenthesised subquery, an
+ * `ON` or `USING` constraint — and it ends only at a clause keyword (WHERE, GROUP, ORDER, LIMIT, …),
+ * at `;`, or at the `)` that closes its depth. An item that is itself a parenthesis is a subquery
+ * when it starts with SELECT, WITH or VALUES, and otherwise a parenthesised join, whose first word is
+ * an item too. Anywhere else a listed name could be a column, an alias, a CTE or a function, so
  * it throws rather than being rewritten or passed through — a column that shares a table's name
  * would otherwise be renamed with it. It also throws when quoted, before or after a `.` (a
  * qualified column or a schema-qualified name), when it names a table where an index belongs or
@@ -128,13 +158,11 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
       push("quoted", sql.slice(i + 1, end), i, end + 1); i = end + 1;
       continue;
     }
-    // Named parameters (`:x`, `@x`, `$x`) and numbers are not identifiers, whatever their letters spell.
-    if ((c === ":" || c === "@" || c === "$") && i + 1 < sql.length && isIdentStart(sql[i + 1])) {
-      let j = i + 1;
-      while (j < sql.length && isIdentPart(sql[j])) j++;
-      push("literal", "param", i, j); i = j;
-      continue;
-    }
+    // Only `?` and `?NNN` parameters. A named one (`:x`, `@x`, `$x`, `#x`) is refused: SQLite's TCL
+    // form `$a(...)` runs to the next `)`, quotes included, so tokenizing it as a name would put a
+    // quote inside it out of step with SQLite's and let a string hide a statement. Nothing we run
+    // uses them.
+    if (c === ":" || c === "@" || c === "$" || c === "#") throw refuse(`a named parameter ("${c}"); only ? and ?NNN are admitted`);
     if (/[0-9]/.test(c)) {
       let j = i + 1;
       while (j < sql.length && /[0-9A-Za-z_.]/.test(sql[j])) j++;
@@ -150,12 +178,62 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
     push("punct", c, i, i + 1); i++;
   }
 
-  const roles: (Role | undefined)[] = [];
   const at = (k: number) => (k >= 0 ? tokens[k] : undefined);
   const word = (k: number, ...texts: string[]) => {
     const t = at(k);
     return t !== undefined && t.type === "word" && texts.includes(t.text);
   };
+
+  // Statement kinds, and where each FROM or JOIN item starts. One flag per open parenthesis: whether
+  // that depth is inside a FROM or JOIN list. Nothing here rewrites; it only marks and refuses.
+  const fromItems = new Set<number>();
+  {
+    let inFrom: boolean[] = [false];
+    let statementStart = true;
+    for (let k = 0; k < tokens.length; k++) {
+      const t = tokens[k];
+      if (statementStart) {
+        if (t.type === "punct" && t.text === ";") continue;
+        if (t.type !== "word" || !STATEMENT_KINDS.has(t.text)) {
+          throw refuse(`a statement that starts with "${t.raw}": only ${[...STATEMENT_KINDS].join(", ").toUpperCase()} are admitted`);
+        }
+        if (t.text === "drop" && word(k + 1, "view", "trigger")) {
+          throw refuse(`a DROP ${tokens[k + 1].raw.toUpperCase()} statement: no view or trigger is on a namespace's list`);
+        }
+        statementStart = false;
+      }
+      const d = inFrom.length - 1;
+      if (t.type === "punct") {
+        if (t.text === ";") {
+          if (d !== 0) throw refuse("a `;` inside parentheses");
+          inFrom = [false];
+          statementStart = true;
+        } else if (t.text === "(") {
+          const next = tokens[k + 1];
+          // A parenthesised join's first word is a FROM item; a subquery's is its own statement.
+          const join = fromItems.has(k) && !(next?.type === "word" && SUBQUERY_STARTS.has(next.text));
+          inFrom.push(join);
+          if (join) fromItems.add(k + 1);
+        } else if (t.text === ")") {
+          if (d === 0) throw refuse("an unbalanced `)`");
+          inFrom.pop();
+        } else if (t.text === "," && inFrom[d]) {
+          fromItems.add(k + 1);
+        }
+        continue;
+      }
+      if (t.type !== "word") continue;
+      if ((t.text === "from" && !word(k - 1, "distinct")) || t.text === "join") {
+        inFrom[d] = true;
+        fromItems.add(k + 1);
+      } else if (FROM_LIST_ENDS.has(t.text)) {
+        inFrom[d] = false;
+      }
+    }
+    if (inFrom.length !== 1) throw refuse("an unclosed `(`");
+  }
+
+  const roles: (Role | undefined)[] = [];
   /** Index of the keyword before an optional `IF EXISTS` / `IF NOT EXISTS` that ends just before `k`. */
   const beforeIfExists = (k: number) => {
     if (word(k - 1, "exists") && word(k - 2, "if")) return k - 3;
@@ -173,17 +251,10 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
     if (word(k, "if") && (word(k + 1, "exists") || (word(k + 1, "not") && word(k + 2, "exists")))) return undefined;
     if (word(k, "not") && word(k - 1, "if") && word(k + 1, "exists")) return undefined;
     if (word(k, "exists") && (word(k - 1, "if") || (word(k - 1, "not") && word(k - 2, "if")))) return undefined;
+    if (fromItems.has(k)) return "from";
     const p1 = at(k - 1);
-    if (p1 === undefined) return undefined;
-    if (p1.type === "punct") {
-      // `FROM a, b` and `JOIN a, b`: a comma straight after a FROM item continues the list.
-      if (p1.text === "," && roles[k - 2] === "from") return "from";
-      return undefined;
-    }
-    if (p1.type !== "word") return undefined;
+    if (p1 === undefined || p1.type !== "word") return undefined;
     switch (p1.text) {
-      case "from": return word(k - 2, "distinct") ? undefined : "from";
-      case "join": return "from";
       case "into": return "table";
       case "update":
         // `ON CONFLICT ... DO UPDATE SET` names no table, and the `OR` of `UPDATE OR <conflict>` is not one.
@@ -191,7 +262,6 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
         if (word(k, "or") && CONFLICT_WORDS.has(at(k + 1)?.text ?? "")) return undefined;
         return "table";
       case "references": return "table";
-      case "reindex": case "analyze": return "either";
       case "on":
         // Only `CREATE INDEX <name> ON <table>`; `JOIN ... ON <expr>` is an expression.
         return roles[k - 2] === "created-index" ? "table" : undefined;
@@ -227,7 +297,7 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
       // An unlisted name where only a table or index can stand is outside the namespace: reading or
       // writing it would reach another component's table. pi-durable 1.0 addresses nothing but its
       // own listed objects, sqlite_master and pragma tables included, so there are no exceptions.
-      if (role === "from" || role === "table" || role === "index" || role === "either") {
+      if (role === "from" || role === "table" || role === "index") {
         throw refuse(`"${t.type === "word" ? t.raw : t.text}" stands where a table or index name belongs, and is not on the namespace's list`);
       }
       continue;

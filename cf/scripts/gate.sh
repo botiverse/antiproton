@@ -72,6 +72,7 @@ for f in test/*.ts; do
 done
 run_suite pi-storage-do bash test/pi-storage-do.sh
 run_suite pi-durable-do bash test/pi-durable-do.sh
+run_suite ap-store-do bash test/ap-store-do.sh
 run_suite durable-drive-do bash test/durable-drive-do.sh
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 
