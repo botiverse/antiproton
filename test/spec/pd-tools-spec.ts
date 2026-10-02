@@ -35,8 +35,8 @@ import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import { UnknownJob } from "../../cf/src/model-queue.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 
-const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
-const SYSTEM = "You are a test agent.";
+export const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
+export const SYSTEM = "You are a test agent.";
 const CTX = { tenantId: "t", agentId: "a", taskId: "t_a" };
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
@@ -96,9 +96,9 @@ function latch() {
   return { open, opened, reached, arrived };
 }
 
-type World = Awaited<ReturnType<typeof world>>;
+export type World = Awaited<ReturnType<typeof world>>;
 
-async function world(storage: DurableSqlHost) {
+export async function world(storage: DurableSqlHost) {
   const w = {
     invoked: [] as string[],
     /** How many plugin calls ran at once, at most, and now. */
@@ -192,14 +192,14 @@ async function world(storage: DurableSqlHost) {
 
 // ---- the two engines ------------------------------------------------------------
 
-type Engine = {
+export type Engine = {
   name: "pi085" | "pd";
   agent: PiAgent | DurableAgent;
   dispatched: string[];
   pd?: PdHost;
 };
 
-function toolOptions(w: World) {
+export function toolOptions(w: World) {
   return { tools: w.catalogue, toolHost: w.host, interrupts: { continuations: w.continuations, scope: "main" }, extraTools: w.extraTools as never };
 }
 
@@ -227,12 +227,12 @@ function pd(storage: DurableSqlHost, w: World, opts: { stepDeadlineMs?: number; 
 
 // ---- the model ----------------------------------------------------------------------
 
-type Request = { messages: ModelMessage[]; tools?: ToolDefinition[] };
-type Turn = (req: Request) => ModelResponse;
+export type Request = { messages: ModelMessage[]; tools?: ToolDefinition[] };
+export type Turn = (req: Request) => ModelResponse;
 
 const usage = { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 };
-const say = (text: string): Turn => () => ({ text, finishReason: "stop", truncated: false, usage });
-const calls = (...c: Array<[id: string, name: string, args: unknown] | ((req: Request) => [string, string, unknown])>): Turn => (req) => ({
+export const say = (text: string): Turn => () => ({ text, finishReason: "stop", truncated: false, usage });
+export const calls = (...c: Array<[id: string, name: string, args: unknown] | ((req: Request) => [string, string, unknown])>): Turn => (req) => ({
   text: "", finishReason: "tool_calls", truncated: false, usage,
   toolCalls: c.map((x) => (typeof x === "function" ? x(req) : x)).map(([id, name, args]) => ({ id, name, arguments: args })),
 });
@@ -245,7 +245,7 @@ const lastResult = (req: Request): Record<string, unknown> => {
 };
 
 /** Drive one engine through a user message and the model's turns. Returns every request the model was sent. */
-async function converse(e: Engine, user: string, script: Turn[]): Promise<Request[]> {
+export async function converse(e: Engine, user: string, script: Turn[]): Promise<Request[]> {
   const requests: Request[] = [];
   const answered = new Set<string>();
   await e.agent.say(user);
@@ -271,16 +271,16 @@ async function converse(e: Engine, user: string, script: Turn[]): Promise<Reques
 }
 
 /** What differs between two runs and is not behaviour: a token, an expiry time. */
-const norm = (s: string) => s.replace(/rjc_[0-9a-f]+/g, "<token>").replace(/\\?"expiresAt\\?":\\?"[^"\\]*\\?"/g, "<expiresAt>");
+export const norm = (s: string) => s.replace(/rjc_[0-9a-f]+/g, "<token>").replace(/\\?"expiresAt\\?":\\?"[^"\\]*\\?"/g, "<expiresAt>");
 /** A request as the model reads it, system prompt aside (the prompt's own parity is the runtime's case). */
-const seen = (r: Request) => ({ tools: r.tools ?? [], messages: r.messages.filter((m) => m.role !== "system").map((m) => norm(show(m))) });
+export const seen = (r: Request) => ({ tools: r.tools ?? [], messages: r.messages.filter((m) => m.role !== "system").map((m) => norm(show(m))) });
 
 /**
  * Each round's tool results in a fixed order. pi085 stores a round's results in call order; pd
  * appends each as its call settles, so a quick call's result can come first. Both send the model
  * call order (the requests are compared as sent); this is about the stored order only.
  */
-function roundsSorted(lines: string[]): string[] {
+export function roundsSorted(lines: string[]): string[] {
   const out: string[] = [];
   let block: string[] = [];
   const flush = () => { out.push(...block.sort()); block = []; };
@@ -293,7 +293,7 @@ function roundsSorted(lines: string[]): string[] {
 }
 
 /** The transcript as the console reads it: role, tool, text, error flag. */
-async function transcript(e: Engine): Promise<string[]> {
+export async function transcript(e: Engine): Promise<string[]> {
   const entries = await e.agent.entries({});
   type M = { role: string; toolName?: string; isError?: boolean; stopReason?: string; content: unknown };
   // pi085 records each "not ready yet" of the offloaded provider as a `deferred` assistant message,
@@ -345,7 +345,7 @@ function same(r: { pi: Run; pd: Run }, opts: { transcript?: boolean } = {}) {
  * then, which settles once the call does — or never, for a harness abandoned mid-call. A step
  * before the poll is due parks at once, so it is asked again after the wake.
  */
-async function stepUntil(e: Engine, reached: Promise<void>): Promise<{ step: ReturnType<Engine["agent"]["step"]> }> {
+export async function stepUntil(e: Engine, reached: Promise<void>): Promise<{ step: ReturnType<Engine["agent"]["step"]> }> {
   let there = false;
   void reached.then(() => { there = true; });
   for (let i = 0; i < 200; i++) {
@@ -358,7 +358,7 @@ async function stepUntil(e: Engine, reached: Promise<void>): Promise<{ step: Ret
   throw new Error(`${e.name}: the tool call never started`);
 }
 
-const toolMessages = (req: Request) => req.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+export const toolMessages = (req: Request) => req.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
 
 // ---- the cases ----------------------------------------------------------------------
 

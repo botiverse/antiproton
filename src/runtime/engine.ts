@@ -46,6 +46,12 @@ export interface AgentEngine {
   step(): Promise<StepOutcome>;
   /** Continue a turn paused for an API caller once every result is in (client-calls.ts). True when a run started. */
   resumeClientCalls(): Promise<boolean>;
+  /** Function calls this session waits on its API caller for, oldest first. */
+  waitingClientCalls(): Promise<Array<{ call_id: string; name: string; arguments: string }>>;
+  /** The API caller's results, kept also for a call not run yet; a result for a call that already has one is ignored. */
+  answerClientCalls(results: ReadonlyArray<{ callId: string; output: string; isError: boolean }>): Promise<void>;
+  /** Forget this session's client calls, when its turn is cancelled. How many were still waiting. */
+  dropClientCalls(): Promise<number>;
   /** Whether a run is in flight. */
   running(): Promise<boolean>;
   status(): Promise<EngineStatus>;

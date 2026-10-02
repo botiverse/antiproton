@@ -313,14 +313,13 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
 
   add("engine", "what a later step owns says so instead of doing something else", async (storage) => {
     const a = object(storage).agent();
-    for (const [what, call, step] of [
-      ["cancel", () => a.cancel("m"), "step 8"], ["markCancelled", () => a.markCancelled("m"), "step 8"], ["compact", () => a.compact(), "not supported"],
-    ] as const) {
+    for (const [what, call, step] of [["compact", () => a.compact(), "not supported"]] as const) {
       let thrown: unknown;
       try { await call(); } catch (e) { thrown = e; }
       check(thrown instanceof Error && thrown.message.includes("pd engine") && thrown.message.includes(step), `${what}: ${String(thrown)}`);
     }
-    check(await a.resumeClientCalls() === false, "resumeClientCalls must be a no-op: runtime.step calls it every pass");
+    // Cancel and client calls are step 8's (test/pd-cancel.ts); with nothing recorded, resuming finds nothing to do.
+    check(await a.resumeClientCalls() === false, "resumeClientCalls must be false with no client call: runtime.step calls it every pass");
   });
 
   return cases;

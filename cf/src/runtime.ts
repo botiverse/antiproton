@@ -32,7 +32,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/contex
 import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
 import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
 import {
-  answerClientCall, clientTools, dropClientCalls, pendingClientCalls,
+  clientTools,
 } from "../../src/runtime/client-calls.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
@@ -1689,11 +1689,13 @@ export class AgentRuntime {
       ),
     });
     const taken = new Set([...offered.map((t) => t.name), "run_js", "resume", "jobs"]);
-    const callerTools = Array.isArray(apiTools)
-      ? clientTools(
-          apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
-            name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
-          })),
+    const callerDefs = Array.isArray(apiTools)
+      ? apiTools.filter((t: any) => typeof t?.name === "string" && !taken.has(t.name)).map((t: any) => ({
+          name: String(t.name), description: String(t.description ?? ""), parameters: t.parameters ?? { type: "object", properties: {} },
+        }))
+      : [];
+    const callerTools = Array.isArray(apiTools) && engine !== "pd"
+      ? clientTools(callerDefs,
           { sql: this.#deps.ctx.storage.sql, session, lane: () => agentRef.current!.lane,
             branch: (tip) => agentRef.current!.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any })
       : [];
@@ -1771,8 +1773,8 @@ export class AgentRuntime {
 
     if (engine === "pd") {
       // The same catalogue PiAgent gets, through the same host and the same continuations
-      // (src/runtime/durable-tools.ts), less the caller's functions: those pause the turn through
-      // PiAgent's lane (client-calls.ts) and are step 8's.
+      // (src/runtime/durable-tools.ts). The caller's functions are pd's own tools there (`clientTool`), which wait
+      // for the caller instead of pausing PiAgent's lane (client-calls.ts), so they are handed over as definitions.
       this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
       // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
       await this.#pd.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
@@ -1781,7 +1783,9 @@ export class AgentRuntime {
         unknownJob: (id) => new UnknownJob(id),
         openSession: (other) => this.agent(tenantId, agentId, other),
         tools: offered as MountedTool[], toolHost: host, ...(keeping ? { interrupts: keeping } : {}),
-        extraTools: extraTools.filter((t) => !(callerTools as unknown[]).includes(t)) as never,
+        extraTools: extraTools as never, clientTools: callerDefs,
+        // The cancel marker's model message, as PiAgent's entry projector below makes it.
+        markerNotes: { [TURN_CANCELLED]: CANCELLED_NOTE },
       });
       this.#agents.set(cacheKey, { agent: pd, builtFrom });
       return pd;
@@ -1851,17 +1855,21 @@ export class AgentRuntime {
     const agent = await this.agent(tenantId, agentId, session);
     const cancelledTurn = await agent.cancel(TURN_CANCELLED);
     const sql = this.#deps.ctx.storage.sql;
-    ensureAgentTables(sql);
-    // A turn waiting for the caller has no run to abort; it still ends, and says so.
-    if (dropClientCalls(sql, session) > 0 && !cancelledTurn) {
+    const ensured = this.#ownWrite(() => ensureAgentTables(sql));
+    if (ensured instanceof Promise) await ensured;
+    // A turn waiting for the caller has no run to abort on pi085; it still ends, and says so. On pd the waiting
+    // tool is the run, so `cancel` already wrote the marker.
+    if ((await agent.dropClientCalls()) > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
     }
-    const jobs = await stopSessionJobs({
+    const stop = () => stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
       cancel: (job) => this.#gateway.cancelBackground(
         { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
+    // Its writes span awaits, so on a pd object they run with no pi-durable transaction open (`PdHost.apart`).
+    const jobs = this.#pd ? await this.#pd.apart(() => stop()) : await stop();
     return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
   }
 
@@ -1872,7 +1880,7 @@ export class AgentRuntime {
 
   /** Function calls this session waits on its API caller for, with the turn each belongs to. */
   async waitingClientCalls(tenantId: string, agentId: string, session: string) {
-    const rows = pendingClientCalls(this.#deps.ctx.storage.sql, session);
+    const rows = await (await this.agent(tenantId, agentId, session)).waitingClientCalls();
     if (!rows.length) return [];
     const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
     return rows.map((r) => ({ ...r, turn_id: turns.get(r.call_id) ?? "" }));
@@ -1891,9 +1899,11 @@ export class AgentRuntime {
     const unknown = results.filter((r) => turns.get(r.callId) !== r.turnId).map((r) => r.callId);
     if (unknown.length) return { unknown };
     const sql = this.#deps.ctx.storage.sql;
-    ensureAgentTables(sql);
-    for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
-    markSession(sql, session, true);
+    const ensured = this.#ownWrite(() => ensureAgentTables(sql));
+    if (ensured instanceof Promise) await ensured;
+    await (await this.agent(tenantId, agentId, session)).answerClientCalls(results);
+    const marked = this.#ownWrite(() => markSession(sql, session, true));
+    if (marked instanceof Promise) await marked;
     return { unknown: [] };
   }
 

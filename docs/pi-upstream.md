@@ -117,6 +117,7 @@ tests only) and `@earendil-works/chord` (types, and `chord/context` in
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
 | the facade's serial operation queue (re-implemented, smaller: a transaction always queues) | pi-durable `storage/sqlite/node.js` (`SerialOperationQueue`) | `src/store/pi-durable-sqlite.ts` |
 | the interrupted-call line (`INTERRUPTION_MARKER`), and the shape of pi-durable's interrupted result | pi-agent-core `harness/runtime/drive/tools.js`; pi-durable `harness/tool.js` (`fromSlot`, `renderDiagnostics`) | `src/runtime/durable-tools.ts` (`PI085_INTERRUPTED`, `pdInterruptedBlock`); `test/pd-tools.ts` reads both installed files |
+| the shape of pi-durable's aborted result (`Tool <name> was aborted`, the slot's `details` kept) | pi-durable `harness/tool.js` (the task's `abort`, `fromSlot`) | `src/runtime/durable-tools.ts` (`pdAbortedBlock`, `pi085ClientAborted`); `test/pd-cancel.ts` compares what each engine sends the model after a cancel |
 
 The usage arithmetic is copied because pi's export map does not publish it. The
 scan semantics are re-implemented against a reference we can read; pi's own
@@ -167,6 +168,27 @@ wrapped) rest on these, each read in 1.0.0's `dist` and covered by
   every installed extension (`harness/agent.js`, `selectExtensions`).
 - A round's tool results are stored in completion order and sent to the model
   in call order.
+
+Cancel and the API caller's functions (`DurableAgent.cancel`, `clientTool`;
+`test/pd-cancel.ts` and `npm run pd-cancel:do`) rest on these:
+
+- `Conversation.abort()` marks every live task of the conversation, starts the
+  scheduler, and resolves once it is idle. A generation aborted in its `poll`
+  phase calls `cancelDeferred` (`harness/generation.js`, `abort`), which is how
+  the job row is dropped; nothing is appended for the abort itself, so the
+  marker entry is ours.
+- Once the abort mark is down a tool's late result is not committed; its
+  result is `Tool <name> was aborted`, built from the slot, so `details` the
+  tool published before (`api.details`) are kept. pi085's abort instead waits
+  for the tool and records its real result — the one request that differs
+  after a cancel mid-call.
+- A gateway call runs inside `apart`, which holds pi-durable's commits off, the
+  abort mark's among them: a cancel waits for the call in flight, as pi085's
+  does.
+- A tool may wait in `execute()` as long as it likes; `close()` aborts it. A
+  `safe` one is run again on reopen, which is what lets a harness whose only
+  pending work is the caller's function close with no alarm
+  (`externalWaits` in `parkVerdict`).
 
 #### On pi-durable: parking replaces `drive()` returning `waiting`
 

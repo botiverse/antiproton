@@ -18,6 +18,8 @@
     "durable-agent:do": "bash test/durable-agent-do.sh",
     "pd-tools": "node test/pd-tools.ts",
     "pd-tools:do": "bash test/pd-tools-do.sh",
+    "pd-cancel": "node test/pd-cancel.ts",
+    "pd-cancel:do": "bash test/pd-cancel-do.sh",
     "pd-outbox": "node test/pd-outbox.ts",
     "pd-outbox:do": "bash test/pd-outbox-do.sh",
     "pi-loop": "node test/pi-loop.ts",
