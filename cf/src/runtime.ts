@@ -676,6 +676,8 @@ export class AgentRuntime {
   #agents = new Map<string, { agent: AgentEngine; builtFrom: string }>();
   /** The object's one pi-durable harness, made when a `pd` agent is first opened (src/runtime/durable-agent.ts). */
   #pd: PdHost | null = null;
+  /** Whether a pd agent was opened in this object: what a delivered answer's wake depends on (cf/src/index.ts). */
+  get servesPd(): boolean { return this.#pd !== null; }
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;

@@ -547,8 +547,10 @@ export function recordedEngine(sql: DurableSqlHost["sql"]): "pi085" | "pd" | nul
  * The object's storage, with a check on the hazard `PiDurableSqlite` describes: while a pi-durable
  * transaction is open it is a savepoint over the one connection, and any other write joins it and is
  * rolled back with it. Every write made while one is open that does not address pi-durable's own `pd_`
- * objects is recorded in `joined` and refused with an error naming it — pi-durable's own statements,
- * all rewritten to `pd_` names, pass. For tests: a joined write is a bug to find, not a state to run in.
+ * objects is recorded in `joined` (pi-durable's own statements, all rewritten to `pd_` names, are not).
+ * Recorded rather than thrown: a throw inside someone else's transaction surfaces as whatever that
+ * transaction's owner does with it — a crashed task, an unhandled rejection — not as the write. For
+ * tests: assert `joined` is empty.
  */
 export function guardJoinedWrites(storage: DurableSqlHost): DurableSqlHost & { readonly joined: string[] } {
   let open = 0;
@@ -558,8 +560,7 @@ export function guardJoinedWrites(storage: DurableSqlHost): DurableSqlHost & { r
     sql: {
       exec(query, ...bindings) {
         if (open > 0 && /^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i.test(query) && !/\bpd_/.test(query)) {
-          joined.push(query);
-          throw new Error(`a write joined an open pi-durable transaction: ${query.replace(/\s+/g, " ").slice(0, 160)}`);
+          joined.push(query.replace(/\s+/g, " ").slice(0, 160));
         }
         return storage.sql.exec(query, ...bindings);
       },
