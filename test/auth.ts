@@ -36,7 +36,13 @@ await check("seal/open round-trips and rejects tampering, wrong secret, expiry",
   const [body, sig] = token.split(".");
   const forged = b64url(new TextEncoder().encode(JSON.stringify({ hello: "evil", exp: now + 1000 })));
   assert((await open(SECRET, `${forged}.${sig}`, now)) === null, "tampered body accepted");
-  assert((await open(SECRET, `${body}.${sig.slice(0, -2)}AA`, now)) === null, "tampered sig accepted");
+  // The first character: the last two could already be "AA", and the last one has unused bits (#658).
+  assert((await open(SECRET, `${body}.${sig[0] === "A" ? "B" : "A"}${sig.slice(1)}`, now)) === null, "tampered sig accepted");
+  // The same signature bytes in another spelling: the unused low bits of the last character set.
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  assert(sig.length === 43 && A.indexOf(sig.at(-1)!) % 4 === 0, `signature shape ${sig}`);
+  assert((await open(SECRET, `${body}.${sig.slice(0, -1)}${A[A.indexOf(sig.at(-1)!) + 1]}`, now)) === null, "respelled sig accepted");
+  assert((await open(SECRET, `${body}.${sig.slice(0, 20)} ${sig.slice(20)}`, now)) === null, "sig with a space accepted");
   assert((await open(SECRET, "garbage", now)) === null, "garbage accepted");
   assert((await open(SECRET, null, now)) === null, "null accepted");
 });

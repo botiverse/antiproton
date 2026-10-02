@@ -123,6 +123,9 @@ export async function open<T extends { exp: number }>(secret: string, token: str
   const sig = token.slice(dot + 1);
   let sigBytes: Uint8Array;
   try { sigBytes = unb64url(sig); } catch { return null; }
+  // atob ignores the unused low bits of the last character (and whitespace), so several spellings
+  // decode to the same signature. Only the one seal() writes is accepted: a token has one form.
+  if (b64url(sigBytes) !== sig) return null;
   const key = await hmacKey(secret, "verify");
   const ok = await crypto.subtle.verify("HMAC", key, sigBytes, enc.encode(body));
   if (!ok) return null;

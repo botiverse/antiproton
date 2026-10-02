@@ -28,7 +28,7 @@ await check("an expired, forged or foreign-kind ticket names nobody", async () =
   const t = await handoffTicket(SECRET, V, T);
   must((await redeemTicket(SECRET, t, T + HANDOFF_TTL_MS + 1, spender())) === null, "an expired ticket");
   must((await redeemTicket("x".repeat(48), t, T + 1, spender())) === null, "a ticket under another secret");
-  must((await redeemTicket(SECRET, t.slice(0, -2) + "AA", T + 1, spender())) === null, "a tampered ticket");
+  must((await redeemTicket(SECRET, t.replace(/\.(.)/, (_, c) => `.${c === "A" ? "B" : "A"}`), T + 1, spender())) === null, "a tampered ticket");
   // A session cookie is sealed with the same secret: it must not pass for a ticket.
   const session = await seal(SECRET, { v: 1, who: "a@b", sub: "github:1", source: "github", exp: T + 60_000, nonce: "n" });
   must((await redeemTicket(SECRET, session, T + 1, spender())) === null, "another sealed kind passed for a ticket");
