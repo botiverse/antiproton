@@ -49,6 +49,14 @@
  *   `toolExecution` setting (dist/harness/runtime/drive/tools.js, `runTools`), so on pi085 the
  *   gateway's mount lock (`#onMount`, src/runtime/gateway.ts) is what serialises such calls. Both
  *   keep the lock; pd is stricter about the round.
+ * - **Functions the API caller runs** (`clientTool`). pi085 cannot suspend a tool, so a call to one
+ *   records itself, aborts the run, and resumes it on a new branch once every result is in
+ *   (src/runtime/client-calls.ts). pi-durable can leave a tool waiting: the call is recorded in
+ *   `ap_client_calls` and the tool waits in-process for the caller's result. A harness whose only
+ *   pending work is such a wait closes with no alarm (`externalWaits`, src/runtime/durable-drive.ts),
+ *   which is safe because the tool is replay-safe: the close aborts it, nothing is recorded, and the
+ *   reopened harness runs it again, which finds the answer in the row. What the model reads is
+ *   pi085's: the call, then the caller's result as its result, with no placeholder in between.
  */
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import type { Context } from "@earendil-works/chord";
@@ -56,6 +64,7 @@ import {
   defineExtension, GenerationTask, hook, LiveDoc, type Extension, type ToolExecutionApi, type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { Message, ToolResultMessage } from "pi-ai-1";
+import { CLIENT_PENDING } from "./client-calls.ts";
 
 /**
  * What pi085 tells the model about a call cut off with its outcome unknown and not run again.
@@ -82,6 +91,31 @@ export function pi085Interrupted<M extends Message>(m: M): M {
   if (!r.isError || last?.type !== "text" || last.text !== pdInterruptedBlock(r.toolName)) return m;
   return { ...r, content: [...r.content.slice(0, -1), { type: "text", text: PI085_INTERRUPTED }] } as M;
 }
+
+/**
+ * The block pi-durable 1.0.0 ends a call's result with when its turn's abort cut it off: `fromSlot(slot, "aborted",
+ * ...)` then `renderDiagnostics` (dist/harness/tool.js, the task's `abort`).
+ */
+export const pdAbortedBlock = (toolName: string) => `<harness>\n[error] Tool ${toolName} was aborted\n</harness>`;
+
+/**
+ * A caller's function cut off by a cancel, as pi085 shows it. pi085's call had already ended its run with
+ * `CLIENT_PENDING` as its (failed) result when the caller was asked (src/runtime/client-calls.ts), so that is what a
+ * cancelled wait leaves there; pd's tool was still waiting, and pi-durable's abort writes its "aborted" block. The
+ * call is known as the caller's by the `details` the tool publishes before it waits (`clientTool`), which pi-durable
+ * keeps in the aborted result. Anything else is returned as is.
+ */
+export function pi085ClientAborted<M extends Message>(m: M): M {
+  if (m.role !== "toolResult") return m;
+  const r = m as ToolResultMessage;
+  const last = r.content.at(-1);
+  if (!r.isError || (r.details as { client?: unknown } | undefined)?.client !== true) return m;
+  if (last?.type !== "text" || last.text !== pdAbortedBlock(r.toolName)) return m;
+  return { ...r, content: [{ type: "text", text: CLIENT_PENDING }] } as M;
+}
+
+/** One stored message as pi085 would have shown it, the model and the transcript's readers alike. */
+export const pi085View = <M extends Message>(m: M): M => pi085ClientAborted(pi085Interrupted(m));
 
 /** No bound of pi-durable's own: see "Output limits" above. */
 const UNBOUNDED = { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER } as const;
@@ -155,14 +189,58 @@ function untilAborted<T>(running: Promise<T>, signal: AbortSignal | undefined, o
   });
 }
 
-/** The extension a session's conversation selects: its tools, and the hook that shows the model pi085's interrupted line. */
-export function toolsExtension(name: string, tools: readonly AgentHarnessTool<undefined>[], apart?: Apart): Extension {
+/** A function the Agents API caller runs itself, as declared on the agent (cf/src/runtime.ts `agent()`). */
+export type ClientToolDef = { name: string; description: string; parameters: unknown };
+
+/** The caller's result for a call. */
+export type ClientAnswer = { output: string; isError: boolean };
+
+/** Where a client tool records its call and waits for the answer: `PdHost` (src/runtime/durable-agent.ts). */
+export interface ClientCallPort {
+  /**
+   * The caller's result for this call: recorded as waiting unless already answered, then waited for. Rejects with
+   * the signal's reason when it aborts (a close, or a cancel of the turn), having recorded nothing more.
+   */
+  answer(call: { conversationId: number; callId: string; name: string; arguments: string }, signal: AbortSignal | undefined): Promise<ClientAnswer>;
+}
+
+/**
+ * A function the caller runs, as a pi-durable tool: replay-safe (it does nothing but read a row and wait), and its
+ * result the caller's, in pi085's shape — the output as the text, a failure as an error result with the output as
+ * its text (pi085 throws it, and pi-agent-core makes the message the result).
+ */
+export function clientTool(def: ClientToolDef, port: ClientCallPort): ToolRegistration {
+  return {
+    name: def.name,
+    description: def.description,
+    parameters: def.parameters as ToolRegistration["parameters"],
+    replay: "safe",
+    outputLimits: UNBOUNDED,
+    async execute(args, api, context) {
+      // Published before the wait, so that a cancel's "aborted" result keeps it and reads as pi085's (`pi085ClientAborted`).
+      await api.details({ client: true }, context);
+      const r = await port.answer(
+        { conversationId: Number(api.conversationId), callId: api.callId, name: def.name, arguments: JSON.stringify(args ?? {}) },
+        context.abortSignal);
+      return r.isError
+        ? { content: [{ type: "text", text: r.output }], isError: true }
+        : { content: [{ type: "text", text: r.output }], details: { client: true } };
+    },
+  };
+}
+
+/** The extension a session's conversation selects: its tools, and the hook that shows the model pi085's texts (`pi085View`). */
+export function toolsExtension(
+  name: string, tools: readonly AgentHarnessTool<undefined>[], apart?: Apart,
+  client?: { defs: readonly ClientToolDef[]; port: ClientCallPort },
+): Extension {
   return defineExtension({
     name,
-    tools: tools.map((t) => durableTool(t, apart)),
+    // The caller's functions last, as pi085 lists them (cf/src/runtime.ts `agent()`).
+    tools: [...tools.map((t) => durableTool(t, apart)), ...(client?.defs ?? []).map((d) => clientTool(d, client!.port))],
     hooks: [hook(GenerationTask, {
       beforeRequest: ({ messages }) => {
-        const shown = messages.map(pi085Interrupted);
+        const shown = messages.map(pi085View);
         return shown.some((m, i) => m !== messages[i]) ? { messages: shown } : undefined;
       },
     })],

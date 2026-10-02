@@ -39,7 +39,18 @@ export type DriveSnapshot = {
   readonly inspection: HarnessInspection;
   /** `pi.live` and `pi.inbox` of every conversation a live task or an unsettled submission belongs to. */
   readonly docs: ReadonlyMap<ConversationId, ConversationDocs>;
+  /**
+   * Tool calls that wait on someone outside the object, by conversation: an Agents API caller running a function
+   * itself (`ap_client_calls`, src/runtime/durable-agent.ts). Absent: none.
+   */
+  readonly externalWaits?: ExternalWaits;
 };
+
+/** Call ids, by conversation, whose tool waits on someone outside the object to answer it. */
+export type ExternalWaits = ReadonlyMap<ConversationId, ReadonlySet<string>>;
+
+/** A tool task running no code of its own until someone outside the object answers its call. */
+export type ExternalWait = { readonly taskId: TaskId; readonly conversationId: ConversationId; readonly callId: string };
 
 /** A task that runs no code until `until`: a generation polling or backing off, a compaction backing off. */
 export type Sleeper = { readonly taskId: TaskId; readonly phase: "poll" | "retry"; readonly until: number };
@@ -47,8 +58,16 @@ export type Sleeper = { readonly taskId: TaskId; readonly phase: "poll" | "retry
 export type ParkVerdict =
   /** Nothing live and nothing queued: close, set no alarm. */
   | { readonly verdict: "idle" }
-  /** Only sleeping: close, and set an alarm for `until`, the earliest sleeper's wake time. */
-  | { readonly verdict: "park"; readonly until: number; readonly sleepers: readonly Sleeper[] }
+  /**
+   * Only sleeping: close, and set an alarm for `until`, the earliest sleeper's wake time. `external` are tool calls
+   * waiting on someone outside the object as well; their answer, not the alarm, wakes them.
+   */
+  | { readonly verdict: "park"; readonly until: number; readonly sleepers: readonly Sleeper[]; readonly external: readonly ExternalWait[] }
+  /**
+   * Nothing runs and nothing sleeps: every live task waits, at the end of the chain, on someone outside the object.
+   * Close, and set no alarm: the answer is what wakes it (`DurableAgent.answerClientCalls`).
+   */
+  | { readonly verdict: "external"; readonly external: readonly ExternalWait[] }
   /** Work is running or about to: stay open. `reason` names the first thing that said so. */
   | { readonly verdict: "wait"; readonly reason: string };
 
@@ -101,9 +120,16 @@ function activityOf(kind: string, checkpoint: JsonValue | undefined): Activity {
  * - every sleeper reserved (`running`, with a running invocation), not abort-marked,
  *   and its wake time at least `minParkMs` (default 1000, never below 1) after `now` — strictly in the future;
  * - in every conversation involved, no committed partial of a streaming response and
- *   no tool slot that is not done;
+ *   no tool slot that is not done, except a running one whose call is an external wait;
  * - queued input only where a run already holds the conversation: it waits for that
  *   run's next boundary. Queued input with no run would start one, so it is work.
+ *
+ * A tool task running its call (`execute`) whose call id is in `externalWaits` counts as
+ * neither working nor sleeping: it waits for someone outside the object, whose answer
+ * reopens the harness. Closing it is safe only because such a tool is replay-safe: the
+ * close aborts it, nothing is recorded, and the reopened harness runs it again, which
+ * then finds the answer. With sleepers as well, the verdict is "park" with their wake
+ * time; with none, "external", which sets no alarm.
  */
 /**
  * A park shorter than this saves almost nothing and risks closing the harness mid-fetch (the alarm
@@ -115,10 +141,12 @@ export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PAR
   const { now, inspection, docs } = snapshot;
   const margin = Math.max(1, minParkMs);
   const wait = (reason: string): ParkVerdict => ({ verdict: "wait", reason });
+  const external = (id: ConversationId, callId: unknown) =>
+    typeof callId === "string" && (snapshot.externalWaits?.get(id)?.has(callId) ?? false);
 
   for (const [id, { live, inbox }] of docs) {
     if (live?.generation?.message !== undefined) return wait(`conversation ${id} is streaming a response`);
-    const busySlot = live?.tools?.find((slot) => slot.status !== "done");
+    const busySlot = live?.tools?.find((slot) => slot.status !== "done" && !(slot.status === "running" && external(id, slot.callId)));
     if (busySlot !== undefined) return wait(`conversation ${id} has tool call ${busySlot.callId} ${busySlot.status}`);
     if ((inbox?.items.length ?? 0) > 0 && live?.run === undefined) return wait(`conversation ${id} has queued input and no run`);
   }
@@ -133,11 +161,19 @@ export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PAR
   }
 
   const sleepers: Sleeper[] = [];
+  const outside: ExternalWait[] = [];
   for (const { record, state } of inspection.tasks) {
     const label = `task ${record.id} (${record.kind})`;
     if (!docs.has(record.conversationId)) return wait(`${label} belongs to a conversation not read`);
     if (record.abortRequested) return wait(`${label} is marked for abort`);
     if (state.kind === "waiting" && record.state.status === "waiting") continue;
+    const callId = isObject(record.input as JsonValue) ? (record.input as JsonObject).callId : undefined;
+    const checkpoint = record.state.status === "running" ? record.state.checkpoint : undefined;
+    if (record.kind === TOOL && state.kind === "running" && record.state.status === "running"
+      && isObject(checkpoint) && checkpoint.phase === "execute" && external(record.conversationId, callId)) {
+      outside.push({ taskId: record.id, conversationId: record.conversationId, callId: callId as string });
+      continue;
+    }
     if (state.kind !== "running" || record.state.status !== "running") return wait(`${label} is ${state.kind}`);
     const activity = activityOf(record.kind, record.state.checkpoint);
     // Not parked, and named apart from "working": a task this table does not know may be sleeping in a
@@ -150,8 +186,10 @@ export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PAR
     if (activity.until - now < margin) return wait(`${label} is due: ${activity.phase} until ${activity.until}, now ${now}`);
     sleepers.push({ taskId: record.id, phase: activity.phase, until: activity.until });
   }
-  if (sleepers.length === 0) return wait("every live task waits on another and none sleeps");
-  return { verdict: "park", until: Math.min(...sleepers.map((s) => s.until)), sleepers };
+  if (sleepers.length === 0) {
+    return outside.length === 0 ? wait("every live task waits on another and none sleeps") : { verdict: "external", external: outside };
+  }
+  return { verdict: "park", until: Math.min(...sleepers.map((s) => s.until)), sleepers, external: outside };
 }
 
 /**
@@ -160,7 +198,9 @@ export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PAR
  * if the second inspection differs. The documents and the tasks are committed
  * together, so equal inspections either side of the reads bracket one state.
  */
-export async function readSnapshot(harness: Harness, context: Context, now: () => number, attempts = 5): Promise<DriveSnapshot | undefined> {
+export async function readSnapshot(
+  harness: Harness, context: Context, now: () => number, attempts = 5, externalWaits?: () => ExternalWaits,
+): Promise<DriveSnapshot | undefined> {
   for (let i = 0; i < attempts; i++) {
     const at = now();
     const inspection = await harness.inspect(context);
@@ -175,8 +215,11 @@ export async function readSnapshot(harness: Harness, context: Context, now: () =
         inbox: await harness.snapshot(InboxDoc, id, context),
       });
     }
+    // Read between the two inspections: an answer that lands after it is seen by the next read, which its
+    // notice (`SettleOptions.subscribe`) asks for.
+    const waits = externalWaits?.();
     const again = await harness.inspect(context);
-    if (JSON.stringify(again) === JSON.stringify(inspection)) return { now: at, inspection, docs };
+    if (JSON.stringify(again) === JSON.stringify(inspection)) return { now: at, inspection, docs, ...(waits ? { externalWaits: waits } : {}) };
   }
   return undefined;
 }
@@ -184,6 +227,8 @@ export async function readSnapshot(harness: Harness, context: Context, now: () =
 export type SettleResult =
   | { readonly state: "idle" }
   | { readonly state: "parked"; readonly parkedUntil: number; readonly sleepers: readonly Sleeper[] }
+  /** Closed, with tool calls waiting on someone outside the object and nothing to set an alarm for. */
+  | { readonly state: "external"; readonly external: readonly ExternalWait[] }
   /** The deadline passed with work still running; the harness is left open. */
   | { readonly state: "timeout"; readonly last: ParkVerdict };
 
@@ -199,6 +244,13 @@ export type SettleOptions = {
   readonly recheckMs?: number;
   /** Called with each verdict, for tests and traces. */
   readonly onVerdict?: (verdict: ParkVerdict) => void;
+  /** Read with each snapshot: calls whose tool waits on someone outside the object (`DriveSnapshot.externalWaits`). */
+  readonly externalWaits?: () => ExternalWaits;
+  /**
+   * Another source of "read again": `externalWaits` moves without a pi-durable commit (a tool records its call in
+   * our own table), so it notices settle itself. Returns the unsubscribe.
+   */
+  readonly subscribe?: (wake: () => void) => () => void;
 };
 
 /**
@@ -221,21 +273,22 @@ export async function settle(harness: Harness, options: SettleOptions): Promise<
   let wake: (() => void) | undefined;
   let subscribed = true;
   const stop = harness.subscribeCommits(() => { commits++; wake?.(); });
-  const unsubscribe = () => { if (subscribed) { subscribed = false; stop(); } };
+  const stopOther = options.subscribe?.(() => { commits++; wake?.(); });
+  const unsubscribe = () => { if (subscribed) { subscribed = false; stop(); stopOther?.(); } };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     for (;;) {
       const seen = commits;
-      const snapshot = await readSnapshot(harness, options.context, now);
+      const snapshot = await readSnapshot(harness, options.context, now, 5, options.externalWaits);
       const verdict: ParkVerdict = snapshot === undefined
         ? { verdict: "wait", reason: "the state moved under every read" }
         : parkVerdict(snapshot, options.minParkMs);
       options.onVerdict?.(verdict);
-      if (verdict.verdict === "idle" || verdict.verdict === "park") {
+      if (verdict.verdict !== "wait") {
         unsubscribe();
         await harness.close(options.context);
-        return verdict.verdict === "idle"
-          ? { state: "idle" }
+        return verdict.verdict === "idle" ? { state: "idle" }
+          : verdict.verdict === "external" ? { state: "external", external: verdict.external }
           : { state: "parked", parkedUntil: verdict.until, sleepers: verdict.sleepers };
       }
       if (options.deadlineMs !== undefined && now() - started >= options.deadlineMs) return { state: "timeout", last: verdict };

@@ -42,7 +42,7 @@ const d1 = () => {
 };
 
 const wholeObject: DriveCase = {
-  group: "the whole object", name: "a pd turn through AgentDO's entry points — approval, API input with a model binding, question expiry, background job, idle lease, alarms — joins nothing",
+  group: "the whole object", name: "a pd turn through AgentDO's entry points — approval, API input with a model binding, a caller's function result, a cancel, question expiry, background job, idle lease, alarms — joins nothing",
   async run() {
     const raw = sqliteHost();
     try {
@@ -139,6 +139,28 @@ const wholeObject: DriveCase = {
       await drain();
       check(requests.some((r) => r.includes("hello from the API")), "the API input never reached the model");
 
+      // A function the API caller runs: its result submitted, then a turn cancelled — each from inside an open commit.
+      const weather = { name: "n", instructions: "be brief", tools: [{ name: "get_weather", description: "weather", parameters: { type: "object", properties: {} } }] };
+      await D.apiPostInput(T, A, JSON.stringify(weather), "s2", "weather?");
+      await answer([call("w1", "get_weather")], "toolUse");
+      let status = await D.apiSessionStatus(T, A, "s2");
+      for (let i = 0; i < 100 && status.status !== "requires_action"; i++) { await D.alarm(); await sleep(10); status = await D.apiSessionStatus(T, A, "s2"); }
+      check(status.status === "requires_action" && status.pending[0]?.call_id === "w1", `the caller's function is not waiting: ${show(status)}`);
+      const submitted = during(() => D.apiToolResults(T, A, "s2", [{ turnId: status.pending[0]!.turn_id, callId: "w1", output: "sunny", isError: false }]));
+      await D.uiSay(T, A, `t_${A}`, "meanwhile", "steer");
+      const sub = await submitted;
+      check(sub.ok && show(sub.value) === show({ unknown: [] }), `the results threw or were refused: ${show(sub)}`);
+      await drain();
+      check(requests.some((r) => r.includes("sunny")), "the caller's result never reached the model");
+      await D.apiPostInput(T, A, JSON.stringify(weather), "s2", "write a long story");
+      for (let i = 0; i < 100 && jobs.length <= answered; i++) { await D.alarm(); if (jobs.length <= answered) await sleep(10); }
+      const cancelled = during(() => D.apiCancelSession(T, A, "s2"));
+      await D.uiSay(T, A, `t_${A}`, "and the story?", "steer");
+      const can = await cancelled;
+      check(can.ok && typeof can.value?.cancelledTurn === "string", `the cancel threw or found nothing: ${show(can)}`);
+      answered = jobs.length;
+      await drain();
+
       // The question expires; the background job comes due; the lease reaches its warning, then its end.
       await sleep(450);
       raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0");
@@ -156,7 +178,7 @@ const wholeObject: DriveCase = {
       check(seen.includes("lease.release"), `the lease was not released: ${show(seen)}`);
 
       const kinds = new Set(raw.sql.exec("SELECT kind FROM do_activity").toArray().map((r) => String((r as { kind: unknown }).kind)));
-      for (const k of ["uiSay", "uiDecide", "apiPostInput", "alarm", "deliver", "offload_dispatch", "offload_provider"]) check(kinds.has(k), `no do_activity row of kind ${k}: ${show([...kinds])}`);
+      for (const k of ["uiSay", "uiDecide", "apiPostInput", "apiToolResults", "apiCancelSession", "alarm", "deliver", "offload_dispatch", "offload_provider"]) check(kinds.has(k), `no do_activity row of kind ${k}: ${show([...kinds])}`);
       check(raw.sql.exec("SELECT COUNT(*) AS n FROM alarms").toArray()[0] as { n: number }, "no alarm rows");
       check(g.joined.length === 0, `${g.joined.length} writes joined an open pi-durable transaction: ${show(g.joined.slice(0, 5))}`);
       await (await rt.agent(T, A)).close?.();

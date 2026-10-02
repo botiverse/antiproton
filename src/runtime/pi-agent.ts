@@ -30,7 +30,7 @@ import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
-import { resumeClientCalls } from "./client-calls.ts";
+import { answerClientCall, dropClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
 import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 export type { StepOutcome } from "./engine.ts";
@@ -541,6 +541,19 @@ export class PiAgent implements AgentEngine {
       sql: this.#sql, session: this.#opts.session ?? MAIN_SESSION, lane: this.#lane,
       branch: (tip) => this.#storage.scanBranch({ start: tip, order: "oldestFirst" }, CTX),
     });
+  }
+
+  async waitingClientCalls() {
+    return pendingClientCalls(this.#sql, this.#opts.session ?? MAIN_SESSION);
+  }
+
+  async answerClientCalls(results: ReadonlyArray<{ callId: string; output: string; isError: boolean }>) {
+    const session = this.#opts.session ?? MAIN_SESSION;
+    for (const r of results) answerClientCall(this.#sql, session, r.callId, { output: r.output, isError: r.isError });
+  }
+
+  async dropClientCalls() {
+    return dropClientCalls(this.#sql, this.#opts.session ?? MAIN_SESSION);
   }
 
   async running(): Promise<boolean> {

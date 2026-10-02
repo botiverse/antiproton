@@ -31,9 +31,9 @@
  *   commit. Written by src/runtime/pd-outbox.ts through `unit`, in the same
  *   commit as the rows it accounts for.
  *
- * Only the engine, the directory and `unit` have operations here; the other tables are
- * declared so that the namespace's list is complete from the start, and their
- * operations arrive with the steps that use them.
+ * The engine, the directory, `unit` and the client calls have operations here; the
+ * other tables are declared so that the namespace's list is complete from the start,
+ * and their operations arrive with the steps that use them.
  */
 import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
@@ -61,6 +61,17 @@ const SCHEMA = [
 /** The kernels an agent can run on. `pi085` is every agent created before the choice existed. */
 export const AGENT_ENGINES = ["pi085", "pd"] as const;
 export type AgentEngineName = (typeof AGENT_ENGINES)[number];
+
+/**
+ * A function call the Agents API caller runs itself (src/runtime/client-calls.ts has the pi085 side). `state` is
+ * the same three as there: `pending` (recorded by the tool, the caller has not answered), `answered` (the caller's
+ * result, possibly before the tool ran), `used` (the tool returned it). A row with no `name` is an answer that came
+ * before the tool ran.
+ */
+export type ApClientCall = {
+  conversationId: number; callId: string; name: string; arguments: string;
+  state: "pending" | "answered" | "used"; output: string | null; isError: boolean; createdAt: number;
+};
 
 export type ApConversation = { taskId: string; tenantId: string; agentId: string; conversationId: number; createdAt: number };
 
@@ -174,6 +185,79 @@ export class ApStore {
       return row;
     });
   }
+
+  // ---- client_calls -------------------------------------------------------------
+
+  clientCall(conversationId: number, callId: string): ApClientCall | null {
+    const r = this.#run("SELECT * FROM client_calls WHERE conversation_id = ? AND call_id = ?", [conversationId, callId])[0];
+    return r ? clientCallOf(r) : null;
+  }
+
+  /**
+   * A tool's call, recorded as waiting for the caller unless the caller already answered it. Resolves to the row in
+   * force: an `answered` or `used` row is returned as it is (gaining its name, so a reader can tell it was called).
+   */
+  recordClientCall(c: { conversationId: number; callId: string; name: string; arguments: string; at: number }): Promise<ApClientCall> {
+    return this.#writer.exclusive(() => {
+      this.#run(
+        `INSERT INTO client_calls (conversation_id, call_id, name, arguments, state, created_at) VALUES (?, ?, ?, ?, 'pending', ?)
+         ON CONFLICT (conversation_id, call_id) DO UPDATE SET name = excluded.name, arguments = excluded.arguments`,
+        [c.conversationId, c.callId, c.name, c.arguments, c.at]);
+      return this.clientCall(c.conversationId, c.callId)!;
+    });
+  }
+
+  /** The caller's result, kept also before the tool has run. False when the call already has one. */
+  answerClientCall(conversationId: number, callId: string, result: { output: string; isError: boolean }, at: number): Promise<boolean> {
+    return this.#writer.exclusive(() => {
+      const row = this.clientCall(conversationId, callId);
+      if (row && row.state !== "pending") return false;
+      if (row) {
+        this.#run("UPDATE client_calls SET state = 'answered', output = ?, is_error = ? WHERE conversation_id = ? AND call_id = ?",
+          [result.output, result.isError ? 1 : 0, conversationId, callId]);
+      } else {
+        this.#run("INSERT INTO client_calls (conversation_id, call_id, state, output, is_error, created_at) VALUES (?, ?, 'answered', ?, ?, ?)",
+          [conversationId, callId, result.output, result.isError ? 1 : 0, at]);
+      }
+      return true;
+    });
+  }
+
+  /** The tool returned the caller's answer. Kept, not deleted: a replay of the same call returns it again. */
+  useClientCall(conversationId: number, callId: string): Promise<void> {
+    return this.#writer.exclusive(() => {
+      this.#run("UPDATE client_calls SET state = 'used' WHERE conversation_id = ? AND call_id = ? AND state = 'answered'", [conversationId, callId]);
+    });
+  }
+
+  /** Calls of the conversation a tool is waiting on the caller for, oldest first. Every conversation's when none is named. */
+  pendingClientCalls(conversationId?: number): ApClientCall[] {
+    const rows = conversationId === undefined
+      ? this.#run("SELECT * FROM client_calls WHERE state = 'pending' ORDER BY created_at, call_id", [])
+      : this.#run("SELECT * FROM client_calls WHERE conversation_id = ? AND state = 'pending' ORDER BY created_at, call_id", [conversationId]);
+    return rows.map(clientCallOf);
+  }
+
+  /** Calls a tool recorded that the caller has answered and the tool has not returned yet. */
+  answeredClientCalls(conversationId: number): ApClientCall[] {
+    return this.#run("SELECT * FROM client_calls WHERE conversation_id = ? AND state = 'answered' AND name != '' ORDER BY created_at, call_id", [conversationId])
+      .map(clientCallOf);
+  }
+
+  /** Forget a conversation's calls, when its turn is cancelled. How many were still waiting. */
+  dropClientCalls(conversationId: number): Promise<number> {
+    return this.#writer.exclusive(() => {
+      const waiting = this.pendingClientCalls(conversationId).length;
+      this.#run("DELETE FROM client_calls WHERE conversation_id = ?", [conversationId]);
+      return waiting;
+    });
+  }
 }
+
+const clientCallOf = (r: Record<string, unknown>): ApClientCall => ({
+  conversationId: Number(r.conversation_id), callId: String(r.call_id), name: String(r.name), arguments: String(r.arguments),
+  state: String(r.state) as ApClientCall["state"], output: r.output === null || r.output === undefined ? null : String(r.output),
+  isError: !!Number(r.is_error), createdAt: Number(r.created_at),
+});
 
 const describe = (v: unknown) => (typeof v === "string" ? JSON.stringify(v) : typeof v === "number" ? String(v) : v === null ? "null" : typeof v);

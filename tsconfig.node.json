@@ -90,6 +90,8 @@
     "test/spec/durable-agent-spec.ts",
     "test/pd-tools.ts",
     "test/spec/pd-tools-spec.ts",
+    "test/pd-cancel.ts",
+    "test/spec/pd-cancel-spec.ts",
     "test/pd-transcript.ts",
     "test/spec/pd-conversation.ts",
     "test/pd-outbox.ts",
