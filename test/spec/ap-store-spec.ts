@@ -138,7 +138,7 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     is.strictEqual(ap.conversation("s_other"), null);
   }));
 
-  add("exclusive", "waits for an open pi-durable transaction, then commits even though that transaction rolls back", () => withHost(async (host) => {
+  add("PiDurableSqlite.exclusive", "waits for an open pi-durable transaction, then commits even though that transaction rolls back", () => withHost(async (host) => {
     const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     const ap = new ApStore(host.sql, AP);
@@ -168,7 +168,7 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     is.deepEqual(await db.all("SELECT id FROM record_ids"), []);
   }));
 
-  add("exclusive", "control: the same write issued straight to the host while the transaction is open is rolled back with it", () => withHost(async (host) => {
+  add("PiDurableSqlite.exclusive", "control: the same write issued straight to the host while the transaction is open is rolled back with it", () => withHost(async (host) => {
     const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     const ap = new ApStore(host.sql, AP);
@@ -181,7 +181,7 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     is.strictEqual(ap.engine(), null);
   }));
 
-  add("exclusive", "is atomic: a throw inside leaves nothing written, and an async function is refused and rolled back", () => withHost(async (host) => {
+  add("PiDurableSqlite.exclusive", "is atomic: a throw inside leaves nothing written, and an async function is refused and rolled back", () => withHost(async (host) => {
     const db = new PiDurableSqlite(host, PD);
     const ap = new ApStore(host.sql, AP);
     await db.exclusive(() => ap.ensure());
@@ -204,7 +204,7 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     is.strictEqual(ap.engine(), "pi085");
   }));
 
-  add("exclusive", "inTransaction is true only while a pi-durable transaction is open", () => withHost(async (host) => {
+  add("PiDurableSqlite.exclusive", "inTransaction is true only while a pi-durable transaction is open", () => withHost(async (host) => {
     const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     const seen: boolean[] = [db.inTransaction];
