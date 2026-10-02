@@ -41,14 +41,14 @@ import type { ApStore } from "../store/ap-store.ts";
 
 /** The counters a usage row bills (`modelTokenRows`). */
 const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning"] as const;
-export type Tokens = Partial<Record<(typeof COUNTERS)[number], number>>;
+type Tokens = Partial<Record<(typeof COUNTERS)[number], number>>;
 /** Keyed as `pi.usage` keys them: `models` by `provider/model`, `tools` by tool name. */
-export type UsageTotals = { models: Record<string, Tokens>; tools: Record<string, Tokens> };
+type UsageTotals = { models: Record<string, Tokens>; tools: Record<string, Tokens> };
 
 type Raw = { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
 type MessageLike = { role?: unknown; model?: unknown; provider?: unknown; jobId?: unknown; stopReason?: unknown; usage?: Tokens };
 
-export interface BookContext {
+interface BookContext {
   /** Whose rows these are. Null when the host is not bound yet: then a batch that bills anything throws. */
   owner: { tenantId: string; agentId: string } | null;
   /** The commit's time: every row's `at`. */
@@ -63,12 +63,11 @@ export interface BookContext {
   fault?: (writes: readonly StorageWrite[]) => void;
 }
 
-export interface Booked {
+interface Booked {
   /** Jobs this batch recorded: dispatch each once the commit has landed. */
   jobs: string[];
   usage: UsageRow[];
   trace: TraceRow[];
-  consumed: string[];
 }
 
 const PI_USAGE = "pi.usage";
@@ -99,7 +98,7 @@ function currentValue(exec: SqliteSyncExecutor, id: number): unknown {
  * What this batch adds to the `pi.usage` documents, summed over them: each changed or created one's new
  * value minus its value before the batch. Copies and retirements add nothing.
  */
-export function usageDelta(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): UsageTotals {
+function usageDelta(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): UsageTotals {
   const out: UsageTotals = { models: {}, tools: {} };
   for (const w of writes) {
     let before: unknown;
@@ -170,8 +169,9 @@ function modelOf(key: string, named: ReadonlyMap<string, string>): string {
 }
 
 /** The commit hook's body. Synchronous, inside the commit's transaction; see the header for what it writes. */
-export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], ctx: BookContext): Booked {
-  const booked: Booked = { jobs: [], usage: [], trace: [], consumed: [] };
+/** Returns the jobs the batch recorded: each is dispatched once the commit has landed. */
+export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], ctx: BookContext): string[] {
+  const booked: Booked = { jobs: [], usage: [], trace: [] };
 
   // Model jobs: recorded by the batch whose poll checkpoint carries the handle.
   for (const job of pollHandles(writes, ctx.staged)) {
@@ -197,7 +197,6 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
       continue;
     }
     ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL", m.jobId);
-    booked.consumed.push(m.jobId);
   }
 
   // Usage: the pi.usage delta, as rows.
@@ -231,7 +230,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
   }
 
   ctx.fault?.(writes);
-  return booked;
+  return booked.jobs;
 }
 
 /**

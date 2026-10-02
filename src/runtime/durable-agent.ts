@@ -59,7 +59,7 @@ import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
-import { bookCommit, strandedAnswerRows, type Booked } from "./pd-outbox.ts";
+import { bookCommit, strandedAnswerRows } from "./pd-outbox.ts";
 import { appendUsage } from "../usage/outbox.ts";
 import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
@@ -110,8 +110,6 @@ export interface PdHostOptions {
   onPoll?: (jobId: string, ready: boolean) => void;
   /** A test seam into the commit hook (src/runtime/pd-outbox.ts, `BookContext.fault`): a throw rolls the commit back. */
   commitFault?: (writes: readonly StorageWrite[]) => void;
-  /** What each commit hook wrote, after its commit landed. For tests. */
-  onBooked?: (booked: Booked) => void;
 }
 
 /** What binds a host to the one agent it serves. */
@@ -283,19 +281,18 @@ export class PdHost {
    */
   #book(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], seq: number): void {
     const binding = this.#binding;
-    const booked = bookCommit(exec, writes, {
+    const jobs = bookCommit(exec, writes, {
       owner: binding ? { tenantId: binding.tenantId, agentId: binding.agentId } : null,
       now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
       ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
     });
-    queueMicrotask(() => void this.#afterCommit(booked, seq));
+    queueMicrotask(() => void this.#afterCommit(jobs, seq));
   }
 
-  async #afterCommit(booked: Booked, seq: number): Promise<void> {
+  async #afterCommit(jobs: readonly string[], seq: number): Promise<void> {
     const next = this.#opts.storage.sql.exec(PD_NAMES.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq;
     if (!(Number(next) > seq)) return;
-    this.#opts.onBooked?.(booked);
-    for (const id of booked.jobs) {
+    for (const id of jobs) {
       // The row is the proof: a commit that rolled back, whatever moved the sequence since, left none.
       if (this.#ap.query("SELECT 1 AS x FROM model_jobs WHERE id = ?", id).length === 0) continue;
       this.#staged.delete(id);

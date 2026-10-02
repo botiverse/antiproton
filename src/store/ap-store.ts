@@ -28,7 +28,7 @@
  *   `#openTask` in cf/src/index.ts accept through AgentDO's `tasks` rows) to the
  *   pi-durable conversation that holds it.
  *
- * The engine, the directory, `unit` and the client calls have operations here; the
+ * The engine, the directory and the client calls have operations here; the
  * other tables are declared so that the namespace's list is complete from the start,
  * and their operations arrive with the steps that use them.
  */
@@ -75,7 +75,7 @@ export type ApClientCall = {
 
 export type ApConversation = { taskId: string; tenantId: string; agentId: string; conversationId: number; createdAt: number };
 
-/** The slice of `ctx.storage` this needs: its SQL, and the transaction `unit` runs in. */
+/** The slice of `ctx.storage` this needs: its SQL, and the transaction `ensure` runs in. */
 export type ApSqlHost = {
   sql: { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
   transactionSync<T>(closure: () => T): T;
@@ -83,14 +83,12 @@ export type ApSqlHost = {
 
 type Binding = string | number | null;
 
-/** The `ap` tables inside a unit (`ApStore.unit`): only valid until the unit's function returns. */
-export type ApUnit = { run(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> };
 
 /**
  * Every statement runs when it is called, reads and writes alike. Nothing of pi-durable's can be open
  * meanwhile: each of its commits is one synchronous transaction (src/store/pi-durable-sqlite.ts), so
  * code of ours never runs inside one. A method whose statements must land together runs them in one
- * host `transactionSync` (`ensure`, `unit`); the rest are one write each, or a read and a write with
+ * host `transactionSync` (`ensure`); the rest are one write each, or a read and a write with
  * no await between them.
  */
 export class ApStore {
@@ -122,14 +120,6 @@ export class ApStore {
     });
   }
 
-  /**
-   * One host `transactionSync`: `ap.run` reaches only the `ap` objects, and whatever else `fn` runs on the
-   * host's connection before it returns commits or rolls back with it. Not for a caller already inside a
-   * transaction (pi-durable's commit hook): node:sqlite refuses a nested one; `query` runs in the open one.
-   */
-  unit<T>(fn: (ap: ApUnit) => T): T {
-    return this.#host.transactionSync(() => fn({ run: (sql, ...bindings) => this.#run(sql, bindings) }));
-  }
 
   /** The engine recorded at creation, or null for an agent that predates the choice. */
   engine(): AgentEngineName | null {

@@ -17,7 +17,6 @@ import { AssistantEntry, UsageDoc, type ConversationId, type StorageWrite } from
 import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
-import type { Booked } from "../../src/runtime/pd-outbox.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { statusEvents } from "../../src/runtime/status.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
@@ -67,9 +66,8 @@ const pdJobs = (storage: DurableSqlHost): Jobs => {
 type Fault = (writes: readonly StorageWrite[]) => void;
 function pdObject(storage: DurableSqlHost, extra: { commitFault?: Fault; dispatch?: (id: string) => Promise<void> } = {}) {
   const dispatched: string[] = [];
-  const booked: Booked[] = [];
   const host = new PdHost({
-    storage, poll: POLL, minParkMs: 1, onBooked: (b) => booked.push(b),
+    storage, poll: POLL, minParkMs: 1,
     ...(extra.commitFault ? { commitFault: extra.commitFault } : {}),
   });
   const agent = DurableAgent.open({
@@ -77,7 +75,7 @@ function pdObject(storage: DurableSqlHost, extra: { commitFault?: Fault; dispatc
     dispatch: async (id) => { dispatched.push(id); await extra.dispatch?.(id); },
     unknownJob: (id) => new UnknownJob(id),
   });
-  return { host, agent, dispatched, booked };
+  return { host, agent, dispatched };
 }
 
 /** The worker: the real conversion of the request, then the answer `answer` builds for this job. */
