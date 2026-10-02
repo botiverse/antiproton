@@ -36,7 +36,8 @@ by its bare name and gets whatever is installed at the top level, which has to
 stay pi-agent-core's 0.85.1 until the runtime moves; a top-level 1.0.0 would
 swap the provider contract under the running loop. Scoped, it installs under
 `node_modules/@earendil-works/pi-durable/`. Nothing of ours imports `chord`
-outside the pi-durable tests, and pi-agent-core gets its own 0.85.1 copy, so
+outside the pi-durable side (`src/runtime/durable-drive.ts`,
+`src/runtime/durable-agent.ts` and their tests), and pi-agent-core gets its own 0.85.1 copy, so
 `chord` can sit at the top level. `npm ls @earendil-works/pi-ai
 @earendil-works/chord pi-ai-1` shows the layout.
 
@@ -63,8 +64,13 @@ stated so they are not rediscovered:
   untagged); the 1.0 one writes version 2 (`version: 2`), which keeps each
   system message where it stands in the transcript, rendered to text by the
   writer. `JobContextV2` in `src/model/pi-bridge.ts` defines it.
-- The production bundle is unchanged while only tests and the conformance
-  worker import `pi-ai-1`.
+- The production bundle carries pi-durable, `chord`, `pi-ai-1` and the
+  `typebox` they validate with, because `cf/src/runtime.ts` imports the `pd`
+  engine (`src/runtime/durable-agent.ts`) to open an agent whose object
+  records it. Measured on a dry-run build: 2,689,794 bytes at master 3a1ee8e,
+  3,609,643 with the engine (gzip 595.57 KiB to 763.43 KiB). A dynamic
+  `import()` does not help — esbuild inlines it, and the build grew to
+  3,819,591 bytes.
 
 The override yields two physical pi-ai copies: the top-level 0.85.1 for the live
 runtime, and 1.0.0 nested under pi-durable. That is safe only while no pi-ai
@@ -90,14 +96,17 @@ tests only) — plus `@earendil-works/pi-ai` for the provider contract
 in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
 (`McpClient`, `StreamableHttpTransport`, `toLlmContent`; see §4).
 pi-durable adds `storage/sqlite` (the `SqliteDatabase` types, and
-`SqliteStorage` and its migrations in tests), its root (`Harness`, `LiveDoc`,
+`SqliteStorage` in `src/runtime/durable-agent.ts`; its migrations in tests), its root (`Harness`, `LiveDoc`,
 `InboxDoc`, `GenerationTask`, `CompactionTask` and the task and document types,
-in `src/runtime/durable-drive.ts`), `testing` (`createStorageConformance`,
-tests only) and `@earendil-works/chord` (types, and `chord/context` in tests).
+in `src/runtime/durable-drive.ts`; `createRegistry` and `ROOT_CONVERSATION_ID`
+in `src/runtime/durable-agent.ts`), `testing` (`createStorageConformance`,
+tests only) and `@earendil-works/chord` (types, and `chord/context` in
+`src/runtime/durable-agent.ts` and tests).
 `pi-ai-1` adds `models` (`createProvider`, `createModels`),
 `utils/event-stream`, `utils/transcript` (`getCurrentTools`), `utils/text`
 (`getSystemMessageText`, `renderSystemMessageUpdate`) and the root's types, in
-`src/model/durable-offloaded.ts`.
+`src/model/durable-offloaded.ts` (and `createModels` in
+`src/runtime/durable-agent.ts`).
 
 ### 2. Copied source — this breaks silently
 

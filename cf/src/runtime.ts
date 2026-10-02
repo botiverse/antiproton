@@ -16,6 +16,7 @@ import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import type { AgentEngine } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
+import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
@@ -673,6 +674,8 @@ export class AgentRuntime {
   // credentials and memory. Keyed so a second conversation never reads the
   // first one's transcript, and cached so a wake does not rebuild them all.
   #agents = new Map<string, { agent: AgentEngine; builtFrom: string }>();
+  /** The object's one pi-durable harness, made when a `pd` agent is first opened (src/runtime/durable-agent.ts). */
+  #pd: PdHost | null = null;
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
@@ -1618,6 +1621,11 @@ export class AgentRuntime {
 
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
+    // Which kernel runs this agent: `pd` (src/runtime/durable-agent.ts) only where the object's `ap_meta`
+    // says so, and nothing in this step writes that row outside the tests — every creation path still
+    // leaves it absent, so every production agent is opened as `PiAgent`, exactly as before. An object
+    // with no `ap_meta` table is read without creating one.
+    const engine = recordedEngine(this.#deps.ctx.storage.sql);
     // Before the catalogue is read: a stale pin is a mount whose every call
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
@@ -1720,6 +1728,59 @@ export class AgentRuntime {
       ...callerTools,
     ];
 
+    // Read here rather than inside the harness, so the harness keeps holding
+    // no I/O of its own.
+    const prompt = systemPrompt({
+      // The agent's own record: a person named and described it at creation,
+      // and that is the first thing the prompt says after the core.
+      persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
+      // Whatever the mounted plugins have to say, in registry order. The
+      // framework no longer reaches into any one plugin for this (Piper,
+      // tygg, 2026-09-12).
+      contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
+      // `release` is scoped to the agent, not to a task, so a new session
+      // inherits whatever the last one left alive — and until now nothing
+      // told it, which is how a container billed overnight for a
+      // conversation that had ended (tygg, 2026-09-22). Session-stable facts
+      // only; the durations are in the two message-side sentences.
+      held: heldPrompt(await heldResources(records, this.#plugins, activityOf), nameOf),
+      policy: this.#deps.policy,
+      // Each paragraph appears only where the thing it describes is really
+      // there — telling an agent to read a result back with a tool it has not
+      // got is a wrong instruction competing with the right ones. That used
+      // to be a question this file asked about one plugin; the artifacts
+      // paragraph is now the artifacts mount's own contribution, so the
+      // condition is "the mount is there" and nobody has to check it.
+      // `sandbox` stays: run_js is the harness's, not a mount's. The pd engine offers no tool yet.
+      sandbox: extras.runJs && engine !== "pd",
+    });
+    const model = {
+      provider: binding.provider,
+      id: binding.model,
+      // The bound model's own window when the table knows it: an agent can be on another model than
+      // the deployment's (model_overrides).
+      contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
+    };
+    const dispatch = async (jobId: string) => {
+      const send = this.#deps.offloadModel;
+      if (!send) throw new Error("no dispatcher configured");
+      await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
+    };
+
+    if (engine === "pd") {
+      // Mounted tools, run_js, jobs and caller functions are not bridged to pi-durable yet (steps 7 and 8):
+      // this agent is offered no tool, and its prompt says so by leaving the sandbox out.
+      this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
+      // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
+      await this.#pd.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
+      const pd = DurableAgent.open({
+        host: this.#pd, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
+        unknownJob: (id) => new UnknownJob(id),
+      });
+      this.#agents.set(cacheKey, { agent: pd, builtFrom });
+      return pd;
+    }
+
     const agent = await PiAgent.open({
       // A cancelled turn's request stays in the history, so the model is told it was cancelled; otherwise the
       // next turn finishes it (QA, 2026-09-15).
@@ -1730,48 +1791,13 @@ export class AgentRuntime {
       usageOwner: { tenantId, agentId },
       sessionId: session === MAIN_SESSION ? key : `${key}#${session}`,
       session,
-      // Read here rather than inside the harness, so the harness keeps holding
-      // no I/O of its own.
-      systemPrompt: systemPrompt({
-        // The agent's own record: a person named and described it at creation,
-        // and that is the first thing the prompt says after the core.
-        persona: personaOf((await this.store.loadAgent(tenantId, agentId))?.config),
-        // Whatever the mounted plugins have to say, in registry order. The
-        // framework no longer reaches into any one plugin for this (Piper,
-        // tygg, 2026-09-12).
-        contributions: await this.#gateway.promptContributions({ tenantId, agentId, taskId: LEGACY_TASK }),
-        // `release` is scoped to the agent, not to a task, so a new session
-        // inherits whatever the last one left alive — and until now nothing
-        // told it, which is how a container billed overnight for a
-        // conversation that had ended (tygg, 2026-09-22). Session-stable facts
-        // only; the durations are in the two message-side sentences.
-        held: heldPrompt(await heldResources(records, this.#plugins, activityOf), nameOf),
-        policy: this.#deps.policy,
-        // Each paragraph appears only where the thing it describes is really
-        // there — telling an agent to read a result back with a tool it has not
-        // got is a wrong instruction competing with the right ones. That used
-        // to be a question this file asked about one plugin; the artifacts
-        // paragraph is now the artifacts mount's own contribution, so the
-        // condition is "the mount is there" and nobody has to check it.
-        // `sandbox` stays: run_js is the harness's, not a mount's.
-        sandbox: extras.runJs,
-      }),
-      model: {
-        provider: binding.provider,
-        id: binding.model,
-        // The bound model's own window when the table knows it: an agent can be on another model than
-        // the deployment's (model_overrides).
-        contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
-      },
+      systemPrompt: prompt,
+      model,
       tools: offered,
       extraTools: extraTools as any,
       toolHost: host,
       ...(keeping ? { interrupts: keeping } : {}),
-      dispatch: async (jobId) => {
-        const send = this.#deps.offloadModel;
-        if (!send) throw new Error("no dispatcher configured");
-        await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
-      },
+      dispatch,
     });
     agentRef.current = agent;
     this.#agents.set(cacheKey, { agent, builtFrom });
@@ -2047,7 +2073,7 @@ export class AgentRuntime {
    *  session asked, so the answer lands in the transcript that is waiting. */
   async takeJob(tenantId: string, agentId: string, jobId: string) {
     await this.ready();
-    const session = this.#jobSession(jobId);
+    const session = this.#jobSessionFor(jobId);
     const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId);
     if (!job) return job;
     // The model the queued call asks for, when it spends the operator's account; null leaves it at the
@@ -2058,7 +2084,7 @@ export class AgentRuntime {
 
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
     await this.ready();
-    const session = this.#jobSession(jobId);
+    const session = this.#jobSessionFor(jobId);
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
   }
 
@@ -2066,6 +2092,15 @@ export class AgentRuntime {
    *  session is not a fallback: it would find no row either and drop the call silently.
    *  An object with no jobs table holds no job either, and is asked without creating
    *  one (ensureAgentTables would also register the main session). */
+  /**
+   * On a `pd` object every session's jobs are in one table the shared harness answers from
+   * (src/runtime/durable-agent.ts), so any session's agent takes and delivers them, and that agent
+   * throws `UnknownJob` for an id with no row. Elsewhere, the `pi_model_jobs` row says which session.
+   */
+  #jobSessionFor(jobId: string): string {
+    return recordedEngine(this.#deps.ctx.storage.sql) === "pd" ? MAIN_SESSION : this.#jobSession(jobId);
+  }
+
   #jobSession(jobId: string): string {
     const sql = this.#deps.ctx.storage.sql;
     const hasJobs = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").toArray().length > 0;
