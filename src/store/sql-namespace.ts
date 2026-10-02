@@ -82,7 +82,8 @@ type Role = "from" | "table" | "index" | "either" | "created-table" | "created-i
  * would otherwise be renamed with it. It also throws when quoted, before or after a `.` (a
  * qualified column or a schema-qualified name), when it names a table where an index belongs or
  * the reverse, and when a FROM item is followed by `(`. A CREATE of any table, index, view or
- * trigger, or a `RENAME TO`, whose name is not on the list throws.
+ * trigger, or a `RENAME TO`, whose name is not on the list throws, and so does any unlisted name
+ * in a table or index position: the component can address nothing outside its namespace.
  */
 export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNamespace): string {
   const known = new Map<string, SqlObjectKind>();
@@ -184,7 +185,11 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
       case "from": return word(k - 2, "distinct") ? undefined : "from";
       case "join": return "from";
       case "into": return "table";
-      case "update": return "table";
+      case "update":
+        // `ON CONFLICT ... DO UPDATE SET` names no table, and the `OR` of `UPDATE OR <conflict>` is not one.
+        if (word(k - 2, "do")) return undefined;
+        if (word(k, "or") && CONFLICT_WORDS.has(at(k + 1)?.text ?? "")) return undefined;
+        return "table";
       case "references": return "table";
       case "reindex": case "analyze": return "either";
       case "on":
@@ -218,7 +223,15 @@ export function qualifySql(sql: string, objects: SqlObjects, namespace: SqlNames
       if (kind === undefined) throw refuse(`it would create "${t.type === "word" ? t.raw : t.text}", which is not on the namespace's list`);
       if (next?.type === "punct" && next.text === ".") throw refuse("a schema-qualified name in a CREATE or RENAME");
     }
-    if (kind === undefined) continue;
+    if (kind === undefined) {
+      // An unlisted name where only a table or index can stand is outside the namespace: reading or
+      // writing it would reach another component's table. pi-durable 1.0 addresses nothing but its
+      // own listed objects, sqlite_master and pragma tables included, so there are no exceptions.
+      if (role === "from" || role === "table" || role === "index" || role === "either") {
+        throw refuse(`"${t.type === "word" ? t.raw : t.text}" stands where a table or index name belongs, and is not on the namespace's list`);
+      }
+      continue;
+    }
     const shown = t.type === "word" ? t.raw : t.text;
     if (t.type === "quoted") throw refuse(`the quoted identifier "${shown}" is a listed name`);
     const p1 = at(k - 1);

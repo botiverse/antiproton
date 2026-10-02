@@ -244,12 +244,31 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     // Qualified either way round, quoted, an alias, a table-valued function, or the wrong kind.
     await throws("SELECT tasks.record FROM tasks", `before "."`);
     await throws("SELECT * FROM tasks.x", `before "."`);
-    await throws("SELECT * FROM main.tasks", `after "."`);
+    await throws("SELECT main.tasks.id FROM tasks", `after "."`);
     await throws('SELECT "tasks" FROM entries', "quoted");
     await throws("SELECT id AS tasks FROM entries", "alias");
     await throws("SELECT * FROM tasks(1)", "table-valued function");
     await throws("SELECT * FROM tasks_by_status", "where the grammar wants a table");
     await throws("SELECT * FROM tasks INDEXED BY entries", "where the grammar wants a index");
+
+    // An unlisted name where a table or index belongs is outside the namespace, whether it is one of
+    // ours, an index of ours, a table nobody has, or SQLite's own catalogue.
+    const outside = "is not on the namespace's list";
+    await throws("SELECT * FROM agents", outside);
+    await throws("INSERT INTO tasks_tenant (x) VALUES (1)", outside);
+    await throws("DROP TABLE outbox", outside);
+    await throws("DROP INDEX IF EXISTS tasks_tenant", outside);
+    await throws("UPDATE agents SET x = 1", outside);
+    await throws("DELETE FROM agents", outside);
+    await throws("SELECT 1 FROM tasks JOIN agents ON 1", outside);
+    await throws("SELECT 1 FROM tasks, agents", outside);
+    await throws("SELECT name FROM sqlite_master", outside);
+    await throws("SELECT * FROM main.tasks", outside);
+    await throws('SELECT * FROM "agents"', outside);
+    await throws("SELECT * FROM json_each(?)", outside);
+    await throws("CREATE TABLE entries (x INTEGER REFERENCES agents(id))", outside);
+    await throws("SELECT 1 FROM tasks INDEXED BY tasks_tenant", outside);
+    await throws("ANALYZE agents", outside);
 
     const rewrites: [string, string][] = [
       ["SELECT id FROM tasks WHERE id = ?", "SELECT id FROM pd_tasks WHERE id = ?"],
