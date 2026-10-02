@@ -17,7 +17,8 @@ import type { SqlHost } from "../../src/store/pi-storage.ts";
 import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
 import { maskRawRefs } from "../../src/store/refs.ts";
-import { hasTable, readEntries, readTranscript, sessionFor } from "./transcript-read.ts";
+import { hasTable, isPd, readEntries, readTranscript, sessionFor } from "./transcript-read.ts";
+import { readPdModelJobs } from "../../src/runtime/pd-transcript.ts";
 import { trajectory } from "./ui.ts";
 import type { MountReports } from "./mount-reports.ts";
 import { worthReporting } from "./mount-reports.ts";
@@ -43,6 +44,8 @@ export interface DiagnosisDeps {
   /** When the object's alarm is set for, read from the platform. */
   alarm: () => Promise<number | null>;
   now?: () => number;
+  /** Runs a synchronous read after any pi-durable transaction open on the object (`AgentRuntime.afterPdTransactions`). */
+  outsidePd?: <T>(fn: () => T) => Promise<T> | T;
 }
 
 const rows = (sql: Sql, table: string, query: string, ...bindings: unknown[]): any[] =>
@@ -134,8 +137,8 @@ export async function readDiagnosis(
   const now = deps.now?.() ?? Date.now();
   const owner = { tenantId, agentId };
   const { store } = deps;
-  const entries = readEntries(sql, session);
-  const transcript = readTranscript(sql, tenantId, agentId, taskId)!;
+  const read = () => ({ entries: readEntries(sql, session), transcript: readTranscript(sql, tenantId, agentId, taskId)! });
+  const { entries, transcript } = await (deps.outsidePd ? deps.outsidePd(read) : read());
   const kinds: Record<string, number> = {};
   for (const e of transcript.events) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
   const compactions = entries.filter((e) => e.type === "compaction");
@@ -203,7 +206,10 @@ export async function readDiagnosis(
     // instant, when the answer was applied to the lane, is the assistant message's `at` in the transcript,
     // under the same job id. Listing only pending jobs hid a 105-second answer on a provisioned agent
     // (2026-09-28 16:59:52Z call, applied 17:01:38Z): once it was answered there was nothing left to read.
-    modelJobs: rows(sql, "pi_model_jobs", "SELECT id, created_at, answered_at FROM pi_model_jobs ORDER BY created_at DESC LIMIT 10")
+    // A pd agent's jobs are `ap_model_jobs` (src/store/ap-store.ts); its `pi_model_jobs` exists and stays empty.
+    modelJobs: (isPd(sql)
+      ? readPdModelJobs(sql as Parameters<typeof readPdModelJobs>[0], 10).map((j) => ({ id: j.id, created_at: j.createdAt, answered_at: j.answeredAt }))
+      : rows(sql, "pi_model_jobs", "SELECT id, created_at, answered_at FROM pi_model_jobs ORDER BY created_at DESC LIMIT 10"))
       .map((r) => r.answered_at === null || r.answered_at === undefined
         ? { id: r.id, createdAt: Number(r.created_at), answeredAt: null, ageMs: now - Number(r.created_at) }
         : { id: r.id, createdAt: Number(r.created_at), answeredAt: Number(r.answered_at), answerMs: Number(r.answered_at) - Number(r.created_at) }),

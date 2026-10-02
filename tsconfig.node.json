@@ -85,6 +85,8 @@
     "test/model-queue.ts",
     "test/durable-agent.ts",
     "test/spec/durable-agent-spec.ts",
+    "test/pd-transcript.ts",
+    "test/spec/pd-conversation.ts",
     "test/pd-outbox.ts",
     "test/spec/pd-outbox-spec.ts"
   ]

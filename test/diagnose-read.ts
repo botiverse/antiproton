@@ -13,6 +13,7 @@ import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { PiSqliteStorage } from "../src/store/pi-storage.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { recordBackgroundJob } from "../src/runtime/background-jobs.ts";
+import { converse } from "./spec/pd-conversation.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -213,6 +214,28 @@ await check("an agent or conversation the object does not hold is null, and an u
   assert(await readDiagnosis(empty.sql, "demo", "u-a", "t_u-a", deps(emptyStore)) === null, "an empty object read as a report");
   assert(empty.sql.exec("SELECT name FROM sqlite_master").toArray().length === 0, "reading an empty object created a table");
   empty.dispose();
+});
+
+await check("a pd agent's report counts pi-durable's entries and lists ap_model_jobs, and reading it writes nothing", async () => {
+  const host = sqliteHost();
+  try {
+    const { rt, agent } = await converse(host, "pd");
+    await agent.close();
+    const before = dump(host);
+    const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { store: rt.store as any, plugins: [], alarm: async () => null, now: () => Date.now() }) as any;
+    assert(r !== null && r.entries === 4 && r.compaction.messages === 4, `entries: ${JSON.stringify({ e: r?.entries, c: r?.compaction })}`);
+    assert(r.eventKinds.message === 2 && r.eventKinds["model.response"] === 2, `kinds: ${JSON.stringify(r.eventKinds)}`);
+    assert(r.modelJobs.length === 2 && r.modelJobs.every((j: any) => typeof j.answerMs === "number"), `jobs: ${JSON.stringify(r.modelJobs)}`);
+    // The control for the jobs: pi's job table exists for a pd agent and is empty.
+    assert(host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0]!.n === 0, "pi_model_jobs is not empty");
+    assert(r.rendered.ok === true && r.rendered.steps > 0, `rendered: ${JSON.stringify(r.rendered)}`);
+    assert(dump(host) === before, "the database changed while the report was read");
+    // The transcript read is handed to the object's "after any pd transaction" route, and its answer is the one used.
+    let routed = 0;
+    const viaRoute = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { store: rt.store as any, plugins: [], alarm: async () => null,
+      outsidePd: async (fn) => { routed++; return rt.afterPdTransactions(fn); } }) as any;
+    assert(routed === 1 && viaRoute.entries === 4, `routed ${routed}, entries ${viaRoute.entries}`);
+  } finally { host.dispose(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

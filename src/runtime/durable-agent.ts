@@ -49,6 +49,7 @@ import { logEvent } from "../core/log.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../store/sql-namespace.ts";
 import { settle, type SettleResult } from "./durable-drive.ts";
+import { projectEntries } from "./pd-transcript.ts";
 import type { AgentEngine, EngineEntry, EngineEntryScan, EngineStatus, StepOutcome } from "./engine.ts";
 
 const PD = prefixedNamespace("pd");
@@ -440,26 +441,6 @@ export interface DurableAgentOptions extends PdBinding {
   systemPrompt: string;
 }
 
-/** A pi-durable entry as the 0.85 `Entry` the console and the bench read: a message entry per model message. */
-function project(records: readonly EntryRecord[]): EngineEntry[] {
-  const out: EngineEntry[] = [];
-  let parent: string | null = null;
-  for (const r of records) {
-    // Plain turns only: the prompt (`pi.system`), resets, compactions and custom entries are the transcript
-    // projection's (step 9). Their absence here is a gap in what is shown, never a wrong message.
-    if (r.kind !== "pi.user" && r.kind !== "pi.assistant" && r.kind !== "pi.tool-result") continue;
-    for (const m of r.model ?? []) {
-      if (m.role === "system") continue;
-      const id: string = String(r.id);
-      // JSON, so no pi-ai 1.0 object reaches a reader on the 0.85 side.
-      const message = JSON.parse(JSON.stringify(m));
-      out.push({ type: "message", id, parentId: parent, seq: Number(r.id), timestamp: Number(m.timestamp ?? 0), message } as EngineEntry);
-      parent = id;
-    }
-  }
-  return out;
-}
-
 /** The `pd` engine for one session. */
 export class DurableAgent implements AgentEngine {
   readonly #opts: DurableAgentOptions;
@@ -569,7 +550,7 @@ export class DurableAgent implements AgentEngine {
     });
   }
 
-  /** This session's transcript, oldest first, as message entries. `seq` is pi-durable's entry id, which only grows. */
+  /** This session's transcript, oldest first, as 0.85 entries (src/runtime/pd-transcript.ts). `seq` is pi-durable's entry id, which only grows. */
   async entries(query: EngineEntryScan): Promise<EngineEntry[]> {
     const id = await this.#host.conversation(this.#session);
     const records = await this.#host.withHarness(async (h) => {
@@ -583,9 +564,9 @@ export class DurableAgent implements AgentEngine {
       } while (cursor !== undefined);
       return all.reverse();
     });
-    let out = project(records);
-    if (query.type !== undefined && query.type !== "message") out = [];
-    if (query.customType !== undefined) out = [];
+    let out = projectEntries(records);
+    if (query.type !== undefined) out = out.filter((e) => e.type === query.type);
+    if (query.customType !== undefined) out = out.filter((e) => e.customType === query.customType);
     if (query.fromSeq !== undefined) out = out.filter((e) => e.seq >= query.fromSeq!);
     if (query.toSeq !== undefined) out = out.filter((e) => e.seq <= query.toSeq!);
     if (query.order === "desc") out.reverse();
@@ -595,7 +576,7 @@ export class DurableAgent implements AgentEngine {
   /** The active context's entries, oldest first: what the next request is built from. */
   async branch(): Promise<EngineEntry[]> {
     const id = await this.#host.conversation(this.#session);
-    return this.#host.withHarness(async (h) => project((await (await this.#host.handle(h, id)).context(bg)).entries));
+    return this.#host.withHarness(async (h) => projectEntries((await (await this.#host.handle(h, id)).context(bg)).entries));
   }
 
   /** The tools the model is offered: none until mounts are bridged (step 7). */

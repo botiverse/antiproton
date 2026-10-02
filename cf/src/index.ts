@@ -68,7 +68,8 @@ import { refuseSecret } from "./secret-shape.ts";
 import { adminDiagnose } from "./admin-diagnose.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
-import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
+import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
+import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { countHeldTime } from "../../src/usage/container.ts";
@@ -712,6 +713,7 @@ export class AgentDO extends DurableObject<Env> {
       store: new DurableObjectStore(this.ctx as any),
       plugins: this.#activeRuntime().plugins(),
       alarm: () => this.ctx.storage.getAlarm(),
+      outsidePd: (fn) => this.#outsidePd(fn),
     });
   }
 
@@ -1892,12 +1894,17 @@ export class AgentDO extends DurableObject<Env> {
    */
   async uiVersion(tenantId: string, agentId: string, taskId: string) {
     const session = await this.#conversation(tenantId, agentId, taskId);
-    ensureAgentTables(this.sql, session);
-    const t = piTables(session);
-    const row = this.sql.exec(`SELECT MAX(seq) AS s, COUNT(*) AS n FROM ${t.entries}`)
-      .toArray()[0] as any;
-    const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?", session)
-      .toArray()[0] as any;
+    // A pd agent's entries and jobs are pi-durable's and `ap_model_jobs`; pi's tables exist for it and stay
+    // empty, so a version read from them would never move and the console would never redraw.
+    const moved = isPd(this.sql) ? await this.#outsidePd(() => pdVersion(this.sql, session)) : (() => {
+      ensureAgentTables(this.sql, session);
+      const t = piTables(session);
+      const row = this.sql.exec(`SELECT MAX(seq) AS s, COUNT(*) AS n FROM ${t.entries}`)
+        .toArray()[0] as any;
+      const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?", session)
+        .toArray()[0] as any;
+      return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}`;
+    })();
     // Held calls and their decisions move the conversation too: the chat is
     // about to carry the held cards beside the turns, and a decision is
     // otherwise invisible to a version built from entries alone. Before the
@@ -1909,7 +1916,7 @@ export class AgentDO extends DurableObject<Env> {
         tenantId, agentId).toArray()[0] as any;
       held = `${a?.n ?? 0}.${a?.c ?? 0}.${a?.d ?? 0}`;
     } catch { /* no approvals table yet */ }
-    return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}.${held}`;
+    return `${moved}.${held}`;
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0): Promise<UiTranscript> {
@@ -1931,7 +1938,19 @@ export class AgentDO extends DurableObject<Env> {
    * conversation this object does not hold.
    */
   async adminTranscript(tenantId: string, agentId: string, taskId: string): Promise<TranscriptEvents | null> {
-    return readTranscript(this.sql, tenantId, agentId, taskId);
+    return this.#outsidePd(() => readTranscript(this.sql, tenantId, agentId, taskId));
+  }
+
+  /**
+   * A read of this object's SQL after any pi-durable transaction open on it. Only a runtime that opened a pd
+   * agent can have one open, so the runtime already built is asked and none is built for the read.
+   *
+   * Known exposure, the same as `AgentRuntime.#ownWrite`'s: `simulateEviction` and `setOffload` drop
+   * `#runtime` while the old runtime's harness may still be running a transaction, and a read after that
+   * runs at once, so it can see that transaction's uncommitted rows. Both are operator and bench paths.
+   */
+  #outsidePd<T>(fn: () => T): Promise<T> | T {
+    return this.#runtime ? this.#runtime.afterPdTransactions(fn) : fn();
   }
 
   #ownerAgent(): string | null {
