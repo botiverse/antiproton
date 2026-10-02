@@ -15,6 +15,7 @@ import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
 import { importDrafts, MIGRATED, migrateToPd, revertToPi085 } from "../../src/runtime/pd-migrate.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
+import { ensureBackgroundTable } from "../../src/runtime/background-jobs.ts";
 import { PiSqliteStorage } from "../../src/store/pi-storage.ts";
 import { ApStore } from "../../src/store/ap-store.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
@@ -237,7 +238,7 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
     });
   });
 
-  add("migrate", "refused while busy, writing nothing; once idle it goes ahead", async () => {
+  add("migrate", "refused while busy (a model call out, a background job running), writing nothing; once idle it goes ahead", async () => {
     await withHost(async (storage) => {
       const w = await history(storage);
       const e = await pi085(storage, w);
@@ -251,6 +252,12 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       check(dump(storage, () => true) === before, "a refused migration wrote something");
       await settle(e, [say("done")]);
       await e.agent.close();
+      // Background work still running: its result would be a message to a session mid-move.
+      ensureBackgroundTable(storage.sql as never);
+      storage.sql.exec("INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES ('bg1','t','a','main','box','shell','{}','running',0,0,0)");
+      const background = await migrateToPd({ storage, host, markerNotes: NOTES });
+      check(!background.ok && /1 background job\(s\) running/.test(background.refused), `with a background job: ${show(background)}`);
+      storage.sql.exec("UPDATE background_jobs SET state = 'done' WHERE id = 'bg1'");
       const out = await migrateToPd({ storage, host, markerNotes: NOTES });
       check(out.ok && out.action === "migrated", `once idle: ${show(out)}`);
     });

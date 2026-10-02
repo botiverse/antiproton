@@ -13,8 +13,9 @@
  *   branch (pi 0.85's abandoned branches), the "not ready yet" answers pi 0.85 records while a call is out
  *   (`deferred`, sent to no model), and custom entries no model reads. A cancel marker is kept: it carries the note
  *   the model is shown for it (`markerNotes`), as `DurableAgent` writes one.
- * - **Refused**: an agent that is not idle — a run in progress or queued input on any session, or a model call not
- *   answered yet. A call out is spend in flight; an answer that came after the move would land nowhere and go unbilled.
+ * - **Refused**: an agent that is not idle — a run in progress or queued input on any session, a model call not
+ *   answered yet, or a background job still running (its result is a message to a session). A call out is spend
+ *   in flight; an answer that came after the move would land nowhere and go unbilled.
  *
  * Each session is imported in one pi-durable commit, through `tx.appendEntry` and nothing else: no generation runs, no
  * `pi.usage` document moves, so the commit hook (src/runtime/pd-outbox.ts `bookCommit`) bills nothing and writes no
@@ -223,6 +224,11 @@ export function busyReason(sql: Sql): string | null {
   if (tableExists(sql, "pi_model_jobs")) {
     const n = Number(sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL").toArray()[0]?.n ?? 0);
     if (n > 0) reasons.push(`${n} model call(s) not answered yet`);
+  }
+  // Background work (src/runtime/background-jobs.ts) ends in a message to its session, which would arrive mid-move.
+  if (tableExists(sql, "background_jobs")) {
+    const n = Number(sql.exec("SELECT COUNT(*) AS n FROM background_jobs WHERE state = 'running'").toArray()[0]?.n ?? 0);
+    if (n > 0) reasons.push(`${n} background job(s) running`);
   }
   return reasons.length ? `the agent is not idle: ${reasons.join("; ")}` : null;
 }

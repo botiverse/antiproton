@@ -103,6 +103,7 @@
     "test/spec/pd-compaction-spec.ts",
     "test/pd-migrate.ts",
     "test/spec/pd-migrate-spec.ts",
+    "test/pd-migrate-object.ts",
     "test/pd-writes.ts",
     "test/spec/pd-writes-spec.ts",
     "test/usage-flush.ts"
