@@ -282,6 +282,9 @@ export class PdHost {
       });
     })();
     this.#driving = driving;
+    // Cleared on failure too: a pass that rejected and stayed here would be handed to every later step,
+    // and the object would never move again. The identity check is defensive — no newer pass can start
+    // while this one is set, since `drive()` returns it — so it guards a future refactor, not a live race.
     const clear = () => { if (this.#driving === driving) this.#driving = null; };
     driving.then(clear, clear);
     return driving;

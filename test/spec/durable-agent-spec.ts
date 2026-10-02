@@ -181,6 +181,38 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await a.close();
   });
 
+  add("turn", "a step whose pass failed does not stick: the next step runs a fresh pass and completes the turn", async (storage) => {
+    // The sweep's read fails once, so the first pass rejects before it opens a harness.
+    let failNext = false;
+    const flaky: DurableSqlHost = {
+      ...storage,
+      sql: { exec: (q, ...b) => {
+        if (failNext && q.includes("dispatched_at IS NULL OR")) { failNext = false; throw new Error("injected: the sweep's read failed"); }
+        return storage.sql.exec(q, ...b);
+      } },
+      transaction: (c) => storage.transaction(c),
+      transactionSync: (c) => storage.transactionSync(c),
+    };
+    const o = object(flaky);
+    const a = o.agent();
+    await a.say("Q1");
+    await a.close();
+    failNext = true;
+    let thrown: unknown;
+    try { await a.step(); } catch (e) { thrown = e; }
+    check(thrown instanceof Error && thrown.message.includes("injected"), `the first step should fail: ${String(thrown)}`);
+    // Not the old rejected promise: a fresh pass, which resumes the generation and parks.
+    const parked = await a.step();
+    check(parked.wakeInMs !== null, `the step after a failed one: ${show(parked)}`);
+    const [row] = jobs(storage);
+    check(row, "no job after the fresh pass");
+    await consume(a, row.id, "A1");
+    await sleep(parked.wakeInMs);
+    check((await a.step()).wakeInMs === null, "did not finish");
+    check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
+    await a.close();
+  });
+
   add("turn", "with no answer the poll interval doubles to its cap, one fetch per wake, one job", async (storage) => {
     const o = object(storage);
     const a = o.agent();
