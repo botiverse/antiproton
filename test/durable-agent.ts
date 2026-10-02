@@ -146,12 +146,29 @@ const runtimeCases: DriveCase[] = [
   },
 ];
 
+/**
+ * The runtime cases step through AgentRuntime, whose step deadline is the production 30 s; a case that cannot
+ * finish fails here by name instead (the spec's cases carry their own deadline).
+ */
+const RUNTIME_CASE_DEADLINE_MS = 15_000;
+const withDeadline = (c: DriveCase): DriveCase => ({
+  ...c,
+  run: async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`case "${c.name}" passed its ${RUNTIME_CASE_DEADLINE_MS} ms deadline`)), RUNTIME_CASE_DEADLINE_MS);
+      timer.unref();
+    });
+    try { await Promise.race([c.run(), deadline]); } finally { clearTimeout(timer); }
+  },
+});
+
 const results = await runDriveCases([
   ...durableAgentCases(async (use) => {
     const host = sqliteHost();
     try { await use(host); } finally { host.dispose(); }
   }, activeTimers),
-  ...runtimeCases,
+  ...runtimeCases.map(withDeadline),
 ]);
 
 console.log(`\n  durable agent: the pd engine — node:sqlite\n  ${"─".repeat(56)}`);

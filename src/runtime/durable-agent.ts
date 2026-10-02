@@ -51,7 +51,7 @@ import {
   type Conversation, type ConversationId, type EntryRecord, type HarnessInspection,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-// The vendored Harness: pi-durable 1.0.0's with a scheduler that reports a sleeping task (`onSleep`, `sleepingUntil`).
+// The vendored Harness: pi-durable 1.0.0's with a scheduler that reports a sleeping task (`sleepingUntil`).
 import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
@@ -160,11 +160,8 @@ export class PdHost {
   #deriveAgain = false;
   /** Client tools waiting in this isolate, by `conversation:call`: each is told to read its row again. */
   readonly #clientWaiters = new Map<string, Set<() => void>>();
-  /**
-   * Told when something `settle` reads moved without a pd commit: a client call's row (its `externalWaits`), or a
-   * task starting to sleep (the harness's `onSleep`).
-   */
-  readonly #settleListeners = new Set<() => void>();
+  /** Told when a client call's row moves: what `settle` reads as `externalWaits` changed without a pd commit. */
+  readonly #clientListeners = new Set<() => void>();
 
   constructor(opts: PdHostOptions) {
     this.#opts = opts;
@@ -286,7 +283,9 @@ export class PdHost {
           compaction: { enabled: false },
         },
         now: this.#now,
-        onSleep: () => this.#notifySettle(),
+        // No `onSleep`: every sleep this harness runs (pi-durable's generation poll and retry; the registry holds
+        // only tool extensions, and a tool cannot sleep) starts right after the commit of its checkpoint, and the
+        // read that commit brings already sees it. settle's 1 s recheck is the backstop if that ever changes.
       }, bg);
       // Settle closes the harness when it parks; whoever asks next opens a fresh one.
       h.subscribeClose(() => {
@@ -437,7 +436,7 @@ export class PdHost {
       return settle(h, {
         context: bg, now: this.#now,
         externalWaits: () => externalWaitsOf(ap),
-        subscribe: (wake) => { this.#settleListeners.add(wake); return () => this.#settleListeners.delete(wake); },
+        subscribe: (wake) => { this.#clientListeners.add(wake); return () => this.#clientListeners.delete(wake); },
         ...(this.#opts.minParkMs === undefined ? {} : { minParkMs: this.#opts.minParkMs }),
         deadlineMs: this.#opts.stepDeadlineMs ?? STEP_DEADLINE_MS,
       });
@@ -474,7 +473,7 @@ export class PdHost {
     waiters.add(listener);
     try {
       let row = await ap.recordClientCall({ ...call, at: this.#now() });
-      this.#notifySettle();
+      this.#notifyClientCalls();
       for (;;) {
         signal?.throwIfAborted();
         if (row.state !== "pending") {
@@ -499,7 +498,7 @@ export class PdHost {
     }
   }
 
-  #notifySettle(): void { for (const l of [...this.#settleListeners]) l(); }
+  #notifyClientCalls(): void { for (const l of [...this.#clientListeners]) l(); }
 
   /**
    * The caller's results for a conversation's calls. Each is written to its row; a tool waiting for it in this isolate
@@ -517,7 +516,7 @@ export class PdHost {
       if (waiters?.size) for (const w of [...waiters]) w();
       else notWaiting.push(r.callId);
     }
-    this.#notifySettle();
+    this.#notifyClientCalls();
     return { accepted, notWaiting };
   }
 

@@ -236,8 +236,8 @@ export type SettleOptions = {
   readonly externalWaits?: () => ExternalWaits;
   /**
    * Other sources of "read again", for what moves without a pi-durable commit: `externalWaits` (a tool records its
-   * call in our own table), and a task starting to sleep, which the harness tells its `onSleep` option
-   * (`HarnessOptions.onSleep`, the vendored scheduler) and the host passes on here. Returns the unsubscribe.
+   * call in our own table), and a task starting to sleep after work it did not commit, which the harness tells its
+   * `onSleep` option (`HarnessOptions.onSleep`, the vendored scheduler). Returns the unsubscribe.
    */
   readonly subscribe?: (wake: () => void) => () => void;
 };
@@ -250,9 +250,10 @@ export type SettleOptions = {
  *
  * On "wait" it re-reads at once only if a commit landed during the read;
  * otherwise it blocks until the next commit, the next `subscribe` notice, or
- * `recheckMs` (default 1 s) — never a tight loop. A task starting to sleep
- * commits nothing, so without the `onSleep` notice in `subscribe` the sleep is
- * seen only at the next recheck. A working task keeps the object open until it
+ * `recheckMs` (default 1 s) — never a tight loop. A sleep commits nothing: one
+ * that starts right after its checkpoint's commit is seen by the read that
+ * commit brings (pi-durable's own sleeps), and one that starts later is seen at
+ * the next recheck unless `onSleep` is passed in through `subscribe`. A working task keeps the object open until it
  * commits or `deadlineMs` passes.
  */
 export async function settle(harness: Harness, options: SettleOptions): Promise<SettleResult> {

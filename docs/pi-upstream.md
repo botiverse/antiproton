@@ -213,9 +213,14 @@ rests on:
 - Who says a task is sleeping is the scheduler: 1.0.0 reports a sleeping task as
   plain `running`, so we run a vendored scheduler (see *Changing upstream
   files*; upstream issue pi#10325) whose `inspect()` adds `sleepingUntil` while
-  the task's invocation is inside `runtime.sleep`, and which calls
-  `HarnessOptions.onSleep` when a sleep starts (a sleep commits nothing, so
-  `settle` would otherwise see it only at its one-second recheck). This replaced
+  the task's invocation is inside `runtime.sleep`. It also calls
+  `HarnessOptions.onSleep` when a sleep starts, for a task that works without
+  committing and then sleeps — no commit brings the read that would see it.
+  `PdHost` does not wire it: its harness runs only pi-durable's poll and retry
+  sleeps (its registry holds tool extensions, and a tool cannot sleep), each the
+  first act after its checkpoint's commit, and the read that commit brings sees
+  the sleep; `test/spec/durable-agent-spec.ts` fails if a park waits for the
+  1 s recheck instead. This replaced
   reading `poll`/`retry` checkpoints and a table of every phase pi-durable
   writes, which a new upstream sleep or an extension's own would have turned
   into a billed wait. The sleep reads the harness clock (`HarnessOptions.now`),

@@ -30,10 +30,23 @@ const reply = (text: string): ModelResponse => ({
   text, finishReason: "stop", truncated: false, usage: { promptTokens: 3, completionTokens: 2, reasoningTokens: 0, cachedPromptTokens: 0 },
 });
 
+/**
+ * A case that cannot finish fails here, by name, with every host it opened closed — never runs on. A step that
+ * cannot park returns after `STEP_DEADLINE_MS` (the runtime's is 30 s), so a case that steps until something
+ * happens fails within `CASE_DEADLINE_MS`. The slowest case passes in about 2 s.
+ */
+const STEP_DEADLINE_MS = 3_000;
+const CASE_DEADLINE_MS = 15_000;
+/** The hosts the running case opened, closed at its deadline. Cases run one at a time. */
+let caseHosts: PdHost[] = [];
+
 /** One object's engine, as AgentRuntime builds it, with what a case reads: dispatches and polls. */
 function object(storage: DurableSqlHost, polls: Array<{ id: string; ready: boolean }> = []) {
   const dispatched: string[] = [];
-  const host = new PdHost({ storage, poll: POLL, minParkMs: 1, onPoll: (id, ready) => polls.push({ id, ready }) });
+  const host = new PdHost({
+    storage, poll: POLL, minParkMs: 1, stepDeadlineMs: STEP_DEADLINE_MS, onPoll: (id, ready) => polls.push({ id, ready }),
+  });
+  caseHosts.push(host);
   const agent = (session?: string, extra: Partial<DurableAgentOptions> = {}) => DurableAgent.open({
     host, tenantId: "t", agentId: "a", model: MODEL, systemPrompt: "You are a terse test assistant.",
     dispatch: async (id) => { dispatched.push(id); },
@@ -78,7 +91,21 @@ const turns = (entries: Array<{ type: string; message?: unknown }>) => entries.m
 export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerProbe): DriveCase[] {
   const cases: DriveCase[] = [];
   const add = (group: string, name: string, body: (host: DurableSqlHost) => Promise<void>) =>
-    cases.push({ group, name, run: () => withHost(body) });
+    cases.push({ group, name, run: () => withHost(async (storage) => {
+      caseHosts = [];
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`case "${name}" passed its ${CASE_DEADLINE_MS} ms deadline`)), CASE_DEADLINE_MS);
+        // Not a timer of the engine's: unref'd, so node's live-timer probe does not count it (workerd has no unref).
+        (timer as { unref?: () => void }).unref?.();
+      });
+      try { await Promise.race([body(storage), deadline]); }
+      catch (error) {
+        // The body may still be running: close what it opened so it stops, then fail with the case's error.
+        await Promise.allSettled(caseHosts.map((h) => h.close()));
+        throw error;
+      } finally { clearTimeout(timer); }
+    }) });
 
   add("turn", `say → an ap job is written and dispatched → step parks${activeTimers ? " with no harness or timer left" : " with no harness left"} → deliver → step: the answer is the transcript`, async (storage) => {
     const o = object(storage);
@@ -92,7 +119,9 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const rows = jobs(storage);
     check(rows.length === 1 && rows[0]!.answer === null && rows[0]!.dispatched_at !== null, `jobs ${show(rows)}`);
     check(show(o.dispatched) === show([rows[0]!.id]), `dispatched ${show(o.dispatched)}`);
-    check(o.polls.length === 0, `polled before the park ended: ${show(o.polls)}`);
+    // Also what pins PdHost passing no `onSleep`: the poll sleep must be seen by the read its checkpoint's commit
+    // brings. Seen only at settle's 1 s recheck, the 300 ms sleep would be over and the job fetched before the park.
+    check(o.polls.length === 0, `polled before the park ended (the park waited for settle's recheck?): ${show(o.polls)}`);
     const id = rows[0]!.id;
     const asked = await consume(a, id, "Paris");
     check(asked.some((m) => m.role === "user" && m.content === "Capital of France?") && asked.some((m) => m.role === "system" && m.content.includes("terse test assistant")),
