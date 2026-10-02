@@ -7,6 +7,9 @@
  * is only ever asked, read-only, for exactly what the request named.
  */
 import { adminTranscript, type TranscriptSource } from "../cf/src/admin-transcript.ts";
+import { readTranscript } from "../cf/src/transcript-read.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { converse, SCRIPT } from "./spec/pd-conversation.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -119,6 +122,21 @@ await check("the object's half only reads: adminTranscript opens no agent, runti
   }
   // The read itself, and that it changes nothing, is test/transcript-read.ts, on a real database.
   assert(body.includes("return readTranscript(this.sql,"), "adminTranscript no longer reads through readTranscript");
+});
+
+await check("a pd agent's conversation comes back through the route, read from the object's pi-durable entries", async () => {
+  // The object's half as adminTranscript runs it (the case above holds that it only calls readTranscript).
+  const host = sqliteHost();
+  try {
+    const { agent } = await converse(host, "pd");
+    await agent.close();
+    const open = (): TranscriptSource => ({ async adminTranscript(t, a, k) { return readTranscript(host.sql, t, a, k); } });
+    const res = await adminTranscript(request("?tenantId=demo&agentId=u-a"), TOKEN, open);
+    assert(res.status === 200, `${res.status}, not 200`);
+    const body = await res.json() as { events: Array<{ kind: string; payload: { text?: string } }> };
+    const said = body.events.filter((e) => e.kind === "model.response").map((e) => e.payload.text).join();
+    assert(said === SCRIPT.map((t) => t.reply).join(), `events ${JSON.stringify(body.events).slice(0, 300)}`);
+  } finally { host.dispose(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

@@ -12,12 +12,19 @@
  * constructor creates tables (Ada, #336). A table that is not there reads as empty.
  * What it cannot give is whether a turn is running: that is the lane's state, read
  * through the harness, so the operator's read leaves `busy` out rather than guess.
+ *
+ * An agent on the `pd` engine (`recordedEngine`, src/runtime/durable-agent.ts) keeps its transcript in
+ * pi-durable's tables, not pi's: the runtime makes pi's tables for it too, and they stay empty, so reading
+ * them would show an empty conversation rather than fail. `readEntries` and `transcriptEvents` ask the
+ * engine first, and a pd session is read through src/runtime/pd-transcript.ts, as SELECTs as well.
  */
 import type { Entry } from "@earendil-works/pi-agent-core/harness/session";
 import { entriesToEvents } from "./pi-view.ts";
 import { maskRawRefs } from "../../src/store/refs.ts";
 import { failedRuns } from "../../src/runtime/pi-agent.ts";
 import { piTables, MAIN_SESSION, type SqlHost } from "../../src/store/pi-storage.ts";
+import { recordedEngine } from "../../src/runtime/durable-agent.ts";
+import { readPdEntries } from "../../src/runtime/pd-transcript.ts";
 
 type Sql = SqlHost["sql"];
 
@@ -43,7 +50,8 @@ export interface ApprovalMark {
 export function transcriptEvents(
   entries: Entry[], sql: Sql, session: string, owner: { tenantId: string; agentId: string }, tail: number,
 ): Pick<TranscriptEvents, "total" | "shown" | "events"> {
-  const failed = failedRuns(sql, session).map((f) => ({
+  // A run that fails before its first model call is pi 0.85's outcome record; pd keeps no such record.
+  const failed = (isPd(sql) ? [] : failedRuns(sql, session)).map((f) => ({
     sequence: f.seq, kind: "model.failed",
     payload: { error: `${f.code}: ${f.message}`, operationId: f.operationId, at: f.at } as Record<string, unknown>,
   }));
@@ -86,8 +94,14 @@ export function sessionFor(sql: Sql, tenantId: string, agentId: string, taskId: 
   return task && task.agent_id === agentId ? taskId : null;
 }
 
-/** A session's entries, oldest first; none when its table was never made. */
+/** Whether this object's agent runs on the pd engine; a plain read, as `recordedEngine` says. */
+export function isPd(sql: Sql): boolean {
+  return recordedEngine(sql as Parameters<typeof recordedEngine>[0]) === "pd";
+}
+
+/** A session's entries, oldest first; none when its table was never made. A pd agent's come from pi-durable's tables. */
 export function readEntries(sql: Sql, session: string): Entry[] {
+  if (isPd(sql)) return readPdEntries(sql as Parameters<typeof readPdEntries>[0], session);
   const t = piTables(session);
   return hasTable(sql, t.entries)
     ? (sql.exec(`SELECT body FROM ${t.entries} ORDER BY seq ASC`).toArray() as any[]).map((r) => JSON.parse(String(r.body)) as Entry)

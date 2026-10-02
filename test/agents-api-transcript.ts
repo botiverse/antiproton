@@ -3,6 +3,8 @@
  * boundaries, statuses, usage, and item shapes the SDK reads.
  */
 import { callTurns, sessionTranscript, TURN_CANCELLED } from "../cf/src/agents-api/transcript.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { converse, SCRIPT } from "./spec/pd-conversation.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -124,6 +126,21 @@ await check("a turn waiting on the caller: status waiting, its call in progress,
   assert(items.map((i) => i.type).join() === "message,function_call" && items[1]!.status === "in_progress", `items ${JSON.stringify(items)}`);
   const turnId = turns[0]!.id;
   assert(callTurns(waitingEntries).get("c5") === turnId, `call turn ${callTurns(waitingEntries).get("c5")} vs ${turnId}`);
+});
+
+await check("a pd agent's session: turns completed with their usage, the replies as final answers (test/pd-transcript.ts holds it equal to pi085's)", async () => {
+  const host = sqliteHost();
+  try {
+    const { agent } = await converse(host, "pd");
+    const t = sessionTranscript({ entries: await agent.entries({ order: "asc" }), running: await agent.running() }, ids);
+    await agent.close();
+    assert(t.turns.map((x) => x.status).join() === "completed,completed", `turns ${JSON.stringify(t.turns)}`);
+    assert(t.turns[0]!.usage?.input_tokens === SCRIPT[0]!.usage.promptTokens && t.turns[1]!.usage?.input_tokens_details.cached_tokens === SCRIPT[1]!.usage.cachedPromptTokens,
+      `usage ${JSON.stringify(t.turns.map((x) => x.usage))}`);
+    const answers = t.items.filter((i) => i.type === "message" && i.role === "assistant");
+    assert(answers.map((i) => (i as any).content[0].text).join() === SCRIPT.map((s) => s.reply).join() && answers.every((i) => i.phase === "final_answer"),
+      `items ${JSON.stringify(t.items)}`);
+  } finally { host.dispose(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

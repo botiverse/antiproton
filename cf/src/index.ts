@@ -68,7 +68,8 @@ import { refuseSecret } from "./secret-shape.ts";
 import { adminDiagnose } from "./admin-diagnose.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
-import { readTranscript, transcriptEvents, approvalsByOp, type TranscriptEvents } from "./transcript-read.ts";
+import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
+import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { countHeldTime } from "../../src/usage/container.ts";
@@ -1887,12 +1888,17 @@ export class AgentDO extends DurableObject<Env> {
    */
   async uiVersion(tenantId: string, agentId: string, taskId: string) {
     const session = await this.#conversation(tenantId, agentId, taskId);
-    ensureAgentTables(this.sql, session);
-    const t = piTables(session);
-    const row = this.sql.exec(`SELECT MAX(seq) AS s, COUNT(*) AS n FROM ${t.entries}`)
-      .toArray()[0] as any;
-    const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?", session)
-      .toArray()[0] as any;
+    // A pd agent's entries and jobs are pi-durable's and `ap_model_jobs`; pi's tables exist for it and stay
+    // empty, so a version read from them would never move and the console would never redraw.
+    const moved = isPd(this.sql) ? pdVersion(this.sql, session) : (() => {
+      ensureAgentTables(this.sql, session);
+      const t = piTables(session);
+      const row = this.sql.exec(`SELECT MAX(seq) AS s, COUNT(*) AS n FROM ${t.entries}`)
+        .toArray()[0] as any;
+      const jobs = this.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL AND session = ?", session)
+        .toArray()[0] as any;
+      return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}`;
+    })();
     // Held calls and their decisions move the conversation too: the chat is
     // about to carry the held cards beside the turns, and a decision is
     // otherwise invisible to a version built from entries alone. Before the
@@ -1904,7 +1910,7 @@ export class AgentDO extends DurableObject<Env> {
         tenantId, agentId).toArray()[0] as any;
       held = `${a?.n ?? 0}.${a?.c ?? 0}.${a?.d ?? 0}`;
     } catch { /* no approvals table yet */ }
-    return `${row?.s ?? 0}.${row?.n ?? 0}.${jobs?.n ?? 0}.${held}`;
+    return `${moved}.${held}`;
   }
 
   async uiTranscript(tenantId: string, agentId: string, taskId: string, tail = 0): Promise<UiTranscript> {
