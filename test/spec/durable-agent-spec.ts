@@ -471,7 +471,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const a = o.agent(undefined, { dispatch: async (id) => { if (fail) { fail = false; throw new Error("queue down"); } sent.push(id); } });
     await a.say("Q1");
     const parked = await a.step();
-    check(sent.length === 0 && jobs(storage).length === 1 && jobs(storage)[0]!.dispatched_at === null, `control: the dispatch was not lost: ${show(jobs(storage))}`);
+    check(sent.length as number === 0 && jobs(storage).length === 1 && jobs(storage)[0]!.dispatched_at === null, `control: the dispatch was not lost: ${show(jobs(storage))}`);
     check(parked.wakeInMs !== null && parked.wakeInMs <= 400, `parked for ${parked.wakeInMs} ms, past the redelivery`);
     await sleep(parked.wakeInMs);
     const again = await a.step();
