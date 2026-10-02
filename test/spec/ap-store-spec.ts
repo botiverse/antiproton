@@ -4,7 +4,8 @@
  * Object's storage, by cf/src/conformance.ts (test/ap-store-do.sh) — the run that
  * reads `exclusive` against the savepoint semantics it exists for.
  */
-import { applySqliteMigrations, SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { SqliteStorage } from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
+import { applySqliteMigrations } from "../../src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js";
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ApStore, AP_INDEXES, AP_OBJECTS, AP_TABLES } from "../../src/store/ap-store.ts";

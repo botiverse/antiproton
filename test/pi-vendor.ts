@@ -7,16 +7,24 @@
  * taken from, and this fails as soon as the installed file differs — an upgrade has to re-take the file
  * and re-apply the change, not run the old copy against new neighbours.
  *
- * Then the patch itself: the vendored Harness reports a sleeping task and the package's own does not
- * (the control), and nothing in the repo opens the package's Harness, which would run without the patch.
+ * Then the patches themselves: the vendored Harness reports a sleeping task and the package's own does not
+ * (the control), and the vendored SqliteStorage never opens an asynchronous transaction where the package's
+ * does (the control); and nothing in the repo opens the package's Harness or SqliteStorage, which would run
+ * without the patch.
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import { createRegistry, defineExtension, defineTask, Harness as UpstreamHarness, type HarnessInspection } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
+import * as upstreamSqlite from "@earendil-works/pi-durable/storage/sqlite";
 import { createModels } from "pi-ai-1/models";
 import { Harness, type SleepNotice } from "../src/vendor/pi/pi-durable/dist/harness/harness.js";
+import { SqliteStorage } from "../src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
+import { SQLITE_MIGRATIONS, CURRENT_SQLITE_SCHEMA_VERSION } from "../src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js";
+import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
+import { prefixedNamespace } from "../src/store/sql-namespace.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
 
 const root = new URL("../", import.meta.url);
 const vendorDir = new URL("src/vendor/pi/", root);
@@ -83,20 +91,67 @@ add("docs/pi-upstream.md and NOTICE list every vendored file", () => {
   }
 });
 
-add("nothing outside src/vendor opens pi-durable's own Harness, which runs the unpatched scheduler", () => {
+add("nothing outside src/vendor opens pi-durable's own Harness or SqliteStorage, which run unpatched", () => {
   const offenders: string[] = [];
+  // SqliteStorage and applySqliteMigrations from the package commit and migrate in an async transaction.
+  const unpatched: Array<[string, RegExp]> = [
+    ["@earendil-works/pi-durable", /^\s*Harness\b/],
+    ["@earendil-works/pi-durable/storage/sqlite", /^\s*(SqliteStorage|applySqliteMigrations)\b/],
+  ];
   for (const dir of ["src", "cf/src", "test", "bench"]) {
     const base = new URL(`${dir}/`, root);
     if (!existsSync(base)) continue;
     for (const f of readdirSync(base, { recursive: true }) as string[]) {
       if (!f.endsWith(".ts") || f.startsWith("vendor/") || `${dir}/${f}` === "test/pi-vendor.ts") continue;
       const text = readFileSync(new URL(f, base), "utf8");
-      for (const [, names] of text.matchAll(/import\s*\{([^}]*)\}\s*from\s*"@earendil-works\/pi-durable"/g)) {
-        if (names!.split(",").some((n) => /^\s*Harness\b/.test(n))) offenders.push(`${dir}/${f}`);
+      for (const [, names, from] of text.matchAll(/import\s*\{([^}]*)\}\s*from\s*"([^"]+)"/g)) {
+        for (const [pkg, name] of unpatched) {
+          if (from === pkg && names!.split(",").some((n) => name.test(n))) offenders.push(`${dir}/${f}`);
+        }
       }
     }
   }
-  check(offenders.length === 0, `import the vendored Harness instead: ${show(offenders)}`);
+  check(offenders.length === 0, `import the vendored Harness or SqliteStorage instead: ${show(offenders)}`);
+});
+
+add("the vendored migrations are the package's schema, statement for statement", () => {
+  check(show(SQLITE_MIGRATIONS) === show(upstreamSqlite.SQLITE_MIGRATIONS), "the vendored SQLITE_MIGRATIONS differ from the package's");
+  check(CURRENT_SQLITE_SCHEMA_VERSION === upstreamSqlite.CURRENT_SQLITE_SCHEMA_VERSION, "schema versions differ");
+});
+
+/** Open, commit, read a document and close over a facade that counts which transaction each step asks for. */
+async function transactionsAsked(open: (db: PiDurableSqlite) => Promise<upstreamSqlite.SqliteStorage>) {
+  const host = sqliteHost();
+  const db = new PiDurableSqlite(host, prefixedNamespace("pd"));
+  const asked = { transaction: 0, transactionSync: 0 };
+  const { transaction, transactionSync } = db;
+  db.transaction = (cb) => { asked.transaction++; return transaction.call(db, cb) as never; };
+  db.transactionSync = (cb) => { asked.transactionSync++; return transactionSync.call(db, cb) as never; };
+  try {
+    const storage = await open(db);
+    await storage.commit([{ type: "conversation", value: { id: 1 as never } }], bg);
+    await storage.document(1 as never, "current", bg);
+    await storage.close(bg);
+  } finally { host.dispose(); }
+  return asked;
+}
+
+add("the vendored SqliteStorage migrates, commits and reads in transactionSync, and never opens an async transaction", async () => {
+  const asked = await transactionsAsked((db) => SqliteStorage.open(db));
+  check(show(asked) === show({ transaction: 0, transactionSync: 3 }), `asked ${show(asked)}`);
+});
+
+add("the control: pi-durable's own SqliteStorage opens an async transaction for each of the three", async () => {
+  const asked = await transactionsAsked((db) => upstreamSqlite.SqliteStorage.open(db));
+  check(show(asked) === show({ transaction: 3, transactionSync: 0 }), `asked ${show(asked)}`);
+});
+
+add("the vendored SqliteStorage refuses a database without transactionSync, and closes it", async () => {
+  let closed = false;
+  const db = { exec: async () => {}, run: async () => {}, get: async () => undefined, all: async () => [], close: async () => { closed = true; } };
+  const error = await SqliteStorage.open(db as never).then(() => null, (e: unknown) => e);
+  check(String(error).includes("transactionSync"), `open said ${show(String(error))}`);
+  check(closed, "the database was not closed");
 });
 
 /** A task that sleeps once until `NAP_UNTIL` and completes. */

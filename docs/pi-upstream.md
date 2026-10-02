@@ -333,19 +333,24 @@ Prefer not to. If it is necessary, it is allowed, but:
 |---|---|---|---|---|
 | `src/vendor/pi/pi-durable/dist/harness/scheduler.js` | `@earendil-works/pi-durable/dist/harness/scheduler.js` | pi-durable 1.0.0 (npm) | `#sleep` records its wake time and calls a new `onSleep` option; `inspect()` reports a sleeping task as `{ kind: "running", sleepingUntil }`. Without it a host cannot tell "only sleeping" from "working", and `settle` (src/runtime/durable-drive.ts) inferred it from checkpoint phases | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
 | `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, and imports the vendored scheduler: the package's harness imports its own | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
+| `src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js` | `@earendil-works/pi-durable/dist/storage/sqlite/storage.js` | pi-durable 1.0.0 (npm) | `commit` (and `document`'s read) run in the facade's `transactionSync` with every statement synchronous, instead of an async `transaction` that awaits between statements: on a Durable Object that one is a savepoint any `sql.exec` issued meanwhile joins, and rolls back with. Same statements, order and errors | none yet: a draft asks for an optional synchronous transaction on `SqliteDatabase` |
+| `src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js` | `@earendil-works/pi-durable/dist/storage/sqlite/migrations.js` | pi-durable 1.0.0 (npm) | `applySqliteMigrations` runs in `transactionSync` too, so no pi-durable transaction spans an await; the schema is the package's (`test/pi-vendor.ts` compares them) | as above |
 
 How the vendored files are used: they are `dist` files, copied, and their
 relative imports of unchanged modules point into the installed package
 (`../../../../../../node_modules/@earendil-works/pi-durable/dist/…`), so they
 share every other module — and its identity — with the package. Our code
-imports `Harness` from the vendored `harness.js` (types in its `harness.d.ts`);
+imports `Harness` from the vendored `harness.js` (types in its `harness.d.ts`)
+and `SqliteStorage` from the vendored `storage.js` (types, and the
+`SqliteSyncDatabase` it needs, in its `storage.d.ts`);
 nothing is redirected and `node_modules` is untouched, so node, the
 conformance worker and the deployed bundle run the same files with no loader
 or alias to forget. `test/pi-vendor.ts` fails when the installed package
 version or an upstream file's sha256 moves from the base in a vendored file's
 header, when a vendored file imports the package's copy of another vendored
 file, and when anything outside `src/vendor` imports the package's own
-`Harness`, which would run without the patch.
+`Harness`, `SqliteStorage` or `applySqliteMigrations`, which would run without
+the patch.
 
 ## Upgrading
 

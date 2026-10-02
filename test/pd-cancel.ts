@@ -17,6 +17,7 @@ import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
 import { pdCancelCases } from "./spec/pd-cancel-spec.ts";
+import { afterPdCommits } from "./spec/pd-commits.ts";
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
@@ -33,9 +34,12 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
  */
 async function apiAgent(engine: "pi085" | "pd") {
   const raw = sqliteHost();
-  /** The next pi-durable transaction opened after `holdNext()` is held open, before its work, until released. */
+  /**
+   * The next pi-durable transaction opened after `holdNext()`: one that spans awaits is held open, before its work,
+   * until released; a synchronous one cannot be held, and reports `reached` as it ends (`afterPdCommits`).
+   */
   let held: { reached: () => void; released: Promise<void> } | null = null;
-  const holding: DurableSqlHost = {
+  const holding: DurableSqlHost = afterPdCommits({
     sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
     transaction: (cb) => raw.transaction(async () => {
       const h = held;
@@ -43,7 +47,7 @@ async function apiAgent(engine: "pi085" | "pd") {
       if (h) { h.reached(); await h.released; }
       return cb();
     }),
-  };
+  }, () => { const h = held; held = null; h?.reached(); });
   const holdNext = () => {
     let reached!: () => void, release!: () => void;
     const at = new Promise<void>((r) => { reached = r; });

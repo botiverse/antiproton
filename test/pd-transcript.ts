@@ -222,44 +222,50 @@ await check("readPdEntries reads what DurableAgent.entries() returns, and writes
   } finally { host.dispose(); }
 });
 
-await check("a routed read waits out an open pi-durable transaction, and never sees the entry its failed commit rolls back", async () => {
-  // A pi-durable commit that has written an entry is held open, then made to fail. A read through
-  // `afterPdTransactions` (what adminTranscript, diagnose and uiVersion use) must wait for it and see the
-  // rollback; a direct read, the control, sees the entry that is never kept.
+await check("a read scheduled from inside a pi-durable commit that fails after writing an entry never sees that entry", async () => {
+  // pi-durable commits in one synchronous transaction (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js):
+  // there is no moment in which a read can run inside it. So a commit that has written an entry is made to fail,
+  // and two reads are scheduled from inside it, before the throw: a direct one, and one through
+  // `afterPdTransactions` (what adminTranscript, diagnose and uiVersion use). Both run after the rollback.
   const host = sqliteHost();
-  const raw = host.transaction;
+  const rawSync = host.transactionSync.bind(host);
   let hold = false;
-  let held!: () => void; const isHeld = new Promise<void>((r) => (held = r));
-  let release!: () => void; const released = new Promise<void>((r) => (release = r));
+  let inside = -1;
+  let reads: Promise<[unknown, unknown]> | null = null;
   const count = () => Number(host.sql.exec("SELECT COUNT(*) AS n FROM pd_entries").toArray()[0]!.n);
-  (host as { transaction: typeof raw }).transaction = (closure) => raw(async () => {
-    const before = hold ? count() : 0;
-    const out = await closure();
-    if (hold && count() > before) { hold = false; held(); await released; throw new Error("injected commit failure"); }
-    return out;
-  });
+  const read = () => ({ n: readPdEntries(host.sql, "main").length, v: pdVersion(host.sql, "main"),
+    events: readTranscript(host.sql, "demo", "u-a", "t_u-a")!.events.length });
+  let rt!: Awaited<ReturnType<typeof converse>>["rt"];
   try {
-    const { rt } = await converse(host, "pd", [SCRIPT[0]!]);
-    const read = () => ({ n: readPdEntries(host.sql, "main").length, v: pdVersion(host.sql, "main"),
-      events: readTranscript(host.sql, "demo", "u-a", "t_u-a")!.events.length });
+    // Before the runtime is made: it keeps the host's methods it was given.
+    (host as { transactionSync: typeof rawSync }).transactionSync = (closure) => rawSync(() => {
+      const before = hold ? count() : 0;
+      const out = closure();
+      if (hold && count() > before) {
+        hold = false;
+        inside = count();
+        reads = new Promise((resolve) => queueMicrotask(() => resolve([read(), rt.afterPdTransactions(read)])))
+          .then(async ([direct, routed]) => [direct, await routed] as [unknown, unknown]);
+        throw new Error("injected commit failure");
+      }
+      return out;
+    });
+    ({ rt } = await converse(host, "pd", [SCRIPT[0]!]));
     const committed = read();
     assert(committed.n === 2, `before: ${show(committed)}`);
+    const rows = count();
     hold = true;
     const driving = rt.postMessage("demo", "u-a", "rolled back").catch(() => "failed");
-    const timeout = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000));
-    assert(await Promise.race([isHeld.then(() => "held" as const), timeout]) === "held", "no pi-durable transaction wrote an entry, so nothing was held");
-    const direct = read();
-    assert(direct.n === committed.n + 1, `control: the direct read did not see the uncommitted entry: ${show(direct)}`);
-    let done = false;
-    const routed = Promise.resolve(rt.afterPdTransactions(read)).then((r) => { done = true; return r; });
-    await new Promise((r) => setTimeout(r, 200));
-    assert(!done, "the routed read ran while the transaction was open");
-    release();
-    const after = await routed;
-    assert(show(after) === show(committed), `the routed read: ${show(after)}, committed: ${show(committed)}`);
+    for (let i = 0; i < 500 && reads === null; i++) await new Promise((r) => setTimeout(r, 10));
+    assert(reads !== null, "no pi-durable transaction wrote an entry, so nothing was failed");
+    assert(inside > rows, `control: inside the commit pd_entries held ${inside} rows, no more than the ${rows} committed`);
+    const [direct, routed] = await reads!;
+    assert(show(direct) === show(committed), `the direct read: ${show(direct)}, committed: ${show(committed)}`);
+    assert(show(routed) === show(committed), `the routed read: ${show(routed)}, committed: ${show(committed)}`);
     await driving;
     assert(show(read()) === show(committed), `after the rollback: ${show(read())}`);
-  } finally { release?.(); host.dispose(); }
+    assert(count() === rows, `after the rollback pd_entries holds ${count()} rows, not ${rows}`);
+  } finally { host.dispose(); }
 });
 
 await check("an object with no pd tables reads as no entries and gains no table", () => {
