@@ -68,7 +68,7 @@ function jobTable(host: DurableSqlHost, pollDelayMs = 0) {
     },
   };
   /**
-   * The queue consumer, as `runQueuedModelCall` does it: parse the stored request,
+   * The queue consumer, as `modelQueueDeps` in cf/src/index.ts does it: parse the stored request,
    * convert it with `toRequest`, ask the model, store `fromResponse` of the reply.
    */
   const consume = (id: string, model: (messages: ModelMessage[], tools?: ToolDefinition[]) => ModelResponse | { error: string }) => {
@@ -153,7 +153,7 @@ function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimer
     try {
       const view = await (await h.root(bg)).context(bg);
       // pi-durable places the prompt and tool declarations as a system message after the first input;
-      // it is a declaration, not a turn, and `jobContext` folds it (the wire-format cases cover that).
+      // it is a declaration, not a turn, and the wire-format cases cover where it reaches the request.
       return view.messages.filter((m) => m.role !== "system").map((m) => {
         const text = typeof m.content === "string" ? m.content
           : m.content.map((c) => (c.type === "text" ? c.text : "")).join("");
@@ -174,20 +174,20 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
   const add = (group: string, name: string, body: (host: DurableSqlHost) => Promise<void>) =>
     cases.push({ group, name, run: () => withHost(body) });
 
-  add("provider", "a job carries the consumer's wire format: system prompt and tools as fields, no system message", async (host) => {
+  add("provider", "a job is wire format v2: the prompt inline where pi-durable put it, after the input; tools as a field", async (host) => {
     const w = world(host);
     const r = parked(await w.submit("Capital of France?"));
     const [row] = w.jobs.rows();
     check(row, "no job was written");
     const job = JSON.parse(row.request);
     check(show(Object.keys(job).sort()) === show(["context", "model", "options"]), `job keys ${show(Object.keys(job))}`);
-    check(show(Object.keys(job.context).sort()) === show(["messages", "systemPrompt", "tools"]), `context keys ${show(Object.keys(job.context))}`);
-    check(job.context.messages.every((m: { role: string }) => m.role !== "system"), "a system message reached the job");
+    check(show(Object.keys(job.context).sort()) === show(["messages", "tools", "version"]) && job.context.version === 2,
+      `context ${show(Object.keys(job.context))} version ${show(job.context.version)}`);
     const { messages, tools } = toRequest(job.context);
     check(messages.length === 2, `request messages ${show(messages)}`);
-    check(messages[0]?.role === "system" && messages[0].content.includes("terse test assistant") && messages[0].content.includes("Answer in one word."),
-      `system prompt ${show(messages[0])}`);
-    check(messages[1]?.role === "user" && messages[1].content === "Capital of France?", `user turn ${show(messages[1])}`);
+    check(messages[0]?.role === "user" && messages[0].content === "Capital of France?", `user turn ${show(messages[0])}`);
+    check(messages[1]?.role === "system" && messages[1].content.includes("terse test assistant") && messages[1].content.includes("Answer in one word."),
+      `system prompt ${show(messages[1])}`);
     check(tools?.length === 1 && tools[0]?.name === "count", `tools ${show(tools)}`);
     check(show(job.model).includes(`"provider":"${PROVIDER}"`) && job.model.id === MODEL, `model ${show(job.model)}`);
     check(r.parkedUntil > 0, "parked");
@@ -267,7 +267,8 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     const rows = w.jobs.rows();
     check(rows.length === 2, `jobs after the answer: ${rows.length}`);
     const seen = toRequest(JSON.parse(rows[1]!.request).context).messages.map((m) => `${m.role}: ${m.content}`);
-    check(show(seen.slice(1)) === show(["user: Q1", "assistant: A1", "user: STEER"]), `second call saw ${show(seen)}`);
+    check(show(seen.filter((m) => !m.startsWith("system: "))) === show(["user: Q1", "assistant: A1", "user: STEER"]) && seen[1]?.startsWith("system: "),
+      `second call saw ${show(seen)}`);
     w.jobs.consume(rows[1]!.id, () => reply("A2"));
     await sleep(second.parkedUntil - Date.now());
     const done = await w.wake();
@@ -419,8 +420,14 @@ export async function runDriveCases(cases: DriveCase[]) {
  * uses (src/model/pi-offloaded.ts) and the 1.0 one above. Each world gets its own
  * plain objects, parsed from one JSON text, and each port keeps only the JSON of
  * the request it was handed — so nothing crosses between the two pi-ai copies
- * but strings. The stored context, and what `toRequest` makes of it, must be
- * byte-identical: the consumer cannot tell which runtime wrote the job.
+ * but strings.
+ *
+ * The 0.85 provider writes wire format version 1 and the 1.0 one version 2
+ * (src/model/pi-bridge.ts), so the stored contexts differ by design; what
+ * `toRequest` makes of them is what reaches the model. A conversation whose only
+ * system message leads must build a byte-identical request either way. One with
+ * later system messages has no version 1 form at all: there the request must be
+ * the version 1 request up to the first of them, then each where it stood.
  */
 export async function wireFormatCases(old: {
   /** `offloadedProvider` from src/model/pi-offloaded.ts and `createModels` from 0.85, wired by the caller. */
@@ -437,7 +444,20 @@ export async function wireFormatCases(old: {
     ],
     tools: [{ name: "count", description: "Count from 1 to n", parameters: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } }],
   });
-  const startNewJob = async () => {
+  // The same conversation as pi-ai 1.0 writes it, then the prompt changes twice after the tool
+  // result — a section patched, then a tool added with no text — and the user speaks again.
+  const later = (() => {
+    const c = JSON.parse(conversation);
+    const shout = { name: "shout", description: "Say it loud", parameters: { type: "object", properties: {} } };
+    return JSON.stringify({ messages: [
+      { role: "system", content: c.systemPrompt, toolsAdded: c.tools, timestamp: 0 },
+      ...c.messages,
+      { role: "system", content: "", sections: { style: "Answer in French." }, timestamp: 4 },
+      { role: "system", content: "", toolsAdded: [shout], timestamp: 5 },
+      { role: "user", content: "And of Spain?", timestamp: 6 },
+    ] });
+  })();
+  const startNewJob = async (json: string) => {
     let request = "";
     const models = createModels();
     models.setProvider(durableOffloadedProvider({
@@ -446,17 +466,34 @@ export async function wireFormatCases(old: {
     }));
     const model = models.getModel(PROVIDER, MODEL);
     check(model, "1.0 model not registered");
-    const message = await models.stream(model, JSON.parse(conversation), { deferred: true }).result();
+    const message = await models.stream(model, JSON.parse(json), { deferred: true }).result();
     check(message.stopReason === "deferred", `1.0 provider answered ${message.stopReason}`);
     return request;
   };
   return [{
-    group: "provider", name: "the same conversation through the 0.85 and 1.0 providers stores the same job context",
+    group: "provider", name: "with no later system message, the 0.85 (v1) and 1.0 (v2) jobs build the same request",
     run: async () => {
-      const [before, after] = [JSON.parse(await old.startOldJob(conversation)), JSON.parse(await startNewJob())];
-      check(show(after.context) === show(before.context), `context differs:\n 0.85 ${show(before.context)}\n 1.0  ${show(after.context)}`);
-      check(show(toRequest(after.context)) === show(toRequest(before.context)), "toRequest differs");
+      const [before, after] = [JSON.parse(await old.startOldJob(conversation)), JSON.parse(await startNewJob(conversation))];
+      check(before.context.version === undefined && after.context.version === 2,
+        `versions: 0.85 ${show(before.context.version)}, 1.0 ${show(after.context.version)}`);
+      check(show(toRequest(after.context)) === show(toRequest(before.context)),
+        `toRequest differs:\n 0.85 ${show(toRequest(before.context))}\n 1.0  ${show(toRequest(after.context))}`);
       for (const k of ["id", "api", "provider"]) check(before.model[k] === after.model[k], `model.${k}: ${before.model[k]} vs ${after.model[k]}`);
+    },
+  }, {
+    group: "provider", name: "later system messages reach the request where they stood; before them it is the 0.85 request",
+    run: async () => {
+      const before = toRequest(JSON.parse(await old.startOldJob(conversation)).context);
+      const after = toRequest(JSON.parse(await startNewJob(later)).context);
+      const k = before.messages.length;
+      check(show(after.messages.slice(0, k)) === show(before.messages),
+        `prefix differs:\n 0.85 ${show(before.messages)}\n 1.0  ${show(after.messages.slice(0, k))}`);
+      // The tool-only change renders no text, so one inline message stands for the two system messages.
+      check(show(after.messages.slice(k)) === show([
+        { role: "system", content: "Updated system prompt section \"style\":\n\nAnswer in French." },
+        { role: "user", content: "And of Spain?" },
+      ]), `after the tool result: ${show(after.messages.slice(k))}`);
+      check(show(after.tools?.map((t) => t.name)) === show(["count", "shout"]), `tools ${show(after.tools)}`);
     },
   }];
 }

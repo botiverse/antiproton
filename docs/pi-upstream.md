@@ -59,7 +59,10 @@ stated so they are not rediscovered:
 - **No pi-ai value crosses between 0.85 and 1.0.** The two share the job wire
   format as JSON only: a job row is a string written by one provider and read
   by `toRequest`; an answer is a string written by `fromResponse` and read back
-  by `readAnswer`.
+  by `readAnswer`. The 0.85 provider writes version 1 (0.85's `Context`,
+  untagged); the 1.0 one writes version 2 (`version: 2`), which keeps each
+  system message where it stands in the transcript, rendered to text by the
+  writer. `JobContextV2` in `src/model/pi-bridge.ts` defines it.
 - The production bundle is unchanged while only tests and the conformance
   worker import `pi-ai-1`.
 
@@ -92,8 +95,9 @@ pi-durable adds `storage/sqlite` (the `SqliteDatabase` types, and
 in `src/runtime/durable-drive.ts`), `testing` (`createStorageConformance`,
 tests only) and `@earendil-works/chord` (types, and `chord/context` in tests).
 `pi-ai-1` adds `models` (`createProvider`, `createModels`),
-`utils/event-stream`, `utils/transcript` (`getCurrentSystemPrompt`,
-`getCurrentTools`) and the root's types, in `src/model/durable-offloaded.ts`.
+`utils/event-stream`, `utils/transcript` (`getCurrentTools`), `utils/text`
+(`getSystemMessageText`, `renderSystemMessageUpdate`) and the root's types, in
+`src/model/durable-offloaded.ts`.
 
 ### 2. Copied source — this breaks silently
 

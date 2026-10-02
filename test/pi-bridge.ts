@@ -49,6 +49,60 @@ check("没有工具调用的助手回合不带 tool_calls 键", () => {
   if ("tool_calls" in (messages[0] as any)) throw new Error("an empty tool_calls key was sent");
 });
 
+// The request a version 1 context builds, as master built it before version 2 existed (printed
+// by that commit's toRequest from this same context). The live runtime writes version 1, so
+// this string is what its provider calls must keep being, byte for byte.
+const V1_CONTEXT = {
+  systemPrompt: "be brief",
+  messages: [
+    { role: "user", content: "hi", timestamp: 1 },
+    { role: "assistant", content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "looking" }, { type: "toolCall", id: "c1", name: "read", arguments: { url: "u" } }], jobId: "mj_1" },
+    { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "page" }, { type: "image", data: "x", mimeType: "image/png" }], isError: false },
+    { role: "user", content: [{ type: "text", text: "and " }, { type: "text", text: "then?" }], timestamp: 4 },
+    { role: "assistant", content: [{ type: "text", text: "done" }] },
+  ],
+  tools: [{ name: "read", description: "d", parameters: { type: "object", properties: { url: { type: "string" } } } }],
+};
+const V1_GOLDEN = '{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},{"role":"assistant","content":"looking","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\\"url\\":\\"u\\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"page"},{"role":"user","content":"and then?"},{"role":"assistant","content":"done"}],"tools":[{"name":"read","description":"d","parameters":{"type":"object","properties":{"url":{"type":"string"}}}}]}';
+
+check("v1(无版本标记)的请求与引入 v2 之前逐字节相同", () => {
+  const got = JSON.stringify(toRequest(V1_CONTEXT as any));
+  if (got !== V1_GOLDEN) throw new Error(`v1 request changed\n  got  ${got}\n  want ${V1_GOLDEN}`);
+});
+
+check("v2 的 system 消息留在原位,成为请求里同一位置的 system 消息", () => {
+  const { messages, tools } = toRequest({
+    version: 2,
+    messages: [
+      { role: "user", content: "Q1", timestamp: 1 } as any,
+      { role: "system", content: "the prompt" },
+      { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }] } as any,
+      { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "page" }], isError: false } as any,
+      { role: "system", content: "Updated system prompt section \"s\":\n\nnew" },
+      { role: "user", content: "Q2", timestamp: 2 } as any,
+    ],
+    tools: [{ name: "read", description: "d", parameters: { type: "object" } as any }],
+  });
+  eq(messages.map((m) => `${m.role}:${m.content}`), [
+    "user:Q1", "system:the prompt", "assistant:", "tool:page",
+    "system:Updated system prompt section \"s\":\n\nnew", "user:Q2",
+  ], "positions");
+  eq(messages[1], { role: "system", content: "the prompt" }, "an inline system message carries only role and content");
+  eq(tools, [{ name: "read", description: "d", parameters: { type: "object" } }], "tools");
+});
+
+check("未知的版本号和 v1 里的 system 消息都被拒绝,而不是猜", () => {
+  const refused = (what: string, ctx: unknown, says: string) => {
+    try { toRequest(ctx as any); } catch (e) {
+      if (!String((e as Error).message).includes(says)) throw new Error(`${what}: wrong reason: ${(e as Error).message}`);
+      return;
+    }
+    throw new Error(`${what} was read`);
+  };
+  refused("version 3", { version: 3, messages: [] }, "wire version 3");
+  refused("a v1 system message", { messages: [{ role: "system", content: "x" }] }, "version 1 model job carries a system message");
+});
+
 const model = { api: "offloaded", provider: "queue", id: "m" };
 
 check("停止原因:工具调用、截断、普通结束", () => {

@@ -14,6 +14,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { operatorRequest, type OperatorModel } from "../../src/model/operator-request.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
+import type { AgentEngine } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
@@ -30,7 +31,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/contex
 import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
 import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
 import {
-  answerClientCall, clientTools, dropClientCalls, pendingClientCalls, resumeClientCalls,
+  answerClientCall, clientTools, dropClientCalls, pendingClientCalls,
 } from "../../src/runtime/client-calls.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
@@ -53,6 +54,7 @@ import {
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
+import { UnknownJob } from "./model-queue.ts";
 
 /** The persona fields of an agent record, if it carries any. */
 export function personaOf(config: unknown): { name?: string; description?: string } | null {
@@ -670,7 +672,7 @@ export class AgentRuntime {
   // agent's object, with its own transcript and the agent's shared mounts,
   // credentials and memory. Keyed so a second conversation never reads the
   // first one's transcript, and cached so a wake does not rebuild them all.
-  #agents = new Map<string, { agent: PiAgent; builtFrom: string }>();
+  #agents = new Map<string, { agent: AgentEngine; builtFrom: string }>();
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
@@ -1602,15 +1604,14 @@ export class AgentRuntime {
    * it starts no timers and no provider work — it reads the transcript and
    * reports what was left open.
    */
-  async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<PiAgent> {
+  async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<AgentEngine> {
     await this.ready();
     const key = `${tenantId}/${agentId}`;
     const cacheKey = `${key}#${session}`;
     const cached = this.#agents.get(cacheKey);
     if (cached) {
       const now = await this.#catalogueKeyFor(tenantId, agentId);
-      const running = cached.builtFrom !== now &&
-        (await cached.agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+      const running = cached.builtFrom !== now && await cached.agent.running();
       if (reuseHarness(cached.builtFrom, now, running)) return cached.agent;
       this.#agents.delete(cacheKey);
     }
@@ -1820,7 +1821,7 @@ export class AgentRuntime {
     ensureAgentTables(sql);
     // A turn waiting for the caller has no run to abort; it still ends, and says so.
     if (dropClientCalls(sql, session) > 0 && !cancelledTurn) {
-      await agent.lane.appendCustomEntry(TURN_CANCELLED, { operationId: null }, BACKGROUND_CONTEXT);
+      await agent.markCancelled(TURN_CANCELLED);
     }
     const jobs = await stopSessionJobs({
       sql, owner: { tenantId, agentId }, session,
@@ -1833,9 +1834,7 @@ export class AgentRuntime {
 
   /** The session's branch, oldest first: what the model's context is built from. */
   async branchEntries(tenantId: string, agentId: string, session: string) {
-    const agent = await this.agent(tenantId, agentId, session);
-    const tip = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).tipId;
-    return tip ? agent.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) : [];
+    return (await this.agent(tenantId, agentId, session)).branch();
   }
 
   /** Function calls this session waits on its API caller for, with the turn each belongs to. */
@@ -1897,10 +1896,7 @@ export class AgentRuntime {
       const out = await agent.step();
       // A turn paused for an API caller's function results continues once they
       // have all arrived; the next pass drives the run this starts.
-      const resumed = out.open === 0 && await resumeClientCalls({
-        sql, session, lane: agent.lane as any,
-        branch: (tip) => agent.storage.scanBranch({ start: tip, order: "oldestFirst" }, BACKGROUND_CONTEXT) as any,
-      });
+      const resumed = out.open === 0 && await agent.resumeClientCalls();
       open += out.open + (resumed ? 1 : 0);
       settled.push(...out.settled);
       const wake = resumed ? 0 : out.wakeInMs;
@@ -2051,7 +2047,7 @@ export class AgentRuntime {
    *  session asked, so the answer lands in the transcript that is waiting. */
   async takeJob(tenantId: string, agentId: string, jobId: string) {
     await this.ready();
-    const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
+    const session = this.#jobSession(jobId);
     const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId);
     if (!job) return job;
     // The model the queued call asks for, when it spends the operator's account; null leaves it at the
@@ -2062,8 +2058,20 @@ export class AgentRuntime {
 
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
     await this.ready();
-    const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
+    const session = this.#jobSession(jobId);
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
+  }
+
+  /** The session whose job this is. No row means no session holds it, so the main
+   *  session is not a fallback: it would find no row either and drop the call silently.
+   *  An object with no jobs table holds no job either, and is asked without creating
+   *  one (ensureAgentTables would also register the main session). */
+  #jobSession(jobId: string): string {
+    const sql = this.#deps.ctx.storage.sql;
+    const hasJobs = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").toArray().length > 0;
+    const session = hasJobs ? jobSession(sql, jobId) : null;
+    if (session === null) throw new UnknownJob(jobId);
+    return session;
   }
 }
 

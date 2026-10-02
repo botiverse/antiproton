@@ -92,7 +92,7 @@ import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
 import { operatorModelOf } from "./model-request.ts";
 import { operatorRequest } from "../../src/model/operator-request.ts";
-import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/context";
+import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
   runtimePanel, timeline, tokens, plugins, mountFragment, mountList, catalogue, agentList, apiKeysPanel } from "./ui.ts";
@@ -245,57 +245,36 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
  * sweeper, the give-up timer and the requeue logic were all attempts to notice
  * that from the outside. A queue does not need noticing: the message is not
  * acked until this returns, so a cancelled invocation is simply redelivered.
- */
-interface QueuedModelCall {
-  doId: string;
-  tenantId: string;
-  agentId: string;
-  jobId: string;
-}
-
-/**
- * The model call, waited on where waiting is free.
- *
- * A Worker bills CPU, not wall clock, so a sixty-second provider call costs
- * almost nothing here; the same wait inside the Durable Object is billed by
- * duration, which is the entire reason the call leaves the object at all.
  *
  * The request arrives in pi's shape and is converted here rather than by
  * importing pi's own provider implementations, which would drag four vendor
- * SDKs into a binary shipped to every tenant.
+ * SDKs into a binary shipped to every tenant. The consumer itself, and what it
+ * does with a job id the object does not hold, is cf/src/model-queue.ts.
  */
-async function runQueuedModelCall(m: QueuedModelCall, env: Env) {
-  const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
-  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId) as any;
-  // Already answered — a redelivery after success, which must not call the
-  // provider again.
-  if (!job) return;
-
-  const model = new OpenAiCompatibleModel(operatorRequest(operatorModelOf(env), job.operatorModel ?? env.HARNESS_MODEL));
-  const { messages, tools } = toRequest(job.context);
-  const t0 = Date.now();
-  const res = await model.complete(messages, tools ? { tools } : {});
-  const identity = {
-    api: String(job.model?.api ?? "offloaded"),
-    provider: String(job.model?.provider ?? "openai-compatible"),
-    id: String(job.model?.id ?? env.HARNESS_MODEL),
+function modelQueueDeps(env: Env): ModelQueueDeps {
+  return {
+    stub: (m) => env.AGENT.get(env.AGENT.idFromString(m.doId)),
+    async call(taken, m) {
+      const job = taken as any;
+      const model = new OpenAiCompatibleModel(operatorRequest(operatorModelOf(env), job.operatorModel ?? env.HARNESS_MODEL));
+      const { messages, tools } = toRequest(job.context);
+      const res = await model.complete(messages, tools ? { tools } : {});
+      const identity = {
+        api: String(job.model?.api ?? "offloaded"),
+        provider: String(job.model?.provider ?? "openai-compatible"),
+        id: String(job.model?.id ?? env.HARNESS_MODEL),
+      };
+      return fromResponse(res, identity, m.jobId);
+    },
+    // A given-up call is still this job's answer, so the entry it becomes names
+    // the job like any other (see `jobId` on fromResponse).
+    givenUp: (m) => ({
+      ...errorMessage(
+        "the model call failed repeatedly and was given up on",
+        { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }),
+      jobId: m.jobId,
+    }),
   };
-  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, fromResponse(res, identity, m.jobId), Date.now() - t0);
-}
-
-/** Out of retries. The agent has to hear about it, or it waits for ever. */
-async function failLoudly(m: QueuedModelCall, env: Env) {
-  const stub = env.AGENT.get(env.AGENT.idFromString(m.doId));
-  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId) as any;
-  if (!job) return;
-  // A given-up call is still this job's answer, so the entry it becomes names
-  // the job like any other (see `jobId` on fromResponse).
-  await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, {
-    ...errorMessage(
-      "the model call failed repeatedly and was given up on",
-      { api: "offloaded", provider: "openai-compatible", id: env.HARNESS_MODEL }),
-    jobId: m.jobId,
-  }, 0);
 }
 
 export { agentObjectName };
@@ -617,8 +596,7 @@ export class AgentDO extends DurableObject<Env> {
    */
   async #entries(tenantId: string, agentId: string, fromSeq?: number) {
     const agent = await this.#activeRuntime().agent(tenantId, agentId);
-    return agent.storage.scanEntries(
-      { order: "asc", ...(fromSeq === undefined ? {} : { fromSeq }) }, BACKGROUND_CONTEXT);
+    return agent.entries({ order: "asc", ...(fromSeq === undefined ? {} : { fromSeq }) });
   }
 
   /**
@@ -682,18 +660,21 @@ export class AgentDO extends DurableObject<Env> {
    * What the worker asks for, and what it hands back.
    *
    * Returns null once the reply is in: a redelivery after a successful call
-   * must not run the provider a second time.
+   * must not run the provider a second time. A job id this object holds no
+   * row for is answered with an `UnknownJobReply` rather than a throw, because
+   * the `UnknownJob` class does not survive RPC (cf/src/model-queue.ts).
    */
   async takeJob(tenantId: string, agentId: string, jobId: string) {
-    return this.#activeRuntime().takeJob(tenantId, agentId, jobId);
+    return replyingUnknownJob(() => this.#activeRuntime().takeJob(tenantId, agentId, jobId));
   }
 
   async deliverAnswer(
     tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs = 0,
-  ) {
+  ): Promise<boolean | UnknownJobReply> {
     const rt = this.#activeRuntime();
-    const wrote = await this.#busy("deliver", () =>
-      rt.deliverAnswer(tenantId, agentId, jobId, answer));
+    const wrote = await replyingUnknownJob(() => this.#busy("deliver", () =>
+      rt.deliverAnswer(tenantId, agentId, jobId, answer)));
+    if (isUnknownJobReply(wrote)) return wrote;
     if (wrote && modelMs > 0) {
       this.#note(Date.now() - modelMs, modelMs, "offload_provider");
       this.#note(Date.now() - modelMs, modelMs, "offload_rtt");
@@ -944,7 +925,7 @@ export class AgentDO extends DurableObject<Env> {
     await rt.ready();
     const agentId = `b_${taskId}`;
     const agent = await rt.agent("bench", agentId);
-    const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[];
+    const entries = await agent.entries({ order: "asc" }) as any[];
     const usage = entries.reduce((a: any, e: any) => {
       const m = e.message;
       if (m?.role !== "assistant" || m.stopReason === "deferred") return a;
@@ -1030,9 +1011,9 @@ export class AgentDO extends DurableObject<Env> {
 
   async #benchPollInner(taskId: string) {
     const agent = await this.#activeRuntime().agent("bench", `b_${taskId}`);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const running = await agent.running();
     const events = entriesToEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
+      await agent.entries({ order: "asc" }));
     // One builder for the body, shared with the runner's tests: a fixture cannot then have a shape this
     // endpoint never sends, which is how the poll fallback stayed inert for four days (src/bench/poll-body.ts).
     return benchPollBody(events, running);
@@ -1042,12 +1023,12 @@ export class AgentDO extends DurableObject<Env> {
    *  bench runs; it is cheaper to be able to look. */
   async benchDebug(taskId: string) {
     const agent = await this.#activeRuntime().agent("bench", this.#benchAgentId(taskId));
-    const tools = await agent.harness.getTools(BACKGROUND_CONTEXT);
-    const entries = await agent.storage.scanEntries({ order: "desc", limit: 4 }, BACKGROUND_CONTEXT);
-    const execution = await agent.lane.inspectExecution(BACKGROUND_CONTEXT);
+    const tools = await agent.tools();
+    const entries = await agent.entries({ order: "desc", limit: 4 });
+    const execution = await agent.status();
     return {
-      status: execution.current ? "running" : "idle",
-      model: execution.configuredModel,
+      status: execution.running ? "running" : "idle",
+      model: execution.model,
       toolCount: tools.length,
       toolNames: tools.map((t: any) => t.name),
       lastMessages: entries.reverse().map((e: any) => ({
@@ -1068,8 +1049,7 @@ export class AgentDO extends DurableObject<Env> {
       .toArray();
     let execution: unknown = null;
     if (who) {
-      execution = await (await rt.agent(who.tenantId, who.agentId))
-        .lane.inspectExecution(BACKGROUND_CONTEXT);
+      execution = (await (await rt.agent(who.tenantId, who.agentId)).status()).detail;
     }
     return { owner: who, execution, modelJobs: jobs, alarm: await this.ctx.storage.getAlarm() };
   }
@@ -1162,7 +1142,7 @@ export class AgentDO extends DurableObject<Env> {
     const agentId = this.#benchAgentId(taskId);
     const agent = await rt.agent("bench", agentId);
     const events = entriesToEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)) as any[];
+      await agent.entries({ order: "asc" })) as any[];
     const usage = events.reduce(
       (a: any, e: any) => {
         const u = e.payload?.usage;
@@ -1175,7 +1155,7 @@ export class AgentDO extends DurableObject<Env> {
     // to answer — does anything reach for run_js — with no on-object evidence.
     const byTool: Record<string, number> = {};
     let toolErrors = 0;
-    for (const e of await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT) as any[]) {
+    for (const e of await agent.entries({ order: "asc" }) as any[]) {
       const name = e.message?.role === "toolResult" ? e.message.toolName : null;
       if (name) byTool[name] = (byTool[name] ?? 0) + 1;
       if (name && e.message.isError) toolErrors += 1;
@@ -1354,7 +1334,7 @@ export class AgentDO extends DurableObject<Env> {
     const agent = await rt.agent(tenantId, agentId, sessionId);
     // The branch, not every entry: resuming a paused call leaves its placeholder result on the branch it left.
     const entries = await rt.branchEntries(tenantId, agentId, sessionId);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+    const running = await agent.running();
     const pending = running ? [] : await rt.waitingClientCalls(tenantId, agentId, sessionId);
     return JSON.stringify({ entries, running, pending });
   }
@@ -1372,7 +1352,7 @@ export class AgentDO extends DurableObject<Env> {
     // 2026-09-14: "no model binding" on a fresh session).
     if (!(await rt.store.getModelBinding(tenantId, agentId))) return { status: "idle", pending: [] };
     const agent = await rt.agent(tenantId, agentId, sessionId);
-    if ((await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null) return { status: "in_progress", pending: [] };
+    if (await agent.running()) return { status: "in_progress", pending: [] };
     const pending = await rt.waitingClientCalls(tenantId, agentId, sessionId);
     return { status: pending.length ? "requires_action" : "idle", pending };
   }
@@ -1595,7 +1575,7 @@ export class AgentDO extends DurableObject<Env> {
     const used: Record<string, number> = {};
     try {
       const agent = await rt.agent(tenantId, agentId);
-      const entries = await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+      const entries = await agent.entries({ order: "asc" });
       for (const e of entries as any[]) {
         const n = e.message?.role === "toolResult" ? e.message.toolName : null;
         if (n) used[n] = (used[n] ?? 0) + 1;
@@ -1932,8 +1912,8 @@ export class AgentDO extends DurableObject<Env> {
     const rt = this.runtime();
     const agent = await rt.agent(tenantId, agentId, session);
     const shown = transcriptEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT), this.sql, session, { tenantId, agentId }, tail);
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+      await agent.entries({ order: "asc" }), this.sql, session, { tenantId, agentId }, tail);
+    const running = await agent.running();
     const pendingApproval = (await rt.store.listApprovals(tenantId, "pending")).length > 0;
     const busy: UiTranscript["busy"] = pendingApproval ? "waiting-for-approval" : running ? "thinking" : null;
     return { ...shown, byOp: approvalsByOp(await rt.store.listApprovals(tenantId)), busy };
@@ -2012,8 +1992,8 @@ export class AgentDO extends DurableObject<Env> {
     this.#claim(tenantId, agentId);
     const agent = await this.runtime().agent(tenantId, agentId);
     const events = entriesToEvents(
-      await agent.storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT));
-    const running = (await agent.lane.inspectExecution(BACKGROUND_CONTEXT)).current !== null;
+      await agent.entries({ order: "asc" }));
+    const running = await agent.running();
     const last = [...events].reverse()
       .find((e) => e.kind === "model.response" && !(e.payload as any).toolCalls);
     return {
@@ -3065,25 +3045,9 @@ async function latency(env: Env) {
 }
 
 export default {
-  /** Where a model call is actually waited on; see runQueuedModelCall. */
+  /** Where a model call is actually waited on; see modelQueueDeps and cf/src/model-queue.ts. */
   async queue(batch: MessageBatch<QueuedModelCall>, env: Env) {
-    for (const message of batch.messages) {
-      if (batch.queue.endsWith("-dlq")) {
-        await failLoudly(message.body, env);
-        message.ack();
-        continue;
-      }
-      try {
-        await runQueuedModelCall(message.body, env);
-        message.ack();
-      } catch (e) {
-        // Deliberately not acked: the queue redelivers, and after max_retries
-        // the message lands in the dead letter queue, where it becomes a
-        // visible failure on the task rather than a silence.
-        console.error("model call failed", String((e as Error)?.message ?? e));
-        message.retry();
-      }
-    }
+    await consumeModelCalls(batch, modelQueueDeps(env));
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {

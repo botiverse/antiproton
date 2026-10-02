@@ -84,7 +84,8 @@
     "test/mount-reports.ts",
     "test/run-js-resume.ts",
     "test/tool-interrupts.ts",
-    "test/mcp-plugin.ts"
+    "test/mcp-plugin.ts",
+    "test/model-queue.ts"
   ],
   "exclude": ["node_modules"]
 }
