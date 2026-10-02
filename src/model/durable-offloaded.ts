@@ -12,30 +12,27 @@
  * What changed in pi-ai 1.0 is what a provider is handed: a `TranscriptContext`,
  * in which the system prompt and the tool declarations are system messages in
  * the transcript, rather than a `Context` with `systemPrompt` and `tools`
- * fields. The queue consumer (`runQueuedModelCall` in cf/src/index.ts) reads a
- * job's `context` through `toRequest` in src/model/pi-bridge.ts, which knows
- * the old shape only — a system message reaching it would be sent as an
- * assistant turn. So `jobContext` below folds the transcript back into exactly
- * that shape, and the job a port receives is `{ model, context, options }` as
- * before: one wire format, read by one consumer, whichever runtime wrote it.
+ * fields — and each one takes effect where it stands. pi-durable writes the
+ * prompt after the first input, and a patch to it after a later input. The
+ * queue consumer (`runQueuedModelCall` in cf/src/index.ts) reads a job's
+ * `context` through `toRequest` in src/model/pi-bridge.ts, so `jobContext`
+ * below writes the transcript as job wire format version 2 (`JobContextV2`
+ * there): every system message inline at its place, and the current tools as
+ * a field, as the 0.85 provider writes them.
  * test/durable-drive.ts runs a job written here through `toRequest` and
  * compares it with the same conversation written by the 0.85 provider.
- *
- * The fold is lossy in one place, deliberately: a system message in the middle
- * of the transcript (a prompt section or tool set that changed during the
- * conversation) is replayed into the one leading prompt, as pi-ai's own
- * `collapseSystemMessages` does for APIs without mid-conversation system
- * messages. The consumer's request format has no place for it.
  *
  * pi-ai 1.0 is imported as `pi-ai-1`, an npm alias; docs/pi-upstream.md says why.
  */
 import type {
-  Api, AssistantMessage, Context, DeferredHandle, Message, Model, SimpleStreamOptions, StreamOptions,
-  TranscriptContext, Usage,
+  Api, AssistantMessage, DeferredHandle, Message, Model, SimpleStreamOptions, StreamOptions,
+  SystemMessage, Tool, TranscriptContext, Usage,
 } from "pi-ai-1";
 import { createProvider, type Provider } from "pi-ai-1/models";
 import { createAssistantMessageEventStream, type AssistantMessageEventStream } from "pi-ai-1/utils/event-stream";
-import { getCurrentSystemPrompt, getCurrentTools } from "pi-ai-1/utils/transcript";
+import { getSystemMessageText, renderSystemMessageUpdate } from "pi-ai-1/utils/text";
+import { getCurrentTools } from "pi-ai-1/utils/transcript";
+import { JOB_WIRE_V2, type InlineSystemMessage, type JobContextV2 } from "./pi-bridge.ts";
 
 /**
  * A message that finished. `aborted` and `pending` are excluded for the reasons
@@ -47,8 +44,11 @@ export type Answered = AssistantMessage & {
   stopReason: Exclude<AssistantMessage["stopReason"], "aborted" | "pending">;
 };
 
+/** A job context written by this provider: version 2, over pi-ai 1.0's non-system messages. */
+export type DurableJobContext = JobContextV2<Exclude<Message, SystemMessage>, Tool>;
+
 /** One queued model call: what the port stores, and what the queue consumer reads back. */
-export type ModelJobRequest = { model: Model<Api>; context: Context; options?: StreamOptions };
+export type ModelJobRequest = { model: Model<Api>; context: DurableJobContext; options?: StreamOptions };
 
 /** Whatever does the waiting. Same contract as `OffloadPort` in src/model/pi-offloaded.ts. */
 export interface DurableOffloadPort {
@@ -74,25 +74,30 @@ const NO_USAGE: Usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-const notSystem = (m: Message): boolean => m.role !== "system";
-
 /**
- * The transcript in the shape the queue consumer reads: the current system
- * prompt and tools as fields, every non-system message in order. Fields are
- * omitted when empty, as the 0.85 harness omitted them.
+ * The transcript as job wire format version 2: each system message rendered to text, where it
+ * stands. The first is the prompt being declared, so it is rendered whole — content, then its
+ * sections — as `getSystemMessageText` renders a leading prompt. Each later one changes that
+ * prompt and is rendered as pi-ai's chat-completions transport renders a mid-conversation
+ * system message (`convertMessages` in its api/openai-completions.js): its content, then each
+ * changed section framed by name. That transport frames by index instead — only index 0 is
+ * whole — which would send pi-durable's first prompt, written after the first input, as an
+ * "update" of a prompt the model was never shown.
  *
- * Lossy: a later system message loses its position — it is replayed into the leading prompt —
- * because the job wire format has no slot for a mid-conversation system message. Carrying it
- * is a phase-3 change to the format and its consumer.
+ * One that renders empty — it only changed the tools — is dropped, as that transport drops it:
+ * `tools` is the set current at the end, the field the 0.85 provider wrote.
  */
-export function jobContext(context: TranscriptContext): Context {
-  const systemPrompt = getCurrentSystemPrompt(context.messages);
+export function jobContext(context: TranscriptContext): DurableJobContext {
   const tools = getCurrentTools(context.messages);
-  return {
-    ...(systemPrompt ? { systemPrompt } : {}),
-    messages: context.messages.filter(notSystem),
-    ...(tools.length ? { tools } : {}),
-  };
+  const messages: Array<Exclude<Message, SystemMessage> | InlineSystemMessage> = [];
+  let declared = false;
+  for (const m of context.messages) {
+    if (m.role !== "system") { messages.push(m); continue; }
+    const content = declared ? renderSystemMessageUpdate(m) : getSystemMessageText(m);
+    declared = true;
+    if (content) messages.push({ role: "system", content });
+  }
+  return { version: JOB_WIRE_V2, messages, ...(tools.length ? { tools } : {}) };
 }
 
 const STOP_REASONS: ReadonlySet<string> = new Set<Answered["stopReason"]>(["stop", "length", "toolUse", "error", "deferred"]);
