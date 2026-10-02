@@ -58,6 +58,7 @@ import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
+import { logEvent } from "../core/log.ts";
 import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
 import { bookCommit, strandedAnswerRows } from "./pd-outbox.ts";
 import { appendUsage } from "../usage/outbox.ts";
@@ -91,6 +92,9 @@ const REDELIVERY_MS = 120_000;
  * from costing a wake every two seconds.
  */
 export const DEFAULT_POLL = { firstMs: 2_000, maxMs: 30_000 } as const;
+
+/** How long a staged job waits for the commit that records it before it is forgotten (`PdHost.#staged`). */
+const STAGED_MS = 10 * 60_000;
 
 /** How long one `step()` keeps the harness open waiting for work that is neither idle nor sleeping. */
 const STEP_DEADLINE_MS = 30_000;
@@ -150,11 +154,13 @@ export class PdHost {
   readonly #ap: ApStore;
   #ensured = false;
   /**
-   * Jobs the provider's port started that no commit has recorded yet, id to request JSON. The commit that
-   * records the job's poll checkpoint inserts its row (`bookCommit`); one that never lands leaves it here,
-   * and it is forgotten when the harness closes, since only that harness's generations could record it.
+   * Jobs the provider's port started that no commit has recorded yet: id to request JSON, and when. The commit
+   * that records the job's poll checkpoint inserts its row (`bookCommit`). Not cleared when a harness closes: a
+   * commit admitted before the close can still land after it, and without its entry it would record a checkpoint
+   * with no row, a poll nobody answers. One that will never land (its generation aborted or failed first) is
+   * forgotten after `STAGED_MS`; its commit follows the provider's return at once, so that is far past it.
    */
-  readonly #staged = new Map<string, string>();
+  readonly #staged = new Map<string, { request: string; at: number }>();
   /** Client tools waiting in this isolate, by `conversation:call`: each is told to read its row again. */
   readonly #clientWaiters = new Map<string, Set<() => void>>();
   /** Told when a client call's row moves: what `settle` reads as `externalWaits` changed without a pd commit. */
@@ -245,7 +251,7 @@ export class PdHost {
       // The commit hook writes the `ap` tables, so they exist before anything commits.
       await this.#store();
       const db = new PiDurableSqlite(this.#opts.storage, PD);
-      const storage = await SqliteStorage.open(db, { onCommit: (exec, writes, seq) => this.#book(exec, writes, seq) });
+      const storage = await SqliteStorage.open(db, { onCommit: (exec, writes, seq) => this.#book(exec, writes, seq, opening) });
       const h = await Harness.open(storage, {
         models: this.#models,
         registry: this.#registry,
@@ -262,7 +268,7 @@ export class PdHost {
       }, bg);
       // Settle closes the harness when it parks; whoever asks next opens a fresh one.
       h.subscribeClose(() => {
-        if (this.#harness === opening) { this.#harness = null; this.#staged.clear(); }
+        if (this.#harness === opening) this.#harness = null;
       });
       return h;
     })();
@@ -278,20 +284,34 @@ export class PdHost {
    * (src/runtime/pd-outbox.ts says what it writes). Jobs the batch recorded are dispatched once the
    * transaction is over — it is synchronous, so a microtask queued here runs after it — and only if
    * the commit landed rather than rolled back: pi-durable's sequence moved past `seq`.
+   *
+   * A commit that rolled back for any reason but `StorageRejected` — a throw here, a failed statement after
+   * it — poisons pi-durable's Session: every later commit on it rejects until it is reopened. So the harness
+   * it ran on is dropped and closed, and whoever asks next opens a fresh one, which resumes each task from its
+   * last landed checkpoint. (A `StorageRejected` rollback does not poison; reopening then costs one open.)
    */
-  #book(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], seq: number): void {
+  #book(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], seq: number, harness: Promise<Harness>): void {
     const binding = this.#binding;
-    const jobs = bookCommit(exec, writes, {
-      owner: binding ? { tenantId: binding.tenantId, agentId: binding.agentId } : null,
-      now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
-      ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
-    });
-    queueMicrotask(() => void this.#afterCommit(jobs, seq));
+    let jobs: string[] = [];
+    try {
+      jobs = bookCommit(exec, writes, {
+        owner: binding ? { tenantId: binding.tenantId, agentId: binding.agentId } : null,
+        now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
+        ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
+      });
+    } finally {
+      queueMicrotask(() => void this.#afterCommit(jobs, seq, harness));
+    }
   }
 
-  async #afterCommit(jobs: readonly string[], seq: number): Promise<void> {
+  async #afterCommit(jobs: readonly string[], seq: number, harness: Promise<Harness>): Promise<void> {
     const next = this.#opts.storage.sql.exec(PD_NAMES.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq;
-    if (!(Number(next) > seq)) return;
+    if (!(Number(next) > seq)) {
+      if (this.#harness === harness) this.#harness = null;
+      logEvent("pd.commit.rolled_back", { ...(this.#binding ? { tenantId: this.#binding.tenantId, agentId: this.#binding.agentId } : {}), seq });
+      await (await harness).close(bg).catch(() => {});
+      return;
+    }
     for (const id of jobs) {
       // The row is the proof: a commit that rolled back, whatever moved the sequence since, left none.
       if (this.#ap.query("SELECT 1 AS x FROM model_jobs WHERE id = ?", id).length === 0) continue;
@@ -464,7 +484,9 @@ export class PdHost {
    */
   async #startJob(request: ModelJobRequest): Promise<string> {
     const id = `mj_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    this.#staged.set(id, JSON.stringify(request));
+    const now = this.#now();
+    for (const [old, staged] of this.#staged) if (staged.at < now - STAGED_MS) this.#staged.delete(old);
+    this.#staged.set(id, { request: JSON.stringify(request), at: now });
     return id;
   }
 

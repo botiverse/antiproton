@@ -18,7 +18,10 @@
  *   name, a tool's under `unknown` (what pi-storage's `#modelOf` makes of a usage row that is not an
  *   assistant's). A batch that does not touch `pi.usage` — an importer's `appendEntry` — bills nothing;
  *   a document copied into a fork is not spend, and is not counted.
- * - **Trace**: a `model.call` row for an assistant entry that names the job it answers and ended.
+ *   A counter that went down writes a negative row, on purpose: `appendUsage` keeps negatives as the
+ *   correction of an earlier count they are, so the rows always sum to what `pi.usage` says.
+ * - **Trace**: a `model.call` row for an assistant entry that names the job it answers and ended, written
+ *   by the batch that marks that job consumed — once per job, whatever later entry carries its id again.
  * - **Model jobs**: the provider's port only stages a job in memory (`PdHost.#startJob`). Its row is
  *   inserted here, by the batch whose `poll` checkpoint carries its handle, and dispatched after that
  *   commit; a commit that never lands leaves no row and nothing dispatched. The batch that appends a
@@ -26,7 +29,8 @@
  *
  * Usage, the job rows and the consumed mark are all-or-nothing with the batch: a failure there throws,
  * and the commit rolls back. The trace row is not billing, so a failure building it is logged and the
- * batch commits without it.
+ * batch commits without it; an entry whose messages are not in the shape this reads is logged and
+ * skipped, as it bills nothing (billing reads `pi.usage`, not entries).
  *
  * A row's `at` is the commit's time, as pi085's is.
  */
@@ -57,8 +61,8 @@ interface BookContext {
   raw: Raw;
   /** The `ap` tables on the same connection, inside the same transaction. */
   ap: Pick<ApStore, "query">;
-  /** Jobs the provider's port started and no commit has recorded yet: id to request JSON. */
-  staged: ReadonlyMap<string, string>;
+  /** Jobs the provider's port started and no commit has recorded yet, by id. */
+  staged: ReadonlyMap<string, { request: string }>;
   /** A test seam, called last inside the transaction: a throw rolls the whole commit back. */
   fault?: (writes: readonly StorageWrite[]) => void;
 }
@@ -130,22 +134,27 @@ function usageDelta(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): 
   return out;
 }
 
-/** The assistant messages of the batch's new entries. */
-function assistantMessages(writes: readonly StorageWrite[]): MessageLike[] {
+/** The assistant messages of the batch's new entries. An entry whose `model` is not a list is logged and skipped. */
+function assistantMessages(writes: readonly StorageWrite[], owner: BookContext["owner"]): MessageLike[] {
   const out: MessageLike[] = [];
   for (const w of writes) {
     if (w.type !== "entry" || w.value.kind !== "pi.assistant") continue;
-    for (const m of (w.value.model ?? []) as readonly MessageLike[]) if (m?.role === "assistant") out.push(m);
+    const model: unknown = w.value.model ?? [];
+    if (!Array.isArray(model)) {
+      logEvent("pd.commit.unreadable_entry", { ...(owner ?? {}), entryId: Number(w.value.id), model: typeof model });
+      continue;
+    }
+    for (const m of model as readonly MessageLike[]) if (isObject(m) && m.role === "assistant") out.push(m);
   }
   return out;
 }
 
 /** The jobs whose handle a `poll` checkpoint of this batch carries and that are staged, not yet recorded. */
-function pollHandles(writes: readonly StorageWrite[], staged: ReadonlyMap<string, string>): Array<{ id: string; conversationId: number }> {
+function pollHandles(writes: readonly StorageWrite[], staged: BookContext["staged"]): Array<{ id: string; conversationId: number }> {
   const out: Array<{ id: string; conversationId: number }> = [];
   for (const w of writes) {
     if (w.type !== "task") continue;
-    const checkpoint = (w.value.state as { checkpoint?: unknown }).checkpoint;
+    const checkpoint = (w.value.state as { checkpoint?: unknown } | undefined)?.checkpoint;
     if (!isObject(checkpoint) || checkpoint.phase !== "poll" || !isObject(checkpoint.handle)) continue;
     const id = checkpoint.handle.id;
     if (typeof id === "string" && staged.has(id)) out.push({ id, conversationId: Number(w.value.conversationId) });
@@ -176,27 +185,29 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
   // Model jobs: recorded by the batch whose poll checkpoint carries the handle.
   for (const job of pollHandles(writes, ctx.staged)) {
     ctx.ap.query("INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-      job.id, Number.isSafeInteger(job.conversationId) ? job.conversationId : null, ctx.staged.get(job.id)!, ctx.now);
+      job.id, Number.isSafeInteger(job.conversationId) ? job.conversationId : null, ctx.staged.get(job.id)!.request, ctx.now);
     booked.jobs.push(job.id);
   }
 
   // Answers: the job is consumed. One whose cancel already billed a delivered answer is not billed again.
   const delta = usageDelta(exec, writes);
-  const messages = assistantMessages(writes);
+  const messages = assistantMessages(writes, ctx.owner);
   const named = new Map<string, string>();
+  /** Jobs this batch moved to consumed, with their instants: the ones that get a trace row. */
   const jobs = new Map<string, { created_at: unknown; answered_at: unknown }>();
   for (const m of messages) {
     if (typeof m.provider === "string" && typeof m.model === "string") named.set(`${m.provider}/${m.model}`, m.model);
     if (typeof m.jobId !== "string") continue;
     const row = ctx.ap.query("SELECT state, answer, created_at, answered_at FROM model_jobs WHERE id = ?", m.jobId)[0];
     if (!row) continue;
-    jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown });
     if (row.state === "cancelled" && row.answer !== null) {
       subtract(delta, `${String(m.provider)}/${String(m.model)}`, m.usage);
       logEvent("pd.jobs.consumed_after_cancel", { ...(ctx.owner ?? {}), jobId: m.jobId });
       continue;
     }
-    ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL", m.jobId);
+    if (ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL RETURNING id", m.jobId).length > 0) {
+      jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown });
+    }
   }
 
   // Usage: the pi.usage delta, as rows.
@@ -215,11 +226,13 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
       for (const m of messages) {
         if (typeof m.jobId !== "string" || !answerEnded(m.stopReason as Parameters<typeof answerEnded>[0])) continue;
         const job = jobs.get(m.jobId);
+        if (!job) continue;
+        jobs.delete(m.jobId);
         booked.trace.push(modelCallRow({
           ...owner, jobId: m.jobId, stopReason: m.stopReason as Parameters<typeof modelCallRow>[0]["stopReason"],
           model: typeof m.model === "string" ? m.model : "unknown", at: ctx.now,
-          createdAt: job ? Number(job.created_at) : null,
-          answeredAt: job && job.answered_at !== null ? Number(job.answered_at) : null,
+          createdAt: Number(job.created_at),
+          answeredAt: job.answered_at !== null ? Number(job.answered_at) : null,
         }));
       }
       appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], booked.trace);

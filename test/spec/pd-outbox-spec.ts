@@ -14,6 +14,7 @@
  */
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import { AssistantEntry, UsageDoc, type ConversationId, type StorageWrite } from "@earendil-works/pi-durable";
+import { setLogSink } from "../../src/core/log.ts";
 import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
@@ -213,8 +214,9 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await o.agent.close();
   });
 
-  add("pi.usage", "a commit that adds to pi.usage with no entry (compaction's shape) bills the delta; a tool's under `unknown`; an importer's entry that leaves pi.usage alone bills nothing", async (storage) => {
-    const o = pdObject(storage);
+  add("pi.usage", "a commit that adds to pi.usage with no entry (compaction's shape) bills the delta; a tool's under `unknown`; an importer's entry that leaves pi.usage alone bills nothing, and carrying a consumed job's id again traces nothing", async (storage) => {
+    const seen: Array<readonly StorageWrite[]> = [];
+    const o = pdObject(storage, { commitFault: (writes) => { seen.push(writes); } });
     await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
     check(show(usagePairs(storage)) === show(Q1_USAGE), `control: the turn billed ${show(usagePairs(storage))}`);
     storage.sql.exec("DELETE FROM usage_outbox");
@@ -236,16 +238,39 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await commit(async (tx) => { (await tx.doc(UsageDoc, id)).tools.search = { ...zero, input: 5, output: 2, totalTokens: 7 }; });
     check(show(usagePairs(storage)) === show([["unknown:input", 5], ["unknown:output", 2]]), `the tool's usage billed ${show(usagePairs(storage))}`);
     storage.sql.exec("DELETE FROM usage_outbox");
-    // An importer's entry, usage and all, that does not touch pi.usage: not spend, nothing billed or traced.
-    const traceBefore = outboxes(storage).trace.length;
+    // An importer's entry, usage and all, that does not touch pi.usage, and that carries the id of the job the turn
+    // consumed: not spend, and that job's span was written once already. Nothing billed, nothing traced.
+    const [job] = pdJobs(storage);
+    const traceBefore = show(outboxes(storage).trace);
+    check(outboxes(storage).trace.length === 1 && job?.state === "consumed", `control: the turn's trace ${traceBefore}, job ${show(job)}`);
+    seen.length = 0;
     await commit(async (tx) => {
       await tx.appendEntry(AssistantEntry, id, { model: [{
         role: "assistant", content: [{ type: "text", text: "imported" }], api: "offloaded", provider: "queue", model: "m1",
-        usage: { ...zero, input: 999, totalTokens: 999 }, stopReason: "stop", timestamp: 1, jobId: "mj_imported",
+        usage: { ...zero, input: 999, totalTokens: 999 }, stopReason: "stop", timestamp: 1, jobId: job!.id,
       } as never] });
     });
+    check(seen.some((w) => hasAnswer(w)), "control: the imported entry never reached the hook");
     check(outboxes(storage).usage.length === 0, `the import billed ${show(usagePairs(storage))}`);
-    check(outboxes(storage).trace.length === traceBefore + 1, "control: the imported entry did reach the hook (its trace row)");
+    check(show(outboxes(storage).trace) === traceBefore, `the import traced: ${show(outboxes(storage).trace)}`);
+    await o.agent.close();
+  });
+
+  add("pi.usage", "an assistant entry whose messages are not a list is logged and skipped: the commit lands and the next one bills", async (storage) => {
+    const o = pdObject(storage);
+    await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
+    const id = (await o.host.conversation("main")) as ConversationId;
+    const lines: string[] = [];
+    setLogSink((line) => lines.push(line));
+    try {
+      await o.host.withHarness(async (h) => (await o.host.handle(h, id)).commit(async (tx) => { await tx.appendEntry(AssistantEntry, id, { model: 5 as never }); }, bg));
+    } finally { setLogSink(null); }
+    check(lines.some((l) => JSON.parse(l).evt === "pd.commit.unreadable_entry"), `log ${show(lines)}`);
+    check(lines.every((l) => JSON.parse(l).evt !== "pd.commit.rolled_back"), `the commit rolled back: ${show(lines)}`);
+    check(Number(storage.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE json_extract(record, '$.model') = 5").toArray()[0]!.n) === 1, "the entry did not land");
+    // The Session is not poisoned: the next commit lands and bills.
+    await o.host.withHarness(async (h) => (await o.host.handle(h, id)).commit(async (tx) => { (await tx.doc(UsageDoc, id)).models["queue/m1"]!.input += 3; }, bg));
+    check(show(usagePairs(storage)) === show([...Q1_USAGE, ["m1:input", 3]]), `usage ${show(usagePairs(storage))}`);
     await o.agent.close();
   });
 
@@ -358,6 +383,30 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
     check(show(outboxes(storage).trace.map((r) => [r.status, r.spanId])) === show([["stop", job.id]]), `trace ${show(outboxes(storage).trace)}`);
     await next.agent.close();
+  });
+
+  add("all-or-nothing", "a hook throw once, on the answer's commit: that step fails, the harness it poisoned is dropped, and the next step reopens, completes the turn and bills once", async (storage) => {
+    let fired = 0;
+    const o = pdObject(storage, { commitFault: (writes) => { if (fired === 0 && hasAnswer(writes)) { fired++; throw new Error("the hook failed once"); } } });
+    await o.agent.say("Q1");
+    const parked = await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job && parked.wakeInMs !== null, `no job: ${show(parked)}`);
+    await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    await sleep(parked.wakeInMs);
+    const failures: string[] = [];
+    let out = await o.agent.step().catch((e: unknown) => { failures.push(String(e)); return null; });
+    check(fired === 1, "control: the fault never fired, so nothing was tested");
+    for (let i = 0; i < 20 && (out === null || out.wakeInMs !== null); i++) {
+      if (out) await sleep(out.wakeInMs!);
+      out = await o.agent.step().catch((e: unknown) => { failures.push(String(e)); return null; });
+    }
+    check(out !== null && out.wakeInMs === null, `the turn did not end: ${show(out)}; failures ${show(failures)}`);
+    check(failures.length <= 1, `steps kept failing after the rolled-back commit: ${show(failures)}`);
+    check(pdJobs(storage)[0]!.state === "consumed", `job ${show(pdJobs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
+    check(show(outboxes(storage).trace.map((r) => [r.status, r.spanId])) === show([["stop", job.id]]), `trace ${show(outboxes(storage).trace)}`);
+    await o.agent.close();
   });
 
   add("replay", "no double billing: steps, new objects and redeliveries after a turn add no row and dispatch nothing", async (storage) => {
