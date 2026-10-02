@@ -511,13 +511,13 @@ await check("sandbox/ with the container running shows its working directory, on
   must(big.ok && big.file.content === null && big.file.size === READ_MAX_BYTES + 5, JSON.stringify(big));
 });
 
-await check("a 31-day window is measured after widening to whole buckets: 31 days from midnight passes, 31 days from noon is 32 and is refused", () => {
+await check("the 31-day limit is on the window asked for, as Raft validates it: 31 days from noon passes (and covers 32 day-buckets), 31 days and a minute is refused", () => {
   const whole = parseUsageQuery(q("from=2026-09-01T00:00:00Z&to=2026-10-02T00:00:00Z&bucket=1d"), NOW);
   must(!("param" in whole), JSON.stringify(whole));
   const noon = parseUsageQuery(q("from=2026-09-01T12:00:00Z&to=2026-10-02T12:00:00Z&bucket=1d"), NOW);
-  must("param" in noon && noon.param === "to", `a 31-day request covering 32 days passed: ${JSON.stringify(noon)}`);
-  const hourly = parseUsageQuery(q("from=2026-09-01T00:30:00Z&to=2026-10-02T00:30:00Z&bucket=1h"), NOW);
-  must("param" in hourly && hourly.param === "to", `31 days and an hour passed: ${JSON.stringify(hourly)}`);
+  must(!("param" in noon), `a 31-day request Raft accepts was refused: ${JSON.stringify(noon)}`);
+  const over = parseUsageQuery(q("from=2026-09-01T12:00:00Z&to=2026-10-02T12:01:00Z&bucket=1d"), NOW);
+  must("param" in over && over.param === "to", `31 days and a minute passed: ${JSON.stringify(over)}`);
 });
 
 await check("a listing applies the read's rule to every segment: a key with a secret-named segment inside a directory is not listed", async () => {
