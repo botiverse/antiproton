@@ -19,6 +19,10 @@
  * /pi-durable runs pi-durable's conformance and our facade's cases
  * (test/spec/pi-durable-spec.ts) on this object's storage, through the async
  * `transaction` node can only imitate (test/pi-durable-do.sh).
+ *
+ * /durable-drive runs the park contract's cases (test/spec/durable-drive-spec.ts):
+ * a pi-durable harness on that facade, closed while it sleeps and reopened, on
+ * this object's storage (test/durable-drive-do.sh).
  */
 import { DurableObject } from "cloudflare:workers";
 import { createStorageConformance } from "@earendil-works/pi-agent-core/harness/session/testing";
@@ -26,6 +30,7 @@ import { PiSqliteStorage } from "../../src/store/pi-storage.ts";
 import { controlPlaneCases } from "../../test/spec/control-plane-spec.ts";
 import { usageCases } from "../../test/spec/usage-spec.ts";
 import { piDurableCases, runPiDurableCases, type PiDurableHost } from "../../test/spec/pi-durable-spec.ts";
+import { durableDriveCases, runDriveCases } from "../../test/spec/durable-drive-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
 
@@ -54,6 +59,29 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
       wipe();
       try { await use(host); } finally { wipe(); }
     }));
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
+  async runDurableDriveSpec() {
+    const host: PiDurableHost = this.ctx.storage;
+    const t0 = Date.now();
+    const wipe = () => {
+      const names = host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()
+        .map((r) => String(r.name)).filter((n) => !n.startsWith("_cf_") && !n.startsWith("sqlite_"));
+      for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
+    };
+    // No timer probe: workerd does not expose its live timers, so "no timer outlives close" is read
+    // under node only.
+    const results = await runDriveCases(durableDriveCases(async (use) => {
+      wipe();
+      try { await use(host); } finally { wipe(); }
+    }, undefined));
     return {
       backend: "durable-object",
       ms: Date.now() - t0,
@@ -117,6 +145,9 @@ export default {
       const usage = await env.PROBE.get(env.PROBE.idFromName("usage")).runUsageSpec();
       const results = [...cp.results, ...usage];
       return Response.json({ ...cp, results, passed: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length });
+    }
+    if (new URL(request.url).pathname === "/durable-drive") {
+      return Response.json(await env.PROBE.get(env.PROBE.idFromName("durable-drive")).runDurableDriveSpec());
     }
     if (new URL(request.url).pathname === "/pi-durable") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("pi-durable")).runPiDurableSpec());

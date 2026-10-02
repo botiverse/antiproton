@@ -73,6 +73,8 @@ done
 run_suite pi-storage-do bash test/pi-storage-do.sh
 # pi-durable's conformance and the SQLite facade's own cases on real Durable Object SQLite (local workerd, no network).
 run_suite pi-durable-do bash test/pi-durable-do.sh
+# The park contract: a pi-durable harness closed while it sleeps and reopened, on real Durable Object SQLite (local workerd, no network).
+run_suite durable-drive-do bash test/durable-drive-do.sh
 # The control plane's queries on real D1 SQLite, after the migrations in cf/migrations (local workerd, no network).
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 # Captured, then printed, then tested. It used to be piped through
