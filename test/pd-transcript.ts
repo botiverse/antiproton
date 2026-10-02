@@ -9,8 +9,9 @@
  * The parity is checked twice. A real conversation run on both engines (test/spec/pd-conversation.ts)
  * compares what each actually stored. Tool calls and the cancel marker cannot be run on pd yet (no tools are
  * offered until mounts are bridged, and cancel arrives with client calls), so those are compared on records
- * written in the shapes pi-durable's own writers use (harness/tool.js `appendToolResult`, harness/generation.js
- * `appendAssistant`) against the 0.85 entries of the same conversation.
+ * written in the shapes pi-durable's own writers use (@earendil-works/pi-durable 1.0.0, dist/harness/tool.js
+ * `appendToolResult` and dist/harness/generation.js `appendAssistant`) against the 0.85 entries of the same
+ * conversation.
  */
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { entriesToEvents } from "../cf/src/pi-view.ts";
