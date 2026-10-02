@@ -3,7 +3,7 @@
  * the agent's outbox (cf/src/usage-d1.ts, src/usage/outbox.ts). Run inside
  * workerd by cf/src/conformance.ts; see test/control-plane-d1.sh.
  */
-import { flushUsage, foldUsage, parseUsageQuery, priceFor, readUsage, sendUsage, usageCursor, usageFirstHours, usageGroup, DAY_MS, KEEP_HOURLY_DAYS, USAGE_WINDOWS, type UsageQuery } from "../../cf/src/usage-d1.ts";
+import { flushUsage, foldUsage, parseUsageQuery, priceFor, readAgentLedger, readUsage, sendUsage, usageBacklogSince, usageCursor, usageFirstHours, usageGroup, DAY_MS, KEEP_HOURLY_DAYS, USAGE_WINDOWS, type UsageQuery } from "../../cf/src/usage-d1.ts";
 import { appendUsage, pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
 import type { SpecCase } from "./control-plane-spec.ts";
 
@@ -338,6 +338,36 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     assert(usageGroup("tool", { agentId: "a", resource: "sandbox.container", key: "sandbox" }) === "sandbox", "sandbox group");
     assert(usageGroup("model", { agentId: "a", resource: "model.tokens", key: "vendor:model:input" }) === "vendor:model", "a model name with a colon");
     assert(priceFor([], { bucket: 0, resource: "r", key: "k", unit: "u" }) === null, "no price is free");
+  });
+
+  add("one agent's ledger: its own rows only, both tables, summed into UTC buckets inside the window", async () => {
+    await sendUsage(db, "t", "a", 0, [
+      row(1, { at: T0 + 10 * 60_000, quantity: 3 }), row(2, { at: T0 + H + 1, quantity: 4 }),
+      row(3, { at: T0 + DAY_MS + 5, quantity: 100 }),
+    ]);
+    await sendUsage(db, "t", "b", 0, [row(1, { agentId: "b", quantity: 50 })]);
+    await sendUsage(db, "u", "a", 0, [row(1, { tenantId: "u", quantity: 70 })]);
+    await db.prepare("INSERT INTO usage_daily(tenant_id, day, agent_id, resource, key, unit, quantity) VALUES ('t', ?, 'a', 'model.tokens', 'm1:input', 'tokens', 9)")
+      .bind(T0 - DAY_MS).run();
+    const hourly = await readAgentLedger(db, "t", "a", T0, T0 + DAY_MS, H);
+    assert(JSON.stringify(hourly.map((r) => [(r.bucket - T0) / H, r.quantity])) === "[[0,3],[1,4]]", `hourly ${JSON.stringify(hourly)}`);
+    const daily = await readAgentLedger(db, "t", "a", T0 - DAY_MS, T0 + 2 * DAY_MS, DAY_MS);
+    assert(JSON.stringify(daily.map((r) => [(r.bucket - T0) / DAY_MS, r.quantity])) === "[[-1,9],[0,7],[1,100]]", `daily ${JSON.stringify(daily)}`);
+    assert(daily.every((r) => r.resource === "model.tokens" && r.key === "m1:input" && r.unit === "tokens"), JSON.stringify(daily));
+  });
+
+  add("what an object has not sent: nothing without tables, the oldest unsent row's time after a partial send, nothing once all is sent", async () => {
+    assert(usageBacklogSince(sql) === null, "an object that never kept usage");
+    assert(!sql.exec("SELECT name FROM sqlite_master WHERE name IN ('usage_outbox','usage_sent')").toArray().length, "the look made the tables");
+    appendUsage(sql as any, [
+      { at: T0 + 5, tenantId: "t", agentId: "a", resource: "js.run", key: "run_js", quantity: 1, unit: "runs" },
+      { at: T0 + 9, tenantId: "t", agentId: "a", resource: "js.run", key: "run_js", quantity: 1, unit: "runs" },
+    ]);
+    assert(usageBacklogSince(sql) === T0 + 5, `before any send: ${usageBacklogSince(sql)}`);
+    await flushUsage(db, sql, "t", "a", 1);
+    assert(usageBacklogSince(sql) === T0 + 9, `after one row was sent: ${usageBacklogSince(sql)}`);
+    await flushUsage(db, sql, "t", "a");
+    assert(usageBacklogSince(sql) === null, `after all was sent: ${usageBacklogSince(sql)}`);
   });
 
   return cases;

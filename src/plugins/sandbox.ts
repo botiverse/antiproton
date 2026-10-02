@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
+import type { HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
 import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -1443,6 +1443,192 @@ export function machinesList(
   } as unknown as Json;
 }
 
+/**
+ * The states in which run9 says a box is awake. Its docs (https://run.sys9.ai/docs/box, read
+ * 2026-10-02): "ready: the box exists, but it is not awake yet. idle: the box is awake and waiting
+ * for the next exec or file transfer. running: an exec or file transfer is active." and "Boxes wake
+ * when used and can sleep when idle." (https://run.sys9.ai/docs/execute-commands: "The box wakes for
+ * the command. When it is idle, run9 can let it sleep."). So `idle` and `running` are awake;
+ * `ready`, anything else, or a state this code has never seen is not.
+ *
+ * **What this cannot close.** run9 sleeps an idle box on its own schedule, which nothing here can
+ * hold off, so a box listed `idle` may go to sleep in the one round trip before the read's command
+ * reaches it, and that command then wakes it. Our own release cannot land there (the mount's lock
+ * covers the check and the start), only run9's sleep can. run9 documents file reads that never wake
+ * a box (https://run.sys9.ai/docs/file-transfer: "These commands do not start a transfer job or wake
+ * a stopped box", for `sys9 run box file ls/stat/cat`), but the HTTP API behind them is not in its
+ * swagger (https://api.run.sys9.ai/swagger.yaml, read 2026-10-02, has only `files/download` and
+ * `files/upload`, and a `file_access_url` field without a protocol), so it is not used until it is
+ * documented or measured.
+ */
+export const AWAKE_STATES: readonly string[] = ["idle", "running"];
+
+/** The longest a look may take, end to end: a person is waiting, and a look is never worth more. */
+export const LOOK_LIST_MS = 10_000;
+export const LOOK_READ_MS = 20_000;
+
+type Box = { boxId: string; cfg: ReturnType<typeof cfgOf>; auth: string; deadline: number };
+
+/** run9's API with the look's deadline as every request's limit. */
+async function run9Call(box: Box, method: string, path: string, body?: unknown): Promise<any> {
+  const left = box.deadline - Date.now();
+  if (left <= 0) throw new Error(`run9 ${method} ${path}: the look ran out of time`);
+  const res = await fetch(box.cfg.endpoint + path, {
+    method, headers: { authorization: box.auth, "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(left),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`run9 ${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+/**
+ * The main machine's box, only if it is running by both records: this mount's own (a box, not
+ * switched off by the idle lease) and run9's list, which is a read and starts nothing. Null for
+ * anything less, without a call to run9 when our own record already says no.
+ */
+async function awakeBox(ctx: PluginContext, deadline: number): Promise<Box | null> {
+  const box = (await readMount(ctx))?.machines[MAIN_MACHINE];
+  if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
+  const cfg = cfgOf(ctx);
+  const cred = JSON.parse(ctx.credential) as Run9Credential;
+  const b: Box = { boxId: box.boxId, cfg, auth: "Basic " + btoa(`${cred.ak}:${cred.sk}`), deadline };
+  const boxes = await run9Call(b, "GET", `/projects/${cfg.project}/workspace/boxes`);
+  const listed = Array.isArray(boxes) ? boxes.find((x: any) => x?.box_id === box.boxId) : null;
+  return listed && AWAKE_STATES.includes(String(listed.state)) ? b : null;
+}
+
+/**
+ * The scripts a look runs: `$1` is the path, `$2` the working directory. Both are resolved with
+ * `realpath`, and a path whose real location is not inside the working directory is refused (exit 4)
+ * — a link inside it may point anywhere on the machine. Exit 3: no such path; exit 5: not a directory.
+ * Nothing is followed after that: `find` without `-L` lists a link as the link.
+ */
+const RESOLVE = 'root=$(realpath -e -- "$2") || exit 3; r=$(realpath -e -- "$1") || exit 3; ' +
+  'case "$r" in "$root"|"$root"/*) ;; *) exit 4;; esac; ';
+export const LIST_SCRIPT = RESOLVE + 'test -d "$r" || exit 5; ' +
+  'n=$(find "$r" -mindepth 1 -maxdepth 1 -printf . | wc -c); ' +
+  "find \"$r\" -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n' | head -n 1000; printf '#total\\t%s\\n' \"$n\"";
+export const STAT_SCRIPT = RESOLVE + "find \"$r\" -maxdepth 0 -printf '%y\\t%s\\t%T@\\t'; printf '%s\\n' \"$r\"";
+
+/** Start a script on an awake box; its exec id. */
+async function startLook(box: Box, script: string, path: string): Promise<string> {
+  const root = "/" + segmentsOf(box.cfg.workdir).join("/");
+  const started = await run9Call(box, "POST", `/projects/${box.cfg.project}/workspace/boxes/${box.boxId}/background-execs`, {
+    command: ["sh", "-c", script, "sh", path, root],
+  });
+  return String(started.exec_id);
+}
+
+/** Wait for a look's command; its exit code and output. */
+async function finishLook(box: Box, execId: string): Promise<{ exit: number; out: string }> {
+  for (;;) {
+    const rec = await run9Call(box, "GET", `/projects/${box.cfg.project}/workspace/execs/${execId}`);
+    if (TERMINAL.includes(rec.state)) {
+      const exit = Number(rec.exit_code);
+      if (rec.state !== "succeeded" && ![3, 4, 5].includes(exit)) throw new Error(`a look in ${box.boxId}: ${rec.state} ${String(rec.reason ?? "").slice(0, 120)}`);
+      return { exit, out: String(rec.output_summary ?? "") };
+    }
+    if (Date.now() + 200 > box.deadline) throw new Error(`a look in ${box.boxId} did not finish in time`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+const FIND_LINE = /^([a-zA-Z])\t(\d+)\t(\d+(?:\.\d+)?)\t(.+)$/;
+
+/**
+ * The listing script's output as entries, and whether any were left out: past the 1000 the script
+ * prints, or lost to run9 cutting a long output (its total line is then missing, or more than the
+ * lines that arrived whole).
+ */
+export function parseListing(out: string): { entries: Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }>; truncated: boolean; omitted?: number } {
+  const entries: Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }> = [];
+  let total: number | null = null;
+  for (const line of out.split("\n")) {
+    const t = /^#total\t(\d+)$/.exec(line);
+    if (t) { total = Number(t[1]); continue; }
+    const m = FIND_LINE.exec(line);
+    if (!m || m[4] === "." || m[4] === "..") continue;
+    entries.push({ name: m[4]!, isDirectory: m[1] === "d", size: Number(m[2]), modifiedAt: Math.round(Number(m[3]) * 1000) });
+  }
+  if (total === null) return { entries, truncated: true };
+  const omitted = Math.max(0, total - entries.length);
+  return omitted ? { entries, truncated: true, omitted } : { entries, truncated: false };
+}
+
+/** A body read up to `max` bytes and no further; null when it is longer. */
+async function readCapped(res: Response, max: number): Promise<{ bytes: Uint8Array | null; seen: number }> {
+  if (!res.body) return { bytes: new Uint8Array(0), seen: 0 };
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let seen = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    seen += value.byteLength;
+    if (seen > max) { await reader.cancel().catch(() => {}); return { bytes: null, seen }; }
+    parts.push(value);
+  }
+  const bytes = new Uint8Array(seen);
+  let at = 0;
+  for (const p of parts) { bytes.set(p, at); at += p.byteLength; }
+  return { bytes, seen };
+}
+
+/** The working directory of the main machine, read only while it is awake (see `Holding.files`). */
+const sandboxFiles: HeldFiles = {
+  async list(ctx, path, locked) {
+    const deadline = Date.now() + LOOK_LIST_MS;
+    // Behind the lock: deciding the box is awake, and starting the command on it. The wait is not.
+    const started = await locked(async () => {
+      const box = await awakeBox(ctx, deadline);
+      return box ? { box, execId: await startLook(box, LIST_SCRIPT, boxPathOf(box.cfg, path)) } : null;
+    });
+    if (!started) return { running: false };
+    const got = await finishLook(started.box, started.execId);
+    if (got.exit === 3 || got.exit === 4) return { running: true, found: false };
+    if (got.exit === 5) return { running: true, found: false, notDirectory: true };
+    return { running: true, found: true, ...parseListing(got.out) };
+  },
+  async read(ctx, path, maxBytes, locked) {
+    const deadline = Date.now() + LOOK_READ_MS;
+    const started = await locked(async () => {
+      const box = await awakeBox(ctx, deadline);
+      return box ? { box, execId: await startLook(box, STAT_SCRIPT, boxPathOf(box.cfg, path)) } : null;
+    });
+    if (!started) return { running: false };
+    const got = await finishLook(started.box, started.execId);
+    if (got.exit !== 0) return { running: true, found: false };
+    const m = FIND_LINE.exec(got.out.split("\n")[0] ?? "");
+    if (!m) throw new Error("a look could not read what the path is");
+    const kind = m[1] === "f" ? "file" as const : m[1] === "d" ? "directory" as const : "other" as const;
+    const size = Number(m[2]);
+    const modifiedAt = Math.round(Number(m[3]) * 1000);
+    const real = m[4]!;
+    if (kind !== "file" || size > maxBytes) return { running: true, found: true, kind, size, modifiedAt, bytes: null };
+    // Behind the lock again: the box is asked again whether it is awake, since a download from one
+    // that went to sleep in between may wake it, and the body is read no further than the cap.
+    const body = await locked(async () => {
+      const box = await awakeBox(ctx, deadline);
+      if (!box) return null;
+      const res = await fetch(`${box.cfg.endpoint}/projects/${box.cfg.project}/workspace/boxes/${box.boxId}/files/download?box_abs_path=${encodeURIComponent(real)}`, {
+        headers: { authorization: box.auth }, signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      });
+      if (!res.ok) throw new Error(`run9 download of ${real} -> ${res.status}: ${(await res.text()).slice(0, 160)}`);
+      return readCapped(res, maxBytes);
+    });
+    if (!body) return { running: false };
+    return { running: true, found: true, kind, size: body.bytes ? body.seen : Math.max(size, body.seen), modifiedAt, bytes: body.bytes };
+  },
+};
+
+/** Where a workspace path is inside the box: under the working directory, never above it. */
+function boxPathOf(cfg: ReturnType<typeof cfgOf>, path: string): string {
+  const root = "/" + segmentsOf(cfg.workdir).join("/");
+  const rest = segmentsOf(path).join("/");
+  return rest ? `${root === "/" ? "" : root}/${rest}` : root;
+}
+
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
   // **"container", never "sandbox"**, in every sentence below that the model
   // reads. The harness already calls the per-execution JavaScript isolate a
@@ -1499,6 +1685,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // "release" and "quiet" in the idle scan, so renaming either would have
     // left it telling the agent to call something that does not exist.
     tools: { release: "release", postpone: "quiet" },
+    /** The main machine's working directory, only while it is awake; never starts it. */
+    files: sandboxFiles,
     /** What this mount is keeping alive, read from its own state and nothing
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {

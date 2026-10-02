@@ -70,11 +70,15 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
+import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { countHeldTime } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
-import { flushUsage, parseUsageQuery, readUsage } from "./usage-d1.ts";
+import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, usageBacklogSince } from "./usage-d1.ts";
+import type { SurfaceDeps } from "./agent-surface/surface.ts";
+import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
+import { heldFiles as surfaceHeldFiles, stateGet as surfaceStateGet, stateList as surfaceStateList } from "./agent-surface/in-agent.ts";
 import { flushActivityThenTrace } from "./activity-raft.ts";
 import { usagePanel } from "./usage.ts";
 import { d1ApiKeys, admit, d1Identities, d1InboundHooks, type IdentityDirectory } from "./control-plane.ts";
@@ -1781,6 +1785,42 @@ export class AgentDO extends DurableObject<Env> {
     return provisionPushStatus(this.runtime(), tenantId, agentId);
   }
 
+  /**
+   * Whether this object is the agent named, read without claiming it: a look at an object that was
+   * never made must not make it the agent's (`#claim` writes the owner row when it is missing).
+   */
+  #isAgent(tenantId: string, agentId: string): boolean {
+    try {
+      const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+      return !!row && row.tenant_id === tenantId && row.agent_id === agentId;
+    } catch { return false; }
+  }
+
+  /** The agent's state rows, for its workspace view (cf/src/agent-surface/). Read-only; nothing of a secret. */
+  async surfaceStateList(tenantId: string, agentId: string, prefix: string, limit: number) {
+    if (!this.#isAgent(tenantId, agentId)) return [];
+    return surfaceStateList(this.runtime(), tenantId, agentId, prefix, limit);
+  }
+
+  /** As JSON text: a stored value is any JSON, which the RPC types cannot carry as a type (see UiTranscript). */
+  async surfaceStateGet(tenantId: string, agentId: string, key: string): Promise<string | null> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    const got = await surfaceStateGet(this.runtime(), tenantId, agentId, key);
+    return got ? JSON.stringify(got) : null;
+  }
+
+  /** The files the agent's container holds, only while it is already running; never starts it. */
+  async surfaceHeldFiles(tenantId: string, agentId: string, op: { op: "list"; path: string } | { op: "read"; path: string; maxBytes: number }) {
+    if (!this.#isAgent(tenantId, agentId)) return { running: false as const };
+    return surfaceHeldFiles(this.runtime(), tenantId, agentId, op);
+  }
+
+  /** When the oldest usage this object has not yet sent happened; null when it has sent all of it. */
+  async surfaceUsageBacklog(tenantId: string, agentId: string): Promise<number | null> {
+    if (!this.#isAgent(tenantId, agentId)) return null;
+    return usageBacklogSince(this.sql as any);
+  }
+
   async hookDropSecret(tenantId: string, agentId: string, hookId: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("hookDropSecret", () => this.runtime().dropHookSecret(tenantId, agentId, hookId));
@@ -1849,11 +1889,12 @@ export class AgentDO extends DurableObject<Env> {
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
     const session = await this.#conversation(tenantId, agentId, taskId);
-    return this.#busy("uiCompact", async () => {
+    // A refusal comes back as a value, not a throw: see cf/src/compact-refusal.ts.
+    return this.#busy("uiCompact", () => refusingCompaction(async () => {
       const r = await this.runtime().requestCompaction(tenantId, agentId, session);
       await this.#wake();
       return r;
-    });
+    }));
   }
 
   async uiSay(
@@ -2769,12 +2810,66 @@ async function provision(request: Request, env: Env, url: URL): Promise<Response
   const deps = provisionDeps(env);
   try {
     const res = await handleProvision(request.method, url.pathname.slice("/provision".length),
-      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId") }, body, who, deps);
+      { idempotencyKey: request.headers.get("idempotency-key"), raftServerId: url.searchParams.get("raftServerId") }, body, who, deps, url.searchParams);
     return res ?? refuse(404, "not_found", `${request.method} ${url.pathname} is not part of raft-agent-provider.v1`);
   } catch (e) {
     const message = typeof e === "object" && e !== null && "message" in e ? String((e as { message?: unknown }).message) : String(e);
     return refuse(500, "internal", message);
   }
+}
+
+/**
+ * What an agent's usage and workspace are read through (cf/src/agent-surface/), for both the public
+ * API and the provider binding: the ledger in D1, the artifacts bucket directly, and the agent's own
+ * object for its state rows, its container's files and the usage it has not sent yet. Reads only.
+ */
+function surfaceDeps(env: Env): SurfaceDeps {
+  // Named by the four methods used rather than as the object's whole stub: checked against the whole
+  // RPC type, this literal is "excessively deep" for the compiler, and the methods' own signatures
+  // above are what the calls rely on.
+  type SurfaceObject = {
+    surfaceUsageBacklog(tenantId: string, agentId: string): Promise<number | null>;
+    surfaceStateList(tenantId: string, agentId: string, prefix: string, limit: number): Promise<Array<{ key: string; bytes: number; updatedAt: number }>>;
+    surfaceStateGet(tenantId: string, agentId: string, key: string): Promise<string | null>;
+    surfaceHeldFiles(tenantId: string, agentId: string, op: { op: "list"; path: string } | { op: "read"; path: string; maxBytes: number }): Promise<HeldListing | HeldRead>;
+  };
+  // The cast below is checked here instead: the object's own methods must still be these.
+  const same: SurfaceObject = null as unknown as Pick<AgentDO, keyof SurfaceObject>;
+  void same;
+  const stub = (tenantId: string, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId))) as unknown as SurfaceObject;
+  const object = (o: R2Object) => ({ key: o.key, size: o.size, uploaded: o.uploaded.getTime(), ...(o.httpMetadata?.contentType ? { contentType: o.httpMetadata.contentType } : {}) });
+  return {
+    usage: {
+      now: () => Date.now(),
+      ledger: (tenantId, agentId, from, to, size) => readAgentLedger(env.CONTROL_DB, tenantId, agentId, from, to, size),
+      backlogSince: (tenantId, agentId) => stub(tenantId, agentId).surfaceUsageBacklog(tenantId, agentId),
+      warn: (m) => console.warn(m),
+    },
+    workspace: {
+      state: {
+        list: (tenantId, agentId, prefix, limit) => stub(tenantId, agentId).surfaceStateList(tenantId, agentId, prefix, limit),
+        get: async (tenantId, agentId, key) => {
+          const text = await stub(tenantId, agentId).surfaceStateGet(tenantId, agentId, key);
+          return text ? JSON.parse(text) : null;
+        },
+      },
+      artifacts: {
+        list: async (prefix, cursor) => {
+          const page = await env.ARTIFACTS.list({ prefix, delimiter: "/", ...(cursor ? { cursor } : {}), include: ["httpMetadata"] });
+          return { objects: page.objects.map(object), prefixes: page.delimitedPrefixes, ...(page.truncated ? { cursor: page.cursor } : {}) };
+        },
+        head: async (key) => { const o = await env.ARTIFACTS.head(key); return o ? object(o) : null; },
+        get: async (key) => {
+          const o = await env.ARTIFACTS.get(key);
+          return o ? { ...object(o), bytes: new Uint8Array(await o.arrayBuffer()) } : null;
+        },
+      },
+      sandbox: {
+        list: async (tenantId, agentId, path) => (await stub(tenantId, agentId).surfaceHeldFiles(tenantId, agentId, { op: "list", path })) as HeldListing,
+        read: async (tenantId, agentId, path, maxBytes) => (await stub(tenantId, agentId).surfaceHeldFiles(tenantId, agentId, { op: "read", path, maxBytes })) as HeldRead,
+      },
+    },
+  };
 }
 
 /**
@@ -2788,6 +2883,7 @@ function provisionDeps(env: Env): ProvisionDeps {
   return {
     now: () => Date.now(),
     registry: d1ProvisionedAgents(env.CONTROL_DB),
+    surface: surfaceDeps(env),
     agent: {
       adopt: async (tenantId, agentId, spec) => {
         const r = await stub(tenantId, agentId).provisionAdopt(tenantId, agentId, JSON.stringify(spec));
@@ -2879,6 +2975,7 @@ async function v1(request: Request, env: Env, url: URL): Promise<Response> {
   };
   const deps: AgentsApiDeps = {
     now: () => Date.now(),
+    surface: { tenantId, deps: surfaceDeps(env) },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     // The agent's object pushes after every change; the stream reads when it hears (agents-api/watch.ts).
     watch: async (agentId) => {
@@ -3409,7 +3506,8 @@ async function route(request: Request, env: Env): Promise<Response> {
           const a = String(url.searchParams.get("agentId"));
           const k = url.searchParams.get("taskId") ?? `t_${a}`;
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          return Response.json(await s2.uiCompact(t, a, k));
+          const r = await s2.uiCompact(t, a, k);
+          return compactionRefusal(r, "json") ?? Response.json(r);
         }
         case "/admin/rename-mount": {
           // Renaming a mount is an operator act, not something an agent or a
@@ -3782,7 +3880,8 @@ async function route(request: Request, env: Env): Promise<Response> {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
-          await stub.uiCompact(gate.tenantId, agentId, taskId);
+          const refused = compactionRefusal(await stub.uiCompact(gate.tenantId, agentId, taskId), "text");
+          if (refused) return refused;
           const t = await stub.uiTranscript(gate.tenantId, agentId, taskId);
           return html(trajectory(conversation(t.events), t.byOp, t.busy));
         }

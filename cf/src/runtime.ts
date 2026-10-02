@@ -1814,8 +1814,9 @@ export class AgentRuntime {
     return agent;
   }
 
-  /** Compact on demand, the way pi's /compact does: an operation like any
-   *  other, so it is admitted, durable, and drives on the same pass. */
+  /** Compact on demand. Both engines refuse today with `CompactionUnavailable`
+   *  (src/runtime/engine.ts), writing nothing; the object turns that into a
+   *  value its routes answer 409 with (cf/src/compact-refusal.ts). */
   async requestCompaction(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
     return (await this.agent(tenantId, agentId, session)).compact();
   }

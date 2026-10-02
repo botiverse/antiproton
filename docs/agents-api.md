@@ -349,6 +349,9 @@ Canceling an idle session is accepted as a no-op. If a turn is active, Antiproto
 | | `GET` | `/v1/agents/sessions/{id}/turns/{turn_id}` | Retrieve details of a specific turn (includes usage) |
 | **Events** | `POST` | `/v1/agents/sessions/{id}/events` | Submit input events (`agent.session.input.*`) |
 | | `GET` | `/v1/agents/sessions/{id}/events` | Open SSE event stream |
+| **Usage & workspace** | `GET` | `/v1/agents/{id}/usage` | The agent's usage, bucketed, every row summable ([`agent-surface.md`](agent-surface.md)) |
+| | `GET` | `/v1/agents/{id}/workspace/files` | One directory level of the agent's state, artifacts and running container |
+| | `GET` | `/v1/agents/{id}/workspace/files/read` | One file of the agent's workspace, at most 1 MB returned |
 
 ---
 

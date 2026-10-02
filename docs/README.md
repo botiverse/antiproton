@@ -3,6 +3,7 @@
 | file | what it is | authoritative? |
 |---|---|---|
 | [`agents-api.md`](agents-api.md) | OpenAI Agents API compatibility guide, SDK configuration, and endpoint reference | yes — preview API guide |
+| [`agent-surface.md`](agent-surface.md) | an agent's usage and workspace files: the three read-only endpoints on `/v1` and their Raft provider binding | yes — endpoint contract |
 | [`ax-design.md`](ax-design.md) | Agent Experience (AX) architecture: how official apps talk to agents in two layers, premise tracking, and structured interruptions | yes — design specification |
 | [`plugins.md`](plugins.md) | how to write, configure, observe, and test plugins in Antiproton | yes — plugin authoring guide |
 | [`philosophy.md`](philosophy.md) | the core philosophy, engineering invariants, and distributed systems rationale behind antiproton | yes — design manifesto |

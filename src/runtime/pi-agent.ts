@@ -22,7 +22,7 @@ import { createModels } from "@earendil-works/pi-ai";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { ensureBackgroundTable } from "./background-jobs.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { AgentHarness } from "@earendil-works/pi-agent-core";
+import { AgentHarness, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 import { LaneBusy } from "@earendil-works/pi-agent-core";
 import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
@@ -31,7 +31,7 @@ import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION }
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { answerClientCall, dropClientCalls, ensureClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
-import type { AgentEngine, EngineEntry, EngineEntryScan, EngineStatus, StepOutcome } from "./engine.ts";
+import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 export type { StepOutcome } from "./engine.ts";
 
@@ -136,6 +136,8 @@ export function markSession(sql: SqlHost["sql"], session: string, active: boolea
 }
 
 export const LANE = "main";
+/** What a refused compaction says, to the console and to the operator's /admin/compact. */
+export const COMPACTION_UNAVAILABLE = "compaction is unavailable on this agent: the model provider can't produce a summary synchronously";
 
 export interface ModelChoice {
   provider: string;
@@ -248,8 +250,25 @@ export class PiAgent implements AgentEngine {
       tools: bridged as any,
       // There is no non-deferred path; this makes the intent explicit to pi.
       streamOptions: { deferred: true },
+      // Compaction cannot work here: pi forces `deferred: false` for the
+      // summary call (dist/harness/runtime/drive/structural.js `summaryContext`,
+      // pi-agent-core 0.85.1), this provider answers deferred regardless, and
+      // the summarizer (dist/harness/compaction/compaction.js) takes the empty
+      // reply as the summary — an entry that drops all history before the cut,
+      // and a model job dispatched for nothing. Off, so the automatic threshold
+      // never fires; the before_compaction hook below covers the paths that do
+      // not read this setting.
+      compaction: { ...DEFAULT_COMPACTION_SETTINGS, enabled: false },
       ...(opts.entryProjectors ? { entryProjectors: opts.entryProjectors as any } : {}),
     }, CTX);
+
+    // The setting above is read by the threshold check only: a manual
+    // compaction and pi's overflow recovery (dist/harness/runtime/drive/
+    // response.js → structural.js `prepareOverflowCompaction`) do not read it,
+    // and `setCompactionSettings` can turn it back on. Every compaction passes
+    // this hook before its model call, so declining here means none of them
+    // writes an empty summary or dispatches a job.
+    harness.hooks.on("before_compaction", () => ({ decline: true }));
 
     const lane = await harness.lane(LANE, CTX);
     // pi keeps the names of the tools a session was configured with, and
@@ -447,8 +466,9 @@ export class PiAgent implements AgentEngine {
     return operationId;
   }
 
-  async compact() {
-    return this.#lane.accept({ kind: "compaction" }, CTX);
+  /** Refused, writing nothing: see `compaction` in `open` for why it cannot work on this provider. */
+  async compact(): Promise<never> {
+    throw new CompactionUnavailable(COMPACTION_UNAVAILABLE);
   }
 
   /**

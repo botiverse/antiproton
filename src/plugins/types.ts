@@ -1494,6 +1494,49 @@ export interface Holding {
    * every fact attached (`markReleased`).
    */
   release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | boolean | void>;
+  /**
+   * The files of the thing held, for a person looking at the agent's workspace (cf/src/agent-surface/
+   * workspace.ts). Only while it is already running: **neither method may start it**, since starting is
+   * what is billed. Not running answers `{ running: false }` and touches nothing at the far end.
+   *
+   * The gateway hands them the mount's own lock (`ToolGateway.heldFiles`), so a release cannot switch
+   * the thing off between the plugin's "it is running" and the step that reads it. They must not write
+   * the mount's state: a look is not a use, and must not postpone an idle release.
+   *
+   * `path` is relative to the thing's working directory, `""` for the directory itself, and has no `.`
+   * or `..` segment. Absent: the mount has no files to show.
+   */
+  files?: HeldFiles;
+}
+
+export type HeldListing =
+  | { running: false }
+  | { running: true; found: false; notDirectory?: true }
+  | {
+    running: true; found: true;
+    /** Symbolic links and other non-regular entries are listed as files, never followed. */
+    entries: Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }>;
+    /** Entries exist that are not in `entries`; `omitted` says how many when it is known. */
+    truncated: boolean; omitted?: number;
+  };
+/**
+ * `kind` is what the path is: only a `file` (a regular file, reached without leaving the working
+ * directory through a link) has bytes. `bytes` is null for anything else, or when the file is larger
+ * than the `maxBytes` asked for; `size` is still reported.
+ */
+export type HeldRead =
+  | { running: false }
+  | { running: true; found: false }
+  | { running: true; found: true; kind: "file" | "directory" | "other"; size: number; modifiedAt: number; bytes: Uint8Array | null };
+
+export interface HeldFiles {
+  /**
+   * `locked` runs a step behind the mount's own lock. A plugin takes it only for the steps that must
+   * not interleave with a release (deciding the thing is running and starting the read on it), not
+   * for the wait on the far end, so a look never holds the agent's own calls for long.
+   */
+  list(ctx: PluginContext, path: string, locked: <T>(fn: () => Promise<T>) => Promise<T>): Promise<HeldListing>;
+  read(ctx: PluginContext, path: string, maxBytes: number, locked: <T>(fn: () => Promise<T>) => Promise<T>): Promise<HeldRead>;
 }
 
 /**
