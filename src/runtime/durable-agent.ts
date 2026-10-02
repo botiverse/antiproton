@@ -794,7 +794,10 @@ export class DurableAgent implements AgentEngine {
   /**
    * The caller's results, committed to the conversation's `ap.clientCalls` in one commit (a call that has a result
    * keeps it), and the harness resumed: a tool waiting in this isolate sees the commit at once, and a parked one is run
-   * again and reads it. A result for a call whose tool has not run yet is kept for it.
+   * again and reads it. A result for a call whose tool has not run yet is kept for it; one for a call that already
+   * has its result in the context (a late answer after a cancel, a repeat for a call already returned) is dropped, so
+   * nothing is kept that no tool will read. A call id unknown to the session is refused before this
+   * (cf/src/runtime.ts `submitToolResults`).
    */
   async answerClientCalls(results: ReadonlyArray<{ callId: string; output: string; isError: boolean }>): Promise<void> {
     const id = await this.#host.conversation(this.#session);
@@ -803,11 +806,13 @@ export class DurableAgent implements AgentEngine {
     const at = this.#host.now;
     await this.#host.withHarness(async (h) => {
       const c = await this.#host.handle(h, id);
+      const returned = new Set((await c.context(bg)).entries.filter((e) => e.kind === "pi.tool-result")
+        .map((e) => String((e.model?.[0] as { toolCallId?: unknown } | undefined)?.toolCallId)));
       await c.commit(async (tx) => {
         const doc = await tx.doc(ClientCallsDoc, c.id);
         for (const r of results) {
           const call = doc.calls[r.callId];
-          if (call?.answer) continue;
+          if (call?.answer || (!call && returned.has(r.callId))) continue;
           doc.calls[r.callId] = { ...(call ? { ...call } : { name: "", arguments: "", at }), answer: { output: r.output, isError: r.isError } };
         }
       }, bg);

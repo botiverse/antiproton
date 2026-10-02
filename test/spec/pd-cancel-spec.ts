@@ -81,12 +81,13 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
  * `script` in turn (`at` counts the turns used so far, across calls). Returns the last outcome.
  */
 const taken = new WeakMap<Eng, Set<string>>();
-async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Request[]) {
+async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Request[], onPass?: () => Promise<void>) {
   const answered = taken.get(e) ?? new Set<string>();
   taken.set(e, answered);
   for (let guard = 0; guard < 300; guard++) {
     const t0 = Date.now();
     const out = await e.agent.step();
+    await onPass?.();
     // No pass driven here has work that runs that long (a slow call is stepped by `stepUntil` instead): a pd step that
     // reaches its deadline was held open by something the park rule did not let go.
     check(e.name !== "pd" || Date.now() - t0 < STEP_DEADLINE_MS - 500,
@@ -102,6 +103,7 @@ async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Reques
       const turn = script[at.n++];
       check(turn, `${e.name}: the model was called ${at.n} times; the script has ${script.length} turns. Last: ${show(req.messages.slice(-2))}`);
       await e.agent.deliver(id, fromResponse(turn(req), job.model, id));
+      await onPass?.();
     }
     if (pending.length) continue;
     if (out.open === 0 && out.wakeInMs === null) {
@@ -131,6 +133,34 @@ async function apiView(e: Eng) {
   const { turns } = sessionTranscript({ entries, running, pending }, { sessionId: "s", agentId: "a" });
   const status = running ? "in_progress" : pending.length ? "requires_action" : "idle";
   return { status, turns: turns.map((t) => t.status), pending: pending.map((p) => p.call_id) };
+}
+
+/**
+ * Every reading of the session's turns, by turn id, as a client polling the Agents API would see them: `sample()` takes
+ * one. `check()` asserts that a turn that read terminal never reads otherwise afterwards, so each turn ends once.
+ */
+function turnHistory(e: Eng) {
+  const seen = new Map<string, string[]>();
+  const terminal = new Set(["completed", "failed", "cancelled"]);
+  return {
+    async sample() {
+      const running = await e.agent.running();
+      const pending = running ? [] : await e.agent.waitingClientCalls();
+      const { turns } = sessionTranscript({ entries: await e.agent.branch(), running, pending }, { sessionId: "s", agentId: "a" });
+      for (const t of turns) {
+        const h = seen.get(t.id) ?? [];
+        if (h.at(-1) !== t.status) h.push(t.status);
+        seen.set(t.id, h);
+      }
+    },
+    check(what: string) {
+      for (const [id, h] of seen) {
+        const end = h.findIndex((x) => terminal.has(x));
+        check(end === -1 || end === h.length - 1, `${e.name}, ${what}: turn ${id} read ${show(h)}: terminal, then not`);
+      }
+      return [...seen.values()].map((h) => h.at(-1));
+    },
+  };
 }
 
 /** What `AgentRuntime.cancelSession` does with an engine. */
@@ -506,6 +536,116 @@ export function pdCancelCases(withHost: WithDriveHost): DriveCase[] {
       check(await markers(e) === 1, `${e.name}: ${await markers(e)} markers`);
       check(requests.length === 2, `${e.name}: ${requests.length} model calls (a late answer must not continue the cancelled turn)`);
       check(texts(requests[1]!).some((x) => x.includes(CANCELLED_NOTE.slice(1, 40))), `${e.name}: no note in ${show(texts(requests[1]!))}`);
+    });
+  });
+
+  // ---- turn status sequences: each turn ends once, whatever the order of input, answers and steps ------------------
+
+  add("sequence", "input while the turn requires action, then the answer: every turn reads terminal at most once, and all end completed", async () => {
+    await each(async (e) => {
+      const history = turnHistory(e);
+      const at = { n: 0 };
+      // pi085 answers the input at once (its own turn), then the caller's result continues the first turn; pd queues the
+      // input behind the result, so one model call answers both.
+      const script = e.name === "pi085"
+        ? [calls(["call_s", "get_weather", { city: "Rome" }]), say("hello"), say("hot")]
+        : [calls(["call_s", "get_weather", { city: "Rome" }]), say("hot, and hello")];
+      await e.agent.say("weather in Rome?");
+      await drive(e, script, at, [], history.sample);
+      await e.agent.say("also, say hello");
+      await history.sample();
+      await drive(e, script, at, [], history.sample);
+      await e.agent.answerClientCalls([{ callId: "call_s", output: "hot", isError: false }]);
+      await history.sample();
+      await drive(e, script, at, [], history.sample);
+      const last = history.check("input during requires_action");
+      check(show(await apiView(e)) === show({ status: "idle", turns: (await apiView(e)).turns.map(() => "completed"), pending: [] }), `${e.name}: final ${show(await apiView(e))}`);
+      check(last.every((x) => x === "completed"), `${e.name}: final ${show(last)}`);
+    });
+  });
+
+  add("sequence", "the answer arrives while a later turn runs (pi085), or while input waits behind it (pd): no turn reads terminal and then not", async () => {
+    await each(async (e) => {
+      const history = turnHistory(e);
+      const at = { n: 0 };
+      const script = e.name === "pi085"
+        ? [calls(["call_r", "get_weather", { city: "Oslo" }]), say("later"), say("cold")]
+        : [calls(["call_r", "get_weather", { city: "Oslo" }]), say("cold, and later")];
+      await e.agent.say("weather in Oslo?");
+      await drive(e, script, at, [], history.sample);
+      await e.agent.say("meanwhile, something else");
+      // One pass only: on pi085 the later turn's model call is now out, unanswered.
+      await e.agent.step();
+      await history.sample();
+      await e.agent.answerClientCalls([{ callId: "call_r", output: "cold", isError: false }]);
+      await history.sample();
+      await drive(e, script, at, [], history.sample);
+      const last = history.check("answer while a later turn runs");
+      check(last.every((x) => x === "completed"), `${e.name}: final ${show(last)}`);
+    });
+  });
+
+  add("sequence", "a steer while a turn runs a tool: the steered turn completes once and stays completed", async () => {
+    await each(async (e) => {
+      const history = turnHistory(e);
+      const requests: Request[] = [];
+      const at = { n: 0 };
+      await e.agent.say("read the page");
+      await e.agent.step();
+      await history.sample();
+      await e.agent.say("and then summarise it", "steer");
+      await history.sample();
+      await drive(e, [calls(["c_p", "web__read_page", { url: "u" }]), say("summary")], at, requests, history.sample);
+      const last = history.check("steer during a running turn");
+      check(last.length === 2 && last.every((x) => x === "completed"), `${e.name}: final ${show(last)}`);
+    });
+  });
+
+  // ---- what ap.clientCalls keeps -------------------------------------------------------------------------------------
+
+  add("client", "a call id used again later gets its own answer, not the earlier call's", async () => {
+    await onPd(async (e) => {
+      const requests: Request[] = [];
+      const at = { n: 0 };
+      const script = [calls(["call_same", "get_weather", { city: "Paris" }]), say("mild"), calls(["call_same", "get_weather", { city: "Tokyo" }]), say("humid")];
+      await e.agent.say("weather in Paris?");
+      await drive(e, script, at, requests);
+      await e.agent.answerClientCalls([{ callId: "call_same", output: "Paris-answer", isError: false }]);
+      await drive(e, script, at, requests);
+      await e.agent.say("and Tokyo?");
+      await drive(e, script, at, requests);
+      const waiting = await e.agent.waitingClientCalls();
+      check(waiting.length === 1 && JSON.parse(waiting[0]!.arguments).city === "Tokyo", `the second call took the first one's answer: waiting ${show(waiting)}, model read ${show(requests.map(toolMessages))}`);
+      await e.agent.answerClientCalls([{ callId: "call_same", output: "Tokyo-answer", isError: false }]);
+      await drive(e, script, at, requests);
+      check(show(toolMessages(requests.at(-1)!).at(-1)) === show("Tokyo-answer"), `the model read ${show(requests.map(toolMessages))}`);
+    });
+  });
+
+  add("client", "an answer for a call that already has its result (after a cancel, or repeated) keeps nothing in ap.clientCalls", async () => {
+    await onPd(async (e) => {
+      const requests: Request[] = [];
+      const at = { n: 0 };
+      const doc = async () => {
+        const id = await e.pd!.conversation("main");
+        return Object.keys((await e.pd!.withHarness((h) => h.snapshot(ClientCallsDoc, id, BACKGROUND)))?.calls ?? {});
+      };
+      await e.agent.say("weather?");
+      await drive(e, [calls(["call_l", "get_weather", { city: "Lima" }])], at, requests);
+      check(typeof await cancelSession(e) === "string", "control: not cancelled");
+      await e.agent.answerClientCalls([{ callId: "call_l", output: "late", isError: false }]);
+      check(show(await doc()) === show([]), `a late answer after the cancel was kept: ${show(await doc())}`);
+      const script = [calls(["call_m", "get_weather", { city: "Rome" }]), say("ok"), calls(["call_n", "get_weather", { city: "Oslo" }])];
+      const at2 = { n: 0 };
+      await e.agent.say("weather in Rome?");
+      await drive(e, script, at2, requests);
+      await e.agent.answerClientCalls([{ callId: "call_m", output: "hot", isError: false }]);
+      await drive(e, script, at2, requests);
+      // call_m returned; the next call's record forgets it, and a repeat of its answer must not bring it back.
+      await e.agent.say("and Oslo?");
+      await drive(e, script, at2, requests);
+      await e.agent.answerClientCalls([{ callId: "call_m", output: "again", isError: false }]);
+      check(show(await doc()) === show(["call_n"]), `ap.clientCalls holds ${show(await doc())}`);
     });
   });
 

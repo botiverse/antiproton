@@ -142,7 +142,9 @@ export function clientTool(def: ClientToolDef): ToolRegistration {
 
 /**
  * Record this call as waiting unless it is (a replay, or an answer that came first), in one commit that also forgets
- * answered calls whose tool task has ended: their result is in the transcript, and nothing reads them again.
+ * answered calls whose tool task has ended: their result is in the transcript, and nothing reads them again. An
+ * answer is carried over only when it was kept for this call before any tool recorded it (no `taskId`): an entry
+ * another task recorded is an earlier call that reused the id, and its answer is not this one's.
  */
 async function recordCall(api: ToolExecutionApi, name: string, args: string, context: Context): Promise<void> {
   const known = (await api.snapshot(ClientCallsDoc, api.conversationId, context))?.calls[api.callId];
@@ -154,11 +156,8 @@ async function recordCall(api: ToolExecutionApi, name: string, args: string, con
       const task = await tx.task(c.taskId);
       if (!task || task.state.status === "terminal") delete doc.calls[id];
     }
-    const was = doc.calls[api.callId];
-    doc.calls[api.callId] = {
-      name, arguments: args, at: was?.at ?? Date.now(), taskId: api.taskId,
-      ...(was?.answer ? { answer: { ...was.answer } } : {}),
-    };
+    const early = doc.calls[api.callId]?.taskId === undefined ? doc.calls[api.callId]?.answer : undefined;
+    doc.calls[api.callId] = { name, arguments: args, at: Date.now(), taskId: api.taskId, ...(early ? { answer: { ...early } } : {}) };
   }, context);
 }
 
