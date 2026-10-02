@@ -8,6 +8,8 @@
   "scripts": {
     "pi-storage": "node test/pi-storage.ts",
     "pi-storage:do": "bash test/pi-storage-do.sh",
+    "pi-durable": "node test/pi-durable.ts",
+    "pi-durable:do": "bash test/pi-durable-do.sh",
     "pi-loop": "node test/pi-loop.ts",
     "pi-offload": "node test/pi-offload.ts",
     "pi-tools": "node test/pi-tools.ts",
@@ -21,7 +23,9 @@
   },
   "dependencies": {
     "@botiverse/raft-sdk": "0.3.2",
+    "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-agent-core": "0.85.1",
+    "@earendil-works/pi-durable": "1.0.0",
     "@earendil-works/pi-mcp": "1.0.0",
     "quickjs-emscripten": "^0.32.0"
   },
@@ -30,5 +34,10 @@
     "typescript": "^7.0.2",
     "wrangler": "^4.129.0"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "overrides": {
+    "@earendil-works/pi-durable": {
+      "@earendil-works/pi-ai": "1.0.0"
+    }
+  }
 }
