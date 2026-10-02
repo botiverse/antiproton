@@ -178,39 +178,50 @@ const runtimeCases: DriveCase[] = [{
 }];
 
 /**
- * `submitToolResults` and `cancelSession` on a pd object, each started while a pi-durable commit is held open (a
- * message to another session opens it) and left running there for a while before the commit is let go. Every
- * write either makes must wait for the commit (`#ownWrite`, `apartFromPd`): the guard throws on one that joins it.
+ * `submitToolResults` and `cancelSession` on a pd object, with a pi-durable commit held open across the writes each
+ * makes after its engine call. The engine call (`answerClientCalls`, `cancel`) is wrapped so that it returns only
+ * once a commit (a message to another session) is open and held; the runtime's next writes are then issued inside
+ * it, and must wait for it (`#ownWrite`, `apartFromPd`, `exclusive`). The commit is let go 100 ms later. The guard
+ * throws on any write that joins.
  */
 runtimeCases.push({
-  group: "runtime", name: "pd: a caller's result and a cancel, each issued while a pi-durable commit is held open, join nothing",
+  group: "runtime", name: "pd: the writes after a caller's result and after a cancel, issued while a pi-durable commit is held open, join nothing",
   run: async () => {
     const a = await apiAgent("pd");
     try {
-      const during = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
+      let posting: Promise<unknown> = Promise.resolve();
+      let opened = 0;
+      /** Open a commit and hold it for 100 ms; resolves once it is open. */
+      const holdOne = async (what: string) => {
         const hold = a.holdNext();
-        const posting = a.rt.postMessage("t", "a", `meanwhile, before ${what}`, "prompt", "s9");
+        posting = a.rt.postMessage("t", "a", `meanwhile, after ${what}`, "prompt", "s9");
         await hold.reached;
-        const running = fn().then((value) => ({ value }), (error) => ({ error: String((error as Error)?.message ?? error) }));
-        await sleep(100);
-        hold.release();
-        const [r] = await Promise.all([running, posting]);
-        check(!("error" in r), `${what} threw: ${(r as { error: string }).error}`);
-        return (r as { value: T }).value;
+        opened++;
+        setTimeout(hold.release, 100);
       };
+      const engine = a.agent as DurableAgent;
+      const answer = engine.answerClientCalls.bind(engine);
+      engine.answerClientCalls = async (results) => { await answer(results); await holdOne("the results"); };
+      const cancel = engine.cancel.bind(engine);
+      engine.cancel = async (marker) => { const id = await cancel(marker); await holdOne("the cancel"); return id; };
+
       a.replies.push(() => ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "call_h", name: "get_weather", arguments: { city: "Oslo" } }] }));
       await a.rt.postMessage("t", "a", "weather in Oslo?");
       await a.settle();
       const turnId = String((await a.rt.waitingClientCalls("t", "a", "main"))[0]?.turn_id ?? "");
       check(turnId, "control: no call is waiting on the caller");
-      const kept = await during("submitToolResults", () => a.rt.submitToolResults("t", "a", "main", [{ turnId, callId: "call_h", output: "cold", isError: false }]));
+      const kept = await a.rt.submitToolResults("t", "a", "main", [{ turnId, callId: "call_h", output: "cold", isError: false }]);
       check(kept.unknown.length === 0, `the result was refused: ${show(kept)}`);
+      await posting;
       a.replies.push(() => ({ text: "cold", finishReason: "stop", truncated: false, usage: USAGE }), () => ({ text: "ok", finishReason: "stop", truncated: false, usage: USAGE }));
       await a.settle();
-      await a.rt.postMessage("t", "a", "write a long story");
-      await a.rt.step("t", "a");
-      const out = await during("cancelSession", () => a.rt.cancelSession("t", "a"));
+      a.replies.push(() => ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "call_k", name: "get_weather", arguments: { city: "Lima" } }] }));
+      await a.rt.postMessage("t", "a", "and in Lima?");
+      await a.settle();
+      const out = await a.rt.cancelSession("t", "a");
+      await posting;
       check(typeof out.cancelledTurn === "string", `nothing was cancelled: ${show(out)}`);
+      check(opened === 2, `control: ${opened} commits were held, not 2`);
       check(a.joined.length === 0, `${a.joined.length} writes joined an open pi-durable transaction: ${show(a.joined.slice(0, 5))}`);
       await a.agent.close();
     } finally { a.dispose(); }
