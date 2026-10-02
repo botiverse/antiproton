@@ -137,7 +137,9 @@ export const mcpPlugin: Plugin = {
     let client: McpClient | null = null;
     try {
       client = await connect(ctx, kept);
-      const listed = await client.listTools();
+      // `timeoutMs` bounds each request; pi-mcp follows `nextCursor` for up to
+      // 1000 pages, so the whole listing gets the same budget as one request.
+      const listed = await client.listTools({ signal: AbortSignal.timeout(Number(ctx.publicConfig?.timeoutMs ?? DEFAULT_TIMEOUT_MS)) });
       return { tools: listed.map(toolSchemaOf) };
     } catch (e) {
       throw failure(e, kept, `listing ${ctx.alias}'s tools failed`, false);

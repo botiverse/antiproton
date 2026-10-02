@@ -51,6 +51,8 @@ function fakeServer(opts: {
   failCall?: "http-503" | "rpc-error";
   /** An answer to `initialize` in place of the normal one, when it returns one. */
   initAnswer?: (headers: Record<string, string>) => Response | undefined;
+  /** Every `tools/list` page waits this long and names a fresh next page. */
+  endlessPagesMs?: number;
 }) {
   const seen: Seen[] = [];
   let sessions = 0;
@@ -73,6 +75,10 @@ function fakeServer(opts: {
       sessions++;
       return json({ protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } },
         { "mcp-session-id": `s${sessions}` });
+    }
+    if (msg.method === "tools/list" && opts.endlessPagesMs !== undefined) {
+      await new Promise((r) => setTimeout(r, opts.endlessPagesMs));
+      return json({ tools: [], nextCursor: `c${seen.length}` });
     }
     if (msg.method === "tools/list") return json({ tools: opts.tools() });
     if (msg.method === "tools/call" && opts.failCall === "http-503") return new Response("overloaded", { status: 503 });
@@ -205,6 +211,20 @@ await check("timeoutMs is bounded: above 60000 or below 1 is refused when writte
     const r = await gw.refreshMountTools("t", "a", "srv");
     must(!r.ok && /timeoutMs must be between 1 and 60000/.test(r.error), `a stored hour-long timeout was used: ${JSON.stringify(r)}`);
     must(server.seen.length === 0, "a request went out under the refused timeout");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+await check("listing is bounded in total by timeoutMs, not per page: a server that pages forever is cut off", async () => {
+  const server = fakeServer({ tools: () => [ECHO], endlessPagesMs: 20 });
+  serve(server);
+  try {
+    const { gw } = await fixture({ url: URL_, timeoutMs: 200 });
+    const began = Date.now();
+    const r = await gw.refreshMountTools("t", "a", "srv");
+    const took = Date.now() - began;
+    must(!r.ok, `an endless listing was kept: ${JSON.stringify(r)}`);
+    // Per page alone, 1000 pages × 20 ms would run 20 s before pi-mcp gives up.
+    must(took < 3_000, `the listing ran ${took} ms under a 200 ms budget`);
   } finally { globalThis.fetch = realFetch; }
 });
 
