@@ -52,7 +52,7 @@ export type DriveSnapshot = {
   readonly docs: ReadonlyMap<ConversationId, ConversationDocs>;
   /**
    * Tool calls that wait on someone outside the object, by conversation: an Agents API caller running a function
-   * itself (`ap_client_calls`, src/runtime/durable-agent.ts). Absent: none.
+   * itself (the `ap.clientCalls` document, src/runtime/durable-tools.ts). Absent: none.
    */
   readonly externalWaits?: ExternalWaits;
 };
@@ -79,7 +79,7 @@ export type ParkVerdict =
   | { readonly verdict: "park"; readonly until: number; readonly sleepers: readonly Sleeper[]; readonly external: readonly ExternalWait[] }
   /**
    * Nothing runs and nothing sleeps: every live task waits, at the end of the chain, on someone outside the object.
-   * Close, and set no alarm: the answer is what wakes it (`DurableAgent.answerClientCalls`).
+   * Close, and set no alarm: the answer, committed by `DurableAgent.answerClientCalls`, is what wakes it.
    */
   | { readonly verdict: "external"; readonly external: readonly ExternalWait[] }
   /** Work is running or about to: stay open. `reason` names the first thing that said so. */
@@ -184,7 +184,8 @@ export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PAR
  * together, so equal inspections either side of the reads bracket one state.
  */
 export async function readSnapshot(
-  harness: Harness, context: Context, now: () => number, attempts = 5, externalWaits?: () => ExternalWaits,
+  harness: Harness, context: Context, now: () => number, attempts = 5,
+  externalWaits?: (conversations: ReadonlySet<ConversationId>) => Promise<ExternalWaits>,
 ): Promise<DriveSnapshot | undefined> {
   for (let i = 0; i < attempts; i++) {
     const at = now();
@@ -200,9 +201,8 @@ export async function readSnapshot(
         inbox: await harness.snapshot(InboxDoc, id, context),
       });
     }
-    // Read between the two inspections: an answer that lands after it is seen by the next read, which its
-    // notice (`SettleOptions.subscribe`) asks for.
-    const waits = externalWaits?.();
+    // Read between the two inspections. An answer is a commit, so one that lands after this read brings another.
+    const waits = await externalWaits?.(ids);
     const again = await harness.inspect(context);
     if (JSON.stringify(again) === JSON.stringify(inspection)) return { now: at, inspection, docs, ...(waits ? { externalWaits: waits } : {}) };
   }
@@ -232,12 +232,15 @@ export type SettleOptions = {
   readonly recheckMs?: number;
   /** Called with each verdict, for tests and traces. */
   readonly onVerdict?: (verdict: ParkVerdict) => void;
-  /** Read with each snapshot: calls whose tool waits on someone outside the object (`DriveSnapshot.externalWaits`). */
-  readonly externalWaits?: () => ExternalWaits;
   /**
-   * Other sources of "read again", for what moves without a pi-durable commit: `externalWaits` (a tool records its
-   * call in our own table), and a task starting to sleep after work it did not commit, which the harness tells its
-   * `onSleep` option (`HarnessOptions.onSleep`, the vendored scheduler). Returns the unsubscribe.
+   * Read with each snapshot, for the conversations it covers: calls whose tool waits on someone outside the object
+   * (`DriveSnapshot.externalWaits`). Read from committed state, so a change to it is a commit and brings a re-read.
+   */
+  readonly externalWaits?: (conversations: ReadonlySet<ConversationId>) => Promise<ExternalWaits>;
+  /**
+   * Another source of "read again", for what moves without a pi-durable commit: a task starting to sleep after work it
+   * did not commit, which the harness tells its `onSleep` option (`HarnessOptions.onSleep`, the vendored scheduler).
+   * Returns the unsubscribe.
    */
   readonly subscribe?: (wake: () => void) => () => void;
 };

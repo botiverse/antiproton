@@ -88,6 +88,19 @@ await check("a prompt not yet picked up is queued; the last turn is in progress 
   assert(steering.status === "in_progress" && steering.completed_at === null, `running ${JSON.stringify(steering)}`);
 });
 
+await check("a turn whose run went on past a later user message (a steer, or input queued behind the caller) is completed, not in progress", () => {
+  const { turns, items } = sessionTranscript({ entries: [
+    user("weather?", 0),
+    entry({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "c7", name: "get_weather", arguments: {} }] }, 1_000),
+    entry({ role: "toolResult", toolCallId: "c7", toolName: "get_weather", isError: false, content: [{ type: "text", text: "hot" }] }, 2_000),
+    user("also say hello", 3_000),
+    entry({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "hot, and hello" }] }, 4_000),
+  ], running: false }, ids);
+  assert(turns.map((t) => t.status).join() === "completed,completed", `statuses ${turns.map((t) => t.status)}`);
+  assert(turns[0]!.completed_at === Math.floor((T0 + 2_000) / 1000), `completed_at ${turns[0]!.completed_at}`);
+  assert(items.find((i) => i.type === "function_call")!.status === "completed", "the answered call does not read completed");
+});
+
 await check("a failed tool result is reported as an error, not as output", () => {
   const { items } = sessionTranscript({ entries: [
     user("go", 0),

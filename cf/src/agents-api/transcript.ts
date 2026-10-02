@@ -86,14 +86,16 @@ export function sessionTranscript(
     const replies = group.filter((x) => x.m.role === "assistant" && x.m.stopReason !== "deferred");
     const final = replies[replies.length - 1];
     const cancelled = group.some((x) => x.m.role === "cancelled");
-    const ended = cancelled || (!!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running));
-
     const waits = group.some((x) => x.m.role === "assistant"
       && (Array.isArray(x.m.content) ? x.m.content : []).some((c: any) => c?.type === "toolCall" && waiting.has(String(c.id))));
+    // A later user message was placed while this turn's run went on (a steer, or input queued behind the caller's
+    // functions on pd): the run continues in the next turn, so this one is over rather than in progress for ever.
+    const superseded = !last && !waits;
+    const ended = cancelled || superseded || (!!final && FINAL.has(String(final.m.stopReason)) && !(last && source.running));
 
     let status: TurnStatus;
     if (cancelled || final?.m.stopReason === "aborted") status = "cancelled";
-    else if (ended) status = final!.m.stopReason === "error" ? "failed" : "completed";
+    else if (ended) status = final?.m.stopReason === "error" ? "failed" : "completed";
     else if (waits && !(last && source.running)) status = "waiting";
     else status = source.running || replies.length ? "in_progress" : "queued";
 

@@ -1773,8 +1773,8 @@ export class AgentRuntime {
 
     if (engine === "pd") {
       // The same catalogue PiAgent gets, through the same host and the same continuations
-      // (src/runtime/durable-tools.ts). The caller's functions are pd's own tools there (`clientTool`), which wait
-      // for the caller instead of pausing PiAgent's lane (client-calls.ts), so they are handed over as definitions.
+      // (src/runtime/durable-tools.ts). The caller's functions are pd's own tools there (`clientTool`), which record
+      // their call in pi-durable state and wait for the caller, so they are handed over as definitions.
       const pdHost = this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
       // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
       ensureAgentTables(this.#deps.ctx.storage.sql, session);
@@ -1785,7 +1785,7 @@ export class AgentRuntime {
         tools: offered as MountedTool[], toolHost: host, ...(keeping ? { interrupts: keeping } : {}),
         extraTools: extraTools as never, clientTools: callerDefs,
         // The cancel marker's model message, as PiAgent's entry projector below makes it.
-        markerNotes: { [TURN_CANCELLED]: CANCELLED_NOTE },
+        cancelNote: CANCELLED_NOTE,
       });
       this.#agents.set(cacheKey, { agent: pd, builtFrom });
       return pd;
@@ -1857,7 +1857,7 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     ensureAgentTables(sql);
     // A turn waiting for the caller has no run to abort on pi085; it still ends, and says so. On pd the waiting
-    // tool is the run, so `cancel` already wrote the marker.
+    // tool is the run, so `cancel` already wrote the marker and forgot the calls.
     if ((await agent.dropClientCalls()) > 0 && !cancelledTurn) {
       await agent.markCancelled(TURN_CANCELLED);
     }
@@ -1878,7 +1878,7 @@ export class AgentRuntime {
   /** Function calls this session waits on its API caller for, with the turn each belongs to. */
   async waitingClientCalls(tenantId: string, agentId: string, session: string) {
     // pi085 reads its table directly, building no agent (a catalogue read on every status poll). Only a pd object
-    // keeps its calls in the engine's own table; `#pd` is set once a pd agent is opened, which both callers
+    // keeps its calls in the engine's own state; `#pd` is set once a pd agent is opened, which both callers
     // (AgentDO `apiSessionStatus`, `apiTranscript`) do before asking.
     const rows = this.#pd
       ? await (await this.agent(tenantId, agentId, session)).waitingClientCalls()

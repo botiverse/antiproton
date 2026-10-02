@@ -21,7 +21,6 @@ import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "../../src/model/types.ts";
 import { interrupt, type Plugin } from "../../src/plugins/types.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
-import { PI085_INTERRUPTED, pdInterruptedBlock } from "../../src/runtime/durable-tools.ts";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import {
@@ -461,7 +460,7 @@ export function pdToolsCases(withHost: WithDriveHost): DriveCase[] {
     });
   });
 
-  add("interrupted", "an unsafe call cut off by a close is not run again, and the model reads pi085's line about it", async () => {
+  add("interrupted", "an unsafe call cut off by a close is not run again, and the model reads that it was interrupted (pd: pi-durable's own result, shown as stored)", async () => {
     const script = [calls(["c1", "web__slow", {}]), say("noted")];
     const requests: Partial<Record<"pi085" | "pd", Request[]>> = {};
     for (const which of ["pi085", "pd"] as const) {
@@ -504,17 +503,10 @@ export function pdToolsCases(withHost: WithDriveHost): DriveCase[] {
         requests[which] = seenHere;
         check(show(w.invoked) === show(["web.slow"]), `${which}: the unsafe call ran ${w.invoked.length} times`);
         if (which === "pd") {
-          // The stored record keeps pi-durable's own words; what the model is sent, and what a reader of the
-          // transcript is shown, is pi085's.
-          const records = await second.pd!.withHarness(async (h) => {
-            const c = await second.pd!.handle(h, await second.pd!.conversation("main"));
-            return (await c.entries({}, 50, undefined, BACKGROUND)).items.filter((r) => r.kind === "pi.tool-result");
-          });
-          check(records.length === 1 && show(records[0]!.model).includes(show(pdInterruptedBlock("web__slow")).slice(1, -1)),
-            `pd's interrupted result is not what tool.js writes: ${show(records.map((r) => r.model))}`);
-          const shown = (await second.agent.entries({})).map((x) => show((x as unknown as { message: unknown }).message));
-          check(shown.some((m) => m.includes(show(PI085_INTERRUPTED).slice(1, -1))) && !shown.some((m) => m.includes("<harness>")),
-            `the transcript shows ${show(shown)}`);
+          // What the model is sent is what the transcript shows: the stored result, unrewritten.
+          const shown = (await second.agent.entries({})).map((x) => (x as unknown as { message?: { role?: string; content?: Array<{ text?: string }> } }).message)
+            .filter((m) => m?.role === "toolResult").map((m) => (m!.content ?? []).map((c) => c.text ?? "").join(""));
+          check(show(shown) === show(toolMessages(seenHere[0]!)), `the transcript shows ${show(shown)}, the model read ${show(toolMessages(seenHere[0]!))}`);
         }
         await second.agent.close();
       });
@@ -522,9 +514,10 @@ export function pdToolsCases(withHost: WithDriveHost): DriveCase[] {
     for (const which of ["pi085", "pd"] as const) {
       const reqs = requests[which]!;
       check(reqs.length === 1, `${which}: ${reqs.length} model calls after the reopen`);
-      check(show(toolMessages(reqs[0]!)) === show([PI085_INTERRUPTED]), `${which}: the model read ${show(toolMessages(reqs[0]!))}`);
+      const read = toolMessages(reqs[0]!);
+      check(read.length === 1 && read[0]!.includes("interrupted"), `${which}: the model read ${show(read)}`);
     }
-    check(show(seen(requests.pi085![0]!)) === show(seen(requests.pd![0]!)), "the requests after the reopen differ");
+    check(toolMessages(requests.pd![0]!)[0]!.includes("Tool web__slow was interrupted and may have partially run"), `pd: the model read ${show(toolMessages(requests.pd![0]!))}`);
   });
 
   add("interrupted", "a read-safe call cut off by a close runs again on reopen, and its result is the model's", async () => {
