@@ -1,5 +1,5 @@
 import type { Json } from "../core/types.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
+import type { HeldFiles, Plugin, PluginContext, MountActivity, MountUsage, Released, SandboxForm } from "./types.ts";
 import { backgrounded, LEASE_KEY, markReleased } from "./types.ts";
 import type { R2Artifacts } from "../store/artifacts.ts";
 import { toAgentRef } from "../store/refs.ts";
@@ -1443,6 +1443,108 @@ export function machinesList(
   } as unknown as Json;
 }
 
+/**
+ * The states in which run9 says a box is awake (run.sys9.ai/docs/box, read 2026-10-02): `idle` is
+ * "awake and waiting for the next exec or file transfer", `running` is "an exec or file transfer is
+ * active". `ready` is "exists, but it is not awake yet" — an exec there wakes it, which is the one
+ * thing a look at the files must not do. Anything else, or a state this code has never seen, is
+ * treated as not awake.
+ */
+export const AWAKE_STATES: readonly string[] = ["idle", "running"];
+
+/**
+ * The main machine's box, only if it is running by both records: this mount's own (a box, not
+ * switched off by the idle lease) and run9's list, which is a read and starts nothing. Null for
+ * anything less, without a call to run9 when our own record already says no.
+ */
+async function awakeBox(ctx: PluginContext): Promise<{ boxId: string; cfg: ReturnType<typeof cfgOf>; api: Run9Api } | null> {
+  const box = (await readMount(ctx))?.machines[MAIN_MACHINE];
+  if (!box?.boxId || parkedAt(box) !== null || !ctx.credential) return null;
+  const cfg = cfgOf(ctx);
+  const api = apiFor(cfg, ctx);
+  const boxes = await api("GET", `/projects/${cfg.project}/workspace/boxes`);
+  const listed = Array.isArray(boxes) ? boxes.find((b: any) => b?.box_id === box.boxId) : null;
+  if (!listed || !AWAKE_STATES.includes(String(listed.state))) return null;
+  return { boxId: box.boxId, cfg, api };
+}
+
+/**
+ * A read-only command in an awake box, its path passed as an argument rather than spliced into the
+ * script, and its output once it has finished. Exit 3 is the script's own "no such path".
+ */
+async function lookIn(
+  box: { boxId: string; cfg: ReturnType<typeof cfgOf>; api: Run9Api }, script: string, path: string,
+): Promise<{ missing: true } | { missing: false; out: string }> {
+  const { api, cfg, boxId } = box;
+  const started = await api("POST", `/projects/${cfg.project}/workspace/boxes/${boxId}/background-execs`, {
+    command: ["sh", "-c", script, "sh", path],
+  });
+  const deadline = Date.now() + Math.min(cfg.timeoutMs, 30_000);
+  for (;;) {
+    const rec = await api("GET", `/projects/${cfg.project}/workspace/execs/${started.exec_id}`);
+    if (TERMINAL.includes(rec.state)) {
+      if (rec.exit_code === 3) return { missing: true };
+      if (rec.state !== "succeeded") throw new Error(`listing ${path} in ${boxId}: ${rec.state} ${String(rec.reason ?? "").slice(0, 120)}`);
+      return { missing: false, out: String(rec.output_summary ?? "") };
+    }
+    if (Date.now() > deadline) throw new Error(`listing ${path} in ${boxId} did not finish in time`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+/** `%y\t%s\t%T@\t%f` lines from find, as entries; a line that did not arrive whole is left out. */
+export function parseFindLines(out: string): Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }> {
+  const entries: Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }> = [];
+  for (const line of out.split("\n")) {
+    const m = /^([a-zA-Z])\t(\d+)\t(\d+(?:\.\d+)?)\t(.+)$/.exec(line);
+    if (!m || m[4] === "." || m[4] === "..") continue;
+    entries.push({ name: m[4]!, isDirectory: m[1] === "d", size: Number(m[2]), modifiedAt: Math.round(Number(m[3]) * 1000) });
+  }
+  return entries;
+}
+
+/** Where a workspace path is inside the box: under the working directory, never above it. */
+function boxPathOf(cfg: ReturnType<typeof cfgOf>, path: string): string {
+  const root = "/" + segmentsOf(cfg.workdir).join("/");
+  const rest = segmentsOf(path).join("/");
+  return rest ? `${root === "/" ? "" : root}/${rest}` : root;
+}
+
+/** The working directory of the main machine, read only while it is awake (see `Holding.files`). */
+const sandboxFiles: HeldFiles = {
+  async list(ctx, path) {
+    const box = await awakeBox(ctx);
+    if (!box) return { running: false };
+    const got = await lookIn(box,
+      'test -d "$1" || exit 3; find -L "$1" -mindepth 1 -maxdepth 1 -printf \'%y\\t%s\\t%T@\\t%f\\n\' | head -n 1000',
+      boxPathOf(box.cfg, path));
+    return got.missing ? { running: true, found: false } : { running: true, found: true, entries: parseFindLines(got.out) };
+  },
+  async read(ctx, path, maxBytes) {
+    const box = await awakeBox(ctx);
+    if (!box) return { running: false };
+    const abs = boxPathOf(box.cfg, path);
+    const got = await lookIn(box, 'test -e "$1" || exit 3; find -L "$1" -maxdepth 0 -printf \'%y\\t%s\\t%T@\\t.x\\n\'', abs);
+    if (got.missing) return { running: true, found: false };
+    const m = /^([a-zA-Z])\t(\d+)\t(\d+(?:\.\d+)?)\t/.exec(got.out);
+    if (!m) throw new Error(`could not read what ${abs} is`);
+    const isDirectory = m[1] === "d";
+    const size = Number(m[2]);
+    const modifiedAt = Math.round(Number(m[3]) * 1000);
+    if (isDirectory || size > maxBytes) return { running: true, found: true, isDirectory, size, modifiedAt, bytes: null };
+    const cred = JSON.parse(ctx.credential!) as Run9Credential;
+    const res = await fetch(`${box.cfg.endpoint}/projects/${box.cfg.project}/workspace/boxes/${box.boxId}/files/download?box_abs_path=${encodeURIComponent(abs)}`, {
+      headers: { authorization: "Basic " + btoa(`${cred.ak}:${cred.sk}`) }, signal: AbortSignal.timeout(box.cfg.timeoutMs),
+    });
+    if (!res.ok) throw new Error(`could not read ${abs}: ${res.status} ${(await res.text()).slice(0, 160)}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    // The file may have grown since it was measured; what came back is what is reported.
+    return bytes.byteLength > maxBytes
+      ? { running: true, found: true, isDirectory: false, size: bytes.byteLength, modifiedAt, bytes: null }
+      : { running: true, found: true, isDirectory: false, size: bytes.byteLength, modifiedAt, bytes };
+  },
+};
+
 export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lease: BoxLease | null = null): Plugin {
   // **"container", never "sandbox"**, in every sentence below that the model
   // reads. The harness already calls the per-execution JavaScript isolate a
@@ -1499,6 +1601,8 @@ export function sandboxPlugin(artifacts: R2Artifacts | null, bucket: string, lea
     // "release" and "quiet" in the idle scan, so renaming either would have
     // left it telling the agent to call something that does not exist.
     tools: { release: "release", postpone: "quiet" },
+    /** The main machine's working directory, only while it is awake; never starts it. */
+    files: sandboxFiles,
     /** What this mount is keeping alive, read from its own state and nothing
      *  else: no credential, no call to run9. */
     async activity(ctx: PluginContext): Promise<MountActivity> {

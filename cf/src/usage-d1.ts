@@ -292,3 +292,41 @@ export async function flushUsage(
   pruneUsage(sql as any, expected);
   return { rows: rows.length, counted };
 }
+
+/**
+ * One agent's ledger rows with `from <= hour < to`, summed into buckets of `size` ms (UTC), both
+ * tables (cf/src/agent-surface/usage.ts reads it; the CASTs are readUsage's, for the same reason).
+ */
+export async function readAgentLedger(db: D1Database, tenantId: string, agentId: string, from: number, to: number, size: number):
+  Promise<Array<{ bucket: number; resource: string; key: string; unit: string; quantity: number }>> {
+  const { results } = await db.prepare(
+    `SELECT bucket, resource, key, unit, SUM(quantity) AS quantity
+     FROM (
+       SELECT (hour / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, resource, key, unit, quantity
+         FROM usage_hourly WHERE tenant_id = ? AND agent_id = ? AND hour >= ? AND hour < ?
+       UNION ALL
+       SELECT (day / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, resource, key, unit, quantity
+         FROM usage_daily WHERE tenant_id = ? AND agent_id = ? AND day >= ? AND day < ?
+     )
+     GROUP BY bucket, resource, key, unit
+     ORDER BY bucket, resource, key, unit`,
+  ).bind(size, size, tenantId, agentId, from, to, size, size, tenantId, agentId, from, to).all();
+  return (results as any[]).map((r) => ({
+    bucket: Number(r.bucket), resource: String(r.resource), key: String(r.key), unit: String(r.unit), quantity: Number(r.quantity),
+  }));
+}
+
+/**
+ * When the oldest row this object holds and has not yet sent happened; null when it has sent
+ * everything. Only reads: an object that never kept usage has neither table and answers null, rather
+ * than having them made by a look.
+ */
+export function usageBacklogSince(sql: { exec(q: string, ...b: unknown[]): { toArray(): any[] } }): number | null {
+  const first = (q: string, ...b: unknown[]): any => {
+    try { return sql.exec(q, ...b).toArray()[0]; }
+    catch (e) { if (/no such table/i.test(String((e as Error)?.message ?? e))) return undefined; throw e; }
+  };
+  const sent = first("SELECT through_seq FROM usage_sent WHERE id = 1");
+  const r = first("SELECT MIN(at) AS at FROM usage_outbox WHERE seq > ?", sent ? Number(sent.through_seq) : 0);
+  return r && r.at !== null && r.at !== undefined ? Number(r.at) : null;
+}

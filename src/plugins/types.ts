@@ -1494,6 +1494,34 @@ export interface Holding {
    * every fact attached (`markReleased`).
    */
   release(ctx: PluginContext, opts?: { reason?: "idle"; id?: string }): Promise<Released | Released[] | boolean | void>;
+  /**
+   * The files of the thing held, for a person looking at the agent's workspace (cf/src/agent-surface/
+   * workspace.ts). Only while it is already running: **neither method may start it**, since starting is
+   * what is billed. Not running answers `{ running: false }` and touches nothing at the far end.
+   *
+   * The gateway asks these behind the mount's own lock (`ToolGateway.heldFiles`), so a release cannot
+   * switch the thing off between the plugin's "it is running" and its read. They must not write the
+   * mount's state: a look is not a use, and must not postpone an idle release.
+   *
+   * `path` is relative to the thing's working directory, `""` for the directory itself, and has no `.`
+   * or `..` segment. Absent: the mount has no files to show.
+   */
+  files?: HeldFiles;
+}
+
+export type HeldListing =
+  | { running: false }
+  | { running: true; found: false }
+  | { running: true; found: true; entries: Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }> };
+/** `bytes` is null when the file is larger than the `maxBytes` asked for, or is a directory; its `size` is still reported. */
+export type HeldRead =
+  | { running: false }
+  | { running: true; found: false }
+  | { running: true; found: true; isDirectory: boolean; size: number; modifiedAt: number; bytes: Uint8Array | null };
+
+export interface HeldFiles {
+  list(ctx: PluginContext, path: string): Promise<HeldListing>;
+  read(ctx: PluginContext, path: string, maxBytes: number): Promise<HeldRead>;
 }
 
 /**

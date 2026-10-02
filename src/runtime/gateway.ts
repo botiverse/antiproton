@@ -4,7 +4,7 @@ import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } 
 import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
-import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult } from "../plugins/types.ts";
+import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead } from "../plugins/types.ts";
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
@@ -434,6 +434,35 @@ export class ToolGateway {
     if (!mount || !holding) return [{ live: null }];
     const pctx = this.#quietContext(ctx, mount);
     return holding.activities ? holding.activities(pctx) : [await holding.activity(pctx)];
+  }
+
+  /**
+   * The files of what the agent's first file-showing mount holds (`Holding.files`), for a person
+   * looking at its workspace. `{ running: false }` when no mount can show any.
+   *
+   * Behind the mount's own lock, as a call and a release are: the plugin's "it is running" and its
+   * read are two steps, and an idle release landing between them would leave the read waking what
+   * the release had just switched off. The credential is read without recording a use — a look is
+   * not the credential put to work.
+   */
+  async heldFiles(
+    ctx: { tenantId: string; agentId: string; taskId: string },
+    op: { op: "list"; path: string } | { op: "read"; path: string; maxBytes: number },
+  ): Promise<HeldListing | HeldRead> {
+    for (const mount of await this.#store.listMounts(ctx.tenantId, ctx.agentId)) {
+      const plugin = this.#plugins.get(mount.plugin);
+      const files = plugin ? holdingOf(plugin)?.files : undefined;
+      if (!plugin || !files) continue;
+      const look = async () => {
+        const credential = mount.secretRef
+          ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId }, { touch: false })
+          : null;
+        const pctx: PluginContext = { ...this.#quietContext(ctx, mount), credential, credentialRefKind: secretRefKind(mount.secretRef) };
+        return op.op === "list" ? files.list(pctx, op.path) : files.read(pctx, op.path, op.maxBytes);
+      };
+      return isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, look) : look();
+    }
+    return { running: false };
   }
 
   /** The context `activity` and `usage` are asked in: the mount's own database, and no credential. */

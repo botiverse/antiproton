@@ -22,6 +22,7 @@ import { originProblem } from "../../../src/plugins/types.ts";
 import { secretShape } from "../secret-shape.ts";
 import type { ConnectionRegistry, ConnectorStore, ProviderTokenIdentity, ProvisionRegistry, ProvisionedAgent } from "../control-plane.ts";
 import { CONNECTION_PROVIDERS, returnUrlProblem, scopesFor, type ConnectionProvider } from "./connect.ts";
+import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 
 export type ProvisionTool = "enable_push" | "disable_push";
 
@@ -87,6 +88,11 @@ export interface ProvisionDeps {
     confirm(tenantId: string, agentId: string, provider: ConnectionProvider, pending: string, raftUserId: string):
       Promise<{ ok: true; account: string | null; sealed: { ciphertext: string; iv: string } } | { ok: false; error: string; missing?: true }>;
   };
+  /**
+   * An agent's usage and workspace, read through the same core the public API uses
+   * (cf/src/agent-surface/). Absent: those routes answer 404.
+   */
+  surface?: SurfaceDeps;
 }
 
 export const PROVIDER_AGENT_PREFIX = "raft_";
@@ -181,7 +187,7 @@ async function registerPush(deps: ProvisionDeps, row: ProvisionedAgent): Promise
 
 export async function handleProvision(
   method: string, path: string, headers: { idempotencyKey: string | null; raftServerId: string | null }, body: unknown,
-  who: ProviderTokenIdentity, deps: ProvisionDeps,
+  who: ProviderTokenIdentity, deps: ProvisionDeps, query: URLSearchParams = new URLSearchParams(),
 ): Promise<Response | null> {
   const seg = path.split("/").filter(Boolean);
   if (seg[0] === "connectors" && seg.length === 2 && method === "DELETE") {
@@ -270,6 +276,18 @@ export async function handleProvision(
   const rest = byRaft ? seg.slice(2) : seg.slice(1);
   if ((rest.length === 3 || (rest.length === 4 && rest[3] === "confirm")) && rest[1] === "connections") {
     return connection(method, rest, body, tenantId, byRaft, deps);
+  }
+  // `…/usage`, `…/workspace-files`, `…/workspace-files/read`: the agent's own surface, read through
+  // the core the public API uses; only how the agent is found, and the envelope, are this binding's.
+  const read = method === "GET" && rest.length >= 2 ? surfaceReadOf(rest.slice(1), "provider") : null;
+  if (read && deps.surface) {
+    const found = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);
+    if (!found || found.status === "deleted") {
+      return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
+    }
+    const a = await surface(deps.surface, read, tenantId, found.agentId, query);
+    if (!a.ok) return fail({ status: a.status, code: a.status === 404 ? "not_found" : "invalid", message: a.message, ...(a.param ? { param: a.param } : {}) });
+    return ok(read === "usage" ? { raftAgentId: found.raftAgentId, providerAgentId: found.agentId, ...a.body } : a.body);
   }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;
   const row = byRaft ? await deps.registry.get(tenantId, rest[0]!) : await deps.registry.getByAgentId(tenantId, rest[0]!);

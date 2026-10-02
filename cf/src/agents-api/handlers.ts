@@ -18,6 +18,7 @@ import {
 import { sessionTranscript } from "./transcript.ts";
 import { pumpSessionEvents, type PendingCall, type Snapshot } from "./events.ts";
 import type { Watch } from "./watch.ts";
+import { surface, surfaceReadOf, type SurfaceDeps } from "../agent-surface/surface.ts";
 
 export type SessionStatus = "idle" | "in_progress" | "requires_action" | "failed";
 
@@ -64,6 +65,11 @@ export interface AgentsApiDeps {
     /** The session's pi entries, oldest first, and whether its lane is running now. */
     transcript(agentId: string, sessionId: string): Promise<{ entries: unknown[]; running: boolean; pending: PendingCall[] }>;
   };
+  /**
+   * An agent's usage and workspace (cf/src/agent-surface/), in the tenant the key belongs to.
+   * Absent: those routes answer 404.
+   */
+  surface?: { tenantId: string; deps: SurfaceDeps };
 }
 
 type Refusal = { ok: false; status: number; message: string; param: string; code: string };
@@ -332,6 +338,16 @@ export async function handleAgentsApi(
   if (seg.length === 1 && method === "GET") {
     const page = cursorPage((await deps.index.listAgents()).map((x) => ({ ...toOpenAIAgent(x.id, x.agent) })), q);
     return page.ok ? ok(page.page) : refuse(page);
+  }
+  // `/agents/:id/usage`, `/agents/:id/workspace/files`, `/agents/:id/workspace/files/read`: an agent
+  // this key made (its index), read through the core the provider binding uses.
+  const read = method === "GET" && seg.length >= 3 ? surfaceReadOf(seg.slice(2), "v1") : null;
+  if (read && deps.surface) {
+    const id = seg[1]!;
+    if (!(await deps.index.getAgent(id))) return notFound("agent", id);
+    const a = await surface(deps.surface.deps, read, deps.surface.tenantId, id, query);
+    if (!a.ok) return a.status === 404 ? openAIError(404, a.message, { code: "not_found" }) : openAIError(400, a.message, { param: a.param ?? null, code: "invalid_value" });
+    return ok(read === "usage" ? { agentId: id, ...a.body } : a.body);
   }
   if (seg.length === 2 && seg[1] !== "environments") {
     const id = seg[1]!;
