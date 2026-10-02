@@ -18,8 +18,9 @@ storage conformance suite against it.
 It also includes six files of pi-durable 1.0.0's compiled package, copied and
 modified, each with a header saying what was changed:
 src/vendor/pi/pi-durable/dist/harness/scheduler.js (reports a task's sleep to
-the host), src/vendor/pi/pi-durable/dist/harness/harness.js (passes that
-option through, and uses the two files after it),
+the host, and ends it on the host's wake),
+src/vendor/pi/pi-durable/dist/harness/harness.js (passes that option and the
+wake through, and uses the two files after it),
 src/vendor/pi/pi-durable/dist/harness/compaction.js (polls a deferred
 summary), src/vendor/pi/pi-durable/dist/harness/registry.js (holds that
 compaction), src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js

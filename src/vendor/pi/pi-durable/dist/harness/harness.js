@@ -9,6 +9,7 @@
  * What changed (marked "antiproton patch"):
  * - Passes `HarnessOptions.onSleep` to the scheduler, and imports the vendored ./scheduler.js
  *   (see its header for the change and why).
+ * - Adds `wake(taskIds)`, the scheduler's: ends the listed tasks' sleeps now (see ./scheduler.js).
  * - Imports the vendored ./compaction.js (`createCompaction`, a manual compaction) and ./registry.js
  *   (`BUILTIN_TASKS`), whose compaction task can poll a deferred summary (see ./compaction.js), and `open`
  *   refuses a registry whose built-in task of a name is not that one: the package's `createRegistry()` makes such
@@ -170,6 +171,11 @@ class HarnessImpl extends SessionImpl {
     resume() {
         this.#assertOpen();
         this.#tasks.resume();
+    }
+    // antiproton patch: end the listed tasks' sleeps now, or their next one (TaskScheduler.wake).
+    wake(taskIds) {
+        this.#assertOpen();
+        this.#tasks.wake(taskIds);
     }
     getTask(id, context) {
         return this.readOnLine(() => this.#storage.task(id, context));

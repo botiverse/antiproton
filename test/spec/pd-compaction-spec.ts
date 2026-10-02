@@ -25,7 +25,7 @@ import { UnknownJob } from "../../cf/src/model-queue.ts";
 import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 
-const POLL = { firstMs: 200, maxMs: 800 };
+const POLL_MS = 200;
 const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
 const OWNER = { tenantId: "t", agentId: "a" };
 const PROMPT = "You are a terse test assistant.";
@@ -59,9 +59,9 @@ const compactionTasks = (storage: DurableSqlHost) =>
   storage.sql.exec("SELECT record FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.compaction'").toArray().map((r) => JSON.parse(String(r.record)).state);
 
 type Fault = (writes: readonly StorageWrite[]) => void;
-function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault } = {}) {
+function pdObject(storage: DurableSqlHost, compaction: typeof MANUAL, extra: { commitFault?: Fault; host?: Partial<ConstructorParameters<typeof PdHost>[0]> } = {}) {
   const dispatched: string[] = [];
-  const host = new PdHost({ storage, poll: POLL, minParkMs: 1, compaction, ...(extra.commitFault ? { commitFault: extra.commitFault } : {}) });
+  const host = new PdHost({ storage, pollAfterMs: POLL_MS, minParkMs: 1, compaction, ...(extra.commitFault ? { commitFault: extra.commitFault } : {}), ...extra.host });
   const agent = DurableAgent.open({
     host, ...OWNER, model: MODEL, systemPrompt: PROMPT,
     dispatch: async (id) => { dispatched.push(id); },
@@ -284,6 +284,61 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     const entries = await next.agent.entries({});
     check(entries.filter((e) => e.type === "compaction").length === 1 && show(entries).includes("after the crash"), "one summary placed");
     await next.agent.close();
+  });
+
+  /** A poll interval far longer than any case: only a wake can end the summary's sleep in time. */
+  const SLOW = { pollAfterMs: 60_000 };
+  /** A long conversation, a manual compaction, and its summary job out, on a host whose poll waits a minute. */
+  async function summaryOut(storage: DurableSqlHost, host: Partial<ConstructorParameters<typeof PdHost>[0]>) {
+    const setup = pdObject(storage, MANUAL);
+    await longConversation(storage, setup.agent);
+    await setup.agent.close();
+    const o = pdObject(storage, MANUAL, { host: { ...SLOW, ...host } });
+    await o.agent.compact();
+    return o;
+  }
+
+  /** Park on the summary, deliver its answer, step once: what that step does, and how long it took. */
+  async function deliverToParked(storage: DurableSqlHost, noWake: boolean) {
+    const o = await summaryOut(storage, { noWake });
+    const parked = await o.agent.step();
+    const job = open(storage).find(isSummary);
+    check(job && parked.wakeInMs !== null && parked.wakeInMs > 30_000 && !o.host.open, `parked on the summary for its minute: ${show(parked)}; tasks ${show(compactionTasks(storage))}`);
+    await answer(o.agent, job.id, reply("## Goal\nwoken", 300, 40));
+    const t0 = Date.now();
+    const out = await o.agent.step();
+    const ms = Date.now() - t0;
+    const placed = (await o.agent.entries({})).filter((e) => e.type === "compaction").length;
+    const state = jobs(storage).find((j) => j.id === job.id)?.state;
+    await o.agent.close();
+    return { out, ms, placed, state };
+  }
+
+  add("wake", "an answer delivered to a parked compaction wakes its poll: the next step places the summary at once, not at pollAt a minute later", async (storage) => {
+    const r = await deliverToParked(storage, false);
+    check(r.out.wakeInMs === null && r.placed === 1 && r.ms < 5_000 && r.state === "consumed", `woken: ${show(r)}`);
+  });
+
+  add("wake", "the control: with the wake off, the same delivery leaves the summary asleep until pollAt", async (storage) => {
+    const r = await deliverToParked(storage, true);
+    check(r.out.wakeInMs !== null && r.out.wakeInMs > 30_000 && r.placed === 0, `without the wake: ${show(r)}`);
+  });
+
+  add("wake", "an answer delivered while the open harness sleeps in the summary's poll ends that sleep: the step in flight places the summary and goes idle", async (storage) => {
+    // Never parks (a sleeper due within the deadline is waited for in-process), so the harness stays open asleep.
+    const o = await summaryOut(storage, { minParkMs: 120_000, stepDeadlineMs: 20_000 });
+    const stepping = o.agent.step();
+    let job: Job | undefined;
+    for (let i = 0; i < 200 && !job; i++) { await sleep(10); job = open(storage).find(isSummary); }
+    check(job, `no summary job; tasks ${show(compactionTasks(storage))}`);
+    await sleep(50);
+    check(o.host.open, "control: the harness is not open, so the delivery's own wake is not what is tested");
+    const t0 = Date.now();
+    await answer(o.agent, job.id, reply("## Goal\nwoken live", 300, 40));
+    const out = await stepping;
+    check(out.wakeInMs === null && Date.now() - t0 < 5_000, `the step in flight: ${show(out)} after ${Date.now() - t0} ms`);
+    check((await o.agent.entries({})).some((e) => e.type === "compaction" && show(e).includes("woken live")), "the summary was not placed");
+    await o.agent.close();
   });
 
   return cases;

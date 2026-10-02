@@ -10,11 +10,20 @@
  * - `#sleep` records the wake time on the invocation while its timer is pending, and calls the new
  *   scheduler option `onSleep({ taskId, conversationId, until })` once when the sleep starts.
  * - `inspect()` reports such a task as `{ kind: "running", sleepingUntil }` instead of `{ kind: "running" }`.
+ * - A new `wake(taskIds)` ends the listed tasks' sleeps now: one in progress returns at once, and for a live task with
+ *   no invocation yet (not started since open) the wake is kept and its first `#sleep` returns at once (kept until it
+ *   is used or the task ends). A task whose invocation is running but not sleeping is not woken: a kept wake would
+ *   end whatever sleep came next, such as a retry's backoff. `delay` takes a callback that is handed its early end,
+ *   beside its abort.
  * - Relative imports of unchanged modules point into the installed package; the source map comment is dropped.
  *
  * Why: a Durable Object is billed while a harness sleeps in-process. Closing the harness mid-sleep is safe
  * (it resumes from the checkpoint), but 1.0.0 gives a host no way to know a task is only sleeping, so
  * src/runtime/durable-drive.ts inferred it from checkpoint phases. With this the scheduler says so itself.
+ * `wake`: a sleep waits for a time, and what the task is waiting for (a model answer written by another process) can
+ * arrive sooner; 1.0.0 gives a host no way to end the sleep, so the answer waited for the checkpoint's `pollAt`. Every
+ * pi-durable sleep re-checks what it waited for when it ends (a poll fetches again and commits a new `pollAt` when not
+ * ready), so a wake that came too early costs one extra check.
  *
  * test/pi-vendor.ts fails when the installed file's sha256 or the package version moves from the base above.
  */
@@ -58,6 +67,8 @@ export class TaskScheduler {
     #context;
     // antiproton patch: told when an invocation starts sleeping.
     #onSleep;
+    // antiproton patch: wakes asked for a live task that was not sleeping; its next sleep returns at once.
+    #wakes = new Set();
     #live = new Map();
     #invocations = new Map();
     #taskWaiters = new Waiters();
@@ -130,6 +141,23 @@ export class TaskScheduler {
     resume() {
         this.#enabled = true;
         this.#kick();
+    }
+    /**
+     * antiproton patch: end the listed tasks' sleeps now. A task sleeping returns from `runtime.sleep` at once; a live
+     * task with no invocation (not started yet) keeps the wake, and its first sleep returns at once. A task whose
+     * invocation runs but does not sleep is left alone: its next sleep may be one the wake is not about (a retry's
+     * backoff after the answer it was woken for). Ids of tasks that are not live are ignored. Writes nothing.
+     */
+    wake(taskIds) {
+        if (this.#closing)
+            return;
+        for (const id of taskIds) {
+            const invocation = this.#invocations.get(id);
+            if (invocation?.endSleep !== undefined)
+                invocation.endSleep();
+            else if (invocation === undefined && this.#live.has(id))
+                this.#wakes.add(id);
+        }
     }
     /** Wait for every invocation signalled by `#seal()`. Writes nothing. */
     async join() {
@@ -238,6 +266,8 @@ export class TaskScheduler {
                 failed.push(record.id);
             if (record.state.status === "terminal") {
                 this.#live.delete(record.id);
+                // antiproton patch: a wake kept for a task that ended is never used.
+                this.#wakes.delete(record.id);
                 this.#failedMigrations.delete(record.id);
                 this.#failFastChecks.delete(record.id);
                 if (this.#conversationOwners.has(record.id))
@@ -1097,9 +1127,12 @@ export class TaskScheduler {
         const signal = AbortSignal.any(signals);
         // antiproton patch: while the timer below is pending the invocation runs no code, so inspect() reports
         // `sleepingUntil` and the host is told once; a host may close the Harness then and reopen it at `until`.
+        // A wake (`wake`) ends the sleep early: a kept one before it starts, `endSleep` while it waits.
         try {
             for (;;) {
                 signal.throwIfAborted();
+                if (this.#wakes.delete(invocation.taskId))
+                    return;
                 const remaining = until - this.#now();
                 if (remaining <= 0)
                     return;
@@ -1112,11 +1145,21 @@ export class TaskScheduler {
                         this.#report(error);
                     }
                 }
-                await delay(Math.min(remaining, MAX_TIMER_DELAY), signal);
+                let woken = false;
+                await delay(Math.min(remaining, MAX_TIMER_DELAY), signal, (end) => {
+                    invocation.endSleep = () => {
+                        woken = true;
+                        end();
+                    };
+                });
+                invocation.endSleep = undefined;
+                if (woken)
+                    return;
             }
         }
         finally {
             invocation.sleepingUntil = undefined;
+            invocation.endSleep = undefined;
         }
     }
     async #watchDoc(invocation, args) {
@@ -1188,17 +1231,21 @@ function canReserve(task, record) {
     const definition = task.definition;
     return (definition.version === record.version || (definition.version > record.version && definition.migrate !== undefined));
 }
-function delay(ms, signal) {
+// antiproton patch: `onEnd` is handed a function that ends the delay early, beside its abort.
+function delay(ms, signal, onEnd) {
     return new Promise((resolve, reject) => {
         const onAbort = () => {
             clearTimeout(timer);
             reject(signal.reason);
         };
-        const timer = setTimeout(() => {
+        const end = () => {
+            clearTimeout(timer);
             signal.removeEventListener("abort", onAbort);
             resolve();
-        }, ms);
+        };
+        const timer = setTimeout(end, ms);
         signal.addEventListener("abort", onAbort, { once: true });
+        onEnd?.(end);
     });
 }
 /** Structural equality of two JSON values; object key order is ignored. */
