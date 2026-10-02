@@ -239,7 +239,8 @@ const calls = (...c: Array<[id: string, name: string, args: unknown] | ((req: Re
 const lastResult = (req: Request): Record<string, unknown> => {
   const m = [...req.messages].reverse().find((x) => x.role === "tool");
   check(m, `no tool result in ${show(req.messages)}`);
-  return JSON.parse(String(m.content));
+  // Not JSON (an error line): the script goes on, and the comparison of the requests says what differed.
+  try { return JSON.parse(String(m.content)); } catch { return { unparsed: String(m.content) }; }
 };
 
 /** Drive one engine through a user message and the model's turns. Returns every request the model was sent. */
