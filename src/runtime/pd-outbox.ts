@@ -7,7 +7,8 @@
  * counts, and a `model.call` trace row for an assistant entry that carries the job id it answers
  * and ended. pi-durable's commits are its own, and nothing of ours may run inside them
  * (src/store/pi-durable-sqlite.ts), so here the same rows are derived afterwards from the committed
- * entries, past a watermark: pi-durable's `entries.commit_seq`, kept in `ap_outbox_marks`.
+ * entries, past a watermark: pi-durable's `entries.commit_seq`, kept in `ap_outbox_marks` with the
+ * entry id that bounds the read (`OUTBOX_ENTRY_MARK`).
  *
  * The rows are the same rows from the same facts, built by the same functions (`modelTokenRows`,
  * `modelCallRow`), so the flushers (cf/src/usage-d1.ts, cf/src/trace-r2.ts, cf/src/activity-raft.ts),
@@ -52,6 +53,18 @@ import { SqlQualifier, type SqlNamespace } from "../store/sql-namespace.ts";
 
 /** The `ap_outbox_marks` row: both outboxes are derived in one pass, so they share one mark. */
 export const OUTBOX_MARK = "usage+trace";
+/**
+ * The same mark as an entry id, which is what bounds the read. `entries` has no index on `commit_seq`
+ * and we may not add one (its tables are pi-durable's), so a read by sequence scans every entry the
+ * object ever committed, on every pass. The id is the table's INTEGER PRIMARY KEY, so `id > ?` is a
+ * range on the rowid, and it is monotonic with commit order: ids are minted from one counter only
+ * inside a commit callback on the Session's mutation line, which runs one commit at a time
+ * (session/session.js `#runCommit`, session/transaction.js), and a reopened storage resumes the
+ * counter from `durable_metadata.next_id`, past every committed id. So every entry committed after
+ * the last pass has a larger id than every entry it read. docs/pi-upstream.md lists this contract;
+ * test/spec/pd-outbox-spec.ts checks it on every run and counts what a pass reads.
+ */
+export const OUTBOX_ENTRY_MARK = "usage+trace:entry-id";
 /** The `ap_meta` row holding what every pass so far has derived, for the comparison with `pi.usage`. */
 const TOTALS_KEY = "outbox.usage";
 
@@ -148,9 +161,15 @@ export function derivePdOutbox(raw: Raw, ap: ApUnit, ctx: DeriveContext): Derive
   const through = Number(raw.exec(pd.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq ?? 1) - 1;
   if (through <= from) return { from, through: from, entries: 0, usage: 0, trace: 0, check: null };
 
-  const records = raw.exec(pd.rewrite(
-    "SELECT record FROM entries WHERE commit_seq > ? AND commit_seq <= ? " +
-    "AND json_extract(record, '$.kind') IN ('pi.assistant', 'pi.tool-result') ORDER BY commit_seq, id"), from, through).toArray();
+  const fromId = Number(ap.run("SELECT through_seq FROM outbox_marks WHERE outbox = ?", OUTBOX_ENTRY_MARK)[0]?.through_seq ?? 0);
+  // `commit_seq` stays in the predicate as the statement of what is read; the id range is what bounds it.
+  const fresh = raw.exec(pd.rewrite(
+    "SELECT id, commit_seq, record FROM entries WHERE id > ? AND commit_seq <= ? ORDER BY id"), fromId, through).toArray();
+  const throughId = fresh.reduce((max, r) => Math.max(max, Number(r.id)), fromId);
+  const records = fresh.filter((r) => {
+    const kind = (JSON.parse(String(r.record)) as { kind?: unknown }).kind;
+    return kind === "pi.assistant" || kind === "pi.tool-result";
+  });
   const usage: UsageRow[] = [];
   const trace: TraceRow[] = [];
   const totalsRow = ap.run("SELECT v FROM meta WHERE k = ?", TOTALS_KEY)[0];
@@ -191,8 +210,10 @@ export function derivePdOutbox(raw: Raw, ap: ApUnit, ctx: DeriveContext): Derive
   appendUsage(raw as Parameters<typeof appendUsage>[0], usage);
   ctx.fault?.("appended");
   ap.run("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", TOTALS_KEY, JSON.stringify(totals));
-  ap.run("INSERT INTO outbox_marks (outbox, through_seq, updated_at) VALUES (?, ?, ?) " +
-    "ON CONFLICT (outbox) DO UPDATE SET through_seq = excluded.through_seq, updated_at = excluded.updated_at", OUTBOX_MARK, through, ctx.now);
+  for (const [outbox, value] of [[OUTBOX_MARK, through], [OUTBOX_ENTRY_MARK, throughId]] as const) {
+    ap.run("INSERT INTO outbox_marks (outbox, through_seq, updated_at) VALUES (?, ?, ?) " +
+      "ON CONFLICT (outbox) DO UPDATE SET through_seq = excluded.through_seq, updated_at = excluded.updated_at", outbox, value, ctx.now);
+  }
 
   const counted = countedUsage(raw, pd);
   let check: UsageCheck;

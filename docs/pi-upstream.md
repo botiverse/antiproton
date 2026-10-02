@@ -203,6 +203,12 @@ documents. It reads pi-durable's tables directly, and rests on:
 - `durable_metadata.next_seq` is one past the last committed sequence, and is
   written in the commit it counts.
 - An entry row's `record` is the `EntryRecord` as JSON, with `kind` and `model`.
+- **Entry ids grow with commit order.** They are minted from one counter only
+  inside a commit callback on the Session's mutation line, one commit at a
+  time, and a reopened storage resumes it from `durable_metadata.next_id`. The
+  derivation reads `id > mark` (a range on the INTEGER PRIMARY KEY) instead of
+  `commit_seq > mark`, which has no index and would scan every entry on every
+  pass; an id minted out of order would be an entry never billed.
 - `pi.usage` checkpoints on every change, so its newest revision is a `base`;
   a `delta` there is reported as unreadable rather than read.
 - An offloaded answer keeps the fields the worker wrote (`jobId`) when

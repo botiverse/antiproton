@@ -141,6 +141,40 @@ const traceShape = (r: TraceOutboxRow) => ({
 });
 const transitions = (rows: readonly TraceOutboxRow[]) => statusEvents(OWNER.agentId, rows).map((e) => e.detail ? `${e.status}|${e.detail}` : e.status);
 const mark = (storage: DurableSqlHost) => storage.sql.exec("SELECT through_seq FROM ap_outbox_marks WHERE outbox = ?", OUTBOX_MARK).toArray()[0]?.through_seq ?? null;
+/** Pairs of entries whose ids are in the opposite order to their commits: what the id mark relies on being none. */
+const inversions = (storage: DurableSqlHost) => Number(storage.sql.exec(
+  "SELECT COUNT(*) AS n FROM pd_entries a JOIN pd_entries b ON a.id < b.id AND a.commit_seq > b.commit_seq").toArray()[0]!.n);
+
+/**
+ * The storage, with every read the outbox makes of `pd_entries` measured in rows read. On a Durable
+ * Object the cursor says (`rowsRead`); node:sqlite does not, so there the statement's plan is asked:
+ * a SEARCH on the rowid reads the rows it returns, a SCAN reads the table.
+ */
+function measured(storage: DurableSqlHost) {
+  const reads: number[] = [];
+  const exec = storage.sql.exec.bind(storage.sql);
+  const sql = {
+    exec(query: string, ...bindings: Parameters<DurableSqlHost["sql"]["exec"]>[1][]) {
+      const cursor = exec(query, ...bindings);
+      if (!/FROM pd_entries WHERE id > \?/.test(query)) return cursor;
+      return {
+        toArray() {
+          const rows = cursor.toArray();
+          const counted = (cursor as { rowsRead?: unknown }).rowsRead;
+          if (typeof counted === "number") { reads.push(counted); return rows; }
+          const plan = exec(`EXPLAIN QUERY PLAN ${query}`, ...bindings).toArray().map((r) => String(r.detail)).join(" ");
+          reads.push(/\bSCAN\b/.test(plan) ? Number(exec("SELECT COUNT(*) AS n FROM pd_entries").toArray()[0]!.n) : rows.length);
+          return rows;
+        },
+      };
+    },
+  } as DurableSqlHost["sql"];
+  const host: DurableSqlHost = {
+    sql, transaction: (closure) => storage.transaction(closure), transactionSync: (closure) => storage.transactionSync(closure),
+  };
+  return { host, reads };
+}
+
 const assistantEntries = (storage: DurableSqlHost) =>
   storage.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE json_extract(record, '$.kind') = 'pi.assistant'").toArray()[0]!.n;
 
@@ -174,6 +208,8 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(show(pd.trace.map(traceShape)) === show(pi.trace.map(traceShape)), `trace differs:\n pd    ${show(pd.trace.map(traceShape))}\n pi085 ${show(pi.trace.map(traceShape))}`);
     check(show(transitions(pd.trace)) === show(transitions(pi.trace)), `status differs: pd ${show(transitions(pd.trace))}, pi085 ${show(transitions(pi.trace))}`);
     check(show(transitions(pd.trace)) === show(["thinking", "online", "thinking", "error", "thinking", "online"]), `status ${show(transitions(pd.trace))}`);
+    check(Number(storage.sql.exec("SELECT COUNT(*) AS n FROM pd_entries").toArray()[0]!.n) > SCRIPT.length * 2 && inversions(storage) === 0,
+      `entry ids out of commit order: ${inversions(storage)} inversions`);
   });
 
   add("idempotency", "a pass run again derives nothing: no duplicate row, the mark where it was", async (storage) => {
@@ -191,6 +227,37 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     const pass = await again.host.deriveOutbox();
     check(pass && pass.entries === 0 && pass.through === at, `a new object's pass: ${show(pass)}`);
     check(show(outboxes(storage)) === show(before), `rows changed: ${show(outboxes(storage))}`);
+    await o.agent.close();
+  });
+
+  add("cost", "a pass reads only the entries committed since the last one, not the table: 2,000 entries before, a few rows after", async (storage) => {
+    const { host, reads } = measured(storage);
+    const o = pdObject(host);
+    await pdTurn(host, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
+    // 2,000 more entries, committed as pi-durable commits them: one sequence, ids past the counter, the
+    // counter and the sequence moved. In a conversation nothing reads, so the turns below are unchanged.
+    const FILLER = 2_000;
+    const meta = storage.sql.exec("SELECT next_id, next_seq FROM pd_durable_metadata").toArray()[0]!;
+    const firstId = Number(meta.next_id), seq = Number(meta.next_seq);
+    for (let i = 0; i < FILLER; i++) {
+      const id = firstId + i;
+      storage.sql.exec("INSERT INTO pd_record_ids (id, record_type) VALUES (?, 'entry')", id);
+      storage.sql.exec("INSERT INTO pd_entries (id, conversation_id, head, commit_seq, record) VALUES (?, 999999, NULL, ?, ?)",
+        id, seq, JSON.stringify({ id, conversationId: 999999, kind: "test.filler", data: { i } }));
+    }
+    storage.sql.exec("UPDATE pd_durable_metadata SET next_id = ?, next_seq = ?", String(firstId + FILLER), seq + 1);
+    reads.length = 0;
+    const catchUp = await o.host.deriveOutbox();
+    // The control: the measurement does see a read of the filler, so a small number below is not blindness.
+    check(catchUp?.through === seq && reads.reduce((a, b) => a + b, 0) >= FILLER, `the pass over the filler read ${show(reads)}: ${show(catchUp)}`);
+    reads.length = 0;
+    const usageBefore = outboxes(storage).usage.length;
+    await pdTurn(host, o.agent, "Q2", [replying(SCRIPT[2]!.reply)]);
+    const total = reads.reduce((a, b) => a + b, 0);
+    check(reads.length > 0 && total <= 20, `the passes of a turn after ${FILLER} entries read ${total} rows (${show(reads)})`);
+    check(show(outboxes(storage).usage.slice(usageBefore).map((r) => [r.key, r.quantity])) === show(EXPECTED_USAGE.slice(7)),
+      `the turn's usage ${show(outboxes(storage).usage.slice(usageBefore))}`);
+    check(inversions(storage) === 0, `entry ids out of commit order: ${inversions(storage)} inversions`);
     await o.agent.close();
   });
 
