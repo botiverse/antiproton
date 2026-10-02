@@ -23,9 +23,11 @@
  * - **Trace**: a `model.call` row for an assistant entry that names the job it answers and ended, written
  *   by the batch that marks that job consumed — once per job, whatever later entry carries its id again.
  * - **Model jobs**: the provider's port only stages a job in memory (`PdHost.#startJob`). Its row is
- *   inserted here, by the batch whose `poll` checkpoint carries its handle, and dispatched after that
- *   commit; a commit that never lands leaves no row and nothing dispatched. The batch that appends a
- *   job's answer marks it `consumed`.
+ *   inserted here, by the batch whose `poll` checkpoint carries its handle — a generation's or a
+ *   compaction's (the vendored harness/compaction.js) — and dispatched after that commit; a commit that
+ *   never lands leaves no row and nothing dispatched. The batch that appends a job's answer marks it
+ *   `consumed`, and so does the batch that moves a task off the `poll` of an answered job: a summary's
+ *   answer is never an entry.
  *
  * Usage, the job rows and the consumed mark are all-or-nothing with the batch: a failure there throws,
  * and the commit rolls back. The trace row is not billing, so a failure building it is logged and the
@@ -75,6 +77,8 @@ interface Booked {
 }
 
 const PI_USAGE = "pi.usage";
+/** pi-durable's compaction task's kind (`CompactionTask`, the vendored harness/compaction.js). */
+const COMPACTION = "pi.compaction";
 const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const own = <T>(o: Record<string, T>, k: string): T | undefined => (Object.hasOwn(o, k) ? o[k] : undefined);
@@ -162,6 +166,28 @@ function pollHandles(writes: readonly StorageWrite[], staged: BookContext["stage
   return out;
 }
 
+/**
+ * The jobs whose summary `poll` this batch ended: a compaction task's write whose stored record (the state the batch
+ * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle. The
+ * poll read an answer and the batch acts on it — or the task was aborted, whose cancel marked the job already. A
+ * generation's answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not
+ * (the vendored harness/compaction.js places a summary entry, or nothing), so this is how its job is consumed.
+ */
+function endedSummaryPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
+  const out: string[] = [];
+  for (const w of writes) {
+    if (w.type !== "task" || w.value.kind !== COMPACTION) continue;
+    const row = exec.get<{ record: string }>("SELECT record FROM tasks WHERE id = ?", Number(w.value.id));
+    if (row === undefined) continue;
+    const was = (JSON.parse(row.record) as { state?: { checkpoint?: unknown } }).state?.checkpoint;
+    if (!isObject(was) || was.phase !== "poll" || !isObject(was.handle) || typeof was.handle.id !== "string") continue;
+    const now = (w.value.state as { checkpoint?: unknown } | undefined)?.checkpoint;
+    if (isObject(now) && now.phase === "poll" && isObject(now.handle) && now.handle.id === was.handle.id) continue;
+    out.push(was.handle.id);
+  }
+  return out;
+}
+
 /** Subtract `usage` from `delta[bucket][key]`: spend already billed elsewhere. */
 function subtract(delta: UsageTotals, key: string, usage: Tokens | undefined): void {
   const into = own(delta.models, key);
@@ -208,6 +234,12 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
     if (ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL RETURNING id", m.jobId).length > 0) {
       jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown });
     }
+  }
+
+  // A poll that ended with no entry naming its job (a compaction's summary): consumed, once answered. No trace row:
+  // a `model.call` row reads as the turn's own call (src/runtime/status.ts), and a summary is not one.
+  for (const id of endedSummaryPolls(exec, writes)) {
+    ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL AND answer IS NOT NULL", id);
   }
 
   // Usage: the pi.usage delta, as rows.

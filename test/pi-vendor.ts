@@ -15,7 +15,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { BACKGROUND_CONTEXT as bg, withAbortSignal } from "@earendil-works/chord/context";
-import { createRegistry, defineExtension, defineTask, Harness as UpstreamHarness, type HarnessInspection } from "@earendil-works/pi-durable";
+import { createRegistry as upstreamCreateRegistry, defineExtension, defineTask, Harness as UpstreamHarness, type HarnessInspection } from "@earendil-works/pi-durable";
+import { createRegistry } from "../src/vendor/pi/pi-durable/dist/harness/registry.js";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import * as upstreamSqlite from "@earendil-works/pi-durable/storage/sqlite";
 import { createModels } from "pi-ai-1/models";
@@ -105,11 +106,12 @@ add("docs/pi-upstream.md and NOTICE list every vendored file", () => {
   }
 });
 
-add("nothing outside src/vendor opens pi-durable's own Harness or SqliteStorage, which run unpatched", () => {
+add("nothing outside src/vendor opens pi-durable's own Harness, SqliteStorage, createRegistry or CompactionTask, which run unpatched", () => {
   const offenders: string[] = [];
   // SqliteStorage and applySqliteMigrations from the package commit and migrate in an async transaction.
+  // createRegistry and CompactionTask from the package hold and are the compaction without its `poll` phase.
   const unpatched: Array<[string, RegExp]> = [
-    ["@earendil-works/pi-durable", /^\s*Harness\b/],
+    ["@earendil-works/pi-durable", /^\s*(Harness|createRegistry|CompactionTask)\b/],
     ["@earendil-works/pi-durable/storage/sqlite", /^\s*(SqliteStorage|applySqliteMigrations)\b/],
   ];
   for (const dir of ["src", "cf/src", "test", "bench"]) {
@@ -125,7 +127,7 @@ add("nothing outside src/vendor opens pi-durable's own Harness or SqliteStorage,
       }
     }
   }
-  check(offenders.length === 0, `import the vendored Harness or SqliteStorage instead: ${show(offenders)}`);
+  check(offenders.length === 0, `import the vendored Harness, SqliteStorage or registry instead: ${show(offenders)}`);
 });
 
 add("the vendored migrations are the package's schema, statement for statement", () => {
@@ -315,6 +317,22 @@ add("the vendored Harness: once a sleep is aborted, inspect() reports plain runn
   const { during, after } = await sleepThenAfter("abort");
   check(during !== undefined, "control: the sleep was never reported");
   check(show(after) === show({ kind: "running" }), `after the aborted sleep inspect said ${show(after)}`);
+});
+
+add("the vendored registry holds the vendored compaction, which has a `poll` phase; the package's does not (the control)", () => {
+  const ours = createRegistry().snapshot().task("pi.compaction")?.definition as { phases?: Record<string, unknown> } | undefined;
+  const theirs = upstreamCreateRegistry().snapshot().task("pi.compaction")?.definition as { phases?: Record<string, unknown> } | undefined;
+  check(show(Object.keys(ours?.phases ?? {})) === show(["select", "summarize", "poll", "retry"]), `vendored phases ${show(Object.keys(ours?.phases ?? {}))}`);
+  check(theirs !== undefined && !("poll" in (theirs.phases ?? {})), `the package's phases ${show(Object.keys(theirs?.phases ?? {}))}`);
+});
+
+add("the vendored Harness refuses a registry made by the package's createRegistry, whose compaction cannot poll", async () => {
+  let refused: unknown;
+  try { await (await Harness.open(new MemoryStorage(), { models: createModels(), registry: upstreamCreateRegistry() }, bg)).close(bg); }
+  catch (e) { refused = e; }
+  check(refused instanceof Error && /lacks built-in tasks pi\.compaction\b/.test(refused.message), `the package's registry: ${String(refused)}`);
+  const h = await Harness.open(new MemoryStorage(), { models: createModels(), registry: createRegistry() }, bg);
+  await h.close(bg);
 });
 
 /** Resolve with how long `p` took, or reject after `ms`: a woken nap must not wait for its 60 s. */

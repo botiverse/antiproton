@@ -77,6 +77,9 @@ run_suite durable-drive-do bash test/durable-drive-do.sh
 run_suite durable-agent-do bash test/durable-agent-do.sh
 run_suite pd-tools-do bash test/pd-tools-do.sh
 run_suite pd-outbox-do bash test/pd-outbox-do.sh
+run_suite pd-cancel-do bash test/pd-cancel-do.sh
+run_suite pd-writes-do bash test/pd-writes-do.sh
+run_suite pd-compaction-do bash test/pd-compaction-do.sh
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 
 # `|| true`: see (2). Under `set -e` a failing assignment would stop the script

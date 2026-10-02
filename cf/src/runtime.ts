@@ -1814,9 +1814,11 @@ export class AgentRuntime {
     return agent;
   }
 
-  /** Compact on demand. Both engines refuse today with `CompactionUnavailable`
+  /** Compact on demand. pi085 refuses with `CompactionUnavailable`
    *  (src/runtime/engine.ts), writing nothing; the object turns that into a
-   *  value its routes answer 409 with (cf/src/compact-refusal.ts). */
+   *  value its routes answer 409 with (cf/src/compact-refusal.ts). pd starts a
+   *  compaction and returns its operation id (`DurableAgent.compact`); the wake
+   *  the object sets after it carries it. */
   async requestCompaction(tenantId: string, agentId: string, session: string = MAIN_SESSION) {
     return (await this.agent(tenantId, agentId, session)).compact();
   }
