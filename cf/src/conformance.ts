@@ -34,6 +34,10 @@
  * model job rows written inside pi-durable's commit, compared field for field with PiAgent's on the
  * same storage, and the jobs' crash, cancel and rollback cases (test/pd-outbox-do.sh).
  *
+ * /pd-compaction runs the pd engine's compaction cases (test/spec/pd-compaction-spec.ts): the vendored
+ * compaction's deferred summary through `ap_model_jobs`, parked, placed, billed once, cancelled and crashed
+ * (test/pd-compaction-do.sh).
+ *
  * /pd-writes runs the runtime's writes on a pd object (test/spec/pd-writes-spec.ts): an approval, an
  * expired question, a model binding, a background pass and the idle lease, each started as a pi-durable
  * commit ends (test/pd-writes-do.sh).
@@ -57,6 +61,7 @@ import { pdCancelCases } from "../../test/spec/pd-cancel-spec.ts";
 import { durableAgentCases } from "../../test/spec/durable-agent-spec.ts";
 import { pdOutboxCases } from "../../test/spec/pd-outbox-spec.ts";
 import { pdWritesCases } from "../../test/spec/pd-writes-spec.ts";
+import { pdCompactionCases } from "../../test/spec/pd-compaction-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
 
@@ -169,6 +174,27 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
       for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
     };
     const results = await runDriveCases(pdOutboxCases(async (use) => {
+      wipe();
+      try { await use(host); } finally { wipe(); }
+    }));
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
+  async runPdCompactionSpec() {
+    const host: PiDurableHost = this.ctx.storage;
+    const t0 = Date.now();
+    const wipe = () => {
+      const names = host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()
+        .map((r) => String(r.name)).filter((n) => !n.startsWith("_cf_") && !n.startsWith("sqlite_"));
+      for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
+    };
+    const results = await runDriveCases(pdCompactionCases(async (use) => {
       wipe();
       try { await use(host); } finally { wipe(); }
     }));
@@ -308,6 +334,9 @@ export default {
     }
     if (new URL(request.url).pathname === "/pd-outbox") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-outbox")).runPdOutboxSpec());
+    }
+    if (new URL(request.url).pathname === "/pd-compaction") {
+      return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-compaction")).runPdCompactionSpec());
     }
     if (new URL(request.url).pathname === "/pd-writes") {
       const only = new URL(request.url).searchParams.get("only") ?? "";

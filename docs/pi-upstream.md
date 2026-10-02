@@ -97,9 +97,9 @@ in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
 (`McpClient`, `StreamableHttpTransport`, `toLlmContent`; see §4).
 pi-durable adds `storage/sqlite` (the `SqliteDatabase` types, and
 `SqliteStorage` in `src/runtime/durable-agent.ts`; its migrations in tests), its root (`Harness`, `LiveDoc`,
-`InboxDoc`, `GenerationTask`, `CompactionTask` and the task and document types,
-in `src/runtime/durable-drive.ts`; `createRegistry`, `AgentDoc` and `ROOT_CONVERSATION_ID`
-in `src/runtime/durable-agent.ts`; `defineExtension`, `hook`, `GenerationTask` and the tool
+`InboxDoc`, `ToolTask` and the task and document types,
+in `src/runtime/durable-drive.ts`; `AgentDoc`, `GenerationTask` and `ROOT_CONVERSATION_ID`
+in `src/runtime/durable-agent.ts`, whose `createRegistry` is the vendored one; `defineExtension`, `hook`, `GenerationTask` and the tool
 types in `src/runtime/durable-tools.ts`), `testing` (`createStorageConformance`,
 tests only) and `@earendil-works/chord` (types, and `chord/context` in
 `src/runtime/durable-agent.ts` and tests).
@@ -202,7 +202,8 @@ pi-durable has no `drive()` and nothing returns `waiting`. A generation that
 gets `deferred` commits a `poll` checkpoint (`pollAt`, from the handle's
 `pollAfterMs`) and then **sleeps in-process until `pollAt`**; a retryable error
 commits `retry` with `until` and sleeps the same way, and so does a compaction
-retry. An object that kept the harness open for that would be billed for the
+(the vendored `harness/compaction.js`): its summary is deferred too, and its
+`poll` and `retry` sleep alike. An object that kept the harness open for that would be billed for the
 sleep. What replaces `waiting` is `settle()` in `src/runtime/durable-drive.ts`:
 it reads the harness after every commit and every sleep notice, and when the
 harness is doing nothing but sleeping until T it closes the harness and returns
@@ -302,8 +303,8 @@ rests on:
 - **`pi.usage` is the ledger.** Every writer that records spend adds to the
   conversation's `pi.usage` document in the commit that records it: a response
   (`appendAssistant` in `harness/generation.js`, a failed attempt that is
-  retried included), compaction's model call (`harness/compaction.js`, which
-  appends no entry) and a tool result that carries usage (`appendToolResult`
+  retried included), compaction's model call (the vendored `harness/compaction.js`,
+  which appends no entry for it) and a tool result that carries usage (`appendToolResult`
   in `harness/tool.js`). Usage rows are the batch's change to those documents,
   so a writer that appends an entry without touching `pi.usage` bills nothing,
   and a writer that spends without recording it would bill nothing either.
@@ -311,14 +312,20 @@ rests on:
   assistant entry of the same batch names it, otherwise the part after the
   first `/`.
 - **A generation records a deferred handle in a `poll` checkpoint**, in the
-  commit after the provider returned it (`classify` in `harness/generation.js`).
+  commit after the provider returned it (`classify` in `harness/generation.js`),
+  and so does a compaction's summary (`respond` in the vendored
+  `harness/compaction.js`): same phase name, same `handle` field.
   The provider only stages the job; that commit inserts the row, and the job is
-  dispatched after it. A generation that dies before it leaves no row.
+  dispatched after it. A task that dies before it leaves no row.
+- A summary's answer is never an entry, so its job is marked consumed by the
+  batch that moves the compaction task off the `poll` of an answered job; it
+  gets no `model.call` trace row, which the status would read as the turn's.
 - An offloaded answer keeps the fields the worker wrote (`jobId`) when
   pi-durable stores it as the entry's message; the batch that appends it marks
   the job consumed.
-- `cancelDeferred` is called only for a generation whose committed checkpoint
-  is `poll` (`abort` in `harness/generation.js`), so a cancelled job's answer
+- `cancelDeferred` is called only for a generation or a compaction whose
+  committed checkpoint is `poll` (`abort` in `harness/generation.js` and the
+  vendored `harness/compaction.js`), so a cancelled job's answer
   is never appended; an answer that reaches a cancelled row is billed where it
   is stored (`PdHost.deliver`, `#dropJob`).
 
@@ -384,15 +391,22 @@ Prefer not to. If it is necessary, it is allowed, but:
 | vendored file | upstream path | taken from | why | upstream link |
 |---|---|---|---|---|
 | `src/vendor/pi/pi-durable/dist/harness/scheduler.js` | `@earendil-works/pi-durable/dist/harness/scheduler.js` | pi-durable 1.0.0 (npm) | `#sleep` records its wake time and calls a new `onSleep` option; `inspect()` reports a sleeping task as `{ kind: "running", sleepingUntil }`. Without it a host cannot tell "only sleeping" from "working", and `settle` (src/runtime/durable-drive.ts) inferred it from checkpoint phases. A new `wake(taskIds)` ends the tasks' sleeps now (or their next one), through a resolver `delay` hands out beside its abort: without it a delivered answer waited for the checkpoint's `pollAt` | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
-| `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, adds `Harness.wake` (the scheduler's), and imports the vendored scheduler: the package's harness imports its own | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
+| `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, adds `Harness.wake` (the scheduler's), and imports the vendored scheduler: the package's harness imports its own. Imports the vendored compaction and registry too, and `open` refuses a registry whose built-in task of a name is not the vendored one (the package's `createRegistry` makes one) | [pi#10325](https://github.com/earendil-works/pi/issues/10325); compaction: none yet |
+| `src/vendor/pi/pi-durable/dist/harness/compaction.js` | `@earendil-works/pi-durable/dist/harness/compaction.js` | pi-durable 1.0.0 (npm) | the summary request keeps `deferred`, and a new `poll` phase sleeps until `pollAt`, fetches the deferred response and classifies it as `summarize` did (place, retry, fail, or poll again); an abort in `poll` cancels it. Upstream strips `deferred`, so on a provider that answers only deferred its summary is "no text" and its job is never read | none yet: a draft PR asks for a deferred-capable summary with a `poll` phase |
+| `src/vendor/pi/pi-durable/dist/harness/registry.js` | `@earendil-works/pi-durable/dist/harness/registry.js` | pi-durable 1.0.0 (npm) | `BUILTIN_TASKS` holds the vendored `CompactionTask`: the scheduler runs a task with the definition its registry holds by kind, and the package's registry imports its own compaction | as above |
 | `src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js` | `@earendil-works/pi-durable/dist/storage/sqlite/storage.js` | pi-durable 1.0.0 (npm) | `commit` (and `document`'s read) run in the facade's `transactionSync` with every statement synchronous, instead of an async `transaction` that awaits between statements: on a Durable Object that one is a savepoint any `sql.exec` issued meanwhile joins, and rolls back with. Same statements, order and errors. `open` also takes `{ onCommit }`, which `commit` calls inside that transaction before applying the batch, so our usage, trace and job rows commit or roll back with pi-durable's state (`src/runtime/pd-outbox.ts`) | none yet: a draft asks for an optional synchronous transaction on `SqliteDatabase` |
 | `src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js` | `@earendil-works/pi-durable/dist/storage/sqlite/migrations.js` | pi-durable 1.0.0 (npm) | `applySqliteMigrations` runs in `transactionSync` too, so no pi-durable transaction spans an await; the schema is the package's (`test/pi-vendor.ts` compares them) | as above |
 
 How the vendored files are used: they are `dist` files, copied, and their
 relative imports of unchanged modules point into the installed package
 (`../../../../../../node_modules/@earendil-works/pi-durable/dist/…`), so they
-share every other module — and its identity — with the package. Our code
-imports `Harness` from the vendored `harness.js` (types in its `harness.d.ts`)
+share every other module — and its identity — with the package. The vendored
+`compaction.js` imports pi-ai's utilities from pi-durable's own nested copy
+(`node_modules/@earendil-works/pi-durable/node_modules/@earendil-works/pi-ai/dist/utils/`),
+the copy the package's files import: the bare name would resolve the top-level
+0.85.1. Our code
+imports `Harness` from the vendored `harness.js` (types in its `harness.d.ts`),
+`createRegistry` from the vendored `registry.js` (types in its `registry.d.ts`)
 and `SqliteStorage` from the vendored `storage.js` (types, and the
 `SqliteSyncDatabase` it needs, in its `storage.d.ts`);
 nothing is redirected and `node_modules` is untouched, so node, the
@@ -401,8 +415,10 @@ or alias to forget. `test/pi-vendor.ts` fails when the installed package
 version or an upstream file's sha256 moves from the base in a vendored file's
 header, when a vendored file imports the package's copy of another vendored
 file, and when anything outside `src/vendor` imports the package's own
-`Harness`, `SqliteStorage` or `applySqliteMigrations`, which would run without
-the patch.
+`Harness`, `createRegistry`, `CompactionTask`, `SqliteStorage` or
+`applySqliteMigrations`, which would run without the patch. `test/pd-compaction.ts`
+and `npm run pd-compaction:do` cover the compaction patch on the `pd` engine:
+a manual and a threshold compaction, a cancel and two crashes.
 
 ## Upgrading
 

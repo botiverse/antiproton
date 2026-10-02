@@ -50,12 +50,14 @@
  */
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
-  AgentDoc, createRegistry, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID, ToolTask,
+  AgentDoc, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID, ToolTask,
   type Conversation, type ConversationId, type EntryRecord, type HarnessInspection, type TaskId,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
 // The vendored Harness: pi-durable 1.0.0's with a scheduler that reports a sleeping task (`sleepingUntil`).
 import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
+// The vendored registry: its built-in compaction polls a deferred summary (the vendored compaction.js).
+import { createRegistry } from "../vendor/pi/pi-durable/dist/harness/registry.js";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
@@ -71,7 +73,7 @@ import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.t
 import { ClientCallsDoc, toolsExtension, waitingCalls, type ClientToolDef } from "./durable-tools.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { projectEntries } from "./pd-transcript.ts";
-import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
+import { type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 const PD = prefixedNamespace("pd");
 const PD_NAMES = new SqlQualifier(PI_DURABLE_OBJECTS, PD);
@@ -123,6 +125,8 @@ export interface PdHostOptions {
   onPoll?: (jobId: string, ready: boolean) => void;
   /** A test seam into the commit hook (src/runtime/pd-outbox.ts, `BookContext.fault`): a throw rolls the commit back. */
   commitFault?: (writes: readonly StorageWrite[]) => void;
+  /** pi-durable's compaction thresholds, over its defaults (harness/agent.js `DEFAULT_COMPACTION_POLICY`). For tests. */
+  compaction?: { reserveTokens?: number; keepRecentTokens?: number; backgroundTokens?: number };
 }
 
 /** What binds a host to the one agent it serves. */
@@ -259,14 +263,17 @@ export class PdHost {
         registry: this.#registry,
         settings: {
           stream: { deferred: true },
-          // pi-durable's compaction calls the model without `deferred` (harness/compaction.js strips it), and
-          // this provider answers nothing else, so a compaction could only fail. Off until a step makes it work.
-          compaction: { enabled: false },
+          // pi-durable's thresholds (harness/agent.js `DEFAULT_COMPACTION_POLICY`) over the bound model's window:
+          // a background compaction past window - reserve - background tokens, a blocking one past window -
+          // reserve, and one on a context overflow. The summary is a deferred model call like a generation's: the
+          // vendored harness/compaction.js polls it (src/vendor/pi/pi-durable/), and the registry holds that one.
+          compaction: { ...this.#opts.compaction, enabled: true },
         },
         now: this.#now,
-        // Not for settle: every sleep this harness runs (pi-durable's generation poll and retry; the registry holds
-        // only tool extensions, and a tool cannot sleep) starts right after the commit of its checkpoint, and the
-        // read that commit brings already sees it. settle's 1 s recheck is the backstop if that ever changes.
+        // Not for settle: every sleep this harness runs (pi-durable's generation and compaction polls and retries; the
+        // registry holds only tool extensions, and a tool cannot sleep) starts right after the commit of its
+        // checkpoint, and the read that commit brings already sees it. settle's 1 s recheck is the backstop if that
+        // ever changes.
         // For the wake: an answer delivered while its poll was fetching (not sleeping, so `Harness.wake` passes it
         // by) is found when the poll's next sleep starts.
         onSleep: ({ taskId }) => { void this.#wakeOnSleep(taskId); },
@@ -489,7 +496,8 @@ export class PdHost {
   }
 
   /**
-   * Wake every task whose `poll` checkpoint waits for a job that has its answer, not yet consumed or cancelled (only `jobId`'s, when given): its
+   * Wake every task whose `poll` checkpoint waits for a job that has its answer, not yet consumed or cancelled (only `jobId`'s, when given) —
+   * a generation's, or a compaction's summary (the vendored harness/compaction.js writes the same `poll` and `handle`): its
    * sleep ends now, or its next one does not wait (`Harness.wake`). Read from storage rather than remembered, so a
    * reopened harness finds what was delivered while it was closed. A wake too early costs one poll, which comes
    * back not ready and commits a new `pollAt`.
@@ -600,6 +608,9 @@ async function runningIn(h: Harness, id: ConversationId): Promise<boolean> {
   const waits = (await externalWaitsOf(h, [id])).get(id);
   return inspection.tasks.some((t) => {
     if (t.record.conversationId !== id) return false;
+    // A background compaction (past pi-durable's threshold) is not the turn: the run it was started in ended without
+    // waiting for it, and pi085 has nothing running then either. A manual one is not background, and is running.
+    if (t.record.background) return false;
     if (t.state.kind === "waiting" && t.record.kind === GENERATION_KIND) return false;
     const callId = (t.record.input as { callId?: unknown } | null)?.callId;
     if (t.record.kind === TOOL_KIND && typeof callId === "string" && waits?.has(callId) && !t.record.abortRequested) return false;
@@ -731,9 +742,22 @@ export class DurableAgent implements AgentEngine {
     }, bg);
   }
 
-  compact(): Promise<unknown> {
-    // No step owns this yet: see `compaction: { enabled: false }` in PdHost.harness for why it cannot work today.
-    return Promise.reject(new CompactionUnavailable("compact is not supported on the pd engine yet: pi-durable's compaction calls the model without deferral, which the offloaded provider cannot answer"));
+  /**
+   * Start a manual compaction of this session's conversation: pi-durable's `Conversation.compact`, whose summary is a
+   * deferred model call the vendored compaction polls (src/vendor/pi/pi-durable/dist/harness/compaction.js). Durable
+   * before it returns; the wake the caller sets runs `step()`, which parks while the summary is out. The summary is
+   * placed through a write submission: at once when the conversation is idle, else at the run's next boundary. One
+   * already under way that is not a run's own (a manual or background one) is returned instead of a second.
+   */
+  async compact(): Promise<{ operationId: string }> {
+    await this.#host.conversation(this.#session);
+    // Compacting starts the scheduler, which runs every session's tasks.
+    await this.#host.ensureSessions();
+    return this.#host.withHarness(async (h) => {
+      const c = await this.#conversation(h);
+      const under = (await h.snapshot(LiveDoc, c.id, bg))?.compactions?.find((s) => !s.blocking);
+      return { operationId: String(under?.taskId ?? await c.compact(undefined, bg)) };
+    });
   }
 
   /**
