@@ -16,6 +16,8 @@
     "durable-drive:do": "bash test/durable-drive-do.sh",
     "durable-agent": "node test/durable-agent.ts",
     "durable-agent:do": "bash test/durable-agent-do.sh",
+    "pd-outbox": "node test/pd-outbox.ts",
+    "pd-outbox:do": "bash test/pd-outbox-do.sh",
     "pi-loop": "node test/pi-loop.ts",
     "pi-offload": "node test/pi-offload.ts",
     "pi-tools": "node test/pi-tools.ts",

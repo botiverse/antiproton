@@ -23,6 +23,9 @@
  *   Two `DurableAgent`s — two sessions, or the same one rebuilt after the
  *   catalogue changed — share the harness, the step in flight and the job
  *   table. Two harnesses on one storage would run the same task twice.
+ * - The usage and trace outbox rows that pi 0.85 writes inside its commit are
+ *   derived here after each pi-durable commit and at the end of every step
+ *   (`deriveOutbox`, src/runtime/pd-outbox.ts), rows and watermark in one unit.
  *
  * Every write of ours runs through `PiDurableSqlite.exclusive`, so none of
  * it joins a pi-durable transaction that is open on the object's one
@@ -41,6 +44,8 @@ import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { ApStore } from "../store/ap-store.ts";
+import { derivePdOutbox, type DerivePass } from "./pd-outbox.ts";
+import { logEvent } from "../core/log.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../store/sql-namespace.ts";
 import { settle, type SettleResult } from "./durable-drive.ts";
@@ -82,6 +87,10 @@ export interface PdHostOptions {
   stepDeadlineMs?: number;
   /** Each provider poll of a job, and whether it found the answer. For tests and traces. */
   onPoll?: (jobId: string, ready: boolean) => void;
+  /** A test seam into the outbox pass (src/runtime/pd-outbox.ts, `DeriveContext.fault`). */
+  outboxFault?: (stage: "appended") => void;
+  /** Each outbox pass that completed, with what it derived and how it compared with `pi.usage`. For tests. */
+  onOutboxPass?: (pass: DerivePass) => void;
 }
 
 /** What binds a host to the one agent it serves. */
@@ -113,6 +122,9 @@ export class PdHost {
   /** The `ap` tables, written through whichever facade is in use (`#writer`). */
   readonly #ap: ApStore;
   #ensured: Promise<ApStore> | null = null;
+  /** The outbox pass in flight, and whether a commit landed after it read: then it runs once more. */
+  #deriving: Promise<DerivePass | null> | null = null;
+  #deriveAgain = false;
 
   constructor(opts: PdHostOptions) {
     this.#opts = opts;
@@ -187,7 +199,7 @@ export class PdHost {
     const opening = (async () => {
       const db = new PiDurableSqlite(this.#opts.storage, PD);
       this.#db = db;
-      const h = await Harness.open(await SqliteStorage.open(db), {
+      const h = await Harness.open(this.#noticingCommits(await SqliteStorage.open(db)), {
         models: this.#models,
         registry: this.#registry,
         settings: {
@@ -207,6 +219,73 @@ export class PdHost {
     this.#harness = opening;
     opening.catch(() => { if (this.#harness === opening) { this.#harness = null; this.#db = null; } });
     return opening;
+  }
+
+  /**
+   * The storage the harness commits through, telling the outbox about each commit once it has resolved.
+   * The Harness does not expose its Session's `subscribeCommits`, and pi-durable's every commit goes
+   * through `Storage.commit`, so this is the same notice one layer down. The pass it starts is not awaited
+   * here and runs through `exclusive`, so it waits for whatever pi-durable transaction is queued next
+   * instead of joining it.
+   */
+  #noticingCommits(storage: SqliteStorage): SqliteStorage {
+    return new Proxy(storage, {
+      get: (target, key) => {
+        const value: unknown = Reflect.get(target, key, target);
+        if (typeof value !== "function") return value;
+        if (key !== "commit") return value.bind(target);
+        return async (...args: unknown[]) => {
+          const seq = await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          void this.deriveOutbox();
+          return seq;
+        };
+      },
+    });
+  }
+
+  // ---- the usage and trace outboxes --------------------------------------------
+
+  /**
+   * Derive the usage and trace rows for everything pi-durable has committed since the last pass
+   * (src/runtime/pd-outbox.ts): one `exclusive` unit, rows and watermark together. Calls that arrive
+   * while a pass runs share one further pass, which starts after it, so a commit that landed during a
+   * pass is never left for the next wake. Resolves to the last pass; null when the host is not bound
+   * to an agent yet (whose rows these would be is not known, so nothing is derived and the mark stays).
+   *
+   * A failure is logged and resolves to null rather than failing the step that asked: the mark did not
+   * move, so the next pass derives the same rows.
+   */
+  deriveOutbox(): Promise<DerivePass | null> {
+    if (this.#deriving) { this.#deriveAgain = true; return this.#deriving; }
+    this.#deriving = (async () => {
+      for (;;) {
+        this.#deriveAgain = false;
+        const last = await this.#derivePass();
+        // Released in the same turn as the check, so a call arriving after it starts a pass of its own
+        // instead of joining one that has already decided to end. Only one loop runs at a time, so the
+        // promise being released is this one.
+        if (!this.#deriveAgain) { this.#deriving = null; return last; }
+      }
+    })();
+    return this.#deriving;
+  }
+
+  async #derivePass(): Promise<DerivePass | null> {
+    const binding = this.#binding;
+    if (!binding) return null;
+    const owner = { tenantId: binding.tenantId, agentId: binding.agentId };
+    try {
+      const ap = await this.#store();
+      const pass = await ap.unit((tables) => derivePdOutbox(this.#opts.storage.sql, tables, {
+        owner, pd: PD, ap: AP, now: this.#now(),
+        ...(this.#opts.outboxFault ? { fault: this.#opts.outboxFault } : {}),
+      }));
+      this.#opts.onOutboxPass?.(pass);
+      return pass;
+    } catch (error) {
+      logEvent("pd.outbox.error", { ...owner, error: String((error as Error)?.message ?? error).slice(0, 200) });
+      return null;
+    }
   }
 
   /** Run `fn` on the open harness; if that harness closed under it (a park), once more on a fresh one. */
@@ -458,6 +537,9 @@ export class DurableAgent implements AgentEngine {
   async step(): Promise<StepOutcome> {
     await this.#host.conversation(this.#session);
     const result = await this.#host.drive();
+    // Each commit already started a pass; this one is what the step waits for, so that the rows of
+    // everything the step committed are in the outboxes before the alarm flushes them.
+    await this.#host.deriveOutbox();
     if (result.state === "idle") return { open: 0, wakeInMs: null, settled: [] };
     if (result.state === "parked") {
       return { open: result.sleepers.length, wakeInMs: Math.max(0, result.parkedUntil - this.#host.now), settled: [] };

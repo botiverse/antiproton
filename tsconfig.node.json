@@ -84,6 +84,8 @@
     "test/mcp-plugin.ts",
     "test/model-queue.ts",
     "test/durable-agent.ts",
-    "test/spec/durable-agent-spec.ts"
+    "test/spec/durable-agent-spec.ts",
+    "test/pd-outbox.ts",
+    "test/spec/pd-outbox-spec.ts"
   ]
 }
