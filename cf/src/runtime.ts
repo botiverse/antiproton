@@ -54,6 +54,7 @@ import {
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
+import { UnknownJob } from "./model-queue.ts";
 
 /** The persona fields of an agent record, if it carries any. */
 export function personaOf(config: unknown): { name?: string; description?: string } | null {
@@ -2046,7 +2047,7 @@ export class AgentRuntime {
    *  session asked, so the answer lands in the transcript that is waiting. */
   async takeJob(tenantId: string, agentId: string, jobId: string) {
     await this.ready();
-    const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
+    const session = this.#jobSession(jobId);
     const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId);
     if (!job) return job;
     // The model the queued call asks for, when it spends the operator's account; null leaves it at the
@@ -2057,8 +2058,20 @@ export class AgentRuntime {
 
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
     await this.ready();
-    const session = jobSession(this.#deps.ctx.storage.sql, jobId) ?? MAIN_SESSION;
+    const session = this.#jobSession(jobId);
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
+  }
+
+  /** The session whose job this is. No row means no session holds it, so the main
+   *  session is not a fallback: it would find no row either and drop the call silently.
+   *  An object with no jobs table holds no job either, and is asked without creating
+   *  one (ensureAgentTables would also register the main session). */
+  #jobSession(jobId: string): string {
+    const sql = this.#deps.ctx.storage.sql;
+    const hasJobs = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").toArray().length > 0;
+    const session = hasJobs ? jobSession(sql, jobId) : null;
+    if (session === null) throw new UnknownJob(jobId);
+    return session;
   }
 }
 

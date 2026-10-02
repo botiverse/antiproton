@@ -68,7 +68,7 @@ function jobTable(host: DurableSqlHost, pollDelayMs = 0) {
     },
   };
   /**
-   * The queue consumer, as `runQueuedModelCall` does it: parse the stored request,
+   * The queue consumer, as `modelQueueDeps` in cf/src/index.ts does it: parse the stored request,
    * convert it with `toRequest`, ask the model, store `fromResponse` of the reply.
    */
   const consume = (id: string, model: (messages: ModelMessage[], tools?: ToolDefinition[]) => ModelResponse | { error: string }) => {
