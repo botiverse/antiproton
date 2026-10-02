@@ -13,7 +13,7 @@
  */
 import { objectMoved } from "./do-retry.ts";
 import { HANDOFF_PATH, adminHostServes, adminShell, handoffTicket, redeemTicket, safeReturnTo } from "./admin-host.ts";
-import { nextAlarm } from "./alarm-next.ts";
+import { nextAlarm, pdDeliveryWake } from "./alarm-next.ts";
 import { adminModels } from "./admin-models.ts";
 import { html, conditional, holds, notModified } from "./version.ts";
 import type { Json } from "../../src/core/types.ts";
@@ -682,8 +682,13 @@ export class AgentDO extends DurableObject<Env> {
     if (wrote) {
       await this.broadcast();
       // The answer is what makes the next pass finish, so wake now rather than
-      // waiting for the safety-net alarm.
-      await this.#wake();
+      // waiting for the safety-net alarm. Not on a pd object, whose park alarm
+      // is already set for when the answer will be read (alarm-next.ts).
+      if (!rt.servesPd) await this.#wake();
+      else {
+        const at = pdDeliveryWake(await this.ctx.storage.getAlarm(), Date.now());
+        if (at !== null) await this.#wake(at);
+      }
     }
     return wrote;
   }

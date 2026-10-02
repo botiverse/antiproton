@@ -676,6 +676,8 @@ export class AgentRuntime {
   #agents = new Map<string, { agent: AgentEngine; builtFrom: string }>();
   /** The object's one pi-durable harness, made when a `pd` agent is first opened (src/runtime/durable-agent.ts). */
   #pd: PdHost | null = null;
+  /** Whether a pd agent was opened in this object: what a delivered answer's wake depends on (cf/src/index.ts). */
+  get servesPd(): boolean { return this.#pd !== null; }
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
@@ -1832,7 +1834,8 @@ export class AgentRuntime {
     const agent = await this.agent(tenantId, agentId, session);
     // A conversation that has just been spoken to has work until a step says
     // otherwise, so the next wake steps it.
-    markSession(this.#deps.ctx.storage.sql, session, true);
+    const marked = this.#ownWrite(() => markSession(this.#deps.ctx.storage.sql, session, true));
+    if (marked instanceof Promise) await marked;
     const res: any = await agent.say(text, mode);
     return { ...messageLanded(res, mode), result: res };
   }
@@ -1903,21 +1906,27 @@ export class AgentRuntime {
   async step(tenantId: string, agentId: string) {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    ensureAgentTables(sql);
+    const ensured = this.#ownWrite(() => ensureAgentTables(sql));
+    if (ensured instanceof Promise) await ensured;
     // Background work first (task #16). A job that ended is delivered as a
     // message, which marks its session as having work, so the loop below steps
     // it in this same pass; the rest say when they want checking again.
     const owner = { tenantId, agentId };
     const jobCtx = (job: { session: string }) =>
       ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
-    const bg = await runBackgroundPass({
+    // Not on a pd object whose harness may be open: the pass writes `background_jobs` with plain SQL across
+    // awaits, which could join a pi-durable transaction, and nothing the pd engine offers starts background
+    // work yet (tools are step 7). `#pd` is set only once a pd agent was opened, so before that no harness
+    // exists, and the pass runs as it always has.
+    const bg = this.#pd ? { wakeInMs: null } : await runBackgroundPass({
       sql, owner,
       poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json),
       cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
       deliver: async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); },
     });
-    const sessions = sessionsWithWork(sql);
+    const listed = this.#ownWrite(() => sessionsWithWork(sql));
+    const sessions = listed instanceof Promise ? await listed : listed;
     if (!sessions.length) sessions.push(MAIN_SESSION);
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
@@ -1931,7 +1940,8 @@ export class AgentRuntime {
       settled.push(...out.settled);
       const wake = resumed ? 0 : out.wakeInMs;
       if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
-      markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
+      const marked = this.#ownWrite(() => markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null));
+      if (marked instanceof Promise) await marked;
     }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
@@ -1940,13 +1950,16 @@ export class AgentRuntime {
     // A turn that settled while background work runs has not finished using
     // its containers: releasing now would take the machine out from under the
     // job, which is the normal case, since the model keeps working (task #16).
-    const backgroundRunning = runningBackgroundJobs(sql, owner).length > 0;
+    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) and the pd
+    // engine offers no tool that could hold or start anything yet (step 7).
+    const pd = this.#pd !== null;
+    const backgroundRunning = !pd && runningBackgroundJobs(sql, owner).length > 0;
     // A program suspended at a pause keeps the object awake (and is discarded
     // here once past its time), and, like background work, has not finished
     // with the containers it was using.
     const keep = this.#continuations.wakeInMs();
     if (keep !== null) wakeInMs = wakeInMs === null ? keep : Math.min(wakeInMs, keep);
-    if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
+    if (!pd && this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
       if (!this.#deps.idle) {
         if (settled.length) {
           const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
@@ -2092,10 +2105,16 @@ export class AgentRuntime {
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any);
   }
 
-  /** The session whose job this is. No row means no session holds it, so the main
-   *  session is not a fallback: it would find no row either and drop the call silently.
-   *  An object with no jobs table holds no job either, and is asked without creating
-   *  one (ensureAgentTables would also register the main session). */
+  /**
+   * A write of the runtime's own tables. On an object where a pd agent was opened it waits out any
+   * pi-durable transaction open on the object's one connection (`PdHost.exclusive`), which a plain
+   * `sql.exec` would join and be rolled back with; the promise is returned to await. Elsewhere it runs at
+   * once and returns nothing, so a pi085 object takes exactly the path it always took.
+   */
+  #ownWrite<T>(fn: () => T): Promise<T> | T {
+    return this.#pd ? this.#pd.exclusive(fn) : fn();
+  }
+
   /**
    * On a `pd` object every session's jobs are in one table the shared harness answers from
    * (src/runtime/durable-agent.ts), so any session's agent takes and delivers them, and that agent
@@ -2105,6 +2124,10 @@ export class AgentRuntime {
     return recordedEngine(this.#deps.ctx.storage.sql) === "pd" ? MAIN_SESSION : this.#jobSession(jobId);
   }
 
+  /** The session whose job this is. No row means no session holds it, so the main
+   *  session is not a fallback: it would find no row either and drop the call silently.
+   *  An object with no jobs table holds no job either, and is asked without creating
+   *  one (ensureAgentTables would also register the main session). */
   #jobSession(jobId: string): string {
     const sql = this.#deps.ctx.storage.sql;
     const hasJobs = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pi_model_jobs'").toArray().length > 0;
