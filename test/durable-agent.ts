@@ -10,6 +10,7 @@ import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
 import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
+import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
@@ -64,9 +65,9 @@ const runtimeCases: DriveCase[] = [
     run: async () => {
       const host = sqliteHost();
       try {
-        const ap = new ApStore(host.sql, prefixedNamespace("ap"));
-        ap.ensure();
-        ap.setEngineOnce("pd");
+        const ap = new ApStore(host.sql, new PiDurableSqlite(host, prefixedNamespace("pd")), prefixedNamespace("ap"));
+        await ap.ensure();
+        await ap.setEngineOnce("pd");
         const { rt, sent } = await runtime(host);
         const agent = await rt.agent("t", "a");
         check(agent instanceof DurableAgent, `opened ${agent.constructor.name}`);

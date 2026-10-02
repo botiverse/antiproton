@@ -24,7 +24,7 @@
  *   catalogue changed — share the harness, the step in flight and the job
  *   table. Two harnesses on one storage would run the same task twice.
  *
- * Every statement of ours runs through `PiDurableSqlite.exclusive`, so none of
+ * Every write of ours runs through `PiDurableSqlite.exclusive`, so none of
  * it joins a pi-durable transaction that is open on the object's one
  * connection (src/store/pi-durable-sqlite.ts says why that matters).
  *
@@ -110,11 +110,14 @@ export class PdHost {
   #harness: Promise<Harness> | null = null;
   #driving: Promise<SettleResult> | null = null;
   #conversations = new Map<string, Promise<ConversationId>>();
-  #ensured = false;
+  /** The `ap` tables, written through whichever facade is in use (`#writer`). */
+  readonly #ap: ApStore;
+  #ensured: Promise<ApStore> | null = null;
 
   constructor(opts: PdHostOptions) {
     this.#opts = opts;
     this.#now = opts.now ?? Date.now;
+    this.#ap = new ApStore(opts.storage.sql, { exclusive: (fn) => this.exclusive(fn) }, AP);
   }
 
   get now(): number { return this.#now(); }
@@ -157,15 +160,23 @@ export class PdHost {
 
   // ---- our own SQL, kept out of pi-durable's transactions --------------------
 
-  /** A synchronous unit over the `ap` tables, after any pi-durable transaction open or queued on the facade in use. */
-  exclusive<T>(fn: (ap: ApStore) => T): Promise<T> {
-    // With no harness open nothing of pi-durable's can be in flight, and a facade of its own has an empty queue.
-    const db = this.#db ?? new PiDurableSqlite(this.#opts.storage, PD);
-    return db.exclusive(() => {
-      const ap = new ApStore(this.#opts.storage.sql, AP);
-      if (!this.#ensured) { ap.ensure(); this.#ensured = true; }
-      return fn(ap);
-    });
+  /**
+   * A synchronous unit of our SQL, after any pi-durable transaction open or queued on the facade in use:
+   * the open harness's, whose queue it must join. With no harness open nothing of pi-durable's can be in
+   * flight, and a facade of its own has an empty queue.
+   */
+  exclusive<T>(fn: () => T): Promise<T> {
+    return (this.#db ?? new PiDurableSqlite(this.#opts.storage, PD)).exclusive(fn);
+  }
+
+  /** The `ap` store, its tables made on first use. */
+  #store(): Promise<ApStore> {
+    if (!this.#ensured) {
+      const ensuring = this.#ap.ensure().then(() => this.#ap);
+      this.#ensured = ensuring;
+      ensuring.catch(() => { if (this.#ensured === ensuring) this.#ensured = null; });
+    }
+    return this.#ensured;
   }
 
   // ---- the harness ------------------------------------------------------------
@@ -229,7 +240,8 @@ export class PdHost {
     const known = this.#conversations.get(session);
     if (known) return known;
     const made = (async () => {
-      const listed = await this.exclusive((ap) => ap.conversation(session));
+      const ap = await this.#store();
+      const listed = ap.conversation(session);
       if (listed) return listed.conversationId as ConversationId;
       const { tenantId, agentId } = this.#bound();
       // Not atomic with the row below: a crash between them leaves a conversation nothing lists, and the
@@ -238,8 +250,7 @@ export class PdHost {
         session === MAIN_SESSION
           ? (await h.root(bg)).id
           : (await h.createConversation({ ownership: { kind: "ownerless" } }, bg)).id);
-      const row = await this.exclusive((ap) =>
-        ap.openConversation({ taskId: session, tenantId, agentId, conversationId: id, createdAt: this.#now() }));
+      const row = await ap.openConversation({ taskId: session, tenantId, agentId, conversationId: id, createdAt: this.#now() });
       return row.conversationId as ConversationId;
     })();
     this.#conversations.set(session, made);
@@ -281,9 +292,9 @@ export class PdHost {
   async #startJob(request: ModelJobRequest): Promise<string> {
     const id = `mj_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
     // Durable before it is dispatched, as in PiAgent: a dispatch can be retried from the row.
-    await this.exclusive((ap) => ap.query(
+    await (await this.#store()).query(
       "INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, NULL, ?, ?)",
-      id, JSON.stringify(request), this.#now()));
+      id, JSON.stringify(request), this.#now());
     await this.#dispatch(id);
     return id;
   }
@@ -291,7 +302,7 @@ export class PdHost {
   async #dispatch(id: string): Promise<boolean> {
     try { await this.#bound().dispatch(id); }
     catch { return false; /* not marked, so the next sweep sends it */ }
-    await this.exclusive((ap) => ap.query("UPDATE model_jobs SET dispatched_at = ? WHERE id = ?", this.#now(), id));
+    await (await this.#store()).query("UPDATE model_jobs SET dispatched_at = ? WHERE id = ?", this.#now(), id);
     return true;
   }
 
@@ -299,16 +310,16 @@ export class PdHost {
   async #sweep(limit = 20): Promise<number> {
     if (!this.#binding) return 0;
     const now = this.#now();
-    const ids = await this.exclusive((ap) => ap.query(
+    const ids = (await (await this.#store()).query(
       "SELECT id FROM model_jobs WHERE answer IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
-      now - REDELIVERY_MS, limit).map((r) => String(r.id)));
+      now - REDELIVERY_MS, limit)).map((r) => String(r.id));
     let sent = 0;
     for (const id of ids) if (await this.#dispatch(id)) sent++;
     return sent;
   }
 
   async #pollJob(id: string): Promise<Answered | null> {
-    const row = await this.exclusive((ap) => ap.query("SELECT answer FROM model_jobs WHERE id = ?", id)[0]);
+    const [row] = await (await this.#store()).query("SELECT answer FROM model_jobs WHERE id = ?", id);
     const answer = row?.answer;
     this.#opts.onPoll?.(id, typeof answer === "string");
     // `readAnswer` refuses what nothing that writes this row can produce (a stored `aborted`, a non-assistant).
@@ -317,12 +328,12 @@ export class PdHost {
 
   /** pi-durable cancels a polling generation's job when the generation is aborted; a late answer then has no row. */
   async #dropJob(id: string): Promise<void> {
-    await this.exclusive((ap) => ap.query("DELETE FROM model_jobs WHERE id = ?", id));
+    await (await this.#store()).query("DELETE FROM model_jobs WHERE id = ?", id);
   }
 
   /** The worker's question: the request, or null once answered so a redelivered message does not call twice. */
   async takeJob(id: string): Promise<unknown> {
-    const row = await this.exclusive((ap) => ap.query("SELECT request, answer FROM model_jobs WHERE id = ?", id)[0]);
+    const [row] = await (await this.#store()).query("SELECT request, answer FROM model_jobs WHERE id = ?", id);
     if (!row) throw this.#bound().unknownJob(id);
     return row.answer === null ? JSON.parse(String(row.request)) : null;
   }
@@ -331,15 +342,12 @@ export class PdHost {
   async deliver(id: string, answer: AnsweredMessage): Promise<boolean> {
     const json = JSON.stringify(answer);
     const now = this.#now();
-    const outcome = await this.exclusive((ap) => {
-      const row = ap.query("SELECT answer FROM model_jobs WHERE id = ?", id)[0];
-      if (!row) return "unknown" as const;
-      if (row.answer !== null) return false;
-      ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ?", json, now, id);
-      return true;
-    });
-    if (outcome === "unknown") throw this.#bound().unknownJob(id);
-    return outcome;
+    const ap = await this.#store();
+    // One statement decides it, so two deliveries cannot both see the row unanswered.
+    const won = await ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING id", json, now, id);
+    if (won.length > 0) return true;
+    if ((await ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id)).length === 0) throw this.#bound().unknownJob(id);
+    return false;
   }
 }
 
@@ -523,5 +531,6 @@ export class DurableAgent implements AgentEngine {
 export function recordedEngine(sql: DurableSqlHost["sql"]): "pi085" | "pd" | null {
   const meta = AP.qualify("meta", "table");
   if (sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", meta).toArray().length === 0) return null;
-  return new ApStore(sql as ConstructorParameters<typeof ApStore>[0], AP).engine();
+  const readOnly = { exclusive: () => Promise.reject(new Error("recordedEngine only reads")) };
+  return new ApStore(sql as ConstructorParameters<typeof ApStore>[0], readOnly, AP).engine();
 }
