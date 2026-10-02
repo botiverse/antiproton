@@ -71,6 +71,8 @@
     "test/connect.ts",
     "test/activity-flush.ts",
     "test/provision-runtime.ts",
+    "test/agent-surface.ts",
+    "test/agent-surface-runtime.ts",
     "test/exa-default.ts",
     "test/model-gateway.ts",
     "test/admin-models.ts",
