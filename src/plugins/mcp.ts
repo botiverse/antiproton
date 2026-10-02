@@ -9,9 +9,12 @@
  * server, and the list an agent is offered changes only when a person asked.
  *
  * Streamable HTTP only. pi-mcp's stdio transport spawns a process, which a
- * Worker cannot do, and importing it pulls `child_process` into the bundle —
- * so this file imports exactly `McpClient`, `StreamableHttpTransport` and
- * `toLlmContent`, and `test/mcp-plugin.ts` holds it to that. No OAuth: a server
+ * Worker cannot do. The package has no subpath for its transports, so even this
+ * file's import resolves `stdio.js` and `cross-spawn` at module level; what
+ * keeps them out of the Worker is the bundler dropping the unreferenced
+ * `StdioTransport`, not the import list. This file imports exactly `McpClient`,
+ * `StreamableHttpTransport` and `toLlmContent`, and `test/mcp-plugin.ts` checks
+ * both the list and that the bundle carries no `child_process`. No OAuth: a server
  * that needs a key gets it from a header whose value names a secret the agent
  * kept (`{{name}}`), filled in server-side on every request.
  *

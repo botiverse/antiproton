@@ -15,6 +15,7 @@ import { ToolGateway } from "../src/runtime/gateway.ts";
 import { agentRef, KEPT_PREFIX } from "../src/runtime/secrets.ts";
 import { qualifyMountedTools } from "../src/runtime/pi-tools.ts";
 import { validateMount } from "../src/runtime/mount-config.ts";
+import { admitTools } from "../src/runtime/mount-tools.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { mcpPlugin, parseHeaderLines, serverUrlProblem, toolSchemaOf } from "../src/plugins/mcp.ts";
 import { toolsOf, type Plugin } from "../src/plugins/types.ts";
@@ -359,6 +360,17 @@ await check("pi-mcp: every connection initializes again, with no session id carr
     must(server.seen.some((s) => s.rpc === "tools/call" && s.headers["mcp-session-id"]), "the call did not carry its own session");
     must(!server.seen.some((s) => s.method === "GET"), "a GET stream was opened");
   } finally { globalThis.fetch = realFetch; }
+});
+
+await check("a listed tool with no string name is skipped as nameless, not admitted as \"undefined\"", async () => {
+  const snap = await admitTools({ tools: [
+    { name: undefined, summary: "", parameters: {}, sideEffects: "read", idempotency: "none" },
+    { name: null, summary: "", parameters: {}, sideEffects: "read", idempotency: "none" },
+    { name: 42, summary: "", parameters: {}, sideEffects: "read", idempotency: "none" },
+  ] as never }, 0);
+  must(snap.tools.length === 0, `admitted: ${snap.tools.map((t) => t.name).join()}`);
+  must(snap.skipped.length === 3 && snap.skipped.every((s) => s.reason === "the server gave no usable name"),
+    `skipped: ${JSON.stringify(snap.skipped)}`);
 });
 
 await check("pi-mcp: the plugin imports only the HTTP client, and its bundle carries no child_process", async () => {

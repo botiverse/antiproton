@@ -28,7 +28,12 @@ export async function admitTools(listed: ListedTools, takenAt: number): Promise<
   const skipped: Array<{ name: string; reason: string }> = [...(listed.skipped ?? [])];
   const seen = new Set<string>();
   for (const t of listed.tools) {
-    const name = typeof t?.name === "string" ? t.name : String(t?.name);
+    if (typeof t?.name !== "string") {
+      // Not String(): `String(undefined)` is "undefined", which passes the name rule.
+      skipped.push({ name: JSON.stringify(t?.name) ?? "(none)", reason: "the server gave no usable name" });
+      continue;
+    }
+    const name = t.name;
     if (!TOOL_SEGMENT.test(name)) {
       skipped.push({ name, reason: "not a name an agent can address: only letters, digits and _ (no dots, dashes or spaces)" });
       continue;
