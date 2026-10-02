@@ -12,7 +12,7 @@ import type { ModelResponse } from "../src/model/types.ts";
 import { DurableAgent, guardJoinedWrites } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
-import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
+import { PiDurableSqlite, type DurableSqlHost } from "../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
@@ -33,7 +33,24 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
  */
 async function apiAgent(engine: "pi085" | "pd") {
   const raw = sqliteHost();
-  const guarded = guardJoinedWrites(raw, { throwOnJoin: true });
+  /** The next pi-durable transaction opened after `holdNext()` is held open, before its work, until released. */
+  let held: { reached: () => void; released: Promise<void> } | null = null;
+  const holding: DurableSqlHost = {
+    sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
+    transaction: (cb) => raw.transaction(async () => {
+      const h = held;
+      held = null;
+      if (h) { h.reached(); await h.released; }
+      return cb();
+    }),
+  };
+  const holdNext = () => {
+    let reached!: () => void, release!: () => void;
+    const at = new Promise<void>((r) => { reached = r; });
+    held = { reached, released: new Promise<void>((r) => { release = r; }) };
+    return { reached: at, release };
+  };
+  const guarded = guardJoinedWrites(holding, { throwOnJoin: true });
   const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
   if (engine === "pd") {
     const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
@@ -93,7 +110,7 @@ async function apiAgent(engine: "pi085" | "pd") {
       items: items.map(({ id: _i, turn_id: _t, ...rest }) => show(rest)),
     };
   };
-  return { rt, agent, sent, requests, replies, settle, view, joined: guarded.joined, dispose: () => raw.dispose() };
+  return { rt, agent, sent, requests, replies, settle, view, holdNext, joined: guarded.joined, dispose: () => raw.dispose() };
 }
 
 const runtimeCases: DriveCase[] = [{
@@ -159,6 +176,46 @@ const runtimeCases: DriveCase[] = [{
     check(show(pd.requests[0]).includes(CANCELLED_NOTE.slice(1, 40)), `the note is not in the next request: ${show(pd.requests[0])}`);
   },
 }];
+
+/**
+ * `submitToolResults` and `cancelSession` on a pd object, each started while a pi-durable commit is held open (a
+ * message to another session opens it) and left running there for a while before the commit is let go. Every
+ * write either makes must wait for the commit (`#ownWrite`, `apartFromPd`): the guard throws on one that joins it.
+ */
+runtimeCases.push({
+  group: "runtime", name: "pd: a caller's result and a cancel, each issued while a pi-durable commit is held open, join nothing",
+  run: async () => {
+    const a = await apiAgent("pd");
+    try {
+      const during = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
+        const hold = a.holdNext();
+        const posting = a.rt.postMessage("t", "a", `meanwhile, before ${what}`, "prompt", "s9");
+        await hold.reached;
+        const running = fn().then((value) => ({ value }), (error) => ({ error: String((error as Error)?.message ?? error) }));
+        await sleep(100);
+        hold.release();
+        const [r] = await Promise.all([running, posting]);
+        check(!("error" in r), `${what} threw: ${(r as { error: string }).error}`);
+        return (r as { value: T }).value;
+      };
+      a.replies.push(() => ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "call_h", name: "get_weather", arguments: { city: "Oslo" } }] }));
+      await a.rt.postMessage("t", "a", "weather in Oslo?");
+      await a.settle();
+      const turnId = String((await a.rt.waitingClientCalls("t", "a", "main"))[0]?.turn_id ?? "");
+      check(turnId, "control: no call is waiting on the caller");
+      const kept = await during("submitToolResults", () => a.rt.submitToolResults("t", "a", "main", [{ turnId, callId: "call_h", output: "cold", isError: false }]));
+      check(kept.unknown.length === 0, `the result was refused: ${show(kept)}`);
+      a.replies.push(() => ({ text: "cold", finishReason: "stop", truncated: false, usage: USAGE }), () => ({ text: "ok", finishReason: "stop", truncated: false, usage: USAGE }));
+      await a.settle();
+      await a.rt.postMessage("t", "a", "write a long story");
+      await a.rt.step("t", "a");
+      const out = await during("cancelSession", () => a.rt.cancelSession("t", "a"));
+      check(typeof out.cancelledTurn === "string", `nothing was cancelled: ${show(out)}`);
+      check(a.joined.length === 0, `${a.joined.length} writes joined an open pi-durable transaction: ${show(a.joined.slice(0, 5))}`);
+      await a.agent.close();
+    } finally { a.dispose(); }
+  },
+});
 
 const only = process.argv[2];
 // Twice: with each pi-durable commit held open 5 ms (the widest window for a write to join it), and as is.
