@@ -286,7 +286,7 @@ export async function handleProvision(
       return fail({ status: 404, code: "not_found", message: `no provisioned agent ${byRaft ? "made from Raft agent " : ""}${rest[0]}` });
     }
     const a = await surface(deps.surface, read, tenantId, found.agentId, query);
-    if (!a.ok) return fail({ status: a.status, code: a.status === 404 ? "not_found" : "invalid", message: a.message, ...(a.param ? { param: a.param } : {}) });
+    if (!a.ok) return fail({ status: a.status, code: a.status === 404 ? "not_found" : a.status === 502 ? "unavailable" : "invalid", message: a.message, ...(a.param ? { param: a.param } : {}) });
     return ok(read === "usage" ? { raftAgentId: found.raftAgentId, providerAgentId: found.agentId, ...a.body } : a.body);
   }
   if (rest.length < 1 || rest.length > 2 || (rest.length === 2 && rest[1] !== "credential")) return null;

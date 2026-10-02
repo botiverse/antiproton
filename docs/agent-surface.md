@@ -24,14 +24,15 @@ answer as an id that never existed.
 | `GET` | `/v1/agents/{agentId}/workspace/files/read?path=` | one file of its workspace |
 
 Errors use the API's usual envelope: `{ "error": { "message", "type", "param", "code" } }`. A bad
-parameter is `400`, `code: "invalid_value"`, with the parameter named in `param`.
+parameter is `400`, `code: "invalid_value"`, with the parameter named in `param`; a failure underneath
+is `502`, `code: "upstream_unavailable"`.
 
 ### `GET .../usage`
 
 | Parameter | |
 |---|---|
 | `from` | Required. ISO 8601 time with a zone (`2026-10-01T00:00:00Z`, `2026-10-01T08:00:00+08:00`). An unencoded `+` that arrives as a space before the offset is read as the `+`. |
-| `to` | Required, the same form, later than `from`. `to - from` is at most 31 days. |
+| `to` | Required, the same form, later than `from`. The window, once widened to whole buckets (below), is at most 31 days: a `1d` request from noon to noon 31 days later covers 32 and is refused. |
 | `bucket` | `1h` (default) or `1d`. Days are cut at 00:00 UTC. `1h` is refused for a `from` more than 35 days ago (hourly rows past that may have been folded into days); use `1d`. |
 
 The window is widened to whole buckets — `from` down and `to` up to a bucket boundary — and the answer
@@ -82,7 +83,9 @@ The subtraction is made per bucket and per model or tool. A difference that woul
 | `dirPath` | The directory to list, e.g. `state/notes/`. Empty or `/` is the top level. A trailing `/` is optional. |
 | `includeHidden` | `true` or `false` (default). Hidden entries are those whose name starts with `.`. |
 
-Answers one directory level, directories first, then by name, at most 1000 entries:
+Answers one directory level, directories first, then by name, at most 1000 entries. A listing that
+left entries out says so: `truncated: true`, and `omitted` with how many when that is known (a
+container whose output was cut short may not say). A whole listing has neither field.
 
 ```json
 { "files": [
@@ -90,6 +93,10 @@ Answers one directory level, directories first, then by name, at most 1000 entri
   { "name": "memory", "path": "state/memory", "isDirectory": false, "size": 31, "modifiedAt": "2026-10-01T01:00:00.000Z" },
   { "name": ".draft", "path": "state/.draft", "isDirectory": false, "size": 8, "modifiedAt": "2026-10-01T01:00:00.000Z", "isHidden": true }
 ] }
+```
+
+```json
+{ "files": [ ... ], "truncated": true, "omitted": 41 }
 ```
 
 `path` is what to pass back as `dirPath` (a directory, ending in `/`) or as `path` to the read (a
@@ -101,9 +108,17 @@ The top level is always three directories:
 |---|---|
 | `state/` | What the agent keeps with its state tools, one file per key; a `/` in a key makes directories. A text value is its text; any other value is JSON. In a listing, a state file's `size` is its stored (JSON-encoded) size; the read reports the size of the content it returns. The agent's sealed secrets are never listed and never readable, under any spelling of their name; mount credentials and hook secrets are not part of the workspace at all. |
 | `artifacts/` | The agent's objects in object storage: tool results too large to return inline, files saved out of its container, and state values too large for a row. |
-| `sandbox/` | The working directory (`/work` by default) of the agent's container, **only while that container is already running**. A look never starts one: a container is billed while it runs. When none is running, `sandbox/` holds a single file, `NOT_RUNNING.txt`, saying so, and any other path under it is `404`. |
+| `sandbox/` | The working directory (`/work` by default) of the agent's container, **only while that container is already running**. A look never starts one: a container is billed while it runs. When none is running, `sandbox/` holds a single file, `NOT_RUNNING.txt`, saying so, and any other path under it is `404`. "Running" means both that antiproton has not switched the container off and that its provider lists it as awake (run9's `idle` or `running`, not `ready`). One race remains: the provider may put an idle container to sleep in the moment between that check and the look's first command, which then wakes it (see `AWAKE_STATES` in `src/plugins/sandbox.ts`). |
 
-Listing a directory that does not exist is `404`.
+Listing a directory that does not exist is `404`; listing a file in `sandbox/` is `400` with
+`param: "dirPath"`.
+
+In `sandbox/`, symbolic links are listed as files and never followed. A path whose real location —
+every link in it resolved inside the container — is outside the working directory is `404`, so a link
+to `/` or to a file elsewhere in the container shows nothing of what it points at. Only a regular file
+is read; a device, FIFO or socket is `400`. A look takes at most 10 seconds (a listing) or 20 (a read),
+and never holds up the agent's own use of its container for longer than it takes to check the container
+is awake and start the look.
 
 ### `GET .../workspace/files/read`
 
@@ -122,6 +137,8 @@ Listing a directory that does not exist is `404`.
 - `mimeType` is taken from the name's extension, else what the store recorded, else `text/plain` or
   `application/octet-stream`.
 - A path to a directory is `400`; a path that does not exist is `404`.
+- When something underneath fails (the ledger, the agent, object storage, the container's provider),
+  the answer is `502` with a sentence that names none of it; the detail is logged on the server only.
 
 ### Paths
 
@@ -155,4 +172,4 @@ The same three reads for an agent a Raft server provisioned, with the provider t
   `raftAgentId` and `providerAgentId` instead of `agentId`.
 - **Errors.** The provider envelope: `{ "error": { "code", "message", "param"? } }`. A bad parameter is
   `400`, `code: "invalid"`, `param` naming it; a missing agent, file or directory is `404`,
-  `code: "not_found"`.
+  `code: "not_found"`; a failure underneath is `502`, `code: "unavailable"`.

@@ -65,7 +65,8 @@ function fakeSurface(opts: { now?: number } = {}) {
   const state = new Map<string, Map<string, { value: unknown; ref: string | null; bytes: number; updatedAt: number }>>();
   const objects = new Map<string, { bytes: Uint8Array; uploaded: number; contentType?: string }>();
   const gets: string[] = [];
-  let sandbox: { running: boolean; files: Map<string, Uint8Array>; dirs: Set<string> } = { running: false, files: new Map(), dirs: new Set([""]) };
+  type Box = { running: boolean; files: Map<string, Uint8Array>; dirs: Set<string>; others?: Set<string>; cut?: { truncated: boolean; omitted?: number }; fail?: string };
+  let sandbox: Box = { running: false, files: new Map(), dirs: new Set([""]) };
   const sandboxCalls: string[] = [];
   const workspace: WorkspaceDeps = {
     state: {
@@ -108,20 +109,24 @@ function fakeSurface(opts: { now?: number } = {}) {
       async list(tenantId, agentId, path): Promise<SandboxList> {
         sandboxCalls.push(`list ${tenantId}/${agentId} ${path}`);
         if (!sandbox.running) return { running: false };
+        if (sandbox.fail) throw new Error(sandbox.fail);
+        if (sandbox.files.has(path)) return { running: true, found: false, notDirectory: true };
         if (!sandbox.dirs.has(path)) return { running: true, found: false };
         const pre = path ? path + "/" : "";
         const entries = new Map<string, { name: string; isDirectory: boolean; size: number; modifiedAt: number }>();
         for (const d of sandbox.dirs) if (d.startsWith(pre) && d !== path && !d.slice(pre.length).includes("/")) entries.set(d, { name: d.slice(pre.length), isDirectory: true, size: 0, modifiedAt: T0 });
         for (const [f, b] of sandbox.files) if (f.startsWith(pre) && !f.slice(pre.length).includes("/")) entries.set(f, { name: f.slice(pre.length), isDirectory: false, size: b.byteLength, modifiedAt: T0 });
-        return { running: true, found: true, entries: [...entries.values()] };
+        return { running: true, found: true, entries: [...entries.values()], ...(sandbox.cut ?? { truncated: false }) };
       },
       async read(tenantId, agentId, path, maxBytes): Promise<SandboxRead> {
         sandboxCalls.push(`read ${tenantId}/${agentId} ${path}`);
         if (!sandbox.running) return { running: false };
-        if (sandbox.dirs.has(path)) return { running: true, found: true, isDirectory: true, size: 0, modifiedAt: T0, bytes: null };
+        if (sandbox.fail) throw new Error(sandbox.fail);
+        if (sandbox.dirs.has(path)) return { running: true, found: true, kind: "directory", size: 0, modifiedAt: T0, bytes: null };
+        if (sandbox.others?.has(path)) return { running: true, found: true, kind: "other", size: 0, modifiedAt: T0, bytes: null };
         const b = sandbox.files.get(path);
         if (!b) return { running: true, found: false };
-        return { running: true, found: true, isDirectory: false, size: b.byteLength, modifiedAt: T0, bytes: b.byteLength > maxBytes ? null : b };
+        return { running: true, found: true, kind: "file", size: b.byteLength, modifiedAt: T0, bytes: b.byteLength > maxBytes ? null : b };
       },
     },
   };
@@ -506,6 +511,52 @@ await check("sandbox/ with the container running shows its working directory, on
   must(big.ok && big.file.content === null && big.file.size === READ_MAX_BYTES + 5, JSON.stringify(big));
 });
 
+await check("a 31-day window is measured after widening to whole buckets: 31 days from midnight passes, 31 days from noon is 32 and is refused", () => {
+  const whole = parseUsageQuery(q("from=2026-09-01T00:00:00Z&to=2026-10-02T00:00:00Z&bucket=1d"), NOW);
+  must(!("param" in whole), JSON.stringify(whole));
+  const noon = parseUsageQuery(q("from=2026-09-01T12:00:00Z&to=2026-10-02T12:00:00Z&bucket=1d"), NOW);
+  must("param" in noon && noon.param === "to", `a 31-day request covering 32 days passed: ${JSON.stringify(noon)}`);
+  const hourly = parseUsageQuery(q("from=2026-09-01T00:30:00Z&to=2026-10-02T00:30:00Z&bucket=1h"), NOW);
+  must("param" in hourly && hourly.param === "to", `31 days and an hour passed: ${JSON.stringify(hourly)}`);
+});
+
+await check("a listing applies the read's rule to every segment: a key with a secret-named segment inside a directory is not listed", async () => {
+  const f = workspaceFixture();
+  f.put("t", "a", "notes/kept:y", "SECRET-VALUE-789");
+  f.put("t", "a", "kept:dir/z", "SECRET-VALUE-000");
+  const notes = await workspaceList(f.deps.workspace, "t", "a", "state/notes/", true);
+  must(notes.ok && !JSON.stringify(notes).includes("kept"), JSON.stringify(names(notes)));
+  const top = await workspaceList(f.deps.workspace, "t", "a", "state/", true);
+  must(top.ok && !JSON.stringify(top).includes("kept"), `a directory named as a secret was listed: ${JSON.stringify(names(top))}`);
+});
+
+await check("a listing that left entries out says so, with how many when known; a whole one says nothing", async () => {
+  const f = workspaceFixture();
+  f.setSandbox({ running: true, dirs: new Set([""]), files: new Map([["a.txt", enc("a")]]), cut: { truncated: true, omitted: 41 } });
+  const cut = await workspaceList(f.deps.workspace, "t", "a", "sandbox/", false);
+  must(cut.ok && cut.truncated === true && cut.omitted === 41, JSON.stringify(cut));
+  f.setSandbox({ running: true, dirs: new Set([""]), files: new Map([["a.txt", enc("a")]]), cut: { truncated: true } });
+  const unknown = await workspaceList(f.deps.workspace, "t", "a", "sandbox/", false);
+  must(unknown.ok && unknown.truncated === true && !("omitted" in unknown), `an unknown count was given a number: ${JSON.stringify(unknown)}`);
+  f.setSandbox({ running: true, dirs: new Set([""]), files: new Map([["a.txt", enc("a")]]) });
+  const whole = await workspaceList(f.deps.workspace, "t", "a", "sandbox/", false);
+  must(whole.ok && !("truncated" in whole) && !("omitted" in whole), JSON.stringify(whole));
+  for (let i = 0; i < 1005; i++) f.objects.set(`t/t/a/many/${String(i).padStart(4, "0")}`, { bytes: enc("x"), uploaded: T0 });
+  const many = await workspaceList(f.deps.workspace, "t", "a", "artifacts/many/", false);
+  must(many.ok && many.files.length === 1000 && many.truncated === true && many.omitted === 5, `cap: ${many.ok ? `${many.files.length} ${many.truncated} ${many.omitted}` : JSON.stringify(many)}`);
+});
+
+await check("in the container, listing a file is refused as not a directory, and reading anything but a regular file is refused", async () => {
+  const f = workspaceFixture();
+  f.setSandbox({ running: true, dirs: new Set([""]), files: new Map([["index.js", enc("x")]]), others: new Set(["tty"]) });
+  const file = await workspaceList(f.deps.workspace, "t", "a", "sandbox/index.js", false);
+  must(!file.ok && file.status === 400 && file.param === "dirPath", JSON.stringify(file));
+  const gone = await workspaceList(f.deps.workspace, "t", "a", "sandbox/nope/", false);
+  must(!gone.ok && gone.status === 404, JSON.stringify(gone));
+  const dev = await workspaceRead(f.deps.workspace, "t", "a", "sandbox/tty");
+  must(!dev.ok && dev.status === 400 && /regular file/.test(dev.message), JSON.stringify(dev));
+});
+
 // ---- the two surfaces ------------------------------------------------------------------------------
 
 const WHO = { label: "raft", tenantId: "t", raftOrigin: "https://raft.example", scope: "tenant" as const };
@@ -640,6 +691,20 @@ await check("a platform token names the Raft server beside the read's own parame
   must(wrong.status === 404, wrong.text);
   const read = await provider(deps, "/agents/raft_01JX/workspace-files/read", "raftServerId=srv-1&path=state/missing", PLATFORM);
   must(read.status === 404 && /no file/.test(read.body.error.message), `the server parameter got in the path's way: ${read.text}`);
+});
+
+await check("a failure underneath is answered without its detail on both surfaces, and the detail is logged", async () => {
+  const f = bothSurfaces();
+  const detail = "run9 POST /projects/shared-proj/workspace/boxes/h-t-agent_1-abc/background-execs -> 500: boom";
+  f.setSandbox({ running: true, dirs: new Set([""]), files: new Map(), fail: detail });
+  const p = await provider(provisionDeps(f, [agentRow()]), "/agents/raft_01JX/workspace-files", "dirPath=sandbox/");
+  const v = await v1(v1Deps(f, "t", { agent_1: STORED }), "/agents/agent_1/workspace/files/read", "path=sandbox/x");
+  for (const [who, r] of [["provider", p], ["v1", v]] as const) {
+    must(r.status === 502, `${who}: ${r.status} ${r.text}`);
+    must(!/run9|shared-proj|h-t-|background-execs|boom/.test(r.text), `${who} leaked: ${r.text}`);
+  }
+  must(p.body.error.code === "unavailable" && v.body.error.type === "server_error", `${p.text} / ${v.text}`);
+  must(f.warnings.filter((w) => w.includes("shared-proj")).length === 2, `the detail was not logged: ${JSON.stringify(f.warnings)}`);
 });
 
 await check("without the surface wired, the routes are not there rather than half there", async () => {

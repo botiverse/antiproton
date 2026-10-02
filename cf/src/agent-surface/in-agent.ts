@@ -20,6 +20,9 @@ export async function stateGet(rt: AgentRuntime, tenantId: string, agentId: stri
   return got ? { value: got.value, ref: got.ref, bytes: got.bytes, updatedAt: got.updatedAt } : null;
 }
 
+export async function heldFiles(rt: AgentRuntime, tenantId: string, agentId: string, op: { op: "list"; path: string }): Promise<HeldListing>;
+export async function heldFiles(rt: AgentRuntime, tenantId: string, agentId: string, op: { op: "read"; path: string; maxBytes: number }): Promise<HeldRead>;
+export async function heldFiles(rt: AgentRuntime, tenantId: string, agentId: string, op: { op: "list"; path: string } | { op: "read"; path: string; maxBytes: number }): Promise<HeldListing | HeldRead>;
 export async function heldFiles(
   rt: AgentRuntime, tenantId: string, agentId: string,
   op: { op: "list"; path: string } | { op: "read"; path: string; maxBytes: number },

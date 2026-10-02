@@ -18,6 +18,8 @@
  * No caller's concepts either; the public API and the provider binding both call these.
  */
 
+import type { HeldListing, HeldRead } from "../../../src/plugins/types.ts";
+
 export const ROOTS = ["state", "artifacts", "sandbox"] as const;
 export type Root = typeof ROOTS[number];
 
@@ -25,6 +27,8 @@ export type Root = typeof ROOTS[number];
 export const READ_MAX_BYTES = 1024 * 1024;
 /** The most entries one listing returns; a directory larger than this is cut, in name order. */
 export const LIST_MAX = 1000;
+/** The most state keys one listing reads; past it the listing says it was cut. */
+const STATE_LIST_MAX = 5000;
 /** The name of the file `sandbox/` holds while no container is running. */
 export const NOT_RUNNING_FILE = "NOT_RUNNING.txt";
 export const NOT_RUNNING_TEXT =
@@ -35,6 +39,9 @@ export const NOT_RUNNING_TEXT =
 /** What the agent's sealed secrets are named in the store (src/runtime/secrets.ts KEPT_PREFIX). */
 const SECRET_PREFIX = "kept:";
 
+/** A listing, and what it left out: `truncated` only when entries exist that are not in `files`. */
+export type Listing = { files: FileNode[]; truncated?: true; omitted?: number };
+
 export interface FileNode { name: string; path: string; isDirectory: boolean; size: number; modifiedAt: string; isHidden?: true }
 export interface FileRead { content: string | null; binary: boolean; size: number; mimeType: string; encoding: "utf-8" | "base64" }
 export type Refused = { ok: false; status: 400 | 404; param?: string; message: string };
@@ -42,14 +49,8 @@ export type Refused = { ok: false; status: 400 | 404; param?: string; message: s
 export interface ArtifactObject { key: string; size: number; uploaded: number; contentType?: string }
 
 /** The container's working directory, as the plugin that holds it answers (src/plugins/types.ts HeldFiles). */
-export type SandboxList =
-  | { running: false }
-  | { running: true; found: false }
-  | { running: true; found: true; entries: Array<{ name: string; isDirectory: boolean; size: number; modifiedAt: number }> };
-export type SandboxRead =
-  | { running: false }
-  | { running: true; found: false }
-  | { running: true; found: true; isDirectory: boolean; size: number; modifiedAt: number; bytes: Uint8Array | null };
+export type SandboxList = HeldListing;
+export type SandboxRead = HeldRead;
 
 export interface WorkspaceDeps {
   state: {
@@ -104,26 +105,38 @@ export function workspacePath(raw: string, param: string, allowTop: boolean): { 
 const node = (path: string, name: string, isDirectory: boolean, size: number, modified: number): FileNode =>
   ({ name, path, isDirectory, size, modifiedAt: iso(modified), ...(name.startsWith(".") ? { isHidden: true as const } : {}) });
 
-function shown(nodes: FileNode[], includeHidden: boolean): FileNode[] {
-  return nodes
+/**
+ * The entries a listing shows, in order, and what it left out — the source's own cut (`cut`, with a
+ * count when the source knew one) and this listing's cap. Hidden entries left out on request are not
+ * "left out": the caller asked for that.
+ */
+function shown(nodes: FileNode[], includeHidden: boolean, cut: { truncated: boolean; omitted?: number } = { truncated: false }): Listing {
+  const visible = nodes
     .filter((n) => includeHidden || !n.isHidden)
-    .sort((a, b) => (a.isDirectory === b.isDirectory ? (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) : a.isDirectory ? -1 : 1))
-    .slice(0, LIST_MAX);
+    .sort((a, b) => (a.isDirectory === b.isDirectory ? (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) : a.isDirectory ? -1 : 1));
+  const over = Math.max(0, visible.length - LIST_MAX);
+  const files = visible.slice(0, LIST_MAX);
+  if (!over && !cut.truncated) return { files };
+  const known = cut.truncated ? cut.omitted : 0;
+  return { files, truncated: true, ...(known !== undefined ? { omitted: known + over } : {}) };
 }
 
 /** One directory level of the agent's workspace. */
 export async function workspaceList(
   deps: WorkspaceDeps, tenantId: string, agentId: string, dirPath: string, includeHidden: boolean,
-): Promise<{ ok: true; files: FileNode[] } | Refused> {
+): Promise<({ ok: true } & Listing) | Refused> {
   const p = workspacePath(dirPath, "dirPath", true);
   if ("ok" in p) return p;
   if (p.root === null) return { ok: true, files: ROOTS.map((r) => node(`${r}/`, r, true, 0, 0)) };
+  const listed = (l: Listing) => ({ ok: true as const, ...l });
   const base = [p.root, ...p.segs].join("/") + "/";
 
   if (p.root === "state") {
     if (p.segs.some(isSecretName)) return notFound(base);
     const prefix = p.segs.length ? p.segs.join("/") + "/" : "";
-    const rows = (await deps.state.list(tenantId, agentId, prefix, 5000)).filter((r) => r.key.startsWith(prefix) && !isSecretName(r.key));
+    const all = await deps.state.list(tenantId, agentId, prefix, STATE_LIST_MAX + 1);
+    // The same rule as the read: no segment of a key may read as a secret's name.
+    const rows = all.slice(0, STATE_LIST_MAX).filter((r) => r.key.startsWith(prefix) && !r.key.split("/").some(isSecretName));
     if (prefix && !rows.length) return notFound(base);
     const dirs = new Map<string, number>();
     const files: FileNode[] = [];
@@ -134,7 +147,8 @@ export async function workspaceList(
       const dir = rest.slice(0, cut);
       dirs.set(dir, Math.max(dirs.get(dir) ?? 0, r.updatedAt));
     }
-    return { ok: true, files: shown([...files, ...[...dirs].map(([d, at]) => node(`${base}${d}/`, d, true, 0, at))], includeHidden) };
+    return listed(shown([...files, ...[...dirs].map(([d, at]) => node(`${base}${d}/`, d, true, 0, at))], includeHidden,
+      { truncated: all.length > STATE_LIST_MAX }));
   }
 
   if (p.root === "artifacts") {
@@ -155,21 +169,21 @@ export async function workspaceList(
         files.push(node(`${base}${name}/`, name, true, 0, 0));
       }
       cursor = page.cursor;
-    } while (cursor && files.length < LIST_MAX * 2);
+    } while (cursor && files.length <= LIST_MAX * 2);
     if (p.segs.length && !files.length) return notFound(base);
-    return { ok: true, files: shown(files, includeHidden) };
+    return listed(shown(files, includeHidden, { truncated: !!cursor }));
   }
 
-  const listed = await deps.sandbox.list(tenantId, agentId, p.segs.join("/"));
-  if (!listed.running) {
+  const box = await deps.sandbox.list(tenantId, agentId, p.segs.join("/"));
+  if (!box.running) {
     if (p.segs.length) return notFound(base);
     return { ok: true, files: [node(`sandbox/${NOT_RUNNING_FILE}`, NOT_RUNNING_FILE, false, new TextEncoder().encode(NOT_RUNNING_TEXT).byteLength, 0)] };
   }
-  if (!listed.found) return notFound(base);
-  return {
-    ok: true,
-    files: shown(listed.entries.map((e) => node(e.isDirectory ? `${base}${e.name}/` : base + e.name, e.name, e.isDirectory, e.isDirectory ? 0 : e.size, e.modifiedAt)), includeHidden),
-  };
+  if (!box.found) {
+    return box.notDirectory ? { ok: false, status: 400, param: "dirPath", message: `${base.slice(0, -1)} is a file, not a directory` } : notFound(base);
+  }
+  return listed(shown(box.entries.map((e) => node(e.isDirectory ? `${base}${e.name}/` : base + e.name, e.name, e.isDirectory, e.isDirectory ? 0 : e.size, e.modifiedAt)),
+    includeHidden, { truncated: box.truncated, ...(box.omitted !== undefined ? { omitted: box.omitted } : {}) }));
 }
 
 const MIME: Record<string, string> = {
@@ -258,7 +272,8 @@ export async function workspaceRead(
     return notFound(shownPath);
   }
   if (!got.found) return notFound(shownPath);
-  if (got.isDirectory) return { ok: false, status: 400, param: "path", message: `${shownPath} is a directory; list it with workspace-files` };
+  if (got.kind === "directory") return { ok: false, status: 400, param: "path", message: `${shownPath} is a directory; list it with workspace-files` };
+  if (got.kind !== "file") return { ok: false, status: 400, param: "path", message: `${shownPath} is not a regular file (a device, socket or the like), and is not read` };
   if (got.size > READ_MAX_BYTES || !got.bytes) return { ok: true, file: tooLarge(name, got.size) };
   return { ok: true, file: asRead(got.bytes, name) };
 }

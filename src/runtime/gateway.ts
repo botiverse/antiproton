@@ -440,10 +440,10 @@ export class ToolGateway {
    * The files of what the agent's first file-showing mount holds (`Holding.files`), for a person
    * looking at its workspace. `{ running: false }` when no mount can show any.
    *
-   * Behind the mount's own lock, as a call and a release are: the plugin's "it is running" and its
-   * read are two steps, and an idle release landing between them would leave the read waking what
-   * the release had just switched off. The credential is read without recording a use — a look is
-   * not the credential put to work.
+   * The plugin is handed the mount's own lock, the one a call and a release take, for the steps where
+   * its "it is running" and the read it starts must not be split by a release — which would leave the
+   * read waking what the release had just switched off — and not for the wait in between. The
+   * credential is read without recording a use: a look is not the credential put to work.
    */
   async heldFiles(
     ctx: { tenantId: string; agentId: string; taskId: string },
@@ -453,14 +453,13 @@ export class ToolGateway {
       const plugin = this.#plugins.get(mount.plugin);
       const files = plugin ? holdingOf(plugin)?.files : undefined;
       if (!plugin || !files) continue;
-      const look = async () => {
-        const credential = mount.secretRef
-          ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId }, { touch: false })
-          : null;
-        const pctx: PluginContext = { ...this.#quietContext(ctx, mount), credential, credentialRefKind: secretRefKind(mount.secretRef) };
-        return op.op === "list" ? files.list(pctx, op.path) : files.read(pctx, op.path, op.maxBytes);
-      };
-      return isExclusive(plugin) ? this.#onMount(`${ctx.tenantId}/${ctx.agentId}/${mount.alias}`, look) : look();
+      const credential = mount.secretRef
+        ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId }, { touch: false })
+        : null;
+      const pctx: PluginContext = { ...this.#quietContext(ctx, mount), credential, credentialRefKind: secretRefKind(mount.secretRef) };
+      const key = `${ctx.tenantId}/${ctx.agentId}/${mount.alias}`;
+      const locked = <T>(fn: () => Promise<T>): Promise<T> => (isExclusive(plugin) ? this.#onMount(key, fn) : fn());
+      return op.op === "list" ? files.list(pctx, op.path, locked) : files.read(pctx, op.path, op.maxBytes, locked);
     }
     return { running: false };
   }

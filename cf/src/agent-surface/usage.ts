@@ -70,7 +70,12 @@ export function parseUsageQuery(q: URLSearchParams, now: number): UsageQuery | U
   const bucket = q.get("bucket") ?? "1h";
   if (bucket !== "1h" && bucket !== "1d") return { param: "bucket", message: "bucket is 1h or 1d" };
   if (to <= from) return { param: "to", message: "to must be later than from" };
-  if (to - from > USAGE_WINDOW_MAX_MS) return { param: "to", message: "the window from..to is at most 31 days" };
+  // Measured on the window the answer will cover: widened to whole buckets, a 31-day 1d request
+  // that starts mid-day would otherwise read 32 days.
+  const size = bucket === "1d" ? DAY_MS : HOUR_MS;
+  if (Math.ceil(to / size) * size - Math.floor(from / size) * size > USAGE_WINDOW_MAX_MS) {
+    return { param: "to", message: "the window from..to, widened to whole buckets, is at most 31 days" };
+  }
   if (bucket === "1h" && from < now - HOURLY_KEPT_MS) {
     return { param: "bucket", message: "hourly buckets cover the last 35 days; use bucket=1d for an older window" };
   }

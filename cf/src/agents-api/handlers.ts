@@ -346,7 +346,11 @@ export async function handleAgentsApi(
     const id = seg[1]!;
     if (!(await deps.index.getAgent(id))) return notFound("agent", id);
     const a = await surface(deps.surface.deps, read, deps.surface.tenantId, id, query);
-    if (!a.ok) return a.status === 404 ? openAIError(404, a.message, { code: "not_found" }) : openAIError(400, a.message, { param: a.param ?? null, code: "invalid_value" });
+    if (!a.ok) {
+      if (a.status === 404) return openAIError(404, a.message, { code: "not_found" });
+      if (a.status === 502) return openAIError(502, a.message, { code: "upstream_unavailable" });
+      return openAIError(400, a.message, { param: a.param ?? null, code: "invalid_value" });
+    }
     return ok(read === "usage" ? { agentId: id, ...a.body } : a.body);
   }
   if (seg.length === 2 && seg[1] !== "environments") {
