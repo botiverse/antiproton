@@ -199,8 +199,8 @@ gets `deferred` commits a `poll` checkpoint (`pollAt`, from the handle's
 commits `retry` with `until` and sleeps the same way, and so does a compaction
 retry. An object that kept the harness open for that would be billed for the
 sleep. What replaces `waiting` is `settle()` in `src/runtime/durable-drive.ts`:
-it reads the committed state after every commit, and when the harness is doing
-nothing but sleeping until T it closes the harness and returns
+it reads the harness after every commit and every sleep notice, and when the
+harness is doing nothing but sleeping until T it closes the harness and returns
 `{ state: "parked", parkedUntil: T }` for the caller to set an alarm; the alarm
 opens a harness on the same storage and calls `resume()`. The contracts it
 rests on:
@@ -210,20 +210,32 @@ rests on:
   fetch cut off by close is simply made again.
 - A not-ready `fetchDeferred` commits a fresh `poll` checkpoint with a new
   `pollAt` and **no transcript entry**.
-- A sleeping task is `running` with its checkpoint in `poll` or `retry`, and the
-  sleep reads the harness clock (`HarnessOptions.now`), which is the clock the
-  park decision must read.
+- Who says a task is sleeping is the scheduler: 1.0.0 reports a sleeping task as
+  plain `running`, so we run a vendored scheduler (see *Changing upstream
+  files*; upstream issue pi#10325) whose `inspect()` adds `sleepingUntil` while
+  the task's invocation is inside `runtime.sleep`. It also calls
+  `HarnessOptions.onSleep` when a sleep starts, for a task that works without
+  committing and then sleeps — no commit brings the read that would see it.
+  `PdHost` does not wire it: its harness runs only pi-durable's poll and retry
+  sleeps (its registry holds tool extensions, and a tool cannot sleep), each the
+  first act after its checkpoint's commit, and the read that commit brings sees
+  the sleep; `test/spec/durable-agent-spec.ts` fails if a park waits for the
+  1 s recheck instead. This replaced
+  reading `poll`/`retry` checkpoints and a table of every phase pi-durable
+  writes, which a new upstream sleep or an extension's own would have turned
+  into a billed wait. The sleep reads the harness clock (`HarnessOptions.now`),
+  which is the clock the park decision must read.
 - Input submitted while a run holds the conversation waits in `pi.inbox` for
   the run's next boundary, and does not wake the sleeper.
 
 The park predicate, `parkVerdict`, says "park" only when all of these hold:
 every live task is a sleeper or `waiting` on other tasks; every sleeper is
-`running`, not abort-marked, and its T is **strictly after now** (by at least
+reported `sleepingUntil` T by the scheduler, not abort-marked, and its T is **strictly after now** (by at least
 `minParkMs`, default 1000 — a shorter park saves almost nothing and risks closing mid-fetch); no conversation involved has a committed streaming
 partial or a tool slot that is not done; and queued input exists only where a
 run already holds its conversation. T is the earliest sleeper's. The strict
-comparison is the one that matters: a task whose `pollAt` has passed is
-fetching or about to, with its checkpoint still saying `poll`, and parking it
+comparison is the one that matters: a task whose T has passed is fetching or
+about to (its timer may fire late, so the report can still stand), and parking it
 sets an alarm in the past that reopens, fetches, parks again — a spike measured
 108 fetches for one answer that way. `test/durable-drive.ts` and
 `npm run durable-drive:do` cover submit-then-park, the wake that completes with
@@ -319,7 +331,21 @@ Prefer not to. If it is necessary, it is allowed, but:
 
 | vendored file | upstream path | taken from | why | upstream link |
 |---|---|---|---|---|
-| *(none yet)* | | | | |
+| `src/vendor/pi/pi-durable/dist/harness/scheduler.js` | `@earendil-works/pi-durable/dist/harness/scheduler.js` | pi-durable 1.0.0 (npm) | `#sleep` records its wake time and calls a new `onSleep` option; `inspect()` reports a sleeping task as `{ kind: "running", sleepingUntil }`. Without it a host cannot tell "only sleeping" from "working", and `settle` (src/runtime/durable-drive.ts) inferred it from checkpoint phases | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
+| `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, and imports the vendored scheduler: the package's harness imports its own | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
+
+How the vendored files are used: they are `dist` files, copied, and their
+relative imports of unchanged modules point into the installed package
+(`../../../../../../node_modules/@earendil-works/pi-durable/dist/…`), so they
+share every other module — and its identity — with the package. Our code
+imports `Harness` from the vendored `harness.js` (types in its `harness.d.ts`);
+nothing is redirected and `node_modules` is untouched, so node, the
+conformance worker and the deployed bundle run the same files with no loader
+or alias to forget. `test/pi-vendor.ts` fails when the installed package
+version or an upstream file's sha256 moves from the base in a vendored file's
+header, when a vendored file imports the package's copy of another vendored
+file, and when anything outside `src/vendor` imports the package's own
+`Harness`, which would run without the patch.
 
 ## Upgrading
 
@@ -341,7 +367,9 @@ before the expensive one.
    the same model against both engines.
 4. `npm run pi-loop`, `pi-offload`, `pi-tools`, `pi-agent`, `pi-bridge` — the
    behavioural contracts and every divergence above.
-5. Re-diff the copied source in the table in §2.
+5. Re-diff the copied source in the table in §2, and re-take each vendored file
+   in *Changing upstream files* from the new version and re-apply its marked
+   change (`test/pi-vendor.ts` fails until its header's base sha256 matches).
 6. The remaining suites.
 7. **SWE-bench before deploying.** Every contract above can hold while the agent
    simply gets worse, and nothing in §1–3 would notice.

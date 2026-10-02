@@ -8,7 +8,8 @@
  * - There is no `drive()` returning `waiting`. A generation that is handed a
  *   deferred answer commits a `poll` checkpoint and sleeps in-process until
  *   `pollAt`. `step()` resumes the harness and runs `settle()`
- *   (src/runtime/durable-drive.ts) until the harness is idle or only sleeping,
+ *   (src/runtime/durable-drive.ts) until the harness is idle or only sleeping —
+ *   which the vendored scheduler reports itself (src/vendor/pi/pi-durable/) —
  *   closes it, and returns the sleep's end as `wakeInMs`. A parked object has
  *   no harness open and no timer alive.
  * - The model call is the offloaded provider on pi-ai 1.0
@@ -46,10 +47,12 @@
  */
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
-  AgentDoc, createRegistry, GenerationTask, Harness, LiveDoc, ROOT_CONVERSATION_ID, ToolTask,
+  AgentDoc, createRegistry, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID, ToolTask,
   type Conversation, type ConversationId, type EntryRecord, type HarnessInspection,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+// The vendored Harness: pi-durable 1.0.0's with a scheduler that reports a sleeping task (`sleepingUntil`).
+import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
@@ -280,6 +283,9 @@ export class PdHost {
           compaction: { enabled: false },
         },
         now: this.#now,
+        // No `onSleep`: every sleep this harness runs (pi-durable's generation poll and retry; the registry holds
+        // only tool extensions, and a tool cannot sleep) starts right after the commit of its checkpoint, and the
+        // read that commit brings already sees it. settle's 1 s recheck is the backstop if that ever changes.
       }, bg);
       // Settle closes the harness when it parks; whoever asks next opens a fresh one.
       h.subscribeClose(() => {
