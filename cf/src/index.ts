@@ -76,6 +76,7 @@ import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../sr
 import { countHeldTime } from "../../src/usage/container.ts";
 import { benchPollBody } from "../../src/bench/poll-body.ts";
 import { flushUsage, parseUsageQuery, readAgentLedger, readUsage, usageBacklogSince } from "./usage-d1.ts";
+import { drainCursors, hasUnsent, standDownDelay, USAGE_WAKE_DELAY_MS } from "./usage-flush.ts";
 import type { SurfaceDeps } from "./agent-surface/surface.ts";
 import type { HeldListing, HeldRead } from "../../src/plugins/types.ts";
 import { heldFiles as surfaceHeldFiles, stateGet as surfaceStateGet, stateList as surfaceStateList } from "./agent-surface/in-agent.ts";
@@ -179,6 +180,9 @@ export interface Env {
    *  The message carries ids only — the transcript stays in the object. */
   MODEL_QUEUE: { send(body: unknown): Promise<void> };
 }
+/** One handler's billed span, as `#busy` keeps it: `rowid` once it has been written down mid-flight. */
+type BusySpan = { at: number; kind: string; rowid: number | null };
+
 type WorkerCode = {
   compatibilityDate: string;
   compatibilityFlags?: string[];
@@ -539,16 +543,54 @@ export class AgentDO extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(at);
   }
 
-  /** Wraps a billed entry point so we can measure what we are charged for. */
-  async #busy<T>(kind: string, fn: () => Promise<T>): Promise<T> {
-    const t0 = Date.now();
+  /**
+   * Wraps a billed entry point so we can measure what we are charged for. The handler is handed its own
+   * span, so a pass can write it down before it ends (`#noteSpanSoFar`); the end then completes that row
+   * rather than adding a second one.
+   */
+  async #busy<T>(kind: string, fn: (span: BusySpan) => Promise<T>): Promise<T> {
+    const span: BusySpan = { at: Date.now(), kind, rowid: null };
     try {
-      return await fn();
+      return await fn(span);
     } finally {
-      const ms = Date.now() - t0;
-      const noted = this.#own(() => this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", t0, ms, kind));
+      const ms = Date.now() - span.at;
+      const noted = this.#own(() => span.rowid === null
+        ? this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", span.at, ms, kind)
+        : this.sql.exec("UPDATE do_activity SET ms = ? WHERE rowid = ?", ms, span.rowid));
       if (noted instanceof Promise) await noted;
+      // A pass decides its own next wake (`alarm`); every other handler may have left rows to send.
+      if (kind !== "alarm") await this.#usageWake();
     }
+  }
+
+  /**
+   * A handler that leaves outbox rows unsent, on an object with no alarm armed, arms a short one: the
+   * alarm pass is the only sender, and nothing else would come for them (cf/src/usage-flush.ts). Decided
+   * from the outboxes themselves rather than at each writer, so a writer added later is covered too. An
+   * alarm already armed is left alone — its pass sends them, and moving it would add a pass to a turn.
+   * Never fails the handler: a missed wake leaves the rows for the next one, as before.
+   */
+  async #usageWake() {
+    try {
+      if (!hasUnsent(this.sql as any)) return;
+      if (await this.ctx.storage.getAlarm() !== null) return;
+      await this.#wake(Date.now() + USAGE_WAKE_DELAY_MS);
+    } catch (e: any) {
+      console.warn(`usage wake skipped: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
+  }
+
+  /**
+   * Write a running span down as it stands now, so active-time counting sees it before the handler ends
+   * (the pass that stands down counts its own time this way). Only on this object's own tables, from code
+   * already apart from pi-durable's commits.
+   */
+  #noteSpanSoFar(span: BusySpan) {
+    const ms = Date.now() - span.at;
+    if (span.rowid === null) {
+      const row = this.sql.exec("INSERT INTO do_activity VALUES (?,?,?) RETURNING rowid AS id", span.at, ms, span.kind).toArray()[0] as any;
+      span.rowid = Number(row.id);
+    } else this.sql.exec("UPDATE do_activity SET ms = ? WHERE rowid = ?", ms, span.rowid);
   }
 
   /**
@@ -2241,7 +2283,7 @@ export class AgentDO extends DurableObject<Env> {
     this.#wakeAsked = null;
     if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
     try {
-      await this.#busy("alarm", async () => {
+      await this.#busy("alarm", async (span) => {
         this.alarmFiredAt = Date.now();
         const firedAt = this.alarmFiredAt;
         const fired = this.#own(() => {
@@ -2275,6 +2317,8 @@ export class AgentDO extends DurableObject<Env> {
         await this.broadcast();
         // The bookkeeping below writes this object's tables across awaits (D1, R2, the mounts' reports), so
         // on a pd object it runs apart from pi-durable's commits; it calls nothing that commits.
+        // Where the drains stood before this pass sent anything: a pass that moved none of them is a retry.
+        const drainedFrom = drainCursors(this.sql as any);
         const { usagePending: pending, flushed } = await rt.apartFromPd(async () => {
           // This pass's usage, to the tenant's hourly table. A failure is kept
           // for later rather than failing the pass: the rows stay in the outbox.
@@ -2301,12 +2345,37 @@ export class AgentDO extends DurableObject<Env> {
         // waking every 30s for ever. Whatever input asked for during the pass is kept (alarm-next.ts).
         const planned = out.wakeInMs !== null ? Date.now() + Math.max(50, out.wakeInMs)
           : usagePending ? Date.now() + 60_000 : null;
-        const next = nextAlarm(this.#wakeAsked, planned);
-        if (next === null) await this.ctx.storage.deleteAlarm();
-        else await this.ctx.storage.setAlarm(next);
+        let next = nextAlarm(this.#wakeAsked, planned);
+        let comeBackInMs: number | null = null;
+        if (next === null) {
+          // About to stand down. This pass's own active time is in no row yet (it is written when the
+          // pass ends), so it is written down as it stands, counted, and sent with whatever else is
+          // left; then, if an outbox still holds rows, the pass comes back for them, bounded
+          // (cf/src/usage-flush.ts). Inside the same apart-from-pd step as the earlier bookkeeping.
+          let deleted = null as Promise<void> | null;
+          next = await rt.apartFromPd(async () => {
+            try {
+              this.#noteSpanSoFar(span);
+              this.#countActiveTime(who.tenantId, who.agentId);
+              await flushUsage(this.env.CONTROL_DB, this.sql as any, who.tenantId, who.agentId);
+            } catch (e: any) {
+              console.warn(`final usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
+            }
+            // From the look at the outboxes to arming, nothing awaits: a handler that ends after the
+            // look finds the alarm already as decided here, and arms its own if there is none.
+            const moved = drainCursors(this.sql as any).some((c, i) => c > drainedFrom[i]!);
+            comeBackInMs = standDownDelay(this.sql as any, hasUnsent(this.sql as any), moved);
+            const at = nextAlarm(this.#wakeAsked, comeBackInMs === null ? null : Date.now() + comeBackInMs);
+            if (at === null) deleted = this.ctx.storage.deleteAlarm();
+            return at;
+          });
+          if (deleted) await deleted;
+          if (next !== null) await this.ctx.storage.setAlarm(next);
+        } else await this.ctx.storage.setAlarm(next);
         logEvent("alarm.end", {
           tenantId: who.tenantId, agentId: who.agentId, ms: Date.now() - alarmStarted,
-          wakeInMs: out.wakeInMs, usagePending, activityError: flushed.activityError ?? undefined, traceError: flushed.traceError ?? undefined,
+          wakeInMs: out.wakeInMs, usagePending, comeBackInMs: comeBackInMs ?? undefined,
+          activityError: flushed.activityError ?? undefined, traceError: flushed.traceError ?? undefined,
         });
       });
       const reset = this.#own(() => this.#alarmFailures(0));

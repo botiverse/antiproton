@@ -97,6 +97,7 @@
     "test/pd-outbox.ts",
     "test/spec/pd-outbox-spec.ts",
     "test/pd-writes.ts",
-    "test/spec/pd-writes-spec.ts"
+    "test/spec/pd-writes-spec.ts",
+    "test/usage-flush.ts"
   ]
 }

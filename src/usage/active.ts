@@ -115,8 +115,10 @@ const WATERMARK = "CREATE TABLE IF NOT EXISTS usage_active(hour INTEGER PRIMARY 
  * second time in full.
  *
  * The pass calling this is not in `do_activity` yet, so each pass counts the one
- * before it, and the last pass before an agent goes quiet leaves its own span
- * for the next wake.
+ * before it. The pass that stands down writes its own span down as it stands
+ * and calls this once more (cf/src/index.ts `alarm`, cf/src/usage-flush.ts), so
+ * what an agent going quiet leaves for its next wake is only the tail after
+ * that final count.
  */
 export function countActiveTime(
   sql: Sql, who: { tenantId: string; agentId: string }, now = Date.now(),
