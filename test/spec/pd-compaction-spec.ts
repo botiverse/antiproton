@@ -33,7 +33,7 @@ const PROMPT = "You are a terse test assistant.";
 const MANUAL = { keepRecentTokens: 10, reserveTokens: 1000, backgroundTokens: 0 };
 /** A background compaction past ~1000 tokens of context: a long turn crosses it. */
 const THRESHOLD = { keepRecentTokens: 10, reserveTokens: 1000, backgroundTokens: 98_000 };
-/** The summarizer's system prompt (harness/compaction.js): how a summary job is told from a generation's. */
+/** The summarizer's system prompt (src/vendor/pi/pi-durable/dist/harness/compaction.js): how a summary job is told from a generation's. */
 const SUMMARIZER = "You are a context summarization assistant.";
 const SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:";
 
