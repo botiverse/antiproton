@@ -12,7 +12,7 @@
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { branchTip, setValue } from "@earendil-works/pi-agent-core/harness/session";
 import { fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
-import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
+import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
 import { importDrafts, MIGRATED, migrateToPd, revertToPi085 } from "../../src/runtime/pd-migrate.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { ensureBackgroundTable } from "../../src/runtime/background-jobs.ts";
@@ -128,6 +128,8 @@ async function history(storage: DurableSqlHost): Promise<World> {
   const s2 = await pi085(storage, w, "s2");
   await turn(s2, "hello from the second session", [say("second session reply")]);
   await s2.agent.close();
+  // The table a background job is recorded in, as any object that ever stepped has it.
+  ensureBackgroundTable(storage.sql as never);
   return w;
 }
 
@@ -284,6 +286,40 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
     });
   });
 
+  add("migrate", "a run that fails part-way leaves pi085 as it was, transient state included; pi085 goes on; the next run re-imports what moved, and pd's request carries the turn taken in between", async () => {
+    await withHost(async (storage) => {
+      const w = await history(storage);
+      let transient = 0;
+      const cancelTransient = async () => { transient++; return { heldForResume: 0 }; };
+      // The second session's import commit fails: `main` is imported and marked, `s2` is not.
+      const failing = new PdHost({ storage, pollAfterMs: 20, minParkMs: 1, stepDeadlineMs: 3_000,
+        commitFault: (writes) => { const t = show(writes); if (t.includes(MIGRATED) && (t.includes('"session":"s2"') || t.includes('\\"session\\":\\"s2\\"'))) throw new Error("the disk is full"); } });
+      failing.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
+      const failed = await migrateToPd({ storage, host: failing, cancel: CANCEL, cancelTransient });
+      check(!failed.ok && /import failed/.test(failed.refused) && /disk is full/.test(failed.refused), `the failed run: ${show(failed)}`);
+      check(recordedEngine(storage.sql) === null && (transient as number) === 0, `after the failed run: engine ${recordedEngine(storage.sql)}, transient state dropped ${transient} time(s)`);
+      check(Number(storage.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE json_extract(record, '$.kind') = ?", MIGRATED).toArray()[0]!.n) === 1,
+        "control: the failed run did not import main before s2 failed");
+      // Still pi085, and spoken to.
+      const e = await pi085(storage, w);
+      await turn(e, "said while the move was half done", [say("heard")]);
+      await e.agent.close();
+      const host = pdHost(storage);
+      host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
+      const dry = await migrateToPd({ storage, host, cancel: CANCEL, dryRun: true });
+      const main = dry.ok ? dry.sessions.find((x) => x.session === "main") : undefined;
+      check(main?.imported === true && main.stale === true, `the dry-run does not report main's import as stale: ${show(dry)}`);
+      const out = await migrateToPd({ storage, host, cancel: CANCEL, cancelTransient });
+      check(out.ok && out.action === "migrated" && transient === 1, `the second run: ${show(out)}, transient state dropped ${transient} time(s)`);
+      const pdMain = pd(host, w);
+      const [req] = await turn(pdMain, "next on main", [say("ok")]);
+      await pdMain.agent.close();
+      const lines = seen(req!).messages;
+      check(lines.filter((m) => m.includes("said while the move was half done")).length === 1, `pd's request lacks the turn taken in between, or has it twice: ${show(lines)}`);
+      check(lines.filter((m) => m.includes("read page x")).length === 1, `pd's request has the imported history other than once: ${show(lines)}`);
+    });
+  });
+
   add("migrate", "a compaction's retained tail: kept where it stands when it is the entries before it, else appended after a compaction that starts at itself", () => {
     const at = (id: string, parentId: string | null, rest: object) => ({ id, parentId, seq: 0, timestamp: 1, ...rest });
     const user = { role: "user", content: [{ type: "text", text: "kept" }], timestamp: 1 };
@@ -318,6 +354,11 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       check(!busy.ok && /not idle/.test(busy.refused), `busy revert: ${show(busy)}`);
       await settle(e, [say("pd again")]);
       await e.agent.close();
+      // A background job running: refused too (its result would be a message mid-move).
+      storage.sql.exec("INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES ('bg2','t','a','main','box','shell','{}','running',0,0,0)");
+      const background = await revertToPi085({ storage, host });
+      check(!background.ok && /1 background job\(s\) running/.test(background.refused), `revert with a background job: ${show(background)}`);
+      storage.sql.exec("DELETE FROM background_jobs WHERE id = 'bg2'");
       const dry = await revertToPi085({ storage, host, dryRun: true });
       check(dry.ok && dry.action === "dry-run" && (dry.dropped?.conversations ?? 0) === 2, `dry-run: ${show(dry)}`);
       const out = await revertToPi085({ storage, host });

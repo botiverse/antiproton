@@ -19,9 +19,11 @@
  *
  * Each session is imported in one pi-durable commit, through `tx.appendEntry` and nothing else: no generation runs, no
  * `pi.usage` document moves, so the commit hook (src/runtime/pd-outbox.ts `bookCommit`) bills nothing and writes no
- * trace row. The commit ends with an `ap.migrated` entry; a session whose conversation has one is not imported again,
- * so a migration that stopped part-way is finished by running it again. The engine moves last
- * (`ApStore.migrateEngine`), so until then the agent is pi085's, unchanged.
+ * trace row. The commit ends with an `ap.migrated` entry naming the pi085 tip it copied; a session whose conversation
+ * has one for the tip its branch still has is not imported again, so a migration that stopped part-way is finished by
+ * running it again. One whose branch moved since (the agent stayed on pi085 and was spoken to) makes the next run drop
+ * every pd conversation and import them all afresh. The engine moves last (`ApStore.migrateEngine`), so until then
+ * the agent is pi085's, unchanged; the runtime's transient state is dropped only then too.
  *
  * pi 0.85's tables are only read, and stay as they are: the rollback (`revertToPi085`) drops what pi-durable and the
  * `ap` tables hold for the conversations and moves the engine back, and pi085 reopens on its own transcript exactly as
@@ -90,6 +92,12 @@ export type SessionPlan = {
   counts: ImportCounts;
   /** Already imported: its conversation holds the `ap.migrated` entry. */
   imported: boolean;
+  /**
+   * Imported, but pi085 went on after it: the marker names another tip than the branch's now (a run that stopped
+   * part-way, the agent kept on pi085, then spoken to). The run that goes ahead drops every pd conversation and
+   * imports them all again.
+   */
+  stale?: boolean;
 };
 
 export type MigrationResult =
@@ -222,6 +230,16 @@ export function importDrafts(branch: readonly Json[], cancel?: CancelShape): {
   return { drafts, heads, counts };
 }
 
+/**
+ * Background work still running (src/runtime/background-jobs.ts), or null: it ends in a message to its session, which
+ * would arrive mid-move, either way.
+ */
+function backgroundRunning(sql: Sql): string | null {
+  if (!tableExists(sql, "background_jobs")) return null;
+  const n = Number(sql.exec("SELECT COUNT(*) AS n FROM background_jobs WHERE state = 'running'").toArray()[0]?.n ?? 0);
+  return n > 0 ? `${n} background job(s) running` : null;
+}
+
 /** Why the agent cannot be moved now, or null when it is idle. Read from pi 0.85's tables only. */
 export function busyReason(sql: Sql): string | null {
   const reasons: string[] = [];
@@ -234,11 +252,8 @@ export function busyReason(sql: Sql): string | null {
     const n = Number(sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL").toArray()[0]?.n ?? 0);
     if (n > 0) reasons.push(`${n} model call(s) not answered yet`);
   }
-  // Background work (src/runtime/background-jobs.ts) ends in a message to its session, which would arrive mid-move.
-  if (tableExists(sql, "background_jobs")) {
-    const n = Number(sql.exec("SELECT COUNT(*) AS n FROM background_jobs WHERE state = 'running'").toArray()[0]?.n ?? 0);
-    if (n > 0) reasons.push(`${n} background job(s) running`);
-  }
+  const background = backgroundRunning(sql);
+  if (background) reasons.push(background);
   return reasons.length ? `the agent is not idle: ${reasons.join("; ")}` : null;
 }
 
@@ -269,11 +284,13 @@ export function planMigration(sql: Sql, opts: { cancel?: CancelShape; now?: () =
     const all = tableExists(sql, t.entries) ? Number(sql.exec(`SELECT COUNT(*) AS n FROM ${t.entries}`).toArray()[0]?.n ?? 0) : 0;
     if (all > branch.length) counts.dropped["off-branch"] = all - branch.length;
     const records = readPdRecords(sql, session);
-    const imported = records.some((r) => r.kind === MIGRATED);
+    const marker = records.find((r) => r.kind === MIGRATED);
+    const imported = marker !== undefined;
+    const stale = imported && (marker.data as { tipId?: unknown } | undefined)?.tipId !== tipId;
     if (!imported && records.some((r) => r.kind !== "pi.system")) {
       throw new Error(`session ${session}'s pi-durable conversation already holds ${records.length} entries that no migration wrote`);
     }
-    return { session, tipId, branch: branch.length, counts, imported, drafts, heads };
+    return { session, tipId, branch: branch.length, counts, imported, ...(stale ? { stale } : {}), drafts, heads };
   });
 }
 
@@ -317,11 +334,16 @@ export async function migrateToPd(o: MigrateOptions): Promise<MigrationResult> {
   if (busy) return { ok: false, refused: busy, sessions: report(plans) };
   if (o.dryRun) return { ok: true, action: "dry-run", engine: "pi085", sessions: report(plans) };
 
-  const cancelled: Record<string, number> = {
-    clientCalls: plans.reduce((n, p) => n + (p.imported ? 0 : p.counts.cancelledCalls ?? 0), 0), ...(await o.cancelTransient?.() ?? {}),
-  };
   const now = o.now ?? Date.now;
+  const waiting = plans.reduce((n, p) => n + (p.imported && !p.stale ? 0 : p.counts.cancelledCalls ?? 0), 0);
   try {
+    // An import pi085 went on after is dropped whole, with every other: pd holds nothing but imports until the flip.
+    if (plans.some((p) => p.stale)) {
+      await o.host.close();
+      dropPdState(o.storage);
+      o.host.forgetConversations();
+      for (const p of plans) { p.imported = false; delete p.stale; }
+    }
     for (const plan of plans) {
       if (plan.imported) continue;
       const id = await o.host.conversation(plan.session);
@@ -344,13 +366,29 @@ export async function migrateToPd(o: MigrateOptions): Promise<MigrationResult> {
         return true;
       }, bg);
     }
+  } catch (error) {
+    // Still pi085's, with nothing of its own dropped: a run that goes ahead later re-imports what moved since.
+    return { ok: false, refused: `the import failed, and the agent stays on pi085: ${String((error as Error)?.message ?? error)}`, sessions: report(plans) };
   } finally {
     await o.host.close();
   }
+  // Only once every session is in pd: a failed import leaves pi085's programs and questions where they were.
+  const cancelled: Record<string, number> = { clientCalls: waiting, ...(await o.cancelTransient?.() ?? {}) };
   const ap = new ApStore(o.storage, AP);
   ap.ensure();
   const moved = ap.migrateEngine("pi085", "pd");
   return { ok: true, action: "migrated", engine: moved, sessions: report(plans), cancelled };
+}
+
+/** Every pd conversation and model job: pi-durable's tables (client calls' documents with them), and the `ap` rows that list them. */
+function dropPdState(storage: DurableSqlHost): void {
+  const ap = new ApStore(storage, AP);
+  ap.ensure();
+  storage.transactionSync(() => {
+    for (const t of PI_DURABLE_TABLES) storage.sql.exec(`DROP TABLE IF EXISTS ${PD.qualify(t, "table")}`);
+    ap.query("DELETE FROM conversations");
+    ap.query("DELETE FROM model_jobs");
+  });
 }
 
 /**
@@ -368,6 +406,8 @@ export async function revertToPi085(o: { storage: DurableSqlHost; host: PdHost; 
   if (ap.migratedFrom() !== "pi085") return { ok: false, refused: "this agent was created on pd, not migrated to it: there is no pi085 transcript to return to" };
   const out = Number(ap.query("SELECT COUNT(*) AS n FROM model_jobs WHERE answer IS NULL AND state IS NULL")[0]?.n ?? 0);
   if (out > 0) return { ok: false, refused: `the agent is not idle: ${out} model call(s) not answered yet` };
+  const background = backgroundRunning(sql);
+  if (background) return { ok: false, refused: `the agent is not idle: ${background}` };
   const live = await o.host.withHarness(async (h) => (await h.inspect(bg)).tasks.length);
   await o.host.close();
   if (live > 0) return { ok: false, refused: `the agent is not idle: ${live} pi-durable task(s) under way` };
@@ -381,10 +421,6 @@ export async function revertToPi085(o: { storage: DurableSqlHost; host: PdHost; 
   if (o.dryRun) return { ok: true, action: "dry-run", engine: "pd", dropped };
   // Dropped before the engine moves: an agent left on pi085 with pd's tables still holding the import would, migrated
   // again, find its sessions imported and keep a stale copy.
-  o.storage.transactionSync(() => {
-    for (const t of PI_DURABLE_TABLES) sql.exec(`DROP TABLE IF EXISTS ${PD.qualify(t, "table")}`);
-    ap.query("DELETE FROM conversations");
-    ap.query("DELETE FROM model_jobs");
-  });
+  dropPdState(o.storage);
   return { ok: true, action: "reverted", engine: ap.migrateEngine("pd", "pi085"), dropped };
 }
