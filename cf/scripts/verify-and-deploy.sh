@@ -81,6 +81,8 @@ run_suite durable-drive-do bash test/durable-drive-do.sh
 run_suite durable-agent-do bash test/durable-agent-do.sh
 # Tools on the pd engine against pi085 (same model, same gateway, same texts), on real Durable Object SQLite (local workerd, no network).
 run_suite pd-tools-do bash test/pd-tools-do.sh
+# The pd engine's usage and trace outboxes, derived from pi-durable's entries and compared with pi085's, on real Durable Object SQLite (local workerd, no network).
+run_suite pd-outbox-do bash test/pd-outbox-do.sh
 # The control plane's queries on real D1 SQLite, after the migrations in cf/migrations (local workerd, no network).
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 # Captured, then printed, then tested. It used to be piped through

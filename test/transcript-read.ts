@@ -14,6 +14,7 @@ import { readTranscript, transcriptEvents, approvalsByOp } from "../cf/src/trans
 import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { PiSqliteStorage, MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { converse } from "./spec/pd-conversation.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -90,6 +91,28 @@ await check("it shows what the console shows: the same events, masked references
   const second = readTranscript(host.sql, "demo", "u-a", "task_2");
   assert(second?.events.length === 1 && JSON.stringify(second).includes("second conversation"), `task_2 read ${JSON.stringify(second).slice(0, 200)}`);
   host.dispose();
+});
+
+await check("a pd agent is read from pi-durable's entries, not pi's tables: what the console shows, and nothing written", async () => {
+  const host = sqliteHost();
+  try {
+    const { rt, agent } = await converse(host, "pd");
+    const owner = { tenantId: "demo", agentId: "u-a" };
+    const shownInConsole = {
+      ...transcriptEvents(await agent.entries({ order: "asc" }), host.sql, MAIN_SESSION, owner, 0),
+      byOp: approvalsByOp(await rt.store.listApprovals("demo")),
+    };
+    await agent.close();
+    // The control: pi's tables exist for a pd agent and are empty, so reading them would show no conversation.
+    assert(host.sql.exec("SELECT COUNT(*) AS n FROM pi_entries").toArray()[0]!.n === 0, "pi_entries is not empty, so this does not tell the reads apart");
+    const before = dump(host);
+    const read = readTranscript(host.sql, "demo", "u-a", "t_u-a");
+    assert(read !== null && read.events.map((e) => e.kind).join() === "message,model.response,message,model.response",
+      `read ${JSON.stringify(read).slice(0, 300)}`);
+    assert(JSON.stringify(read) === JSON.stringify(shownInConsole), `read ${JSON.stringify(read).slice(0, 200)}\nconsole ${JSON.stringify(shownInConsole).slice(0, 200)}`);
+    assert(readTranscript(host.sql, "demo", "u-a", "task_nope") === null, "a conversation the agent does not hold was read");
+    assert(dump(host) === before, "the database changed while it was being read");
+  } finally { host.dispose(); }
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

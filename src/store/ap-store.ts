@@ -28,9 +28,10 @@
  * - `outbox_marks`: how far the usage and trace outboxes have read pi-durable's
  *   entries. A watermark is pi-durable's commit sequence (`entries.commit_seq`,
  *   strictly increasing per atomic commit), so "through seq N" never splits a
- *   commit.
+ *   commit. Written by src/runtime/pd-outbox.ts through `unit`, in the same
+ *   commit as the rows it accounts for.
  *
- * Only the engine and the directory have operations here; the other tables are
+ * Only the engine, the directory and `unit` have operations here; the other tables are
  * declared so that the namespace's list is complete from the start, and their
  * operations arrive with the steps that use them.
  */
@@ -69,6 +70,9 @@ export type ApSqlHost = { exec(query: string, ...bindings: Array<string | number
 export type ApWriter = { exclusive<T>(fn: () => T): Promise<T> };
 
 type Binding = string | number | null;
+
+/** The `ap` tables inside a unit (`ApStore.unit`): only valid until the unit's function returns. */
+export type ApUnit = { run(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> };
 
 /**
  * Every write goes through `writer.exclusive`, so it waits behind an open pi-durable transaction and
@@ -111,6 +115,16 @@ export class ApStore {
   }
 
   ensure(): Promise<void> { return this.#writer.exclusive(() => { for (const s of SCHEMA) this.#run(s, []); }); }
+
+  /**
+   * One synchronous unit through `exclusive`: `ap.run` reaches only the `ap` objects, and whatever
+   * else `fn` runs on the host's connection before it returns commits or rolls back with it. That is
+   * what lets the outbox derivation (src/runtime/pd-outbox.ts) append its rows and advance its
+   * watermark in `outbox_marks` as one commit.
+   */
+  unit<T>(fn: (ap: ApUnit) => T): Promise<T> {
+    return this.#writer.exclusive(() => fn({ run: (sql, ...bindings) => this.#run(sql, bindings) }));
+  }
 
   /** The engine recorded at creation, or null for an agent that predates the choice. */
   engine(): AgentEngineName | null {

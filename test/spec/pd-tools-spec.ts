@@ -552,9 +552,17 @@ export function pdToolsCases(withRawHost: WithDriveHost, opts: { slowCommitMs: n
         requests[which] = seenHere;
         check(show(w.invoked) === show(["web.slow"]), `${which}: the unsafe call ran ${w.invoked.length} times`);
         if (which === "pd") {
-          // The stored entry keeps pi-durable's own words; only what the model is sent is pi085's.
-          const stored = (await second.agent.entries({})).map((x) => show((x as unknown as { message: unknown }).message));
-          check(stored.some((m) => m.includes(show(pdInterruptedBlock("web__slow")).slice(1, -1))), `pd's interrupted result is not what tool.js writes: ${show(stored)}`);
+          // The stored record keeps pi-durable's own words; what the model is sent, and what a reader of the
+          // transcript is shown, is pi085's.
+          const records = await second.pd!.withHarness(async (h) => {
+            const c = await second.pd!.handle(h, await second.pd!.conversation("main"));
+            return (await c.entries({}, 50, undefined, BACKGROUND)).items.filter((r) => r.kind === "pi.tool-result");
+          });
+          check(records.length === 1 && show(records[0]!.model).includes(show(pdInterruptedBlock("web__slow")).slice(1, -1)),
+            `pd's interrupted result is not what tool.js writes: ${show(records.map((r) => r.model))}`);
+          const shown = (await second.agent.entries({})).map((x) => show((x as unknown as { message: unknown }).message));
+          check(shown.some((m) => m.includes(show(PI085_INTERRUPTED).slice(1, -1))) && !shown.some((m) => m.includes("<harness>")),
+            `the transcript shows ${show(shown)}`);
         }
         await second.agent.close();
       });

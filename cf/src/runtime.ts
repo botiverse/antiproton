@@ -2117,6 +2117,15 @@ export class AgentRuntime {
   }
 
   /**
+   * A synchronous read of pi-durable's rows (src/runtime/pd-transcript.ts) after any pi-durable transaction
+   * open on this object, by the same route as `#ownWrite`: a read inside one would see rows a failing commit
+   * then rolls back. With no pd agent opened there is no such transaction, and it runs at once.
+   */
+  afterPdTransactions<T>(fn: () => T): Promise<T> | T {
+    return this.#ownWrite(fn);
+  }
+
+  /**
    * On a `pd` object every session's jobs are in one table the shared harness answers from
    * (src/runtime/durable-agent.ts), so any session's agent takes and delivers them, and that agent
    * throws `UnknownJob` for an id with no row. Elsewhere, the `pi_model_jobs` row says which session.
