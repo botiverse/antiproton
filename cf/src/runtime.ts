@@ -32,7 +32,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core/harness/contex
 import { callTurns, CANCELLED_NOTE, TURN_CANCELLED } from "./agents-api/transcript.ts";
 import { apiAgentSeeds, harnessExtras } from "./agents-api/provisioning.ts";
 import {
-  clientTools,
+  answerClientCall, clientTools, pendingClientCalls,
 } from "../../src/runtime/client-calls.ts";
 
 export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
@@ -1884,7 +1884,12 @@ export class AgentRuntime {
 
   /** Function calls this session waits on its API caller for, with the turn each belongs to. */
   async waitingClientCalls(tenantId: string, agentId: string, session: string) {
-    const rows = await (await this.agent(tenantId, agentId, session)).waitingClientCalls();
+    // pi085 reads its table directly, building no agent (a catalogue read on every status poll). Only a pd object
+    // keeps its calls in the engine's own table; `#pd` is set once a pd agent is opened, which both callers
+    // (AgentDO `apiSessionStatus`, `apiTranscript`) do before asking.
+    const rows = this.#pd
+      ? await (await this.agent(tenantId, agentId, session)).waitingClientCalls()
+      : pendingClientCalls(this.#deps.ctx.storage.sql, session);
     if (!rows.length) return [];
     const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
     return rows.map((r) => ({ ...r, turn_id: turns.get(r.call_id) ?? "" }));
@@ -1905,7 +1910,9 @@ export class AgentRuntime {
     const sql = this.#deps.ctx.storage.sql;
     const ensured = this.#ownWrite(() => ensureAgentTables(sql));
     if (ensured instanceof Promise) await ensured;
-    await (await this.agent(tenantId, agentId, session)).answerClientCalls(results);
+    // As `waitingClientCalls`: pi085 writes its table directly, building no agent; pd hands them to its engine.
+    if (this.#pd) await (await this.agent(tenantId, agentId, session)).answerClientCalls(results);
+    else for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
     const marked = this.#ownWrite(() => markSession(sql, session, true));
     if (marked instanceof Promise) await marked;
     return { unknown: [] };

@@ -30,7 +30,7 @@ import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness
 import { PiSqliteStorage, ensurePiTables, piTables, type SqlHost, MAIN_SESSION } from "../store/pi-storage.ts";
 import { offloadedProvider, type OffloadPort, type Answered } from "../model/pi-offloaded.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
-import { answerClientCall, dropClientCalls, ensureClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
+import { answerClientCall, dropClientCalls, pendingClientCalls, resumeClientCalls } from "./client-calls.ts";
 import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 export type { StepOutcome } from "./engine.ts";
@@ -549,12 +549,10 @@ export class PiAgent implements AgentEngine {
 
   async answerClientCalls(results: ReadonlyArray<{ callId: string; output: string; isError: boolean }>) {
     const session = this.#opts.session ?? MAIN_SESSION;
-    ensureClientCalls(this.#sql);
     for (const r of results) answerClientCall(this.#sql, session, r.callId, { output: r.output, isError: r.isError });
   }
 
   async dropClientCalls() {
-    ensureClientCalls(this.#sql);
     return dropClientCalls(this.#sql, this.#opts.session ?? MAIN_SESSION);
   }
 
