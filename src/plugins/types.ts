@@ -1,4 +1,4 @@
-import type { Json, MountPolicy } from "../core/types.ts";
+import type { Json, MountPolicy, MountRecord } from "../core/types.ts";
 import type { AnswerSpec } from "../core/execution.ts";
 
 export interface ToolSchema {
@@ -19,6 +19,40 @@ export interface ToolSchema {
    * plugin may offer the same service.
    */
   reads?: "parked-result";
+}
+
+/**
+ * The tools one mount offers when its plugin cannot know them in advance: what
+ * a remote server listed when the operator last asked, kept on the mount record.
+ *
+ * Stored, not fetched on demand, because the catalogue and the gateway read a
+ * mount's tools on every harness build and every call, and neither may wait on
+ * somebody else's server; a wake that reached the network to learn its own
+ * tool list would also offer a different list each time the server moved.
+ *
+ * `tools` is already admitted: every name in it is addressable, so every
+ * reader of {@link toolsOf} sees the same list. What was left out is in
+ * `skipped`, with the reason, for the person reading the mount's page.
+ *
+ * `hash` covers `tools` and `skipped` and nothing else, so a refresh that finds
+ * the same list changes nothing — not the record, and not the harness cache key.
+ * It is not the version pin: `toolVersion` stays the plugin's version, which is
+ * what the gateway compares and `repinMounts` rewrites.
+ */
+export interface ToolSnapshot {
+  hash: string;
+  tools: ToolSchema[];
+  skipped: Array<{ name: string; reason: string }>;
+  takenAt: number;
+}
+
+/**
+ * What a plugin's `snapshotTools` lists, before the kernel admits it. Anything
+ * the plugin itself chose to leave out goes in `skipped` with its reason.
+ */
+export interface ListedTools {
+  tools: ToolSchema[];
+  skipped?: Array<{ name: string; reason: string }>;
 }
 
 /**
@@ -522,6 +556,21 @@ export function interruptsOf(p: Pick<Plugin, "interrupts">): Interrupting | null
 
 export function isExclusive(p: Pick<Plugin, "holds">): boolean {
   return !!p.holds;
+}
+
+/**
+ * The tools one mount offers: the plugin's answer for that mount when it gives
+ * one, its static list otherwise.
+ *
+ * Every reader that is about a specific mount asks this rather than reading
+ * `plugin.tools`, because for a plugin whose tools come from a remote server
+ * the static list is empty and only the mount knows. A reader that asked
+ * `plugin.tools` would offer nothing or refuse everything for such a mount,
+ * and two readers that asked differently would disagree about one name — the
+ * catalogue offering a tool the gateway calls unknown.
+ */
+export function toolsOf(p: Pick<Plugin, "tools" | "mountTools">, mount: MountRecord): ToolSchema[] {
+  return p.mountTools?.(mount) ?? p.tools;
 }
 
 /** The most live hooks one mount may hold; see `InboundHooks`. */
@@ -1431,7 +1480,28 @@ export interface SandboxEgress {
 export interface Plugin {
   id: string;
   version: string;
+  /** The tools every mount of this plugin offers; see `mountTools` for a plugin whose mounts differ. */
   tools: ToolSchema[];
+  /**
+   * The tools one mount offers, when they differ by mount; read through
+   * {@link toolsOf}, never directly.
+   *
+   * Synchronous and local: it reads what is on the mount record (normally its
+   * {@link ToolSnapshot}) and answers. It is asked on every harness build and
+   * every call, so it must not reach a server. Absent: `tools` is the answer.
+   */
+  mountTools?(mount: MountRecord): ToolSchema[];
+  /**
+   * List the tools a mount should offer, by asking whoever knows. Called when
+   * the mount is created and when an operator asks for a refresh — never on a
+   * wake, a harness build or a call. The kernel admits the list (names an agent
+   * can address, no duplicates), hashes it and stores it on the mount as its
+   * {@link ToolSnapshot}; the stored copy is replaced only when the hash moved.
+   *
+   * A throw leaves the stored snapshot as it was and is reported to the
+   * operator who asked.
+   */
+  snapshotTools?(ctx: PluginContext): Promise<ListedTools>;
   /** This mount holds something real; see {@link Holding}. Declaring it is what
    *  makes the mount exclusive — ask {@link isExclusive}, never the two separately. */
   holds?: Holding;

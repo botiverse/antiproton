@@ -9,7 +9,8 @@ import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclus
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
-import { pluginEnabled, LEASE_KEY } from "../plugins/types.ts";
+import { pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
+import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
 import { toolCallRows } from "../usage/outbox.ts";
@@ -673,11 +674,13 @@ export class ToolGateway {
         },
       };
     }
-    if (!plugin.tools.some((t) => t.name === r.tool)) {
+    // This mount's tools, not the plugin's: for a plugin whose tools come from
+    // a remote server the two differ, and the catalogue offered the mount's.
+    const schema = toolsOf(plugin, r.mount).find((t) => t.name === r.tool);
+    if (!schema) {
       return { status: "rejected", error: { code: "unknown_tool", message: unknownToolMessage(r.mount.alias, r.tool) } };
     }
 
-    const schema = plugin.tools.find((t) => t.name === r.tool)!;
     const operationId = opts.operationId ?? (opts.idempotencyKey
       ? `op_${createHash("sha256").update(`${ctx.tenantId}|${ctx.taskId}|${opts.idempotencyKey}`).digest("hex").slice(0, 20)}`
       : `op_${randomUUID().replace(/-/g, "").slice(0, 20)}`);
@@ -1148,6 +1151,52 @@ export class ToolGateway {
       return { skipped: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` };
     }
     return { mount, plugin };
+  }
+
+  /**
+   * Operator-only: ask a mount's plugin what tools the mount offers, and keep
+   * the answer on the mount (`Plugin.snapshotTools`, `ToolSnapshot`).
+   *
+   * The one place a mount's tool list is fetched. Nothing on a wake, a harness
+   * build or a call reaches here, so a server that is down or slow costs the
+   * operator who asked and never an agent's turn. The stored snapshot is
+   * replaced only when the admitted list hashes differently, so a refresh that
+   * hears the same list leaves the record and the harness cache as they were.
+   *
+   * The same gates as a pushed event: the mount exists, its plugin is switched
+   * on for this agent and is the version the mount pins. The context is the one
+   * a call would get, minus a task, so `{{secret}}` headers resolve as they do
+   * on a call.
+   */
+  async refreshMountTools(tenantId: string, agentId: string, alias: string): Promise<
+    | { ok: true; changed: boolean; hash: string; tools: string[]; skipped: Array<{ name: string; reason: string }> }
+    | { ok: false; error: string }
+  > {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { ok: false, error: `no mount named ${alias}` };
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin?.snapshotTools) return { ok: false, error: `the plugin on ${alias} lists its own tools; there is nothing to refresh` };
+    const choices = await this.#store.pluginChoices(tenantId, agentId);
+    if (!pluginEnabled(this.#seeded.has(mount.plugin), choices[mount.plugin])) {
+      return { ok: false, error: `${mount.plugin} is switched off for this agent` };
+    }
+    if (plugin.version !== mount.toolVersion) {
+      return { ok: false, error: `mount pins ${mount.toolVersion}, registry has ${plugin.version}` };
+    }
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+      : null;
+    let snapshot;
+    try {
+      const listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential));
+      snapshot = await admitTools(listed, Date.now());
+    } catch (e) {
+      return { ok: false, error: `could not list ${alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
+    }
+    const changed = mount.toolSnapshot?.hash !== snapshot.hash;
+    if (changed) await this.#store.updateMountToolSnapshot(tenantId, agentId, alias, snapshot);
+    const kept = changed ? snapshot : mount.toolSnapshot!;
+    return { ok: true, changed, hash: kept.hash, tools: kept.tools.map((t) => t.name), skipped: kept.skipped };
   }
 
   /**

@@ -62,6 +62,13 @@ export interface ToolRef {
   tool: string;
 }
 
+/**
+ * What one plugin tool may be called: the part after the alias in an address.
+ * No dot, because `<alias>.<tool>` is split at the first one and a tool name
+ * holding another would be read back as a path that names something else.
+ */
+export const TOOL_SEGMENT = /^[a-z0-9_]+$/i;
+
 /** A literal tool name as a script may write it: an offered name or a dotted address. */
 const TOOL_NAME = /^[a-z0-9_]+(\.[a-z0-9_]+)*$/i;
 

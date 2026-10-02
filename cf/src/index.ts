@@ -45,7 +45,8 @@ import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
 import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
-import { pluginEnabled } from "../../src/plugins/types.ts";
+import { pluginEnabled, toolsOf } from "../../src/plugins/types.ts";
+import { skippedToolNotes } from "../../src/runtime/mount-tools.ts";
 
 /** What the plugins page is handed about each mount; declared and checked in cf/src/mount-reports.ts. */
 import type { MountReports } from "./mount-reports.ts";
@@ -1584,9 +1585,10 @@ export class AgentDO extends DurableObject<Env> {
     // the same function that names them for the model, over the whole catalogue
     // at once: the tie-break at the length cap is a property of the set, and a
     // per-mount join would print a name that exists nowhere.
-    const named = qualifyMountedTools(mounts.flatMap((m) =>
-      (byId.get(m.plugin)?.tools ?? []).map((t) => ({ name: t.name, address: `${m.alias}.${t.name}` })),
-    ));
+    const named = qualifyMountedTools(mounts.flatMap((m) => {
+      const plugin = byId.get(m.plugin);
+      return (plugin ? toolsOf(plugin, m) : []).map((t) => ({ name: t.name, address: `${m.alias}.${t.name}` }));
+    }));
 
     // Which tools this agent has actually reached for. A catalogue says what is
     // possible; this says what happened.
@@ -1640,6 +1642,11 @@ export class AgentDO extends DurableObject<Env> {
             ? validateMount(plugin, m.publicConfig as any, m.secretRef).map((x) => x.message)
             : [`no plugin named ${m.plugin} is installed`],
           tools: named.filter((n) => n.address.startsWith(`${m.alias}.`)).map((n) => n.name),
+          // Remote tools the mount's snapshot left out, and why. Kept apart from
+          // `problems`, which are about the mount's settings: these are about
+          // what a server said, and changing a setting does not fix them.
+          toolNotes: skippedToolNotes(m.toolSnapshot),
+          ...(plugin?.snapshotTools ? { toolsTakenAt: m.toolSnapshot?.takenAt ?? null } : {}),
         };
       })),
       used,
@@ -1760,6 +1767,11 @@ export class AgentDO extends DurableObject<Env> {
   async adminAddMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }) {
     this.#claim(tenantId, agentId);
     return this.#busy("adminAddMount", () => this.runtime().addMount(tenantId, agentId, seed));
+  }
+
+  async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("adminRefreshMountTools", () => this.runtime().refreshMountTools(tenantId, agentId, alias));
   }
 
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
@@ -2697,7 +2709,14 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
  * `/admin/mounts`, automation token only: add one mount the defaults do not
  * give, for a test or an operator's setup. `POST {tenantId, agentId, alias,
  * plugin, config}` -> `{added}` (false when the same mount was already there).
- * No credential travels here; it is attached on the mount afterwards.
+ * No credential travels here; it is attached on the mount afterwards. A mount
+ * whose tools come from a server answers `tools` too: what it listed, or why
+ * it could not.
+ *
+ * `POST {tenantId, agentId, refreshTools: alias}` asks that server again and
+ * answers `{changed, hash, tools, skipped}`; the mount's list is replaced only
+ * when it changed. Here rather than a tool on the mount, because what a mount
+ * offers the agent is the operator's to change, not the agent's.
  */
 async function adminMounts(request: Request, env: Env): Promise<Response> {
   if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
@@ -2707,11 +2726,17 @@ async function adminMounts(request: Request, env: Env): Promise<Response> {
   const b = (await request.json().catch(() => null)) as any;
   const tenantId = String(b?.tenantId ?? ""), agentId = String(b?.agentId ?? "");
   try { agentObjectName(tenantId, agentId); } catch (e: any) { return Response.json({ error: String(e?.message ?? e) }, { status: 400 }); }
+  const stub = env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)));
+  if (b?.refreshTools !== undefined) {
+    const r = await stub.adminRefreshMountTools(tenantId, agentId, String(b.refreshTools));
+    return r.ok
+      ? Response.json({ changed: r.changed, hash: r.hash, tools: r.tools, skipped: r.skipped })
+      : Response.json({ error: r.error }, { status: 400 });
+  }
   const config = b?.config ?? {};
   if (typeof config !== "object" || Array.isArray(config)) return Response.json({ error: "config is an object" }, { status: 400 });
-  const r = await env.AGENT.get(env.AGENT.idFromName(agentObjectName(tenantId, agentId)))
-    .adminAddMount(tenantId, agentId, { alias: String(b?.alias ?? ""), plugin: String(b?.plugin ?? ""), config });
-  return r.ok ? Response.json({ added: r.added }) : Response.json({ error: r.error }, { status: 400 });
+  const r = await stub.adminAddMount(tenantId, agentId, { alias: String(b?.alias ?? ""), plugin: String(b?.plugin ?? ""), config });
+  return r.ok ? Response.json({ added: r.added, ...(r.tools ? { tools: r.tools } : {}) }) : Response.json({ error: r.error }, { status: 400 });
 }
 
 /**

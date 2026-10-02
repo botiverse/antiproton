@@ -298,19 +298,19 @@ check("the mount list names each mount, its plugin and its credential state, and
  * catalogue widens to everything, because the six are still in it. The three
  * opt-in rows are what notice that direction.
  */
-check("the real catalogue reaches the page: seven rows say default, two say opt-in", () => {
+check("the real catalogue reaches the page: seven rows say default, three say opt-in", () => {
   const rt = new AgentRuntime({
     ctx: { storage: {} } as any, bucket: {} as any, bucketName: "b",
     models: { resolve: () => null } as any,
   } as any);
   const rows = installedRows(rt.plugins(), {}, SEEDED_PLUGINS);
-  if (rows.length < 9) throw new Error(`the registry produced ${rows.length} rows, so this compares almost nothing`);
+  if (rows.length < 10) throw new Error(`the registry produced ${rows.length} rows, so this compares almost nothing`);
 
   const seeded = rows.filter((r) => r.defaultForAllAgents).map((r) => r.id).sort();
   const optIn = rows.filter((r) => !r.defaultForAllAgents).map((r) => r.id).sort();
   must(seeded.join() === "artifacts,exa,github,http,sandbox,state,tools",
     `the seeded rows are ${seeded.join()}`);
-  must(optIn.join() === "demo,raft", `the opt-in rows are ${optIn.join()}`);
+  must(optIn.join() === "demo,mcp,raft", `the opt-in rows are ${optIn.join()}`);
 
   // And the words, read out of the rendered page rather than the payload.
   //

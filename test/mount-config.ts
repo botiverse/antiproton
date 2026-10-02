@@ -21,6 +21,7 @@ import { statePlugin } from "../src/plugins/state.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
+import { mcpPlugin } from "../src/plugins/mcp.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { credentialForm, originProblem, credentialState, identityNote, type CredentialRefKind } from "../src/plugins/types.ts";
 import { secretRefKind } from "../src/runtime/secrets.ts";
@@ -220,6 +221,7 @@ const everyPlugin: Plugin[] = [
   statePlugin(null as any, null, "local"),
   artifactsPlugin(null as any, "local"),
   raftPlugin,
+  mcpPlugin,
   builtinToolsPlugin(null as any, () => []),
   ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
 ];

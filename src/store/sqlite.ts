@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
-import type { PluginChoice } from "../plugins/types.ts";
+import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, pendingUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS mounts (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL,
   installation_id TEXT NOT NULL, connection_id TEXT, plugin TEXT NOT NULL,
   tool_version TEXT NOT NULL, public_config TEXT NOT NULL, secret_ref TEXT, policy TEXT,
+  tool_snapshot TEXT,
   PRIMARY KEY (tenant_id, agent_id, alias));
 CREATE TABLE IF NOT EXISTS agent_plugins (
   tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, plugin TEXT NOT NULL,
@@ -184,6 +185,7 @@ export class SqliteStore implements StorageAdapter {
     for (const alter of [
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
+      "ALTER TABLE mounts ADD COLUMN tool_snapshot TEXT",
       // A secrets table created before the suffix column was dropped keeps a
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
@@ -785,6 +787,7 @@ export class SqliteStore implements StorageAdapter {
       publicConfig: JSON.parse(r.public_config),
       policy: r.policy ? JSON.parse(r.policy) : null,
       secretRef: r.secret_ref,
+      toolSnapshot: r.tool_snapshot ? JSON.parse(r.tool_snapshot) : null,
     };
   }
 
@@ -1031,14 +1034,21 @@ export class SqliteStore implements StorageAdapter {
     this.#db
       .prepare(
         `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id,
-           plugin, tool_version, public_config, secret_ref, policy)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+           plugin, tool_version, public_config, secret_ref, policy, tool_snapshot)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId,
         m.plugin, m.toolVersion, j(m.publicConfig), m.secretRef,
-        m.policy ? j(m.policy) : null,
+        m.policy ? j(m.policy) : null, m.toolSnapshot ? j(m.toolSnapshot) : null,
       );
+  }
+
+  async updateMountToolSnapshot(tenantId: string, agentId: string, alias: string, snapshot: ToolSnapshot | null) {
+    const r = this.#db
+      .prepare("UPDATE mounts SET tool_snapshot=? WHERE tenant_id=? AND agent_id=? AND alias=?")
+      .run(snapshot ? j(snapshot) : null, tenantId, agentId, alias);
+    return Number(r.changes) > 0;
   }
 
   async updateMountPolicy(

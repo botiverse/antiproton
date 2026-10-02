@@ -16,7 +16,7 @@ import type {
 // The vocabulary belongs to the plugin contract; the store persists it rather
 // than defining a second copy of the same three words. Type-only, and
 // `plugins/types.ts` reaches only `core/types.ts`, so nothing circles back.
-import type { CredentialRefKind, CredentialState, PluginChoice } from "../plugins/types.ts";
+import type { CredentialRefKind, CredentialState, PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import type { PluginDbTables } from "../store/plugin-db.ts";
 import type { UsageRow } from "../usage/outbox.ts";
 import type { TraceRow } from "../trace/outbox.ts";
@@ -347,6 +347,8 @@ export interface StorageAdapter {
    */
   /** The version a mount pins; the console reconciles it to the registry's. */
   updateMountToolVersion(tenantId: string, agentId: string, alias: string, toolVersion: string): Promise<boolean>;
+  /** Replace what a remote server listed for this mount (`ToolSnapshot`); null clears it. Never the version pin. */
+  updateMountToolSnapshot(tenantId: string, agentId: string, alias: string, snapshot: ToolSnapshot | null): Promise<boolean>;
   updateMountConfig(
     tenantId: string, agentId: string, alias: string, publicConfig: Json,
   ): Promise<boolean>;

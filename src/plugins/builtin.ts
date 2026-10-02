@@ -1,5 +1,6 @@
 import type { StorageAdapter } from "../core/store.ts";
-import type { Plugin } from "./types.ts";
+import { toolsOf, type Plugin } from "./types.ts";
+import { skippedToolNotes } from "../runtime/mount-tools.ts";
 // The one function that decides what the model may call a tool. Imported rather
 // than reimplemented: discovery that formats its own names is discovery that can
 // disagree with dispatch, which is what it did — it answered `node.save`, the
@@ -29,8 +30,12 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
       const plugins = new Map(registry().map((p) => [p.id, p]));
       // Qualified against the whole mounted set, the way the harness does it,
       // because that is the only way the two agree by construction.
-      const catalogue = qualifyMountedTools(mounts.flatMap((m) =>
-        (plugins.get(m.plugin)?.tools ?? []).map((t) => ({
+      // Each mount's own tools (`toolsOf`), the same list `describe` reads its
+      // schema from below: the two must be one list, or a name found here has
+      // no schema there.
+      const catalogue = qualifyMountedTools(mounts.flatMap((m) => {
+        const plugin = plugins.get(m.plugin);
+        return (plugin ? toolsOf(plugin, m) : []).map((t) => ({
           name: t.name,
           address: `${m.alias}.${t.name}`,
           description: t.summary,
@@ -42,8 +47,8 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
           label: m.publicConfig.account ?? null,
           summary: t.summary,
           sideEffects: t.sideEffects,
-        })),
-      )).map(({ parameters: _p, description: _d, ...rest }) => rest);
+        }));
+      })).map(({ parameters: _p, description: _d, ...rest }) => rest);
       // The address is the gateway's key and stays out of every answer: an agent
       // that is shown one will use one. It is kept on the entry above only so
       // `describe` can still recognise a name an older transcript taught it.
@@ -53,9 +58,16 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
       };
       switch (tool) {
         case "mounts":
-          return mounts.map((m) => ({
-            alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
-          }));
+          return mounts.map((m) => {
+            // A remote tool the mount could not offer is named here, so an agent
+            // told about it elsewhere learns why it is missing rather than
+            // guessing at a typo.
+            const notes = skippedToolNotes(m.toolSnapshot);
+            return {
+              alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
+              ...(notes.length ? { notOffered: notes } : {}),
+            };
+          });
         case "search": {
           const terms = String((args as any)?.query ?? "").toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean);
           if (!terms.length) return catalogue.map(shown);
@@ -95,7 +107,7 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
           }
           const [alias, ...rest] = hit.address.split(".");
           const mount = mounts.find((m) => m.alias === alias)!;
-          const schema = plugins.get(mount.plugin)!.tools.find((t) => t.name === rest.join("."))!;
+          const schema = toolsOf(plugins.get(mount.plugin)!, mount).find((t) => t.name === rest.join("."))!;
           return { ...shown(hit), parameters: schema.parameters, idempotency: schema.idempotency };
         }
         default:

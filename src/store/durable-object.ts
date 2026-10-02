@@ -1,5 +1,5 @@
 import type { StorageAdapter, StateEntry } from "../core/store.ts";
-import type { PluginChoice } from "../plugins/types.ts";
+import type { PluginChoice, ToolSnapshot } from "../plugins/types.ts";
 import { PluginDbTables } from "./plugin-db.ts";
 import { appendUsage, type UsageRow } from "../usage/outbox.ts";
 import { completedPayload, type CompletedFacts } from "./operation-event.ts";
@@ -81,7 +81,7 @@ const SCHEMA = [
     `CREATE TABLE IF NOT EXISTS mounts (
      tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, alias TEXT NOT NULL, installation_id TEXT NOT NULL,
      connection_id TEXT, plugin TEXT NOT NULL, tool_version TEXT NOT NULL, public_config TEXT NOT NULL,
-     secret_ref TEXT, policy TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
+     secret_ref TEXT, policy TEXT, tool_snapshot TEXT, PRIMARY KEY (tenant_id, agent_id, alias))`,
     // Only the agents that said something appear here. No row is `"inherit"`,
     // which is why `"inherit"` is never written: a stored copy of today's
     // default would keep answering after the default changed.
@@ -132,6 +132,7 @@ export class DurableObjectStore implements StorageAdapter {
     for (const alter of [
       "ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mounts ADD COLUMN policy TEXT",
+      "ALTER TABLE mounts ADD COLUMN tool_snapshot TEXT",
       // A secrets table created before the suffix column was dropped keeps a
       // NOT NULL column the insert no longer fills; drop it, and with it the
       // one plaintext fragment of a value the row ever held.
@@ -518,6 +519,7 @@ export class DurableObjectStore implements StorageAdapter {
       installationId: r.installation_id, connectionId: r.connection_id, toolVersion: r.tool_version,
       publicConfig: JSON.parse(r.public_config),
       policy: r.policy ? JSON.parse(r.policy) : null, secretRef: r.secret_ref,
+      toolSnapshot: r.tool_snapshot ? JSON.parse(r.tool_snapshot) : null,
     };
   }
 
@@ -719,9 +721,16 @@ export class DurableObjectStore implements StorageAdapter {
   async addMount(m: MountRecord) {
     this.#sql.exec(
       `INSERT INTO mounts(tenant_id, agent_id, alias, installation_id, connection_id, plugin,
-         tool_version, public_config, secret_ref, policy) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+         tool_version, public_config, secret_ref, policy, tool_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       m.tenantId, m.agentId, m.alias, m.installationId, m.connectionId, m.plugin, m.toolVersion,
-      j(m.publicConfig), m.secretRef, m.policy ? j(m.policy) : null);
+      j(m.publicConfig), m.secretRef, m.policy ? j(m.policy) : null, m.toolSnapshot ? j(m.toolSnapshot) : null);
+  }
+
+  async updateMountToolSnapshot(tenantId: string, agentId: string, alias: string, snapshot: ToolSnapshot | null) {
+    this.#sql.exec("UPDATE mounts SET tool_snapshot=? WHERE tenant_id=? AND agent_id=? AND alias=?",
+      snapshot ? j(snapshot) : null, tenantId, agentId, alias);
+    return !!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?",
+      tenantId, agentId, alias);
   }
 
   async updateMountPolicy(
