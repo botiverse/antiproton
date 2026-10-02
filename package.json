@@ -10,6 +10,8 @@
     "pi-storage:do": "bash test/pi-storage-do.sh",
     "pi-durable": "node test/pi-durable.ts",
     "pi-durable:do": "bash test/pi-durable-do.sh",
+    "durable-drive": "node test/durable-drive.ts",
+    "durable-drive:do": "bash test/durable-drive-do.sh",
     "pi-loop": "node test/pi-loop.ts",
     "pi-offload": "node test/pi-offload.ts",
     "pi-tools": "node test/pi-tools.ts",
@@ -27,6 +29,7 @@
     "@earendil-works/pi-agent-core": "0.85.1",
     "@earendil-works/pi-durable": "1.0.0",
     "@earendil-works/pi-mcp": "1.0.0",
+    "pi-ai-1": "npm:@earendil-works/pi-ai@1.0.0",
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {

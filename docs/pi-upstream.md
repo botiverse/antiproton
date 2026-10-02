@@ -10,9 +10,12 @@ the same repository and is held to the same rules; its contracts are in their
 own section below.
 
 `@earendil-works/pi-durable` 1.0.0 is installed beside it, for the move of the
-agent loop onto pi's durable harness. Only its SQLite storage core is used so
-far, through `src/store/pi-durable-sqlite.ts`, and nothing in `cf/src` or
-`src/runtime` reaches it yet; the runtime still runs on `pi-agent-core`.
+agent loop onto pi's durable harness. What exists on it so far is its SQLite
+storage core behind `src/store/pi-durable-sqlite.ts`, the offloaded provider
+on pi-ai 1.0 (`src/model/durable-offloaded.ts`) and the park decision
+(`src/runtime/durable-drive.ts`). Nothing in `cf/src` or the live runtime
+reaches any of them yet (only the never-deployed conformance worker does); the
+runtime still runs on `pi-agent-core`.
 
 ## The pin is exact, on purpose
 
@@ -35,7 +38,30 @@ swap the provider contract under the running loop. Scoped, it installs under
 `node_modules/@earendil-works/pi-durable/`. Nothing of ours imports `chord`
 outside the pi-durable tests, and pi-agent-core gets its own 0.85.1 copy, so
 `chord` can sit at the top level. `npm ls @earendil-works/pi-ai
-@earendil-works/chord` shows the layout.
+@earendil-works/chord pi-ai-1` shows the layout.
+
+Our own code that is on the 1.0 side imports pi-ai 1.0 as **`pi-ai-1`**, a
+package alias (`"pi-ai-1": "npm:@earendil-works/pi-ai@1.0.0"`). The bare name
+has to keep meaning 0.85.1, for the reason above, and the copy under
+pi-durable cannot be named from our code at all: its exports are pi-durable's,
+and node refuses a `node_modules` segment in an `imports` mapping. The alias is
+the one name that says at the import site which world a file is in. Its costs,
+stated so they are not rediscovered:
+
+- **It is a second install of the same 1.0.0**, not the one pi-durable loads.
+  Our provider, `Models` and streams come from `pi-ai-1`; pi-durable reads them
+  through its own copy. That is safe only because pi-durable takes nothing from
+  pi-ai but pure functions (`utils/transcript`, `retry`, `estimate`, `overflow`,
+  `validation`) and makes no `instanceof` or identity check on a pi-ai value
+  (read in 1.0.0's `dist`). Both are things to re-read on an upgrade, and
+  `test/durable-drive.ts` fails when the two installs' versions differ. TypeScript
+  sees one package, because it merges same-name same-version copies.
+- **No pi-ai value crosses between 0.85 and 1.0.** The two share the job wire
+  format as JSON only: a job row is a string written by one provider and read
+  by `toRequest`; an answer is a string written by `fromResponse` and read back
+  by `readAnswer`.
+- The production bundle is unchanged while only tests and the conformance
+  worker import `pi-ai-1`.
 
 The override yields two physical pi-ai copies: the top-level 0.85.1 for the live
 runtime, and 1.0.0 nested under pi-durable. That is safe only while no pi-ai
@@ -49,7 +75,7 @@ value crosses between the two: they may share types, never runtime objects
 The authoritative list is a command, not a table, because a table rots:
 
 ```bash
-grep -rhoE 'from "@earendil-works/[^"]+"' src cf/src test bench --include='*.ts' | sort -u
+grep -rhoE 'from "(@earendil-works/|pi-ai-1)[^"]*"' src cf/src test bench --include='*.ts' | sort -u
 ```
 
 At the time of writing that is six entry points: four from
@@ -61,9 +87,13 @@ tests only) — plus `@earendil-works/pi-ai` for the provider contract
 in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
 (`McpClient`, `StreamableHttpTransport`, `toLlmContent`; see §4).
 pi-durable adds `storage/sqlite` (the `SqliteDatabase` types, and
-`SqliteStorage` and its migrations in tests), and, in tests only, its root
-(`ROOT_CONVERSATION_ID`), `testing` (`createStorageConformance`) and
-`@earendil-works/chord/context`.
+`SqliteStorage` and its migrations in tests), its root (`Harness`, `LiveDoc`,
+`InboxDoc`, `GenerationTask`, `CompactionTask` and the task and document types,
+in `src/runtime/durable-drive.ts`), `testing` (`createStorageConformance`,
+tests only) and `@earendil-works/chord` (types, and `chord/context` in tests).
+`pi-ai-1` adds `models` (`createProvider`, `createModels`),
+`utils/event-stream`, `utils/transcript` (`getCurrentSystemPrompt`,
+`getCurrentTools`) and the root's types, in `src/model/durable-offloaded.ts`.
 
 ### 2. Copied source — this breaks silently
 
@@ -85,7 +115,8 @@ upstream's suite rather than ours.
 Nothing imports these. Nothing types them. Everything rests on them:
 
 - `drive()` returns `waiting` rather than blocking when a response carries
-  `stopReason: "deferred"`. If it ever awaited instead, the object would be
+  `stopReason: "deferred"` (pi-agent-core; on pi-durable, parking replaces it —
+  see below). If it ever awaited instead, the object would be
   billed for the provider's latency and the cost model would be gone.
 - A `fetchDeferred` that is not ready answers by returning **the same handle**.
 - The inbox (`steer` / `followUp` / `nextRun`) drains at `accept()`, not on a
@@ -102,6 +133,46 @@ Nothing imports these. Nothing types them. Everything rests on them:
 
 Each has a test. That is deliberate: an upgrade that quietly changes one of
 these should fail here, not on a tenant.
+
+#### On pi-durable: parking replaces `drive()` returning `waiting`
+
+pi-durable has no `drive()` and nothing returns `waiting`. A generation that
+gets `deferred` commits a `poll` checkpoint (`pollAt`, from the handle's
+`pollAfterMs`) and then **sleeps in-process until `pollAt`**; a retryable error
+commits `retry` with `until` and sleeps the same way, and so does a compaction
+retry. An object that kept the harness open for that would be billed for the
+sleep. What replaces `waiting` is `settle()` in `src/runtime/durable-drive.ts`:
+it reads the committed state after every commit, and when the harness is doing
+nothing but sleeping until T it closes the harness and returns
+`{ state: "parked", parkedUntil: T }` for the caller to set an alarm; the alarm
+opens a harness on the same storage and calls `resume()`. The contracts it
+rests on:
+
+- `Harness.close()` at any moment aborts task invocations and **writes no task
+  outcome**; a reopened harness resumes each task from its last checkpoint. A
+  fetch cut off by close is simply made again.
+- A not-ready `fetchDeferred` commits a fresh `poll` checkpoint with a new
+  `pollAt` and **no transcript entry**.
+- A sleeping task is `running` with its checkpoint in `poll` or `retry`, and the
+  sleep reads the harness clock (`HarnessOptions.now`), which is the clock the
+  park decision must read.
+- Input submitted while a run holds the conversation waits in `pi.inbox` for
+  the run's next boundary, and does not wake the sleeper.
+
+The park predicate, `parkVerdict`, says "park" only when all of these hold:
+every live task is a sleeper or `waiting` on other tasks; every sleeper is
+`running`, not abort-marked, and its T is **strictly after now** (by at least
+`minParkMs`, default 1000 — a shorter park saves almost nothing and risks closing mid-fetch); no conversation involved has a committed streaming
+partial or a tool slot that is not done; and queued input exists only where a
+run already holds its conversation. T is the earliest sleeper's. The strict
+comparison is the one that matters: a task whose `pollAt` has passed is
+fetching or about to, with its checkpoint still saying `poll`, and parking it
+sets an alarm in the past that reopens, fetches, parks again — a spike measured
+108 fetches for one answer that way. `test/durable-drive.ts` and
+`npm run durable-drive:do` cover submit-then-park, the wake that completes with
+one fetch, the wake that parks again with one fetch, the wake whose `pollAt` has
+passed, input while parked, and the retry backoff, and judge one parked
+snapshot at T−1, T and T+1.
 
 ### 4. pi-mcp — what `src/plugins/mcp.ts` rests on
 
@@ -177,6 +248,8 @@ before the expensive one.
    For pi-durable, `npm run pi-durable` and `npm run pi-durable:do` do the same
    with its suite, plus the facade's own cases; a new migration fails them
    until the list of names in `src/store/pi-durable-sqlite.ts` is updated.
+   Then `npm run durable-drive` and `npm run durable-drive:do`, the park
+   contract above; bump `pi-ai-1` together with pi-durable's pi-ai.
 4. `npm run pi-loop`, `pi-offload`, `pi-tools`, `pi-agent`, `pi-bridge` — the
    behavioural contracts and every divergence above.
 5. Re-diff the copied source in the table in §2.
