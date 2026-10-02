@@ -16,28 +16,25 @@
  *   adopt that rebuilds the agent's config cannot move an agent between
  *   kernels. A missing row means the agent predates the choice (pi 0.85).
  * - `model_jobs`: `pi_model_jobs` (src/runtime/pi-agent.ts), with the session
- *   replaced by pi-durable's conversation id. That id is nullable because the
- *   offloaded provider's port (src/model/durable-offloaded.ts) is handed only
- *   `{ model, context, options }`.
+ *   replaced by pi-durable's conversation id, and a `state`: null while the job
+ *   is out, `consumed` once a commit appended its answer, `cancelled` once its
+ *   generation was aborted (the row is kept, so a late answer is still billed).
+ *   The row is inserted inside pi-durable's commit (src/runtime/pd-outbox.ts),
+ *   which knows the conversation; a row from before that may hold null.
  * - `client_calls`: `api_client_calls` (src/runtime/client-calls.ts), keyed by
  *   pi-durable's conversation id instead of a session name.
  * - `conversations`: the directory from the id a caller addresses (a task id:
  *   `t_<agent>` or an Agents API session id, which `#conversation` and
  *   `#openTask` in cf/src/index.ts accept through AgentDO's `tasks` rows) to the
  *   pi-durable conversation that holds it.
- * - `outbox_marks`: how far the usage and trace outboxes have read pi-durable's
- *   entries. A watermark is pi-durable's commit sequence (`entries.commit_seq`,
- *   strictly increasing per atomic commit), so "through seq N" never splits a
- *   commit. Written by src/runtime/pd-outbox.ts through `unit`, in the same
- *   transaction as the rows it accounts for.
  *
- * The engine, the directory, `unit` and the client calls have operations here; the
+ * The engine, the directory and the client calls have operations here; the
  * other tables are declared so that the namespace's list is complete from the start,
  * and their operations arrive with the steps that use them.
  */
 import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
-export const AP_TABLES = ["meta", "model_jobs", "client_calls", "conversations", "outbox_marks"] as const;
+export const AP_TABLES = ["meta", "model_jobs", "client_calls", "conversations"] as const;
 export const AP_INDEXES = ["model_jobs_open"] as const;
 export const AP_OBJECTS: SqlObjects = { tables: AP_TABLES, indexes: AP_INDEXES };
 
@@ -45,7 +42,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT`,
   `CREATE TABLE IF NOT EXISTS model_jobs (
      id TEXT PRIMARY KEY, conversation_id INTEGER, request TEXT NOT NULL, answer TEXT,
-     created_at INTEGER NOT NULL, dispatched_at INTEGER, answered_at INTEGER) STRICT`,
+     created_at INTEGER NOT NULL, dispatched_at INTEGER, answered_at INTEGER, state TEXT) STRICT`,
   // What a sweep for lost and unanswered calls reads.
   `CREATE INDEX IF NOT EXISTS model_jobs_open ON model_jobs (answered_at, created_at)`,
   `CREATE TABLE IF NOT EXISTS client_calls (
@@ -55,7 +52,10 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS conversations (
      task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
      conversation_id INTEGER NOT NULL UNIQUE, created_at INTEGER NOT NULL) STRICT`,
-  `CREATE TABLE IF NOT EXISTS outbox_marks (outbox TEXT PRIMARY KEY, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`,
+];
+/** Columns added after a table was first made: each is added where it is missing (an object made before it). */
+const ADDED_COLUMNS = [
+  { table: "model_jobs", column: "state", sql: "ALTER TABLE model_jobs ADD COLUMN state TEXT" },
 ];
 
 /** The kernels an agent can run on. `pi085` is every agent created before the choice existed. */
@@ -75,7 +75,7 @@ export type ApClientCall = {
 
 export type ApConversation = { taskId: string; tenantId: string; agentId: string; conversationId: number; createdAt: number };
 
-/** The slice of `ctx.storage` this needs: its SQL, and the transaction `unit` runs in. */
+/** The slice of `ctx.storage` this needs: its SQL, and the transaction `ensure` runs in. */
 export type ApSqlHost = {
   sql: { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
   transactionSync<T>(closure: () => T): T;
@@ -83,14 +83,12 @@ export type ApSqlHost = {
 
 type Binding = string | number | null;
 
-/** The `ap` tables inside a unit (`ApStore.unit`): only valid until the unit's function returns. */
-export type ApUnit = { run(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> };
 
 /**
  * Every statement runs when it is called, reads and writes alike. Nothing of pi-durable's can be open
  * meanwhile: each of its commits is one synchronous transaction (src/store/pi-durable-sqlite.ts), so
  * code of ours never runs inside one. A method whose statements must land together runs them in one
- * host `transactionSync` (`ensure`, `unit`); the rest are one write each, or a read and a write with
+ * host `transactionSync` (`ensure`); the rest are one write each, or a read and a write with
  * no await between them.
  */
 export class ApStore {
@@ -107,22 +105,21 @@ export class ApStore {
     return this.#host.sql.exec(this.#names.rewrite(sql), ...bindings).toArray();
   }
 
-  /** Any statement over the `ap` objects; a name outside them throws before anything runs. */
+  /** Any statement over the `ap` objects, run at once — inside whatever transaction is open, the commit hook's included; a name outside them throws before anything runs. */
   query(sql: string, ...bindings: Binding[]): Array<Record<string, unknown>> {
     return this.#run(sql, bindings);
   }
 
-  ensure(): void { this.#host.transactionSync(() => { for (const s of SCHEMA) this.#run(s, []); }); }
-
-  /**
-   * One host `transactionSync`: `ap.run` reaches only the `ap` objects, and whatever else `fn` runs on the
-   * host's connection before it returns commits or rolls back with it. That is what lets the outbox
-   * derivation (src/runtime/pd-outbox.ts) append its rows and advance its watermark in `outbox_marks` as
-   * one commit.
-   */
-  unit<T>(fn: (ap: ApUnit) => T): T {
-    return this.#host.transactionSync(() => fn({ run: (sql, ...bindings) => this.#run(sql, bindings) }));
+  ensure(): void {
+    this.#host.transactionSync(() => {
+      for (const s of SCHEMA) this.#run(s, []);
+      // A select of a missing column fails as it is prepared, before it runs, so it writes nothing either way.
+      for (const a of ADDED_COLUMNS) {
+        try { this.#run(`SELECT ${a.column} FROM ${a.table} WHERE 0`, []); } catch { this.#run(a.sql, []); }
+      }
+    });
   }
+
 
   /** The engine recorded at creation, or null for an agent that predates the choice. */
   engine(): AgentEngineName | null {

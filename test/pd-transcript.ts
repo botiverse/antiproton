@@ -222,7 +222,7 @@ await check("readPdEntries reads what DurableAgent.entries() returns, and writes
   } finally { host.dispose(); }
 });
 
-await check("a read scheduled from inside a pi-durable commit that fails after writing an entry never sees that entry", async () => {
+await check("a read scheduled from inside a pi-durable commit that fails after writing an entry never sees that entry, and the retry lands it once", async () => {
   // pi-durable commits in one synchronous transaction (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js):
   // there is no moment in which a read can run inside it. So a commit that has written an entry is made to fail,
   // and a read (what adminTranscript, diagnose and uiVersion make) is scheduled from inside it, before the throw.
@@ -248,7 +248,7 @@ await check("a read scheduled from inside a pi-durable commit that fails after w
       }
       return out;
     });
-    const { rt } = await converse(host, "pd", [SCRIPT[0]!]);
+    const { rt, agent } = await converse(host, "pd", [SCRIPT[0]!]);
     const committed = read();
     assert(committed.n === 2, `before: ${show(committed)}`);
     const rows = count();
@@ -260,9 +260,13 @@ await check("a read scheduled from inside a pi-durable commit that fails after w
     assert(inside > rows, `control: inside the commit pd_entries held ${inside} rows, no more than the ${rows} committed`);
     const direct = await scheduled;
     assert(show(direct) === show(committed), `the read: ${show(direct)}, committed: ${show(committed)}`);
-    await driving;
-    assert(show(read()) === show(committed), `after the rollback: ${show(read())}`);
-    assert(count() === rows, `after the rollback pd_entries holds ${count()} rows, not ${rows}`);
+    // The rolled-back commit poisoned its harness, which is dropped (PdHost.#afterCommit); the say is retried on a
+    // fresh one under the same request id, so its entries land once, whole.
+    assert(await driving !== "failed", "the say failed instead of being retried on a fresh harness");
+    assert(count() === inside, `after the rollback and the retry pd_entries holds ${count()} rows, not the ${inside} the failed commit had`);
+    assert(read().n === committed.n + 1, `after the retry: ${show(read())}`);
+    // The retried turn goes on to its model call; this test is done with it.
+    await agent.close();
   } finally { host.dispose(); }
 });
 

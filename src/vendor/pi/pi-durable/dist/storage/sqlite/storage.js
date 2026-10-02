@@ -14,6 +14,11 @@
  *   with the callback's error, as `transaction` did.
  * - `document` reads its record and revisions in `transactionSync` too (it is materializeDocument's other caller).
  * - `open` refuses a database without `transactionSync`, and migrates through the vendored ./migrations.js.
+ * - `open` takes an optional second argument, `{ onCommit }`. `commit` calls `onCommit(exec, writes, seq)` inside its
+ *   transaction, after the batch's checks and before any of its writes is applied: `exec` is the transaction's own
+ *   executor, so whatever the hook reads is the state the batch is applied to, and whatever it writes commits or rolls
+ *   back with the batch. A throw in it rolls the commit back and rejects with that error; a hook that returns a
+ *   thenable is refused the same way, since its work would run after the transaction.
  * - Relative imports of unchanged modules point into the installed package; the source map comment is dropped.
  *
  * Why: on a Durable Object the only transaction that spans an await is `ctx.storage.transaction`, a savepoint over
@@ -101,12 +106,16 @@ export class SqliteStorage {
     closing;
     admittedReads = 0;
     readsDrained;
-    constructor(db, nextId) {
+    // antiproton patch: the commit hook (see the header).
+    onCommit;
+    constructor(db, nextId, onCommit) {
         this.db = db;
         this.nextId = nextId;
+        this.onCommit = onCommit;
     }
     /** Initialize storage over an owned SQLite database facade. */
-    static async open(db) {
+    // antiproton patch: `options.onCommit`, the commit hook (see the header).
+    static async open(db, options) {
         try {
             // antiproton patch: commits, document reads and migrations run in the facade's synchronous transaction.
             if (typeof db.transactionSync !== "function")
@@ -115,7 +124,7 @@ export class SqliteStorage {
             const metadata = await db.get("SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1");
             if (metadata === undefined)
                 throw new Error("Durable SQLite metadata is missing");
-            return new SqliteStorage(db, Number(metadata.next_id));
+            return new SqliteStorage(db, Number(metadata.next_id), options?.onCommit);
         }
         catch (error) {
             try {
@@ -140,6 +149,12 @@ export class SqliteStorage {
             const committedSeq = seqFromNumber(metadata.next_seq);
             this.checkGlobalIds(transaction, writes);
             this.checkDocumentActions(transaction, documentActions);
+            // antiproton patch: the commit hook, in this transaction, before the batch is applied (see the header).
+            if (this.onCommit !== undefined) {
+                const hooked = this.onCommit(transaction, writes, committedSeq);
+                if (typeof hooked?.then === "function")
+                    throw new TypeError("onCommit must be synchronous: it returned a thenable, whose work would run after the commit's transaction");
+            }
             for (const write of writes)
                 this.applyTableWrite(transaction, write, committedSeq);
             this.applyDocumentActions(transaction, documentActions, committedSeq);

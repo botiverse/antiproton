@@ -175,7 +175,7 @@ Cancel and the API caller's functions (`DurableAgent.cancel`, `clientTool`;
 - `Conversation.abort()` marks every live task of the conversation, starts the
   scheduler, and resolves once it is idle. A generation aborted in its `poll`
   phase calls `cancelDeferred` (`harness/generation.js`, `abort`), which is how
-  the job row is dropped; nothing is appended for the abort itself, so the
+  the job row is marked cancelled; nothing is appended for the abort itself, so the
   marker entry is ours.
 - Once the abort mark is down a tool's late result is not committed; its
   result is `Tool <name> was aborted`, built from the slot, so `details` the
@@ -247,8 +247,8 @@ snapshot at T−1, T and T+1.
 A pi-durable commit is one host `transactionSync` (the vendored `storage.js`, see
 *Changing upstream files*): every statement in it synchronous, so no other code
 of the object runs between its first statement and its commit or rollback.
-Nothing of ours can land inside one, and a failed commit rolls back only its
-own writes. That is the whole of the coordination between pi-durable and the
+Nothing of ours can land inside one except what its commit hook writes on purpose
+(below), and a failed commit rolls back only its own writes and the hook's. That is the whole of the coordination between pi-durable and the
 rest of the object: the facade (`src/store/pi-durable-sqlite.ts`) runs each
 statement when it is called, with no queue; the runtime, the store, the
 gateway, the plugins and `AgentDO` write the object's SQL with plain
@@ -267,35 +267,40 @@ that had one). It rests on:
   as each commit ends, which is how `test/pd-writes.ts`, `test/pd-cancel.ts` and
   `test/durable-agent.ts` drive the runtime's writes against commits.
 
-#### On pi-durable: usage and trace are derived after the commit
+#### On pi-durable: our bookkeeping is written inside pi-durable's commit
 
-pi 0.85 lets us write the usage and trace outboxes inside `Storage.commit`;
-pi-durable's commits are its own, so `src/runtime/pd-outbox.ts` derives the
-same rows afterwards from committed entries, past a watermark on
-`entries.commit_seq`, and checks its totals against pi-durable's `pi.usage`
-documents. It reads pi-durable's tables directly, and rests on:
+pi 0.85 lets us write the usage and trace outboxes inside `Storage.commit`; on
+pi-durable the vendored storage calls a commit hook inside the transaction that
+applies each batch (see *Changing upstream files*), and `bookCommit` in
+`src/runtime/pd-outbox.ts` writes there: usage rows, `model.call` trace rows and
+the `ap_model_jobs` rows, all committing or rolling back with the batch. It
+rests on:
 
-- **Every response is an assistant entry**, a failed attempt that is retried
-  included, and its usage is added to `pi.usage` in the same commit
-  (`appendAssistant` in `harness/generation.js`). Derived totals therefore
-  equal `pi.usage`; compaction (off on pd) is the one writer that counts usage
-  with no entry.
-- `durable_metadata.next_seq` is one past the last committed sequence, and is
-  written in the commit it counts.
-- An entry row's `record` is the `EntryRecord` as JSON, with `kind` and `model`.
-- **Entry ids grow with commit order.** They are minted from one counter only
-  inside a commit callback on the Session's mutation line, one commit at a
-  time, and a reopened storage resumes it from `durable_metadata.next_id`. The
-  derivation reads `id > mark` (a range on the INTEGER PRIMARY KEY) instead of
-  `commit_seq > mark`, which has no index and would scan every entry on every
-  pass; an id minted out of order would be an entry never billed.
-- `pi.usage` checkpoints on every change, so its newest revision is a `base`;
-  a `delta` there is reported as unreadable rather than read.
+- **`pi.usage` is the ledger.** Every writer that records spend adds to the
+  conversation's `pi.usage` document in the commit that records it: a response
+  (`appendAssistant` in `harness/generation.js`, a failed attempt that is
+  retried included), compaction's model call (`harness/compaction.js`, which
+  appends no entry) and a tool result that carries usage (`appendToolResult`
+  in `harness/tool.js`). Usage rows are the batch's change to those documents,
+  so a writer that appends an entry without touching `pi.usage` bills nothing,
+  and a writer that spends without recording it would bill nothing either.
+- `pi.usage` keys a model as `provider/model`; the row names the model as an
+  assistant entry of the same batch names it, otherwise the part after the
+  first `/`.
+- **A generation records a deferred handle in a `poll` checkpoint**, in the
+  commit after the provider returned it (`classify` in `harness/generation.js`).
+  The provider only stages the job; that commit inserts the row, and the job is
+  dispatched after it. A generation that dies before it leaves no row.
 - An offloaded answer keeps the fields the worker wrote (`jobId`) when
-  pi-durable stores it as the entry's message.
+  pi-durable stores it as the entry's message; the batch that appends it marks
+  the job consumed.
+- `cancelDeferred` is called only for a generation whose committed checkpoint
+  is `poll` (`abort` in `harness/generation.js`), so a cancelled job's answer
+  is never appended; an answer that reaches a cancelled row is billed where it
+  is stored (`PdHost.deliver`, `#dropJob`).
 
 `test/pd-outbox.ts` and `npm run pd-outbox:do` compare the rows with PiAgent's
-for the same conversation, and fail when any of these moves.
+for the same conversation, and cover the jobs' crash, cancel and rollback cases.
 
 ### 4. pi-mcp — what `src/plugins/mcp.ts` rests on
 
@@ -357,7 +362,7 @@ Prefer not to. If it is necessary, it is allowed, but:
 |---|---|---|---|---|
 | `src/vendor/pi/pi-durable/dist/harness/scheduler.js` | `@earendil-works/pi-durable/dist/harness/scheduler.js` | pi-durable 1.0.0 (npm) | `#sleep` records its wake time and calls a new `onSleep` option; `inspect()` reports a sleeping task as `{ kind: "running", sleepingUntil }`. Without it a host cannot tell "only sleeping" from "working", and `settle` (src/runtime/durable-drive.ts) inferred it from checkpoint phases | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
 | `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, and imports the vendored scheduler: the package's harness imports its own | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
-| `src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js` | `@earendil-works/pi-durable/dist/storage/sqlite/storage.js` | pi-durable 1.0.0 (npm) | `commit` (and `document`'s read) run in the facade's `transactionSync` with every statement synchronous, instead of an async `transaction` that awaits between statements: on a Durable Object that one is a savepoint any `sql.exec` issued meanwhile joins, and rolls back with. Same statements, order and errors | none yet: a draft asks for an optional synchronous transaction on `SqliteDatabase` |
+| `src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js` | `@earendil-works/pi-durable/dist/storage/sqlite/storage.js` | pi-durable 1.0.0 (npm) | `commit` (and `document`'s read) run in the facade's `transactionSync` with every statement synchronous, instead of an async `transaction` that awaits between statements: on a Durable Object that one is a savepoint any `sql.exec` issued meanwhile joins, and rolls back with. Same statements, order and errors. `open` also takes `{ onCommit }`, which `commit` calls inside that transaction before applying the batch, so our usage, trace and job rows commit or roll back with pi-durable's state (`src/runtime/pd-outbox.ts`) | none yet: a draft asks for an optional synchronous transaction on `SqliteDatabase` |
 | `src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js` | `@earendil-works/pi-durable/dist/storage/sqlite/migrations.js` | pi-durable 1.0.0 (npm) | `applySqliteMigrations` runs in `transactionSync` too, so no pi-durable transaction spans an await; the schema is the package's (`test/pi-vendor.ts` compares them) | as above |
 
 How the vendored files are used: they are `dist` files, copied, and their

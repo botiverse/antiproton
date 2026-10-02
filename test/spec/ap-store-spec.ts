@@ -177,25 +177,5 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     is.deepEqual(ap.openConversation(good), good);
   }));
 
-  add("ap store", "unit is one transaction: a throw inside leaves nothing written, and one that returns commits", () => withHost(async (host) => {
-    const ap = new ApStore(host, AP);
-    ap.ensure();
-    const boom = new Error("inside");
-    let error: unknown;
-    try {
-      ap.unit((t) => {
-        t.run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', 'pd')");
-        // Whatever else runs on the host's connection inside the unit is in it too.
-        host.sql.exec("INSERT INTO ap_conversations VALUES ('t_a', 't', 'a', 1, 1)");
-        throw boom;
-      });
-    } catch (e) { error = e; }
-    check(error === boom, `unit threw ${String(error)}, not the closure's error`);
-    is.strictEqual(ap.engine(), null);
-    is.strictEqual(ap.conversation("t_a"), null);
-    is.strictEqual(ap.unit((t) => { t.run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', 'pi085')"); return ap.engine(); }), "pi085");
-    is.strictEqual(ap.engine(), "pi085");
-  }));
-
   return cases;
 }

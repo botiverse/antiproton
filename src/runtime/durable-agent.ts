@@ -13,8 +13,10 @@
  *   closes it, and returns the sleep's end as `wakeInMs`. A parked object has
  *   no harness open and no timer alive.
  * - The model call is the offloaded provider on pi-ai 1.0
- *   (src/model/durable-offloaded.ts). Its port writes `ap_model_jobs`
- *   (src/store/ap-store.ts) instead of `pi_model_jobs`, and the worker reads and
+ *   (src/model/durable-offloaded.ts). Its port stages the job in memory; the
+ *   `ap_model_jobs` row (src/store/ap-store.ts, instead of `pi_model_jobs`) is
+ *   written by the pi-durable commit that records the job's poll checkpoint, and
+ *   the job is dispatched once that commit has landed. The worker reads and
  *   answers that row through `takeJob` and `deliver` here. A job id with no row
  *   is the runtime's `UnknownJob` (cf/src/model-queue.ts), handed in as
  *   `unknownJob` because src/ does not import cf/.
@@ -25,8 +27,8 @@
  *   catalogue changed — share the harness, the step in flight and the job
  *   table. Two harnesses on one storage would run the same task twice.
  * - The usage and trace outbox rows that pi 0.85 writes inside its commit are
- *   derived here after each pi-durable commit and at the end of every step
- *   (`deriveOutbox`, src/runtime/pd-outbox.ts), rows and watermark in one unit.
+ *   written inside pi-durable's commit too, by the vendored storage's commit hook
+ *   (`bookCommit`, src/runtime/pd-outbox.ts).
  * - A function the Agents API caller runs itself is a tool that records its call
  *   in `ap_client_calls` and waits in-process for the answer (`clientTool`,
  *   src/runtime/durable-tools.ts). A harness whose only pending work is such a wait
@@ -34,7 +36,7 @@
  *   when it is open in this isolate, and otherwise resumes the harness, whose replay
  *   of the tool finds it in the row.
  * - A cancel aborts the conversation (pi-durable cancels a polling generation's job
- *   through the provider's port, `#dropJob`) and appends the marker as an entry of
+ *   through the provider's port, `#dropJob`, which marks its row cancelled) and appends the marker as an entry of
  *   its own kind whose model message is the note the runtime names for it
  *   (`markerNotes`): what pi085's entry projector shows the model for its marker.
  *
@@ -56,11 +58,14 @@ import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
-import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
-import { derivePdOutbox, type DerivePass } from "./pd-outbox.ts";
 import { logEvent } from "../core/log.ts";
-import { PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
-import { prefixedNamespace } from "../store/sql-namespace.ts";
+import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
+import { bookCommit, strandedAnswerRows } from "./pd-outbox.ts";
+import { appendUsage } from "../usage/outbox.ts";
+import type { StorageWrite } from "@earendil-works/pi-durable";
+import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
+import { PI_DURABLE_OBJECTS, PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
+import { prefixedNamespace, SqlQualifier } from "../store/sql-namespace.ts";
 import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.ts";
 import { toolsExtension, type ClientAnswer, type ClientToolDef } from "./durable-tools.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
@@ -68,6 +73,7 @@ import { projectEntries } from "./pd-transcript.ts";
 import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 const PD = prefixedNamespace("pd");
+const PD_NAMES = new SqlQualifier(PI_DURABLE_OBJECTS, PD);
 const AP = prefixedNamespace("ap");
 
 /** Which session is the agent's first one; its conversation is pi-durable's root. Same string as pi-storage's MAIN_SESSION. */
@@ -87,6 +93,9 @@ const REDELIVERY_MS = 120_000;
  */
 export const DEFAULT_POLL = { firstMs: 2_000, maxMs: 30_000 } as const;
 
+/** How long a staged job waits for the commit that records it before it is forgotten (`PdHost.#staged`). */
+const STAGED_MS = 10 * 60_000;
+
 /** How long one `step()` keeps the harness open waiting for work that is neither idle nor sleeping. */
 const STEP_DEADLINE_MS = 30_000;
 
@@ -103,10 +112,8 @@ export interface PdHostOptions {
   stepDeadlineMs?: number;
   /** Each provider poll of a job, and whether it found the answer. For tests and traces. */
   onPoll?: (jobId: string, ready: boolean) => void;
-  /** A test seam into the outbox pass (src/runtime/pd-outbox.ts, `DeriveContext.fault`). */
-  outboxFault?: (stage: "appended") => void;
-  /** Each outbox pass that completed, with what it derived and how it compared with `pi.usage`. For tests. */
-  onOutboxPass?: (pass: DerivePass) => void;
+  /** A test seam into the commit hook (src/runtime/pd-outbox.ts, `BookContext.fault`): a throw rolls the commit back. */
+  commitFault?: (writes: readonly StorageWrite[]) => void;
 }
 
 /** What binds a host to the one agent it serves. */
@@ -146,9 +153,14 @@ export class PdHost {
   /** The `ap` tables. */
   readonly #ap: ApStore;
   #ensured = false;
-  /** The outbox pass in flight, and whether a commit landed after it read: then it runs once more. */
-  #deriving: Promise<DerivePass | null> | null = null;
-  #deriveAgain = false;
+  /**
+   * Jobs the provider's port started that no commit has recorded yet: id to request JSON, and when. The commit
+   * that records the job's poll checkpoint inserts its row (`bookCommit`). Not cleared when a harness closes: a
+   * commit admitted before the close can still land after it, and without its entry it would record a checkpoint
+   * with no row, a poll nobody answers. One that will never land (its generation aborted or failed first) is
+   * forgotten after `STAGED_MS`; its commit follows the provider's return at once, so that is far past it.
+   */
+  readonly #staged = new Map<string, { request: string; at: number }>();
   /** Client tools waiting in this isolate, by `conversation:call`: each is told to read its row again. */
   readonly #clientWaiters = new Map<string, Set<() => void>>();
   /** Told when a client call's row moves: what `settle` reads as `externalWaits` changed without a pd commit. */
@@ -236,8 +248,11 @@ export class PdHost {
   harness(): Promise<Harness> {
     if (this.#harness) return this.#harness;
     const opening = (async () => {
+      // The commit hook writes the `ap` tables, so they exist before anything commits.
+      await this.#store();
       const db = new PiDurableSqlite(this.#opts.storage, PD);
-      const h = await Harness.open(this.#noticingCommits(await SqliteStorage.open(db)), {
+      const storage = await SqliteStorage.open(db, { onCommit: (exec, writes, seq) => this.#book(exec, writes, seq, opening) });
+      const h = await Harness.open(storage, {
         models: this.#models,
         registry: this.#registry,
         settings: {
@@ -262,69 +277,46 @@ export class PdHost {
     return opening;
   }
 
-  /**
-   * The storage the harness commits through, telling the outbox about each commit once it has resolved.
-   * The Harness does not expose its Session's `subscribeCommits`, and pi-durable's every commit goes
-   * through `Storage.commit`, so this is the same notice one layer down. The pass it starts is not awaited
-   * here.
-   */
-  #noticingCommits(storage: SqliteStorage): SqliteStorage {
-    return new Proxy(storage, {
-      get: (target, key) => {
-        const value: unknown = Reflect.get(target, key, target);
-        if (typeof value !== "function") return value;
-        if (key !== "commit") return value.bind(target);
-        return async (...args: unknown[]) => {
-          const seq = await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
-          void this.deriveOutbox();
-          return seq;
-        };
-      },
-    });
-  }
-
-  // ---- the usage and trace outboxes --------------------------------------------
+  // ---- inside pi-durable's commit ------------------------------------------------
 
   /**
-   * Derive the usage and trace rows for everything pi-durable has committed since the last pass
-   * (src/runtime/pd-outbox.ts): one `ApStore.unit`, rows and watermark together. Calls that arrive
-   * while a pass runs share one further pass, which starts after it, so a commit that landed during a
-   * pass is never left for the next wake. Resolves to the last pass; null when the host is not bound
-   * to an agent yet (whose rows these would be is not known, so nothing is derived and the mark stays).
+   * The commit hook: inside the transaction of every pi-durable commit, before its batch is applied
+   * (src/runtime/pd-outbox.ts says what it writes). Jobs the batch recorded are dispatched once the
+   * transaction is over — it is synchronous, so a microtask queued here runs after it — and only if
+   * the commit landed rather than rolled back: pi-durable's sequence moved past `seq`.
    *
-   * A failure is logged and resolves to null rather than failing the step that asked: the mark did not
-   * move, so the next pass derives the same rows.
+   * A commit that rolled back for any reason but `StorageRejected` — a throw here, a failed statement after
+   * it — poisons pi-durable's Session: every later commit on it rejects until it is reopened. So the harness
+   * it ran on is dropped and closed, and whoever asks next opens a fresh one, which resumes each task from its
+   * last landed checkpoint. (A `StorageRejected` rollback does not poison; reopening then costs one open.)
    */
-  deriveOutbox(): Promise<DerivePass | null> {
-    if (this.#deriving) { this.#deriveAgain = true; return this.#deriving; }
-    this.#deriving = (async () => {
-      for (;;) {
-        this.#deriveAgain = false;
-        const last = await this.#derivePass();
-        // Released in the same turn as the check, so a call arriving after it starts a pass of its own
-        // instead of joining one that has already decided to end. Only one loop runs at a time, so the
-        // promise being released is this one.
-        if (!this.#deriveAgain) { this.#deriving = null; return last; }
-      }
-    })();
-    return this.#deriving;
+  #book(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], seq: number, harness: Promise<Harness>): void {
+    const binding = this.#binding;
+    let jobs: string[] = [];
+    try {
+      jobs = bookCommit(exec, writes, {
+        owner: binding ? { tenantId: binding.tenantId, agentId: binding.agentId } : null,
+        now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
+        ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
+      });
+    } finally {
+      queueMicrotask(() => void this.#afterCommit(jobs, seq, harness));
+    }
   }
 
-  async #derivePass(): Promise<DerivePass | null> {
-    const binding = this.#binding;
-    if (!binding) return null;
-    const owner = { tenantId: binding.tenantId, agentId: binding.agentId };
-    try {
-      const ap = await this.#store();
-      const pass = ap.unit((tables) => derivePdOutbox(this.#opts.storage.sql, tables, {
-        owner, pd: PD, ap: AP, now: this.#now(),
-        ...(this.#opts.outboxFault ? { fault: this.#opts.outboxFault } : {}),
-      }));
-      this.#opts.onOutboxPass?.(pass);
-      return pass;
-    } catch (error) {
-      logEvent("pd.outbox.error", { ...owner, error: String((error as Error)?.message ?? error).slice(0, 200) });
-      return null;
+  async #afterCommit(jobs: readonly string[], seq: number, harness: Promise<Harness>): Promise<void> {
+    const next = this.#opts.storage.sql.exec(PD_NAMES.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq;
+    if (!(Number(next) > seq)) {
+      if (this.#harness === harness) this.#harness = null;
+      logEvent("pd.commit.rolled_back", { ...(this.#binding ? { tenantId: this.#binding.tenantId, agentId: this.#binding.agentId } : {}), seq });
+      await (await harness).close(bg).catch(() => {});
+      return;
+    }
+    for (const id of jobs) {
+      // The row is the proof: a commit that rolled back, whatever moved the sequence since, left none.
+      if (this.#ap.query("SELECT 1 AS x FROM model_jobs WHERE id = ?", id).length === 0) continue;
+      this.#staged.delete(id);
+      await this.#dispatch(id);
     }
   }
 
@@ -485,13 +477,16 @@ export class PdHost {
 
   // ---- ap_model_jobs: the provider's port, and the worker's side -----------------
 
+  /**
+   * The provider's port: the job is only staged here. The commit that records the generation's poll checkpoint,
+   * whose handle names it, inserts the row (`bookCommit`), and the job is dispatched once that commit has landed
+   * (`#afterCommit`). A generation that dies before that commit leaves no row and sends nothing.
+   */
   async #startJob(request: ModelJobRequest): Promise<string> {
     const id = `mj_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    // Durable before it is dispatched, as in PiAgent: a dispatch can be retried from the row.
-    (await this.#store()).query(
-      "INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, NULL, ?, ?)",
-      id, JSON.stringify(request), this.#now());
-    await this.#dispatch(id);
+    const now = this.#now();
+    for (const [old, staged] of this.#staged) if (staged.at < now - STAGED_MS) this.#staged.delete(old);
+    this.#staged.set(id, { request: JSON.stringify(request), at: now });
     return id;
   }
 
@@ -507,7 +502,7 @@ export class PdHost {
     if (!this.#binding) return 0;
     const now = this.#now();
     const ids = (await this.#store()).query(
-      "SELECT id FROM model_jobs WHERE answer IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
+      "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
       now - REDELIVERY_MS, limit).map((r) => String(r.id));
     let sent = 0;
     for (const id of ids) if (await this.#dispatch(id)) sent++;
@@ -522,27 +517,45 @@ export class PdHost {
     return typeof answer === "string" ? readAnswer(answer) : null;
   }
 
-  /** pi-durable cancels a polling generation's job when the generation is aborted; a late answer then has no row. */
+  /**
+   * pi-durable cancels a polling generation's job when the generation is aborted. The row is marked, not deleted:
+   * the worker may already be carrying it, and its answer is spend. An answer already delivered, which no commit
+   * will now append, is billed here, in the same transaction as the mark; one delivered later is billed by `deliver`.
+   */
   async #dropJob(id: string): Promise<void> {
-    (await this.#store()).query("DELETE FROM model_jobs WHERE id = ?", id);
+    this.#staged.delete(id);
+    const owner = this.#bound();
+    const ap = await this.#store();
+    this.#opts.storage.transactionSync(() => {
+      const [row] = ap.query("UPDATE model_jobs SET state = 'cancelled' WHERE id = ? AND state IS NULL RETURNING answer", id);
+      if (row && typeof row.answer === "string") appendUsage(this.#opts.storage.sql as never, strandedAnswerRows(owner, this.#now(), row.answer));
+    });
   }
 
-  /** The worker's question: the request, or null once answered so a redelivered message does not call twice. */
+  /** The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice. */
   async takeJob(id: string): Promise<unknown> {
-    const [row] = (await this.#store()).query("SELECT request, answer FROM model_jobs WHERE id = ?", id);
+    const [row] = (await this.#store()).query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
     if (!row) throw this.#bound().unknownJob(id);
-    return row.answer === null ? JSON.parse(String(row.request)) : null;
+    return row.answer === null && row.state === null ? JSON.parse(String(row.request)) : null;
   }
 
-  /** The worker's answer. False when one is already in. Writing it is what the next poll reads. */
+  /**
+   * The worker's answer. False when one is already in. Writing it is what the next poll reads. An answer to a job
+   * that was cancelled is read by no poll, so its usage is billed here, in the transaction that stores it.
+   */
   async deliver(id: string, answer: AnsweredMessage): Promise<boolean> {
     const json = JSON.stringify(answer);
     const now = this.#now();
+    const owner = this.#bound();
     const ap = await this.#store();
     // One statement decides it, so two deliveries cannot both see the row unanswered.
-    const won = ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING id", json, now, id);
-    if (won.length > 0) return true;
-    if (ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length === 0) throw this.#bound().unknownJob(id);
+    const won = this.#opts.storage.transactionSync(() => {
+      const [row] = ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING state", json, now, id);
+      if (row?.state === "cancelled") appendUsage(this.#opts.storage.sql as never, strandedAnswerRows(owner, now, json));
+      return row !== undefined;
+    });
+    if (won) return true;
+    if (ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length === 0) throw owner.unknownJob(id);
     return false;
   }
 }
@@ -766,9 +779,6 @@ export class DurableAgent implements AgentEngine {
   async step(): Promise<StepOutcome> {
     await this.#host.conversation(this.#session);
     const result = await this.#host.drive();
-    // Each commit already started a pass; this one is what the step waits for, so that the rows of
-    // everything the step committed are in the outboxes before the alarm flushes them.
-    await this.#host.deriveOutbox();
     if (result.state === "idle") return { open: 0, wakeInMs: null, settled: [] };
     if (result.state === "parked") {
       return { open: result.sleepers.length, wakeInMs: Math.max(0, result.parkedUntil - this.#host.now), settled: [] };
