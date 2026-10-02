@@ -431,6 +431,37 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
     });
   });
 
+  add("client", "input while the turn waits on the caller starts a new turn at once; a later answer goes back to the call, as on pi085", async () => {
+    const r = await each(async (e) => {
+      const requests: Request[] = [];
+      const at = { n: 0 };
+      const script = [calls(["call_q", "get_weather", { city: "Rome" }]), say("hello"), say("hot then")];
+      await e.agent.say("weather in Rome?");
+      await drive(e, script, at, requests);
+      const waiting = await apiView(e);
+      await e.agent.say("actually, just say hello");
+      await drive(e, script, at, requests);
+      const after = await apiView(e);
+      const afterItems = await apiItems(e);
+      await e.agent.answerClientCalls([{ callId: "call_q", output: "hot", isError: false }]);
+      await drive(e, script, at, requests);
+      return { waiting, after, afterItems, answered: await apiView(e), items: await apiItems(e), requests };
+    });
+    for (const [name, v] of Object.entries(r)) {
+      check(show(v.waiting) === show({ status: "requires_action", turns: ["waiting"], pending: ["call_q"] }), `${name}: waiting ${show(v.waiting)}`);
+      // The new input is answered at once; the call still waits for the caller.
+      check(show(v.after) === show({ status: "requires_action", turns: ["waiting", "completed"], pending: ["call_q"] }), `${name}: after the input ${show(v.after)}`);
+      check(v.afterItems.some((x) => x.includes("actually, just say hello")) && v.afterItems.some((x) => x.includes("\"hello\"")), `${name}: items ${show(v.afterItems)}`);
+      // The answer goes back to the call: the turn in between leaves the branch, as pi085's navigateTree leaves it.
+      check(show(v.answered) === show({ status: "idle", turns: ["completed"], pending: [] }), `${name}: after the answer ${show(v.answered)}`);
+      check(v.requests.length === 3 && show(toolMessages(v.requests[1]!)) === show([CLIENT_PENDING]) && show(toolMessages(v.requests[2]!)) === show(["hot"]),
+        `${name}: the model read ${show(v.requests.map(toolMessages))}`);
+    }
+    sameItems({ pi085: { items: r.pi085.afterItems }, pd: { items: r.pd.afterItems } }, "after input while waiting");
+    sameItems(r, "after the late answer");
+    sameRequests(r.pi085.requests, r.pd.requests, "input while waiting on the caller");
+  });
+
   add("client", "a result that arrives before the tool runs is used at once, and nothing waits", async () => {
     const r = await each(async (e) => {
       const requests: Request[] = [];

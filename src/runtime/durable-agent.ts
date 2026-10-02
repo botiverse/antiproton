@@ -613,6 +613,22 @@ function externalWaitsOf(ap: ApStore): ExternalWaits {
   return out;
 }
 
+/**
+ * The active entries with their context edits applied, as pi-durable derives the model's context from them
+ * (harness/context.js `deriveContext`, @earendil-works/pi-durable 1.0.0: the newest edit of a target wins): an omitted
+ * entry is left out, a replaced one carries its replacement. What `branch()` shows is then what the model is sent.
+ */
+function withEdits(entries: readonly EntryRecord[]): EntryRecord[] {
+  const edits = new Map<string, NonNullable<EntryRecord["edits"]>[number]>();
+  for (const e of entries) for (const edit of e.edits ?? []) edits.set(String(edit.target), edit);
+  if (edits.size === 0) return [...entries];
+  return entries.flatMap((e) => {
+    const edit = edits.get(String(e.id));
+    if (edit?.action === "omit") return [];
+    return edit?.action === "replace" ? [{ ...e, model: edit.messages }] : [e];
+  });
+}
+
 const GENERATION_KIND = GenerationTask.definition.name;
 const TOOL_KIND = ToolTask.definition.name;
 
@@ -698,8 +714,10 @@ export class DurableAgent implements AgentEngine {
     const requestId = `say:${crypto.randomUUID()}`;
     // Submitting starts the scheduler, which runs every session's tasks.
     await this.#host.ensureSessions();
+    const ap = await this.#host.store();
     return this.#host.withHarness(async (h) => {
       const c = await this.#conversation(h);
+      await this.#leaveCallerWait(h, c, ap);
       const submission = await c.submit({ type: "input", content: text, whenBusy: mode === "followUp" ? "followUp" : "steer", requestId }, bg);
       const record = await submission.status(bg);
       // `messageLanded` (cf/src/runtime.ts) reads an operation id as "a run started".
@@ -707,6 +725,21 @@ export class DurableAgent implements AgentEngine {
         ? { ok: true, value: { operationId: String(submission.id) } }
         : { ok: true, value: { entryId: null, submissionId: String(submission.id) } };
     });
+  }
+
+  /**
+   * Input while the turn waits only on the API caller. pi085's run had ended at that pause, its calls holding the
+   * placeholder result, so the input starts a new turn at once and the calls stay waiting; an answer that comes later
+   * goes back to the call (`resumeClientCalls`). Here the waiting tools are the run, and input would queue behind
+   * them until the caller answered. So the run is aborted first — the tools' results become "aborted", which
+   * `pi085ClientAborted` shows as pi085's placeholder — and the rows stay `pending`: the same state pi085 is in.
+   */
+  async #leaveCallerWait(h: Harness, c: Conversation, ap: ApStore): Promise<void> {
+    if (ap.pendingClientCalls(c.id).every((r) => r.name === "")) return;
+    const inspection = await h.inspect(bg);
+    const live = inspection.tasks.some((t) => t.record.conversationId === c.id && !t.record.background);
+    if (!live || runningIn(inspection, c.id, externalWaitsOf(ap))) return;
+    await c.abort(bg);
   }
 
   /**
@@ -784,7 +817,65 @@ export class DurableAgent implements AgentEngine {
    */
   async resumeClientCalls(): Promise<boolean> {
     const id = await this.#host.conversation(this.#session);
-    return (await this.#host.store()).answeredClientCalls(id).length > 0;
+    const ap = await this.#host.store();
+    const answered = ap.answeredClientCalls(id);
+    if (answered.length === 0) return false;
+    return this.#host.withHarness(async (h) => {
+      const inspection = await h.inspect(bg);
+      const liveCalls = new Set(inspection.tasks
+        .filter((t) => t.record.conversationId === id && t.record.kind === TOOL_KIND)
+        .map((t) => (t.record.input as { callId?: unknown } | null)?.callId));
+      // A tool still waits for one of them: the next pass's replay reads it.
+      if (answered.some((r) => liveCalls.has(r.callId))) return true;
+      // Their run was left for new input (`#leaveCallerWait`): continue it as pi085 does, once every call is
+      // answered and the conversation is idle.
+      if (ap.pendingClientCalls(id).some((r) => r.name !== "")) return false;
+      if (inspection.tasks.some((t) => t.record.conversationId === id && !t.record.background)) return false;
+      const resumed = await this.#resumeLeftCalls(await this.#host.handle(h, id), answered);
+      if (resumed) await ap.query("DELETE FROM client_calls WHERE conversation_id = ? AND (name != '' OR state = 'used')", id);
+      return resumed;
+    });
+  }
+
+  /**
+   * pi085's resume of calls answered after their turn moved on (client-calls.ts `resumeClientCalls`): it moves the lane
+   * back to the assistant message that made them, so what came after leaves the model's context, and starts a run whose
+   * first messages are the real results. pi-durable has no tree to move in; the same context is written as edits on
+   * one entry — each call's placeholder result replaced by the caller's, every later entry other than that message's
+   * results omitted — and a run is started on it in the same commit, as pi-durable starts one (harness/generation.js
+   * `startRun`, @earendil-works/pi-durable 1.0.0). `branch()` applies the same edits, so readers see pi085's branch.
+   */
+  async #resumeLeftCalls(c: Conversation, answered: ReadonlyArray<{ callId: string; output: string | null; isError: boolean }>): Promise<boolean> {
+    const answers = new Map(answered.map((r) => [r.callId, r]));
+    const view = await c.context(bg);
+    const at = [...view.entries].reverse().find((e) => e.kind === "pi.assistant"
+      && ((e.model?.[0] as { content?: Array<{ type: string; id?: string }> } | undefined)?.content ?? []).some((p) => p.type === "toolCall" && answers.has(String(p.id))));
+    if (!at) return false;
+    const message = at.model![0] as { content: Array<{ type: string; id?: string; name?: string }> };
+    const ofMessage = new Set(message.content.filter((p) => p.type === "toolCall").map((p) => String(p.id)));
+    const now = this.#host.now;
+    const edits: Array<{ target: EntryRecord["id"]; action: "omit" } | { target: EntryRecord["id"]; action: "replace"; messages: never[] }> = [];
+    for (const e of view.entries.slice(view.entries.indexOf(at) + 1)) {
+      const first = e.model?.[0] as { role?: string; toolCallId?: string; toolName?: string } | undefined;
+      const callId = e.kind === "pi.tool-result" ? String(first?.toolCallId) : undefined;
+      const answer = callId === undefined ? undefined : answers.get(callId);
+      if (answer) {
+        edits.push({ target: e.id, action: "replace", messages: [{
+          role: "toolResult", toolCallId: callId, toolName: String(first?.toolName), timestamp: now,
+          content: [{ type: "text", text: answer.output ?? "" }], isError: answer.isError,
+        }] as never[] });
+      } else if (!(callId !== undefined && ofMessage.has(callId))) {
+        edits.push({ target: e.id, action: "omit" });
+      }
+    }
+    await c.commit(async (tx) => {
+      await tx.appendEntry(c.id, { kind: "ap.client_resume", edits, data: { calls: [...answers.keys()], at: now } });
+      const live = await tx.doc(LiveDoc, c.id);
+      if (live.run === undefined) {
+        live.run = { taskId: await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" }, conversationId: c.id }), inputs: [] };
+      }
+    }, bg);
+    return true;
   }
 
   /** Calls of this session the API caller has not answered, oldest first: pi085's `pendingClientCalls`. */
@@ -858,7 +949,7 @@ export class DurableAgent implements AgentEngine {
   /** The active context's entries, oldest first: what the next request is built from. */
   async branch(): Promise<EngineEntry[]> {
     const id = await this.#host.conversation(this.#session);
-    return this.#host.withHarness(async (h) => projectEntries((await (await this.#host.handle(h, id)).context(bg)).entries));
+    return this.#host.withHarness(async (h) => projectEntries(withEdits((await (await this.#host.handle(h, id)).context(bg)).entries)));
   }
 
   /** The tools the model is offered, as this conversation's agent resolves them. */
