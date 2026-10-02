@@ -15,11 +15,14 @@
  */
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ROOT_CONVERSATION_ID, type StorageWrite } from "@earendil-works/pi-durable";
-import { SqliteStorage, SQLITE_MIGRATIONS, applySqliteMigrations } from "@earendil-works/pi-durable/storage/sqlite";
+import {
+  SqliteStorage, SQLITE_MIGRATIONS, applySqliteMigrations, type SqliteDatabase, type SqliteExecutor,
+} from "@earendil-works/pi-durable/storage/sqlite";
 import { createStorageConformance, type StorageConformanceAssertions } from "@earendil-works/pi-durable/testing";
 import {
-  PiDurableSqlite, PI_DURABLE_INDEXES, PI_DURABLE_PREFIX, PI_DURABLE_TABLES, type DurableSqlHost,
+  PiDurableSqlite, PI_DURABLE_INDEXES, PI_DURABLE_OBJECTS, PI_DURABLE_TABLES, type DurableSqlHost,
 } from "../../src/store/pi-durable-sqlite.ts";
+import { prefixedNamespace, qualifySql, type SqlNamespace } from "../../src/store/sql-namespace.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 
 /** A Durable Object's storage, or node's stand-in for it: AgentDO's own schema needs `transactionSync` too. */
@@ -29,6 +32,7 @@ export type WithHost = (use: (host: PiDurableHost) => Promise<void>) => Promise<
 export type PiDurableCase = { group: string; name: string; run(): Promise<void> };
 
 const context = BACKGROUND_CONTEXT;
+const PD = prefixedNamespace("pd");
 type StoredTask = Extract<StorageWrite, { type: "task" }>["value"];
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
@@ -85,14 +89,14 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
   for (const c of createStorageConformance({
     assertions: vitestLikeAssertions,
     withStorage: (use) => withHost(async (host) => {
-      const storage = await SqliteStorage.open(new PiDurableSqlite(host));
+      const storage = await SqliteStorage.open(new PiDurableSqlite(host, PD));
       try { await use(storage); } finally { await storage.close(context); }
     }),
   })) cases.push({ group: "pi-durable conformance", name: c.name, run: () => c.run() });
 
-  const add = (name: string, run: () => Promise<void>) => cases.push({ group: "prefix facade", name, run });
+  const add = (name: string, run: () => Promise<void>) => cases.push({ group: "namespace facade", name, run });
 
-  add("the list of names to prefix is exactly what pi-durable's migrations create", async () => {
+  add("the list of names to namespace is exactly what pi-durable's migrations create", async () => {
     const created = new Set<string>();
     const statements = [
       // applySqliteMigrations creates this one itself, outside SQLITE_MIGRATIONS.
@@ -119,7 +123,7 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     const ourTasks = () => host.sql.exec("SELECT * FROM tasks ORDER BY task_id").toArray();
     const tasksBefore = ourTasks();
 
-    const storage = await SqliteStorage.open(new PiDurableSqlite(host));
+    const storage = await SqliteStorage.open(new PiDurableSqlite(host, PD));
     await storage.commit([{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }], context);
     const taskId: StoredTask["id"] = await storage.mintId();
     const task: StoredTask = {
@@ -136,11 +140,12 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     const fresh = after.filter((r) => !beforeKeys.has(key(r)));
     // SQLite names the index behind a composite primary key itself, after the table it serves.
     const automatic = fresh.filter((r) => r.name.startsWith("sqlite_autoindex_"));
-    for (const r of automatic) check(r.tbl_name.startsWith(PI_DURABLE_PREFIX), `${r.name} serves an unprefixed table`);
+    const ours = new Set(PI_DURABLE_TABLES.map((t) => PD.qualify(t, "table")));
+    for (const r of automatic) check(ours.has(r.tbl_name), `${r.name} serves ${r.tbl_name}, which is not a namespaced table`);
     const added = fresh.filter((r) => !automatic.includes(r)).map(key).sort();
     const expected = [
-      ...PI_DURABLE_TABLES.map((t) => `table ${PI_DURABLE_PREFIX}${t}`),
-      ...PI_DURABLE_INDEXES.map((i) => `index ${PI_DURABLE_PREFIX}${i}`),
+      ...PI_DURABLE_TABLES.map((t) => `table ${PD.qualify(t, "table")}`),
+      ...PI_DURABLE_INDEXES.map((i) => `index ${PD.qualify(i, "index")}`),
     ].sort();
     check(show(added) === show(expected), `opening added ${show(added)}; expected exactly ${show(expected)}`);
     for (const row of before) {
@@ -148,12 +153,12 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
       check(now !== undefined && equal(now, row, false), `${key(row)} changed: ${show(row)} -> ${show(now)}`);
     }
     vitestLikeAssertions.deepEqual(ourTasks(), tasksBefore);
-    const theirs = host.sql.exec(`SELECT count(*) AS n FROM ${PI_DURABLE_PREFIX}tasks`).toArray()[0];
+    const theirs = host.sql.exec(`SELECT count(*) AS n FROM ${PD.qualify("tasks", "table")}`).toArray()[0];
     check(theirs?.n === 1, `pd_tasks holds ${show(theirs)}, expected the one task committed`);
   }));
 
   add("a statement that would create a name not on the list throws, and creates nothing", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host);
+    const db = new PiDurableSqlite(host, PD);
     const before = master(host);
     // `agents` is one of ours; `tasks_tenant` is our index on our `tasks`.
     await vitestLikeAssertions.rejects(db.exec("CREATE TABLE agents (x INTEGER)"), `would create "agents"`);
@@ -166,8 +171,61 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     vitestLikeAssertions.deepEqual(await db.get("SELECT 'tasks' AS v, ? AS w", "entries"), { v: "tasks", w: "entries" });
   }));
 
+  add("a schema-style namespace gets every statement pi-durable runs qualified as pd.<name>", async () => {
+    // A store with real schemas: tables addressed `pd.tasks`; indexes left bare, as Postgres wants
+    // them in CREATE INDEX. Nothing runs against it — Durable Object SQLite has no schemas — so the
+    // statements are the ones pi-durable issued through the prefixed facade during its own suite.
+    const schema: SqlNamespace = { name: "pd", qualify: (o, kind) => (kind === "table" ? `pd.${o}` : o) };
+    const seen = new Set<string>();
+    const recording = (inner: SqliteExecutor): SqliteExecutor => ({
+      exec: (sql) => { seen.add(sql); return inner.exec(sql); },
+      run: (sql, ...p) => { seen.add(sql); return inner.run(sql, ...p); },
+      get: <T extends object>(sql: string, ...p: Parameters<SqliteExecutor["get"]>[1][]) => { seen.add(sql); return inner.get<T>(sql, ...p); },
+      all: <T extends object>(sql: string, ...p: Parameters<SqliteExecutor["all"]>[1][]) => { seen.add(sql); return inner.all<T>(sql, ...p); },
+    });
+    for (const c of createStorageConformance({
+      assertions: vitestLikeAssertions,
+      withStorage: (use) => withHost(async (host) => {
+        const db = new PiDurableSqlite(host, PD);
+        const recorder: SqliteDatabase = {
+          ...recording(db),
+          transaction: (cb) => db.transaction((tx) => cb(recording(tx))),
+          close: () => db.close(),
+        };
+        const storage = await SqliteStorage.open(recorder);
+        try { await use(storage); } finally { await storage.close(context); }
+      }),
+    })) await c.run();
+    check(seen.size >= 40, `only ${seen.size} distinct statements were recorded`);
+
+    for (const sql of seen) {
+      const out = qualifySql(sql, PI_DURABLE_OBJECTS, schema);
+      const code = out.replace(/'(?:[^']|'')*'/g, "''");
+      for (const name of PI_DURABLE_TABLES) {
+        const bare = new RegExp(`(?<![\\w.])${name}\\b`).exec(code);
+        check(bare === null, `"${name}" is left unqualified in: ${out.slice(0, 160)}`);
+      }
+      // The two namespaces must have rewritten the same positions, so the prefixed text is the
+      // schema text with each `pd.<table>` written `pd_<table>`, and nothing else differs.
+      const prefixed = qualifySql(sql, PI_DURABLE_OBJECTS, PD);
+      const fromSchema = qualifySql(sql, PI_DURABLE_OBJECTS, { name: "pd", qualify: (o) => `pd.${o}` })
+        .replace(/\bpd\.(\w+)/g, (_m, o: string) => `pd_${o}`);
+      check(prefixed === fromSchema, `the two namespaces rewrote different positions in: ${sql.slice(0, 160)}`);
+    }
+    const migration = SQLITE_MIGRATIONS[0]!.statements;
+    const one = (s: string | undefined) => qualifySql(s ?? "", PI_DURABLE_OBJECTS, schema).replace(/\s+/g, " ").trim();
+    vitestLikeAssertions.strictEqual(one(migration.find((s) => /CREATE TABLE tasks\b/.test(s))).slice(0, 26), "CREATE TABLE pd.tasks ( id");
+    vitestLikeAssertions.strictEqual(one("CREATE INDEX tasks_by_status ON tasks (status, id)"), "CREATE INDEX tasks_by_status ON pd.tasks (status, id)");
+    vitestLikeAssertions.strictEqual(
+      one("INSERT INTO tasks (id, kind) VALUES (?, 'tasks') ON CONFLICT(id) DO UPDATE SET kind = excluded.kind"),
+      "INSERT INTO pd.tasks (id, kind) VALUES (?, 'tasks') ON CONFLICT(id) DO UPDATE SET kind = excluded.kind",
+    );
+    vitestLikeAssertions.strictEqual(one("SELECT tasks.record FROM tasks WHERE tasks.id = ?"), "SELECT pd.tasks.record FROM pd.tasks WHERE pd.tasks.id = ?");
+    await vitestLikeAssertions.rejects(Promise.resolve().then(() => qualifySql("CREATE TABLE events (x)", PI_DURABLE_OBJECTS, schema)), `would create "events"`);
+  });
+
   add("a transaction that throws after an await leaves no rows, and a write queued meanwhile survives", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host);
+    const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     const boom = new Error("boom");
     const order: string[] = [];
@@ -189,7 +247,7 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
   }));
 
   add("a transaction that commits keeps writes made across awaits, and its handle dies with it", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host);
+    const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     const handle = await db.transaction(async (tx) => {
       await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 300);
@@ -202,7 +260,7 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
   }));
 
   add("bigint binds as the same integer, an unsafe one is refused, and a blob comes back as bytes", () => withHost(async (host) => {
-    const db = new PiDurableSqlite(host);
+    const db = new PiDurableSqlite(host, PD);
     await applySqliteMigrations(db);
     for (const id of [42n, BigInt(Number.MAX_SAFE_INTEGER)]) {
       await db.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", id);

@@ -135,7 +135,7 @@ These are not bugs and must survive an upgrade:
 | the provider has **no non-deferred path** | Cloudflare bills Durable Objects for wall clock with no exemption for network I/O; a completion is ~94% waiting | `test/pi-offload.ts` |
 | `step()` polls only when an answer already exists | pi records what the provider says, and "not ready" is something it said — correct for a batch API, but our provider is a table in the same object, so asking costs a transcript row for nothing | `test/pi-agent.ts` |
 | a `steer` on an idle lane **starts a run** | pi keeps the three gestures separate because its front end is a TUI that knows the lane's state; an HTTP request does not, and the page sends every message as a steer | `test/pi-agent.ts` |
-| pi-durable's SQLite tables and indexes are **renamed to `pd_*`** by our facade, from a fixed list; any other CREATE throws | its schema creates `tasks` with no `IF NOT EXISTS`, and `AgentDO` already has a `tasks` table in the same object (`src/store/durable-object.ts`) — unprefixed, pi-durable's migration fails on an object that has ours, and on one that had pi-durable's first, our `CREATE TABLE IF NOT EXISTS` would silently adopt a table of another shape | `test/pi-durable.ts`, `npm run pi-durable:do` |
+| pi-durable's SQLite tables and indexes are **placed in a namespace** by our facade (`src/store/sql-namespace.ts`), from a fixed list — `pd_tasks` on a Durable Object; any other CREATE throws | its schema creates `tasks` with no `IF NOT EXISTS`, and `AgentDO` already has a `tasks` table in the same object (`src/store/durable-object.ts`) — un-namespaced, pi-durable's migration fails on an object that has ours, and on one that had pi-durable's first, our `CREATE TABLE IF NOT EXISTS` would silently adopt a table of another shape. The namespace is an interface rather than a prefix so a store with real schemas can address them as `pd.tasks` without the facade changing | `test/pi-durable.ts`, `npm run pi-durable:do` |
 
 If an upgrade makes one of these unnecessary, delete it deliberately and strike
 the row — do not leave it as a divergence nobody can explain.
@@ -171,7 +171,7 @@ before the expensive one.
    for the `Storage` contract, and it is upstream's suite rather than ours.
    For pi-durable, `npm run pi-durable` and `npm run pi-durable:do` do the same
    with its suite, plus the facade's own cases; a new migration fails them
-   until the `pd_` list in `src/store/pi-durable-sqlite.ts` is updated.
+   until the list of names in `src/store/pi-durable-sqlite.ts` is updated.
 4. `npm run pi-loop`, `pi-offload`, `pi-tools`, `pi-agent`, `pi-bridge` — the
    behavioural contracts and every divergence above.
 5. Re-diff the copied source in the table in §2.

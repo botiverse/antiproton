@@ -19,14 +19,14 @@
  * (src/store/durable-object.ts). Its migrations say `CREATE TABLE tasks` with no
  * `IF NOT EXISTS`, so in an object that has ours pi-durable fails to open, and
  * in one where pi-durable came first ours would silently adopt its table. Every
- * name pi-durable's schema creates is therefore rewritten to carry `pd_`. The statement set is fixed and small, so
- * the rewrite is an allowlist rather than a pattern: an identifier is renamed
- * only when it is one of the names below, string literals and bound values are
- * never touched, and a statement that would create any name not on the list
- * throws — so an upstream schema change cannot land unprefixed beside our
- * tables, and has to be read before it can land at all.
+ * name pi-durable's schema creates is therefore placed in a namespace handed to
+ * the constructor (src/store/sql-namespace.ts): `pd_tasks` on Durable Object
+ * SQLite, and on a store with real schemas it could be `pd.tasks` with nothing
+ * here changing. The rewrite is an allowlist of the names below, and a
+ * statement that would create any other name throws.
  */
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/pi-durable/storage/sqlite";
+import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
 /** The slice of `ctx.storage` this needs, and all that a test must fake. */
 export type DurableSqlHost = {
@@ -37,12 +37,10 @@ type SqlBinding = string | number | null | Uint8Array;
 /** A Durable Object returns blobs as `ArrayBuffer`; node:sqlite returns `Uint8Array` and may return `bigint`. */
 type SqlCell = string | number | bigint | null | ArrayBuffer | Uint8Array;
 
-export const PI_DURABLE_PREFIX = "pd_";
-
 /**
  * Everything pi-durable's schema creates (`dist/storage/sqlite/migrations.js`):
  * its nine tables, `durable_schema` among them, and their sixteen indexes.
- * Indexes share the table namespace in SQLite, so they are prefixed too.
+ * Indexes share the table namespace in SQLite, so they are namespaced too.
  * Depends on: @earendil-works/pi-durable 1.0.0 — an upgrade that adds a
  * migration fails here (a CREATE of an unlisted name) and in
  * test/spec/pi-durable-spec.ts, which compares this list with the migrations.
@@ -59,141 +57,7 @@ export const PI_DURABLE_INDEXES = [
   "documents_by_address", "documents_by_scope", "documents_by_scope_kind",
   "document_revisions_by_kind",
 ] as const;
-const KNOWN: ReadonlySet<string> = new Set<string>([...PI_DURABLE_TABLES, ...PI_DURABLE_INDEXES]);
-
-/** Words after which the next identifier is the name of something being created. */
-const CREATED_KINDS = new Set(["table", "index", "view", "trigger"]);
-const CREATE_MODIFIERS = new Set(["temp", "temporary", "unique", "virtual", "if", "not", "exists"]);
-
-const isIdentStart = (c: string) => /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 0x80;
-const isIdentPart = (c: string) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 0x80;
-
-const refuse = (why: string, sql: string) =>
-  new Error(`pi-durable SQL refused by the ${PI_DURABLE_PREFIX} prefix facade: ${why}\n  in: ${sql.slice(0, 200)}`);
-
-/**
- * Rewrites pi-durable's own table and index names to carry the prefix.
- *
- * A known name is renamed wherever it stands as a bare identifier, including as
- * the qualifier in `tasks.id`. Three positions are refused rather than guessed
- * at, because in each one the same word could be something the rename must not
- * touch: after `.` (a column, or `main.tasks`), after `AS` (an alias, which
- * would rename a key in the returned row), and in quotes. A `CREATE` of any
- * table, index, view or trigger, or a `RENAME TO`, whose name is not on the
- * list throws.
- */
-export function prefixPiDurableSql(sql: string): string {
-  let out = "";
-  let i = 0;
-  // The last significant token, lowercased: a word, or a single punctuation character.
-  let prev = "";
-  // Set while the next identifier names an object being created or renamed.
-  let naming = false;
-  let creating = false;
-  // The previous identifier was a created name, so a following `.` means it was a schema qualifier.
-  let namedLast = false;
-
-  const identifier = (raw: string, quoted: boolean) => {
-    const lower = raw.toLowerCase();
-    if (naming) {
-      if (!KNOWN.has(lower)) throw refuse(`it would create "${raw}", which is not on the list of pi-durable's schema objects`, sql);
-      naming = false;
-      namedLast = true;
-    } else namedLast = false;
-    if (!KNOWN.has(lower)) return raw;
-    if (quoted) throw refuse(`the quoted identifier "${raw}" names one of pi-durable's objects`, sql);
-    if (prev === ".") throw refuse(`"${raw}" after "." is a column or a schema-qualified name, not a table to rename`, sql);
-    if (prev === "as") throw refuse(`"${raw}" after AS is an alias, and renaming it would rename a row key`, sql);
-    return PI_DURABLE_PREFIX + raw;
-  };
-
-  while (i < sql.length) {
-    const c = sql[i];
-    // String literals and comments are copied untouched: data is never rewritten.
-    if (c === "'") {
-      let j = i + 1;
-      for (;;) {
-        if (j >= sql.length) throw refuse("an unterminated string literal", sql);
-        if (sql[j] === "'") { if (sql[j + 1] === "'") { j += 2; continue; } break; }
-        j++;
-      }
-      out += sql.slice(i, j + 1); i = j + 1; prev = "'"; namedLast = false;
-      continue;
-    }
-    if (c === "-" && sql[i + 1] === "-") {
-      const end = sql.indexOf("\n", i);
-      const j = end === -1 ? sql.length : end;
-      out += sql.slice(i, j); i = j;
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      const end = sql.indexOf("*/", i + 2);
-      if (end === -1) throw refuse("an unterminated comment", sql);
-      out += sql.slice(i, end + 2); i = end + 2;
-      continue;
-    }
-    if (c === '"' || c === "`" || c === "[") {
-      const close = c === "[" ? "]" : c;
-      const end = sql.indexOf(close, i + 1);
-      if (end === -1) throw refuse("an unterminated quoted identifier", sql);
-      out += sql.slice(i, end + 1);
-      identifier(sql.slice(i + 1, end), true);
-      prev = "ident"; i = end + 1;
-      continue;
-    }
-    // Named parameters (`:x`, `@x`, `$x`) and numbers are not identifiers, whatever their letters spell.
-    if ((c === ":" || c === "@" || c === "$") && i + 1 < sql.length && isIdentStart(sql[i + 1])) {
-      let j = i + 1;
-      while (j < sql.length && isIdentPart(sql[j])) j++;
-      out += sql.slice(i, j); i = j; prev = "param"; namedLast = false;
-      continue;
-    }
-    if (/[0-9]/.test(c)) {
-      let j = i + 1;
-      while (j < sql.length && /[0-9A-Za-z_.]/.test(sql[j])) j++;
-      out += sql.slice(i, j); i = j; prev = "number"; namedLast = false;
-      continue;
-    }
-    if (isIdentStart(c)) {
-      let j = i + 1;
-      while (j < sql.length && isIdentPart(sql[j])) j++;
-      const word = sql.slice(i, j);
-      const lower = word.toLowerCase();
-      i = j;
-      if (lower === "create") { creating = true; out += word; prev = lower; namedLast = false; continue; }
-      if (creating && !naming && CREATED_KINDS.has(lower)) { naming = true; creating = false; out += word; prev = lower; continue; }
-      if (naming && CREATE_MODIFIERS.has(lower)) { out += word; prev = lower; continue; }
-      if (creating && CREATE_MODIFIERS.has(lower)) { out += word; prev = lower; continue; }
-      if (lower === "to" && prev === "rename") { naming = true; out += word; prev = lower; continue; }
-      creating = false;
-      out += identifier(word, false);
-      prev = lower;
-      continue;
-    }
-    if (!/\s/.test(c)) {
-      if (c === "." && namedLast) throw refuse("a schema-qualified name in a CREATE or RENAME", sql);
-      namedLast = false;
-      prev = c;
-    }
-    out += c; i++;
-  }
-  if (naming) throw refuse("a CREATE or RENAME with no name", sql);
-  return out;
-}
-
-// The statement set is fixed, so the rewrite is computed once per distinct text. The texts that
-// vary (scans assemble their WHERE from a handful of clauses) are a bounded set too; the cap is
-// only so that a caller that broke that assumption costs memory linearly in nothing.
-const REWRITTEN = new Map<string, string>();
-function rewrite(sql: string): string {
-  let hit = REWRITTEN.get(sql);
-  if (hit === undefined) {
-    hit = prefixPiDurableSql(sql);
-    if (REWRITTEN.size >= 512) REWRITTEN.clear();
-    REWRITTEN.set(sql, hit);
-  }
-  return hit;
-}
+export const PI_DURABLE_OBJECTS: SqlObjects = { tables: PI_DURABLE_TABLES, indexes: PI_DURABLE_INDEXES };
 
 /**
  * The Durable Object binds no `bigint`, and pi-durable's value type allows one. A safe integer is
@@ -212,8 +76,10 @@ function readRow(row: Record<string, SqlCell>): Record<string, SqliteValue> {
   return out;
 }
 
-function query(host: DurableSqlHost, sql: string, params: readonly SqliteValue[]): Array<Record<string, SqliteValue>> {
-  return host.sql.exec(rewrite(sql), ...params.map(bindValue)).toArray().map(readRow);
+type Connection = { host: DurableSqlHost; names: SqlQualifier };
+
+function query(c: Connection, sql: string, params: readonly SqliteValue[]): Array<Record<string, SqliteValue>> {
+  return c.host.sql.exec(c.names.rewrite(sql), ...params.map(bindValue)).toArray().map(readRow);
 }
 
 /**
@@ -243,38 +109,41 @@ class SerialQueue {
 const asRows = <T extends object>(rows: Array<Record<string, SqliteValue>>) => rows as unknown as T[];
 
 class TransactionHandle implements SqliteExecutor {
-  #host: DurableSqlHost;
+  #connection: Connection;
   #active = true;
-  constructor(host: DurableSqlHost) { this.#host = host; }
+  constructor(connection: Connection) { this.#connection = connection; }
   revoke() { this.#active = false; }
 
-  #use<T>(operation: (host: DurableSqlHost) => T): Promise<T> {
+  #use<T>(operation: (connection: Connection) => T): Promise<T> {
     if (!this.#active) return Promise.reject(new Error("SQLite transaction handle is no longer active"));
-    try { return Promise.resolve(operation(this.#host)); } catch (error) { return Promise.reject(error); }
+    try { return Promise.resolve(operation(this.#connection)); } catch (error) { return Promise.reject(error); }
   }
-  exec(sql: string) { return this.#use((h) => { query(h, sql, []); }); }
-  run(sql: string, ...params: SqliteValue[]) { return this.#use((h) => { query(h, sql, params); }); }
-  get<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((h) => asRows<T>(query(h, sql, params))[0]); }
-  all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((h) => asRows<T>(query(h, sql, params))); }
+  exec(sql: string) { return this.#use((c) => { query(c, sql, []); }); }
+  run(sql: string, ...params: SqliteValue[]) { return this.#use((c) => { query(c, sql, params); }); }
+  get<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))[0]); }
+  all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
 }
 
 export class PiDurableSqlite implements SqliteDatabase {
-  #host: DurableSqlHost;
+  #connection: Connection;
   #queue = new SerialQueue();
   #closed = false;
 
-  constructor(host: DurableSqlHost) { this.#host = host; }
+  /** `namespace` places pi-durable's tables: `prefixedNamespace("pd")` on a Durable Object. */
+  constructor(host: DurableSqlHost, namespace: SqlNamespace) {
+    this.#connection = { host, names: new SqlQualifier(PI_DURABLE_OBJECTS, namespace) };
+  }
 
-  #use<T>(operation: (host: DurableSqlHost) => T): Promise<T> {
+  #use<T>(operation: (connection: Connection) => T): Promise<T> {
     return this.#queue.run(() => {
       if (this.#closed) throw new Error("database is closed");
-      return operation(this.#host);
+      return operation(this.#connection);
     });
   }
-  exec(sql: string) { return this.#use((h) => { query(h, sql, []); }); }
-  run(sql: string, ...params: SqliteValue[]) { return this.#use((h) => { query(h, sql, params); }); }
-  get<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((h) => asRows<T>(query(h, sql, params))[0]); }
-  all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((h) => asRows<T>(query(h, sql, params))); }
+  exec(sql: string) { return this.#use((c) => { query(c, sql, []); }); }
+  run(sql: string, ...params: SqliteValue[]) { return this.#use((c) => { query(c, sql, params); }); }
+  get<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))[0]); }
+  all<T extends object>(sql: string, ...params: SqliteValue[]) { return this.#use((c) => asRows<T>(query(c, sql, params))); }
 
   /**
    * The host's transaction rejects with the closure's own error after rolling back. If the rollback
@@ -284,9 +153,9 @@ export class PiDurableSqlite implements SqliteDatabase {
   transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
     return this.#queue.enqueue(async () => {
       if (this.#closed) throw new Error("database is closed");
-      const handle = new TransactionHandle(this.#host);
+      const handle = new TransactionHandle(this.#connection);
       try {
-        return await this.#host.transaction(async () => {
+        return await this.#connection.host.transaction(async () => {
           try { return await callback(handle); } finally { handle.revoke(); }
         });
       } finally { handle.revoke(); }

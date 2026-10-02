@@ -16,7 +16,7 @@ const results = await runPiDurableCases(piDurableCases(async (use) => {
   try { await use(host); } finally { host.dispose(); }
 }));
 
-console.log(`\n  pi-durable Storage conformance + prefix facade — node:sqlite\n  ${"─".repeat(56)}`);
+console.log(`\n  pi-durable Storage conformance + namespace facade — node:sqlite\n  ${"─".repeat(56)}`);
 let group = "";
 for (const r of results) {
   if (r.group !== group) { group = r.group; console.log(`  ${group}`); }

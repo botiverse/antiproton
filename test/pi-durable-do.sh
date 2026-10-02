@@ -23,7 +23,7 @@ if [ -z "$answered" ]; then
 fi
 node -e '
 const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-console.log(`\n  pi-durable Storage conformance + prefix facade — ${r.backend}\n  ${"─".repeat(56)}`);
+console.log(`\n  pi-durable Storage conformance + namespace facade — ${r.backend}\n  ${"─".repeat(56)}`);
 let g = "";
 for (const c of r.results) {
   if (c.group !== g) { g = c.group; console.log(`  ${g}`); }
