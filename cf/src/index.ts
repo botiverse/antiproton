@@ -777,7 +777,10 @@ export class AgentDO extends DurableObject<Env> {
       && this.sql.exec("SELECT 1 FROM owner WHERE k = 'self' AND tenant_id = ? AND agent_id = ?", tenantId, agentId).toArray().length > 0;
     if (!owned) return null;
     this.#claim(tenantId, agentId);
-    return this.#busy("migrateEngine", () => this.runtime().migrateEngine(tenantId, agentId, op, { dryRun }));
+    const run = () => this.runtime().migrateEngine(tenantId, agentId, op, { dryRun });
+    // Nothing else runs in the object while it moves: a message taken by pi085 after its transcript was read would be
+    // in no pd conversation. A dry-run writes nothing and need not hold anything up.
+    return this.#busy("migrateEngine", () => (dryRun ? run() : this.ctx.blockConcurrencyWhile(run)));
   }
 
   /** The binding, credential-free, so an operator can see whose key is in use. */
