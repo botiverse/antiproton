@@ -120,12 +120,14 @@ export function toHourly(rows: readonly UsageRow[]): HourlyRow[] {
 
 /** A model reply's usage, one row per kind of token it counted.
  *
- * `cacheWrite1h` is its own key, not folded into `cache_write`: cache reads
- * and writes are already separate keys because providers price them
- * differently, and a 1-hour cache write is a third price where it exists.
- * Models that never report it (DeepSeek today) drop out at the zero filter,
- * so the key appears only when something measured it — like every other row
- * this function makes.
+ * `cacheWrite1h` is a SUBSET of `cacheWrite`, not a sibling: pi-ai's own
+ * type says "Subset of `cacheWrite` written with 1h retention", and pi's
+ * cost function prices the two parts as `cacheWrite − cacheWrite1h` and
+ * `cacheWrite1h` at a higher rate. So `cache_write` stays the TOTAL and
+ * `cache_write_1h` measures the part of it that carries long retention —
+ * the relation `reasoning` has to `output`. A pricer must NOT add the two
+ * keys (that double-counts the subset); it subtracts the subset and prices
+ * each part, the way pi's own cost function does.
  */
 export function modelTokenRows(
   base: { at: number; tenantId: string; agentId: string },
