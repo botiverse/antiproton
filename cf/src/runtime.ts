@@ -1751,8 +1751,8 @@ export class AgentRuntime {
       // to be a question this file asked about one plugin; the artifacts
       // paragraph is now the artifacts mount's own contribution, so the
       // condition is "the mount is there" and nobody has to check it.
-      // `sandbox` stays: run_js is the harness's, not a mount's. The pd engine offers no tool yet.
-      sandbox: extras.runJs && engine !== "pd",
+      // `sandbox` stays: run_js is the harness's, not a mount's. Both engines offer it.
+      sandbox: extras.runJs,
     });
     const model = {
       provider: binding.provider,
@@ -1768,14 +1768,18 @@ export class AgentRuntime {
     };
 
     if (engine === "pd") {
-      // Mounted tools, run_js, jobs and caller functions are not bridged to pi-durable yet (steps 7 and 8):
-      // this agent is offered no tool, and its prompt says so by leaving the sandbox out.
+      // The same catalogue PiAgent gets, through the same host and the same continuations
+      // (src/runtime/durable-tools.ts), less the caller's functions: those pause the turn through
+      // PiAgent's lane (client-calls.ts) and are step 8's.
       this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
       // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
       await this.#pd.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
       const pd = DurableAgent.open({
         host: this.#pd, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
         unknownJob: (id) => new UnknownJob(id),
+        openSession: (other) => this.agent(tenantId, agentId, other),
+        tools: offered as MountedTool[], toolHost: host, ...(keeping ? { interrupts: keeping } : {}),
+        extraTools: extraTools.filter((t) => !(callerTools as unknown[]).includes(t)) as never,
       });
       this.#agents.set(cacheKey, { agent: pd, builtFrom });
       return pd;

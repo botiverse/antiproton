@@ -30,6 +30,9 @@
  * /durable-agent runs the pd engine's cases (test/spec/durable-agent-spec.ts): DurableAgent over
  * PdHost, a turn through `ap_model_jobs`, parked and reopened, on this object's storage
  * (test/durable-agent-do.sh).
+ *
+ * /pd-tools runs the tool parity cases (test/spec/pd-tools-spec.ts): the same scripted model against
+ * PiAgent and DurableAgent, each over the real gateway on this object's storage (test/pd-tools-do.sh).
  */
 import { DurableObject } from "cloudflare:workers";
 import { createStorageConformance } from "@earendil-works/pi-agent-core/harness/session/testing";
@@ -39,6 +42,7 @@ import { usageCases } from "../../test/spec/usage-spec.ts";
 import { piDurableCases, runPiDurableCases, type PiDurableHost } from "../../test/spec/pi-durable-spec.ts";
 import { apStoreCases } from "../../test/spec/ap-store-spec.ts";
 import { durableDriveCases, runDriveCases } from "../../test/spec/durable-drive-spec.ts";
+import { pdToolsCases } from "../../test/spec/pd-tools-spec.ts";
 import { durableAgentCases } from "../../test/spec/durable-agent-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
@@ -143,6 +147,27 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     };
   }
 
+  async runPdToolsSpec() {
+    const host: PiDurableHost = this.ctx.storage;
+    const t0 = Date.now();
+    const wipe = () => {
+      const names = host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()
+        .map((r) => String(r.name)).filter((n) => !n.startsWith("_cf_") && !n.startsWith("sqlite_"));
+      for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
+    };
+    const results = await runDriveCases(pdToolsCases(async (use) => {
+      wipe();
+      try { await use(host); } finally { wipe(); }
+    }));
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
   async runPiStorageSpec() {
     const sql = (this.ctx.storage as any).sql;
     const t0 = Date.now();
@@ -203,6 +228,9 @@ export default {
     }
     if (new URL(request.url).pathname === "/durable-agent") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("durable-agent")).runDurableAgentSpec());
+    }
+    if (new URL(request.url).pathname === "/pd-tools") {
+      return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-tools")).runPdToolsSpec());
     }
     if (new URL(request.url).pathname === "/ap-store") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("ap-store")).runApStoreSpec());

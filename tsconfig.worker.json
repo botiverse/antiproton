@@ -87,7 +87,9 @@
     "test/mcp-plugin.ts",
     "test/model-queue.ts",
     "test/durable-agent.ts",
-    "test/spec/durable-agent-spec.ts"
+    "test/spec/durable-agent-spec.ts",
+    "test/pd-tools.ts",
+    "test/spec/pd-tools-spec.ts"
   ],
   "exclude": ["node_modules"]
 }

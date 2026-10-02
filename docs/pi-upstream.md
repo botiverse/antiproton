@@ -98,8 +98,9 @@ in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
 pi-durable adds `storage/sqlite` (the `SqliteDatabase` types, and
 `SqliteStorage` in `src/runtime/durable-agent.ts`; its migrations in tests), its root (`Harness`, `LiveDoc`,
 `InboxDoc`, `GenerationTask`, `CompactionTask` and the task and document types,
-in `src/runtime/durable-drive.ts`; `createRegistry` and `ROOT_CONVERSATION_ID`
-in `src/runtime/durable-agent.ts`), `testing` (`createStorageConformance`,
+in `src/runtime/durable-drive.ts`; `createRegistry`, `AgentDoc` and `ROOT_CONVERSATION_ID`
+in `src/runtime/durable-agent.ts`; `defineExtension`, `hook`, `GenerationTask` and the tool
+types in `src/runtime/durable-tools.ts`), `testing` (`createStorageConformance`,
 tests only) and `@earendil-works/chord` (types, and `chord/context` in
 `src/runtime/durable-agent.ts` and tests).
 `pi-ai-1` adds `models` (`createProvider`, `createModels`),
@@ -115,6 +116,7 @@ tests only) and `@earendil-works/chord` (types, and `chord/context` in
 | `emptyUsage`, `addUsage` | `harness/utils/usage.js` | `src/store/pi-storage.ts` |
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
 | the facade's serial operation queue (re-implemented, smaller: a transaction always queues) | pi-durable `storage/sqlite/node.js` (`SerialOperationQueue`) | `src/store/pi-durable-sqlite.ts` |
+| the interrupted-call line (`INTERRUPTION_MARKER`), and the shape of pi-durable's interrupted result | pi-agent-core `harness/runtime/drive/tools.js`; pi-durable `harness/tool.js` (`fromSlot`, `renderDiagnostics`) | `src/runtime/durable-tools.ts` (`PI085_INTERRUPTED`, `pdInterruptedBlock`); `test/pd-tools.ts` reads both installed files |
 
 The usage arithmetic is copied because pi's export map does not publish it. The
 scan semantics are re-implemented against a reference we can read; pi's own
@@ -146,6 +148,25 @@ Nothing imports these. Nothing types them. Everything rests on them:
 
 Each has a test. That is deliberate: an upgrade that quietly changes one of
 these should fail here, not on a tenant.
+
+On pi-durable, the tools (`src/runtime/durable-tools.ts`, the pi085 tool objects
+wrapped) rest on these, each read in 1.0.0's `dist` and covered by
+`test/pd-tools.ts` and `npm run pd-tools:do`:
+
+- `ToolRegistration.replay` is decided at recovery: an `unsafe` call whose
+  intent was recorded is not run again and gets an error result
+  (`harness/tool.js`, the `execute` phase); a `safe` one is run again.
+- `close()` aborts a running tool's context **and waits for `execute()` to
+  return**; the wrapper stops waiting on abort so a close is not as long as a
+  gateway call.
+- One `executionMode: "sequential"` tool makes its whole round sequential
+  (`harness/generation.js`, `startToolRound`). pi-agent-core 0.85's harness
+  does not read the field at all.
+- A conversation's stored `extensions` array selects exactly the installed
+  extensions it names and silently skips a missing one; an unset selection is
+  every installed extension (`harness/agent.js`, `selectExtensions`).
+- A round's tool results are stored in completion order and sent to the model
+  in call order.
 
 #### On pi-durable: parking replaces `drive()` returning `waiting`
 
@@ -262,7 +283,9 @@ before the expensive one.
    with its suite, plus the facade's own cases; a new migration fails them
    until the list of names in `src/store/pi-durable-sqlite.ts` is updated.
    Then `npm run durable-drive` and `npm run durable-drive:do`, the park
-   contract above; bump `pi-ai-1` together with pi-durable's pi-ai.
+   contract above; bump `pi-ai-1` together with pi-durable's pi-ai. Then
+   `npm run pd-tools` and `npm run pd-tools:do`: the tool contracts above, and
+   the same model against both engines.
 4. `npm run pi-loop`, `pi-offload`, `pi-tools`, `pi-agent`, `pi-bridge` — the
    behavioural contracts and every divergence above.
 5. Re-diff the copied source in the table in §2.
