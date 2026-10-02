@@ -100,6 +100,7 @@
     "test/spec/pd-compaction-spec.ts",
     "test/pd-writes.ts",
     "test/spec/pd-writes-spec.ts",
-    "test/usage-flush.ts"
+    "test/usage-flush.ts",
+    "test/bench-pd.ts"
   ]
 }

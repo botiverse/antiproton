@@ -190,14 +190,14 @@ export class PdHost {
   /**
    * One agent per object, the invariant AgentDO rests on (cf/src/index.ts, `benchStart`): the
    * provider's port is not told which conversation a job belongs to, so a job's dispatch can name
-   * only the one agent the object serves. A bench object that hosts each task's agent in turn is
-   * the one exception, and making pd serve it is the bench wiring's.
+   * only the one agent the object serves. The bench keeps it too: a pd bench task runs in an object
+   * of its own (cf/src/bench.ts `chooseBenchEngine`, bench/objects.ts), never in one a task used before.
    */
   bind(binding: PdBinding): void {
     const was = this.#binding;
     if (was && (was.tenantId !== binding.tenantId || was.agentId !== binding.agentId)) {
       throw new Error(`the pd engine serves one agent per object: this one is ${was.tenantId}/${was.agentId}, ` +
-        `not ${binding.tenantId}/${binding.agentId} (an object reused across agents is not supported yet, step 10)`);
+        `not ${binding.tenantId}/${binding.agentId} (a pd object never changes agent)`);
     }
     this.#binding = binding;
     // Registered again on every bind: the binding's model is the truth, as PiAgent's `open` treats it.

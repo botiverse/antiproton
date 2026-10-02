@@ -53,7 +53,7 @@ import type { MountReports } from "./mount-reports.ts";
 import { worthReporting } from "./mount-reports.ts";
 export type { MountReports };
 import { qualifyMountedTools } from "../../src/runtime/pi-tools.ts";
-import { BenchState } from "./bench.ts";
+import { BenchState, chooseBenchEngine, type BenchEngine } from "./bench.ts";
 import {
   resolveViewer,
   programmaticAccess,
@@ -878,6 +878,12 @@ export class AgentDO extends DurableObject<Env> {
       "INSERT INTO bench_config(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", k, v);
   }
 
+  /** The task's engine, recorded before its agent is first built (cf/src/bench.ts `chooseBenchEngine`). */
+  #takeBenchEngine(engine: unknown): BenchEngine {
+    const owner = this.sql.exec("SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
+    return chooseBenchEngine(this.ctx.storage as any, engine, owner?.agent_id ? String(owner.agent_id) : null);
+  }
+
   /** A bench task's transcript is cleared and its owner row rewritten; shared
    *  by both benchmarks. See benchStart for why each is needed. */
   #takeBenchAgent(agentId: string) {
@@ -901,11 +907,12 @@ export class AgentDO extends DurableObject<Env> {
    */
   async benchSweStart(taskId: string, o: {
     policy: string; image: string; workdir?: string; shape?: string; timeoutMs?: number;
-    shell?: string; shellPrefix?: string; offload?: boolean; network?: "open" | "none";
+    shell?: string; shellPrefix?: string; offload?: boolean; network?: "open" | "none"; engine?: string;
   }) {
     await this.setOffload(o.offload !== false);
     return this.#busy("benchSweStart", async () => {
       const agentId = `b_${taskId}`;
+      const engine = this.#takeBenchEngine(o.engine);
       this.#setBenchConfig("mode", "swe");
       this.#setBenchConfig("policy", o.policy);
       this.#benchRuntime = null;
@@ -942,7 +949,7 @@ export class AgentDO extends DurableObject<Env> {
         },
         secretRef: OPERATOR_RUN9_REF, policy: null,
       });
-      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe", network: o.network ?? "none" };
+      return { taskId, agentId, offload: this.#offloadOn(), mode: "swe", network: o.network ?? "none", engine };
     });
   }
 
@@ -1007,9 +1014,10 @@ export class AgentDO extends DurableObject<Env> {
     return { taskId, usage, byTool, modelTurns, toolTurns, toolErrors, entries: entries.length, meter };
   }
 
-  async benchStart(taskId: string, policy: string, offload: boolean) {
+  async benchStart(taskId: string, policy: string, offload: boolean, engine?: string) {
     await this.setOffload(offload);
     return this.#busy("benchStart", async () => {
+      const chosen = this.#takeBenchEngine(engine);
       this.sql.exec(
         "INSERT INTO bench_config(k,v) VALUES ('policy',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", policy);
       const agentId = `b_${taskId}`;
@@ -1026,6 +1034,9 @@ export class AgentDO extends DurableObject<Env> {
       // agent was answering a customer from six conversations ago — 821k tokens
       // for an eight-turn task, and four failures scored against a harness that
       // was working exactly as designed.
+      //
+      // That is pi085's shape only. A pd task never shares an object, so there is
+      // nothing of pi-durable's to clear: `#takeBenchEngine` refused a used one.
       this.#clearTranscript();
       const rt = this.#benchRt(policy);
       // The alarm is what advances a run, and it asks the object who it serves.
@@ -1047,7 +1058,7 @@ export class AgentDO extends DurableObject<Env> {
         { alias: "tools", plugin: "tools", account: "builtin" },
         { alias: "retail", plugin: "retail", account: "benchmark" },
       ], { chosen: true });
-      return { taskId, agentId, offload: this.#offloadOn() };
+      return { taskId, agentId, offload: this.#offloadOn(), engine: chosen };
     });
   }
 
@@ -1100,8 +1111,9 @@ export class AgentDO extends DurableObject<Env> {
     const rt = this.#activeRuntime();
     await rt.ready();
     const who = await this.owner();
+    // A pd object's jobs are in `ap_model_jobs` (src/store/ap-store.ts).
     const jobs = this.sql.exec(
-      "SELECT id, created_at, answered_at FROM pi_model_jobs ORDER BY created_at DESC LIMIT 10")
+      `SELECT id, created_at, answered_at FROM ${isPd(this.sql) ? "ap_model_jobs" : "pi_model_jobs"} ORDER BY created_at DESC LIMIT 10`)
       .toArray();
     let execution: unknown = null;
     if (who) {
@@ -1184,12 +1196,19 @@ export class AgentDO extends DurableObject<Env> {
         };
       } catch { return { archived: [] }; }
     }
+    const agentId = this.#benchAgentId(taskId);
     try {
       const rows = this.sql.exec(
-        "SELECT body FROM bench_archive WHERE agent_id=? ORDER BY seq ASC", this.#benchAgentId(taskId))
+        "SELECT body FROM bench_archive WHERE agent_id=? ORDER BY seq ASC", agentId)
         .toArray() as any[];
-      return { taskId, entries: entriesToEvents(rows.map((r) => JSON.parse(r.body))) };
-    } catch { return { taskId, entries: [] }; }
+      if (rows.length) return { taskId, entries: entriesToEvents(rows.map((r) => JSON.parse(r.body))) };
+    } catch { /* nothing archived here */ }
+    // A task on an object of its own (every pd task, bench/objects.ts) is never archived: nothing
+    // replaces it, so its transcript is still the live one.
+    if ((await this.owner())?.agentId === agentId) {
+      return { taskId, entries: entriesToEvents(await (await this.#activeRuntime().agent("bench", agentId)).entries({ order: "asc" })) };
+    }
+    return { taskId, entries: [] };
   }
 
   async benchResult(taskId: string) {
@@ -3407,7 +3426,8 @@ async function route(request: Request, env: Env): Promise<Response> {
           const g = await guardSpending(request, env);
           if (g) return g;
           const b = (await request.json()) as any;
-          return Response.json(await stub.benchStart(String(b.taskId), String(b.policy ?? ""), b.offload !== false));
+          return Response.json(await stub.benchStart(String(b.taskId), String(b.policy ?? ""), b.offload !== false,
+            b.engine === undefined ? undefined : String(b.engine)));
         }
         case "/bench/say": {
           const g = await guardSpending(request, env);
