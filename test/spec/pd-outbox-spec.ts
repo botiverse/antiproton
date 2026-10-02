@@ -26,7 +26,7 @@ import { pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
 import { UnknownJob } from "../../cf/src/model-queue.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 
-const POLL = { firstMs: 200, maxMs: 800 };
+const POLL_MS = 200;
 const MODEL = { provider: "queue", id: "m1", contextWindow: 100_000 };
 const OWNER = { tenantId: "t", agentId: "a" };
 const PROMPT = "You are a terse test assistant.";
@@ -68,7 +68,7 @@ type Fault = (writes: readonly StorageWrite[]) => void;
 function pdObject(storage: DurableSqlHost, extra: { commitFault?: Fault; dispatch?: (id: string) => Promise<void> } = {}) {
   const dispatched: string[] = [];
   const host = new PdHost({
-    storage, poll: POLL, minParkMs: 1,
+    storage, pollAfterMs: POLL_MS, minParkMs: 1,
     ...(extra.commitFault ? { commitFault: extra.commitFault } : {}),
   });
   const agent = DurableAgent.open({

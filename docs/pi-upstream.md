@@ -215,7 +215,7 @@ rests on:
   the task's invocation is inside `runtime.sleep`. It also calls
   `HarnessOptions.onSleep` when a sleep starts, for a task that works without
   committing and then sleeps — no commit brings the read that would see it.
-  `PdHost` does not wire it: its harness runs only pi-durable's poll and retry
+  `settle` does not need it: its harness runs only pi-durable's poll and retry
   sleeps (its registry holds tool extensions, and a tool cannot sleep), each the
   first act after its checkpoint's commit, and the read that commit brings sees
   the sleep; `test/spec/durable-agent-spec.ts` fails if a park waits for the
@@ -226,6 +226,23 @@ rests on:
   which is the clock the park decision must read.
 - Input submitted while a run holds the conversation waits in `pi.inbox` for
   the run's next boundary, and does not wake the sleeper.
+- What wakes a poll sleeper early is the delivered answer. 1.0.0 has no way to
+  end a sleep before its time, so the vendored scheduler adds
+  `Harness.wake(taskIds)`: a task inside `runtime.sleep` returns from it at
+  once, and a live task with no invocation yet keeps the wake for its first
+  sleep. A task running but not sleeping is not woken: a kept wake would end
+  whatever sleep came next, such as a retry's backoff after an error answer.
+  `PdHost` calls it for every task whose `poll` checkpoint names a job that has
+  its answer (`#wakeAnswered`, read from `ap_model_jobs`, not remembered): in
+  `deliver` when the harness is open, in every `drive` before `resume()`, so
+  the step the delivery asks of a parked object (cf/src/index.ts
+  `deliverAnswer`, as on pi085) reads the answer at once, and from the harness's
+  `onSleep` when a poll starts sleeping, for an answer that landed while the
+  poll was fetching. A wake that comes too early costs one fetch, which commits
+  a new `pollAt` (the contract above). The handle's `pollAfterMs` is then only
+  the backstop for a lost wake: `POLL_BACKSTOP_MS`, 5 min, the same for every
+  poll. While a job is out, a park comes back by its redelivery time
+  (`REDELIVERY_MS`, 2 min) anyway, for the sweep that resends a lost dispatch.
 
 The park predicate, `parkVerdict`, says "park" only when all of these hold:
 every live task is a sleeper or `waiting` on other tasks; every sleeper is
@@ -360,8 +377,8 @@ Prefer not to. If it is necessary, it is allowed, but:
 
 | vendored file | upstream path | taken from | why | upstream link |
 |---|---|---|---|---|
-| `src/vendor/pi/pi-durable/dist/harness/scheduler.js` | `@earendil-works/pi-durable/dist/harness/scheduler.js` | pi-durable 1.0.0 (npm) | `#sleep` records its wake time and calls a new `onSleep` option; `inspect()` reports a sleeping task as `{ kind: "running", sleepingUntil }`. Without it a host cannot tell "only sleeping" from "working", and `settle` (src/runtime/durable-drive.ts) inferred it from checkpoint phases | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
-| `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, and imports the vendored scheduler: the package's harness imports its own | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
+| `src/vendor/pi/pi-durable/dist/harness/scheduler.js` | `@earendil-works/pi-durable/dist/harness/scheduler.js` | pi-durable 1.0.0 (npm) | `#sleep` records its wake time and calls a new `onSleep` option; `inspect()` reports a sleeping task as `{ kind: "running", sleepingUntil }`. Without it a host cannot tell "only sleeping" from "working", and `settle` (src/runtime/durable-drive.ts) inferred it from checkpoint phases. A new `wake(taskIds)` ends the tasks' sleeps now (or their next one), through a resolver `delay` hands out beside its abort: without it a delivered answer waited for the checkpoint's `pollAt` | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
+| `src/vendor/pi/pi-durable/dist/harness/harness.js` | `@earendil-works/pi-durable/dist/harness/harness.js` | pi-durable 1.0.0 (npm) | passes `HarnessOptions.onSleep` to the scheduler, adds `Harness.wake` (the scheduler's), and imports the vendored scheduler: the package's harness imports its own | [pi#10325](https://github.com/earendil-works/pi/issues/10325) |
 | `src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js` | `@earendil-works/pi-durable/dist/storage/sqlite/storage.js` | pi-durable 1.0.0 (npm) | `commit` (and `document`'s read) run in the facade's `transactionSync` with every statement synchronous, instead of an async `transaction` that awaits between statements: on a Durable Object that one is a savepoint any `sql.exec` issued meanwhile joins, and rolls back with. Same statements, order and errors. `open` also takes `{ onCommit }`, which `commit` calls inside that transaction before applying the batch, so our usage, trace and job rows commit or roll back with pi-durable's state (`src/runtime/pd-outbox.ts`) | none yet: a draft asks for an optional synchronous transaction on `SqliteDatabase` |
 | `src/vendor/pi/pi-durable/dist/storage/sqlite/migrations.js` | `@earendil-works/pi-durable/dist/storage/sqlite/migrations.js` | pi-durable 1.0.0 (npm) | `applySqliteMigrations` runs in `transactionSync` too, so no pi-durable transaction spans an await; the schema is the package's (`test/pi-vendor.ts` compares them) | as above |
 

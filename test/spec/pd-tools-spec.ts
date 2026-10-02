@@ -213,7 +213,7 @@ async function pi085(storage: DurableSqlHost, w: World): Promise<Engine> {
 
 function pd(storage: DurableSqlHost, w: World, opts: { stepDeadlineMs?: number; openSession?: (s: string) => Promise<unknown>; session?: string } = {}): Engine {
   const dispatched: string[] = [];
-  const host = new PdHost({ storage, poll: { firstMs: 20, maxMs: 40 }, minParkMs: 1, ...(opts.stepDeadlineMs ? { stepDeadlineMs: opts.stepDeadlineMs } : {}) });
+  const host = new PdHost({ storage, pollAfterMs: 20, minParkMs: 1, ...(opts.stepDeadlineMs ? { stepDeadlineMs: opts.stepDeadlineMs } : {}) });
   const agent = DurableAgent.open({
     host, tenantId: "t", agentId: "a", model: MODEL, systemPrompt: SYSTEM,
     dispatch: async (id) => { dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),

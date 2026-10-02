@@ -7,8 +7,8 @@
  * taken from, and this fails as soon as the installed file differs — an upgrade has to re-take the file
  * and re-apply the change, not run the old copy against new neighbours.
  *
- * Then the patches themselves: the vendored Harness reports a sleeping task and the package's own does not
- * (the control), and the vendored SqliteStorage never opens an asynchronous transaction where the package's
+ * Then the patches themselves: the vendored Harness reports a sleeping task, and ends a sleep on `wake()`, and
+ * the package's own does neither (the control), and the vendored SqliteStorage never opens an asynchronous transaction where the package's
  * does (the control); and nothing in the repo opens the package's Harness or SqliteStorage, which would run
  * without the patch.
  */
@@ -315,6 +315,99 @@ add("the vendored Harness: once a sleep is aborted, inspect() reports plain runn
   const { during, after } = await sleepThenAfter("abort");
   check(during !== undefined, "control: the sleep was never reported");
   check(show(after) === show({ kind: "running" }), `after the aborted sleep inspect said ${show(after)}`);
+});
+
+/** Resolve with how long `p` took, or reject after `ms`: a woken nap must not wait for its 60 s. */
+async function within<T>(ms: number, p: Promise<T>): Promise<number> {
+  const t0 = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([p, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`not done within ${ms} ms`)), ms); })]);
+    return Date.now() - t0;
+  } finally { clearTimeout(timer); }
+}
+
+add("the vendored Harness: wake() ends a sleep in progress, and the task goes on at once", async () => {
+  const sleeps: SleepNotice[] = [];
+  const { h, taskId, inspection } = await napping(Harness.open, sleeps);
+  try {
+    check((inspection.tasks[0]?.state as { sleepingUntil?: number }).sleepingUntil !== undefined, "control: the nap was not asleep");
+    h.wake([taskId]);
+    const ms = await within(2_000, h.waitForTask(taskId, bg));
+    check(ms < 1_000, `the woken task took ${ms} ms`);
+    check(timers() === 0, `live timers after the woken sleep: ${timers()}`);
+  } finally { await h.close(bg); }
+});
+
+add("the vendored Harness: a wake asked before the sleep starts is kept, and the next sleep returns at once", async () => {
+  const registry = createRegistry();
+  registry.install(defineExtension({ name: "vendor-test", tasks: [Nap] }));
+  const h = await Harness.open(new MemoryStorage(), { models: createModels(), registry }, bg);
+  try {
+    napUntil = Date.now() + 60_000;
+    const root = await h.root(bg);
+    const taskId = await root.commit((tx) => tx.createTask(Nap, {}, { ownership: { kind: "conversation" } }), bg);
+    // Not resumed yet: no invocation, so the wake is kept for the task. An id that is no live task is ignored.
+    h.wake([taskId, "no-such-task" as unknown as typeof taskId]);
+    h.resume();
+    const ms = await within(2_000, h.waitForTask(taskId, bg));
+    check(ms < 1_000, `the pre-woken task took ${ms} ms`);
+  } finally { await h.close(bg); }
+});
+
+add("the vendored Harness: a wake for another task leaves a sleep alone", async () => {
+  const { h, taskId } = await napping(Harness.open, []);
+  try {
+    h.wake(["no-such-task" as unknown as typeof taskId]);
+    await new Promise((r) => setTimeout(r, 50));
+    const state = (await h.inspect(bg)).tasks[0]?.state as { sleepingUntil?: number } | undefined;
+    check(state?.sleepingUntil !== undefined, `the nap stopped sleeping: ${show(state)}`);
+  } finally { await h.close(bg); }
+});
+
+/** A task that runs (waits on `busyGate`) before it sleeps a minute: a wake while it runs is not one for that sleep. */
+let busyGate: Promise<void> = Promise.resolve();
+let busyRunning: () => void = () => {};
+const Busy = defineTask<Record<string, never>, { phase: "busy" }, null>({
+  name: "vendor-test.busy", version: 1, initial: () => ({ phase: "busy" }),
+  phases: {
+    busy: async (_task, runtime, context) => {
+      busyRunning();
+      await busyGate;
+      await runtime.sleep(Date.now() + 60_000, context);
+      await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+    },
+  },
+  abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
+});
+
+add("the vendored Harness: a wake for a task that runs but does not sleep is not kept for its next sleep", async () => {
+  const registry = createRegistry();
+  registry.install(defineExtension({ name: "vendor-test", tasks: [Busy] }));
+  const h = await Harness.open(new MemoryStorage(), { models: createModels(), registry }, bg);
+  let open!: () => void;
+  busyGate = new Promise<void>((r) => { open = r; });
+  const running = new Promise<void>((r) => { busyRunning = r; });
+  try {
+    const root = await h.root(bg);
+    const taskId = await root.commit((tx) => tx.createTask(Busy, {}, { ownership: { kind: "conversation" } }), bg);
+    h.resume();
+    await running;
+    h.wake([taskId]);
+    open();
+    let state: { sleepingUntil?: number } | undefined;
+    for (let i = 0; i < 100 && state?.sleepingUntil === undefined; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+      state = (await h.inspect(bg)).tasks[0]?.state as { sleepingUntil?: number } | undefined;
+    }
+    check(state?.sleepingUntil !== undefined, `the sleep after the wake did not wait: ${show(state)}`);
+  } finally { open(); await h.close(bg); }
+});
+
+add("the control: pi-durable's own Harness has no wake", async () => {
+  const { h } = await napping(UpstreamHarness.open as typeof Harness.open, []);
+  try { check(typeof (h as { wake?: unknown }).wake === "undefined", "upstream's Harness has a wake: re-check the patch"); }
+  finally { await h.close(bg); }
 });
 
 let passed = 0;
