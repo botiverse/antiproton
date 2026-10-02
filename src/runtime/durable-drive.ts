@@ -72,13 +72,19 @@ function sleepOf(kind: string, checkpoint: JsonValue | undefined): Omit<Sleeper,
  * - at least one live task, and every live task either a sleeper or parked
  *   `waiting` on other tasks (which runs no code until they settle);
  * - every sleeper reserved (`running`, with a running invocation), not abort-marked,
- *   and its wake time at least `minParkMs` (>= 1) after `now` — strictly in the future;
+ *   and its wake time at least `minParkMs` (default 1000, never below 1) after `now` — strictly in the future;
  * - in every conversation involved, no committed partial of a streaming response and
  *   no tool slot that is not done;
  * - queued input only where a run already holds the conversation: it waits for that
  *   run's next boundary. Queued input with no run would start one, so it is work.
  */
-export function parkVerdict(snapshot: DriveSnapshot, minParkMs = 1): ParkVerdict {
+/**
+ * A park shorter than this saves almost nothing and risks closing the harness mid-fetch (the alarm
+ * fires as the sleep would have ended), so by default a sleeper due sooner is waited for in-process.
+ */
+export const DEFAULT_MIN_PARK_MS = 1_000;
+
+export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PARK_MS): ParkVerdict {
   const { now, inspection, docs } = snapshot;
   const margin = Math.max(1, minParkMs);
   const wait = (reason: string): ParkVerdict => ({ verdict: "wait", reason });
@@ -152,7 +158,7 @@ export type SettleOptions = {
   readonly context: Context;
   /** The harness's clock (`HarnessOptions.now`); the verdict must read the clock the sleeps use. */
   readonly now?: () => number;
-  /** A sleeper due sooner than this is waited for in-process instead of parked. Default 1: strictly ahead. */
+  /** A sleeper due sooner than this is waited for in-process instead of parked. Default `DEFAULT_MIN_PARK_MS`. */
   readonly minParkMs?: number;
   /** Give up after this long and return `timeout` without closing. */
   readonly deadlineMs?: number;

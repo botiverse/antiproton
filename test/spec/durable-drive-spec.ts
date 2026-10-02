@@ -24,7 +24,7 @@ import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type ModelJobRequest } from "../../src/model/durable-offloaded.ts";
 import { fromResponse, errorMessage, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "../../src/model/types.ts";
-import { parkVerdict, readSnapshot, settle, type ParkVerdict, type SettleResult } from "../../src/runtime/durable-drive.ts";
+import { DEFAULT_MIN_PARK_MS, parkVerdict, readSnapshot, settle, type ParkVerdict, type SettleResult } from "../../src/runtime/durable-drive.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 
@@ -116,7 +116,7 @@ function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimer
   /** Each verdict, with the live timers at that moment where they can be counted. */
   const verdicts: Array<{ verdict: ParkVerdict; timers?: number }> = [];
   const drive = (h: Harness): Promise<SettleResult> =>
-    settle(h, { context: bg, deadlineMs: 10_000, onVerdict: (verdict) => verdicts.push({ verdict, ...(activeTimers ? { timers: activeTimers() } : {}) }) });
+    settle(h, { context: bg, deadlineMs: 10_000, minParkMs: 1, onVerdict: (verdict) => verdicts.push({ verdict, ...(activeTimers ? { timers: activeTimers() } : {}) }) });
   /** What an alarm does: open, resume, settle. */
   const wake = async () => { const h = await open(); h.resume(); return drive(h); };
   /** What a request does: open, submit, settle. */
@@ -283,19 +283,22 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     let snapshot;
     for (let i = 0; i < 200 && !snapshot; i++) {
       const s = await readSnapshot(h, bg, Date.now);
-      if (s && parkVerdict(s).verdict === "park") snapshot = s;
+      if (s && parkVerdict(s, 1).verdict === "park") snapshot = s;
       else await sleep(5);
     }
     await h.close(bg);
     check(snapshot, "never reached a parkable state");
-    const v = parkVerdict(snapshot);
+    const v = parkVerdict(snapshot, 1);
     check(v.verdict === "park", show(v));
     const T = v.until;
-    const at = (now: number) => parkVerdict({ ...snapshot, now }).verdict;
+    const at = (now: number) => parkVerdict({ ...snapshot, now }, 1).verdict;
     check(at(T - 1) === "park", `now = T-1: ${at(T - 1)}`);
     check(at(T) === "wait", `now = T: ${at(T)} — a sleeper due now is about to fetch`);
     check(at(T + 1) === "wait", `now = T+1: ${at(T + 1)} — a past T parks into a loop`);
     check(parkVerdict({ ...snapshot, now: T - 50 }, 100).verdict === "wait", "minParkMs not honoured");
+    // The production default: a sleeper due in under a second is not parked.
+    check(parkVerdict({ ...snapshot, now: T - (DEFAULT_MIN_PARK_MS - 1) }).verdict === "wait", "default parked a sleeper due in < 1000 ms");
+    check(parkVerdict({ ...snapshot, now: T - DEFAULT_MIN_PARK_MS }).verdict === "park", "default refused a sleeper due in 1000 ms");
   });
 
   add("verdict", "queued input with no run is work; with a run holding the conversation it waits for the boundary", async (host) => {
@@ -306,7 +309,7 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     let snapshot;
     for (let i = 0; i < 200 && !snapshot; i++) {
       const s = await readSnapshot(h, bg, Date.now);
-      if (s && parkVerdict(s).verdict === "park") snapshot = s;
+      if (s && parkVerdict(s, 1).verdict === "park") snapshot = s;
       else await sleep(5);
     }
     await h.close(bg);
@@ -314,17 +317,17 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     const [id, docs] = [...snapshot.docs][0]!;
     const item = { id: snapshot.inspection.submissions[0]!.id, mode: "steer" as const, content: "later" };
     const withInbox = new Map([[id, { ...docs, inbox: { items: [item] } }]]);
-    check(parkVerdict({ ...snapshot, docs: withInbox }).verdict === "park", "queued input behind a sleeping run should park");
+    check(parkVerdict({ ...snapshot, docs: withInbox }, 1).verdict === "park", "queued input behind a sleeping run should park");
     const noRun = new Map([[id, { inbox: { items: [item] }, live: { ...docs.live, run: undefined } }]]);
-    check(parkVerdict({ ...snapshot, docs: noRun }).verdict === "wait", "queued input with no run must not park");
+    check(parkVerdict({ ...snapshot, docs: noRun }, 1).verdict === "wait", "queued input with no run must not park");
     const partial = {
       role: "assistant" as const, content: [], api: "offloaded", provider: PROVIDER, model: MODEL, stopReason: "pending" as const, timestamp: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     };
     const streaming = new Map([[id, { ...docs, live: { ...docs.live, generation: { attempt: 1, message: partial } } }]]);
-    check(parkVerdict({ ...snapshot, docs: streaming }).verdict === "wait", "a committed partial must not park");
+    check(parkVerdict({ ...snapshot, docs: streaming }, 1).verdict === "wait", "a committed partial must not park");
     const toolRunning = new Map([[id, { ...docs, live: { ...docs.live, tools: [{ callId: "c1", name: "count", status: "running" as const }] } }]]);
-    check(parkVerdict({ ...snapshot, docs: toolRunning }).verdict === "wait", "a running tool slot must not park");
+    check(parkVerdict({ ...snapshot, docs: toolRunning }, 1).verdict === "wait", "a running tool slot must not park");
     const empty = { ...snapshot, inspection: { ...snapshot.inspection, tasks: [], submissions: [] }, docs: new Map() };
     check(parkVerdict(empty).verdict === "idle", "nothing live should be idle");
   });

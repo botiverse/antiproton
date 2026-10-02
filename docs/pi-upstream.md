@@ -162,7 +162,7 @@ rests on:
 The park predicate, `parkVerdict`, says "park" only when all of these hold:
 every live task is a sleeper or `waiting` on other tasks; every sleeper is
 `running`, not abort-marked, and its T is **strictly after now** (by at least
-`minParkMs`, default 1); no conversation involved has a committed streaming
+`minParkMs`, default 1000 — a shorter park saves almost nothing and risks closing mid-fetch); no conversation involved has a committed streaming
 partial or a tool slot that is not done; and queued input exists only where a
 run already holds its conversation. T is the earliest sleeper's. The strict
 comparison is the one that matters: a task whose `pollAt` has passed is

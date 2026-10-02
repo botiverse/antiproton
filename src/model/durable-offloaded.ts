@@ -80,6 +80,10 @@ const notSystem = (m: Message): boolean => m.role !== "system";
  * The transcript in the shape the queue consumer reads: the current system
  * prompt and tools as fields, every non-system message in order. Fields are
  * omitted when empty, as the 0.85 harness omitted them.
+ *
+ * Lossy: a later system message loses its position — it is replayed into the leading prompt —
+ * because the job wire format has no slot for a mid-conversation system message. Carrying it
+ * is a phase-3 change to the format and its consumer.
  */
 export function jobContext(context: TranscriptContext): Context {
   const systemPrompt = getCurrentSystemPrompt(context.messages);
