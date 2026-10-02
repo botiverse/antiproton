@@ -1444,21 +1444,22 @@ export function machinesList(
 }
 
 /**
- * The states in which run9 says a box is awake. Its docs (run.sys9.ai/docs/box, read 2026-10-02):
- * "ready: the box exists, but it is not awake yet. idle: the box is awake and waiting for the next exec
- * or file transfer. running: an exec or file transfer is active." and "Boxes wake when used and can
- * sleep when idle." (docs/execute-commands: "The box wakes for the command. When it is idle, run9 can
- * let it sleep."). So `idle` and `running` are awake; `ready`, anything else, or a state this code has
- * never seen is not.
+ * The states in which run9 says a box is awake. Its docs (https://run.sys9.ai/docs/box, read
+ * 2026-10-02): "ready: the box exists, but it is not awake yet. idle: the box is awake and waiting
+ * for the next exec or file transfer. running: an exec or file transfer is active." and "Boxes wake
+ * when used and can sleep when idle." (https://run.sys9.ai/docs/execute-commands: "The box wakes for
+ * the command. When it is idle, run9 can let it sleep."). So `idle` and `running` are awake;
+ * `ready`, anything else, or a state this code has never seen is not.
  *
  * **What this cannot close.** run9 sleeps an idle box on its own schedule, which nothing here can
  * hold off, so a box listed `idle` may go to sleep in the one round trip before the read's command
  * reaches it, and that command then wakes it. Our own release cannot land there (the mount's lock
- * covers the check and the start), only run9's sleep can. run9 documents file reads that never wake a
- * box (docs/file-transfer: "These commands do not start a transfer job or wake a stopped box", for
- * `sys9 run box file ls/stat/cat`), but the HTTP API behind them is not in its swagger
- * (api.run.sys9.ai/swagger.yaml has only `files/download` and `files/upload`, and a `file_access_url`
- * field without a protocol), so it is not used until it is documented or measured.
+ * covers the check and the start), only run9's sleep can. run9 documents file reads that never wake
+ * a box (https://run.sys9.ai/docs/file-transfer: "These commands do not start a transfer job or wake
+ * a stopped box", for `sys9 run box file ls/stat/cat`), but the HTTP API behind them is not in its
+ * swagger (https://api.run.sys9.ai/swagger.yaml, read 2026-10-02, has only `files/download` and
+ * `files/upload`, and a `file_access_url` field without a protocol), so it is not used until it is
+ * documented or measured.
  */
 export const AWAKE_STATES: readonly string[] = ["idle", "running"];
 
