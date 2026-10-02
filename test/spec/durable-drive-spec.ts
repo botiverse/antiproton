@@ -17,8 +17,7 @@
 import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
-  createRegistry, defineExtension, defineTask, defineTool, section, Harness, type HarnessOptions, type HarnessSettings,
-  type TaskInspection,
+  createRegistry, defineExtension, defineTask, defineTool, section, type HarnessSettings, type TaskInspection,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "pi-ai-1";
@@ -26,9 +25,10 @@ import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type ModelJobRequest } from "../../src/model/durable-offloaded.ts";
 import { fromResponse, errorMessage, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelMessage, ModelResponse, ToolDefinition } from "../../src/model/types.ts";
-import { DEFAULT_MIN_PARK_MS, parkVerdict, readSnapshot, type DriveSnapshot, settle, type ParkVerdict, type SettleResult } from "../../src/runtime/durable-drive.ts";
+import { DEFAULT_MIN_PARK_MS, parkVerdict, readSnapshot, sleepingUntil, type DriveSnapshot, settle, type ParkVerdict, type SettleResult } from "../../src/runtime/durable-drive.ts";
 import { PiDurableSqlite, type DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
+import { Harness, type HarnessOptions, type SleepNotice } from "../../src/vendor/pi/pi-durable/dist/harness/harness.js";
 
 export type DriveCase = { group: string; name: string; run(): Promise<void> };
 /** Hands each case a host with no tables, and cleans up after it. */
@@ -95,16 +95,21 @@ const countTool = defineTool({
   execute: async () => ({}),
 });
 /**
- * A task that sleeps in a phase the park table does not know — what a new pi-durable phase or an
- * extension's own task calling `runtime.sleep` would look like to `parkVerdict`.
+ * An extension's own task calling `runtime.sleep` in a phase of its own: no built-in checkpoint shape says it
+ * sleeps, so only the scheduler's report can. `napUntil` is the T it last asked for. It works a moment before
+ * sleeping and commits nothing in between, so the read after its last commit sees it working, and only the
+ * harness's `onSleep` notice can bring the read that sees it sleep.
  */
+let napUntil = 0;
 const NapTask = defineTask<Record<string, never>, { phase: "nap"; until: number }, null>({
   name: "drive-test.nap",
   version: 1,
   initial: () => ({ phase: "nap", until: 0 }),
   phases: {
     nap: async (_task, runtime, context) => {
-      await runtime.sleep(runtime.now() + 60_000, context);
+      await sleep(50);
+      napUntil = runtime.now() + 60_000;
+      await runtime.sleep(napUntil, context);
       await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
     },
   },
@@ -128,16 +133,25 @@ function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimer
   const registry = createRegistry();
   registry.install(extension);
   const reports: string[] = [];
+  /** Every sleep the harness noticed, and settle's listeners for them: what PdHost wires (`#settleListeners`). */
+  const sleeps: SleepNotice[] = [];
+  const listeners = new Set<() => void>();
+  const subscribe = (wake: () => void) => { listeners.add(wake); return () => { listeners.delete(wake); }; };
   const options: HarnessOptions = {
     models, registry,
     settings: { stream: { deferred: true }, retry: { enabled: true, maxRetries: 3, baseDelayMs: RETRY_BASE_MS }, ...settings },
     onReport: (e) => reports.push(e instanceof Error ? e.message : String(e)),
+    onSleep: (sleep) => { sleeps.push(sleep); for (const l of [...listeners]) l(); },
   };
   const open = async () => Harness.open(await SqliteStorage.open(new PiDurableSqlite(host, prefixedNamespace("pd"))), options, bg);
   /** Each verdict, with the live timers at that moment where they can be counted. */
   const verdicts: Array<{ verdict: ParkVerdict; timers?: number }> = [];
-  const drive = (h: Harness): Promise<SettleResult> =>
-    settle(h, { context: bg, deadlineMs: 10_000, minParkMs: 1, onVerdict: (verdict) => verdicts.push({ verdict, ...(activeTimers ? { timers: activeTimers() } : {}) }) });
+  /** A timeout leaves the harness open (the runtime asks again); here it is closed, so a failing case cannot leak a live harness into the next. */
+  const drive = async (h: Harness): Promise<SettleResult> => {
+    const r = await settle(h, { context: bg, deadlineMs: 10_000, minParkMs: 1, subscribe, onVerdict: (verdict) => verdicts.push({ verdict, ...(activeTimers ? { timers: activeTimers() } : {}) }) });
+    if (r.state === "timeout") await h.close(bg);
+    return r;
+  };
   /** What an alarm does: open, resume, settle. */
   const wake = async () => { const h = await open(); h.resume(); return drive(h); };
   /** What a request does: open, submit, settle. */
@@ -161,7 +175,7 @@ function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimer
       });
     } finally { await h.close(bg); }
   };
-  return { jobs, open, wake, submit, transcript, verdicts, reports };
+  return { jobs, open, wake, submit, transcript, verdicts, reports, sleeps, subscribe };
 }
 
 function parked(r: SettleResult): Extract<SettleResult, { state: "parked" }> {
@@ -354,7 +368,7 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(parkVerdict(empty).verdict === "idle", "nothing live should be idle");
   });
 
-  add("verdict", "a running task with an unrecognised or malformed checkpoint is not parked, and is named as such", async (host) => {
+  add("verdict", "the scheduler's report decides, not the checkpoint: no report is working, a report parks whatever the checkpoint", async (host) => {
     const w = world(host);
     const h = await w.open();
     const root = await h.root(bg, { agent: { model: { provider: PROVIDER, modelId: MODEL } } });
@@ -370,36 +384,49 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     const base = snapshot;
     const [task] = base.inspection.tasks;
     check(task && task.record.state.status === "running", "no running task in the parked snapshot");
+    const reported = sleepingUntil(task.state);
+    const checkpoint = task.record.state.checkpoint as { phase?: unknown; pollAt?: unknown };
+    check(reported !== undefined && checkpoint.phase === "poll" && checkpoint.pollAt === reported,
+      `the scheduler reported ${show(task.state)} for checkpoint ${show(checkpoint)}`);
     const T = Date.now() + 60_000;
-    const withCheckpoint = (checkpoint: JsonValue): DriveSnapshot => {
+    const as = (checkpoint: JsonValue, state: TaskInspection["state"]): DriveSnapshot => {
       const record: TaskInspection["record"] = { ...task.record, state: { status: "running", checkpoint } };
-      return { ...base, inspection: { ...base.inspection, tasks: [{ ...task, record }] } };
+      return { ...base, inspection: { ...base.inspection, tasks: [{ record, state }] } };
     };
-    const malformed: JsonValue[] = [{ phase: "ready" }, { phase: "pol", pollAt: T }, { pollAt: T }, { phase: "poll" }, { phase: "poll", pollAt: String(T) }, "poll", null];
-    for (const checkpoint of malformed) {
-      const v = parkVerdict(withCheckpoint(checkpoint), 1);
-      check(v.verdict === "wait" && v.reason.includes("unrecognised checkpoint"), `${show(checkpoint)}: ${show(v)}`);
+    // A poll checkpoint with pollAt ahead, but no report: the old inference parked this; the invocation may be fetching.
+    const unreported = parkVerdict(as({ phase: "poll", attempt: 1, pollAt: T }, { kind: "running" }), 1);
+    check(unreported.verdict === "wait" && unreported.reason.includes("is working (poll)"), `unreported poll: ${show(unreported)}`);
+    for (const odd of [{ phase: "nap" }, { phase: "request", attempt: 1 }, { pollAt: T }, "poll", null] as JsonValue[]) {
+      const v = parkVerdict(as(odd, { kind: "running", sleepingUntil: T } as TaskInspection["state"]), 1);
+      check(v.verdict === "park" && v.until === T, `reported sleep with checkpoint ${show(odd)}: ${show(v)}`);
     }
-    const working = parkVerdict(withCheckpoint({ phase: "request", attempt: 1 }), 1);
-    check(working.verdict === "wait" && working.reason.includes("is working (request)"), `request: ${show(working)}`);
-    const sleeping = parkVerdict(withCheckpoint({ phase: "poll", attempt: 1, pollAt: T }), 1);
-    check(sleeping.verdict === "park", `the well-formed control did not park: ${show(sleeping)}`);
+    const due = parkVerdict(as({ phase: "nap" }, { kind: "running", sleepingUntil: base.now } as TaskInspection["state"]), 1);
+    check(due.verdict === "wait" && due.reason.includes("is due"), `a reported sleep due now: ${show(due)}`);
   });
 
-  add("verdict", "settle on a task sleeping in an unknown phase: no spin — one read per commit or recheck, then timeout", async (host) => {
+  add("verdict", `an extension's task sleeping in its own phase parks at its T, told by onSleep${activeTimers ? ", and no timer outlives close" : ""}`, async (host) => {
     const w = world(host);
     const h = await w.open();
     const root = await h.root(bg, { agent: { model: { provider: PROVIDER, modelId: MODEL } } });
     await root.commit((tx) => tx.createTask(NapTask, {}, { ownership: { kind: "conversation" } }), bg);
     h.resume();
     const verdicts: ParkVerdict[] = [];
-    const recheckMs = 100, deadlineMs = 600;
-    const r = await settle(h, { context: bg, minParkMs: 1, recheckMs, deadlineMs, onVerdict: (v) => verdicts.push(v) });
-    await h.close(bg);
-    check(r.state === "timeout", `expected timeout, got ${show(r)}`);
-    check(r.last.verdict === "wait" && r.last.reason.includes("unrecognised checkpoint"), `last verdict ${show(r.last)}`);
-    // Without commits, reads happen once per recheck: about deadline / recheck of them, never a tight loop.
-    check(verdicts.length >= 2 && verdicts.length <= deadlineMs / recheckMs + 3, `${verdicts.length} reads in ${deadlineMs} ms`);
+    let timersAtPark = -1;
+    // A recheck longer than the deadline: only a commit or the onSleep notice can bring the read that parks.
+    const started = Date.now();
+    const r = await settle(h, {
+      context: bg, minParkMs: 1, recheckMs: 60_000, deadlineMs: 5_000, subscribe: w.subscribe,
+      onVerdict: (v) => { verdicts.push(v); if (v.verdict === "park" && activeTimers) timersAtPark = activeTimers(); },
+    });
+    const p = parked(r);
+    check(p.parkedUntil === napUntil && napUntil > started, `parked until ${p.parkedUntil}, the task asked for ${napUntil}`);
+    check(p.sleepers.length === 1 && p.sleepers[0]?.phase === "nap", `sleepers ${show(p.sleepers)}`);
+    check(w.sleeps.length === 1 && w.sleeps[0]?.until === napUntil, `onSleep notices ${show(w.sleeps)}`);
+    check(Date.now() - started < 2_000, `parked after ${Date.now() - started} ms: the notice did not wake settle`);
+    if (activeTimers) {
+      check(timersAtPark > 0, `no live timer seen before close: ${timersAtPark}`);
+      check(activeTimers() === 0, `live timers after close: ${activeTimers()}`);
+    }
   });
 
   return cases;
