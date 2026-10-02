@@ -12,7 +12,7 @@ import { BOX_KEY, BOX_STORE, LIST_SCRIPT, STAT_SCRIPT, parseListing, sandboxPlug
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -54,7 +54,9 @@ function boxFs(nodes: Record<string, Node>) {
     const out = r.stdout.split(dir).join("");
     return { exit: r.status ?? 1, out: cut ? cut(out) : out };
   };
-  const body = (p: string) => { try { return new Uint8Array(readFileSync(host(p))); } catch { return null; } };
+  // Only a regular file is served, as run9's download does ("exactly one regular file"); reading a
+  // FIFO here would block the suite rather than fail it.
+  const body = (p: string) => { try { return statSync(host(p)).isFile() ? new Uint8Array(readFileSync(host(p))) : null; } catch { return null; } };
   return { exec, body };
 }
 
