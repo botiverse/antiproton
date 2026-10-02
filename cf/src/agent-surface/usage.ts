@@ -112,9 +112,10 @@ export function nonOverlapping(rows: readonly LedgerRow[], warn: (m: string) => 
       tools.set(id, t);
       continue;
     }
-    if (r.resource === "tool.call") {
-      // A tool's time (unit ms) has no subset to take out; it keeps the tool's own dimension.
-      out.push({ bucket: r.bucket, resource: r.resource, dimensions: { tool: r.key }, unit: r.unit, quantity: r.quantity });
+    if (r.resource === "tool.call" && r.unit === "ms") {
+      // A tool's time is its own resource, so every tool.call row counts calls and every
+      // tool.duration row counts milliseconds: rows of one resource always share a unit.
+      out.push({ bucket: r.bucket, resource: "tool.duration", dimensions: { tool: r.key }, unit: "ms", quantity: r.quantity });
       continue;
     }
     if (split && r.resource === "model.tokens") {

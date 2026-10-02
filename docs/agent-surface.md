@@ -60,13 +60,16 @@ names the window it covers:
   not yet counted), when the agent's unsent usage could not be read, or when the ledger marks part of
   the window as unreadable. A `partial` answer is a lower bound.
 
-**Every row can be summed with every other row of its resource and unit: no kind contains another.**
+**One rule: rows of the same resource share a unit and can be summed directly — no kind contains
+another.** The ledger's own `tool.call` time rows (unit `ms`) are therefore emitted as their own
+resource, `tool.duration`. The one exception is a resource passed through as the ledger holds it (last
+row below), which keeps the ledger's units: sum those per `unit`.
 
 | `resource` | `dimensions` | `unit` | |
 |---|---|---|---|
 | `model.tokens` | `{ model, kind }` | `tokens` | `kind` is one of `input`, `output`, `reasoning`, `cache_read`, `cache_write_5m`, `cache_write_1h`. `output` **excludes** reasoning tokens (`output` as the provider counts it less `reasoning`); `cache_write_5m` is the cache write less its 1-hour part. A model's own name may contain `:`. |
 | `tool.call` | `{ tool, outcome }` | `calls` | `outcome` is `succeeded` or `failed`; `succeeded` is all calls less the failed ones. |
-| `tool.call` | `{ tool }` | `ms` | Time spent in the tool. |
+| `tool.duration` | `{ tool }` | `ms` | Time spent in the tool (the ledger's `tool.call` rows in `ms`). |
 | anything else | `{ key }` | as recorded | Passed through as the ledger holds it (for example `js.run` / `{ key: "run_js" }` / `runs`). |
 
 The subtraction is made per bucket and per model or tool. A difference that would come out negative

@@ -198,7 +198,25 @@ await check("tool calls come out as succeeded and failed, from calls less failed
   must(pick(u.rows, { tool: "web.fetch", outcome: "failed" }).length === 0 && pick(u.rows, { tool: "web.fetch", outcome: "succeeded" })[0]?.quantity === 3, "no failures, no failed row");
   must(u.rows.filter((r) => r.resource === "tool.call" && r.unit === "calls").every((r) => r.dimensions.outcome), "a calls row without an outcome overlaps the others");
   const ms = pick(u.rows, { tool: "gh.issue_list", unit: "ms" });
-  must(ms.length === 1 && ms[0]!.quantity === 900 && ms[0]!.dimensions.outcome === undefined, JSON.stringify(ms));
+  must(ms.length === 1 && ms[0]!.resource === "tool.duration" && ms[0]!.quantity === 900 && ms[0]!.dimensions.outcome === undefined, JSON.stringify(ms));
+});
+
+await check("a tool's calls, failures and time in one bucket: succeeded and failed tool.call rows, one tool.duration row, and no tool.call row in ms", async () => {
+  const f = fakeSurface();
+  f.row(T0, "tool.call", "web.fetch", "calls", 4);
+  f.row(T0, "tool.call", "web.fetch", "failed", 1);
+  f.row(T0, "tool.call", "web.fetch", "ms", 1234);
+  const u = await agentUsage(f.deps.usage, "t", "agent_1", window("2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z"));
+  const shape = u.rows.map((r) => `${r.resource}|${JSON.stringify(r.dimensions)}|${r.unit}|${r.quantity}`).sort();
+  must(JSON.stringify(shape) === JSON.stringify([
+    'tool.call|{"tool":"web.fetch","outcome":"failed"}|calls|1',
+    'tool.call|{"tool":"web.fetch","outcome":"succeeded"}|calls|3',
+    'tool.duration|{"tool":"web.fetch"}|ms|1234',
+  ]), JSON.stringify(shape));
+  must(!u.rows.some((r) => r.resource === "tool.call" && r.unit !== "calls"), "a tool.call row in another unit");
+  const units = new Map<string, Set<string>>();
+  for (const r of u.rows) units.set(r.resource, (units.get(r.resource) ?? new Set()).add(r.unit));
+  must([...units.values()].every((s) => s.size === 1), `a resource with two units: ${JSON.stringify([...units].map(([k, v]) => [k, [...v]]))}`);
 });
 
 await check("a model name with ':' in it is split on the last ':'", async () => {
