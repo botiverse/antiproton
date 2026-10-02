@@ -94,7 +94,9 @@
     "test/pd-transcript.ts",
     "test/spec/pd-conversation.ts",
     "test/pd-outbox.ts",
-    "test/spec/pd-outbox-spec.ts"
+    "test/spec/pd-outbox-spec.ts",
+    "test/pd-writes.ts",
+    "test/spec/pd-writes-spec.ts"
   ],
   "exclude": ["node_modules"]
 }

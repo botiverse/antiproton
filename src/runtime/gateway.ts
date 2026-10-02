@@ -241,6 +241,42 @@ export class ToolGateway {
 
   readonly #seeded: ReadonlySet<string>;
 
+  /**
+   * Run every entry point that reaches a plugin or writes a row inside `apart` from now on.
+   *
+   * For an object whose agent runs on pi-durable (cf/src/runtime.ts): a commit there is a savepoint held
+   * open across awaits on the object's one connection, and what a call writes as it goes — its
+   * operation, approval and usage rows, and whatever the plugin keeps in its database, which it writes
+   * synchronously and so cannot be gated statement by statement — would join a commit open at that
+   * moment. `apart` (`PiDurableSqlite.apart`) starts the work once no commit is open and keeps commits
+   * off until it settles, so the whole of a call, an approval, a poll or a release is outside every one.
+   * An entry point reached from inside another (an approval runs `invoke`; a tool call already runs in
+   * `apart`) starts at once, since nothing can be open then.
+   *
+   * Every entry point that runs plugin code or writes is wrapped; `resolve` and `receiveBlocked` only
+   * read, and are not. Not set, nothing is wrapped: every other object calls these methods exactly as
+   * before.
+   */
+  gateCalls(apart: <T>(fn: () => Promise<T>) => Promise<T>): void {
+    const gate = <A extends unknown[], R>(call: (...args: A) => Promise<R>) =>
+      (...args: A): Promise<R> => apart(() => call.apply(this, args));
+    this.invoke = gate(this.invoke);
+    this.resumeInterrupt = gate(this.resumeInterrupt);
+    this.cancelInterrupt = gate(this.cancelInterrupt);
+    this.applyApproval = gate(this.applyApproval);
+    this.pollBackground = gate(this.pollBackground);
+    this.cancelBackground = gate(this.cancelBackground);
+    this.releaseTask = gate(this.releaseTask);
+    this.mountActivity = gate(this.mountActivity);
+    this.mountActivities = gate(this.mountActivities);
+    this.mountUsage = gate(this.mountUsage);
+    this.promptContributions = gate(this.promptContributions);
+    this.receive = gate(this.receive);
+    this.reportActivity = gate(this.reportActivity);
+    this.refreshMountTools = gate(this.refreshMountTools);
+    this.checkMount = gate(this.checkMount);
+  }
+
   #inbound?: (tenantId: string, agentId: string, alias: string) => InboundHooks;
 
   /** alias.tool  →  exact mount.  plugin.tool  →  only if unambiguous. */

@@ -45,7 +45,7 @@ import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
 import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
-import { pluginEnabled, toolsOf } from "../../src/plugins/types.ts";
+import { pluginEnabled, toolsOf, type Plugin } from "../../src/plugins/types.ts";
 import { skippedToolNotes } from "../../src/runtime/mount-tools.ts";
 
 /** What the plugins page is handed about each mount; declared and checked in cf/src/mount-reports.ts. */
@@ -366,42 +366,52 @@ export class AgentDO extends DurableObject<Env> {
 
   /** The three-gate advance from §7.3, on DO SQLite, timed. */
   async verifyStorage() {
-    const t0 = Date.now();
-    this.sql.exec("DELETE FROM probe_tasks");
-    this.sql.exec("DELETE FROM probe_outbox");
-    this.sql.exec(
-      "INSERT INTO probe_tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
+    // Its own transactions and tables, kept out of any pi-durable commit like every other write here.
+    return this.#own(() => {
+      const t0 = Date.now();
+      this.sql.exec("DELETE FROM probe_tasks");
+      this.sql.exec("DELETE FROM probe_outbox");
+      this.sql.exec(
+        "INSERT INTO probe_tasks VALUES ('t1','tenant-a',0,0,0,?)", JSON.stringify({ log: [] }));
 
-    const commit = (gen: number, token: number, version: number, cmd: string) =>
-      this.ctx.storage.transactionSync(() => {
-        const row = [...this.sql.exec("SELECT * FROM probe_tasks WHERE task_id='t1'")][0] as any;
-        if (token < row.fencing_token) return "fenced";
-        if (gen !== row.generation) return "stale_generation";
-        if (version !== row.checkpoint_version) return "version_conflict";
-        this.sql.exec(
-          "UPDATE probe_tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
-          row.checkpoint_version + 1, token, JSON.stringify({ log: [cmd] }));
-        this.sql.exec("INSERT INTO probe_outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
-        return "ok";
-      });
+      const commit = (gen: number, token: number, version: number, cmd: string) =>
+        this.ctx.storage.transactionSync(() => {
+          const row = [...this.sql.exec("SELECT * FROM probe_tasks WHERE task_id='t1'")][0] as any;
+          if (token < row.fencing_token) return "fenced";
+          if (gen !== row.generation) return "stale_generation";
+          if (version !== row.checkpoint_version) return "version_conflict";
+          this.sql.exec(
+            "UPDATE probe_tasks SET checkpoint_version=?, fencing_token=?, checkpoint=? WHERE task_id='t1'",
+            row.checkpoint_version + 1, token, JSON.stringify({ log: [cmd] }));
+          this.sql.exec("INSERT INTO probe_outbox VALUES (?, 't1', 'pending') ON CONFLICT DO NOTHING", cmd);
+          return "ok";
+        });
 
-    const results = {
-      happyPath: commit(0, 5, 0, "cmd-1"),
-      staleVersion: commit(0, 5, 0, "cmd-dup"),
-      fenced: commit(0, 1, 1, "cmd-zombie"),
-      staleGeneration: commit(9, 6, 1, "cmd-oldgen"),
-      replayIsIdempotent: (() => {
-        commit(0, 6, 1, "cmd-1");
-        return [...this.sql.exec("SELECT count(*) AS n FROM probe_outbox WHERE command_id='cmd-1'")][0];
-      })(),
-      rowsAfter: [...this.sql.exec("SELECT * FROM probe_tasks")][0],
-      ms: Date.now() - t0,
-    };
-    return results;
+      const results = {
+        happyPath: commit(0, 5, 0, "cmd-1"),
+        staleVersion: commit(0, 5, 0, "cmd-dup"),
+        fenced: commit(0, 1, 1, "cmd-zombie"),
+        staleGeneration: commit(9, 6, 1, "cmd-oldgen"),
+        replayIsIdempotent: (() => {
+          commit(0, 6, 1, "cmd-1");
+          return [...this.sql.exec("SELECT count(*) AS n FROM probe_outbox WHERE command_id='cmd-1'")][0];
+        })(),
+        rowsAfter: [...this.sql.exec("SELECT * FROM probe_tasks")][0],
+        ms: Date.now() - t0,
+      };
+      return results;
+    });
   }
+
+  /**
+   * Plugins for this object's runtime beyond the registry's. None here: the seam is for a subclass that
+   * mounts test plugins on a whole object (test/pd-writes.ts), which nothing else can reach.
+   */
+  protected extraPlugins(): Plugin[] | undefined { return undefined; }
 
   runtime(): AgentRuntime {
     this.#runtime ??= new AgentRuntime({
+      extraPlugins: this.extraPlugins(),
       ctx: this.ctx,
       bucket: this.env.ARTIFACTS,
       bucketName: this.env.ARTIFACT_BUCKET,
@@ -454,6 +464,9 @@ export class AgentDO extends DurableObject<Env> {
    * into one database.
    */
   #claim(tenantId: string, agentId: string) {
+    // Plain SQL, not `#own`, on a pd object too: the table is made in the constructor, so the CREATE
+    // changes nothing, and the INSERT runs only at the first claim, before anything could have opened
+    // the agent whose harness commits.
     this.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
     const row = this.sql.exec("SELECT tenant_id, agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     if (!row) {
@@ -529,7 +542,9 @@ export class AgentDO extends DurableObject<Env> {
     try {
       return await fn();
     } finally {
-      this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", t0, Date.now() - t0, kind);
+      const ms = Date.now() - t0;
+      const noted = this.#own(() => this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", t0, ms, kind));
+      if (noted instanceof Promise) await noted;
     }
   }
 
@@ -541,8 +556,10 @@ export class AgentDO extends DurableObject<Env> {
    * clock. Measurement must never break delivery, so it cannot throw.
    */
   #note(at: number, ms: number, kind: string) {
-    try { this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", at, ms, kind); }
-    catch { /* a missing measurement is not a failure */ }
+    try {
+      const noted = this.#own(() => this.sql.exec("INSERT INTO do_activity VALUES (?,?,?)", at, ms, kind));
+      if (noted instanceof Promise) noted.catch(() => { /* a missing measurement is not a failure */ });
+    } catch { /* a missing measurement is not a failure */ }
   }
 
   /**
@@ -737,9 +754,10 @@ export class AgentDO extends DurableObject<Env> {
 
   async setOffload(on: boolean) {
     const before = this.#offloadOn();
-    this.sql.exec(
+    const kept = this.#own(() => this.sql.exec(
       "INSERT INTO bench_config(k,v) VALUES ('offload',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-      on ? "1" : "0");
+      on ? "1" : "0"));
+    if (kept instanceof Promise) await kept;
     if (on !== before) {
       this.#runtime = null; // rebuilt with the new wiring on next use
       this.#benchRuntime = null;
@@ -1176,7 +1194,8 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   async resetActivity() {
-    this.sql.exec("DELETE FROM do_activity");
+    const reset = this.#own(() => this.sql.exec("DELETE FROM do_activity"));
+    if (reset instanceof Promise) await reset;
     return { ok: true };
   }
 
@@ -1229,12 +1248,15 @@ export class AgentDO extends DurableObject<Env> {
   /** Records an agent the route has already had adopted by its own object. */
   async uiRecordAgent(tenantId: string, ownerAgentId: string, rec: { agentId: string; name: string; description: string; avatar: string; createdAt: number }) {
     this.#claim(tenantId, ownerAgentId);
-    this.#directory();
-    // The name and description follow the agent (a PATCH from the API or the provider renames it);
-    // the avatar and the birth date do not.
-    this.sql.exec("INSERT INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?) " +
-      "ON CONFLICT(agent_id) DO UPDATE SET name = excluded.name, description = excluded.description",
-      rec.agentId, rec.name, rec.description, rec.avatar, rec.createdAt);
+    const recorded = this.#own(() => {
+      this.#directory();
+      // The name and description follow the agent (a PATCH from the API or the provider renames it);
+      // the avatar and the birth date do not.
+      this.sql.exec("INSERT INTO owned_agents(agent_id, name, description, avatar, created_at) VALUES (?,?,?,?,?) " +
+        "ON CONFLICT(agent_id) DO UPDATE SET name = excluded.name, description = excluded.description",
+        rec.agentId, rec.name, rec.description, rec.avatar, rec.createdAt);
+    });
+    if (recorded instanceof Promise) await recorded;
     return rec;
   }
 
@@ -1244,14 +1266,15 @@ export class AgentDO extends DurableObject<Env> {
   // The owner's object indexes the agents and sessions its key created.
   // An agent's tools carry JSON Schema (recursive Json), which the RPC stub types
   // expand without bound; agents therefore cross the object boundary as JSON text.
-  async apiPutAgent(tenantId: string, ownerAgentId: string, id: string, agentJson: string) { this.#claim(tenantId, ownerAgentId); putApiAgent(this.sql, id, JSON.parse(agentJson) as StoredAgent); }
-  async apiGetAgent(tenantId: string, ownerAgentId: string, id: string): Promise<string | null> { this.#claim(tenantId, ownerAgentId); const a = getApiAgent(this.sql, id); return a ? JSON.stringify(a) : null; }
-  async apiListAgents(tenantId: string, ownerAgentId: string): Promise<string> { this.#claim(tenantId, ownerAgentId); return JSON.stringify(listApiAgents(this.sql)); }
-  async apiDeleteAgent(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return deleteApiAgent(this.sql, id); }
-  async apiPutSession(tenantId: string, ownerAgentId: string, sess: StoredSession) { this.#claim(tenantId, ownerAgentId); putApiSession(this.sql, sess); }
-  async apiGetSession(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return getApiSession(this.sql, id); }
-  async apiListSessions(tenantId: string, ownerAgentId: string, agentId: string | null) { this.#claim(tenantId, ownerAgentId); return listApiSessions(this.sql, agentId); }
-  async apiDeleteSession(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return deleteApiSession(this.sql, id); }
+  // Each through `#own`: every one of these makes the API's tables when they are missing, the reads too.
+  async apiPutAgent(tenantId: string, ownerAgentId: string, id: string, agentJson: string) { this.#claim(tenantId, ownerAgentId); return this.#own(() => { putApiAgent(this.sql, id, JSON.parse(agentJson) as StoredAgent); }); }
+  async apiGetAgent(tenantId: string, ownerAgentId: string, id: string): Promise<string | null> { this.#claim(tenantId, ownerAgentId); return this.#own(() => { const a = getApiAgent(this.sql, id); return a ? JSON.stringify(a) : null; }); }
+  async apiListAgents(tenantId: string, ownerAgentId: string): Promise<string> { this.#claim(tenantId, ownerAgentId); return this.#own(() => JSON.stringify(listApiAgents(this.sql))); }
+  async apiDeleteAgent(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return this.#own(() => deleteApiAgent(this.sql, id)); }
+  async apiPutSession(tenantId: string, ownerAgentId: string, sess: StoredSession) { this.#claim(tenantId, ownerAgentId); return this.#own(() => { putApiSession(this.sql, sess); }); }
+  async apiGetSession(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return this.#own(() => getApiSession(this.sql, id)); }
+  async apiListSessions(tenantId: string, ownerAgentId: string, agentId: string | null) { this.#claim(tenantId, ownerAgentId); return this.#own(() => listApiSessions(this.sql, agentId)); }
+  async apiDeleteSession(tenantId: string, ownerAgentId: string, id: string) { this.#claim(tenantId, ownerAgentId); return this.#own(() => deleteApiSession(this.sql, id)); }
 
   /** The persona the harness reads: the API's name and instructions, with the full config kept beside them. */
   #apiPersona(agentId: string, a: StoredAgent, avatar: string) {
@@ -1383,10 +1406,10 @@ export class AgentDO extends DurableObject<Env> {
 
   async uiListAgents(tenantId: string, ownerAgentId: string) {
     this.#claim(tenantId, ownerAgentId);
-    this.#directory();
     // An agent deleted through the API is gone here too (its object is kept, as for every agent);
     // one the API made, with a key of this person's, is marked so the list can say so.
-    const api = apiAgentIds(this.sql);
+    const listed = this.#own(() => { this.#directory(); return apiAgentIds(this.sql); });
+    const api = listed instanceof Promise ? await listed : listed;
     const rows = (this.sql.exec("SELECT * FROM owned_agents ORDER BY created_at DESC").toArray() as any[])
       .filter((r) => !api.deleted.has(String(r.agent_id)));
     const owned = rows.map((r) => ({
@@ -1402,8 +1425,8 @@ export class AgentDO extends DurableObject<Env> {
   async uiOwnsAgent(tenantId: string, ownerAgentId: string, agentId: string): Promise<boolean> {
     if (agentId === ownerAgentId) return true;
     this.#claim(tenantId, ownerAgentId);
-    this.#directory();
-    if (apiAgentIds(this.sql).deleted.has(agentId)) return false;
+    const listed = this.#own(() => { this.#directory(); return apiAgentIds(this.sql); });
+    if ((listed instanceof Promise ? await listed : listed).deleted.has(agentId)) return false;
     return this.sql.exec("SELECT 1 FROM owned_agents WHERE agent_id=?", agentId).toArray().length > 0;
   }
 
@@ -1955,6 +1978,22 @@ export class AgentDO extends DurableObject<Env> {
     return this.#runtime ? this.#runtime.afterPdTransactions(fn) : fn();
   }
 
+  /**
+   * A synchronous write of this object's own tables — `do_activity`, `alarms`, the directory, the API's
+   * index — after any pi-durable commit open on it, as `#outsidePd`'s reads are: a pi-durable commit is a
+   * savepoint held open across awaits on the object's one connection, and a write issued while it is
+   * open joins it and is rolled back with it. Through the runtime already built, since only one that
+   * opened a pd agent can have a commit open; with none, or with no pd agent, `fn` runs at once and its
+   * value comes back as it is, so every other object writes exactly as it did. A caller awaits the
+   * result only when it is a promise, for the same reason.
+   *
+   * Same exposure as `#outsidePd` after `simulateEviction` and `setOffload`. Not used by the bench
+   * routes: a bench object hosts one agent after another, which the pd engine refuses (`PdHost.bind`).
+   */
+  #own<T>(fn: () => T): Promise<T> | T {
+    return this.#runtime ? this.#runtime.outsideCommits(fn) : fn();
+  }
+
   #ownerAgent(): string | null {
     const row = this.sql.exec("SELECT agent_id FROM owner WHERE k='self'").toArray()[0] as any;
     return row ? String(row.agent_id) : null;
@@ -2158,14 +2197,19 @@ export class AgentDO extends DurableObject<Env> {
    */
   async alarm() {
     const alarmStarted = Date.now();
-    const failures = this.#alarmFailures();
+    const counted = this.#own(() => this.#alarmFailures());
+    const failures = counted instanceof Promise ? await counted : counted;
     this.#wakeAsked = null;
     if (failures < 20) await this.ctx.storage.setAlarm(Date.now() + 30_000);
     try {
       await this.#busy("alarm", async () => {
         this.alarmFiredAt = Date.now();
-        this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
-        this.sql.exec("INSERT INTO alarms VALUES (?)", this.alarmFiredAt);
+        const firedAt = this.alarmFiredAt;
+        const fired = this.#own(() => {
+          this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
+          this.sql.exec("INSERT INTO alarms VALUES (?)", firedAt);
+        });
+        if (fired instanceof Promise) await fired;
         // The object may have been evicted since the alarm was armed, so this
         // instance can be brand new: build the runtime rather than assuming it.
         const rt = this.#activeRuntime();
@@ -2182,25 +2226,35 @@ export class AgentDO extends DurableObject<Env> {
         // existing, so it is written down where diagnose can find it rather
         // than left to be noticed on an invoice.
         for (const f of out.releaseFailed ?? []) {
-          this.sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
-          this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", Date.now(), f.alias, f.error);
+          const at = Date.now();
+          const kept = this.#own(() => {
+            this.sql.exec("CREATE TABLE IF NOT EXISTS release_errors(at INTEGER, alias TEXT, message TEXT)");
+            this.sql.exec("INSERT INTO release_errors VALUES (?,?,?)", at, f.alias, f.error);
+          });
+          if (kept instanceof Promise) await kept;
         }
         await this.broadcast();
-        // This pass's usage, to the tenant's hourly table. A failure is kept
-        // for later rather than failing the pass: the rows stay in the outbox.
-        let usagePending = false;
-        try {
-          this.#countActiveTime(who.tenantId, who.agentId);
-          await this.#countHeldTime(rt, who.tenantId, who.agentId);
-          await flushUsage(this.env.CONTROL_DB, this.sql as any, who.tenantId, who.agentId);
-        } catch (e: any) {
-          usagePending = true;
-          console.warn(`usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
-        }
-        // This pass's activity to the service that runs this agent, then this pass's trace rows
-        // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
-        // Same terms as usage: a failure keeps the rows and asks for another pass.
-        const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+        // The bookkeeping below writes this object's tables across awaits (D1, R2, the mounts' reports), so
+        // on a pd object it runs apart from pi-durable's commits; it calls nothing that commits.
+        const { usagePending: pending, flushed } = await rt.apartFromPd(async () => {
+          // This pass's usage, to the tenant's hourly table. A failure is kept
+          // for later rather than failing the pass: the rows stay in the outbox.
+          let usagePending = false;
+          try {
+            this.#countActiveTime(who.tenantId, who.agentId);
+            await this.#countHeldTime(rt, who.tenantId, who.agentId);
+            await flushUsage(this.env.CONTROL_DB, this.sql as any, who.tenantId, who.agentId);
+          } catch (e: any) {
+            usagePending = true;
+            console.warn(`usage flush failed for ${who.agentId}: ${String(e?.message ?? e).slice(0, 200)}`);
+          }
+          // This pass's activity to the service that runs this agent, then this pass's trace rows
+          // to R2, with the export holding whatever activity did not consume (cf/src/activity-raft.ts).
+          // Same terms as usage: a failure keeps the rows and asks for another pass.
+          const flushed = await flushActivityThenTrace(rt.gateway(), this.env.ARTIFACTS, this.sql as any, who.tenantId, who.agentId);
+          return { usagePending, flushed };
+        });
+        let usagePending = pending;
         if (flushed.activityError) { usagePending = true; console.warn(`activity flush failed for ${who.agentId}: ${flushed.activityError}`); }
         if (flushed.traceError) { usagePending = true; console.warn(`trace flush failed for ${who.agentId}: ${flushed.traceError}`); }
         // The pass says when to come back — a retry has a time, a model call has a poll interval,
@@ -2216,16 +2270,21 @@ export class AgentDO extends DurableObject<Env> {
           wakeInMs: out.wakeInMs, usagePending, activityError: flushed.activityError ?? undefined, traceError: flushed.traceError ?? undefined,
         });
       });
-      this.#alarmFailures(0);
+      const reset = this.#own(() => this.#alarmFailures(0));
+      if (reset instanceof Promise) await reset;
     } catch (e: any) {
       // Recorded, not swallowed: a handler failing silently is how the last
       // two stalls stayed invisible. The fallback alarm above means the next
       // pass still happens.
-      this.#alarmFailures(failures + 1);
+      const counted = this.#own(() => this.#alarmFailures(failures + 1));
+      if (counted instanceof Promise) await counted;
       logEvent("alarm.error", { object: this.ctx.id.toString(), ms: Date.now() - alarmStarted, failures: failures + 1, error: String(e?.message ?? e).slice(0, 200) });
-      this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)");
-      this.sql.exec("INSERT INTO alarm_errors VALUES (?,?)",
-        Date.now(), String(e?.message ?? e).slice(0, 300));
+      const at = Date.now();
+      const kept = this.#own(() => {
+        this.sql.exec("CREATE TABLE IF NOT EXISTS alarm_errors(at INTEGER, message TEXT)");
+        this.sql.exec("INSERT INTO alarm_errors VALUES (?,?)", at, String(e?.message ?? e).slice(0, 300));
+      });
+      if (kept instanceof Promise) await kept;
       throw e;
     }
   }
@@ -2243,7 +2302,8 @@ export class AgentDO extends DurableObject<Env> {
     return Number(r?.v ?? 0);
   }
   async alarmStatus() {
-    this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)");
+    const made = this.#own(() => this.sql.exec("CREATE TABLE IF NOT EXISTS alarms(at INTEGER)"));
+    if (made instanceof Promise) await made;
     const rows = [...this.sql.exec("SELECT at FROM alarms ORDER BY at DESC LIMIT 1")] as any[];
     return {
       armedAt: this.alarmSetAt, firedAt: rows[0]?.at ?? null,
