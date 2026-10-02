@@ -1,19 +1,15 @@
 /**
- * Writes on a `pd` object, kept out of pi-durable's transactions: the runtime's cases
- * (test/spec/pd-writes-spec.ts) over node:sqlite, and, node's only, the whole `AgentDO`: a pd agent
- * driven through the object's own entry points — a console message, the alarm, the model queue's
- * take and deliver, an approval, an API input that rebinds the model, a question left to expire, a
- * background job, the idle lease — with some of them started from a pi-durable commit (as it ends: it is
- * synchronous, test/spec/pd-commits.ts), and every write the object makes, its own bookkeeping included,
- * checked against joining one.
+ * Writes on a `pd` object: the runtime's cases (test/spec/pd-writes-spec.ts) over node:sqlite, and, node's
+ * only, the whole `AgentDO`: a pd agent driven through the object's own entry points — a console message,
+ * the alarm, the model queue's take and deliver, an approval, an API input that rebinds the model, a
+ * question left to expire, a background job, the idle lease — with some of them started as a pi-durable
+ * commit ends (test/spec/pd-commits.ts), each checked for what it is for.
  * `npm run pd-writes:do` runs the spec's cases on a real Durable Object; the whole object needs the
  * `cloudflare:workers` module, which node has only as the stand-in below.
  */
 import { register } from "node:module";
 import type { Json } from "../src/core/types.ts";
-import { guardJoinedWrites } from "../src/runtime/durable-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
-import { PiDurableSqlite, type DurableSqlHost } from "../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
@@ -44,24 +40,20 @@ const d1 = () => {
 };
 
 const wholeObject: DriveCase = {
-  group: "the whole object", name: "a pd turn through AgentDO's entry points — approval, API input with a model binding, a caller's function result, a cancel, question expiry, background job, idle lease, alarms — joins nothing",
+  group: "the whole object", name: "a pd turn through AgentDO's entry points — approval, API input with a model binding, a caller's function result, a cancel, question expiry, background job, idle lease, alarms",
   async run() {
     const raw = sqliteHost();
     try {
       let armed: Array<() => void> = [];
-      // Started inside the next pi-durable transaction that spans awaits, or as the next synchronous one ends.
-      const slow: DurableSqlHost = afterPdCommits({
-        sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
-        transaction: (cb) => raw.transaction(async () => { for (const start of armed.splice(0)) start(); await sleep(5); return cb(); }),
-      }, () => { for (const start of armed.splice(0)) start(); });
-      const g = guardJoinedWrites(slow, { throwOnJoin: true });
+      // Started as the next pi-durable commit ends.
+      const g = afterPdCommits(raw, () => { for (const start of armed.splice(0)) start(); });
       const during = <R>(fn: () => Promise<R>) => new Promise<{ ok: boolean; value?: R; error?: string }>((resolve) => {
         armed.push(() => { fn().then((value) => resolve({ ok: true, value }), (e) => resolve({ ok: false, error: String(e?.message ?? e) })); });
       });
       // The engine choice, as a creation path writes it, before the object first wakes.
-      const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
-      await ap.ensure();
-      await ap.setEngineOnce("pd");
+      const ap = new ApStore(raw, prefixedNamespace("ap"));
+      ap.ensure();
+      ap.setEngineOnce("pd");
 
       const seen: Seen = [];
       const held = { lastUsedAt: null as number | null };
@@ -71,7 +63,7 @@ const wholeObject: DriveCase = {
       let alarmAt: number | null = null;
       const ctx = {
         storage: {
-          sql: g.sql, transaction: g.transaction, transactionSync: g.transactionSync,
+          sql: g.sql, transactionSync: g.transactionSync,
           getAlarm: async () => alarmAt, setAlarm: async (at: number) => { alarmAt = at; }, deleteAlarm: async () => { alarmAt = null; },
         },
         id: { toString: () => "do-1" }, getWebSockets: () => [], exports: {},
@@ -130,7 +122,7 @@ const wholeObject: DriveCase = {
       await answer([{ type: "text", text: "started" }], "stop");
       check(D.runtime().runJsContinuations.size === 1, "the question is not held");
 
-      // Inside open commits: the approval, an API input that rebinds the model, a console message, an alarm.
+      // As commits end: the approval, an API input that rebinds the model, a console message, an alarm.
       const op = (await rt.store.listApprovals(T, "pending"))[0]?.operationId;
       check(op, "no approval is pending");
       const approved = during(() => D.uiDecide(T, A, "", op, "approved", "human"));
@@ -145,7 +137,7 @@ const wholeObject: DriveCase = {
       await drain();
       check(requests.some((r) => r.includes("hello from the API")), "the API input never reached the model");
 
-      // A function the API caller runs: its result submitted, then a turn cancelled — each from inside an open commit.
+      // A function the API caller runs: its result submitted, then a turn cancelled — each as a commit ends.
       const weather = { name: "n", instructions: "be brief", tools: [{ name: "get_weather", description: "weather", parameters: { type: "object", properties: {} } }] };
       await D.apiPostInput(T, A, JSON.stringify(weather), "s2", "weather?");
       await answer([call("w1", "get_weather")], "toolUse");
@@ -186,7 +178,6 @@ const wholeObject: DriveCase = {
       const kinds = new Set(raw.sql.exec("SELECT kind FROM do_activity").toArray().map((r) => String((r as { kind: unknown }).kind)));
       for (const k of ["uiSay", "uiDecide", "apiPostInput", "apiToolResults", "apiCancelSession", "alarm", "deliver", "offload_dispatch", "offload_provider"]) check(kinds.has(k), `no do_activity row of kind ${k}: ${show([...kinds])}`);
       check(raw.sql.exec("SELECT COUNT(*) AS n FROM alarms").toArray()[0] as { n: number }, "no alarm rows");
-      check(g.joined.length === 0, `${g.joined.length} writes joined an open pi-durable transaction: ${show(g.joined.slice(0, 5))}`);
       await (await rt.agent(T, A)).close?.();
     } finally { raw.dispose(); }
   },
@@ -196,7 +187,7 @@ const results = await runDriveCases([
   ...pdWritesCases(async (use) => {
     const host = sqliteHost();
     try { await use(host); } finally { host.dispose(); }
-  }, { slowCommitMs: 5 }),
+  }),
   wholeObject,
 ]);
 

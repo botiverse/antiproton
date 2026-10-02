@@ -1,7 +1,6 @@
 /**
- * The `ap` namespace (src/store/ap-store.ts) and `PiDurableSqlite.exclusive`, over node:sqlite.
- * `npm run ap-store:do` runs the same cases on real Durable Object storage, which is the reading
- * that counts for `exclusive`: node's BEGIN/COMMIT only stands in for the object's savepoint.
+ * The `ap` namespace (src/store/ap-store.ts), over node:sqlite. `npm run ap-store:do` runs the same
+ * cases on real Durable Object storage.
  */
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { apStoreCases } from "./spec/ap-store-spec.ts";
@@ -12,7 +11,7 @@ const results = await runPiDurableCases(apStoreCases(async (use) => {
   try { await use(host); } finally { host.dispose(); }
 }));
 
-console.log(`\n  ap namespace + exclusive — node:sqlite\n  ${"─".repeat(56)}`);
+console.log(`\n  ap namespace — node:sqlite\n  ${"─".repeat(56)}`);
 let group = "";
 for (const r of results) {
   if (r.group !== group) { group = r.group; console.log(`  ${group}`); }

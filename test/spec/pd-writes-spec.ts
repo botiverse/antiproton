@@ -1,12 +1,11 @@
 /**
- * Every write the runtime makes on a `pd` object, kept out of pi-durable's transactions.
+ * The runtime's writes on a `pd` object, as plain writes beside pi-durable's commits.
  *
- * pi-durable commits through `ctx.storage.transaction`, a savepoint over the object's one connection
- * that stays open across awaits (src/store/pi-durable-sqlite.ts): any other write issued while it is
- * open joins it, and is rolled back with it when the commit fails. Each case here runs an `AgentRuntime`
- * on a `pd` object whose every pi-durable transaction is held open across a timer, starts one of the
- * runtime's writes from INSIDE such a transaction (`World.during`), and asks two things: did the write
- * do what it is for, and did anything of ours join (`guardJoinedWrites`, which also throws at the write).
+ * Each pi-durable commit is one synchronous transaction (src/store/pi-durable-sqlite.ts), so nothing of
+ * ours can land inside one, and nothing holds our writes off. Each case here runs an `AgentRuntime` on a
+ * `pd` object, starts one of the runtime's writes as a pi-durable commit ends (`World.during`, the
+ * closest anything can get to one), and asks whether the write did what it is for: an approval, an
+ * expired question, a model binding, a background pass, auto-release and the idle lease.
  *
  * Run over node:sqlite by test/pd-writes.ts, which adds the whole `AgentDO`, and on a real Durable
  * Object's storage by cf/src/conformance.ts (test/pd-writes-do.sh).
@@ -14,9 +13,8 @@
 import { AgentRuntime } from "../../cf/src/runtime.ts";
 import type { Json } from "../../src/core/types.ts";
 import { backgrounded, interrupt, type Plugin } from "../../src/plugins/types.ts";
-import { guardJoinedWrites } from "../../src/runtime/durable-agent.ts";
 import { ApStore } from "../../src/store/ap-store.ts";
-import { PiDurableSqlite, type DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
+import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 import { afterPdCommits } from "./pd-commits.ts";
@@ -31,10 +29,7 @@ const USAGE = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2
 /** What the test plugins did, in order. */
 export type Seen = string[];
 
-/**
- * Called from inside a plugin's work, before it writes: a case starts a pi-durable commit here, so a
- * write the plugin makes after it would land in that commit unless the whole of the work is kept apart.
- */
+/** Called from inside a plugin's work, before it writes: a case starts a pi-durable commit here. */
 export type PluginHooks = { duringSend?: () => void; duringPoll?: () => void };
 
 /**
@@ -103,35 +98,23 @@ export function testPlugins(seen: Seen, held: { lastUsedAt: number | null }, hoo
 }
 
 export interface WorldOptions {
-  /** How long each pi-durable transaction is held open before its work. */
-  slowCommitMs: number;
   autoRelease?: boolean;
   idle?: { warnMs: number; maxMs: number };
   runJsResumeMs?: number;
 }
 
-/** A `pd` agent `t/a` with the three plugins mounted, on `raw` behind the guard. */
+/** A `pd` agent `t/a` with the three plugins mounted, on `raw`. */
 export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
   const seen: Seen = [];
   const held = { lastUsedAt: null as number | null };
   const hooks: PluginHooks = {};
-  // What `during` armed: started inside the next pi-durable transaction that spans awaits, before its work, or
-  // as the next synchronous one ends (`afterPdCommits`: no other code can run inside that).
+  // What `during` armed: started as the next pi-durable commit ends (`afterPdCommits`).
   const armed: Array<() => unknown> = [];
-  const slow: DurableSqlHost = afterPdCommits({
-    sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
-    transaction: (cb) => raw.transaction(async () => {
-      for (const start of armed.splice(0)) start();
-      if (o.slowCommitMs > 0) await sleep(o.slowCommitMs);
-      return cb();
-    }),
-  }, () => { for (const start of armed.splice(0)) start(); });
-  const g = guardJoinedWrites(slow, { throwOnJoin: true });
-  const storage = { sql: g.sql, transaction: g.transaction, transactionSync: g.transactionSync };
+  const storage: DurableSqlHost = afterPdCommits(raw, () => { for (const start of armed.splice(0)) start(); });
   // The engine choice, as a creation path writes it.
-  const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
-  await ap.ensure();
-  await ap.setEngineOnce("pd");
+  const ap = new ApStore(raw, prefixedNamespace("ap"));
+  ap.ensure();
+  ap.setEngineOnce("pd");
   const sent: string[] = [];
   const rt = new AgentRuntime({
     ctx: { storage } as never, bucket: {} as never, bucketName: "b", sandbox: false,
@@ -154,13 +137,10 @@ export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
   const requests: string[] = [];
   let answered = 0;
   const w = {
-    rt, seen, held, hooks, raw, storage, joined: g.joined, requests,
+    rt, seen, held, hooks, raw, storage, requests,
     /** Closes the harness, so no timer of it outlives the case. */
     async close() { await (await rt.agent(T, A)).close?.(); },
-    /**
-     * Start `fn` inside the next pi-durable transaction, and resolve with what it settled to once it
-     * has. The transaction is the window a write of ours must not land in.
-     */
+    /** Start `fn` as the next pi-durable commit ends, and resolve with what it settled to once it has. */
     during<R>(fn: () => R | Promise<R>): Promise<{ ok: true; value: R } | { ok: false; error: string }> {
       return new Promise((resolve) => {
         armed.push(() => {
@@ -208,49 +188,44 @@ export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
 const call = (id: string, name: string, args: Json = {}) => ({ type: "toolCall", id, name, arguments: args });
 const text = (t: string) => ({ type: "text", text: t });
 
-export function pdWritesCases(withRawHost: WithDriveHost, opts: { slowCommitMs: number }): DriveCase[] {
+export function pdWritesCases(withRawHost: WithDriveHost): DriveCase[] {
   const cases: DriveCase[] = [];
   const add = (name: string, run: () => Promise<void>) => cases.push({ group: "pd writes", name, run });
   const world = (o: Partial<WorldOptions>, use: (w: Awaited<ReturnType<typeof pdWorld>>) => Promise<void>) =>
     withRawHost(async (raw) => {
-      const w = await pdWorld(raw, { slowCommitMs: opts.slowCommitMs, ...o });
-      try {
-        await use(w);
-        check(w.joined.length === 0, `${w.joined.length} writes joined an open pi-durable transaction: ${show(w.joined.slice(0, 5))}`);
-      } finally { await w.close(); }
+      const w = await pdWorld(raw, o);
+      try { await use(w); } finally { await w.close(); }
     });
 
   // pi-durable commits in one synchronous transaction (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js), so
   // `during` starts its work as the commit ends: even a write past every gate lands after it, and stays.
   add("a write straight at the storage, started from a pd commit, cannot join it: it lands after, and stays", () =>
     withRawHost(async (raw) => {
-      const w = await pdWorld(raw, { slowCommitMs: opts.slowCommitMs });
+      const w = await pdWorld(raw, {});
       try {
         const r = w.during(() => w.storage.sql.exec("INSERT INTO agents(tenant_id, agent_id, config, created_at) VALUES ('x', 'y', '{}', 0)"));
         await w.rt.postMessage(T, A, "hello");
         const got = await r;
-        check(got.ok, `the ungated write: ${show(got)}`);
-        check(w.joined.length === 0, `the guard saw ${show(w.joined)}`);
+        check(got.ok, `the write: ${show(got)}`);
         const row = raw.sql.exec("SELECT count(*) AS n FROM agents WHERE tenant_id = 'x'").toArray()[0];
         check(row?.n === 1, `the write left ${show(row)}`);
       } finally { await w.close(); }
     }));
 
-  add("approving a held call while a pd commit is open runs the call once and joins nothing", () =>
+  add("approving a held call as a pd commit ends runs the call once and keeps its writes", () =>
     world({}, async (w) => {
       await w.rt.postMessage(T, A, "post it");
       await w.answer([call("c1", "web__send", { url: "u1" })], "toolUse");
-      // The held call's turn goes on; the approval lands inside its next commit.
+      // The held call's turn goes on; the approval starts as its next commit ends.
       await w.answer([text("waiting for approval")], "stop");
       const op = (await w.rt.store.listApprovals(T, "pending"))[0]?.operationId;
       check(op, "no approval was pending");
       const decided = w.during(() => w.rt.gateway().applyApproval(T, op, "approved", "human"));
-      // And while the approved call runs, another message: its commit must wait for the call to finish.
+      // And while the approved call runs, another message, which commits beside it.
       let meanwhile: Promise<unknown> | null = null;
       w.hooks.duringSend = () => { meanwhile = w.rt.postMessage(T, A, "meanwhile"); };
       await w.rt.postMessage(T, A, "anything yet?");
       const r = await decided;
-      check(w.joined.length === 0, `joined: ${show(w.joined)}`);
       check(r.ok, `the approval threw: ${r.ok ? "" : r.error}`);
       check(show(r.value).includes('"executed":true'), `the approval: ${show(r.value)}`);
       check(meanwhile, "the approved call did not run");
@@ -260,19 +235,18 @@ export function pdWritesCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       await w.drain();
     }));
 
-  add("a tool question that expires is cancelled at the plugin outside every pd commit", () =>
+  add("a tool question that expires is cancelled at the plugin, its write kept", () =>
     world({ runJsResumeMs: 400 }, async (w) => {
       await w.rt.postMessage(T, A, "wipe it");
       await w.answer([call("c1", "web__wipe")], "toolUse");
       await w.answer([text("asked")], "stop");
       check(w.rt.runJsContinuations.size === 1, `held questions: ${w.rt.runJsContinuations.size}`);
       await sleep(450);
-      // The sweep a pass makes, inside a commit: its cancel must wait the commit out.
+      // The sweep a pass makes, started as a commit ends.
       const swept = w.during(() => w.rt.runJsContinuations.wakeInMs());
       await w.rt.postMessage(T, A, "never mind");
       check((await swept).ok, "the sweep threw");
       for (let i = 0; i < 50 && !w.seen.includes("web.cancel"); i++) await sleep(10);
-      check(w.joined.length === 0, `joined: ${show(w.joined)}`);
       check(w.seen.includes("web.cancel"), `the plugin was not told: ${show(w.seen)}`);
       for (let i = 0; i < 50 && !w.raw.sql.exec("SELECT 1 FROM plugin_db WHERE store = 'asked'").toArray().length; i++) await sleep(10);
       check(w.raw.sql.exec("SELECT 1 FROM plugin_db WHERE store = 'asked'").toArray().length === 1, "the plugin's write is not there");
@@ -280,7 +254,7 @@ export function pdWritesCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       await w.settle();
     }));
 
-  add("binding the operator's model while a pd commit is open writes the binding and joins nothing", () =>
+  add("binding the operator's model as a pd commit ends writes the binding", () =>
     world({}, async (w) => {
       const bound = w.during(() => w.rt.bindOperatorModel(T, A, "m2"));
       await w.rt.postMessage(T, A, "hello");
@@ -307,13 +281,13 @@ export function pdWritesCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       await w.settle();
     }));
 
-  add("a pass that starts inside a pd commit polls the job once and delivers it once, joining nothing", () =>
+  add("a pass that starts as a pd commit ends polls the job once and delivers it once", () =>
     world({}, async (w) => {
       await w.rt.postMessage(T, A, "run the tests");
       await w.answer([call("c1", "box__long")], "toolUse");
       await w.answer([text("started")], "stop");
       w.raw.sql.exec("UPDATE background_jobs SET next_poll_at = 0");
-      // While the job is polled, a message: its commit must wait for the pass's writes.
+      // While the job is polled, a message, which commits beside the pass's writes.
       let meanwhile: Promise<unknown> | null = null;
       w.hooks.duringPoll = () => { meanwhile ??= w.rt.postMessage(T, A, "meanwhile"); };
       const passed = w.during(() => w.rt.step(T, A));

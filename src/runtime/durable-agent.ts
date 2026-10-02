@@ -40,10 +40,9 @@
  *   its own kind whose model message is the note the runtime names for it
  *   (`markerNotes`): what pi085's entry projector shows the model for its marker.
  *
- * Every write of ours runs through `PiDurableSqlite.exclusive` or its own host
- * `transactionSync`, so none of it joins a pi-durable transaction that is open
- * on the object's one connection (src/store/pi-durable-sqlite.ts says why that
- * matters) — except the commit hook's, which is written inside one on purpose.
+ * Our writes are plain statements: each pi-durable commit is one synchronous
+ * transaction (src/store/pi-durable-sqlite.ts), so none of ours can land
+ * inside one.
  *
  * Only pi-ai 1.0 (`pi-ai-1`) is imported here. What crosses to the 0.85 side —
  * a job's request, an answer, a projected entry — crosses as JSON.
@@ -59,13 +58,12 @@ import { Harness } from "../vendor/pi/pi-durable/dist/harness/harness.js";
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
-import { ApStore } from "../store/ap-store.ts";
+import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
 import { bookCommit, strandedAnswerRows, type Booked } from "./pd-outbox.ts";
 import { appendUsage } from "../usage/outbox.ts";
 import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
-import { logEvent } from "../core/log.ts";
-import { PI_DURABLE_OBJECTS, PiDurableSqlite, SerialQueue, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
+import { PI_DURABLE_OBJECTS, PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
 import { prefixedNamespace, SqlQualifier } from "../store/sql-namespace.ts";
 import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.ts";
 import { toolsExtension, type ClientAnswer, type ClientToolDef } from "./durable-tools.ts";
@@ -145,23 +143,14 @@ export class PdHost {
   readonly #models = createModels();
   readonly #registry = createRegistry();
   #binding: PdBinding | null = null;
-  /**
-   * The object's one queue (`SerialQueue`): every harness's facade is opened on it, and `#ours` — the
-   * facade our own SQL goes through, never closed — shares it, so `exclusive`, `outside` and `apart` are
-   * ordered against whichever harness is open, or opens while they run.
-   */
-  readonly #queue = new SerialQueue();
-  readonly #ours: PiDurableSqlite;
-  /** The facade the open harness runs on. */
-  #db: PiDurableSqlite | null = null;
   #harness: Promise<Harness> | null = null;
   #driving: Promise<SettleResult> | null = null;
   #conversations = new Map<string, Promise<ConversationId>>();
   /** Sessions whose tools are installed in the registry, this isolate. */
   readonly #installed = new Set<string>();
-  /** The `ap` tables, written through whichever facade is in use (`#writer`). */
+  /** The `ap` tables. */
   readonly #ap: ApStore;
-  #ensured: Promise<ApStore> | null = null;
+  #ensured = false;
   /**
    * Jobs the provider's port started that no commit has recorded yet, id to request JSON. The commit that
    * records the job's poll checkpoint inserts its row (`bookCommit`); one that never lands leaves it here,
@@ -176,8 +165,7 @@ export class PdHost {
   constructor(opts: PdHostOptions) {
     this.#opts = opts;
     this.#now = opts.now ?? Date.now;
-    this.#ours = new PiDurableSqlite(opts.storage, PD, { queue: this.#queue });
-    this.#ap = new ApStore(opts.storage.sql, { exclusive: (fn) => this.exclusive(fn) }, AP);
+    this.#ap = new ApStore(opts.storage, AP);
   }
 
   get now(): number { return this.#now(); }
@@ -227,19 +215,10 @@ export class PdHost {
    */
   installTools(session: string, tools: Parameters<typeof toolsExtension>[1], clientTools: readonly ClientToolDef[] = []): string {
     const name = toolsExtensionName(session);
-    this.#registry.install(toolsExtension(name, tools, (fn) => this.apart(fn),
+    this.#registry.install(toolsExtension(name, tools,
       clientTools.length ? { defs: clientTools, port: { answer: (call, signal) => this.#clientAnswer(call, signal) } } : undefined));
     this.#installed.add(session);
     return name;
-  }
-
-  /**
-   * Async work of ours that writes the object's SQL — a tool call, an approval, a background poll — kept
-   * out of pi-durable's transactions (`PiDurableSqlite.apart`), whether or not a harness is open when it
-   * starts: one opened meanwhile waits for it too.
-   */
-  apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> {
-    return this.#ours.apart(fn);
   }
 
   extension(session: string) { return this.#registry.snapshot().extension(toolsExtensionName(session)); }
@@ -248,31 +227,15 @@ export class PdHost {
   async ensureSessions(): Promise<void> {
     const open = this.#binding?.openSession;
     if (!open) return;
-    const listed = (await (await this.#store()).query("SELECT task_id FROM conversations ORDER BY created_at"))
+    const listed = (await this.#store()).query("SELECT task_id FROM conversations ORDER BY created_at")
       .map((r) => String(r.task_id));
     for (const session of listed) if (!this.#installed.has(session)) await open(session);
   }
 
-  // ---- our own SQL, kept out of pi-durable's transactions --------------------
-
-  /** A synchronous unit of our SQL, as one transaction, after any pi-durable transaction open or queued (`PiDurableSqlite.exclusive`). */
-  exclusive<T>(fn: () => T): Promise<T> {
-    return this.#ours.exclusive(fn);
-  }
-
-  /** Synchronous SQL of ours that keeps its own atomicity, after any pi-durable transaction open or queued (`PiDurableSqlite.outside`). */
-  outside<T>(fn: () => T): Promise<T> {
-    return this.#ours.outside(fn);
-  }
-
   /** The `ap` store, its tables made on first use. */
-  #store(): Promise<ApStore> {
-    if (!this.#ensured) {
-      const ensuring = this.#ap.ensure().then(() => this.#ap);
-      this.#ensured = ensuring;
-      ensuring.catch(() => { if (this.#ensured === ensuring) this.#ensured = null; });
-    }
-    return this.#ensured;
+  async #store(): Promise<ApStore> {
+    if (!this.#ensured) { this.#ap.ensure(); this.#ensured = true; }
+    return this.#ap;
   }
 
   // ---- the harness ------------------------------------------------------------
@@ -283,8 +246,7 @@ export class PdHost {
     const opening = (async () => {
       // The commit hook writes the `ap` tables, so they exist before anything commits.
       await this.#store();
-      const db = new PiDurableSqlite(this.#opts.storage, PD, { queue: this.#queue });
-      this.#db = db;
+      const db = new PiDurableSqlite(this.#opts.storage, PD);
       const storage = await SqliteStorage.open(db, { onCommit: (exec, writes, seq) => this.#book(exec, writes, seq) });
       const h = await Harness.open(storage, {
         models: this.#models,
@@ -302,12 +264,12 @@ export class PdHost {
       }, bg);
       // Settle closes the harness when it parks; whoever asks next opens a fresh one.
       h.subscribeClose(() => {
-        if (this.#harness === opening) { this.#harness = null; this.#db = null; this.#staged.clear(); }
+        if (this.#harness === opening) { this.#harness = null; this.#staged.clear(); }
       });
       return h;
     })();
     this.#harness = opening;
-    opening.catch(() => { if (this.#harness === opening) { this.#harness = null; this.#db = null; } });
+    opening.catch(() => { if (this.#harness === opening) this.#harness = null; });
     return opening;
   }
 
@@ -323,7 +285,7 @@ export class PdHost {
     const binding = this.#binding;
     const booked = bookCommit(exec, writes, {
       owner: binding ? { tenantId: binding.tenantId, agentId: binding.agentId } : null,
-      now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap.direct(), staged: this.#staged,
+      now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
       ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
     });
     queueMicrotask(() => void this.#afterCommit(booked, seq));
@@ -333,10 +295,9 @@ export class PdHost {
     const next = this.#opts.storage.sql.exec(PD_NAMES.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq;
     if (!(Number(next) > seq)) return;
     this.#opts.onBooked?.(booked);
-    const ap = this.#ap.direct();
     for (const id of booked.jobs) {
       // The row is the proof: a commit that rolled back, whatever moved the sequence since, left none.
-      if (ap.run("SELECT 1 AS x FROM model_jobs WHERE id = ?", id).length === 0) continue;
+      if (this.#ap.query("SELECT 1 AS x FROM model_jobs WHERE id = ?", id).length === 0) continue;
       this.#staged.delete(id);
       await this.#dispatch(id);
     }
@@ -358,7 +319,7 @@ export class PdHost {
     if (!open) return;
     const h = await open.catch(() => null);
     if (h) await h.close(bg);
-    if (this.#harness === open) { this.#harness = null; this.#db = null; }
+    if (this.#harness === open) this.#harness = null;
   }
 
   /** Whether a harness is open in this isolate: what "no live timers" asks of a parked object. */
@@ -383,7 +344,7 @@ export class PdHost {
         session === MAIN_SESSION
           ? (await h.root(bg)).id
           : (await h.createConversation({ ownership: { kind: "ownerless" } }, bg)).id);
-      const row = await ap.openConversation({ taskId: session, tenantId, agentId, conversationId: id, createdAt: this.#now() });
+      const row = ap.openConversation({ taskId: session, tenantId, agentId, conversationId: id, createdAt: this.#now() });
       return row.conversationId as ConversationId;
     })();
     this.#conversations.set(session, made);
@@ -449,12 +410,12 @@ export class PdHost {
     const listener = () => { told = true; poke(); };
     waiters.add(listener);
     try {
-      let row = await ap.recordClientCall({ ...call, at: this.#now() });
+      let row = ap.recordClientCall({ ...call, at: this.#now() });
       this.#notifyClientCalls();
       for (;;) {
         signal?.throwIfAborted();
         if (row.state !== "pending") {
-          if (row.state === "answered") await ap.useClientCall(call.conversationId, call.callId);
+          if (row.state === "answered") ap.useClientCall(call.conversationId, call.callId);
           return { output: row.output ?? "", isError: row.isError };
         }
         if (!told) {
@@ -487,7 +448,7 @@ export class PdHost {
     const accepted: string[] = [];
     const notWaiting: string[] = [];
     for (const r of results) {
-      if (!(await ap.answerClientCall(conversationId, r.callId, { output: r.output, isError: r.isError }, this.#now()))) continue;
+      if (!ap.answerClientCall(conversationId, r.callId, { output: r.output, isError: r.isError }, this.#now())) continue;
       accepted.push(r.callId);
       const waiters = this.#clientWaiters.get(`${conversationId}:${r.callId}`);
       if (waiters?.size) for (const w of [...waiters]) w();
@@ -513,7 +474,7 @@ export class PdHost {
   async #dispatch(id: string): Promise<boolean> {
     try { await this.#bound().dispatch(id); }
     catch { return false; /* not marked, so the next sweep sends it */ }
-    await (await this.#store()).query("UPDATE model_jobs SET dispatched_at = ? WHERE id = ?", this.#now(), id);
+    (await this.#store()).query("UPDATE model_jobs SET dispatched_at = ? WHERE id = ?", this.#now(), id);
     return true;
   }
 
@@ -521,16 +482,16 @@ export class PdHost {
   async #sweep(limit = 20): Promise<number> {
     if (!this.#binding) return 0;
     const now = this.#now();
-    const ids = (await (await this.#store()).query(
+    const ids = (await this.#store()).query(
       "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
-      now - REDELIVERY_MS, limit)).map((r) => String(r.id));
+      now - REDELIVERY_MS, limit).map((r) => String(r.id));
     let sent = 0;
     for (const id of ids) if (await this.#dispatch(id)) sent++;
     return sent;
   }
 
   async #pollJob(id: string): Promise<Answered | null> {
-    const [row] = await (await this.#store()).query("SELECT answer FROM model_jobs WHERE id = ?", id);
+    const [row] = (await this.#store()).query("SELECT answer FROM model_jobs WHERE id = ?", id);
     const answer = row?.answer;
     this.#opts.onPoll?.(id, typeof answer === "string");
     // `readAnswer` refuses what nothing that writes this row can produce (a stored `aborted`, a non-assistant).
@@ -545,17 +506,16 @@ export class PdHost {
   async #dropJob(id: string): Promise<void> {
     this.#staged.delete(id);
     const owner = this.#bound();
-    await this.#store();
-    const ap = this.#ap.direct();
+    const ap = await this.#store();
     this.#opts.storage.transactionSync(() => {
-      const [row] = ap.run("UPDATE model_jobs SET state = 'cancelled' WHERE id = ? AND state IS NULL RETURNING answer", id);
+      const [row] = ap.query("UPDATE model_jobs SET state = 'cancelled' WHERE id = ? AND state IS NULL RETURNING answer", id);
       if (row && typeof row.answer === "string") appendUsage(this.#opts.storage.sql as never, strandedAnswerRows(owner, this.#now(), row.answer));
     });
   }
 
   /** The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice. */
   async takeJob(id: string): Promise<unknown> {
-    const [row] = await (await this.#store()).query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
+    const [row] = (await this.#store()).query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
     if (!row) throw this.#bound().unknownJob(id);
     return row.answer === null && row.state === null ? JSON.parse(String(row.request)) : null;
   }
@@ -568,16 +528,15 @@ export class PdHost {
     const json = JSON.stringify(answer);
     const now = this.#now();
     const owner = this.#bound();
-    await this.#store();
-    const ap = this.#ap.direct();
+    const ap = await this.#store();
     // One statement decides it, so two deliveries cannot both see the row unanswered.
     const won = this.#opts.storage.transactionSync(() => {
-      const [row] = ap.run("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING state", json, now, id);
+      const [row] = ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING state", json, now, id);
       if (row?.state === "cancelled") appendUsage(this.#opts.storage.sql as never, strandedAnswerRows(owner, now, json));
       return row !== undefined;
     });
     if (won) return true;
-    if (ap.run("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length === 0) throw owner.unknownJob(id);
+    if (ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length === 0) throw owner.unknownJob(id);
     return false;
   }
 }
@@ -833,7 +792,7 @@ export class DurableAgent implements AgentEngine {
       if (ap.pendingClientCalls(id).some((r) => r.name !== "")) return false;
       if (inspection.tasks.some((t) => t.record.conversationId === id && !t.record.background)) return false;
       const resumed = await this.#resumeLeftCalls(await this.#host.handle(h, id), answered);
-      if (resumed) await ap.query("DELETE FROM client_calls WHERE conversation_id = ? AND (name != '' OR state = 'used')", id);
+      if (resumed) ap.query("DELETE FROM client_calls WHERE conversation_id = ? AND (name != '' OR state = 'used')", id);
       return resumed;
     });
   }
@@ -969,67 +928,10 @@ export class DurableAgent implements AgentEngine {
 /**
  * The engine recorded for this object, read without creating anything: an object with no `ap_meta`
  * table (every object made before the choice existed) is `pi085`'s and is left exactly as it was.
- * A plain read, not through `exclusive`: it writes nothing, so joining an open transaction cannot
- * lose anything, and it is asked before any harness of this object exists.
  */
 export function recordedEngine(sql: DurableSqlHost["sql"]): "pi085" | "pd" | null {
   const meta = AP.qualify("meta", "table");
   if (sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", meta).toArray().length === 0) return null;
-  const readOnly = { exclusive: () => Promise.reject(new Error("recordedEngine only reads")) };
-  return new ApStore(sql as ConstructorParameters<typeof ApStore>[0], readOnly, AP).engine();
-}
-
-/**
- * The object's storage, with a check on the hazard `PiDurableSqlite` describes: while a pi-durable
- * transaction is open it is a savepoint over the one connection, and any other write joins it and is
- * rolled back with it. Every write made while one is open that does not address pi-durable's own `pd_`
- * objects is recorded in `joined` (pi-durable's own statements, all rewritten to `pd_` names, are not),
- * and so is a `transactionSync` begun while one is open, which is a unit of ours nested inside it.
- *
- * A statement that changed nothing is not one: what a rollback can lose is a change, so a statement
- * that failed (an `ALTER` that finds its column already there), a `CREATE ... IF NOT EXISTS` of a name
- * that exists and a `DROP ... IF EXISTS` of one that does not are not recorded. Any other write is,
- * whether or not it matched a row, since that cannot be told from here.
- *
- * `throwOnJoin` also throws, after the statement ran, at the caller that issued it, so a test names
- * the write rather than counting it. Off, it only records: a throw inside someone else's transaction
- * surfaces as whatever that transaction's owner does with it, not as the write. For tests: assert
- * `joined` is empty.
- */
-export function guardJoinedWrites(storage: DurableSqlHost, opts: { throwOnJoin?: boolean } = {}): DurableSqlHost & { readonly joined: string[] } {
-  let open = 0;
-  const joined: string[] = [];
-  const exists = (name: string) =>
-    storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name = ?", name).toArray().length > 0;
-  const noOp = (query: string) => {
-    const create = /^\s*CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+IF\s+NOT\s+EXISTS\s+"?(\w+)"?/i.exec(query);
-    if (create) return exists(create[1]!);
-    const drop = /^\s*DROP\s+(?:TABLE|INDEX)\s+IF\s+EXISTS\s+"?(\w+)"?/i.exec(query);
-    if (drop) return !exists(drop[1]!);
-    return false;
-  };
-  const join = (what: string) => {
-    joined.push(what);
-    if (opts.throwOnJoin) throw new Error(`joined write: a write of ours ran inside an open pi-durable transaction: ${what}`);
-  };
-  return {
-    joined,
-    sql: {
-      exec(query, ...bindings) {
-        const write = open > 0 && /^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i.test(query) && !/\bpd_/.test(query);
-        const changes = write && !noOp(query);
-        const result = storage.sql.exec(query, ...bindings);
-        if (changes) join(query.replace(/\s+/g, " ").slice(0, 160));
-        return result;
-      },
-    },
-    async transaction(closure) {
-      open++;
-      try { return await storage.transaction(closure); } finally { open--; }
-    },
-    transactionSync: (closure) => {
-      if (open > 0) join("transactionSync: a unit of ours begun inside an open pi-durable transaction");
-      return storage.transactionSync(closure);
-    },
-  };
+  const readOnly = { sql: sql as ApSqlHost["sql"], transactionSync: (): never => { throw new Error("recordedEngine only reads"); } };
+  return new ApStore(readOnly, AP).engine();
 }

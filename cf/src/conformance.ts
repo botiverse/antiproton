@@ -17,11 +17,10 @@
  * database the same way (test/control-plane-d1.sh prepares it).
  *
  * /pi-durable runs pi-durable's conformance and our facade's cases
- * (test/spec/pi-durable-spec.ts) on this object's storage, through the async
- * `transaction` node can only imitate (test/pi-durable-do.sh).
+ * (test/spec/pi-durable-spec.ts) on this object's storage (test/pi-durable-do.sh).
  *
- * /ap-store runs the `ap` namespace's cases and `PiDurableSqlite.exclusive`'s
- * (test/spec/ap-store-spec.ts) on this object's storage (test/ap-store-do.sh).
+ * /ap-store runs the `ap` namespace's cases (test/spec/ap-store-spec.ts) on this object's storage
+ * (test/ap-store-do.sh).
  *
  * /durable-drive runs the park contract's cases (test/spec/durable-drive-spec.ts):
  * a pi-durable harness on that facade, closed while it sleeps and reopened, on
@@ -36,8 +35,8 @@
  * same storage, and the jobs' crash, cancel and rollback cases (test/pd-outbox-do.sh).
  *
  * /pd-writes runs the runtime's writes on a pd object (test/spec/pd-writes-spec.ts): an approval, an
- * expired question, a model binding, a background pass and the idle lease, each started inside an open
- * pi-durable commit, none joining it (test/pd-writes-do.sh).
+ * expired question, a model binding, a background pass and the idle lease, each started as a pi-durable
+ * commit ends (test/pd-writes-do.sh).
  *
  * /pd-tools runs the tool parity cases (test/spec/pd-tools-spec.ts): the same scripted model against
  * PiAgent and DurableAgent, each over the real gateway on this object's storage (test/pd-tools-do.sh).
@@ -194,10 +193,7 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     const results = await runDriveCases(pdWritesCases(async (use) => {
       wipe();
       try { await use(host); } finally { wipe(); }
-    // No timer inside the commit: a sleep there intermittently never fired under `wrangler dev`, and the
-    // object was reset after 30 s (measured 2026-10-02, 1 run in 3 of one case). The cases still start
-    // their write inside the open commit, which is what each checks.
-    }, { slowCommitMs: 0 }).filter((c) => c.name.includes(only)));
+    }).filter((c) => c.name.includes(only)));
     return {
       backend: "durable-object",
       ms: Date.now() - t0,
@@ -218,7 +214,7 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     const results = await runDriveCases(pdToolsCases(async (use) => {
       wipe();
       try { await use(host); } finally { wipe(); }
-    }, { slowCommitMs: 0 }));
+    }));
     return {
       backend: "durable-object",
       ms: Date.now() - t0,
@@ -239,7 +235,7 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     const results = await runDriveCases(pdCancelCases(async (use) => {
       wipe();
       try { await use(host); } finally { wipe(); }
-    }, { slowCommitMs: 0 }));
+    }));
     return {
       backend: "durable-object",
       ms: Date.now() - t0,

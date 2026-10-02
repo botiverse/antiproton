@@ -10,7 +10,6 @@ import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { ApStore } from "../src/store/ap-store.ts";
-import { PiDurableSqlite } from "../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { appendUsage } from "../src/usage/outbox.ts";
 import { appendTrace } from "../src/trace/outbox.ts";
@@ -79,9 +78,9 @@ const T = "t", A = "a";
 async function object(opts: { pd?: boolean } = {}) {
   const raw = sqliteHost();
   if (opts.pd) {
-    const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
-    await ap.ensure();
-    await ap.setEngineOnce("pd");
+    const ap = new ApStore(raw, prefixedNamespace("ap"));
+    ap.ensure();
+    ap.setEngineOnce("pd");
   }
   const db = d1();
   const jobs: string[] = [];
@@ -89,7 +88,7 @@ async function object(opts: { pd?: boolean } = {}) {
   const state = { alarmAt: null as number | null, sets: 0 };
   const ctx = {
     storage: {
-      sql: raw.sql, transaction: raw.transaction, transactionSync: raw.transactionSync,
+      sql: raw.sql, transactionSync: raw.transactionSync,
       getAlarm: async () => state.alarmAt,
       setAlarm: async (at: number) => { state.alarmAt = at; state.sets++; },
       deleteAlarm: async () => { state.alarmAt = null; },

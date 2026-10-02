@@ -37,7 +37,7 @@ import { logEvent } from "../core/log.ts";
 import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
 import { appendUsage, modelTokenRows, type UsageRow } from "../usage/outbox.ts";
-import type { ApUnit } from "../store/ap-store.ts";
+import type { ApStore } from "../store/ap-store.ts";
 
 /** The counters a usage row bills (`modelTokenRows`). */
 const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning"] as const;
@@ -56,7 +56,7 @@ export interface BookContext {
   /** The object's connection, for the outbox tables; inside the commit's transaction. */
   raw: Raw;
   /** The `ap` tables on the same connection, inside the same transaction. */
-  ap: ApUnit;
+  ap: Pick<ApStore, "query">;
   /** Jobs the provider's port started and no commit has recorded yet: id to request JSON. */
   staged: ReadonlyMap<string, string>;
   /** A test seam, called last inside the transaction: a throw rolls the whole commit back. */
@@ -175,7 +175,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
 
   // Model jobs: recorded by the batch whose poll checkpoint carries the handle.
   for (const job of pollHandles(writes, ctx.staged)) {
-    ctx.ap.run("INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+    ctx.ap.query("INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
       job.id, Number.isSafeInteger(job.conversationId) ? job.conversationId : null, ctx.staged.get(job.id)!, ctx.now);
     booked.jobs.push(job.id);
   }
@@ -188,7 +188,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
   for (const m of messages) {
     if (typeof m.provider === "string" && typeof m.model === "string") named.set(`${m.provider}/${m.model}`, m.model);
     if (typeof m.jobId !== "string") continue;
-    const row = ctx.ap.run("SELECT state, answer, created_at, answered_at FROM model_jobs WHERE id = ?", m.jobId)[0];
+    const row = ctx.ap.query("SELECT state, answer, created_at, answered_at FROM model_jobs WHERE id = ?", m.jobId)[0];
     if (!row) continue;
     jobs.set(m.jobId, row as { created_at: unknown; answered_at: unknown });
     if (row.state === "cancelled" && row.answer !== null) {
@@ -196,7 +196,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
       logEvent("pd.jobs.consumed_after_cancel", { ...(ctx.owner ?? {}), jobId: m.jobId });
       continue;
     }
-    ctx.ap.run("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL", m.jobId);
+    ctx.ap.query("UPDATE model_jobs SET state = 'consumed' WHERE id = ? AND state IS NULL", m.jobId);
     booked.consumed.push(m.jobId);
   }
 

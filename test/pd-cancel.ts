@@ -9,10 +9,9 @@ import { AgentRuntime } from "../cf/src/runtime.ts";
 import { CANCELLED_NOTE, sessionTranscript } from "../cf/src/agents-api/transcript.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../src/model/types.ts";
-import { DurableAgent, guardJoinedWrites } from "../src/runtime/durable-agent.ts";
+import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
-import { PiDurableSqlite, type DurableSqlHost } from "../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
@@ -28,42 +27,23 @@ const WEATHER = { name: "get_weather", description: "weather for a city", parame
 type Job = { model: { api: string; provider: string; id: string }; context: Parameters<typeof toRequest>[0] };
 
 /**
- * One Agents API agent on an AgentRuntime over node:sqlite, its object recording `engine`, every write guarded
- * (`guardJoinedWrites`). `pass()` is what AgentDO's alarm does: one `step`, then the model's queue answers what it
- * dispatched from `script`; it returns the step's outcome.
+ * One Agents API agent on an AgentRuntime over node:sqlite, its object recording `engine`. `pass()` is what
+ * AgentDO's alarm does: one `step`, then the model's queue answers what it dispatched from `script`; it returns the
+ * step's outcome. `holdNext()` resolves `reached` as the next pi-durable commit ends (`afterPdCommits`).
  */
 async function apiAgent(engine: "pi085" | "pd") {
   const raw = sqliteHost();
-  /**
-   * The next pi-durable transaction opened after `holdNext()`: one that spans awaits is held open, before its work,
-   * until released; a synchronous one cannot be held, and reports `reached` as it ends (`afterPdCommits`).
-   */
-  let held: { reached: () => void; released: Promise<void> } | null = null;
-  const holding: DurableSqlHost = afterPdCommits({
-    sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
-    transaction: (cb) => raw.transaction(async () => {
-      const h = held;
-      held = null;
-      if (h) { h.reached(); await h.released; }
-      return cb();
-    }),
-  }, () => { const h = held; held = null; h?.reached(); });
-  const holdNext = () => {
-    let reached!: () => void, release!: () => void;
-    const at = new Promise<void>((r) => { reached = r; });
-    held = { reached, released: new Promise<void>((r) => { release = r; }) };
-    return { reached: at, release };
-  };
-  const guarded = guardJoinedWrites(holding, { throwOnJoin: true });
-  const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
+  let reachedNext: (() => void) | null = null;
+  const host = afterPdCommits(raw, () => { const r = reachedNext; reachedNext = null; r?.(); });
+  const holdNext = () => ({ reached: new Promise<void>((r) => { reachedNext = r; }) });
   if (engine === "pd") {
-    const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));
-    await ap.ensure();
-    await ap.setEngineOnce("pd");
+    const ap = new ApStore(raw, prefixedNamespace("ap"));
+    ap.ensure();
+    ap.setEngineOnce("pd");
   }
   const sent: string[] = [];
   const rt = new AgentRuntime({
-    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync, transaction: host.transaction } },
+    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
     operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
@@ -114,11 +94,11 @@ async function apiAgent(engine: "pi085" | "pd") {
       items: items.map(({ id: _i, turn_id: _t, ...rest }) => show(rest)),
     };
   };
-  return { rt, agent, sent, requests, replies, settle, view, holdNext, joined: guarded.joined, dispose: () => raw.dispose() };
+  return { rt, agent, sent, requests, replies, settle, view, holdNext, dispose: () => raw.dispose() };
 }
 
 const runtimeCases: DriveCase[] = [{
-  group: "runtime", name: "through AgentRuntime: cancel a running turn, cancel on idle, a client call round trip — the same Agents API reading and model requests on both engines, no joined write",
+  group: "runtime", name: "through AgentRuntime: cancel a running turn, cancel on idle, a client call round trip — the same Agents API reading and model requests on both engines",
   run: async () => {
     const out: Record<string, { views: unknown[]; requests: unknown[]; cancelled: Array<string | null> }> = {};
     for (const engine of ["pi085", "pd"] as const) {
@@ -155,7 +135,6 @@ const runtimeCases: DriveCase[] = [{
         a.replies.push(() => ({ text: "21 degrees", finishReason: "stop", truncated: false, usage: USAGE }));
         await a.settle();
         views.push(await a.view());
-        check(a.joined.length === 0, `${engine}: ${a.joined.length} writes joined an open pi-durable transaction: ${show(a.joined.slice(0, 5))}`);
         out[engine] = { views, cancelled, requests: a.requests.map((r) => r.messages.filter((m) => m.role !== "system")) };
         await a.agent.close();
       } finally { a.dispose(); }
@@ -182,33 +161,27 @@ const runtimeCases: DriveCase[] = [{
 }];
 
 /**
- * `submitToolResults` and `cancelSession` on a pd object, with a pi-durable commit held open across the writes each
- * makes after its engine call. `answerClientCalls` is wrapped to return only once a commit (a message to another
- * session) is open and held, and `dropClientCalls` to start only then; the writes that follow are issued inside it,
- * and must wait for it (`#ownWrite`, `exclusive`). The commit is let go 100 ms later. The guard
- * throws on any write that joins.
+ * `submitToolResults` and `cancelSession` on a pd object, each with another session's message committing in the
+ * middle: `answerClientCalls` is wrapped to return only once that commit has ended, and `dropClientCalls` to start
+ * only then. The result is kept and the turn cancelled all the same.
  */
 runtimeCases.push({
-  group: "runtime", name: "pd: the writes after a caller's result and after a cancel, issued while a pi-durable commit is held open, join nothing",
+  group: "runtime", name: "pd: a caller's result and a cancel, with another session's commit landing between their writes",
   run: async () => {
     const a = await apiAgent("pd");
     try {
       let posting: Promise<unknown> = Promise.resolve();
       let opened = 0;
-      /** Open a commit and hold it for 100 ms; resolves once it is open. */
+      /** Post to another session; resolves once its commit has ended. */
       const holdOne = async (what: string) => {
         const hold = a.holdNext();
         posting = a.rt.postMessage("t", "a", `meanwhile, after ${what}`, "prompt", "s9");
         await hold.reached;
         opened++;
-        setTimeout(hold.release, 100);
       };
       const engine = a.agent as DurableAgent;
       const answer = engine.answerClientCalls.bind(engine);
       engine.answerClientCalls = async (results) => { await answer(results); await holdOne("the results"); };
-      // On the cancel path the runtime's first write (`ensureAgentTables` through `#ownWrite`) would itself wait out a
-      // commit held from `cancel`, and every write after it with it; held from just before the drop, the drop's own
-      // write is the one issued inside.
       const drop = engine.dropClientCalls.bind(engine);
       engine.dropClientCalls = async () => { await holdOne("the cancel"); return drop(); };
 
@@ -228,20 +201,18 @@ runtimeCases.push({
       const out = await a.rt.cancelSession("t", "a");
       await posting;
       check(typeof out.cancelledTurn === "string", `nothing was cancelled: ${show(out)}`);
-      check(opened === 2, `control: ${opened} commits were held, not 2`);
-      check(a.joined.length === 0, `${a.joined.length} writes joined an open pi-durable transaction: ${show(a.joined.slice(0, 5))}`);
+      check(opened === 2, `control: ${opened} commits landed between the writes, not 2`);
       await a.agent.close();
     } finally { a.dispose(); }
   },
 });
 
 const only = process.argv[2];
-// Twice: with each pi-durable commit held open 5 ms (the widest window for a write to join it), and as is.
 const results = await runDriveCases([
-  ...[5, 0].flatMap((slowCommitMs) => pdCancelCases(async (use) => {
+  ...pdCancelCases(async (use) => {
     const host = sqliteHost();
     try { await use(host); } finally { host.dispose(); }
-  }, { slowCommitMs }).map((c) => ({ ...c, group: `${c.group}${slowCommitMs ? ", slow commits" : ""}` }))),
+  }),
   ...runtimeCases,
 ].filter((c) => !only || c.name.includes(only))
   // PD_TRACE=1 names each case as it starts: a case that hangs is otherwise silent until the whole run is killed.

@@ -225,17 +225,16 @@ await check("readPdEntries reads what DurableAgent.entries() returns, and writes
 await check("a read scheduled from inside a pi-durable commit that fails after writing an entry never sees that entry", async () => {
   // pi-durable commits in one synchronous transaction (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js):
   // there is no moment in which a read can run inside it. So a commit that has written an entry is made to fail,
-  // and two reads are scheduled from inside it, before the throw: a direct one, and one through
-  // `afterPdTransactions` (what adminTranscript, diagnose and uiVersion use). Both run after the rollback.
+  // and a read (what adminTranscript, diagnose and uiVersion make) is scheduled from inside it, before the throw.
+  // It runs after the rollback.
   const host = sqliteHost();
   const rawSync = host.transactionSync.bind(host);
   let hold = false;
   let inside = -1;
-  let reads: Promise<[unknown, unknown]> | null = null;
+  let reads: Promise<unknown> | null = null;
   const count = () => Number(host.sql.exec("SELECT COUNT(*) AS n FROM pd_entries").toArray()[0]!.n);
   const read = () => ({ n: readPdEntries(host.sql, "main").length, v: pdVersion(host.sql, "main"),
     events: readTranscript(host.sql, "demo", "u-a", "t_u-a")!.events.length });
-  let rt!: Awaited<ReturnType<typeof converse>>["rt"];
   try {
     // Before the runtime is made: it keeps the host's methods it was given.
     (host as { transactionSync: typeof rawSync }).transactionSync = (closure) => rawSync(() => {
@@ -244,27 +243,23 @@ await check("a read scheduled from inside a pi-durable commit that fails after w
       if (hold && count() > before) {
         hold = false;
         inside = count();
-        reads = new Promise<[unknown, unknown]>((resolve, reject) => queueMicrotask(() => {
-          const direct = read();
-          Promise.resolve(rt.afterPdTransactions(read)).then((routed) => resolve([direct, routed]), reject);
-        }));
+        reads = new Promise<unknown>((resolve) => queueMicrotask(() => resolve(read())));
         throw new Error("injected commit failure");
       }
       return out;
     });
-    ({ rt } = await converse(host, "pd", [SCRIPT[0]!]));
+    const { rt } = await converse(host, "pd", [SCRIPT[0]!]);
     const committed = read();
     assert(committed.n === 2, `before: ${show(committed)}`);
     const rows = count();
     hold = true;
     const driving = rt.postMessage("demo", "u-a", "rolled back").catch(() => "failed");
     for (let i = 0; i < 500 && reads === null; i++) await new Promise((r) => setTimeout(r, 10));
-    const scheduled = reads as Promise<[unknown, unknown]> | null;
+    const scheduled = reads as Promise<unknown> | null;
     assert(scheduled !== null, "no pi-durable transaction wrote an entry, so nothing was failed");
     assert(inside > rows, `control: inside the commit pd_entries held ${inside} rows, no more than the ${rows} committed`);
-    const [direct, routed] = await scheduled;
-    assert(show(direct) === show(committed), `the direct read: ${show(direct)}, committed: ${show(committed)}`);
-    assert(show(routed) === show(committed), `the routed read: ${show(routed)}, committed: ${show(committed)}`);
+    const direct = await scheduled;
+    assert(show(direct) === show(committed), `the read: ${show(direct)}, committed: ${show(committed)}`);
     await driving;
     assert(show(read()) === show(committed), `after the rollback: ${show(read())}`);
     assert(count() === rows, `after the rollback pd_entries holds ${count()} rows, not ${rows}`);
