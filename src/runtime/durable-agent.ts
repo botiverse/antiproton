@@ -52,7 +52,7 @@ import { settle, type SettleResult } from "./durable-drive.ts";
 import { toolsExtension } from "./durable-tools.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
 import { projectEntries } from "./pd-transcript.ts";
-import type { AgentEngine, EngineEntry, EngineEntryScan, EngineStatus, StepOutcome } from "./engine.ts";
+import { CompactionUnavailable, type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
 const PD = prefixedNamespace("pd");
 const AP = prefixedNamespace("ap");
@@ -579,7 +579,7 @@ export class DurableAgent implements AgentEngine {
 
   compact(): Promise<unknown> {
     // No step owns this yet: see `compaction: { enabled: false }` in PdHost.harness for why it cannot work today.
-    return Promise.reject(new Error("compact is not supported on the pd engine yet: pi-durable's compaction calls the model without deferral, which the offloaded provider cannot answer"));
+    return Promise.reject(new CompactionUnavailable("compact is not supported on the pd engine yet: pi-durable's compaction calls the model without deferral, which the offloaded provider cannot answer"));
   }
 
   /**

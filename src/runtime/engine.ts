@@ -27,6 +27,16 @@ export interface StepOutcome {
   settled: Array<{ operationId: string; status: string }>;
 }
 
+/**
+ * An engine that cannot compact says so with this, and nothing is written: no
+ * operation, no entry, no model job. The caller turns it into a refusal its own
+ * caller can read (cf/src/index.ts `uiCompact`), not a 500. The class does not
+ * survive a Durable Object RPC boundary, so it is caught on the object's side.
+ */
+export class CompactionUnavailable extends Error {
+  override name = "CompactionUnavailable";
+}
+
 /** What the debugging endpoints show. `detail` is the engine's own record, passed through unread. */
 export interface EngineStatus {
   running: boolean;

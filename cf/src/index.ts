@@ -70,6 +70,7 @@ import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
+import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
 import { busySpans, countActiveTime, unionMs, type ActivitySpan } from "../../src/usage/active.ts";
 import { countHeldTime } from "../../src/usage/container.ts";
@@ -1849,11 +1850,12 @@ export class AgentDO extends DurableObject<Env> {
   async uiCompact(tenantId: string, agentId: string, taskId: string) {
     this.#claim(tenantId, agentId);
     const session = await this.#conversation(tenantId, agentId, taskId);
-    return this.#busy("uiCompact", async () => {
+    // A refusal comes back as a value, not a throw: see cf/src/compact-refusal.ts.
+    return this.#busy("uiCompact", () => refusingCompaction(async () => {
       const r = await this.runtime().requestCompaction(tenantId, agentId, session);
       await this.#wake();
       return r;
-    });
+    }));
   }
 
   async uiSay(
@@ -3409,7 +3411,8 @@ async function route(request: Request, env: Env): Promise<Response> {
           const a = String(url.searchParams.get("agentId"));
           const k = url.searchParams.get("taskId") ?? `t_${a}`;
           const s2 = env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a)));
-          return Response.json(await s2.uiCompact(t, a, k));
+          const r = await s2.uiCompact(t, a, k);
+          return compactionRefusal(r, "json") ?? Response.json(r);
         }
         case "/admin/rename-mount": {
           // Renaming a mount is an operator act, not something an agent or a
@@ -3782,7 +3785,8 @@ async function route(request: Request, env: Env): Promise<Response> {
           const form = await formOf(request);
           if (!form) return new Response("expected a form body", { status: 400 });
           const taskId = String(form.get("taskId") ?? "") || `t_${agentId}`;
-          await stub.uiCompact(gate.tenantId, agentId, taskId);
+          const refused = compactionRefusal(await stub.uiCompact(gate.tenantId, agentId, taskId), "text");
+          if (refused) return refused;
           const t = await stub.uiTranscript(gate.tenantId, agentId, taskId);
           return html(trajectory(conversation(t.events), t.byOp, t.busy));
         }

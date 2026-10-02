@@ -35,6 +35,7 @@
     "test/admin-transcript.ts",
     "test/transcript-read.ts",
     "test/admin-diagnose.ts",
+    "test/pi-compaction.ts",
     "test/diagnose-read.ts",
     "test/credential-writers.ts",
     "test/trace-drain.ts",
