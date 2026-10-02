@@ -84,6 +84,46 @@ export function checkUrl(
   return { ok: true, url };
 }
 
+/** `{{name}}` in a header value: where a secret the agent kept is filled in. */
+const SECRET_SLOT = /\{\{([^}]*)\}\}/;
+
+/**
+ * The value of a secret the agent kept, read once per request and remembered
+ * in `kept` so the same name costs one read and `hideSecrets` knows every value
+ * that went out. A name with no secret behind it is the agent's to fix, so the
+ * message says how.
+ */
+export async function keptSecret(name: string, kept: Map<string, string>, ctx: Pick<PluginContext, "agentSecret">): Promise<string> {
+  const have = kept.get(name);
+  if (have !== undefined) return have;
+  const value = await ctx.agentSecret(name);
+  if (value === null) throw new Error(`no secret named ${name}; keep one with secret_put, or see secret_list`);
+  kept.set(name, value);
+  return value;
+}
+
+/**
+ * Text with every `{{name}}` replaced by the secret the agent kept under that
+ * name, resolved server-side at the moment of the request. Most services want
+ * `Bearer <key>` and what an agent keeps is the bare key, which is why this is
+ * a template and not a name.
+ */
+export async function fillSecrets(spec: string, kept: Map<string, string>, ctx: Pick<PluginContext, "agentSecret">): Promise<string> {
+  for (const m of spec.matchAll(new RegExp(SECRET_SLOT.source, "g"))) await keptSecret(m[1]!.trim(), kept, ctx);
+  return spec.replace(new RegExp(SECRET_SLOT.source, "g"), (_, n: string) => kept.get(n.trim())!);
+}
+
+/**
+ * Every verbatim appearance of a value in `kept` replaced with its name. Only
+ * verbatim: a server that encodes the value (URL, JSON escapes, base64) is not
+ * recognised, so this narrows the leak and does not close it. Values shorter
+ * than four characters are left alone, or every `a` in a page would be a secret.
+ */
+export function hideSecrets(text: string, kept: Map<string, string>): string {
+  return [...kept].reduce(
+    (t, [name, value]) => (value.length >= 4 ? t.split(value).join(`[secret ${name}]`) : t), text);
+}
+
 /**
  * HTML in, readable text out.
  *
@@ -281,19 +321,11 @@ export const httpPlugin: Plugin = {
     const secret: Record<string, { as: string; value: string }> = {};
     for (const [header, spec] of Object.entries(a.secretHeaders ?? {})) {
       if (typeof spec !== "string") throw new Error(`secretHeaders.${header} must be the name of a secret you kept, or text with {{name}} in it`);
-      const names = spec.includes("{{") ? [...spec.matchAll(/\{\{([^}]*)\}\}/g)].map((m) => m[1]!.trim()) : [spec];
-      if (!names.length) throw new Error(`secretHeaders.${header} has no {{name}} in it`);
-      for (const name of names) {
-        if (kept.has(name)) continue;
-        const value = await ctx.agentSecret(name);
-        if (value === null) throw new Error(`no secret named ${name}; keep one with secret_put, or see secret_list`);
-        kept.set(name, value);
-      }
-      const value = spec.includes("{{") ? spec.replace(/\{\{([^}]*)\}\}/g, (_, n: string) => kept.get(n.trim())!) : kept.get(spec)!;
+      if (spec.includes("{{") && !SECRET_SLOT.test(spec)) throw new Error(`secretHeaders.${header} has no {{name}} in it`);
+      const value = spec.includes("{{") ? await fillSecrets(spec, kept, ctx) : await keptSecret(spec, kept, ctx);
       secret[header.toLowerCase()] = { as: spec, value };
     }
-    const hide = (text: string) => [...kept].reduce(
-      (t, [name, value]) => (value.length >= 4 ? t.split(value).join(`[secret ${name}]`) : t), text);
+    const hide = (text: string) => hideSecrets(text, kept);
     const hideHeaders = (h: Record<string, string>) =>
       Object.fromEntries(Object.entries(h).map(([k, v]) => [k, hide(v)]));
     let target = String(a.url ?? "");

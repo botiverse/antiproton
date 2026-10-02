@@ -289,6 +289,45 @@ cancel }`. The handle is stored as given, so it must never carry a credential.
 must actually have stopped; if the plugin cannot confirm that, it throws.
 Swallowing that failure reports a cancellation that did not happen.
 
+**A plugin whose tools come from a server lists them per mount.** Declare
+`tools: []`, `mountTools(mount)` and `snapshotTools(ctx)` (`mcp.ts` is the
+one that does). `snapshotTools` asks the server and is called only when the
+mount is added (`/admin/mounts`) and when an operator asks for a refresh
+(`POST /admin/mounts {tenantId, agentId, refreshTools: alias}`) — never on a
+wake, a harness build or a call. The kernel admits the list (names an agent
+can address, each once; `reads` dropped; anything unrecognised made a write;
+every tool `replay: "never"`; at most `MAX_SNAPSHOT_TOOLS` tools, each within a
+description and a schema bound, all within a total — the constants and their
+reasons are in `src/runtime/mount-tools.ts`, and a tool over a bound is skipped
+with the reason, never shortened), hashes it and keeps it on the mount record
+as its `ToolSnapshot`, replacing it only when the hash moved. A list that
+cannot be fetched or cannot be stored leaves the mount as it was and is
+reported to the operator who asked. `mountTools` reads that record and must not reach the
+server. Every reader that is about one mount — the catalogue, the gateway,
+`tools.search`/`describe`, the console's tool column — asks `toolsOf(plugin,
+mount)`, never `plugin.tools`, so they all see one list. Names the kernel left
+out are in the snapshot's `skipped`, shown on the mount's console page and in
+`tools.mounts`. The version pin is still the plugin's `version`: a snapshot
+changes what a mount offers, not which code runs it.
+
+**`replay: "never"` overrides the read rule.** A tool that declares it is not
+run again on its own after an interruption, even when it is a read
+(`replayPolicy` asks it first). Declare it on a read whose claim to be harmless
+is not yours to make; the kernel sets it on every tool a server listed, because
+a remote `readOnlyHint` is that server's word, not reviewed code.
+
+**Bound a number, shape a header list.** A `number` setting can carry `min` and
+`max`; a value outside them is refused when the mount is written, as everything
+in `validateMount` is — refused, not clamped, so the person writing it learns
+the limit. A `string[]` of HTTP headers takes `format: "header-lines"`
+(`headerLines` in `src/plugins/types.ts`): `"Name: value"` lines, no header the
+client writes itself, and no credential written out. A setting is public, so a
+value with no `{{name}}` slot is refused under a header that carries a
+credential by convention (`Authorization`, `Cookie`, `X-Api-Key`, …) or when it
+reads as `Bearer …`/`Basic …`/`Token …` under any name; keep the value as a
+secret and write `Bearer {{name}}`. Read the value through the same function at
+call time, so a value stored before a rule existed is refused there too.
+
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.
 
@@ -693,6 +732,7 @@ it distinguishes comes from a single plugin (`test/mount-config.ts`). Run
 | What an agent is holding, and the three sentences saying so | `src/runtime/held.ts`, `test/held.ts` |
 | When an idle resource is taken, and the warning | `src/runtime/idle-lease.ts`, `test/idle-lease.ts` |
 | Examples | `src/plugins/demo.ts`, `http.ts`, `github.ts` |
+| Tools a mount learns from a server | `src/plugins/mcp.ts`, `src/runtime/mount-tools.ts`, `test/mcp-plugin.ts` |
 | Settings and activity tests | `test/mount-config.ts` |
 | Version and plugin-id refusals | `test/mount-pin.ts` |
 | Pushed events: limits and statuses | `src/runtime/inbound.ts` |

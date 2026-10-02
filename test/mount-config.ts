@@ -21,6 +21,7 @@ import { statePlugin } from "../src/plugins/state.ts";
 import { builtinToolsPlugin } from "../src/plugins/builtin.ts";
 import { artifactsPlugin } from "../src/plugins/artifacts.ts";
 import { raftPlugin } from "../src/plugins/raft.ts";
+import { mcpPlugin } from "../src/plugins/mcp.ts";
 import { appworldPlugins, type Catalogue } from "../src/plugins/appworld.ts";
 import { credentialForm, originProblem, credentialState, identityNote, type CredentialRefKind } from "../src/plugins/types.ts";
 import { secretRefKind } from "../src/runtime/secrets.ts";
@@ -220,6 +221,7 @@ const everyPlugin: Plugin[] = [
   statePlugin(null as any, null, "local"),
   artifactsPlugin(null as any, "local"),
   raftPlugin,
+  mcpPlugin,
   builtinToolsPlugin(null as any, () => []),
   ...appworldPlugins(catalogue, { apiBaseUrl: "http://localhost:8800" }),
 ];
@@ -2748,10 +2750,11 @@ await check("a null credential is a different state, and a different sentence, p
   if (states.get("operator") !== states.get("env")) throw new Error("two deployment-held kinds give two answers for one action");
 });
 
-await check("format is declared only on string settings", () => {
+await check("format is declared only on the type it describes: origin on a string, header-lines on a string[]", () => {
+  const typeFor = { origin: "string", "header-lines": "string[]" } as const;
   const wrong = everyPlugin.flatMap((p) => (p.config ?? [])
-    .filter((f) => f.format !== undefined && f.type !== "string").map((f) => `${p.id}.${f.name}`));
-  if (wrong.length) throw new Error(`format on a non-string setting: ${wrong.join(", ")}`);
+    .filter((f) => f.format !== undefined && f.type !== typeFor[f.format]).map((f) => `${p.id}.${f.name}`));
+  if (wrong.length) throw new Error(`format on a setting of another type: ${wrong.join(", ")}`);
   const odd = { ...ORIGIN_PLUGIN, config: [{ ...ORIGIN_PLUGIN.config![0]!, type: "number" as const }] };
   const problems = validateMount(odd, { serverUrl: 5 }, null);
   if (problems.length) throw new Error(`a number setting was judged as an origin: ${JSON.stringify(problems)}`);

@@ -1,4 +1,4 @@
-import type { Json, MountPolicy } from "../core/types.ts";
+import type { Json, MountPolicy, MountRecord } from "../core/types.ts";
 import type { AnswerSpec } from "../core/execution.ts";
 
 export interface ToolSchema {
@@ -19,6 +19,54 @@ export interface ToolSchema {
    * plugin may offer the same service.
    */
   reads?: "parked-result";
+  /**
+   * `"never"`: do not run this tool again on its own after an interruption,
+   * whatever `sideEffects` and `idempotency` say.
+   *
+   * `sideEffects: "read"` normally means a repeat is harmless, and the runtime
+   * replays reads freely (`replayPolicy`, src/runtime/pi-tools.ts). That rests
+   * on whoever wrote the declaration being the one who knows. A tool whose
+   * schema came from a remote server was declared by that server — its
+   * `readOnlyHint` is a claim, not something this repository reviewed — so the
+   * kernel sets this on every snapshot tool (`admitTools`) and the claim keeps
+   * the read policy without earning a silent second run. Checked before
+   * anything else wherever a replay is decided.
+   */
+  replay?: "never";
+}
+
+/**
+ * The tools one mount offers when its plugin cannot know them in advance: what
+ * a remote server listed when the operator last asked, kept on the mount record.
+ *
+ * Stored, not fetched on demand, because the catalogue and the gateway read a
+ * mount's tools on every harness build and every call, and neither may wait on
+ * somebody else's server; a wake that reached the network to learn its own
+ * tool list would also offer a different list each time the server moved.
+ *
+ * `tools` is already admitted: every name in it is addressable, so every
+ * reader of {@link toolsOf} sees the same list. What was left out is in
+ * `skipped`, with the reason, for the person reading the mount's page.
+ *
+ * `hash` covers `tools` and `skipped` and nothing else, so a refresh that finds
+ * the same list changes nothing — not the record, and not the harness cache key.
+ * It is not the version pin: `toolVersion` stays the plugin's version, which is
+ * what the gateway compares and `repinMounts` rewrites.
+ */
+export interface ToolSnapshot {
+  hash: string;
+  tools: ToolSchema[];
+  skipped: Array<{ name: string; reason: string }>;
+  takenAt: number;
+}
+
+/**
+ * What a plugin's `snapshotTools` lists, before the kernel admits it. Anything
+ * the plugin itself chose to leave out goes in `skipped` with its reason.
+ */
+export interface ListedTools {
+  tools: ToolSchema[];
+  skipped?: Array<{ name: string; reason: string }>;
 }
 
 /**
@@ -524,6 +572,21 @@ export function isExclusive(p: Pick<Plugin, "holds">): boolean {
   return !!p.holds;
 }
 
+/**
+ * The tools one mount offers: the plugin's answer for that mount when it gives
+ * one, its static list otherwise.
+ *
+ * Every reader that is about a specific mount asks this rather than reading
+ * `plugin.tools`, because for a plugin whose tools come from a remote server
+ * the static list is empty and only the mount knows. A reader that asked
+ * `plugin.tools` would offer nothing or refuse everything for such a mount,
+ * and two readers that asked differently would disagree about one name — the
+ * catalogue offering a tool the gateway calls unknown.
+ */
+export function toolsOf(p: Pick<Plugin, "tools" | "mountTools">, mount: MountRecord): ToolSchema[] {
+  return p.mountTools?.(mount) ?? p.tools;
+}
+
 /** The most live hooks one mount may hold; see `InboundHooks`. */
 export const INBOUND_HOOKS_PER_MOUNT = 3;
 
@@ -591,6 +654,9 @@ export interface ConfigField {
    * refuse a credential-shaped name that does not carry it.
    */
   references?: "credential";
+  /** For a `number`: the smallest and largest value a mount may set, checked when the mount is written. */
+  min?: number;
+  max?: number;
   /**
    * What a `string` value has to look like, checked when the mount is written.
    *
@@ -603,8 +669,72 @@ export interface ConfigField {
    *
    * The plugin should read the value through the same `originProblem` at call
    * time too, so the two checks cannot disagree.
+   *
+   * `"header-lines"` is for a `string[]` of HTTP headers the plugin sends on
+   * the mount's behalf, one `"Name: value"` per entry; see
+   * `headerLinesProblem`, which the plugin reads the value through too.
    */
-  format?: "origin";
+  format?: "origin" | "header-lines";
+}
+
+/**
+ * Headers the client writes itself: HTTP framing, and the Streamable HTTP
+ * session headers. A mount that set one would be overwritten or would break the
+ * protocol underneath — a session id set here resumes nothing, since an MCP
+ * client initializes on every connection regardless.
+ */
+const CLIENT_HEADER = /^(accept|content-type|content-length|host|mcp-session-id|mcp-protocol-version|last-event-id)$/i;
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** `{{name}}`: a slot filled from a secret the agent kept, at the moment of the request. */
+const SECRET_SLOT = /\{\{[^}]*\}\}/;
+/** Header names whose value is a credential by convention. */
+const CREDENTIAL_HEADER = /^(authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth-token)$/i;
+/** A value written as an HTTP auth scheme followed by a token. */
+const AUTH_SCHEME_VALUE = /^(bearer|basic|token)\s+\S/i;
+
+/**
+ * `"Name: value"` lines as pairs, or why one is not acceptable. One function
+ * for the mount-time check (`format: "header-lines"`) and the plugin's own.
+ *
+ * A setting is public — shown in the console and handed to the agent by
+ * `tools.mounts` — so a credential written into one is published. The rule is
+ * deliberately narrow, so it refuses what is certainly a key and nothing
+ * else: a value with **no** `{{name}}` in it is refused when its header is one
+ * that carries a credential by convention (`Authorization`,
+ * `Proxy-Authorization`, `Cookie`, `X-Api-Key`, `Api-Key`, `X-Auth-Token`), or
+ * when the value itself reads as an auth scheme and a token (`Bearer …`,
+ * `Basic …`, `Token …`) under any header name. A value with a slot in it is
+ * accepted as written: `Bearer {{key}}` is the form this is steering toward.
+ * A key under an unconventional name with no scheme word is not recognised;
+ * nothing here can tell it from an ordinary value.
+ */
+export function headerLines(lines: unknown): { ok: true; headers: Array<[string, string]> } | { ok: false; error: string } {
+  if (lines === undefined || lines === null) return { ok: true, headers: [] };
+  if (!Array.isArray(lines)) return { ok: false, error: "headers must be a list of \"Name: value\" lines" };
+  const out: Array<[string, string]> = [];
+  for (const line of lines) {
+    const text = String(line);
+    const at = text.indexOf(":");
+    const name = at > 0 ? text.slice(0, at).trim() : "";
+    if (!HEADER_NAME.test(name)) return { ok: false, error: `header "${text.slice(0, 40)}" is not "Name: value"` };
+    if (CLIENT_HEADER.test(name)) return { ok: false, error: `header ${name} is written by the client itself and cannot be set` };
+    const value = text.slice(at + 1).trim();
+    if (!SECRET_SLOT.test(value) && (CREDENTIAL_HEADER.test(name) || AUTH_SCHEME_VALUE.test(value))) {
+      return {
+        ok: false,
+        error: `header ${name} carries a credential written out, and settings are public; keep the value as a secret ` +
+          `(secret_put) and write its name instead, such as "${name}: ${/authorization$/i.test(name) ? "Bearer {{name}}" : "{{name}}"}"`,
+      };
+    }
+    out.push([name, value]);
+  }
+  return { ok: true, headers: out };
+}
+
+/** Why a `"header-lines"` value is not acceptable, or null. */
+export function headerLinesProblem(lines: unknown): string | null {
+  const r = headerLines(lines);
+  return r.ok ? null : r.error;
 }
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -1431,7 +1561,28 @@ export interface SandboxEgress {
 export interface Plugin {
   id: string;
   version: string;
+  /** The tools every mount of this plugin offers; see `mountTools` for a plugin whose mounts differ. */
   tools: ToolSchema[];
+  /**
+   * The tools one mount offers, when they differ by mount; read through
+   * {@link toolsOf}, never directly.
+   *
+   * Synchronous and local: it reads what is on the mount record (normally its
+   * {@link ToolSnapshot}) and answers. It is asked on every harness build and
+   * every call, so it must not reach a server. Absent: `tools` is the answer.
+   */
+  mountTools?(mount: MountRecord): ToolSchema[];
+  /**
+   * List the tools a mount should offer, by asking whoever knows. Called when
+   * the mount is created and when an operator asks for a refresh — never on a
+   * wake, a harness build or a call. The kernel admits the list (names an agent
+   * can address, no duplicates), hashes it and stores it on the mount as its
+   * {@link ToolSnapshot}; the stored copy is replaced only when the hash moved.
+   *
+   * A throw leaves the stored snapshot as it was and is reported to the
+   * operator who asked.
+   */
+  snapshotTools?(ctx: PluginContext): Promise<ListedTools>;
   /** This mount holds something real; see {@link Holding}. Declaring it is what
    *  makes the mount exclusive — ask {@link isExclusive}, never the two separately. */
   holds?: Holding;

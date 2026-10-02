@@ -1,6 +1,8 @@
 // Runtime domain types. Deliberately storage-agnostic: every field that the
 // conformance suite exercises has to survive a swap of StorageAdapter.
 
+import type { ToolSnapshot } from "../plugins/types.ts";
+
 export type Json = unknown;
 
 export type TaskStatus =
@@ -171,4 +173,7 @@ export interface MountRecord {
   /** Absent means allow everything, which is the only sane default for a
    *  mount the operator has just deliberately created. */
   policy?: MountPolicy | null;
+  /** What a remote server listed for this mount; see `ToolSnapshot`. Absent
+   *  for every plugin whose tools are its own. */
+  toolSnapshot?: ToolSnapshot | null;
 }

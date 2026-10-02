@@ -22,6 +22,7 @@
   "dependencies": {
     "@botiverse/raft-sdk": "0.3.2",
     "@earendil-works/pi-agent-core": "0.85.1",
+    "@earendil-works/pi-mcp": "1.0.0",
     "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {

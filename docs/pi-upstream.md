@@ -5,7 +5,9 @@ on an upgrade, and only the first one fails loudly. This file exists so the
 other two are not discovered in production.
 
 Upstream: [`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi),
-MIT, © 2025 Mario Zechner.
+MIT, © 2025 Mario Zechner. The MCP client, `@earendil-works/pi-mcp`, comes from
+the same repository and is held to the same rules; its contracts are in their
+own section below.
 
 ## The pin is exact, on purpose
 
@@ -15,6 +17,9 @@ contracts below — none of which TypeScript would catch, because none of them i
 expressed in a type.
 
 Check for movement with `npm view @earendil-works/pi-agent-core version`.
+
+`@earendil-works/pi-mcp` is pinned the same way, at `1.0.0`; check it with
+`npm view @earendil-works/pi-mcp version`.
 
 ## What we depend on
 
@@ -26,13 +31,14 @@ The authoritative list is a command, not a table, because a table rots:
 grep -rhoE 'from "@earendil-works/[^"]+"' src cf/src test bench --include='*.ts' | sort -u
 ```
 
-At the time of writing that is five entry points: four from
+At the time of writing that is six entry points: four from
 `@earendil-works/pi-agent-core` — the package root (`AgentHarness`,
 `LaneBusy`), `harness/session` (`StorageBackedSession`), `harness/context`
 (`BACKGROUND_CONTEXT`), `harness/session/testing` (`createStorageConformance`,
 tests only) — plus `@earendil-works/pi-ai` for the provider contract
 (`createProvider`, `createAssistantMessageEventStream`) and the faux provider
-in tests.
+in tests, plus the root of `@earendil-works/pi-mcp` for the MCP client
+(`McpClient`, `StreamableHttpTransport`, `toLlmContent`; see §4).
 
 ### 2. Copied source — this breaks silently
 
@@ -70,6 +76,34 @@ Nothing imports these. Nothing types them. Everything rests on them:
 
 Each has a test. That is deliberate: an upgrade that quietly changes one of
 these should fail here, not on a tenant.
+
+### 4. pi-mcp — what `src/plugins/mcp.ts` rests on
+
+The plugin imports exactly `McpClient`, `StreamableHttpTransport` and
+`toLlmContent`. Three things about them are not in any type:
+
+- **The package root re-exports `StdioTransport`, which reaches
+  `child_process` through `cross-spawn`.** It stays out of the Worker only
+  because the package declares `sideEffects: false` and the bundler drops what
+  is not imported. So the stdio transport is never imported, under any name,
+  and an upgrade that drops `sideEffects: false` or makes the root import
+  `child_process` itself would put it back. `test/mcp-plugin.ts` checks the
+  import list and bundles the plugin with esbuild, looking for
+  `child_process` — with a control bundle that imports `StdioTransport` to show
+  the check can see it.
+- **There is no way to resume a session.** `StreamableHttpTransport` takes no
+  session id; it captures the one the server assigns during `initialize` and
+  uses it for that connection only, and `connect` always initializes. So every
+  call is a fresh connection that initializes again — a server keeping state
+  per session sees a new session per call. `test/mcp-plugin.ts` counts one
+  `initialize` per connection, none of them carrying an earlier session id.
+- **`openGetStream: false` means no GET request at all.** The default opens a
+  server-to-client stream after `initialize`; nothing here listens between
+  calls, so the plugin turns it off, and the same test asserts no GET is sent.
+
+Also unexpressed, and read rather than tested: `listTools` silently drops a
+listed tool whose `name` is not a string or whose `inputSchema` is not an
+object, so such a tool never reaches the snapshot's `skipped` list.
 
 ## Where we deliberately differ from pi
 

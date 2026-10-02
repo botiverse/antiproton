@@ -102,7 +102,7 @@ export interface SeedMount {
   account?: string; config?: Json;
   secretRef?: string | null; policy?: MountPolicy | null;
 }
-import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf } from "../../src/plugins/types.ts";
+import { credentialForm, pluginEnabled, renameSafety, isExclusive, backgroundOf, interruptsOf, toolsOf } from "../../src/plugins/types.ts";
 import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
@@ -112,6 +112,7 @@ import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
 import { raftPlugin } from "../../src/plugins/raft.ts";
+import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
@@ -523,13 +524,38 @@ export function unofferedMounts<T extends { plugin: string }>(
  * itself never enters the key, only whether there is one.
  */
 export function catalogueKey(
-  mounts: Array<Pick<MountRecord, "alias" | "plugin" | "toolVersion" | "publicConfig" | "secretRef" | "policy">>,
+  mounts: Array<Pick<MountRecord, "alias" | "plugin" | "toolVersion" | "publicConfig" | "secretRef" | "policy" | "toolSnapshot">>,
   choices: Record<string, PluginChoice>,
 ): string {
+  // The snapshot by its hash: a refresh that changed a mount's remote tool list
+  // changes what the catalogue offers while the version pin stays put, so
+  // without it a cached harness would go on offering the old list.
   const m = [...mounts].sort((a, b) => a.alias.localeCompare(b.alias)).map((x) =>
-    [x.alias, x.plugin, x.toolVersion, x.publicConfig, !!x.secretRef, x.policy ?? null]);
+    [x.alias, x.plugin, x.toolVersion, x.publicConfig, !!x.secretRef, x.policy ?? null, x.toolSnapshot?.hash ?? null]);
   const c = Object.keys(choices).sort().map((k) => [k, choices[k]]);
   return JSON.stringify([m, c]);
+}
+
+/**
+ * The tools a set of mounts offers the model, before qualification: each
+ * mount's own list (`toolsOf`), addressed `<alias>.<tool>`. Pure, so the one
+ * question "does a mount's snapshot reach the catalogue" is answerable without
+ * building a harness.
+ */
+export function mountedToolEntries(records: MountRecord[], byId: ReadonlyMap<string, Plugin>) {
+  return records.flatMap((m) => {
+    const pl = byId.get(m.plugin);
+    return (pl ? toolsOf(pl, m) : []).map((t) => ({
+      name: t.name, description: t.summary, parameters: t.parameters,
+      address: `${m.alias}.${t.name}`,
+      // Carried through so replay policy and exclusivity are decided by the
+      // plugin that knows, not guessed at the point of use.
+      sideEffects: t.sideEffects, idempotency: t.idempotency,
+      reads: t.reads,
+      ...(t.replay ? { replay: t.replay } : {}),
+      exclusive: pl ? isExclusive(pl) : undefined,
+    }));
+  });
 }
 
 /**
@@ -668,6 +694,7 @@ export class AgentRuntime {
       statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       raftPlugin,
+      mcpPlugin,
       ...(deps.extraPlugins ?? []),
       builtinToolsPlugin(this.store, () => plugins),
     );
@@ -1467,7 +1494,7 @@ export class AgentRuntime {
    * would orphan. It is always added without a credential.
    */
   async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }):
-    Promise<{ ok: true; added: boolean } | { ok: false; error: string }> {
+    Promise<{ ok: true; added: boolean; tools?: Awaited<ReturnType<ToolGateway["refreshMountTools"]>> } | { ok: false; error: string }> {
     await this.ready();
     if (!MOUNT_ALIAS.test(seed.alias)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
     const plugin = this.#plugins.find((p) => p.id === seed.plugin);
@@ -1503,7 +1530,25 @@ export class AgentRuntime {
       toolVersion: this.pluginVersion(plugin.id) ?? "1.0.0",
       publicConfig: seed.config, secretRef: null, policy: null,
     });
+    // A mount whose tools come from a server is asked for them now, while the
+    // operator who added it is reading the answer. A failure does not undo the
+    // mount: the server may want a secret the agent has not kept yet, and the
+    // mount offers nothing until a refresh succeeds.
+    if (plugin.snapshotTools) {
+      return { ok: true, added: true, tools: await this.#gateway.refreshMountTools(tenantId, agentId, seed.alias) };
+    }
     return { ok: true, added: true };
+  }
+
+  /**
+   * Ask a mount's server for its tool list again (`/admin/mounts` with
+   * `refreshTools`). Operator-only, like adding the mount: an agent cannot
+   * change what it is offered, and a remote server cannot either until a person
+   * asks. The stored list is replaced only when it changed.
+   */
+  async refreshMountTools(tenantId: string, agentId: string, alias: string) {
+    await this.ready();
+    return this.#gateway.refreshMountTools(tenantId, agentId, alias);
   }
 
   /**
@@ -1545,17 +1590,7 @@ export class AgentRuntime {
       mounts: records.map((m) => ({
         alias: m.alias, plugin: m.plugin, version: m.toolVersion, config: m.publicConfig,
       })),
-      tools: qualifyMountedTools(withholdTools(records.flatMap((m) =>
-        (byId.get(m.plugin)?.tools ?? []).map((t) => ({
-          name: t.name, description: t.summary, parameters: t.parameters,
-          address: `${m.alias}.${t.name}`,
-          // Carried through so replay policy and exclusivity are decided by the
-          // plugin that knows, not guessed at the point of use.
-          sideEffects: t.sideEffects, idempotency: t.idempotency,
-          reads: t.reads,
-          exclusive: (() => { const pl = byId.get(m.plugin); return pl ? isExclusive(pl) : undefined; })(),
-        })),
-      ), this.#deps.withholdTools ?? [])),
+      tools: qualifyMountedTools(withholdTools(mountedToolEntries(records, byId), this.#deps.withholdTools ?? [])),
     };
   }
 
@@ -2085,6 +2120,10 @@ export function installedRows(
       name: t.name, summary: t.summary,
       sideEffects: t.sideEffects, idempotency: t.idempotency,
     })),
+    // There is no mount on this page, so a plugin whose tools are each mount's
+    // own has no list to show; the page says where they come from instead of
+    // reporting the empty static list as "0 tools".
+    toolsPerMount: !!p.mountTools,
   }));
 }
 

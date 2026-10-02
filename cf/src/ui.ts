@@ -2073,6 +2073,10 @@ function mountBlock(d: any, m: any): string {
         ? `<div class="problems">${(m.problems as string[]).map((p) =>
             `<div>${esc(p)}</div>`).join("")}</div>`
         : ""}
+      ${(m.toolNotes ?? []).length
+        ? `<div class="problems warn">${(m.toolNotes as string[]).map((p) =>
+            `<div>${esc(p)}</div>`).join("")}</div>`
+        : ""}
       ${m.reconcileRefused && typeof m.reconcileRefused.reason === "string"
         ? `<div class="problems warn">seed change not applied: ${esc(m.reconcileRefused.reason)}${when(m.reconcileRefused.at) ? ` <span class="when">${esc(when(m.reconcileRefused.at)!)}</span>` : ""}</div>`
         : ""}
@@ -2138,7 +2142,8 @@ export function catalogue(d: any): string {
         : `<span class="tag bad">off — this agent answered "disable"</span>`;
   const pluginBlock = (p: any) => `
     <details class="plug">
-      <summary><b>${esc(p.id)}</b> <span class="sub">${esc(p.version)} · ${p.tools.length} tools</span>
+      <summary><b>${esc(p.id)}</b> <span class="sub">${esc(p.version)} · ${
+        p.toolsPerMount ? "tools listed by each mount's server" : `${p.tools.length} tools`}</span>
         ${p.credential
           ? `<span class="tag ${p.credential.required ? "bad" : ""}">${
               p.credential.required ? "account required" : "account optional"}</span>`
@@ -2161,7 +2166,9 @@ export function catalogue(d: any): string {
         p.config.map((c: any) => [c.name, c.type,
           c.default === undefined ? "—" : String(c.default), c.summary]))}` : ""}
       <h4>tools</h4>
-      ${table(["tool", "effect", "replay", "what it does"], p.tools.map(toolRow))}
+      ${p.toolsPerMount
+        ? `<div class="hint">Each mount offers what its server listed when the mount was added or last refreshed; see the mount.</div>`
+        : table(["tool", "effect", "replay", "what it does"], p.tools.map(toolRow))}
     </details>`;
   return `<div class="hint">Present in the code. Mounting one is a separate, deliberate act.</div>
 ${installed.length ? installed.map(pluginBlock).join("") : `<div class="empty">nothing installed</div>`}`;
