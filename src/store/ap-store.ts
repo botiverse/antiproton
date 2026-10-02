@@ -65,58 +65,101 @@ export type ApConversation = { taskId: string; tenantId: string; agentId: string
 
 /** The slice of `ctx.storage.sql` this needs. */
 export type ApSqlHost = { exec(query: string, ...bindings: Array<string | number | null>): { toArray(): Array<Record<string, unknown>> } };
+/** What runs every write: `PiDurableSqlite.exclusive` on the facade pi-durable itself is opened on. */
+export type ApWriter = { exclusive<T>(fn: () => T): Promise<T> };
+
+type Binding = string | number | null;
 
 /**
- * Synchronous on purpose: on an object where pi-durable is open, run these inside
- * `PiDurableSqlite.exclusive`, which keeps them out of a pi-durable transaction.
+ * Every write goes through `writer.exclusive`, so it waits behind an open pi-durable transaction and
+ * commits on its own instead of joining that transaction's savepoint and rolling back with it. A
+ * caller cannot forget this: no method here writes any other way, and `query` writes through it too.
+ *
+ * Reads go straight to `sql`, synchronously, also while a pi-durable transaction is open. That is
+ * safe because the only uncommitted state such a read could see is that transaction's, and it holds
+ * none in our tables: pi-durable's facade is confined to the `pd` namespace, and every write to
+ * ours runs through `exclusive`, which never runs while it is open. A read therefore sees exactly
+ * what is committed in `ap`. The one way around that is code writing our tables with a raw
+ * `sql.exec` inside the transaction, which is what this class exists to make unnecessary.
  */
 export class ApStore {
   #sql: ApSqlHost;
+  #writer: ApWriter;
   #names: SqlQualifier;
 
-  /** `namespace` places the tables: `prefixedNamespace("ap")` on a Durable Object. */
-  constructor(sql: ApSqlHost, namespace: SqlNamespace) {
+  /**
+   * `writer` is the `PiDurableSqlite` pi-durable runs on in this object, so that its queue orders our
+   * writes after its transactions; `namespace` places the tables: `prefixedNamespace("ap")` on a
+   * Durable Object.
+   */
+  constructor(sql: ApSqlHost, writer: ApWriter, namespace: SqlNamespace) {
     this.#sql = sql;
+    this.#writer = writer;
     this.#names = new SqlQualifier(AP_OBJECTS, namespace);
   }
 
-  /** Any statement over the `ap` objects; a name outside them throws before anything runs. */
-  query(sql: string, ...bindings: Array<string | number | null>): Array<Record<string, unknown>> {
+  #run(sql: string, bindings: Binding[]): Array<Record<string, unknown>> {
     return this.#sql.exec(this.#names.rewrite(sql), ...bindings).toArray();
   }
 
-  ensure(): void { for (const s of SCHEMA) this.query(s); }
+  /**
+   * Any statement over the `ap` objects, run as a write through `exclusive`; a name outside them
+   * throws before anything runs.
+   */
+  query(sql: string, ...bindings: Binding[]): Promise<Array<Record<string, unknown>>> {
+    return this.#writer.exclusive(() => this.#run(sql, bindings));
+  }
+
+  ensure(): Promise<void> { return this.#writer.exclusive(() => { for (const s of SCHEMA) this.#run(s, []); }); }
 
   /** The engine recorded at creation, or null for an agent that predates the choice. */
   engine(): AgentEngineName | null {
-    const v = this.query("SELECT v FROM meta WHERE k = 'engine'")[0]?.v;
+    const v = this.#run("SELECT v FROM meta WHERE k = 'engine'", [])[0]?.v;
     if (v === undefined) return null;
     if (!(AGENT_ENGINES as readonly unknown[]).includes(v)) throw new Error(`unknown engine recorded: ${String(v)}`);
     return v as AgentEngineName;
   }
 
-  /** Records the engine if none is; returns the one in force, which is the first ever written. */
-  setEngineOnce(engine: AgentEngineName): AgentEngineName {
-    if (!(AGENT_ENGINES as readonly string[]).includes(engine)) throw new Error(`unknown engine: ${engine}`);
-    this.query("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', ?)", engine);
-    return this.engine()!;
+  /** Records the engine if none is; resolves to the one in force, which is the first ever written. */
+  setEngineOnce(engine: AgentEngineName): Promise<AgentEngineName> {
+    if (!(AGENT_ENGINES as readonly string[]).includes(engine)) return Promise.reject(new Error(`unknown engine: ${engine}`));
+    return this.#writer.exclusive(() => {
+      this.#run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', ?)", [engine]);
+      return this.engine()!;
+    });
   }
 
   conversation(taskId: string): ApConversation | null {
-    const r = this.query("SELECT task_id, tenant_id, agent_id, conversation_id, created_at FROM conversations WHERE task_id = ?", taskId)[0];
+    const r = this.#run("SELECT task_id, tenant_id, agent_id, conversation_id, created_at FROM conversations WHERE task_id = ?", [taskId])[0];
     return r ? {
       taskId: String(r.task_id), tenantId: String(r.tenant_id), agentId: String(r.agent_id),
       conversationId: Number(r.conversation_id), createdAt: Number(r.created_at),
     } : null;
   }
 
-  /** Lists a conversation unless its task id is listed already; returns the row in force, the first one. */
-  openConversation(c: ApConversation): ApConversation {
-    this.query("INSERT OR IGNORE INTO conversations (task_id, tenant_id, agent_id, conversation_id, created_at) VALUES (?, ?, ?, ?, ?)",
-      c.taskId, c.tenantId, c.agentId, c.conversationId, c.createdAt);
-    const row = this.conversation(c.taskId);
-    // OR IGNORE also swallows a second task id for an already-listed pi-durable conversation.
-    if (row === null) throw new Error(`conversation ${c.conversationId} is already listed under another task id`);
-    return row;
+  /**
+   * Lists a conversation unless its task id is listed already; resolves to the row in force, the
+   * first one. Its fields are checked first: `OR IGNORE` would also skip a NOT NULL violation, and
+   * NaN binds as NULL, so a bad value would otherwise be reported as a conflict that is not there.
+   */
+  openConversation(c: ApConversation): Promise<ApConversation> {
+    for (const field of ["taskId", "tenantId", "agentId"] as const) {
+      const v: unknown = c[field];
+      if (typeof v !== "string" || v === "") return Promise.reject(new TypeError(`openConversation: ${field} must be a non-empty string, not ${describe(v)}`));
+    }
+    for (const field of ["conversationId", "createdAt"] as const) {
+      const v: unknown = c[field];
+      if (!Number.isSafeInteger(v)) return Promise.reject(new TypeError(`openConversation: ${field} must be a safe integer, not ${describe(v)}`));
+    }
+    return this.#writer.exclusive(() => {
+      this.#run("INSERT OR IGNORE INTO conversations (task_id, tenant_id, agent_id, conversation_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        [c.taskId, c.tenantId, c.agentId, c.conversationId, c.createdAt]);
+      const row = this.conversation(c.taskId);
+      // With the fields checked, the only thing OR IGNORE can have skipped is the UNIQUE conversation id.
+      if (row === null) throw new Error(`conversation ${c.conversationId} is already listed under another task id`);
+      return row;
+    });
   }
 }
+
+const describe = (v: unknown) => (typeof v === "string" ? JSON.stringify(v) : typeof v === "number" ? String(v) : v === null ? "null" : typeof v);

@@ -81,6 +81,11 @@ function readRow(row: Record<string, SqlCell>): Record<string, SqliteValue> {
 
 type Connection = { host: DurableSqlHost; names: SqlQualifier };
 
+/** Not globals: the constructors of `async function`, `function*` and `async function*`, which `exclusive` refuses. */
+const ASYNC_FUNCTION = (async () => {}).constructor;
+const GENERATOR_FUNCTION = function* () {}.constructor;
+const ASYNC_GENERATOR_FUNCTION = async function* () {}.constructor;
+
 function query(c: Connection, sql: string, params: readonly SqliteValue[]): Array<Record<string, SqliteValue>> {
   return c.host.sql.exec(c.names.rewrite(sql), ...params.map(bindValue)).toArray().map(readRow);
 }
@@ -183,16 +188,27 @@ export class PiDurableSqlite implements SqliteDatabase {
    * over the object's one connection, so our statements would join it, and be rolled back with it
    * when pi-durable's commit fails — a write we believed done, gone. Going through this facade's
    * queue keeps them out of it; `transactionSync` makes the unit atomic (a throw inside leaves
-   * nothing written). `fn` must not be async: a promise would be returned after the transaction had
-   * already committed, and whatever it awaited would run outside it, so a thenable result throws
-   * and rolls the unit back. It does not check `close()`: closing pi-durable's storage does not close
-   * the object's database, and our tables outlive it.
+   * nothing written). It does not check `close()`: closing pi-durable's storage does not close the
+   * object's database, and our tables outlive it.
+   *
+   * `fn` must be synchronous, because only what it does before it returns is inside the unit. What
+   * is caught:
+   * - a function declared `async` (function, arrow or method) or as a generator, async or not, is
+   *   refused before it is called: none of its body runs, so nothing after its first `await` can
+   *   land later, outside the unit or inside whatever transaction is open by then;
+   * - a plain function that returns a thenable has its synchronous part rolled back and is refused.
+   * What is not: the work behind that returned thenable (an async function it called, a `.then`
+   * callback) still runs later, outside the unit, as does any promise `fn` starts and does not
+   * return. Neither can be stopped once started, only not started; `fn` must not start them.
    */
   exclusive<T>(fn: () => T): Promise<T> {
+    if (fn instanceof ASYNC_FUNCTION || fn instanceof ASYNC_GENERATOR_FUNCTION || fn instanceof GENERATOR_FUNCTION) {
+      return Promise.reject(new TypeError("exclusive() takes a synchronous function; an async or generator one would run outside its transaction, so it is not called"));
+    }
     return this.#queue.run(() => this.#connection.host.transactionSync(() => {
       const result = fn();
       if (typeof (result as { then?: unknown } | null)?.then === "function") {
-        throw new TypeError("exclusive() takes a synchronous function; an async one would run outside its transaction");
+        throw new TypeError("exclusive() takes a synchronous function; this one returned a thenable, whose work would run outside its transaction");
       }
       return result;
     }));

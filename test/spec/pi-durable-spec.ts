@@ -238,7 +238,8 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     await throws("SELECT id FROM entries WHERE tasks = 1 ORDER BY tasks", notTable);
     await throws("CREATE TABLE entries (tasks INTEGER)", notTable);
     await throws("SELECT 1 FROM entries JOIN documents ON tasks = 1", notTable);
-    await throws("WITH tasks AS (SELECT 1) SELECT * FROM entries", notTable);
+    await throws("SELECT * FROM entries WHERE id IN (WITH tasks AS (SELECT 1) SELECT 1)", notTable);
+    await throws("WITH tasks AS (SELECT 1) SELECT * FROM entries", "are admitted");
     await throws("SELECT * FROM entries tasks", notTable);
     await throws("SELECT a IS DISTINCT FROM tasks FROM entries", notTable);
     // Qualified either way round, quoted, an alias, a table-valued function, or the wrong kind.
@@ -268,7 +269,31 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
     await throws("SELECT * FROM json_each(?)", outside);
     await throws("CREATE TABLE entries (x INTEGER REFERENCES agents(id))", outside);
     await throws("SELECT 1 FROM tasks INDEXED BY tasks_tenant", outside);
-    await throws("ANALYZE agents", outside);
+    // A comma continues a FROM or JOIN list whatever its previous item ended with: an alias with or
+    // without AS, a subquery, a JOIN constraint. Each of these once let the name after it through.
+    await throws("SELECT * FROM tasks t, ap_meta", outside);
+    await throws("SELECT * FROM tasks AS t, ap_meta", outside);
+    await throws("SELECT * FROM tasks, (SELECT 1), sqlite_master", outside);
+    await throws("SELECT * FROM tasks JOIN entries e ON e.id = 1, agents", outside);
+    await throws("SELECT * FROM tasks JOIN entries e USING (id), agents", outside);
+    await throws("DELETE FROM tasks WHERE EXISTS (SELECT 1 FROM tasks t, agents)", outside);
+    await throws("SELECT * FROM (sqlite_master)", outside);
+    await throws("SELECT * FROM tasks JOIN (entries e, agents) ON 1", outside);
+    // Statements that address the database rather than a listed object, whatever they name.
+    const kind = "are admitted";
+    await throws("PRAGMA table_info(pd_tasks)", kind);
+    await throws("PRAGMA table_info(tasks)", kind);
+    await throws("VACUUM", kind);
+    await throws("ATTACH DATABASE 'x' AS other", kind);
+    await throws("DETACH other", kind);
+    await throws("ANALYZE agents", kind);
+    await throws("ANALYZE tasks", kind);
+    await throws("REINDEX tasks_by_status", kind);
+    await throws("EXPLAIN SELECT 1 FROM tasks", kind);
+    await throws("BEGIN", kind);
+    await throws("SELECT 1 FROM tasks; PRAGMA writable_schema = 1", kind);
+    await throws("DROP VIEW agents_view", "DROP VIEW");
+    await throws("DROP TRIGGER IF EXISTS agents_trigger", "DROP TRIGGER");
 
     const rewrites: [string, string][] = [
       ["SELECT id FROM tasks WHERE id = ?", "SELECT id FROM pd_tasks WHERE id = ?"],
@@ -286,8 +311,9 @@ export function piDurableCases(withHost: WithHost): PiDurableCase[] {
       ["ALTER TABLE tasks RENAME TO entries", "ALTER TABLE pd_tasks RENAME TO pd_entries"],
       ["CREATE TABLE entries (task INTEGER REFERENCES tasks(id))", "CREATE TABLE pd_entries (task INTEGER REFERENCES pd_tasks(id))"],
       ["SELECT 1 FROM tasks INDEXED BY tasks_by_status", "SELECT 1 FROM pd_tasks INDEXED BY pd_tasks_by_status"],
-      ["REINDEX tasks_by_status", "REINDEX pd_tasks_by_status"],
-      ["ANALYZE tasks", "ANALYZE pd_tasks"],
+      ["SELECT 1 FROM tasks t, entries AS e, (SELECT 1) s, documents", "SELECT 1 FROM pd_tasks t, pd_entries AS e, (SELECT 1) s, pd_documents"],
+      ["SELECT 1 FROM tasks t JOIN entries e ON e.id = t.id, documents d WHERE t.id IN (1, 2) ORDER BY a, b",
+        "SELECT 1 FROM pd_tasks t JOIN pd_entries e ON e.id = t.id, pd_documents d WHERE t.id IN (1, 2) ORDER BY a, b"],
     ];
     for (const [sql, want] of rewrites) vitestLikeAssertions.strictEqual(q(sql), want);
   });
