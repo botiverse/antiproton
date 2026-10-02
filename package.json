@@ -22,6 +22,8 @@
     "pd-cancel:do": "bash test/pd-cancel-do.sh",
     "pd-outbox": "node test/pd-outbox.ts",
     "pd-outbox:do": "bash test/pd-outbox-do.sh",
+    "pd-writes": "node test/pd-writes.ts",
+    "pd-writes:do": "bash test/pd-writes-do.sh",
     "pi-loop": "node test/pi-loop.ts",
     "pi-offload": "node test/pi-offload.ts",
     "pi-tools": "node test/pi-tools.ts",

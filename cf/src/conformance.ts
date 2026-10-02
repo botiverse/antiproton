@@ -35,6 +35,10 @@
  * derived from pi-durable's entries past a watermark, compared field for field with PiAgent's on the
  * same storage (test/pd-outbox-do.sh).
  *
+ * /pd-writes runs the runtime's writes on a pd object (test/spec/pd-writes-spec.ts): an approval, an
+ * expired question, a model binding, a background pass and the idle lease, each started inside an open
+ * pi-durable commit, none joining it (test/pd-writes-do.sh).
+ *
  * /pd-tools runs the tool parity cases (test/spec/pd-tools-spec.ts): the same scripted model against
  * PiAgent and DurableAgent, each over the real gateway on this object's storage (test/pd-tools-do.sh).
  *
@@ -53,6 +57,7 @@ import { pdToolsCases } from "../../test/spec/pd-tools-spec.ts";
 import { pdCancelCases } from "../../test/spec/pd-cancel-spec.ts";
 import { durableAgentCases } from "../../test/spec/durable-agent-spec.ts";
 import { pdOutboxCases } from "../../test/spec/pd-outbox-spec.ts";
+import { pdWritesCases } from "../../test/spec/pd-writes-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
 
@@ -177,6 +182,31 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     };
   }
 
+  /** `only`: the cases whose name includes it, to run one at a time. */
+  async runPdWritesSpec(only = "") {
+    const host: PiDurableHost = this.ctx.storage;
+    const t0 = Date.now();
+    const wipe = () => {
+      const names = host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()
+        .map((r) => String(r.name)).filter((n) => !n.startsWith("_cf_") && !n.startsWith("sqlite_"));
+      for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
+    };
+    const results = await runDriveCases(pdWritesCases(async (use) => {
+      wipe();
+      try { await use(host); } finally { wipe(); }
+    // No timer inside the commit: a sleep there intermittently never fired under `wrangler dev`, and the
+    // object was reset after 30 s (measured 2026-10-02, 1 run in 3 of one case). The cases still start
+    // their write inside the open commit, which is what each checks.
+    }, { slowCommitMs: 0 }).filter((c) => c.name.includes(only)));
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
   async runPdToolsSpec() {
     const host: PiDurableHost = this.ctx.storage;
     const t0 = Date.now();
@@ -282,6 +312,10 @@ export default {
     }
     if (new URL(request.url).pathname === "/pd-outbox") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-outbox")).runPdOutboxSpec());
+    }
+    if (new URL(request.url).pathname === "/pd-writes") {
+      const only = new URL(request.url).searchParams.get("only") ?? "";
+      return Response.json(await env.PROBE.get(env.PROBE.idFromName(`pd-writes${only}`)).runPdWritesSpec(only));
     }
     if (new URL(request.url).pathname === "/pd-tools") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-tools")).runPdToolsSpec());

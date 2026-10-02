@@ -814,11 +814,12 @@ export class AgentRuntime {
     event: Omit<InboundEvent, "hookId"> | null): Promise<{ outcome: InboundOutcome }> {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    ensureInboundTable(sql);
+    const ensured = this.#ownWrite(() => ensureInboundTable(sql));
+    if (ensured instanceof Promise) await ensured;
     const now = Date.now();
     const done = (outcome: InboundOutcome, reason?: string | null, dedupeKey?: string | null) => {
-      recordInbound(sql, { tenantId, agentId, hookId, alias, outcome, reason, dedupeKey, now });
-      return { outcome };
+      const recorded = this.#ownWrite(() => recordInbound(sql, { tenantId, agentId, hookId, alias, outcome, reason, dedupeKey, now }));
+      return recorded instanceof Promise ? recorded.then(() => ({ outcome })) : { outcome };
     };
     if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     const secret = await this.#secrets.resolve(agentRef(hookSecretName(hookId)), { tenantId, agentId });
@@ -848,7 +849,8 @@ export class AgentRuntime {
   async inboundLog(limit = 50) {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    ensureInboundTable(sql);
+    const ensured = this.#ownWrite(() => ensureInboundTable(sql));
+    if (ensured instanceof Promise) await ensured;
     return recentInbound(sql, limit);
   }
 
@@ -1084,7 +1086,8 @@ export class AgentRuntime {
 
     // The warning row is keyed by the thing that is now gone. Left behind, the
     // next one under this alias inherits a release time it was never told.
-    for (const l of live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, l.id);
+    const forgotten = this.#ownWrite(() => { for (const l of live) sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", alias, l.id); });
+    if (forgotten instanceof Promise) await forgotten;
     return { ok: true, released: r.released.includes(alias) };
   }
 
@@ -1775,11 +1778,11 @@ export class AgentRuntime {
       // The same catalogue PiAgent gets, through the same host and the same continuations
       // (src/runtime/durable-tools.ts). The caller's functions are pd's own tools there (`clientTool`), which wait
       // for the caller instead of pausing PiAgent's lane (client-calls.ts), so they are handed over as definitions.
-      this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
+      const pdHost = this.#openPd();
       // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
-      await this.#pd.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
+      await pdHost.exclusive(() => ensureAgentTables(this.#deps.ctx.storage.sql, session));
       const pd = DurableAgent.open({
-        host: this.#pd, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
+        host: pdHost, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
         unknownJob: (id) => new UnknownJob(id),
         openSession: (other) => this.agent(tenantId, agentId, other),
         tools: offered as MountedTool[], toolHost: host, ...(keeping ? { interrupts: keeping } : {}),
@@ -1869,8 +1872,8 @@ export class AgentRuntime {
         { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
     });
-    // Its writes span awaits, so on a pd object they run with no pi-durable transaction open (`PdHost.apart`).
-    const jobs = this.#pd ? await this.#pd.apart(() => stop()) : await stop();
+    // Its writes span awaits, so on a pd object they run with no pi-durable transaction open (`apartFromPd`).
+    const jobs = await this.apartFromPd(stop);
     return { cancelledTurn, stoppedJobs: jobs.stopped, stillRunning: jobs.stillRunning };
   }
 
@@ -1925,23 +1928,23 @@ export class AgentRuntime {
     const owner = { tenantId, agentId };
     const jobCtx = (job: { session: string }) =>
       ({ tenantId, agentId, taskId: job.session === MAIN_SESSION ? LEGACY_TASK : job.session });
-    // Not on a pd object whose harness may be open: the pass writes `background_jobs` with plain SQL across
-    // awaits, which could join a pi-durable transaction. Not yet made safe: wrapping it in `PdHost.apart`
-    // would deadlock, since its delivery submits through the harness. Until it is, background work a pd
-    // agent starts is recorded and never polled. `#pd` is set only once a pd agent was opened, so before that no harness
-    // exists, and the pass runs as it always has.
-    const bg = this.#pd ? { wakeInMs: null } : await runBackgroundPass({
+    const pass = (deliver: (session: string, text: string) => Promise<void>) => runBackgroundPass({
       sql, owner,
       poll: (job) => this.#gateway.pollBackground(jobCtx(job), job.mount, job.handle as Json),
       cancel: (job) => this.#gateway.cancelBackground(jobCtx(job), job.mount, job.handle as Json),
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
-      deliver: async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); },
+      deliver,
     });
+    const bg = this.#pd ? await this.#pdBackgroundPass(this.#pd, pass, tenantId, agentId)
+      : await pass(async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); });
     const listed = this.#ownWrite(() => sessionsWithWork(sql));
     const sessions = listed instanceof Promise ? await listed : listed;
+    // Which sessions had work coming into this pass: on pd, one of them ending idle is a turn that settled.
+    const hadWork = new Set(sessions);
     if (!sessions.length) sessions.push(MAIN_SESSION);
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
+    let pdSettled = false;
     for (const session of sessions) {
       const agent = await this.agent(tenantId, agentId, session);
       const out = await agent.step();
@@ -1952,6 +1955,9 @@ export class AgentRuntime {
       settled.push(...out.settled);
       const wake = resumed ? 0 : out.wakeInMs;
       if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
+      // pi-durable reports no settled operations (`DurableAgent.step`), so a pd session that came in with work
+      // and leaves idle is what "a turn settled" means here.
+      if (this.#pd && hadWork.has(session) && !resumed && out.open === 0 && out.wakeInMs === null) pdSettled = true;
       const marked = this.#ownWrite(() => markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null));
       if (marked instanceof Promise) await marked;
     }
@@ -1962,18 +1968,16 @@ export class AgentRuntime {
     // A turn that settled while background work runs has not finished using
     // its containers: releasing now would take the machine out from under the
     // job, which is the normal case, since the model keeps working (task #16).
-    // On a pd object neither runs: both write with plain SQL (`background_jobs`, `held_warnings`) across
-    // awaits. pd agents have tools that can hold or start things now, so this is a gap still owed.
-    const pd = this.#pd !== null;
-    const backgroundRunning = !pd && runningBackgroundJobs(sql, owner).length > 0;
+    const running = this.#ownWrite(() => runningBackgroundJobs(sql, owner));
+    const backgroundRunning = (running instanceof Promise ? await running : running).length > 0;
     // A program suspended at a pause keeps the object awake (and is discarded
     // here once past its time), and, like background work, has not finished
     // with the containers it was using.
     const keep = this.#continuations.wakeInMs();
     if (keep !== null) wakeInMs = wakeInMs === null ? keep : Math.min(wakeInMs, keep);
-    if (!pd && this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
+    if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
       if (!this.#deps.idle) {
-        if (settled.length) {
+        if (settled.length || pdSettled) {
           const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
           releaseFailed = r.failed;
         }
@@ -2015,15 +2019,19 @@ export class AgentRuntime {
     // release time it was never told. The old `box_warnings` was the same table
     // under a name only a container fits, and `box_reminders` before it counted
     // escalating reminders and is no longer read.
-    sql.exec(`CREATE TABLE IF NOT EXISTS held_warnings(
+    // Each write through `#ownWrite`, so on a pd object none joins a commit; the rest of the pass (the
+    // gateway's calls, the warning's turn) is gated where it runs.
+    const made = this.#ownWrite(() => sql.exec(`CREATE TABLE IF NOT EXISTS held_warnings(
       alias TEXT NOT NULL, live_id TEXT NOT NULL, release_at INTEGER NOT NULL,
-      PRIMARY KEY (alias, live_id))`);
+      PRIMARY KEY (alias, live_id))`));
+    if (made instanceof Promise) await made;
     // Not carried over. Its rows say "this agent was already warned about a
     // release time", so the whole cost of dropping them is that an agent
     // holding something at the moment this deploys is told once more than it
     // needed to be — and the alternative, a copy step, keeps a table nothing
     // reads for the sake of one duplicate message.
-    sql.exec("DROP TABLE IF EXISTS box_warnings");
+    const dropped = this.#ownWrite(() => sql.exec("DROP TABLE IF EXISTS box_warnings"));
+    if (dropped instanceof Promise) await dropped;
     let wakeInMs: number | null = null;
     let releaseFailed: Array<{ alias: string; error: string }> = [];
     const soon = (ms: number) => { wakeInMs = wakeInMs === null ? ms : Math.min(wakeInMs, ms); };
@@ -2060,8 +2068,9 @@ export class AgentRuntime {
             { release: nameOf(h.alias, h.tools.release), postpone: h.tools.postpone ? nameOf(h.alias, h.tools.postpone) : null },
             h.billing, d.idleMs, d.untilReleaseMs, limit,
             { consequence: h.live.lease?.consequence, advice: h.live.lease?.advice, name: h.live.name, args: h.live.args }), "prompt");
-        sql.exec("INSERT INTO held_warnings(alias, live_id, release_at) VALUES (?,?,?) " +
-          "ON CONFLICT(alias, live_id) DO UPDATE SET release_at = excluded.release_at", h.alias, h.live.id, d.releaseAt);
+        const warned = this.#ownWrite(() => sql.exec("INSERT INTO held_warnings(alias, live_id, release_at) VALUES (?,?,?) " +
+          "ON CONFLICT(alias, live_id) DO UPDATE SET release_at = excluded.release_at", h.alias, h.live.id, d.releaseAt));
+        if (warned instanceof Promise) await warned;
         // 0: postMessage only marks the session, so this wake is what runs the warning's turn (idle-lease.ts).
         soon(d.wakeInMs);
         continue;
@@ -2083,7 +2092,8 @@ export class AgentRuntime {
       // This thing only, by its id: another thing the same mount holds has its own clock.
       const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK }, { alias: h.alias, reason: "idle", id: h.live.id });
       releaseFailed = [...releaseFailed, ...r.failed];
-      sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id);
+      const forgotten = this.#ownWrite(() => sql.exec("DELETE FROM held_warnings WHERE alias = ? AND live_id = ?", h.alias, h.live.id));
+      if (forgotten instanceof Promise) await forgotten;
       // A release may leave the thing held in another state with a schedule of its own (switched off, and
       // deleted much later), and nothing else would wake this object for that one. Asked again rather than
       // assumed: whether anything is still held is the plugin's answer. Not after a failure, which would
@@ -2125,6 +2135,58 @@ export class AgentRuntime {
    */
   #ownWrite<T>(fn: () => T): Promise<T> | T {
     return this.#pd ? this.#pd.exclusive(fn) : fn();
+  }
+
+  /**
+   * The object's pi-durable harness, made the first time a pd agent is opened, and from then on the gates
+   * every other writer of this object's SQL goes through: the store's write methods wait out any
+   * pi-durable commit (`DurableObjectStore.gateWrites`), and the gateway's calls run apart from all of
+   * them (`ToolGateway.gateCalls`). Before this nothing of pi-durable's exists in this isolate, so nothing
+   * can be open, and an object that never opens a pd agent never sets either.
+   */
+  #openPd(): PdHost {
+    if (this.#pd) return this.#pd;
+    const pd = new PdHost({ storage: this.#deps.ctx.storage });
+    this.#pd = pd;
+    this.store.gateWrites((fn) => pd.outside(fn));
+    this.#gateway.gateCalls((fn) => pd.apart(() => fn()));
+    return pd;
+  }
+
+  /**
+   * The background pass on a pd object. Its polls, cancels and `background_jobs` writes run in one
+   * `apart` section, so none of them joins a pi-durable commit; what it delivers is posted after the
+   * section ends, because posting submits through the harness — a commit, which would wait for the
+   * section that waits for it. The order a pi085 pass has is kept where it matters: a job's row is
+   * finished before its message is posted, so a crash between them loses the message on both engines
+   * rather than delivering it twice on one.
+   */
+  async #pdBackgroundPass(
+    pd: PdHost,
+    pass: (deliver: (session: string, text: string) => Promise<void>) => ReturnType<typeof runBackgroundPass>,
+    tenantId: string, agentId: string,
+  ) {
+    const deliveries: Array<{ session: string; text: string }> = [];
+    const out = await pd.apart(() => pass(async (session, text) => { deliveries.push({ session, text }); }));
+    for (const d of deliveries) await this.postMessage(tenantId, agentId, d.text, "prompt", d.session);
+    return out;
+  }
+
+  /**
+   * Async work of this object's that writes its SQL — an operator's or a pass's bookkeeping — run apart
+   * from pi-durable's commits on a pd object (`PdHost.apart`), and at once elsewhere. `fn` must not
+   * wait for a commit itself: no harness call (`postMessage`, `step`, an engine's reads) inside.
+   */
+  apartFromPd<T>(fn: () => Promise<T>): Promise<T> {
+    return this.#pd ? this.#pd.apart(() => fn()) : fn();
+  }
+
+  /**
+   * Synchronous SQL of this object's that keeps its own atomicity, after any pi-durable commit open or
+   * queued on a pd object (`PdHost.outside`); at once elsewhere, returning the value rather than a promise.
+   */
+  outsideCommits<T>(fn: () => T): Promise<T> | T {
+    return this.#pd ? this.#pd.outside(fn) : fn();
   }
 
   /**

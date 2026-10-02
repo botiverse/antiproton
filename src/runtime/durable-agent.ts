@@ -56,7 +56,7 @@ import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { ApStore } from "../store/ap-store.ts";
 import { derivePdOutbox, type DerivePass } from "./pd-outbox.ts";
 import { logEvent } from "../core/log.ts";
-import { PiDurableSqlite, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
+import { PiDurableSqlite, SerialQueue, type DurableSqlHost } from "../store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../store/sql-namespace.ts";
 import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.ts";
 import { toolsExtension, type ClientAnswer, type ClientToolDef } from "./durable-tools.ts";
@@ -135,7 +135,14 @@ export class PdHost {
   readonly #models = createModels();
   readonly #registry = createRegistry();
   #binding: PdBinding | null = null;
-  /** The facade the open harness runs on. `exclusive` must go through the one in use, whose queue it joins. */
+  /**
+   * The object's one queue (`SerialQueue`): every harness's facade is opened on it, and `#ours` — the
+   * facade our own SQL goes through, never closed — shares it, so `exclusive`, `outside` and `apart` are
+   * ordered against whichever harness is open, or opens while they run.
+   */
+  readonly #queue = new SerialQueue();
+  readonly #ours: PiDurableSqlite;
+  /** The facade the open harness runs on. */
   #db: PiDurableSqlite | null = null;
   #harness: Promise<Harness> | null = null;
   #driving: Promise<SettleResult> | null = null;
@@ -156,6 +163,7 @@ export class PdHost {
   constructor(opts: PdHostOptions) {
     this.#opts = opts;
     this.#now = opts.now ?? Date.now;
+    this.#ours = new PiDurableSqlite(opts.storage, PD, { queue: this.#queue });
     this.#ap = new ApStore(opts.storage.sql, { exclusive: (fn) => this.exclusive(fn) }, AP);
   }
 
@@ -212,9 +220,13 @@ export class PdHost {
     return name;
   }
 
-  /** A tool call's work, kept out of the open harness's transactions (`PiDurableSqlite.apart`). */
+  /**
+   * Async work of ours that writes the object's SQL — a tool call, an approval, a background poll — kept
+   * out of pi-durable's transactions (`PiDurableSqlite.apart`), whether or not a harness is open when it
+   * starts: one opened meanwhile waits for it too.
+   */
   apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> {
-    return this.#db ? this.#db.apart(fn) : fn(() => {});
+    return this.#ours.apart(fn);
   }
 
   extension(session: string) { return this.#registry.snapshot().extension(toolsExtensionName(session)); }
@@ -230,13 +242,14 @@ export class PdHost {
 
   // ---- our own SQL, kept out of pi-durable's transactions --------------------
 
-  /**
-   * A synchronous unit of our SQL, after any pi-durable transaction open or queued on the facade in use:
-   * the open harness's, whose queue it must join. With no harness open nothing of pi-durable's can be in
-   * flight, and a facade of its own has an empty queue.
-   */
+  /** A synchronous unit of our SQL, as one transaction, after any pi-durable transaction open or queued (`PiDurableSqlite.exclusive`). */
   exclusive<T>(fn: () => T): Promise<T> {
-    return (this.#db ?? new PiDurableSqlite(this.#opts.storage, PD)).exclusive(fn);
+    return this.#ours.exclusive(fn);
+  }
+
+  /** Synchronous SQL of ours that keeps its own atomicity, after any pi-durable transaction open or queued (`PiDurableSqlite.outside`). */
+  outside<T>(fn: () => T): Promise<T> {
+    return this.#ours.outside(fn);
   }
 
   /** The `ap` store, its tables made on first use. */
@@ -255,7 +268,7 @@ export class PdHost {
   harness(): Promise<Harness> {
     if (this.#harness) return this.#harness;
     const opening = (async () => {
-      const db = new PiDurableSqlite(this.#opts.storage, PD);
+      const db = new PiDurableSqlite(this.#opts.storage, PD, { queue: this.#queue });
       this.#db = db;
       const h = await Harness.open(this.#noticingCommits(await SqliteStorage.open(db)), {
         models: this.#models,
@@ -878,28 +891,53 @@ export function recordedEngine(sql: DurableSqlHost["sql"]): "pi085" | "pd" | nul
  * The object's storage, with a check on the hazard `PiDurableSqlite` describes: while a pi-durable
  * transaction is open it is a savepoint over the one connection, and any other write joins it and is
  * rolled back with it. Every write made while one is open that does not address pi-durable's own `pd_`
- * objects is recorded in `joined` (pi-durable's own statements, all rewritten to `pd_` names, are not).
- * Recorded rather than thrown: a throw inside someone else's transaction surfaces as whatever that
- * transaction's owner does with it — a crashed task, an unhandled rejection — not as the write. For
- * tests: assert `joined` is empty.
+ * objects is recorded in `joined` (pi-durable's own statements, all rewritten to `pd_` names, are not),
+ * and so is a `transactionSync` begun while one is open, which is a unit of ours nested inside it.
+ *
+ * A statement that changed nothing is not one: what a rollback can lose is a change, so a statement
+ * that failed (an `ALTER` that finds its column already there), a `CREATE ... IF NOT EXISTS` of a name
+ * that exists and a `DROP ... IF EXISTS` of one that does not are not recorded. Any other write is,
+ * whether or not it matched a row, since that cannot be told from here.
+ *
+ * `throwOnJoin` also throws, after the statement ran, at the caller that issued it, so a test names
+ * the write rather than counting it. Off, it only records: a throw inside someone else's transaction
+ * surfaces as whatever that transaction's owner does with it, not as the write. For tests: assert
+ * `joined` is empty.
  */
-export function guardJoinedWrites(storage: DurableSqlHost): DurableSqlHost & { readonly joined: string[] } {
+export function guardJoinedWrites(storage: DurableSqlHost, opts: { throwOnJoin?: boolean } = {}): DurableSqlHost & { readonly joined: string[] } {
   let open = 0;
   const joined: string[] = [];
+  const exists = (name: string) =>
+    storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name = ?", name).toArray().length > 0;
+  const noOp = (query: string) => {
+    const create = /^\s*CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+IF\s+NOT\s+EXISTS\s+"?(\w+)"?/i.exec(query);
+    if (create) return exists(create[1]!);
+    const drop = /^\s*DROP\s+(?:TABLE|INDEX)\s+IF\s+EXISTS\s+"?(\w+)"?/i.exec(query);
+    if (drop) return !exists(drop[1]!);
+    return false;
+  };
+  const join = (what: string) => {
+    joined.push(what);
+    if (opts.throwOnJoin) throw new Error(`joined write: a write of ours ran inside an open pi-durable transaction: ${what}`);
+  };
   return {
     joined,
     sql: {
       exec(query, ...bindings) {
-        if (open > 0 && /^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i.test(query) && !/\bpd_/.test(query)) {
-          joined.push(query.replace(/\s+/g, " ").slice(0, 160));
-        }
-        return storage.sql.exec(query, ...bindings);
+        const write = open > 0 && /^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i.test(query) && !/\bpd_/.test(query);
+        const changes = write && !noOp(query);
+        const result = storage.sql.exec(query, ...bindings);
+        if (changes) join(query.replace(/\s+/g, " ").slice(0, 160));
+        return result;
       },
     },
     async transaction(closure) {
       open++;
       try { return await storage.transaction(closure); } finally { open--; }
     },
-    transactionSync: (closure) => storage.transactionSync(closure),
+    transactionSync: (closure) => {
+      if (open > 0) join("transactionSync: a unit of ours begun inside an open pi-durable transaction");
+      return storage.transactionSync(closure);
+    },
   };
 }

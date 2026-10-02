@@ -172,7 +172,7 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
       sql: raw.sql, transactionSync: (cb) => raw.transactionSync(cb),
       transaction: (cb) => raw.transaction(async () => { await sleep(opts.slowCommitMs); return cb(); }),
     };
-    const g = guardJoinedWrites(slow);
+    const g = guardJoinedWrites(slow, { throwOnJoin: true });
     try { await use({ sql: g.sql, transaction: g.transaction, transactionSync: g.transactionSync }); } finally { joined.push(...g.joined); }
   });
   const add = (group: string, name: string, run: () => Promise<void>) => cases.push({

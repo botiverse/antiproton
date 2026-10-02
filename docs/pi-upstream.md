@@ -115,7 +115,7 @@ tests only) and `@earendil-works/chord` (types, and `chord/context` in
 |---|---|---|
 | `emptyUsage`, `addUsage` | `harness/utils/usage.js` | `src/store/pi-storage.ts` |
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
-| the facade's serial operation queue (re-implemented, smaller: a transaction always queues) | pi-durable `storage/sqlite/node.js` (`SerialOperationQueue`) | `src/store/pi-durable-sqlite.ts` |
+| the facade's serial operation queue (re-implemented, smaller: a transaction always queues; and ours: one queue per object, shared by every facade the object opens, with our own SQL let ahead of a queued transaction while an `apart` section holds, since none can be open then) | pi-durable `storage/sqlite/node.js` (`SerialOperationQueue`) | `src/store/pi-durable-sqlite.ts` |
 | the interrupted-call line (`INTERRUPTION_MARKER`), and the shape of pi-durable's interrupted result | pi-agent-core `harness/runtime/drive/tools.js`; pi-durable `harness/tool.js` (`fromSlot`, `renderDiagnostics`) | `src/runtime/durable-tools.ts` (`PI085_INTERRUPTED`, `pdInterruptedBlock`); `test/pd-tools.ts` reads both installed files |
 | the shape of pi-durable's aborted result (`Tool <name> was aborted`, the slot's `details` kept) | pi-durable `harness/tool.js` (the task's `abort`, `fromSlot`) | `src/runtime/durable-tools.ts` (`pdAbortedBlock`, `pi085ClientAborted`); `test/pd-cancel.ts` compares what each engine sends the model after a cancel |
 

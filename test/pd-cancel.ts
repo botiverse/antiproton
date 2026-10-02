@@ -33,7 +33,7 @@ type Job = { model: { api: string; provider: string; id: string }; context: Para
  */
 async function apiAgent(engine: "pi085" | "pd") {
   const raw = sqliteHost();
-  const guarded = guardJoinedWrites(raw);
+  const guarded = guardJoinedWrites(raw, { throwOnJoin: true });
   const host = { ...raw, sql: guarded.sql, transaction: guarded.transaction, transactionSync: guarded.transactionSync };
   if (engine === "pd") {
     const ap = new ApStore(raw.sql, new PiDurableSqlite(raw, prefixedNamespace("pd")), prefixedNamespace("ap"));

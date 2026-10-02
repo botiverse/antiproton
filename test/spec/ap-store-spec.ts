@@ -8,7 +8,7 @@ import { applySqliteMigrations, SqliteStorage } from "@earendil-works/pi-durable
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ApStore, AP_INDEXES, AP_OBJECTS, AP_TABLES } from "../../src/store/ap-store.ts";
-import { PiDurableSqlite } from "../../src/store/pi-durable-sqlite.ts";
+import { PiDurableSqlite, SerialQueue } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace, qualifySql, type SqlNamespace } from "../../src/store/sql-namespace.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { vitestLikeAssertions as is, type PiDurableCase, type WithHost } from "./pi-durable-spec.ts";
@@ -319,6 +319,83 @@ export function apStoreCases(withHost: WithHost): PiDurableCase[] {
     seen.push(db.inTransaction);
     await db.exclusive(() => { seen.push(db.inTransaction); });
     is.deepEqual(seen, [false, true, true, false, true, false, false]);
+  }));
+
+  add("PiDurableSqlite.outside", "waits for an open pi-durable transaction like exclusive, but is no unit of its own: a throw keeps what ran before it", () => withHost(async (host) => {
+    const db = new PiDurableSqlite(host, PD);
+    await applySqliteMigrations(db);
+    const ap = new ApStore(host.sql, db, AP);
+    await ap.ensure();
+    const order: string[] = [];
+    let opened!: () => void;
+    const isOpen = new Promise<void>((r) => { opened = r; });
+    const txn = db.transaction(async (tx) => {
+      await tx.run("INSERT INTO record_ids (id, record_type) VALUES (?, 'task')", 100);
+      opened();
+      await sleep(20);
+      order.push("transaction throws");
+      throw new Error("boom");
+    }).catch(() => { order.push("transaction rejected"); });
+    await isOpen;
+    const ours = db.outside(() => {
+      order.push("outside runs");
+      host.sql.exec("INSERT INTO ap_meta (k, v) VALUES ('engine', 'pd')");
+      throw new Error("after the write");
+    });
+    const whileOpen = [...order];
+    await Promise.allSettled([txn, ours]);
+    is.deepEqual(whileOpen, []);
+    is.deepEqual(order, ["transaction throws", "transaction rejected", "outside runs"]);
+    await is.rejects(ours, "after the write");
+    // No unit: the write before the throw stays, which is what lets a store method keep its own transactionSync.
+    is.strictEqual(ap.engine(), "pd");
+    await is.rejects(db.outside((async () => {}) as () => unknown), "is not called");
+  }));
+
+  add("PiDurableSqlite.apart", "facades on one queue: a section on one holds off a transaction on another, which a facade with its own queue does not", () => withHost(async (host) => {
+    await applySqliteMigrations(new PiDurableSqlite(host, PD));
+    const run = async (queue: (n: number) => SerialQueue | undefined) => {
+      const ours = new PiDurableSqlite(host, PD, { queue: queue(0) });
+      const harness = new PiDurableSqlite(host, PD, { queue: queue(1) });
+      const order: string[] = [];
+      let entered!: () => void;
+      const inside = new Promise<void>((r) => { entered = r; });
+      const section = ours.apart(async () => { entered(); await sleep(20); order.push("section ends"); });
+      await inside;
+      const txn = harness.transaction(async () => { order.push("transaction runs"); });
+      await Promise.all([section, txn]);
+      return order;
+    };
+    const shared = new SerialQueue();
+    is.deepEqual(await run(() => shared), ["section ends", "transaction runs"]);
+    // Control: a queue each, as every harness had before the queue was the object's.
+    const own = [new SerialQueue(), new SerialQueue()];
+    is.deepEqual(await run((n) => own[n]), ["transaction runs", "section ends"]);
+  }));
+
+  add("PiDurableSqlite.apart", "inside a section, our own SQL and another section start at once, ahead of a transaction queued behind it", () => withHost(async (host) => {
+    const db = new PiDurableSqlite(host, PD);
+    await applySqliteMigrations(db);
+    const order: string[] = [];
+    let txn: Promise<unknown> = Promise.resolve();
+    let read: Promise<unknown> = Promise.resolve();
+    await db.apart(async () => {
+      // Queued now, and held until this section ends; pi-durable's own read queues behind it.
+      txn = db.transaction(async () => { order.push("transaction"); });
+      read = db.get("SELECT 1 AS one").then(() => { order.push("pi-durable read"); });
+      await sleep(5);
+      // Queued behind that transaction, each of these would wait on a transaction that waits on this
+      // section — the deadlock a store write inside a tool call, or an approval's call, would meet.
+      const ours = Promise.all([
+        db.exclusive(() => { order.push("exclusive()"); }),
+        db.outside(() => { order.push("outside()"); }),
+        db.apart(async () => { order.push("apart()"); }),
+      ]);
+      order.push(await Promise.race([ours.then(() => "ours done"), sleep(500).then(() => "ours deadlocked")]));
+      order.push("section ends");
+    });
+    await Promise.all([txn, read]);
+    is.deepEqual(order, ["exclusive()", "outside()", "apart()", "ours done", "section ends", "transaction", "pi-durable read"]);
   }));
 
   return cases;
