@@ -98,6 +98,9 @@ function query(c: Connection, sql: string, params: readonly SqliteValue[]): Arra
 class SerialQueue {
   #tail: Promise<unknown> = Promise.resolve();
   #pending = 0;
+  /** Async sections of ours running now (`apart`); a transaction does not open while any is. */
+  #apart = 0;
+  #apartDone: Array<() => void> = [];
 
   run<T>(operation: () => T): Promise<T> {
     // Sound only because a plain statement is synchronous: `query` has no await, so it cannot yield
@@ -109,11 +112,28 @@ class SerialQueue {
     try { return Promise.resolve(operation()); } catch (error) { return Promise.reject(error); }
   }
 
-  enqueue<T>(operation: () => Promise<T>): Promise<T> {
+  enqueue<T>(operation: () => Promise<T>, opts: { transaction?: boolean } = {}): Promise<T> {
     this.#pending++;
-    const settled = this.#tail.then(operation).finally(() => { this.#pending--; });
+    const start = opts.transaction ? async () => { while (this.#apart > 0) await new Promise<void>((r) => this.#apartDone.push(r)); return operation(); } : operation;
+    const settled = this.#tail.then(start).finally(() => { this.#pending--; });
     this.#tail = settled.then(() => undefined, () => undefined);
     return settled;
+  }
+
+  /**
+   * `fn` once no transaction is open or queued ahead of it, with every transaction queued after it held
+   * until it settles. Sections run alongside one another: they keep transactions off, not each other.
+   * `release` ends the hold early (see `PiDurableSqlite.apart`).
+   */
+  async apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> {
+    await this.enqueue(async () => { this.#apart++; });
+    let held = true;
+    const release = () => {
+      if (!held) return;
+      held = false;
+      if (--this.#apart === 0) for (const wake of this.#apartDone.splice(0)) wake();
+    };
+    try { return await fn(release); } finally { release(); }
   }
 }
 
@@ -174,7 +194,7 @@ export class PiDurableSqlite implements SqliteDatabase {
           try { return await callback(handle); } finally { handle.revoke(); }
         });
       } finally { handle.revoke(); this.#inTransaction = false; }
-    });
+    }, { transaction: true });
   }
 
   /** True while a pi-durable transaction is open on the host: any `sql.exec` issued now would join it. */
@@ -213,6 +233,20 @@ export class PiDurableSqlite implements SqliteDatabase {
       return result;
     }));
   }
+
+  /**
+   * Async work of ours that writes the object's SQL across awaits — a tool call through the gateway,
+   * whose store writes operation, approval and usage rows as it goes — kept out of every pi-durable
+   * transaction: it starts once none is open or queued ahead of it, and no transaction opens until
+   * it settles. `exclusive` is the same guarantee for a synchronous unit; this is it for one that
+   * awaits, at the price that pi-durable's commits wait for it.
+   *
+   * `fn` must not wait for a pi-durable transaction itself (a commit through the harness, `exclusive`
+   * once one is queued): that transaction waits for `fn`, so neither would finish. It may call
+   * `release` to end the hold before it settles — for work it stops waiting for, whose later writes
+   * are then unguarded.
+   */
+  apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> { return this.#queue.apart(fn); }
 
   close() { return this.#queue.run(() => { this.#closed = true; }); }
 }

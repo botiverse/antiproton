@@ -179,9 +179,14 @@ export class PdHost {
    */
   installTools(session: string, tools: Parameters<typeof toolsExtension>[1]): string {
     const name = toolsExtensionName(session);
-    this.#registry.install(toolsExtension(name, tools));
+    this.#registry.install(toolsExtension(name, tools, (fn) => this.apart(fn)));
     this.#installed.add(session);
     return name;
+  }
+
+  /** A tool call's work, kept out of the open harness's transactions (`PiDurableSqlite.apart`). */
+  apart<T>(fn: (release: () => void) => Promise<T>): Promise<T> {
+    return this.#db ? this.#db.apart(fn) : fn(() => {});
   }
 
   extension(session: string) { return this.#registry.snapshot().extension(toolsExtensionName(session)); }
