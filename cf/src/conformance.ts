@@ -62,6 +62,7 @@ import { durableAgentCases } from "../../test/spec/durable-agent-spec.ts";
 import { pdOutboxCases } from "../../test/spec/pd-outbox-spec.ts";
 import { pdWritesCases } from "../../test/spec/pd-writes-spec.ts";
 import { pdCompactionCases } from "../../test/spec/pd-compaction-spec.ts";
+import { pdMigrateCases } from "../../test/spec/pd-migrate-spec.ts";
 
 const TABLES = ["pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta"];
 
@@ -207,6 +208,27 @@ export class StorageProbe extends DurableObject<{ CONTROL_DB: D1Database }> {
     };
   }
 
+  async runPdMigrateSpec() {
+    const host: PiDurableHost = this.ctx.storage;
+    const t0 = Date.now();
+    const wipe = () => {
+      const names = host.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray()
+        .map((r) => String(r.name)).filter((n) => !n.startsWith("_cf_") && !n.startsWith("sqlite_"));
+      for (const n of names) host.sql.exec(`DROP TABLE IF EXISTS "${n}"`);
+    };
+    const results = await runDriveCases(pdMigrateCases(async (use) => {
+      wipe();
+      try { await use(host); } finally { wipe(); }
+    }));
+    return {
+      backend: "durable-object",
+      ms: Date.now() - t0,
+      passed: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
   /** `only`: the cases whose name includes it, to run one at a time. */
   async runPdWritesSpec(only = "") {
     const host: PiDurableHost = this.ctx.storage;
@@ -337,6 +359,9 @@ export default {
     }
     if (new URL(request.url).pathname === "/pd-compaction") {
       return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-compaction")).runPdCompactionSpec());
+    }
+    if (new URL(request.url).pathname === "/pd-migrate") {
+      return Response.json(await env.PROBE.get(env.PROBE.idFromName("pd-migrate")).runPdMigrateSpec());
     }
     if (new URL(request.url).pathname === "/pd-writes") {
       const only = new URL(request.url).searchParams.get("only") ?? "";

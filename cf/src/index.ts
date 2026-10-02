@@ -66,6 +66,7 @@ import {
 import { adminTranscript } from "./admin-transcript.ts";
 import { refuseSecret } from "./secret-shape.ts";
 import { adminDiagnose } from "./admin-diagnose.ts";
+import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
@@ -764,6 +765,19 @@ export class AgentDO extends DurableObject<Env> {
       plugins: this.#activeRuntime().plugins(),
       alarm: () => this.ctx.storage.getAlarm(),
     });
+  }
+
+  /**
+   * /admin/migrate-engine's object half (cf/src/admin-migrate.ts): move this agent between engines
+   * (`AgentRuntime.migrateEngine`). Null, with nothing written, for an agent this object does not hold: the owner row
+   * is read, not claimed, so asking an object that serves nobody does not make it anybody's.
+   */
+  async migrateEngine(tenantId: string, agentId: string, op: MigrateOp, dryRun: boolean) {
+    const owned = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'owner'").toArray().length > 0
+      && this.sql.exec("SELECT 1 FROM owner WHERE k = 'self' AND tenant_id = ? AND agent_id = ?", tenantId, agentId).toArray().length > 0;
+    if (!owned) return null;
+    this.#claim(tenantId, agentId);
+    return this.#busy("migrateEngine", () => this.runtime().migrateEngine(tenantId, agentId, op, { dryRun }));
   }
 
   /** The binding, credential-free, so an operator can see whose key is in use. */
@@ -3564,6 +3578,9 @@ async function route(request: Request, env: Env): Promise<Response> {
           const r = await s2.uiCompact(t, a, k);
           return compactionRefusal(r, "json") ?? Response.json(r);
         }
+        case "/admin/migrate-engine":
+          return await adminMigrateEngine(request, env.AUTOMATION_TOKEN,
+            (t, a) => env.AGENT.get(env.AGENT.idFromName(agentObjectName(t, a))));
         case "/admin/rename-mount": {
           // Renaming a mount is an operator act, not something an agent or a
           // page does: it moves the mount row, the connection state and the
