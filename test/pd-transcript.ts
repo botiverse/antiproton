@@ -244,8 +244,10 @@ await check("a read scheduled from inside a pi-durable commit that fails after w
       if (hold && count() > before) {
         hold = false;
         inside = count();
-        reads = new Promise((resolve) => queueMicrotask(() => resolve([read(), rt.afterPdTransactions(read)])))
-          .then(async ([direct, routed]) => [direct, await routed] as [unknown, unknown]);
+        reads = new Promise<[unknown, unknown]>((resolve, reject) => queueMicrotask(() => {
+          const direct = read();
+          Promise.resolve(rt.afterPdTransactions(read)).then((routed) => resolve([direct, routed]), reject);
+        }));
         throw new Error("injected commit failure");
       }
       return out;
@@ -257,9 +259,10 @@ await check("a read scheduled from inside a pi-durable commit that fails after w
     hold = true;
     const driving = rt.postMessage("demo", "u-a", "rolled back").catch(() => "failed");
     for (let i = 0; i < 500 && reads === null; i++) await new Promise((r) => setTimeout(r, 10));
-    assert(reads !== null, "no pi-durable transaction wrote an entry, so nothing was failed");
+    const scheduled = reads as Promise<[unknown, unknown]> | null;
+    assert(scheduled !== null, "no pi-durable transaction wrote an entry, so nothing was failed");
     assert(inside > rows, `control: inside the commit pd_entries held ${inside} rows, no more than the ${rows} committed`);
-    const [direct, routed] = await reads!;
+    const [direct, routed] = await scheduled;
     assert(show(direct) === show(committed), `the direct read: ${show(direct)}, committed: ${show(committed)}`);
     assert(show(routed) === show(committed), `the routed read: ${show(routed)}, committed: ${show(committed)}`);
     await driving;
