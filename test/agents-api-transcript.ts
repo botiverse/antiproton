@@ -2,6 +2,7 @@
  * A session's pi entries as Agents API items and turns (task #17): turn
  * boundaries, statuses, usage, and item shapes the SDK reads.
  */
+import { CLIENT_PENDING } from "../src/runtime/client-calls.ts";
 import { callTurns, sessionTranscript, TURN_CANCELLED } from "../cf/src/agents-api/transcript.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { converse, SCRIPT } from "./spec/pd-conversation.ts";
@@ -86,6 +87,29 @@ await check("a prompt not yet picked up is queued; the last turn is in progress 
     user("hello", 0), entry({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "hi" }] }, 1_000),
   ], running: true }, ids).turns[0]!;
   assert(steering.status === "in_progress" && steering.completed_at === null, `running ${JSON.stringify(steering)}`);
+});
+
+await check("a turn whose run went on past a later user message (a steer, or input queued behind the caller) is completed, not in progress", () => {
+  const { turns, items } = sessionTranscript({ entries: [
+    user("weather?", 0),
+    entry({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "c7", name: "get_weather", arguments: {} }] }, 1_000),
+    entry({ role: "toolResult", toolCallId: "c7", toolName: "get_weather", isError: false, content: [{ type: "text", text: "hot" }] }, 2_000),
+    user("also say hello", 3_000),
+    entry({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "hot, and hello" }] }, 4_000),
+  ], running: false }, ids);
+  assert(turns.map((t) => t.status).join() === "completed,completed", `statuses ${turns.map((t) => t.status)}`);
+  assert(turns[0]!.completed_at === Math.floor((T0 + 2_000) / 1000), `completed_at ${turns[0]!.completed_at}`);
+  assert(items.find((i) => i.type === "function_call")!.status === "completed", "the answered call does not read completed");
+});
+
+await check("a turn whose call holds only the caller placeholder is not over when a later turn exists, even with pending blanked", () => {
+  const { turns } = sessionTranscript({ entries: [
+    user("weather?", 0),
+    entry({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "c8", name: "get_weather", arguments: {} }] }, 1_000),
+    entry({ role: "toolResult", toolCallId: "c8", toolName: "get_weather", isError: true, content: [{ type: "text", text: CLIENT_PENDING }] }, 2_000),
+    user("meanwhile", 3_000),
+  ], running: true, pending: [] }, ids);
+  assert(turns[0]!.status === "in_progress" && turns[0]!.completed_at === null, `turn ${JSON.stringify(turns[0])}`);
 });
 
 await check("a failed tool result is reported as an error, not as output", () => {

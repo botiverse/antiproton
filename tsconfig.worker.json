@@ -106,7 +106,8 @@
     "test/pd-migrate-object.ts",
     "test/pd-writes.ts",
     "test/spec/pd-writes-spec.ts",
-    "test/usage-flush.ts"
+    "test/usage-flush.ts",
+    "test/bench-pd.ts"
   ],
   "exclude": ["node_modules"]
 }

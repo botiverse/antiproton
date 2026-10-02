@@ -115,9 +115,6 @@ tests only) and `@earendil-works/chord` (types, and `chord/context` in
 |---|---|---|
 | `emptyUsage`, `addUsage` | `harness/utils/usage.js` | `src/store/pi-storage.ts` |
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
-| the interrupted-call line (`INTERRUPTION_MARKER`), and the shape of pi-durable's interrupted result | pi-agent-core `harness/runtime/drive/tools.js`; pi-durable `harness/tool.js` (`fromSlot`, `renderDiagnostics`) | `src/runtime/durable-tools.ts` (`PI085_INTERRUPTED`, `pdInterruptedBlock`); `test/pd-tools.ts` reads both installed files |
-| starting a run with no input (`live.run` set to a new conversation-owned `GenerationTask`), and the context-edit rule (newest edit of a target wins) | pi-durable `harness/generation.js` (`startRun`); `harness/context.js` (`deriveContext`) | `src/runtime/durable-agent.ts` (`#resumeLeftCalls`, `withEdits`); `test/pd-cancel.ts` compares the requests and branch with pi085's after a caller answers a call its turn left |
-| the shape of pi-durable's aborted result (`Tool <name> was aborted`, the slot's `details` kept) | pi-durable `harness/tool.js` (the task's `abort`, `fromSlot`) | `src/runtime/durable-tools.ts` (`pdAbortedBlock`, `pi085ClientAborted`); `test/pd-cancel.ts` compares what each engine sends the model after a cancel |
 | reading a pi 0.85 session without opening it (the tip in `pi.branch.tip`, a run or queued input in `pi.lane.state`, the branch walk, a compaction's context as its summary, retained tail and what follows), and writing it as pi-durable's context (the newest head marker starts it, an entry's `head` may point at an earlier entry) | pi-agent-core `harness/session/values.js`, `harness/session/context.js` (`buildContextEntries`), `harness/messages.js`; pi-durable `harness/context.js` (`deriveContext`) | `src/runtime/pd-migrate.ts` (`planMigration`, `importDrafts`); `test/pd-migrate.ts` and `npm run pd-migrate:do` compare pd's next requests after a migration, and pi085's after the rollback, with pi085 never migrated |
 
 The usage arithmetic is copied because pi's export map does not publish it. The
@@ -177,12 +174,13 @@ Cancel and the API caller's functions (`DurableAgent.cancel`, `clientTool`;
   scheduler, and resolves once it is idle. A generation aborted in its `poll`
   phase calls `cancelDeferred` (`harness/generation.js`, `abort`), which is how
   the job row is marked cancelled; nothing is appended for the abort itself, so the
-  marker entry is ours.
+  marker entry is ours: a note entry of the runtime's kind, its model message
+  the runtime's note, written with the conversation's client calls forgotten in
+  one commit.
 - Once the abort mark is down a tool's late result is not committed; its
-  result is `Tool <name> was aborted`, built from the slot, so `details` the
-  tool published before (`api.details`) are kept. pi085's abort instead waits
-  for the tool and records its real result — the one request that differs
-  after a cancel mid-call.
+  result is pi-durable's `Tool <name> was aborted` block, and that is what the
+  model and the transcript's readers see (pi085's abort instead waits for the
+  tool and records its real result).
 - Nothing holds pi-durable's commits off while a gateway call runs, so the
   abort mark commits with the call still in flight, and the call's late result
   is not committed (above).
@@ -190,6 +188,14 @@ Cancel and the API caller's functions (`DurableAgent.cancel`, `clientTool`;
   `safe` one is run again on reopen, which is what lets a harness whose only
   pending work is the caller's function close with no alarm
   (`externalWaits` in `parkVerdict`).
+- A tool can commit (`api.commit`) and watch a conversation document
+  (`api.watchDoc`, a `DocumentObserver`): the caller's function records its
+  call in the `ap.clientCalls` document and waits on it, and
+  `Conversation.commit` writes the caller's answer there, so the answer is a
+  pi-durable commit that wakes the watch and `settle`'s re-read alike.
+- Input submitted while a run waits on the caller is queued (`whenBusy:
+  "steer"`) and placed at the run's next boundary, after the caller's results;
+  `Conversation.abort()` withdraws it with the rest of the run.
 
 #### On pi-durable: parking replaces `drive()` returning `waiting`
 

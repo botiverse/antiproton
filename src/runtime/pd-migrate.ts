@@ -8,11 +8,11 @@
  *   `ap_conversations` as `PdHost.conversation` lists one). The object's other durable data is not an engine's and is
  *   not touched: the state store, mounts, credentials, the usage and trace outboxes.
  * - **Let go**: what only a running engine holds — run_js programs and tool questions waiting for `resume`, and a turn
- *   waiting for the Agents API caller's functions, which is imported cancelled (`cancelMarker`; pi085's
+ *   waiting for the Agents API caller's functions, which is imported cancelled (`cancel`; pi085's
  *   `api_client_calls` rows are left as they are, for the rollback) — and, from the transcript, what is not on the active
  *   branch (pi 0.85's abandoned branches), the "not ready yet" answers pi 0.85 records while a call is out
  *   (`deferred`, sent to no model), and custom entries no model reads. A cancel marker is kept: it carries the note
- *   the model is shown for it (`markerNotes`), as `DurableAgent` writes one.
+ *   the model is shown for it (`cancel.note`), in the shape `DurableAgent.cancel` writes one.
  * - **Refused**: an agent that is not idle — a run in progress or queued input on any session, a model call not
  *   answered yet, or a background job still running (its result is a message to a session). A call out is spend
  *   in flight; an answer that came after the move would land nowhere and go unbilled.
@@ -39,7 +39,7 @@
  * |                                         | its `head` is its retained tail where that tail already stands, else  |
  * |                                         | itself, with the tail appended after it (`importDrafts`)              |
  * | `branch_summary`                        | `pi.user`, the text pi 0.85 sends for it                              |
- * | `custom` of a kind in `markerNotes`     | an entry of that kind whose model message is the note                 |
+ * | `custom` of the cancel marker's kind    | an entry of that kind whose model message is the cancel's note        |
  * | any other `custom`                      | dropped                                                               |
  *
  * pi-durable starts a context at its newest head marker, so the newest compaction decides the context as pi 0.85's
@@ -71,7 +71,7 @@ type Json = any;
 /** What one session's import writes, by pi-durable kind, and what it leaves out, by pi 0.85 kind. */
 export type ImportCounts = {
   user: number; assistant: number; toolResult: number; compaction: number;
-  /** Markers kept with their model note (`markerNotes`), by kind. */
+  /** Cancel markers kept with their model note (`cancel`), by kind. */
   notes: Record<string, number>;
   /** Entries pi 0.85 shows the model in a role of its own, imported as the user message it sends for them. */
   converted: number;
@@ -97,7 +97,7 @@ export type MigrationResult =
   | { ok: false; refused: string; sessions?: SessionPlan[] };
 
 export type RevertResult =
-  | { ok: true; action: "dry-run" | "reverted" | "already"; engine: "pi085" | "pd"; dropped?: { conversations: number; entries: number; modelJobs: number; clientCalls: number } }
+  | { ok: true; action: "dry-run" | "reverted" | "already"; engine: "pi085" | "pd"; dropped?: { conversations: number; entries: number; modelJobs: number } }
   | { ok: false; refused: string };
 
 const tableExists = (sql: Sql, name: string) =>
@@ -138,6 +138,18 @@ function piBranch(sql: Sql, session: string, tip: string): Json[] {
   return path.reverse();
 }
 
+/** The cancel marker: its entry kind and the note it shows the model. */
+export type CancelShape = { marker: string; note?: string };
+
+/** A cancel's note entry as `DurableAgent.cancel` writes one (src/runtime/durable-agent.ts `#appendNote`). */
+function cancelEntry(cancel: CancelShape, operationId: string | null, at: number): EntryDraft {
+  return {
+    kind: cancel.marker,
+    ...(cancel.note === undefined ? {} : { model: [{ role: "user", content: [{ type: "text", text: cancel.note }], timestamp: at }] }),
+    data: { operationId, at },
+  };
+}
+
 const plain = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 const show = (v: unknown) => JSON.stringify(v);
 const bump = (into: Record<string, number>, key: string) => { into[key] = (into[key] ?? 0) + 1; };
@@ -157,15 +169,15 @@ function messageDraft(m: Json): Counted {
 }
 
 /**
- * A branch, oldest first, as the entries an import appends (the table in the header). `markerNotes` names the custom
- * kinds that are kept and the note each carries to the model.
+ * A branch, oldest first, as the entries an import appends (the table in the header). `cancel` names the cancel
+ * marker's kind, the one custom kind kept, and the note it carries to the model.
  *
  * `heads` maps a compaction's index in `drafts` to the index of the entry its context starts at. pi 0.85 keeps a
  * compaction's tail as copies inside its entry; when those copies are the entries right before it, as pi 0.85 cuts
  * them, the import points the compaction's `head` at them where they are (pi-durable's own way of keeping a tail)
  * instead of appending them twice. Any other tail is appended after the compaction, which then starts at itself.
  */
-export function importDrafts(branch: readonly Json[], markerNotes: Readonly<Record<string, string>> = {}): {
+export function importDrafts(branch: readonly Json[], cancel?: CancelShape): {
   drafts: EntryDraft[]; heads: Map<number, number>; counts: ImportCounts;
 } {
   const counts: ImportCounts = { user: 0, assistant: 0, toolResult: 0, compaction: 0, notes: {}, converted: 0, dropped: {} };
@@ -199,12 +211,9 @@ export function importDrafts(branch: readonly Json[], markerNotes: Readonly<Reco
       counts.converted++;
       continue;
     }
-    if (e.type === "custom" && typeof e.customType === "string" && markerNotes[e.customType] !== undefined) {
-      drafts.push({
-        kind: e.customType,
-        model: [{ role: "user", content: [{ type: "text", text: markerNotes[e.customType]! }], timestamp: e.timestamp }],
-        data: { ...(e.data && typeof e.data === "object" ? plain(e.data) : {}), at: e.timestamp },
-      });
+    if (e.type === "custom" && cancel !== undefined && e.customType === cancel.marker) {
+      const operationId = (e.data as { operationId?: unknown } | undefined)?.operationId;
+      drafts.push(cancelEntry(cancel, typeof operationId === "string" ? operationId : null, e.timestamp));
       bump(counts.notes, e.customType);
       continue;
     }
@@ -241,25 +250,19 @@ function waitingCalls(sql: Sql, session: string): number {
 
 /**
  * Every session's import, as it would be written, and whether it already was. Writes nothing. A session whose turn
- * waits for the caller's functions ends with a `cancelMarker` entry, when one is named: the turn is cancelled, as
+ * waits for the caller's functions ends with a cancel entry, when `cancel` is given: the turn is cancelled, as
  * `AgentRuntime.cancelSession` cancels one that waits.
  */
-export function planMigration(sql: Sql, opts: { markerNotes?: Readonly<Record<string, string>>; cancelMarker?: string; now?: () => number } = {}):
+export function planMigration(sql: Sql, opts: { cancel?: CancelShape; now?: () => number } = {}):
   Array<SessionPlan & { drafts: EntryDraft[]; heads: Map<number, number> }> {
-  const notes = opts.markerNotes ?? {};
   return piSessions(sql).map((session) => {
     const tip = laneValue(sql, session, "pi.branch.tip");
     const tipId = typeof tip === "string" ? tip : null;
     const branch = tipId === null ? [] : piBranch(sql, session, tipId);
-    const { drafts, heads, counts } = importDrafts(branch, notes);
+    const { drafts, heads, counts } = importDrafts(branch, opts.cancel);
     const waiting = waitingCalls(sql, session);
-    if (waiting > 0 && opts.cancelMarker !== undefined) {
-      const at = (opts.now ?? Date.now)();
-      const note = notes[opts.cancelMarker];
-      drafts.push({
-        kind: opts.cancelMarker, data: { operationId: null, at, waitingCalls: waiting },
-        ...(note === undefined ? {} : { model: [{ role: "user", content: [{ type: "text", text: note }], timestamp: at }] }),
-      });
+    if (waiting > 0 && opts.cancel !== undefined) {
+      drafts.push(cancelEntry(opts.cancel, null, (opts.now ?? Date.now)()));
       counts.cancelledCalls = waiting;
     }
     const t = piTables(session);
@@ -282,10 +285,11 @@ export interface MigrateOptions {
   storage: DurableSqlHost;
   /** The object's pi-durable host, bound to the agent (`PdHost.bind`); its harness is closed when this returns. */
   host: PdHost;
-  /** The custom kinds kept, and the model note each carries: what the runtime hands `DurableAgent` as `markerNotes`. */
-  markerNotes?: Readonly<Record<string, string>>;
-  /** The kind of entry that ends a session whose turn waits on the caller's functions; none when absent. */
-  cancelMarker?: string;
+  /**
+   * The cancel marker's kind and note (the runtime's `TURN_CANCELLED` and the `cancelNote` it hands `DurableAgent`):
+   * pi085's markers of that kind are kept, and a turn waiting on the caller's functions ends with one. Absent: none.
+   */
+  cancel?: CancelShape;
   /** Report what would be imported, and write nothing. */
   dryRun?: boolean;
   /** Drop what the runtime holds in memory for the old engine; returns how many of each it dropped. */
@@ -306,7 +310,7 @@ export async function migrateToPd(o: MigrateOptions): Promise<MigrationResult> {
   let plans: ReturnType<typeof planMigration>;
   try {
     plans = planMigration(sql, {
-      ...(o.markerNotes ? { markerNotes: o.markerNotes } : {}), ...(o.cancelMarker ? { cancelMarker: o.cancelMarker } : {}), ...(o.now ? { now: o.now } : {}),
+      ...(o.cancel ? { cancel: o.cancel } : {}), ...(o.now ? { now: o.now } : {}),
     });
   }
   catch (error) { return { ok: false, refused: String((error as Error)?.message ?? error) }; }
@@ -350,8 +354,8 @@ export async function migrateToPd(o: MigrateOptions): Promise<MigrationResult> {
 }
 
 /**
- * Move a migrated agent back to `pi085`: pi-durable's tables are dropped and the `ap` tables' conversations, model
- * jobs and client calls deleted, then the engine moves. pi 0.85's tables were never written, so its next turn is the
+ * Move a migrated agent back to `pi085`: pi-durable's tables are dropped (the client calls' `ap.clientCalls` documents
+ * with them) and the `ap` tables' conversations and model jobs deleted, then the engine moves. pi 0.85's tables were never written, so its next turn is the
  * one it would have taken had the migration not happened. Refused while the `pd` agent has work under way or a model
  * call out, and for an agent created on `pd`, which has no pi 0.85 transcript to return to.
  */
@@ -373,7 +377,6 @@ export async function revertToPi085(o: { storage: DurableSqlHost; host: PdHost; 
     conversations: Number(ap.query("SELECT COUNT(*) AS n FROM conversations")[0]?.n ?? 0),
     entries,
     modelJobs: Number(ap.query("SELECT COUNT(*) AS n FROM model_jobs")[0]?.n ?? 0),
-    clientCalls: Number(ap.query("SELECT COUNT(*) AS n FROM client_calls")[0]?.n ?? 0),
   };
   if (o.dryRun) return { ok: true, action: "dry-run", engine: "pd", dropped };
   // Dropped before the engine moves: an agent left on pi085 with pd's tables still holding the import would, migrated
@@ -382,7 +385,6 @@ export async function revertToPi085(o: { storage: DurableSqlHost; host: PdHost; 
     for (const t of PI_DURABLE_TABLES) sql.exec(`DROP TABLE IF EXISTS ${PD.qualify(t, "table")}`);
     ap.query("DELETE FROM conversations");
     ap.query("DELETE FROM model_jobs");
-    ap.query("DELETE FROM client_calls");
   });
   return { ok: true, action: "reverted", engine: ap.migrateEngine("pd", "pi085"), dropped };
 }

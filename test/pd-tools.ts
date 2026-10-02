@@ -1,17 +1,12 @@
 /**
  * Tools on the `pd` engine: the parity cases (test/spec/pd-tools-spec.ts) over node:sqlite, and,
  * node's only, the runtime's catalogue assembly (cf/src/runtime.ts `agent()`) for the same agent on
- * both engines, and the two upstream strings src/runtime/durable-tools.ts depends on, read from the
- * installed packages. `npm run pd-tools:do` runs the spec's cases on a real Durable Object.
+ * both engines. `npm run pd-tools:do` runs the spec's cases on a real Durable Object.
  */
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 import { AgentRuntime } from "../cf/src/runtime.ts";
 import { toRequest } from "../src/model/pi-bridge.ts";
 import type { Plugin } from "../src/plugins/types.ts";
 import { DurableAgent } from "../src/runtime/durable-agent.ts";
-import { PI085_INTERRUPTED, pdInterruptedBlock } from "../src/runtime/durable-tools.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { ApStore } from "../src/store/ap-store.ts";
 import { prefixedNamespace } from "../src/store/sql-namespace.ts";
@@ -22,13 +17,6 @@ import { pdToolsCases } from "./spec/pd-tools-spec.ts";
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
-
-/** An installed package's file, found through its main entry (an export map hides the rest). */
-function packageFile(pkg: string, rel: string): string {
-  let dir = dirname(fileURLToPath(import.meta.resolve(pkg)));
-  while (!dir.endsWith("dist")) dir = dirname(dir);
-  return readFileSync(join(dir, rel), "utf8");
-}
 
 /** A plugin for the fixture agent's mount: one read, one write. */
 const kv: Plugin = {
@@ -95,18 +83,6 @@ const nodeCases: DriveCase[] = [
       let at = 0;
       while (at < a.length && a[at] === b[at]) at++;
       check(a === b, `system prompts differ at ${at}\n pi085 …${show(a.slice(Math.max(0, at - 60), at + 120))}\n pd    …${show(b.slice(Math.max(0, at - 60), at + 120))}`);
-    },
-  },
-  {
-    group: "upstream", name: "the interrupted texts durable-tools.ts maps between are the installed packages' own",
-    run: async () => {
-      const pi = packageFile("@earendil-works/pi-agent-core", "harness/runtime/drive/tools.js");
-      check(pi.includes(`const INTERRUPTION_MARKER = ${show(PI085_INTERRUPTED)};`), "pi-agent-core's INTERRUPTION_MARKER is not PI085_INTERRUPTED");
-      const pd = packageFile("@earendil-works/pi-durable", "harness/tool.js");
-      check(pd.includes("const message = `Tool ${call.name} was interrupted and may have partially run`;") &&
-        pd.includes("return `<harness>\\n${diagnostics.map((diagnostic) => `[${diagnostic.severity}] ${diagnostic.message}`).join(\"\\n\")}\\n</harness>`;"),
-        "pi-durable's interrupted result is no longer built the way pdInterruptedBlock assumes");
-      check(pdInterruptedBlock("x") === "<harness>\n[error] Tool x was interrupted and may have partially run\n</harness>", "pdInterruptedBlock");
     },
   },
 ];

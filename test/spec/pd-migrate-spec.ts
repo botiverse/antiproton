@@ -29,7 +29,7 @@ function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new 
 const show = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
-const NOTES = { [TURN_CANCELLED]: CANCELLED_NOTE };
+const CANCEL = { marker: TURN_CANCELLED, note: CANCELLED_NOTE };
 const NOTE_PROJECTOR = {
   [TURN_CANCELLED]: (entry: { timestamp: number }) => [{ role: "user" as const, content: [{ type: "text" as const, text: CANCELLED_NOTE }], timestamp: entry.timestamp }],
 };
@@ -57,7 +57,7 @@ function pd(host: PdHost, w: World, session = "main"): Engine & { agent: Durable
   const agent = DurableAgent.open({
     host, tenantId: "t", agentId: "a", model: MODEL, systemPrompt: SYSTEM, session,
     dispatch: async (id) => { dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),
-    ...toolOptions(w), markerNotes: NOTES,
+    ...toolOptions(w), cancelNote: CANCELLED_NOTE,
   });
   return { name: "pd", agent, dispatched, pd: host };
 }
@@ -191,7 +191,7 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
         "the world lacks what the check below is about");
       const host = pdHost(storage);
       host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
-      const out = await migrateToPd({ storage, host, markerNotes: NOTES });
+      const out = await migrateToPd({ storage, host, cancel: CANCEL });
       check(out.ok && out.action === "migrated" && out.engine === "pd", `not migrated: ${show(out)}`);
       check(out.sessions.map((s) => s.session).join() === "main,s2", `sessions: ${show(out.sessions)}`);
       check(new ApStore(storage, prefixedNamespace("ap")).engine() === "pd", "the engine did not move");
@@ -228,7 +228,7 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       const before = dump(storage, () => true);
       const host = pdHost(storage);
       host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
-      const out = await migrateToPd({ storage, host, markerNotes: NOTES, dryRun: true });
+      const out = await migrateToPd({ storage, host, cancel: CANCEL, dryRun: true });
       check(out.ok && out.action === "dry-run" && out.engine === "pi085", `dry-run: ${show(out)}`);
       const main = out.sessions.find((s) => s.session === "main")!;
       check(main.counts.assistant === 5 && main.counts.toolResult === 1 && main.counts.compaction === 1 && !main.imported && (main.counts.dropped.deferred ?? 0) > 0,
@@ -247,7 +247,7 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       const before = dump(storage, () => true);
       const host = pdHost(storage);
       host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
-      const refused = await migrateToPd({ storage, host, markerNotes: NOTES });
+      const refused = await migrateToPd({ storage, host, cancel: CANCEL });
       check(!refused.ok && /not idle/.test(refused.refused) && /run in progress/.test(refused.refused) && /model call/.test(refused.refused), `busy: ${show(refused)}`);
       check(dump(storage, () => true) === before, "a refused migration wrote something");
       await settle(e, [say("done")]);
@@ -255,10 +255,10 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       // Background work still running: its result would be a message to a session mid-move.
       ensureBackgroundTable(storage.sql as never);
       storage.sql.exec("INSERT INTO background_jobs(id, tenant_id, agent_id, session, mount, tool, handle, state, created_at, polls, next_poll_at) VALUES ('bg1','t','a','main','box','shell','{}','running',0,0,0)");
-      const background = await migrateToPd({ storage, host, markerNotes: NOTES });
+      const background = await migrateToPd({ storage, host, cancel: CANCEL });
       check(!background.ok && /1 background job\(s\) running/.test(background.refused), `with a background job: ${show(background)}`);
       storage.sql.exec("UPDATE background_jobs SET state = 'done' WHERE id = 'bg1'");
-      const out = await migrateToPd({ storage, host, markerNotes: NOTES });
+      const out = await migrateToPd({ storage, host, cancel: CANCEL });
       check(out.ok && out.action === "migrated", `once idle: ${show(out)}`);
     });
   });
@@ -268,15 +268,15 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       await history(storage);
       const host = pdHost(storage);
       host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
-      check((await migrateToPd({ storage, host, markerNotes: NOTES })).ok, "the first run");
+      check((await migrateToPd({ storage, host, cancel: CANCEL })).ok, "the first run");
       const entries = count(storage, "pd_entries");
-      const again = await migrateToPd({ storage, host, markerNotes: NOTES });
+      const again = await migrateToPd({ storage, host, cancel: CANCEL });
       check(again.ok && again.action === "already", `the second run: ${show(again)}`);
       // As if the first run had stopped after its imports: the engine never moved.
       new ApStore(storage, prefixedNamespace("ap")).migrateEngine("pd", "pi085");
-      const dry = await migrateToPd({ storage, host, markerNotes: NOTES, dryRun: true });
+      const dry = await migrateToPd({ storage, host, cancel: CANCEL, dryRun: true });
       check(dry.ok && dry.sessions.every((s) => s.imported), `the imports were not recognised: ${show(dry)}`);
-      const third = await migrateToPd({ storage, host, markerNotes: NOTES });
+      const third = await migrateToPd({ storage, host, cancel: CANCEL });
       check(third.ok && third.action === "migrated" && third.engine === "pd", `the resumed run: ${show(third)}`);
       check(count(storage, "pd_entries") === entries, `imported again: ${entries} entries, now ${count(storage, "pd_entries")}`);
       const markers = Number(storage.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE json_extract(record, '$.kind') = ?", MIGRATED).toArray()[0]!.n);
@@ -306,7 +306,7 @@ export function pdMigrateCases(withHost: WithDriveHost): DriveCase[] {
       const [pi, other] = [dump(storage, isPi), dump(storage, (t) => notEngine(t) && t !== "usage_outbox" && t !== "trace_outbox")];
       const host = pdHost(storage);
       host.bind({ tenantId: "t", agentId: "a", model: MODEL, dispatch: async () => {}, unknownJob: (id) => new UnknownJob(id) });
-      check((await migrateToPd({ storage, host, markerNotes: NOTES })).ok, "migrated");
+      check((await migrateToPd({ storage, host, cancel: CANCEL })).ok, "migrated");
       // A turn on pd: the rollback does not carry it back.
       const e = pd(host, w);
       await turn(e, "a turn on pd", [say("pd reply")]);

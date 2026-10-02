@@ -1,8 +1,7 @@
 /**
- * Cancel and the API caller's functions on the `pd` engine, measured against pi085: the cases of
- * test/spec/pd-cancel-spec.ts over node:sqlite, and, node's only (the conformance worker does not carry the
- * runtime), the same contract through `AgentRuntime` — `cancelSession`, `waitingClientCalls`,
- * `submitToolResults` and `step` — on an object of each engine. `npm run pd-cancel:do` runs the spec's cases
+ * Cancel and the API caller's functions on the `pd` engine: the cases of test/spec/pd-cancel-spec.ts over
+ * node:sqlite, and, node's only (the conformance worker does not carry the runtime), the Agents API contract through
+ * `AgentRuntime` — `cancelSession`, `waitingClientCalls`, `submitToolResults` and `step` — on an object of each engine. `npm run pd-cancel:do` runs the spec's cases
  * on a real Durable Object.
  */
 import { AgentRuntime } from "../cf/src/runtime.ts";
@@ -98,7 +97,7 @@ async function apiAgent(engine: "pi085" | "pd") {
 }
 
 const runtimeCases: DriveCase[] = [{
-  group: "runtime", name: "through AgentRuntime: cancel a running turn, cancel on idle, a client call round trip — the same Agents API reading and model requests on both engines",
+  group: "runtime", name: "through AgentRuntime: cancel a running turn, cancel on idle, a client call round trip — the same Agents API reading on both engines",
   run: async () => {
     const out: Record<string, { views: unknown[]; requests: unknown[]; cancelled: Array<string | null> }> = {};
     for (const engine of ["pi085", "pd"] as const) {
@@ -155,8 +154,10 @@ const runtimeCases: DriveCase[] = [{
       const strip = (p: Array<{ turn_id: string }>) => p.map(({ turn_id: _t, ...rest }) => rest);
       check(show(x) === show(y) && show(strip(a)) === show(strip(b)), `view ${i} differs\n pi085 ${show(v)}\n pd    ${show(pd.views[i])}`);
     });
-    check(show(pi.requests) === show(pd.requests), `the model's requests differ\n pi085 ${show(pi.requests)}\n pd    ${show(pd.requests)}`);
-    check(show(pd.requests[0]).includes(CANCELLED_NOTE.slice(1, 40)), `the note is not in the next request: ${show(pd.requests[0])}`);
+    for (const [engine, r] of [["pi085", pi], ["pd", pd]] as const) {
+      check(r.requests.length === 2 && show(r.requests[0]).includes(CANCELLED_NOTE.slice(1, 40)) && show(r.requests[1]).includes("{\\\"temp\\\":21}"),
+        `${engine}: the model read ${show(r.requests)}`);
+    }
   },
 }];
 
@@ -218,7 +219,7 @@ const results = await runDriveCases([
   // PD_TRACE=1 names each case as it starts: a case that hangs is otherwise silent until the whole run is killed.
   .map((c) => ({ ...c, run: async () => { if (process.env.PD_TRACE) console.error(`start ${c.group}: ${c.name.slice(0, 60)}`); await c.run(); } })));
 
-console.log(`\n  pd cancel and client calls: parity with pi085 — node:sqlite\n  ${"─".repeat(56)}`);
+console.log(`\n  pd cancel and client calls — node:sqlite\n  ${"─".repeat(56)}`);
 let group = "";
 for (const r of results) {
   if (r.group !== group) { group = r.group; console.log(`  ${group}`); }

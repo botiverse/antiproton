@@ -12,6 +12,9 @@
  */
 import { retailPlugin, applyRetailAction, WRITE_TOOLS, type RetailDB } from "../../bench/tau2/retail.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
+import { ApStore, type ApSqlHost } from "../../src/store/ap-store.ts";
+import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
+import { recordedEngine } from "../../src/runtime/durable-agent.ts";
 
 const BASE_DB_KEY = "bench/tau2-db.json";
 
@@ -114,4 +117,40 @@ export class BenchState {
       db: st.db,
     };
   }
+}
+
+/**
+ * The kernel a bench task's agent runs on, recorded before that agent is first built. A production
+ * object never comes here: its engine is never written (cf/src/runtime.ts reads it, `recordedEngine`).
+ *
+ * - `pi085` (or none named): the shared bench object as it always was — each task clears the pi
+ *   tables and takes the object over (`benchStart`). An object already recorded as `pd` is refused:
+ *   that clear does not reach pi-durable's tables, so the next task would continue the last one's
+ *   conversation, the bug the clear exists to prevent.
+ * - `pd`: one task per object, as production is one agent per object. pi-durable's harness serves
+ *   one agent (`PdHost.bind`), and its tables, the `ap` ones and its jobs carry no agent column, so
+ *   instead of clearing them between tasks the driver gives each task an object of its own
+ *   (bench/objects.ts). An object that has already hosted a task is refused.
+ *
+ * `hostedBefore` is the agent the object's owner row names, if any.
+ */
+export type BenchEngine = "pi085" | "pd";
+
+export function chooseBenchEngine(
+  storage: ApSqlHost, requested: unknown, hostedBefore: string | null,
+): BenchEngine {
+  const engine = requested === undefined || requested === null || requested === "" ? "pi085" : requested;
+  if (engine !== "pi085" && engine !== "pd") throw new Error(`unknown bench engine: ${String(requested)} (pi085 or pd)`);
+  const recorded = recordedEngine(storage.sql as Parameters<typeof recordedEngine>[0]);
+  if (engine === "pi085") {
+    if (recorded === "pd") throw new Error("this bench object runs pd, one task per object: start the task on a fresh object (obj=...)");
+    return engine;
+  }
+  if (recorded === "pd" || hostedBefore !== null) {
+    throw new Error(`a pd bench task needs an object of its own; this one already hosted ${hostedBefore ?? "a pd agent"} (obj=...)`);
+  }
+  const ap = new ApStore(storage, prefixedNamespace("ap"));
+  ap.ensure();
+  if (ap.setEngineOnce("pd") !== "pd") throw new Error("the object's engine is already recorded as another");
+  return engine;
 }

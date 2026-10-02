@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the pd cancel and client-call parity cases (test/spec/pd-cancel-spec.ts) against real Durable Object SQLite, in
+# Runs the pd cancel and client-call cases (test/spec/pd-cancel-spec.ts) against real Durable Object SQLite, in
 # the conformance worker, which is never deployed (cf/src/conformance.ts). test/pd-cancel.ts runs them
 # over node:sqlite, with the runtime-level contract beside them; this is the run on the
 # storage and runtime the object will have.
@@ -23,7 +23,7 @@ if [ -z "$answered" ]; then
 fi
 node -e '
 const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-console.log(`\n  pd cancel and client calls: parity with pi085 — ${r.backend}\n  ${"─".repeat(56)}`);
+console.log(`\n  pd cancel and client calls — ${r.backend}\n  ${"─".repeat(56)}`);
 let g = "";
 for (const c of r.results) {
   if (c.group !== g) { g = c.group; console.log(`  ${g}`); }

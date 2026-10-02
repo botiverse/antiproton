@@ -45,7 +45,7 @@
  * /pd-tools runs the tool parity cases (test/spec/pd-tools-spec.ts): the same scripted model against
  * PiAgent and DurableAgent, each over the real gateway on this object's storage (test/pd-tools-do.sh).
  *
- * /pd-cancel runs the cancel and client-call parity cases (test/spec/pd-cancel-spec.ts) the same way
+ * /pd-cancel runs the cancel and client-call cases (test/spec/pd-cancel-spec.ts) the same way
  * (test/pd-cancel-do.sh).
  */
 import { DurableObject } from "cloudflare:workers";

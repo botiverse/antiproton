@@ -17,6 +17,7 @@
  * keeps the simulator's tokens out of the agent's own accounting.
  *
  *   N=8 TRIALS=3 node bench/tau2/cf.ts
+ *   ENGINE=pd N=8 TRIALS=3 OBJ=pd1 node bench/tau2/cf.ts   (one object per task: bench/objects.ts)
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -30,6 +31,7 @@ import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
 import { runOrder, runPlan } from "./plan.ts";
 import { deafnessBudget, hearPollDecision, hearSocketEvent, readDeafness } from "./deafness.ts";
+import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -69,10 +71,15 @@ const SIM = { maxTokens: 8192, reasoning: "low" } as const;
 // Each arm gets its own object, so one arm's activity is never read as
 // another's — the meter is per object and it does not reset itself.
 const OBJ = process.env.OBJ ?? "v1";
-const withObj = (path: string) => path + (path.includes("?") ? "&" : "?") + `obj=${OBJ}`;
+// Which kernel runs the agent, and so whether each task needs an object of its own (bench/objects.ts).
+const ENGINE = benchEngine(process.env.ENGINE);
+const OBJECTS = objectsShape(ENGINE, process.env.OBJECTS);
+/** The object a task runs in: the run's own, or the task's (OBJECTS=per-task, and always on pd). */
+const objOf = (taskId: string) => taskObject(OBJ, OBJECTS, taskId);
+const withObj = (path: string, obj = OBJ) => path + (path.includes("?") ? "&" : "?") + `obj=${obj}`;
 
-async function api(path: string, init: RequestInit = {}): Promise<any> {
-  const r = await fetch(BASE + withObj(path), {
+async function api(path: string, init: RequestInit = {}, obj = OBJ): Promise<any> {
+  const r = await fetch(BASE + withObj(path, obj), {
     ...init,
     headers: { "x-harness-token": TOKEN, ...(init.headers ?? {}) },
     signal: AbortSignal.timeout(120_000),
@@ -81,8 +88,8 @@ async function api(path: string, init: RequestInit = {}): Promise<any> {
   if (!r.ok) throw new Error(`${path} → ${r.status}: ${text.slice(0, 200)}`);
   return text ? JSON.parse(text) : null;
 }
-const post = (path: string, body: unknown) =>
-  api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+const post = (path: string, body: unknown, obj = OBJ) =>
+  api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, obj);
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -122,7 +129,7 @@ function waitForAnswer(taskId: string): Promise<string | null> {
 async function pollForAnswer(taskId: string): Promise<string | null> {
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const s = await api(`/bench/poll?taskId=${taskId}`);
+    const s = await api(`/bench/poll?taskId=${taskId}`, {}, objOf(taskId));
     if (s.status === "idle" && s.answer) { count(taskId, "poll"); return s.answer; }
     await new Promise((r) => setTimeout(r, 1_500));
   }
@@ -151,7 +158,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
   // refused upgrade reaches a WebSocket client only as close 1006 with no body,
   // which this runner then scored as a stalled agent.
   const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
-    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
+    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`, objOf(taskId)), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
   return new Promise<string | null>((resolve) => {
     let done = false;
     const stop = (v: string | null) => {
@@ -166,7 +173,7 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
     const keepalive = setInterval(() => {
       try { ws.send("ping"); } catch { /* closing */ }
       // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
-      void api(`/bench/poll?taskId=${taskId}`).then((poll: any) => {
+      void api(`/bench/poll?taskId=${taskId}`, {}, objOf(taskId)).then((poll: any) => {
         count(taskId, "pollAnswered");
         const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
         if (!d) return;
@@ -239,7 +246,12 @@ const failed = new Map<string, string>();
 async function runTask(task: any) {
   const t0 = Date.now();
   const taskId = `t_${task.id}_${Date.now().toString(36)}`;
-  await post("/bench/start", { taskId, policy: POLICY, offload: true });
+  const obj = objOf(taskId);
+  // The engine is named only when it is not the default, so a pi085 run sends what it always sent.
+  const started = await post("/bench/start", { taskId, policy: POLICY, offload: true, ...(ENGINE === "pi085" ? {} : { engine: ENGINE }) }, obj);
+  // What the object says it runs, not what was asked: an older Worker ignores `engine` and answers without one.
+  const engine = started?.engine ?? (ENGINE === "pi085" ? "pi085" : null);
+  if (engine !== ENGINE) throw new Error(`asked for ${ENGINE}, the object runs ${engine ?? "an engine it did not name"}`);
 
   const instr = task.user_scenario?.instructions ?? {};
   const scenario = [
@@ -284,7 +296,7 @@ async function runTask(task: any) {
     // refusal was filed as a stall of the agent. Named for whose turn it was.
     if (u.text.trim() === "") { ended = `sim_empty (${u.finishReason})`; break; }
 
-    await post("/bench/say", { taskId, text: u.text });
+    await post("/bench/say", { taskId, text: u.text }, obj);
 
     const answered = await waitForAnswer(taskId);
     if (!answered) {
@@ -292,7 +304,7 @@ async function runTask(task: any) {
       else {
         ended = "agent_stalled";
         ({ stall, stallWhy } = await stallAtDeadline(
-          () => api(`/bench/poll?taskId=${taskId}`), seen.get(taskId) ?? 0));
+          () => api(`/bench/poll?taskId=${taskId}`, {}, obj), seen.get(taskId) ?? 0));
         // The hole is spent whether or not it produced the stall, so a round injects exactly one.
         deafness.spend();
       }
@@ -303,14 +315,17 @@ async function runTask(task: any) {
     if (VERBOSE) console.log(`    agent > ${answered.replace(/\s+/g, " ").slice(0, 130)}`);
   }
 
-  const res = await api(`/bench/result?taskId=${taskId}`);
+  const res = await api(`/bench/result?taskId=${taskId}`, {}, obj);
+  // A task with an object of its own has that object's whole activity log to itself.
+  const activity = OBJECTS === "per-task" ? await api("/bench/activity", {}, obj).catch(() => null) : undefined;
   const { hash, expected } = gold(task);
   const writes = (res.writes ?? []).filter((w: any) => WRITE_TOOLS.has(w.name));
   const dbMatch = res.dbHash === hash;
   const actionMatch = grade(expected, writes);
 
   return {
-    id: task.id, taskId, reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
+    id: task.id, taskId, engine, object: `bench-${obj}`, ...(activity === undefined ? {} : { activity }),
+    reward: dbMatch && actionMatch ? 1 : 0, dbMatch, actionMatch, ended, stall, stallWhy,
     delivered: delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 },
     turns: turns - 1, simCalls,
     usage: res.usage ?? {}, kinds: res.kinds ?? {}, byTool: res.byTool ?? {}, toolErrors: res.toolErrors ?? null,
@@ -343,7 +358,8 @@ await api("/bench/basedb", {
   headers: { "content-type": "application/json" },
   body: readFileSync(here + "db.json", "utf8"),
 });
-await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
+// Per task, every object is new and has nothing to reset.
+if (OBJECTS === "shared") await api("/bench/activity/reset", { method: "POST" }).catch(() => {});
 
 const selected = TASKS.slice(OFFSET, OFFSET + N);
 // Before the first line of output: the log path has to exist while there is
@@ -351,7 +367,7 @@ const selected = TASKS.slice(OFFSET, OFFSET + N);
 const run = beginRun("tau2", OBJ);
 teeRun(run);
 console.log(`\n  τ²-bench retail — ${selected.length} task(s) × ${TRIALS} trial(s) in ${ORDER} order, ` +
-  `model ${MODEL_ID}, waiting by ${WAIT}\n  on ${BASE} object bench-${OBJ}\n  ${"─".repeat(84)}`);
+  `model ${MODEL_ID}, waiting by ${WAIT}, engine ${ENGINE}\n  on ${BASE} ${OBJECTS === "shared" ? `object bench-${OBJ}` : `one object per task, bench-${OBJ}-<task>`}\n  ${"─".repeat(84)}`);
 
 const results: any[] = [];
 const t0Run = Date.now();
@@ -361,7 +377,7 @@ for (const { task, trial } of runPlan(selected, TRIALS, ORDER)) {
     let r;
     try { r = await runTask(task); }
     catch (e) {
-      r = { id: task.id, reward: 0, dbMatch: false, actionMatch: false,
+      r = { id: task.id, engine: ENGINE, reward: 0, dbMatch: false, actionMatch: false,
             ended: `error: ${(e as Error).message.slice(0, 80)}`, turns: 0, simCalls: 0,
             usage: {}, kinds: {}, byTool: {}, seconds: 0, expectedWrites: [], performedWrites: [] };
     }
@@ -412,7 +428,9 @@ if (Object.keys(failEndings).length) {
  * active, so the gap between this and the wall clock above is the part of the
  * run that cost nothing because the object was asleep waiting on the queue.
  */
-const act = await api("/bench/activity").catch(() => null);
+const act = OBJECTS === "shared"
+  ? await api("/bench/activity").catch(() => null)
+  : sumActivity(results.map((r) => r.activity));
 if (act) {
   const wall = results.reduce((a, r) => a + r.seconds, 0);
   console.log(`  object billed ${(act.activeMs / 1000).toFixed(1)}s of ${wall}s wall ` +
@@ -420,7 +438,7 @@ if (act) {
     (act.pollMs ? `, of which ${(act.pollMs / 1000).toFixed(1)}s is this runner polling` : ""));
 }
 const recorded = recordRun(run, {
-  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: `bench-${OBJ}`, model: MODEL_ID, wait: WAIT, sim: SIM,
+  bench: "tau2-retail", base: BASE, build: await workerBuild(BASE), driver: driverCommit(), object: OBJECTS === "shared" ? `bench-${OBJ}` : `bench-${OBJ}-<task>`, engine: ENGINE, objects: OBJECTS, model: MODEL_ID, wait: WAIT, sim: SIM,
   provider: await workerModel(BASE),
   tasks: selected.map((t) => t.id), trials: TRIALS, order: ORDER,
   ...(DEAFNESS ? { ignoreAnswers: DEAFNESS } : {}),
