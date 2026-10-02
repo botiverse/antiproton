@@ -5,12 +5,13 @@
  * pi-durable commits in one synchronous transaction (src/vendor/pi/pi-durable/dist/storage/sqlite/storage.js),
  * so there is no "during" to start work in: no other code runs between its first statement and its end.
  * The earliest anything else can run is right after it, which is when `after` runs — synchronously, as the
- * host's `transactionSync` returns or throws, before the facade has seen the result. A transaction is
- * pi-durable's when it wrote a `pd_` object; a unit of ours (`exclusive`) writes none, and is let through.
+ * host's `transactionSync` returns or throws, before the facade has seen the result. A transaction is a
+ * pi-durable commit when it advanced `durable_metadata`, as every commit does last (storage.js `commit`):
+ * migrations, document reads and units of ours (`exclusive`) do not, and are let through.
  */
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 
-const PD_WRITE = /^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE)\b[^]*\bpd_/i;
+const COMMIT = /^\s*UPDATE pd_durable_metadata SET next_id\b/;
 
 export function afterPdCommits(host: DurableSqlHost, after: (outcome: { ok: boolean }) => void): DurableSqlHost {
   let depth = 0;
@@ -18,7 +19,7 @@ export function afterPdCommits(host: DurableSqlHost, after: (outcome: { ok: bool
   return {
     sql: {
       exec(query, ...bindings) {
-        if (depth > 0 && PD_WRITE.test(query)) wrote = true;
+        if (depth > 0 && COMMIT.test(query)) wrote = true;
         return host.sql.exec(query, ...bindings);
       },
     },

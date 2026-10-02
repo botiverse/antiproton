@@ -14,7 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT as bg, withAbortSignal } from "@earendil-works/chord/context";
 import { createRegistry, defineExtension, defineTask, Harness as UpstreamHarness, type HarnessInspection } from "@earendil-works/pi-durable";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import * as upstreamSqlite from "@earendil-works/pi-durable/storage/sqlite";
@@ -77,6 +77,20 @@ add("every relative import of a vendored file resolves, and none reaches the pac
       check(existsSync(target), `${v.file} imports ${spec}, which does not exist`);
       const inPackage = target.pathname.split("/node_modules/")[1];
       check(!inPackage || !ours.has(inPackage), `${v.file} imports the unpatched ${inPackage}`);
+    }
+  }
+});
+
+add("every package a vendored file imports by name resolves to the one copy the package's own files get", () => {
+  // A vendored file lives outside the package, so its bare imports resolve from the repo's top-level node_modules;
+  // the package's own files would resolve a copy nested in its directory first. Two copies are two module
+  // identities (a class, a context key), and the vendored file would be talking to the other one.
+  for (const v of vendored()) {
+    for (const [, spec] of v.text.matchAll(/^import [^;]* from "([^".][^"]*)";$/gm)) {
+      const name = spec!.startsWith("@") ? spec!.split("/").slice(0, 2).join("/") : spec!.split("/")[0]!;
+      const nested = new URL(`node_modules/${v.pkg}/node_modules/${name}/`, root);
+      check(!existsSync(nested), `${v.pkg} has its own copy of ${name} (${nested.pathname}); ${v.file} imports the top-level one`);
+      check(existsSync(new URL(`node_modules/${name}/`, root)), `${v.file} imports ${spec}, which is not installed at the top level`);
     }
   }
 });
@@ -205,6 +219,69 @@ add("the control: pi-durable's own Harness reports the same sleep as plain runni
   await h.close(bg);
   check(show(inspection.tasks[0]?.state) === show({ kind: "running" }), `upstream inspect said ${show(inspection.tasks[0]?.state)}`);
   check(sleeps.length === 0, `upstream called onSleep: ${show(sleeps)}`);
+});
+
+/**
+ * A task that sleeps, then waits on `gate` while its invocation is still running: in "end" the sleep runs out
+ * (`DOZE_MS`); in "abort" it is aborted through the signal of the context it was given. Either way inspect()
+ * must stop reporting `sleepingUntil` once the sleep is over.
+ */
+let dozeMode: "end" | "abort" = "end";
+let dozeAbort = new AbortController();
+let afterSleep: () => void = () => {};
+let gate: Promise<void> = Promise.resolve();
+const DOZE_MS = 300;
+const Doze = defineTask<Record<string, never>, { phase: "doze" }, null>({
+  name: "vendor-test.doze", version: 1, initial: () => ({ phase: "doze" }),
+  phases: {
+    doze: async (_task, runtime, context) => {
+      if (dozeMode === "end") await runtime.sleep(Date.now() + DOZE_MS, context);
+      else await runtime.sleep(Date.now() + 60_000, withAbortSignal(dozeAbort.signal, context)).catch(() => {});
+      afterSleep();
+      await gate;
+      await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+    },
+  },
+  abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
+});
+
+async function sleepThenAfter(mode: "end" | "abort") {
+  dozeMode = mode;
+  dozeAbort = new AbortController();
+  let open!: () => void;
+  gate = new Promise<void>((r) => { open = r; });
+  const slept = new Promise<void>((r) => { afterSleep = r; });
+  const registry = createRegistry();
+  registry.install(defineExtension({ name: "vendor-test", tasks: [Doze] }));
+  const h = await Harness.open(new MemoryStorage(), { models: createModels(), registry }, bg);
+  try {
+    const root = await h.root(bg);
+    await root.commit((tx) => tx.createTask(Doze, {}, { ownership: { kind: "conversation" } }), bg);
+    h.resume();
+    let during: unknown;
+    for (let i = 0; i < 100 && during === undefined; i++) {
+      await new Promise((r) => setImmediate(r));
+      const state = (await h.inspect(bg)).tasks[0]?.state as { sleepingUntil?: number } | undefined;
+      if (state?.sleepingUntil !== undefined) during = state;
+    }
+    if (mode === "abort") dozeAbort.abort();
+    await slept;
+    const after = (await h.inspect(bg)).tasks[0]?.state;
+    open();
+    return { during, after };
+  } finally { open(); await h.close(bg); }
+}
+
+add("the vendored Harness: once a sleep runs out, inspect() reports plain running again", async () => {
+  const { during, after } = await sleepThenAfter("end");
+  check(during !== undefined, "control: the sleep was never reported");
+  check(show(after) === show({ kind: "running" }), `after the sleep inspect said ${show(after)}`);
+});
+
+add("the vendored Harness: once a sleep is aborted, inspect() reports plain running again", async () => {
+  const { during, after } = await sleepThenAfter("abort");
+  check(during !== undefined, "control: the sleep was never reported");
+  check(show(after) === show({ kind: "running" }), `after the aborted sleep inspect said ${show(after)}`);
 });
 
 let passed = 0;
