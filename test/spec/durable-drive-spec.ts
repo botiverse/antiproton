@@ -189,7 +189,7 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
   const add = (group: string, name: string, body: (host: DurableSqlHost) => Promise<void>) =>
     cases.push({ group, name, run: () => withHost(body) });
 
-  add("provider", "a job is wire format v2: the prompt inline where pi-durable put it, after the input; tools as a field", async (host) => {
+  add("provider", "a job is wire format v2: the prompt pi-durable put after the input leads the request, its `instructions` untagged; tools as a field", async (host) => {
     const w = world(host);
     const r = parked(await w.submit("Capital of France?"));
     const [row] = w.jobs.rows();
@@ -200,9 +200,10 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
       `context ${show(Object.keys(job.context))} version ${show(job.context.version)}`);
     const { messages, tools } = toRequest(job.context);
     check(messages.length === 2, `request messages ${show(messages)}`);
-    check(messages[0]?.role === "user" && messages[0].content === "Capital of France?", `user turn ${show(messages[0])}`);
-    check(messages[1]?.role === "system" && messages[1].content.includes("terse test assistant") && messages[1].content.includes("Answer in one word."),
-      `system prompt ${show(messages[1])}`);
+    // The extension's untagged `preamble` section, then the agent's `instructions` out of its `<instructions>` tag.
+    check(messages[0]?.role === "system" && messages[0].content === "You are a terse test assistant.\n\nAnswer in one word.",
+      `system prompt ${show(messages[0])}`);
+    check(messages[1]?.role === "user" && messages[1].content === "Capital of France?", `user turn ${show(messages[1])}`);
     check(tools?.length === 1 && tools[0]?.name === "count", `tools ${show(tools)}`);
     check(show(job.model).includes(`"provider":"${PROVIDER}"`) && job.model.id === MODEL, `model ${show(job.model)}`);
     check(r.parkedUntil > 0, "parked");
@@ -282,7 +283,7 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     const rows = w.jobs.rows();
     check(rows.length === 2, `jobs after the answer: ${rows.length}`);
     const seen = toRequest(JSON.parse(rows[1]!.request).context).messages.map((m) => `${m.role}: ${m.content}`);
-    check(show(seen.filter((m) => !m.startsWith("system: "))) === show(["user: Q1", "assistant: A1", "user: STEER"]) && seen[1]?.startsWith("system: "),
+    check(show(seen.filter((m) => !m.startsWith("system: "))) === show(["user: Q1", "assistant: A1", "user: STEER"]) && seen[0]?.startsWith("system: "),
       `second call saw ${show(seen)}`);
     w.jobs.consume(rows[1]!.id, () => reply("A2"));
     await sleep(second.parkedUntil - Date.now());
@@ -485,6 +486,19 @@ export async function wireFormatCases(old: {
       { role: "user", content: "And of Spain?", timestamp: 6 },
     ] });
   })();
+  // As pi-durable writes it: the first run's prompt after the input that started it, as the agent's
+  // `instructions` section in the tag pi-durable's `renderSections` wraps it in, with no content.
+  const placedMessages = (() => {
+    const c = JSON.parse(conversation);
+    const [first, ...rest] = c.messages;
+    return [first, { role: "system", content: "", sections: { instructions: `<instructions>\n${c.systemPrompt}\n</instructions>` }, toolsAdded: c.tools, timestamp: 1 }, ...rest];
+  })();
+  const placed = JSON.stringify({ messages: placedMessages });
+  const placedThenPatched = JSON.stringify({ messages: [
+    ...placedMessages,
+    { role: "system", content: "", sections: { style: "Answer in French." }, timestamp: 4 },
+    { role: "user", content: "And of Spain?", timestamp: 6 },
+  ] });
   const startNewJob = async (json: string) => {
     let request = "";
     const models = createModels();
@@ -522,6 +536,21 @@ export async function wireFormatCases(old: {
         { role: "user", content: "And of Spain?" },
       ]), `after the tool result: ${show(after.messages.slice(k))}`);
       check(show(after.tools?.map((t) => t.name)) === show(["count", "shout"]), `tools ${show(after.tools)}`);
+    },
+  }, {
+    group: "provider", name: "the prompt pi-durable writes after the first input, tagged as its `instructions` section, leads the request untagged: the 0.85 request",
+    run: async () => {
+      const before = toRequest(JSON.parse(await old.startOldJob(conversation)).context);
+      const after = toRequest(JSON.parse(await startNewJob(placed)).context);
+      check(show(after) === show(before), `toRequest differs:\n 0.85 ${show(before)}\n 1.0  ${show(after)}`);
+    },
+  }, {
+    group: "provider", name: "a later prompt change stays where it stood when the first prompt is moved to the top",
+    run: async () => {
+      const after = toRequest(JSON.parse(await startNewJob(placedThenPatched)).context).messages;
+      check(show(after.map((m) => m.role)) === show(["system", "user", "assistant", "tool", "system", "user"]),
+        `roles ${show(after.map((m) => m.role))}`);
+      check(after[4]!.content === "Updated system prompt section \"style\":\n\nAnswer in French.", `the later one: ${show(after[4])}`);
     },
   }];
 }

@@ -58,7 +58,8 @@ export async function replyingUnknownJob<T>(fn: () => Promise<T>): Promise<T | U
 
 /** The two RPC methods of the agent's object the consumer uses. */
 export interface ModelJobStub {
-  takeJob(tenantId: string, agentId: string, jobId: string): Promise<unknown>;
+  /** `taker`: the queue message that will call the model with the job; absent when nothing is called (giving up). */
+  takeJob(tenantId: string, agentId: string, jobId: string, taker?: string): Promise<unknown>;
   deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs: number): Promise<unknown>;
 }
 
@@ -71,6 +72,8 @@ export interface ModelQueueDeps {
 }
 
 export interface ModelQueueMessage {
+  /** The queue's id for the message, the same on each of its retries. */
+  readonly id?: string;
   readonly body: QueuedModelCall;
   ack(): void;
   retry(): void;
@@ -81,13 +84,16 @@ function unknownJob(m: QueuedModelCall, phase: "take" | "deliver" | "give_up"): 
   logEvent("model_job.unknown", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, phase });
 }
 
-/** The model call, waited on where waiting is free (see index.ts). */
-export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
+/**
+ * The model call, waited on where waiting is free (see index.ts). `taker` is the message's id: the agent
+ * refuses the job to a second message while another one may still be calling the model with it.
+ */
+export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps, taker?: string): Promise<void> {
   const stub = deps.stub(m);
-  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId);
+  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId, taker);
   if (isUnknownJobReply(job)) return unknownJob(m, "take");
   // Already answered — a redelivery after success, which must not call the
-  // provider again.
+  // provider again — or taken by another message that is calling it now.
   if (!job) return;
   const t0 = Date.now();
   const answer = await deps.call(job, m);
@@ -121,7 +127,7 @@ export async function consumeModelCalls(
       continue;
     }
     try {
-      await runModelCall(message.body, deps);
+      await runModelCall(message.body, deps, message.id);
       message.ack();
     } catch (e) {
       // Deliberately not acked: the queue redelivers, and after max_retries

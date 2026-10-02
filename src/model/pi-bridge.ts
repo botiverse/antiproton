@@ -27,7 +27,8 @@ import type { ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
  * them lost its position.
  *
  * Version 2 carries the tag and has no `systemPrompt`: every system message is an entry of
- * `messages`, where it stands. The writer renders each to its text first
+ * `messages`, sent where the writer placed it — the prompt at the top, each later one where it
+ * stands. The writer renders each to its text first
  * (src/model/durable-offloaded.ts `jobContext`), so the consumer needs no pi-ai 1.0 code and the
  * Worker stays small. `tools` is the tool set current at the end of the conversation, because our
  * provider client sends one top-level tool list per request.

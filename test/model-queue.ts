@@ -188,6 +188,18 @@ await check("consumer: a known job is taken, called and delivered into its sessi
   host.dispose();
 });
 
+await check("consumer: the message's id is the taker of its job; giving up names none", async () => {
+  const takers: Array<string | undefined> = [];
+  const stub: ModelJobStub = {
+    async takeJob(_t, _a, _j, taker) { takers.push(taker); return null; },
+    async deliverAnswer() { return true; },
+  };
+  const { msg } = message("job-a");
+  await consumeModelCalls({ queue: "model-calls", messages: [{ ...msg, id: "qm-1" }] }, deps(stub, []));
+  await consumeModelCalls({ queue: "model-calls-dlq", messages: [{ ...msg, id: "qm-1" }] }, deps(stub, []));
+  must(JSON.stringify(takers) === JSON.stringify(["qm-1", null]), `takers ${JSON.stringify(takers)}`);
+});
+
 await check("consumer: any other failure is still retried, not acked", async () => {
   const stub: ModelJobStub = {
     async takeJob() { throw new Error("object unavailable"); },

@@ -71,8 +71,11 @@ export interface AgentEngine {
   branch(): Promise<EngineEntry[]>;
   /** The tools the model is offered. */
   tools(): Promise<Array<{ name: string }>>;
-  /** The worker's side of an offloaded model call: the request (null once answered), then the answer. A value or a promise of one. */
-  takeJob(id: string): unknown;
+  /**
+   * The worker's side of an offloaded model call: the request (null once answered), then the answer. A value or a promise of one.
+   * `taker` is the queue message that will call the model with it; pd refuses a job another message took recently (`PdHost.takeJob`).
+   */
+  takeJob(id: string, taker?: string): unknown;
   deliver(id: string, answer: AnsweredMessage): boolean | Promise<boolean>;
   close(): Promise<void>;
 }

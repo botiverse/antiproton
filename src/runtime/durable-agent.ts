@@ -444,7 +444,8 @@ export class PdHost {
 
   async #dispatch(id: string): Promise<boolean> {
     try { await this.#bound().dispatch(id); }
-    catch { return false; /* not marked, so the next sweep sends it */ }
+    // Not marked again: the row is marked from its insert (`bookCommit`), so the sweep sends it once that is a redelivery interval old.
+    catch { return false; }
     (await this.#store()).query("UPDATE model_jobs SET dispatched_at = ? WHERE id = ?", this.#now(), id);
     return true;
   }
@@ -469,12 +470,15 @@ export class PdHost {
     return due;
   }
 
-  /** Jobs nobody is carrying: never dispatched, or silent longer than a call could take. */
+  /**
+   * Jobs nobody is carrying: never dispatched, or silent longer than a call could take. Due at exactly the redelivery
+   * instant, the one `redeliveryDue` parks for: a strict comparison would find nothing then and park one interval more.
+   */
   async #sweep(limit = 20): Promise<number> {
     if (!this.#binding) return 0;
     const now = this.#now();
     const ids = (await this.#store()).query(
-      "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
+      "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at <= ?) ORDER BY created_at LIMIT ?",
       now - this.#redeliveryMs, limit).map((r) => String(r.id));
     let sent = 0;
     for (const id of ids) if (await this.#dispatch(id)) sent++;
@@ -537,10 +541,32 @@ export class PdHost {
     catch (error) { logEvent("pd.wake.error", { taskId, error: String((error as Error)?.message ?? error).slice(0, 200) }); }
   }
 
-  /** The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice. */
-  async takeJob(id: string): Promise<unknown> {
-    const [row] = (await this.#store()).query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
+  /**
+   * The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice.
+   *
+   * `taker` names the queue message that is about to call the model with it. Two messages for one job — the sweep
+   * resent a dispatch that was not lost, or the queue delivered one twice — would otherwise both call the model while
+   * neither has answered, and the answer `deliver` refuses is paid for and recorded nowhere. So a job taken by another
+   * message within the redelivery interval is refused; the same message's retry (its call failed) is not, and one taken
+   * longer ago than that is presumed lost, as the sweep presumes. Without a taker (giving up, which calls no model)
+   * nothing is refused or recorded. One statement decides it, so two takers cannot both win.
+   */
+  async takeJob(id: string, taker?: string): Promise<unknown> {
+    const ap = await this.#store();
+    if (taker !== undefined) {
+      const now = this.#now();
+      const [won] = ap.query(
+        "UPDATE model_jobs SET taken_at = ?, taken_by = ? WHERE id = ? AND answer IS NULL AND state IS NULL" +
+        " AND (taken_at IS NULL OR taken_at <= ? OR taken_by = ?) RETURNING request",
+        now, taker, id, now - this.#redeliveryMs, taker);
+      if (won) return JSON.parse(String(won.request));
+    }
+    const [row] = ap.query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
     if (!row) throw this.#bound().unknownJob(id);
+    if (taker !== undefined) {
+      if (row.answer === null && row.state === null) logEvent("pd.jobs.take_refused", { tenantId: this.#bound().tenantId, agentId: this.#bound().agentId, jobId: id });
+      return null;
+    }
     return row.answer === null && row.state === null ? JSON.parse(String(row.request)) : null;
   }
 
@@ -894,7 +920,7 @@ export class DurableAgent implements AgentEngine {
     return this.#host.withHarness(async (h) => (await (await this.#conversation(h)).agent(bg)).tools.map((t) => ({ name: t.name })));
   }
 
-  takeJob(id: string): Promise<unknown> { return this.#host.takeJob(id); }
+  takeJob(id: string, taker?: string): Promise<unknown> { return this.#host.takeJob(id, taker); }
 
   deliver(id: string, answer: AnsweredMessage): Promise<boolean> { return this.#host.deliver(id, answer); }
 

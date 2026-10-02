@@ -471,13 +471,43 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const a = o.agent(undefined, { dispatch: async (id) => { if (fail) { fail = false; throw new Error("queue down"); } sent.push(id); } });
     await a.say("Q1");
     const parked = await a.step();
-    check(sent.length as number === 0 && jobs(storage).length === 1 && jobs(storage)[0]!.dispatched_at === null, `control: the dispatch was not lost: ${show(jobs(storage))}`);
+    check(sent.length as number === 0 && jobs(storage).length === 1, `control: the dispatch was not lost: ${show(jobs(storage))} / sent ${show(sent)}`);
     check(parked.wakeInMs !== null && parked.wakeInMs <= 400, `parked for ${parked.wakeInMs} ms, past the redelivery`);
     await sleep(parked.wakeInMs);
     const again = await a.step();
-    check(sent.length === 1 && jobs(storage)[0]!.dispatched_at !== null, `not resent: ${show(jobs(storage))}`);
+    check(sent.length === 1, `not resent: ${show(jobs(storage))}`);
     // Dispatched now: the park comes back at its redelivery, still before the backstop.
     check(again.wakeInMs !== null && again.wakeInMs <= 400 && again.wakeInMs > 200, `after the resend: ${show(again)}`);
+    await a.close();
+  });
+
+  add("jobs", "a message and the wake it asks for, while the dispatch is in flight: one queue send, and a second message for the job is refused while the first is calling the model", async (storage) => {
+    const o = object(storage, [], { redeliveryMs: 600 });
+    // The commit's dispatch is held open, as a queue send that has not returned: the window the wake's sweep ran in.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const sent: string[] = [];
+    const a = o.agent(undefined, { dispatch: async (id) => { sent.push(id); if (sent.length === 1) await held; } });
+    await a.say("Q1");
+    for (let i = 0; i < 400 && sent.length === 0; i++) await sleep(5);
+    check(sent.length === 1 && jobs(storage).length === 1, `control: the dispatch is not in flight: sent ${show(sent)}, jobs ${show(jobs(storage))}`);
+    const parked = await a.step();
+    check(parked.wakeInMs !== null, `step: ${show(parked)}`);
+    release();
+    await sleep(20);
+    const id = jobs(storage)[0]!.id;
+    check(show(sent) === show([id]), `queue sends ${show(sent)}: the wake's sweep sent a job whose dispatch was in flight`);
+    // Two messages for it anyway (a queue that delivered twice): one model call.
+    const [first, second] = [await a.takeJob(id, "msg-1"), await a.takeJob(id, "msg-2")];
+    check(first !== null && second === null, `takes: msg-1 ${first === null ? "refused" : "granted"}, msg-2 ${second === null ? "refused" : "granted"}`);
+    // The first message's retry (its call failed) is not refused.
+    check(await a.takeJob(id, "msg-1") !== null, "the first message's retry was refused");
+    // Taken longer ago than the redelivery interval: presumed lost, as the sweep presumes, and handed out again.
+    await sleep(650);
+    check(await a.takeJob(id, "msg-3") !== null, "a message after the redelivery interval was refused");
+    check(await a.takeJob(id, "msg-2") === null, "a second taker within the interval of the redelivered take was granted");
+    // Giving up calls no model: never refused.
+    check(await a.takeJob(id) !== null, "the give-up's take was refused");
     await a.close();
   });
 

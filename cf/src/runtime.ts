@@ -2154,10 +2154,10 @@ export class AgentRuntime {
 
   /** What the worker asks for, and what it hands back. The job row says which
    *  session asked, so the answer lands in the transcript that is waiting. */
-  async takeJob(tenantId: string, agentId: string, jobId: string) {
+  async takeJob(tenantId: string, agentId: string, jobId: string, taker?: string) {
     await this.ready();
     const session = this.#jobSessionFor(jobId);
-    const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId);
+    const job = await (await this.agent(tenantId, agentId, session)).takeJob(jobId, taker);
     if (!job) return job;
     // The model the queued call asks for, when it spends the operator's account; null leaves it at the
     // deployment's default, which is also what an agent with its own credential got before.
