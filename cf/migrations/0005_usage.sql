@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS usage_cursor (
 
 -- Credits per unit, from a date on. No row: free. Cost is worked out when read, so a price change never
 -- rewrites what was used.
+--
+-- A key that is a SUBSET of another key (model.tokens' cache_write_1h of cache_write, reasoning of
+-- output — pi-ai types the former "Subset of cacheWrite") is priced at the DIFFERENCE, not its own
+-- rate: cache_write at the short-write rate, cache_write_1h at (long − short). Every cost reader is
+-- a plain per-row price × quantity sum (cf/src/usage-d1.ts readUsage; the dashboard's money()), and
+-- delta pricing keeps that sum correct — short×shortRate + subset×(longRate − shortRate) equals
+-- pricing the parts separately, which is how pi's own cost function does it. Pricing a subset key
+-- at its full rate double-counts it, because the total key already carries it.
 CREATE TABLE IF NOT EXISTS usage_prices (
   resource         TEXT NOT NULL,
   key              TEXT NOT NULL,  -- '*' for every key of the resource
