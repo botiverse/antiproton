@@ -187,6 +187,36 @@ one fetch, the wake that parks again with one fetch, the wake whose `pollAt` has
 passed, input while parked, and the retry backoff, and judge one parked
 snapshot at T−1, T and T+1.
 
+#### On pi-durable: usage and trace are derived after the commit
+
+pi 0.85 lets us write the usage and trace outboxes inside `Storage.commit`;
+pi-durable's commits are its own, so `src/runtime/pd-outbox.ts` derives the
+same rows afterwards from committed entries, past a watermark on
+`entries.commit_seq`, and checks its totals against pi-durable's `pi.usage`
+documents. It reads pi-durable's tables directly, and rests on:
+
+- **Every response is an assistant entry**, a failed attempt that is retried
+  included, and its usage is added to `pi.usage` in the same commit
+  (`appendAssistant` in `harness/generation.js`). Derived totals therefore
+  equal `pi.usage`; compaction (off on pd) is the one writer that counts usage
+  with no entry.
+- `durable_metadata.next_seq` is one past the last committed sequence, and is
+  written in the commit it counts.
+- An entry row's `record` is the `EntryRecord` as JSON, with `kind` and `model`.
+- **Entry ids grow with commit order.** They are minted from one counter only
+  inside a commit callback on the Session's mutation line, one commit at a
+  time, and a reopened storage resumes it from `durable_metadata.next_id`. The
+  derivation reads `id > mark` (a range on the INTEGER PRIMARY KEY) instead of
+  `commit_seq > mark`, which has no index and would scan every entry on every
+  pass; an id minted out of order would be an entry never billed.
+- `pi.usage` checkpoints on every change, so its newest revision is a `base`;
+  a `delta` there is reported as unreadable rather than read.
+- An offloaded answer keeps the fields the worker wrote (`jobId`) when
+  pi-durable stores it as the entry's message.
+
+`test/pd-outbox.ts` and `npm run pd-outbox:do` compare the rows with PiAgent's
+for the same conversation, and fail when any of these moves.
+
 ### 4. pi-mcp — what `src/plugins/mcp.ts` rests on
 
 The plugin imports exactly `McpClient`, `StreamableHttpTransport` and
