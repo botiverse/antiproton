@@ -179,9 +179,9 @@ const runtimeCases: DriveCase[] = [{
 
 /**
  * `submitToolResults` and `cancelSession` on a pd object, with a pi-durable commit held open across the writes each
- * makes after its engine call. The engine call (`answerClientCalls`, `cancel`) is wrapped so that it returns only
- * once a commit (a message to another session) is open and held; the runtime's next writes are then issued inside
- * it, and must wait for it (`#ownWrite`, `apartFromPd`, `exclusive`). The commit is let go 100 ms later. The guard
+ * makes after its engine call. `answerClientCalls` is wrapped to return only once a commit (a message to another
+ * session) is open and held, and `dropClientCalls` to start only then; the writes that follow are issued inside it,
+ * and must wait for it (`#ownWrite`, `exclusive`). The commit is let go 100 ms later. The guard
  * throws on any write that joins.
  */
 runtimeCases.push({
@@ -202,8 +202,11 @@ runtimeCases.push({
       const engine = a.agent as DurableAgent;
       const answer = engine.answerClientCalls.bind(engine);
       engine.answerClientCalls = async (results) => { await answer(results); await holdOne("the results"); };
-      const cancel = engine.cancel.bind(engine);
-      engine.cancel = async (marker) => { const id = await cancel(marker); await holdOne("the cancel"); return id; };
+      // On the cancel path the runtime's first write (`ensureAgentTables` through `#ownWrite`) would itself wait out a
+      // commit held from `cancel`, and every write after it with it; held from just before the drop, the drop's own
+      // write is the one issued inside.
+      const drop = engine.dropClientCalls.bind(engine);
+      engine.dropClientCalls = async () => { await holdOne("the cancel"); return drop(); };
 
       a.replies.push(() => ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "call_h", name: "get_weather", arguments: { city: "Oslo" } }] }));
       await a.rt.postMessage("t", "a", "weather in Oslo?");
