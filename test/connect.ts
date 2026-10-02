@@ -56,8 +56,24 @@ await check("an expired or forged link starts nothing", async () => {
   const { url } = await connectLink(ORIGIN, SECRET, spec, x.d.now());
   x.tick(11 * 60_000);
   must((await connectStart(new URL(url), x.d)).status === 400, "an expired link started");
-  const forged = new URL(url); forged.searchParams.set("t", forged.searchParams.get("t")!.replace(/.$/, (c) => (c === "A" ? "B" : "A")));
+  // The FIRST signature character: all six of its bits are signature bits. The last one carries
+  // two unused bits, so changing it there could spell the same signature (#658).
+  const [body, sig] = new URL(url).searchParams.get("t")!.split(".") as [string, string];
+  const forged = new URL(url); forged.searchParams.set("t", `${body}.${sig[0] === "A" ? "B" : "A"}${sig.slice(1)}`);
   must((await connectStart(forged, deps().d)).status === 400, "a forged link started");
+});
+
+await check("a link spelled differently from how it was signed starts nothing (#658)", async () => {
+  const x = deps();
+  const { url } = await connectLink(ORIGIN, SECRET, spec, x.d.now());
+  const [body, sig] = new URL(url).searchParams.get("t")!.split(".") as [string, string];
+  // A 32-byte HMAC is 43 characters; the last holds 4 signature bits and 2 unused zero bits.
+  // Setting the lowest unused bit names the same bytes in a form seal() never writes.
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  must(sig.length === 43 && A.indexOf(sig.at(-1)!) % 4 === 0, `signature shape ${sig}`);
+  const respelled = new URL(url); respelled.searchParams.set("t", `${body}.${sig.slice(0, -1)}${A[A.indexOf(sig.at(-1)!) + 1]}`);
+  must((await connectStart(respelled, x.d)).status === 400, "a respelled link started");
+  must((await connectStart(new URL(url), x.d)).status === 302, "the link as signed no longer starts");
 });
 
 await check("the callback holds the token in the agent's object and sends Raft only a pending id and the initiator", async () => {
