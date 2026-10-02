@@ -14,9 +14,10 @@
  * on the same storage, resume it (or submit), and settle. Between wakes no
  * harness is open, which is the point.
  */
+import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import {
-  createRegistry, defineExtension, defineTool, section, Harness, type HarnessOptions, type HarnessSettings,
+  createRegistry, defineExtension, defineTask, defineTool, section, Harness, type HarnessOptions, type HarnessSettings,
 } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "pi-ai-1";
@@ -92,10 +93,29 @@ const countTool = defineTool({
   parameters: Type.Object({ n: Type.Number() }),
   execute: async () => ({}),
 });
+/**
+ * A task that sleeps in a phase the park table does not know — what a new pi-durable phase or an
+ * extension's own task calling `runtime.sleep` would look like to `parkVerdict`.
+ */
+const NapTask = defineTask<Record<string, never>, { phase: "nap"; until: number }, null>({
+  name: "drive-test.nap",
+  version: 1,
+  initial: () => ({ phase: "nap", until: 0 }),
+  phases: {
+    nap: async (_task, runtime, context) => {
+      await runtime.sleep(runtime.now() + 60_000, context);
+      await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+    },
+  },
+  abort: async (_task, runtime, context) => {
+    await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context);
+  },
+});
 const extension = defineExtension({
   name: "drive-test",
   sections: [section("preamble", () => "You are a terse test assistant.", { tag: false })],
   tools: [countTool],
+  tasks: [NapTask],
 });
 
 function world(host: DurableSqlHost, settings: HarnessSettings = {}, activeTimers?: TimerProbe, pollDelayMs = 0) {
@@ -330,6 +350,53 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(parkVerdict({ ...snapshot, docs: toolRunning }, 1).verdict === "wait", "a running tool slot must not park");
     const empty = { ...snapshot, inspection: { ...snapshot.inspection, tasks: [], submissions: [] }, docs: new Map() };
     check(parkVerdict(empty).verdict === "idle", "nothing live should be idle");
+  });
+
+  add("verdict", "a running task with an unrecognised or malformed checkpoint is not parked, and is named as such", async (host) => {
+    const w = world(host);
+    const h = await w.open();
+    const root = await h.root(bg, { agent: { model: { provider: PROVIDER, modelId: MODEL } } });
+    await root.submit({ type: "input", content: "Q1" }, bg);
+    let snapshot;
+    for (let i = 0; i < 200 && !snapshot; i++) {
+      const s = await readSnapshot(h, bg, Date.now);
+      if (s && parkVerdict(s, 1).verdict === "park") snapshot = s;
+      else await sleep(5);
+    }
+    await h.close(bg);
+    check(snapshot, "never reached a parkable state");
+    const base = snapshot;
+    const [task] = base.inspection.tasks;
+    check(task && task.record.state.status === "running", "no running task in the parked snapshot");
+    const T = Date.now() + 60_000;
+    const withCheckpoint = (checkpoint: JsonValue) => ({
+      ...base,
+      inspection: { ...base.inspection, tasks: [{ ...task, record: { ...task.record, state: { ...task.record.state, checkpoint } } }] },
+    });
+    for (const checkpoint of [{ phase: "ready" }, { phase: "pol", pollAt: T }, { pollAt: T }, { phase: "poll" }, { phase: "poll", pollAt: String(T) }, "poll", null]) {
+      const v = parkVerdict(withCheckpoint(checkpoint), 1);
+      check(v.verdict === "wait" && v.reason.includes("unrecognised checkpoint"), `${show(checkpoint)}: ${show(v)}`);
+    }
+    const working = parkVerdict(withCheckpoint({ phase: "request", attempt: 1 }), 1);
+    check(working.verdict === "wait" && working.reason.includes("is working (request)"), `request: ${show(working)}`);
+    const sleeping = parkVerdict(withCheckpoint({ phase: "poll", attempt: 1, pollAt: T }), 1);
+    check(sleeping.verdict === "park", `the well-formed control did not park: ${show(sleeping)}`);
+  });
+
+  add("verdict", "settle on a task sleeping in an unknown phase: no spin — one read per commit or recheck, then timeout", async (host) => {
+    const w = world(host);
+    const h = await w.open();
+    const root = await h.root(bg, { agent: { model: { provider: PROVIDER, modelId: MODEL } } });
+    await root.commit((tx) => tx.createTask(NapTask, {}, { ownership: { kind: "conversation" } }), bg);
+    h.resume();
+    const verdicts: ParkVerdict[] = [];
+    const recheckMs = 100, deadlineMs = 600;
+    const r = await settle(h, { context: bg, minParkMs: 1, recheckMs, deadlineMs, onVerdict: (v) => verdicts.push(v) });
+    await h.close(bg);
+    check(r.state === "timeout", `expected timeout, got ${show(r)}`);
+    check(r.last.verdict === "wait" && r.last.reason.includes("unrecognised checkpoint"), `last verdict ${show(r.last)}`);
+    // Without commits, reads happen once per recheck: about deadline / recheck of them, never a tight loop.
+    check(verdicts.length >= 2 && verdicts.length <= deadlineMs / recheckMs + 3, `${verdicts.length} reads in ${deadlineMs} ms`);
   });
 
   return cases;

@@ -26,7 +26,7 @@
  */
 import type { Context, JsonValue } from "@earendil-works/chord";
 import {
-  CompactionTask, GenerationTask, InboxDoc, LiveDoc,
+  CompactionTask, GenerationTask, InboxDoc, LiveDoc, ToolTask,
   type ConversationId, type Harness, type HarnessInspection, type InboxState, type JsonObject,
   type LiveState, type TaskId,
 } from "@earendil-works/pi-durable";
@@ -58,13 +58,40 @@ const COMPACTION = CompactionTask.definition.name;
 const isObject = (value: JsonValue | undefined): value is JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** The wake time of a checkpoint that sleeps, or undefined for one that works. */
-function sleepOf(kind: string, checkpoint: JsonValue | undefined): Omit<Sleeper, "taskId"> | undefined {
-  if (!isObject(checkpoint)) return undefined;
+const TOOL = ToolTask.definition.name;
+
+/**
+ * Every checkpoint phase pi-durable 1.0.0's built-in tasks write, and what a `running` task in it is
+ * doing. Read from its `dist` (`phase: "…"` and `runtime.sleep(` in harness/generation.js,
+ * compaction.js, tool.js); test/durable-drive.ts scans the installed `dist` and fails when either
+ * set moves, so a new sleep cannot silently become a billed wait.
+ * - sleeping: the phase handler's first act is `runtime.sleep(T)`; it runs no other code before T.
+ * - working: the handler prepares, streams, polls, selects, summarizes or runs a tool, and commits
+ *   when it is done — the harness progresses, so staying open is right.
+ */
+export const SLEEPING_PHASES: Readonly<Record<string, readonly string[]>> = {
+  [GENERATION]: ["poll", "retry"],
+  [COMPACTION]: ["retry"],
+};
+export const WORKING_PHASES: Readonly<Record<string, readonly string[]>> = {
+  [GENERATION]: ["prepare", "request", "tools"],
+  [COMPACTION]: ["select", "summarize"],
+  [TOOL]: ["call", "execute"],
+};
+
+type Activity =
+  | { readonly kind: "sleeping"; readonly phase: "poll" | "retry"; readonly until: number }
+  | { readonly kind: "working"; readonly phase: string }
+  | { readonly kind: "unrecognised" };
+
+/** What a running task's checkpoint says it is doing. Anything outside the tables above is "unrecognised". */
+function activityOf(kind: string, checkpoint: JsonValue | undefined): Activity {
+  if (!isObject(checkpoint)) return { kind: "unrecognised" };
   const { phase, pollAt, until } = checkpoint;
-  if (kind === GENERATION && phase === "poll" && typeof pollAt === "number") return { phase, until: pollAt };
-  if ((kind === GENERATION || kind === COMPACTION) && phase === "retry" && typeof until === "number") return { phase, until };
-  return undefined;
+  if (kind === GENERATION && phase === "poll" && typeof pollAt === "number") return { kind: "sleeping", phase, until: pollAt };
+  if ((kind === GENERATION || kind === COMPACTION) && phase === "retry" && typeof until === "number") return { kind: "sleeping", phase, until };
+  if (typeof phase === "string" && (WORKING_PHASES[kind] ?? []).includes(phase)) return { kind: "working", phase };
+  return { kind: "unrecognised" };
 }
 
 /**
@@ -112,10 +139,16 @@ export function parkVerdict(snapshot: DriveSnapshot, minParkMs = DEFAULT_MIN_PAR
     if (record.abortRequested) return wait(`${label} is marked for abort`);
     if (state.kind === "waiting" && record.state.status === "waiting") continue;
     if (state.kind !== "running" || record.state.status !== "running") return wait(`${label} is ${state.kind}`);
-    const sleep = sleepOf(record.kind, record.state.checkpoint);
-    if (sleep === undefined) return wait(`${label} is working`);
-    if (sleep.until - now < margin) return wait(`${label} is due: ${sleep.phase} until ${sleep.until}, now ${now}`);
-    sleepers.push({ taskId: record.id, ...sleep });
+    const activity = activityOf(record.kind, record.state.checkpoint);
+    // Not parked, and named apart from "working": a task this table does not know may be sleeping in a
+    // way only it knows (a new pi-durable phase, an extension's task calling `runtime.sleep`), and then
+    // staying open is a billed wait that a diagnostic should be able to point at.
+    if (activity.kind === "unrecognised") {
+      return wait(`${label} has an unrecognised checkpoint ${JSON.stringify(record.state.checkpoint)?.slice(0, 200)}`);
+    }
+    if (activity.kind === "working") return wait(`${label} is working (${activity.phase})`);
+    if (activity.until - now < margin) return wait(`${label} is due: ${activity.phase} until ${activity.until}, now ${now}`);
+    sleepers.push({ taskId: record.id, phase: activity.phase, until: activity.until });
   }
   if (sleepers.length === 0) return wait("every live task waits on another and none sleeps");
   return { verdict: "park", until: Math.min(...sleepers.map((s) => s.until)), sleepers };
@@ -173,6 +206,13 @@ export type SettleOptions = {
  * Re-reads on every commit rather than on a timer, so a long tool call or a
  * fetch in flight costs no reads while it runs. On `idle` and `parked` the
  * harness is closed when this returns, and the caller sets the alarm.
+ *
+ * On "wait" it re-reads at once only if a commit landed during the read;
+ * otherwise it blocks until the next commit or `recheckMs` (default 1 s). So a
+ * task the table cannot classify (an "unrecognised checkpoint") costs one read
+ * per second while it runs no code — never a tight loop — and keeps the object
+ * open until that task commits or `deadlineMs` passes: a billed wait, which is
+ * why test/durable-drive.ts fails when pi-durable's sleep sites move.
  */
 export async function settle(harness: Harness, options: SettleOptions): Promise<SettleResult> {
   const now = options.now ?? Date.now;
