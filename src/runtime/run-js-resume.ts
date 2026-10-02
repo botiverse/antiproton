@@ -135,6 +135,17 @@ export class RunJsContinuations {
   }
 
   /**
+   * Discard every program and question still held, whatever its time, as the sweep discards an expired one: a
+   * migration of the agent's engine (src/runtime/pd-migrate.ts), after which no `resume` could reach them. Returns how many.
+   */
+  discardAll(): number {
+    const n = this.#held.size;
+    for (const s of this.#held.values()) discard(s);
+    this.#held.clear();
+    return n;
+  }
+
+  /**
    * When the object should wake next for these programs, in ms from now: at
    * the keep-alive interval, or sooner when one expires sooner. Null when
    * nothing is suspended, so the keep-alive stops by itself. Sweeps first.

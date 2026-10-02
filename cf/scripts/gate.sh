@@ -80,6 +80,7 @@ run_suite pd-outbox-do bash test/pd-outbox-do.sh
 run_suite pd-cancel-do bash test/pd-cancel-do.sh
 run_suite pd-writes-do bash test/pd-writes-do.sh
 run_suite pd-compaction-do bash test/pd-compaction-do.sh
+run_suite pd-migrate-do bash test/pd-migrate-do.sh
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 
 # `|| true`: see (2). Under `set -e` a failing assignment would stop the script

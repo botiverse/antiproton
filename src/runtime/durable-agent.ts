@@ -381,6 +381,15 @@ export class PdHost {
     return made;
   }
 
+  /**
+   * Forget the conversation ids this host has looked up: their tables were dropped under it (src/runtime/pd-migrate.ts),
+   * and the next use of a session makes or finds its conversation again. Only while no harness is open.
+   */
+  forgetConversations(): void {
+    if (this.#harness) throw new Error("forgetConversations: a harness is open");
+    this.#conversations.clear();
+  }
+
   async handle(h: Harness, id: ConversationId): Promise<Conversation> {
     const c = id === ROOT_CONVERSATION_ID ? await h.root(bg) : await h.conversation(id, bg);
     if (!c) throw new Error(`pi-durable conversation ${id} is listed in ap_conversations but does not exist`);

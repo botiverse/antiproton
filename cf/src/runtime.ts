@@ -17,6 +17,7 @@ import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor
 import type { AgentEngine } from "../../src/runtime/engine.ts";
 import { PiAgent, ensureAgentTables, jobSession, sessionsWithWork, markSession } from "../../src/runtime/pi-agent.ts";
 import { DurableAgent, PdHost, recordedEngine } from "../../src/runtime/durable-agent.ts";
+import { migrateToPd, revertToPi085, type MigrationResult, type RevertResult } from "../../src/runtime/pd-migrate.ts";
 import { heldDecision, warningText } from "../../src/runtime/idle-lease.ts";
 import { heldLines, heldPrompt, heldResources, withHeldNote } from "../../src/runtime/held.ts";
 import {
@@ -1624,9 +1625,9 @@ export class AgentRuntime {
     const binding = await this.store.getModelBinding(tenantId, agentId);
     if (!binding) throw new Error(`no model binding for ${key}`);
     // Which kernel runs this agent: `pd` (src/runtime/durable-agent.ts) only where the object's `ap_meta`
-    // says so, and nothing in this step writes that row outside the tests — every creation path still
-    // leaves it absent, so every production agent is opened as `PiAgent`, exactly as before. An object
-    // with no `ap_meta` table is read without creating one.
+    // says so. Every creation path still leaves that row absent, so an agent is opened as `PiAgent` unless
+    // the operator migrated it (`migrateEngine` below, src/runtime/pd-migrate.ts). An object with no
+    // `ap_meta` table is read without creating one.
     const engine = recordedEngine(this.#deps.ctx.storage.sql);
     // Before the catalogue is read: a stale pin is a mount whose every call
     // the gateway refuses, and the harness opening is the one moment every
@@ -1758,18 +1759,8 @@ export class AgentRuntime {
       // `sandbox` stays: run_js is the harness's, not a mount's. Both engines offer it.
       sandbox: extras.runJs,
     });
-    const model = {
-      provider: binding.provider,
-      id: binding.model,
-      // The bound model's own window when the table knows it: an agent can be on another model than
-      // the deployment's (model_overrides).
-      contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
-    };
-    const dispatch = async (jobId: string) => {
-      const send = this.#deps.offloadModel;
-      if (!send) throw new Error("no dispatcher configured");
-      await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
-    };
+    const model = this.#modelOf(binding);
+    const dispatch = this.#dispatchFor(tenantId, agentId);
 
     if (engine === "pd") {
       // The same catalogue PiAgent gets, through the same host and the same continuations
@@ -1812,6 +1803,70 @@ export class AgentRuntime {
     agentRef.current = agent;
     this.#agents.set(cacheKey, { agent, builtFrom });
     return agent;
+  }
+
+  /** The model an engine registers for a binding. */
+  #modelOf(binding: { provider: string; model: string }) {
+    return {
+      provider: binding.provider,
+      id: binding.model,
+      // The bound model's own window when the table knows it: an agent can be on another model than
+      // the deployment's (model_overrides).
+      contextWindow: contextWindowFor(binding.model, this.#deps.contextWindow ?? ASSUMED_CONTEXT_WINDOW),
+    };
+  }
+
+  /** How an engine hands a written model job to the queue. */
+  #dispatchFor(tenantId: string, agentId: string) {
+    return async (jobId: string) => {
+      const send = this.#deps.offloadModel;
+      if (!send) throw new Error("no dispatcher configured");
+      await send({ tenantId, agentId, taskId: LEGACY_TASK, commandId: jobId, payload: null });
+    };
+  }
+
+  /**
+   * Move this agent between engines (src/runtime/pd-migrate.ts): `migrate` takes an idle pi085 agent to pd, importing
+   * each session's active branch; `revert` takes a migrated one back, leaving pi085's tables as they were. `dryRun`
+   * reports and writes nothing. Null when the object holds no such agent. What either drops from memory — the
+   * engines built so far, the run_js programs and tool questions held for `resume` — is dropped only once it goes
+   * ahead, so a refusal leaves the agent exactly as it was. A turn waiting for the API caller's functions is imported
+   * cancelled, with the marker `cancelSession` writes.
+   */
+  async migrateEngine(tenantId: string, agentId: string, op: "migrate" | "revert", opts: { dryRun?: boolean } = {}):
+    Promise<MigrationResult | RevertResult | null> {
+    await this.ready();
+    if (!(await this.store.loadAgent(tenantId, agentId))) return null;
+    const binding = await this.store.getModelBinding(tenantId, agentId);
+    if (!binding) return { ok: false, refused: `no model binding for ${tenantId}/${agentId}` };
+    const storage = this.#deps.ctx.storage;
+    const host = this.#pd ?? new PdHost({ storage });
+    host.bind({ tenantId, agentId, model: this.#modelOf(binding), dispatch: this.#dispatchFor(tenantId, agentId), unknownJob: (id) => new UnknownJob(id) });
+    /** The engines built so far were opened on the engine that is about to stop being this agent's. */
+    const forget = async () => {
+      const built = [...this.#agents.values()];
+      this.#agents.clear();
+      for (const { agent } of built) await agent.close().catch(() => {});
+    };
+    if (op === "revert") {
+      const out = await revertToPi085({ storage, host, ...(opts.dryRun ? { dryRun: true } : {}) });
+      if (out.ok && out.action === "reverted") {
+        await forget();
+        // Its conversation ids name tables that are gone; the next pd agent, if any, opens a fresh host.
+        this.#pd = null;
+      }
+      return out;
+    }
+    const out = await migrateToPd({
+      storage, host, cancel: { marker: TURN_CANCELLED, note: CANCELLED_NOTE },
+      ...(opts.dryRun ? { dryRun: true } : {}),
+      cancelTransient: async () => {
+        await forget();
+        return { heldForResume: this.#continuations.discardAll() };
+      },
+    });
+    if (out.ok && out.action === "migrated") this.#pd = host;
+    return out;
   }
 
   /** Compact on demand. pi085 refuses with `CompactionUnavailable`

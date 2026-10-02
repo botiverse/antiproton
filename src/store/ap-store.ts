@@ -11,10 +11,12 @@
  *
  * Each table is the counterpart of one that exists for agents on pi 0.85:
  *
- * - `meta(k, v)`: per-object facts. `engine` is the one written now: which
- *   kernel runs this agent, written once at creation and never rewritten, so an
- *   adopt that rebuilds the agent's config cannot move an agent between
- *   kernels. A missing row means the agent predates the choice (pi 0.85).
+ * - `meta(k, v)`: per-object facts. `engine`: which kernel runs this agent,
+ *   written once at creation (`setEngineOnce`), so an adopt that rebuilds the
+ *   agent's config cannot move an agent between kernels; only a migration and
+ *   its rollback move it (`migrateEngine`). A missing row means the agent
+ *   predates the choice (pi 0.85). `migrated_from`: set while a migrated agent
+ *   is on `pd`.
  * - `model_jobs`: `pi_model_jobs` (src/runtime/pi-agent.ts), with the session
  *   replaced by pi-durable's conversation id, and a `state`: null while the job
  *   is out, `consumed` once a commit appended its answer, `cancelled` once its
@@ -119,6 +121,31 @@ export class ApStore {
     if (!(AGENT_ENGINES as readonly string[]).includes(engine)) throw new Error(`unknown engine: ${engine}`);
     this.#run("INSERT OR IGNORE INTO meta (k, v) VALUES ('engine', ?)", [engine]);
     return this.engine()!;
+  }
+
+  /**
+   * Moves the agent from one engine to the other, which `setEngineOnce` never does: the explicit act of a migration
+   * (src/runtime/pd-migrate.ts) and of its rollback. A compare-and-set: it throws, writing nothing, unless the engine in
+   * force is `from` (a missing row is `pi085`, the engine every agent had before the choice existed). Moving to `pd`
+   * records `migrated_from`, which is what lets the rollback tell a migrated agent from one created on `pd`; moving back
+   * removes it.
+   */
+  migrateEngine(from: AgentEngineName, to: AgentEngineName): AgentEngineName {
+    for (const e of [from, to]) if (!(AGENT_ENGINES as readonly string[]).includes(e)) throw new Error(`unknown engine: ${e}`);
+    return this.#host.transactionSync(() => {
+      const current = this.engine() ?? "pi085";
+      if (current !== from) throw new Error(`engine is ${current}, not ${from}: nothing was changed`);
+      this.#run("INSERT INTO meta (k, v) VALUES ('engine', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", [to]);
+      if (to === "pd") this.#run("INSERT INTO meta (k, v) VALUES ('migrated_from', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", [from]);
+      else this.#run("DELETE FROM meta WHERE k = 'migrated_from'", []);
+      return this.engine()!;
+    });
+  }
+
+  /** The engine a migration moved this agent from, while it is on `pd` because of one; null otherwise. */
+  migratedFrom(): string | null {
+    const v = this.#run("SELECT v FROM meta WHERE k = 'migrated_from'", [])[0]?.v;
+    return v === undefined ? null : String(v);
   }
 
   conversation(taskId: string): ApConversation | null {

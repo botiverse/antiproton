@@ -115,6 +115,7 @@ tests only) and `@earendil-works/chord` (types, and `chord/context` in
 |---|---|---|
 | `emptyUsage`, `addUsage` | `harness/utils/usage.js` | `src/store/pi-storage.ts` |
 | scan, cursor and stop-order semantics | `harness/session/in-memory-storage-state.js` | `src/store/pi-storage.ts` |
+| reading a pi 0.85 session without opening it (the tip in `pi.branch.tip`, a run or queued input in `pi.lane.state`, the branch walk, a compaction's context as its summary, retained tail and what follows), and writing it as pi-durable's context (the newest head marker starts it, an entry's `head` may point at an earlier entry) | pi-agent-core `harness/session/values.js`, `harness/session/context.js` (`buildContextEntries`), `harness/messages.js`; pi-durable `harness/context.js` (`deriveContext`) | `src/runtime/pd-migrate.ts` (`planMigration`, `importDrafts`); `test/pd-migrate.ts` and `npm run pd-migrate:do` compare pd's next requests after a migration, and pi085's after the rollback, with pi085 never migrated |
 
 The usage arithmetic is copied because pi's export map does not publish it. The
 scan semantics are re-implemented against a reference we can read; pi's own

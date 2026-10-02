@@ -83,10 +83,11 @@ run_suite durable-agent-do bash test/durable-agent-do.sh
 run_suite pd-tools-do bash test/pd-tools-do.sh
 # The pd engine's usage and trace outboxes, derived from pi-durable's entries and compared with pi085's, on real Durable Object SQLite (local workerd, no network).
 run_suite pd-outbox-do bash test/pd-outbox-do.sh
-# Cancel and client calls, write safety, and compaction on the pd engine, on real Durable Object SQLite (local workerd, no network).
+# Cancel and client calls, write safety, compaction and migration on the pd engine, on real Durable Object SQLite (local workerd, no network).
 run_suite pd-cancel-do bash test/pd-cancel-do.sh
 run_suite pd-writes-do bash test/pd-writes-do.sh
 run_suite pd-compaction-do bash test/pd-compaction-do.sh
+run_suite pd-migrate-do bash test/pd-migrate-do.sh
 # The control plane's queries on real D1 SQLite, after the migrations in cf/migrations (local workerd, no network).
 run_suite control-plane-d1 bash test/control-plane-d1.sh
 # Captured, then printed, then tested. It used to be piped through
