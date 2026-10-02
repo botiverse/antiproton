@@ -176,7 +176,7 @@ Cancel and the API caller's functions (`DurableAgent.cancel`, `clientTool`;
 - `Conversation.abort()` marks every live task of the conversation, starts the
   scheduler, and resolves once it is idle. A generation aborted in its `poll`
   phase calls `cancelDeferred` (`harness/generation.js`, `abort`), which is how
-  the job row is dropped; nothing is appended for the abort itself, so the
+  the job row is marked cancelled; nothing is appended for the abort itself, so the
   marker entry is ours.
 - Once the abort mark is down a tool's late result is not committed; its
   result is `Tool <name> was aborted`, built from the slot, so `details` the

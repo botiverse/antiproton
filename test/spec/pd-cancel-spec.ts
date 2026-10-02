@@ -201,7 +201,7 @@ export function pdCancelCases(withRawHost: WithDriveHost, opts: { slowCommitMs: 
 
   // ---- cancel ---------------------------------------------------------------------------
 
-  add("cancel", "mid model call: the job is dropped, the marker written, the turn cancelled then idle; a second cancel changes nothing; the next request carries the note", async () => {
+  add("cancel", "mid model call: the job is cancelled, the marker written, the turn cancelled then idle; a second cancel changes nothing; the next request carries the note", async () => {
     const r = await each(async (e, _w, storage) => {
       const requests: Request[] = [];
       await e.agent.say("write a long story");

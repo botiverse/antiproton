@@ -333,7 +333,10 @@ export class PdHost {
     const next = this.#opts.storage.sql.exec(PD_NAMES.rewrite("SELECT next_seq FROM durable_metadata WHERE singleton = 1")).toArray()[0]?.next_seq;
     if (!(Number(next) > seq)) return;
     this.#opts.onBooked?.(booked);
+    const ap = this.#ap.direct();
     for (const id of booked.jobs) {
+      // The row is the proof: a commit that rolled back, whatever moved the sequence since, left none.
+      if (ap.run("SELECT 1 AS x FROM model_jobs WHERE id = ?", id).length === 0) continue;
       this.#staged.delete(id);
       await this.#dispatch(id);
     }
