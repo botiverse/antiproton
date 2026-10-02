@@ -59,7 +59,11 @@ async function apiAgent(engine: "pi085" | "pd") {
   /** Alarms and deliveries until nothing is due, the model answering from `replies` in order. */
   const settle = async () => {
     for (let guard = 0; guard < 60; guard++) {
+      const t0 = Date.now();
       const out = await rt.step("t", "a");
+      // Nothing here runs long: a pass near the runtime's step deadline (30 s) was held open by something the park
+      // rule did not let go, and would otherwise repeat sixty times before this says so.
+      check(Date.now() - t0 < 10_000, `${engine}: a pass held the object open for ${Date.now() - t0} ms and left ${show(out)}`);
       let delivered = false;
       for (const id of sent.filter((x) => !answered.has(x))) {
         answered.add(id);
@@ -164,7 +168,9 @@ const results = await runDriveCases([
     try { await use(host); } finally { host.dispose(); }
   }, { slowCommitMs }).map((c) => ({ ...c, group: `${c.group}${slowCommitMs ? ", slow commits" : ""}` }))),
   ...runtimeCases,
-].filter((c) => !only || c.name.includes(only)));
+].filter((c) => !only || c.name.includes(only))
+  // PD_TRACE=1 names each case as it starts: a case that hangs is otherwise silent until the whole run is killed.
+  .map((c) => ({ ...c, run: async () => { if (process.env.PD_TRACE) console.error(`start ${c.group}: ${c.name.slice(0, 60)}`); await c.run(); } })));
 
 console.log(`\n  pd cancel and client calls: parity with pi085 — node:sqlite\n  ${"─".repeat(56)}`);
 let group = "";

@@ -57,9 +57,12 @@ async function pi085(storage: DurableSqlHost, w: World): Promise<Eng> {
   return { name: "pi085", agent, dispatched };
 }
 
+/** pd's step deadline in these cases unless one says otherwise. */
+const STEP_DEADLINE_MS = 3_000;
+
 function pd(storage: DurableSqlHost, w: World, opts: { stepDeadlineMs?: number } = {}): Eng {
   const dispatched: string[] = [];
-  const host = new PdHost({ storage, poll: { firstMs: 20, maxMs: 40 }, minParkMs: 1, stepDeadlineMs: opts.stepDeadlineMs ?? 3_000 });
+  const host = new PdHost({ storage, poll: { firstMs: 20, maxMs: 40 }, minParkMs: 1, stepDeadlineMs: opts.stepDeadlineMs ?? STEP_DEADLINE_MS });
   const agent = DurableAgent.open({
     host, tenantId: "t", agentId: "a", model: MODEL, systemPrompt: SYSTEM,
     dispatch: async (id) => { dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),
@@ -79,7 +82,12 @@ async function drive(e: Eng, script: Turn[], at: { n: number }, requests: Reques
   const answered = taken.get(e) ?? new Set<string>();
   taken.set(e, answered);
   for (let guard = 0; guard < 300; guard++) {
+    const t0 = Date.now();
     const out = await e.agent.step();
+    // No pass driven here has work that runs that long (a slow call is stepped by `stepUntil` instead): a pd step that
+    // reaches its deadline was held open by something the park rule did not let go.
+    check(e.name !== "pd" || Date.now() - t0 < STEP_DEADLINE_MS - 500,
+      `pd: the step held the harness open until its deadline (${Date.now() - t0} ms) and left ${show(out)}`);
     const pending = e.dispatched.filter((id) => !answered.has(id));
     for (const id of pending) {
       answered.add(id);
