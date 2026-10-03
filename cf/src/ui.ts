@@ -2236,9 +2236,10 @@ function mountAddSection(d: any): string {
 }
 
 /**
- * The agent's kept secrets, named only. Values are write-only — the store never
- * returns one, so the page can list names and times and nothing more. Each name's
- * last-read time is the honest signal that a mount's {{name}} header actually read it.
+ * The owner's kept secrets for this agent's mounts, named only. Values are
+ * write-only — the store never returns one, so the page can list names and
+ * times and nothing more. Each name's last-read time is the honest signal
+ * that a mount's {{name}} header actually read it.
  */
 function secretsBlock(d: any): string {
   const kept: any[] = d.kept ?? [];
@@ -2275,8 +2276,9 @@ ${mounts.length ? mounts.map((m) => mountBlock(d, m)).join("") : `<div class="em
 ${mountAddSection(d)}
 
 <h3 style="margin-top:18px">kept secrets</h3>
-<div class="hint">Name-and-value pairs this agent keeps server-side. A mount's request headers
-  read them by <code>{{name}}</code>; the value never leaves the store and never shows here.</div>
+<div class="hint">Secrets you keep for this agent's mounts, stored where the mounts' request
+  headers can read them by <code>{{name}}</code> — and the model cannot. The value never
+  leaves the store and never shows here.</div>
 ${secretsBlock(d)}
 
 <h3 style="margin-top:18px">installed on this deployment</h3>
