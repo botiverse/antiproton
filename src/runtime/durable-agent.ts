@@ -61,6 +61,7 @@ import { createRegistry } from "../vendor/pi/pi-durable/dist/harness/registry.js
 import { createModels } from "pi-ai-1/models";
 import { durableOffloadedProvider, readAnswer, type Answered, type ModelJobRequest } from "../model/durable-offloaded.ts";
 import type { AnsweredMessage } from "../model/pi-bridge.ts";
+import { MODEL_CALL_DEADLINE_MS } from "../model/openai-compatible.ts";
 import { logEvent } from "../core/log.ts";
 import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
 import { bookCommit, strandedAnswerRows } from "./pd-outbox.ts";
@@ -83,19 +84,29 @@ const AP = prefixedNamespace("ap");
 const MAIN_SESSION = "main";
 
 /**
- * How long a dispatched call may be silent before the sweep sends it again. PiAgent's
- * `REDELIVERY_MS`, for the same reasons: longer than any completion, shorter than a caller's patience.
+ * How long a dispatched job may wait for a queue message to take it before the sweep sends it again: the
+ * dispatch, or its message, presumed lost. PiAgent's `REDELIVERY_MS`. It is shorter than a model call may
+ * take, so it is not what covers a job that was taken: `TAKE_HOLD_MS` is.
  * The sweep runs at the start of each `drive`, so a parked object comes back for it: `step` parks no
  * later than the earliest job's redelivery (`PdHost.redeliveryDue`), not only at the poll backstop.
  */
 const REDELIVERY_MS = 120_000;
 
 /**
+ * How long a take holds the job: while it is under this old, no other message takes the job and the sweep does
+ * not send it again (`PdHost.takeJob`, `#sweep`). The taker's model call is abandoned at `MODEL_CALL_DEADLINE_MS`,
+ * and a call that fails releases the take at once (`PdHost.releaseJob`); the minute more covers the taker's own
+ * take and delivery around the call. A take this old is a taker that died without releasing it, and the job is
+ * then sent again and taken by the next message.
+ */
+const TAKE_HOLD_MS = MODEL_CALL_DEADLINE_MS + 60_000;
+
+/**
  * How long a generation sleeps before it polls its job again, every time. It is not what makes a turn
  * go on: `deliver` wakes the task that waits for the answer (`#wakeAnswered`), and so do every `drive`
  * and the start of the poll's sleep, so the answer is read as soon as it is written. This is the backstop
  * for a wake that was lost (an isolate gone between the answer and the wake). While a job is out the park
- * comes back sooner anyway, at its redelivery (`REDELIVERY_MS`).
+ * comes back at its redelivery instead when that is sooner (`PdHost.redeliveryDue`).
  */
 export const POLL_BACKSTOP_MS = 300_000;
 
@@ -119,6 +130,8 @@ export interface PdHostOptions {
   stepDeadlineMs?: number;
   /** `REDELIVERY_MS` when absent. For tests. */
   redeliveryMs?: number;
+  /** `TAKE_HOLD_MS` when absent. For tests. */
+  takeHoldMs?: number;
   /** Never wake a task for a delivered answer: a lost wake, which the poll interval must cover. For tests. */
   noWake?: boolean;
   /** Each provider poll of a job, and whether it found the answer. For tests and traces. */
@@ -444,38 +457,47 @@ export class PdHost {
 
   async #dispatch(id: string): Promise<boolean> {
     try { await this.#bound().dispatch(id); }
-    catch { return false; /* not marked, so the next sweep sends it */ }
+    // Not marked again: the row is marked from its insert (`bookCommit`), so the sweep sends it once that is a redelivery interval old.
+    catch { return false; }
     (await this.#store()).query("UPDATE model_jobs SET dispatched_at = ? WHERE id = ?", this.#now(), id);
     return true;
   }
 
   get #redeliveryMs(): number { return this.#opts.redeliveryMs ?? REDELIVERY_MS; }
+  get #takeHoldMs(): number { return this.#opts.takeHoldMs ?? TAKE_HOLD_MS; }
 
   /**
-   * When the sweep must run again for the jobs still out: the earliest one's dispatch plus the redelivery
-   * interval. One already due, or never dispatched, was just tried by this step's sweep and failed, so it is
-   * due one interval from now rather than at once. Null with no job out.
+   * When the sweep must run again for the jobs still out: for each, its dispatch plus the redelivery interval, or
+   * the end of its take's hold if that is later (the sweep skips a job under a live take); the earliest of those.
+   * One already due, or never dispatched, was just tried by this step's sweep and failed, so it is due one interval
+   * from now rather than at once. Null with no job out.
    */
   async redeliveryDue(): Promise<number | null> {
     if (!this.#binding) return null;
     const now = this.#now();
-    const rows = (await this.#store()).query("SELECT dispatched_at FROM model_jobs WHERE answer IS NULL AND state IS NULL");
+    const rows = (await this.#store()).query("SELECT dispatched_at, taken_at FROM model_jobs WHERE answer IS NULL AND state IS NULL");
     let due: number | null = null;
     for (const r of rows) {
-      const at = r.dispatched_at === null ? now : Number(r.dispatched_at) + this.#redeliveryMs;
+      let at = r.dispatched_at === null ? now : Number(r.dispatched_at) + this.#redeliveryMs;
+      if (r.taken_at !== null) at = Math.max(at, Number(r.taken_at) + this.#takeHoldMs);
       const next = at > now ? at : now + this.#redeliveryMs;
       due = due === null ? next : Math.min(due, next);
     }
     return due;
   }
 
-  /** Jobs nobody is carrying: never dispatched, or silent longer than a call could take. */
+  /**
+   * Jobs nobody is carrying: never dispatched, or dispatched a redelivery interval ago and not under a live take
+   * (`takeJob`). Due at exactly the instant `redeliveryDue` parks for: a strict comparison would find nothing then
+   * and park one interval more.
+   */
   async #sweep(limit = 20): Promise<number> {
     if (!this.#binding) return 0;
     const now = this.#now();
     const ids = (await this.#store()).query(
-      "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at < ?) ORDER BY created_at LIMIT ?",
-      now - this.#redeliveryMs, limit).map((r) => String(r.id));
+      "SELECT id FROM model_jobs WHERE answer IS NULL AND state IS NULL AND (dispatched_at IS NULL OR dispatched_at <= ?)" +
+      " AND (taken_at IS NULL OR taken_at <= ?) ORDER BY created_at LIMIT ?",
+      now - this.#redeliveryMs, now - this.#takeHoldMs, limit).map((r) => String(r.id));
     let sent = 0;
     for (const id of ids) if (await this.#dispatch(id)) sent++;
     return sent;
@@ -537,11 +559,43 @@ export class PdHost {
     catch (error) { logEvent("pd.wake.error", { taskId, error: String((error as Error)?.message ?? error).slice(0, 200) }); }
   }
 
-  /** The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice. */
-  async takeJob(id: string): Promise<unknown> {
-    const [row] = (await this.#store()).query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
+  /**
+   * The worker's question: the request, or null once answered or cancelled so a redelivered message does not call twice.
+   *
+   * `taker` names one attempt to call the model with it (the consumer makes a fresh one each time, cf/src/model-queue.ts).
+   * Two messages for one job — the sweep resent a dispatch that was not lost, or the queue delivered one twice — would
+   * otherwise both call the model while neither has answered, and the answer `deliver` refuses is paid for and recorded
+   * nowhere. So a job under a live take (taken less than `TAKE_HOLD_MS` ago, not released) is refused to every other
+   * taker. A failed call releases its take (`releaseJob`), so the queue's retry takes it at once; one taken longer ago
+   * is a taker that died, and is taken again, as the sweep sends it again. Without a taker the request is only read:
+   * nothing is refused or recorded. One statement decides it, so two takers cannot both win.
+   */
+  async takeJob(id: string, taker?: string): Promise<unknown> {
+    const ap = await this.#store();
+    if (taker !== undefined) {
+      const now = this.#now();
+      const [won] = ap.query(
+        "UPDATE model_jobs SET taken_at = ?, taken_by = ? WHERE id = ? AND answer IS NULL AND state IS NULL" +
+        " AND (taken_at IS NULL OR taken_at <= ?) RETURNING request",
+        now, taker, id, now - this.#takeHoldMs);
+      if (won) return JSON.parse(String(won.request));
+    }
+    const [row] = ap.query("SELECT request, answer, state FROM model_jobs WHERE id = ?", id);
     if (!row) throw this.#bound().unknownJob(id);
+    if (taker !== undefined) {
+      if (row.answer === null && row.state === null) logEvent("pd.jobs.take_refused", { tenantId: this.#bound().tenantId, agentId: this.#bound().agentId, jobId: id });
+      return null;
+    }
     return row.answer === null && row.state === null ? JSON.parse(String(row.request)) : null;
+  }
+
+  /**
+   * A taker's call failed and will be retried: its take ends now, so the retry, or the sweep's resend, takes the job
+   * whatever its message's id. Only the taker's own take is cleared; false when it no longer holds one.
+   */
+  async releaseJob(id: string, taker: string): Promise<boolean> {
+    const ap = await this.#store();
+    return ap.query("UPDATE model_jobs SET taken_at = NULL, taken_by = NULL WHERE id = ? AND taken_by = ? RETURNING id", id, taker).length > 0;
   }
 
   /**
@@ -894,7 +948,9 @@ export class DurableAgent implements AgentEngine {
     return this.#host.withHarness(async (h) => (await (await this.#conversation(h)).agent(bg)).tools.map((t) => ({ name: t.name })));
   }
 
-  takeJob(id: string): Promise<unknown> { return this.#host.takeJob(id); }
+  takeJob(id: string, taker?: string): Promise<unknown> { return this.#host.takeJob(id, taker); }
+
+  releaseJob(id: string, taker: string): Promise<boolean> { return this.#host.releaseJob(id, taker); }
 
   deliver(id: string, answer: AnsweredMessage): Promise<boolean> { return this.#host.deliver(id, answer); }
 

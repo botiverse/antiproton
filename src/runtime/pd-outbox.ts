@@ -208,10 +208,13 @@ function modelOf(key: string, named: ReadonlyMap<string, string>): string {
 export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWrite[], ctx: BookContext): string[] {
   const booked: Booked = { jobs: [], usage: [], trace: [] };
 
-  // Model jobs: recorded by the batch whose poll checkpoint carries the handle.
+  // Model jobs: recorded by the batch whose poll checkpoint carries the handle. Written as dispatched now: the
+  // dispatch follows this commit at once (`PdHost.#afterCommit`), and a sweep that ran before it returned
+  // would read an unmarked row as one nobody is carrying and send it a second time. A dispatch that fails
+  // is sent again by the sweep once this is a redelivery interval old.
   for (const job of pollHandles(writes, ctx.staged)) {
-    ctx.ap.query("INSERT INTO model_jobs (id, conversation_id, request, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-      job.id, Number.isSafeInteger(job.conversationId) ? job.conversationId : null, ctx.staged.get(job.id)!.request, ctx.now);
+    ctx.ap.query("INSERT INTO model_jobs (id, conversation_id, request, created_at, dispatched_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+      job.id, Number.isSafeInteger(job.conversationId) ? job.conversationId : null, ctx.staged.get(job.id)!.request, ctx.now, ctx.now);
     booked.jobs.push(job.id);
   }
 

@@ -17,8 +17,9 @@
  * queue consumer (`modelQueueDeps` in cf/src/index.ts) reads a job's
  * `context` through `toRequest` in src/model/pi-bridge.ts, so `jobContext`
  * below writes the transcript as job wire format version 2 (`JobContextV2`
- * there): every system message inline at its place, and the current tools as
- * a field, as the 0.85 provider writes them.
+ * there): the first system message (the prompt) at the top, every later one
+ * inline at its place, and the current tools as a field, as the 0.85 provider
+ * writes them.
  * test/durable-drive.ts runs a job written here through `toRequest` and
  * compares it with the same conversation written by the 0.85 provider.
  *
@@ -75,14 +76,21 @@ const NO_USAGE: Usage = {
 };
 
 /**
- * The transcript as job wire format version 2: each system message rendered to text, where it
- * stands. The first is the prompt being declared, so it is rendered whole — content, then its
- * sections — as `getSystemMessageText` renders a leading prompt. Each later one changes that
- * prompt and is rendered as pi-ai's chat-completions transport renders a mid-conversation
- * system message (`convertMessages` in its api/openai-completions.js): its content, then each
- * changed section framed by name. That transport frames by index instead — only index 0 is
- * whole — which would send pi-durable's first prompt, written after the first input, as an
- * "update" of a prompt the model was never shown.
+ * The transcript as job wire format version 2: each system message rendered to text. The first with text is the prompt
+ * being declared, so it is rendered whole — content, then its sections — as `getSystemMessageText` renders a
+ * leading prompt, and it is placed at the top of the request, before any other message. pi-durable writes it
+ * after the first input (its first `pi.system` entry is planned when the first run starts, after the input that
+ * started it was appended), so in place the user's request would come before the policy it is to be read under:
+ * pi-ai 0.85 put the prompt first, and a model shown it second followed it differently (fewer tool calls per
+ * round in a τ² comparison). At the top, a conversation whose only system message is the prompt builds the
+ * request pi085 builds. Its `instructions` section is sent without the `<instructions>` tag pi-durable wraps it
+ * in (`renderSections` in pi-durable's harness/prompt.js): the tag names the section and carries nothing else,
+ * and without it the prompt text is the string pi085 sends. Any other section keeps its tag.
+ *
+ * Each later one changes that prompt and stays where it stands, rendered as pi-ai's chat-completions transport
+ * renders a mid-conversation system message (`convertMessages` in its api/openai-completions.js): its content,
+ * then each changed section framed by name. That transport frames by index instead — only index 0 is whole —
+ * which would send pi-durable's first prompt as an "update" of a prompt the model was never shown.
  *
  * One that renders empty — it only changed the tools — is dropped, as that transport drops it:
  * `tools` is the set current at the end, the field the 0.85 provider wrote.
@@ -93,11 +101,29 @@ export function jobContext(context: TranscriptContext): DurableJobContext {
   let declared = false;
   for (const m of context.messages) {
     if (m.role !== "system") { messages.push(m); continue; }
-    const content = declared ? renderSystemMessageUpdate(m) : getSystemMessageText(m);
+    if (declared) {
+      const content = renderSystemMessageUpdate(m);
+      if (content) messages.push({ role: "system", content });
+      continue;
+    }
+    // The prompt is the first one with text: one before it that only changed the tools declares nothing.
+    const content = getSystemMessageText(untagged(m));
+    if (!content) continue;
     declared = true;
-    if (content) messages.push({ role: "system", content });
+    messages.unshift({ role: "system", content });
   }
   return { version: JOB_WIRE_V2, messages, ...(tools.length ? { tools } : {}) };
+}
+
+/** pi-durable's key for the agent's own prompt (`INSTRUCTIONS_KEY` in its harness/agent.js). */
+const INSTRUCTIONS = "instructions";
+
+/** The message with its `instructions` section out of the `<instructions>` tag; unchanged when the section is absent or not so wrapped. */
+function untagged(m: SystemMessage): SystemMessage {
+  const text = m.sections?.[INSTRUCTIONS];
+  const [open, close] = [`<${INSTRUCTIONS}>\n`, `\n</${INSTRUCTIONS}>`];
+  if (typeof text !== "string" || !text.startsWith(open) || !text.endsWith(close) || text.length < open.length + close.length) return m;
+  return { ...m, sections: { ...m.sections, [INSTRUCTIONS]: text.slice(open.length, text.length - close.length) } };
 }
 
 const STOP_REASONS: ReadonlySet<string> = new Set<Answered["stopReason"]>(["stop", "length", "toolUse", "error", "deferred"]);

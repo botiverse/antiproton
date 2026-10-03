@@ -21,6 +21,8 @@
  *   replaced by pi-durable's conversation id, and a `state`: null while the job
  *   is out, `consumed` once a commit appended its answer, `cancelled` once its
  *   generation was aborted (the row is kept, so a late answer is still billed).
+ *   `taken_at` and `taken_by`: when a queue message last took the job for a
+ *   model call, and which message (`PdHost.takeJob`).
  *   The row is inserted inside pi-durable's commit (src/runtime/pd-outbox.ts),
  *   which knows the conversation; a row from before that may hold null.
  * - `conversations`: the directory from the id a caller addresses (a task id:
@@ -44,7 +46,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT`,
   `CREATE TABLE IF NOT EXISTS model_jobs (
      id TEXT PRIMARY KEY, conversation_id INTEGER, request TEXT NOT NULL, answer TEXT,
-     created_at INTEGER NOT NULL, dispatched_at INTEGER, answered_at INTEGER, state TEXT) STRICT`,
+     created_at INTEGER NOT NULL, dispatched_at INTEGER, answered_at INTEGER, state TEXT,
+     taken_at INTEGER, taken_by TEXT) STRICT`,
   // What a sweep for lost and unanswered calls reads.
   `CREATE INDEX IF NOT EXISTS model_jobs_open ON model_jobs (answered_at, created_at)`,
   `CREATE TABLE IF NOT EXISTS conversations (
@@ -54,6 +57,8 @@ const SCHEMA = [
 /** Columns added after a table was first made: each is added where it is missing (an object made before it). */
 const ADDED_COLUMNS = [
   { table: "model_jobs", column: "state", sql: "ALTER TABLE model_jobs ADD COLUMN state TEXT" },
+  { table: "model_jobs", column: "taken_at", sql: "ALTER TABLE model_jobs ADD COLUMN taken_at INTEGER" },
+  { table: "model_jobs", column: "taken_by", sql: "ALTER TABLE model_jobs ADD COLUMN taken_by TEXT" },
 ];
 
 /** The kernels an agent can run on. `pi085` is every agent created before the choice existed. */

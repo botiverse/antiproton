@@ -56,7 +56,8 @@ async function runtime() {
 /** The object's two RPC methods over a real runtime, translated as the object does. */
 function stubOver(rt: AgentRuntime, calls: string[]): ModelJobStub {
   return {
-    takeJob: (t, a, j) => { calls.push(`take ${j}`); return replyingUnknownJob(() => rt.takeJob(t, a, j)); },
+    takeJob: (t, a, j, taker) => { calls.push(`take ${j}`); return replyingUnknownJob(() => rt.takeJob(t, a, j, taker)); },
+    releaseJob: (t, a, j, taker) => { calls.push(`release ${j}`); return replyingUnknownJob(() => rt.releaseJob(t, a, j, taker)); },
     deliverAnswer: (t, a, j, answer) => { calls.push(`deliver ${j}`); return replyingUnknownJob(() => rt.deliverAnswer(t, a, j, answer)); },
   };
 }
@@ -155,6 +156,7 @@ await check("consumer: a job that disappears between take and deliver is acked a
   const inner = stubOver(rt, calls);
   const stub: ModelJobStub = {
     takeJob: inner.takeJob,
+    releaseJob: inner.releaseJob,
     async deliverAnswer(t, a, j, answer, ms) {
       host.sql.exec("DELETE FROM pi_model_jobs WHERE id = ?", j); // cancelled while the provider ran
       return inner.deliverAnswer(t, a, j, answer, ms);
@@ -188,9 +190,31 @@ await check("consumer: a known job is taken, called and delivered into its sessi
   host.dispose();
 });
 
+await check("consumer: each attempt, giving up too, takes under a fresh name; a failed one releases that name and is retried", async () => {
+  const log: string[] = [];
+  const stub: ModelJobStub = {
+    async takeJob(_t, _a, _j, taker) { log.push(`take ${taker}`); return REQUEST; },
+    async releaseJob(_t, _a, _j, taker) { log.push(`release ${taker}`); return true; },
+    async deliverAnswer() { log.push("deliver"); return true; },
+  };
+  const failing: ModelQueueDeps = { ...deps(stub, []), async call() { throw new Error("provider 503"); } };
+  const { msg, m } = message("job-a");
+  const err = console.error; console.error = () => {};
+  try {
+    await consumeModelCalls({ queue: "model-calls", messages: [msg, msg] }, failing);
+    await consumeModelCalls({ queue: "model-calls-dlq", messages: [msg] }, deps(stub, []));
+  } finally { console.error = err; }
+  must(m.retried === 2 && m.acked === 1, JSON.stringify(m));
+  const names = log.map((l) => l.split(" ")[1]);
+  must(log.map((l) => l.split(" ")[0]).join("|") === "take|release|take|release|take|deliver", log.join("|"));
+  must(names[0] && names[0] === names[1] && names[2] === names[3] && names[0] !== names[2] && names[4] && names[4] !== names[0] && names[4] !== names[2],
+    `takers ${log.join("|")}`);
+});
+
 await check("consumer: any other failure is still retried, not acked", async () => {
   const stub: ModelJobStub = {
     async takeJob() { throw new Error("object unavailable"); },
+    async releaseJob() { return true; },
     async deliverAnswer() { return true; },
   };
   const { msg, m } = message("job-a");

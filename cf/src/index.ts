@@ -719,8 +719,13 @@ export class AgentDO extends DurableObject<Env> {
    * row for is answered with an `UnknownJobReply` rather than a throw, because
    * the `UnknownJob` class does not survive RPC (cf/src/model-queue.ts).
    */
-  async takeJob(tenantId: string, agentId: string, jobId: string) {
-    return replyingUnknownJob(() => this.#activeRuntime().takeJob(tenantId, agentId, jobId));
+  async takeJob(tenantId: string, agentId: string, jobId: string, taker?: string) {
+    return replyingUnknownJob(() => this.#activeRuntime().takeJob(tenantId, agentId, jobId, taker));
+  }
+
+  /** A taker's failed call gives its take back, so the queue's retry can take the job (cf/src/model-queue.ts). */
+  async releaseJob(tenantId: string, agentId: string, jobId: string, taker: string) {
+    return replyingUnknownJob(() => this.#activeRuntime().releaseJob(tenantId, agentId, jobId, taker));
   }
 
   async deliverAnswer(
