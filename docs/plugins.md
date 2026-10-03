@@ -372,9 +372,10 @@ only `kept:`. `builtin` holds the raw store too, without the key, so it could
 list, overwrite or delete an owner's secrets but not read a value. The same test
 is a tripwire over the plugin list as `cf/src/runtime.ts` writes it: another
 entry naming the key, the runtime's secret resolver (`this.#secrets`) or
-`this.store`, an entry handed the whole runtime, or a second change to the list
-(including a non-empty initial list or a different list kept as the runtime's)
-turns it red. A key or store bound to another name
+`this.store`, an entry handed the whole runtime, a second push, unshift, splice
+or index write to the list, a non-empty initial list, or a different list kept
+as the runtime's turns it red. A change by another route (`Object.assign`,
+`Array.prototype.push.call`) is not seen. A key or store bound to another name
 first is not seen, and a plugin built elsewhere (the `extraPlugins` entries
 arrive already built) is outside it: what such a plugin can reach was decided
 where it was constructed.
