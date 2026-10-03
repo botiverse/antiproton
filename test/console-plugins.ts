@@ -606,6 +606,7 @@ check("form limits match the server: alias pattern and cap, secret-name length",
   must(rule instanceof RegExp, "the pattern compiles under the v flag");
   must(rule!.test("srv-1") && !rule!.test("Bad_Alias") && !rule!.test("9srv") && !rule!.test("a".repeat(25)),
     "it accepts and rejects what the server does");
+  must(!rule!.test("a_b"), "an underscore is refused too — the capital in Bad_Alias was doing all that case's work");
   must(/name="name" required maxlength="64"/.test(html.replace(/\n/g, " ")), "a secret name may be as long as the server allows");
 });
 
