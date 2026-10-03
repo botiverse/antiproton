@@ -18,6 +18,9 @@ import { setLogSink } from "../../src/core/log.ts";
 import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
+import { cancelJob } from "../../src/runtime/pd-outbox.ts";
+import { ApStore } from "../../src/store/ap-store.ts";
+import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { statusEvents } from "../../src/runtime/status.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
@@ -415,6 +418,70 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await again.agent.close();
   });
 
+  const aborted = (storage: DurableSqlHost) => storage.sql.exec(
+    "SELECT COUNT(*) AS n FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.generation' AND json_extract(record, '$.state.outcome.status') = 'aborted'").toArray()[0]!.n;
+
+  add("jobs", "the model changes, then the turn is cancelled before the poll runs, and the answer arrives after: the job is cancelled, never sent again, and the late answer is billed once, under the model that answered", async (storage) => {
+    const o = pdObject(storage, { redeliveryMs: 1 });
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job && job.state === null, `no open job: ${show(pdJobs(storage))}`);
+    check(await o.agent.takeJob(job.id), "the job was not handed out");
+    const moved = rebound(o);
+    check(await moved.cancel("cancelled") !== null, "nothing was cancelled");
+    check(Number(aborted(storage)) === 1 && Number(noModelFailures(storage)) === 0, `control: the generation did not end aborted (${aborted(storage)} aborted, ${noModelFailures(storage)} no_model)`);
+    check(pdJobs(storage)[0]!.state === "cancelled", `after the cancel ${show(pdJobs(storage))}`);
+    const sent = o.dispatched.length;
+    await sleep(5);
+    for (let i = 0; i < 2; i++) await moved.step();
+    check(o.dispatched.length === sent, `the cancelled job was sent again: ${show(o.dispatched)}`);
+    check(outboxes(storage).usage.length === 0, `billed before any answer: ${show(usagePairs(storage))}`);
+    check(await moved.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === true, "the late answer was refused");
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer billed ${show(usagePairs(storage))}`);
+    const again = pdObject(storage);
+    await again.agent.step();
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    await moved.close();
+    await again.agent.close();
+  });
+
+  add("jobs", "the answer arrives, the model changes, then the turn is cancelled before a poll read it: the abort's commit cancels the job and bills the answer once", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    const moved = rebound(o);
+    check(await moved.cancel("cancelled") !== null, "nothing was cancelled");
+    check(Number(aborted(storage)) === 1, `control: the generation did not end aborted (${aborted(storage)})`);
+    check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))}`);
+    for (let i = 0; i < 2; i++) await moved.step();
+    const again = pdObject(storage);
+    await again.agent.step();
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    await moved.close();
+    await again.agent.close();
+  });
+
+  add("jobs", "cancelJob twice on one answered job: the first bills the answer, the second bills nothing", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    await o.agent.close();
+    const ap = new ApStore(storage, prefixedNamespace("ap"));
+    const first = cancelJob(ap, job.id, OWNER, 1);
+    const second = cancelJob(ap, job.id, OWNER, 2);
+    check(show(first.map((r) => [r.key, r.quantity])) === show(Q1_USAGE), `first ${show(first)}`);
+    check(second.length === 0, `the second cancel billed again: ${show(second)}`);
+    check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
+  });
+
   add("trace", "a trace row the commit fails to write: the commit lands and bills, and the error is kept in trace_errors", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
@@ -428,6 +495,20 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     const kept = storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'trace_errors'").toArray().length > 0;
     const errors = kept ? storage.sql.exec("SELECT at, message FROM trace_errors").toArray() : [];
     check(errors.length === 1 && String(errors[0]!.message).includes("trace refused for the test") && Number(errors[0]!.at) > 0, `trace_errors ${show(errors)}`);
+    await o.agent.close();
+  });
+
+  add("trace", "a trace row the commit fails to write, and keeping the error fails too: the commit still lands and bills", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    storage.sql.exec("CREATE TRIGGER refuse_trace BEFORE INSERT ON trace_outbox BEGIN SELECT RAISE(ABORT, 'trace refused for the test'); END");
+    storage.sql.exec("CREATE TABLE trace_errors (at INTEGER NOT NULL, message TEXT NOT NULL)");
+    storage.sql.exec("CREATE TRIGGER refuse_errors BEFORE INSERT ON trace_errors BEGIN SELECT RAISE(ABORT, 'errors refused for the test'); END");
+    await pdTurn(storage, o.agent, null, [replying(SCRIPT[0]!.reply)]);
+    check(pdJobs(storage)[0]!.state === "consumed", `job ${show(pdJobs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
+    check(Number(storage.sql.exec("SELECT COUNT(*) AS n FROM trace_errors").toArray()[0]!.n) === 0, "an error was kept through a refusing table");
     await o.agent.close();
   });
 

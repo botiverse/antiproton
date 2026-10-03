@@ -27,8 +27,8 @@
  *   compaction's (the vendored harness/compaction.js) — and dispatched after that commit; a commit that
  *   never lands leaves no row and nothing dispatched. The batch that appends a job's answer marks it
  *   `consumed`, and so does the batch that moves a task off the `poll` of an answered job: a summary's
- *   answer is never an entry. The batch that ends a `poll` in pi-durable's `no_model` failure marks its job
- *   `cancelled`, billing an answer already in, as a cancel does (`cancelJob`).
+ *   answer is never an entry. The batch that ends a `poll` unread — pi-durable's `no_model` failure, or an abort —
+ *   marks its job `cancelled`, billing an answer already in, as a cancel does (`cancelJob`).
  *
  * Usage, the job rows and the consumed and cancelled marks are all-or-nothing with the batch: a failure
  * there throws, and the commit rolls back. The trace row is not billing, so a failure building it is
@@ -184,15 +184,16 @@ function pollHandles(writes: readonly StorageWrite[], staged: BookContext["stage
 
 /**
  * The jobs whose summary `poll` this batch ended: a compaction task's write whose stored record (the state the batch
- * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle. The
- * poll read an answer and the batch acts on it — or the task was aborted, whose cancel marked the job already. A
- * generation's answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not
+ * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle, and
+ * that did not end it unread (`unreadPolls`, whose jobs are cancelled instead): the poll read an answer and the batch
+ * acts on it. An abort is not one of these: its handler cancels the job only while the model the poll names is still
+ * registered, so its job may well be open here. A generation's answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not
  * (the vendored harness/compaction.js places a summary entry, or nothing), so this is how its job is consumed.
  */
 function endedSummaryPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
   const out: string[] = [];
   for (const w of writes) {
-    if (w.type !== "task" || w.value.kind !== COMPACTION) continue;
+    if (w.type !== "task" || w.value.kind !== COMPACTION || endedUnread(w.value.state)) continue;
     const was = storedPoll(exec, Number(w.value.id));
     if (was === undefined) continue;
     const now = (w.value.state as { checkpoint?: unknown } | undefined)?.checkpoint;
@@ -211,20 +212,30 @@ function storedPoll(exec: SqliteSyncExecutor, taskId: number): string | undefine
 }
 
 /**
- * The jobs whose `poll` this batch ended with pi-durable's `no_model` failure: a task, a generation's or a compaction's,
- * whose stored record is a `poll` checkpoint and whose new state carries that outcome. Both write it (`failNoModel` in
- * harness/generation.js and the vendored harness/compaction.js) when the model the poll names is no longer registered —
- * the agent's binding moved while the call was out — and they write it before fetching, so the answer was never read,
- * no entry will name the job and nothing will add its usage to `pi.usage`. Read from the outcome pi-durable commits,
- * not inferred from the binding: the failure is the fact, and this batch is the one that records it.
+ * Whether a task's new state is an outcome that ends a `poll` without reading its answer: pi-durable's `no_model`
+ * failure, or an abort. Both a generation and a compaction write them (harness/generation.js and the vendored
+ * harness/compaction.js): `failNoModel` when the model the poll names is no longer registered — the agent's binding
+ * moved while the call was out — and it fails before fetching; `abort` settles the task without fetching at all.
  */
-function noModelPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
+function endedUnread(state: unknown): boolean {
+  const outcome = isObject(state) ? state.outcome : undefined;
+  if (!isObject(outcome)) return false;
+  if (outcome.status === "aborted") return true;
+  return outcome.status === "failed" && isObject(outcome.error) && isObject(outcome.error.detail) && outcome.error.detail.reason === "no_model";
+}
+
+/**
+ * The jobs whose `poll` this batch ended unread (`endedUnread`): a task, a generation's or a compaction's, whose stored
+ * record is a `poll` checkpoint and whose new state is such an outcome. No entry will name the job and nothing will add
+ * its usage to `pi.usage`. An abort's handler cancels the job through the provider's port (`PdHost.#dropJob`), but only
+ * while the model the poll names is registered; after the binding moved it skips the cancel, and the job would stay
+ * open, to be sent again and its answer stored unbilled. Read from the outcome pi-durable commits, not inferred from
+ * the binding: the outcome is the fact, and this batch is the one that records it.
+ */
+function unreadPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
   const out: string[] = [];
   for (const w of writes) {
-    if (w.type !== "task") continue;
-    const outcome = (w.value.state as { outcome?: unknown } | undefined)?.outcome;
-    if (!isObject(outcome) || outcome.status !== "failed" || !isObject(outcome.error)) continue;
-    if (!isObject(outcome.error.detail) || outcome.error.detail.reason !== "no_model") continue;
+    if (w.type !== "task" || !endedUnread(w.value.state)) continue;
     const job = storedPoll(exec, Number(w.value.id));
     if (job !== undefined) out.push(job);
   }
@@ -292,15 +303,15 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
     }
   }
 
-  // A poll that ended in `no_model` never read its answer: the job is cancelled, as an abort's is (`PdHost.#dropJob`), so
-  // its answer is billed as a stranded one — here if it is in already, by `deliver` when it comes. Before the summary
-  // polls below, which would otherwise mark an answered summary job consumed with nothing billing it.
+  // A poll that ended unread (`no_model`, or an abort) never read its answer: the job is cancelled, as `PdHost.#dropJob`
+  // does — a no-op for one that already did it — so its answer is billed as a stranded one: here if it is in already, by
+  // `deliver` when it comes.
   const who = { tenantId: ctx.owner?.tenantId ?? "", agentId: ctx.owner?.agentId ?? "" };
   const base = { at: ctx.now, ...who };
-  for (const id of noModelPolls(exec, writes)) {
+  for (const id of unreadPolls(exec, writes)) {
     const rows = cancelJob(ctx.ap, id, who, ctx.now);
     booked.usage.push(...rows);
-    logEvent("pd.jobs.cancelled_no_model", { ...(ctx.owner ?? {}), jobId: id, billed: rows.length > 0 });
+    logEvent("pd.jobs.cancelled_unread", { ...(ctx.owner ?? {}), jobId: id, billed: rows.length > 0 });
   }
 
   // A poll that ended with no entry naming its job (a compaction's summary): consumed, once answered. No trace row:
