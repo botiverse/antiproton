@@ -62,6 +62,15 @@ function object(storage: DurableSqlHost, polls: Array<{ id: string; ready: boole
   return { host, agent, dispatched, polls };
 }
 
+/**
+ * A clock for `PdHostOptions.now` that stands still until `advance`: a case about the redelivery interval or the
+ * take's hold decides when they elapse, so how late the machine runs a step cannot.
+ */
+function manualClock(start = Date.now()) {
+  let t = start;
+  return { now: () => t, advance: (ms: number) => { t += ms; } };
+}
+
 type Jobs = Array<{ id: string; answer: string | null; dispatched_at: number | null; request: string }>;
 const jobs = (storage: DurableSqlHost): Jobs =>
   storage.sql.exec("SELECT id, answer, dispatched_at, request FROM ap_model_jobs ORDER BY created_at").toArray() as unknown as Jobs;
@@ -528,7 +537,10 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("jobs", "a message and the wake it asks for, while the dispatch is in flight: one queue send, and a second taker is refused while the first holds the job", async (storage) => {
-    const o = object(storage, [], { redeliveryMs: 600, takeHoldMs: 1_200 });
+    // The object's clock moves only when the case moves it (`manualClock`): on the wall clock, a step the machine ran
+    // 600 ms late found the job's redelivery due and sent it again, correctly.
+    const clock = manualClock();
+    const o = object(storage, [], { redeliveryMs: 600, takeHoldMs: 1_200, now: clock.now });
     // The commit's dispatch is held open, as a queue send that has not returned: the window the wake's sweep ran in.
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -552,7 +564,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(await a.releaseJob(id, "try-1") === true, "the holder's release did nothing");
     check(await a.takeJob(id, "try-3") !== null, "a taker after the release was refused");
     // A holder that died: its take lapses after the hold, and the next taker is granted.
-    await sleep(1_250);
+    clock.advance(1_250);
     check(await a.takeJob(id, "try-4") !== null, "a taker after the hold was refused");
     check(await a.takeJob(id, "try-3") === null, "a second taker within the new take's hold was granted");
     // Without a taker the request is only read.
@@ -562,34 +574,32 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
 
   add("jobs", "a model call longer than the redelivery interval: the sweep does not send the job again and no second taker is granted; once the hold lapses it is sent and taken", async (storage) => {
     const RED = 300, HOLD = 1_500;
-    const o = object(storage, [], { redeliveryMs: RED, takeHoldMs: HOLD });
+    // The object's clock moves only when the case moves it. On the wall clock, a step the machine ran late found
+    // the redelivery already due before the first taker took the job, and resent a job nobody had taken yet, which
+    // is correct and not what this case is about.
+    const clock = manualClock();
+    const o = object(storage, [], { redeliveryMs: RED, takeHoldMs: HOLD, now: clock.now });
     const sent: string[] = [];
     const a = o.agent(undefined, { dispatch: async (id) => { sent.push(id); } });
     await a.say("Q1");
     for (let i = 0; i < 400 && sent.length === 0; i++) await sleep(5);
     const parked = await a.step();
     const id = sent[0]!;
+    check(show(sent) === show([id]) && parked.wakeInMs === RED, `control: not parked for the redelivery: ${show(parked)}, sends ${show(sent)}`);
     check(await a.takeJob(id, "try-1") !== null, "the first taker was refused");
     // The model call runs on past the redelivery the object parked for.
-    check(parked.wakeInMs !== null && parked.wakeInMs <= RED, `parked for ${show(parked)}`);
-    await sleep(RED + 50);
-    const s0 = Date.now();
+    clock.advance(RED + 50);
     const during = await a.step();
-    const s1 = Date.now();
     check(show(sent) === show([id]), `sends while the call runs: ${show(sent)}`);
     check(await a.takeJob(id, "try-2") === null, "a second taker was granted while the first one's call runs");
-    // Parked for the end of the hold: not at once (a busy loop), not past it (a dead taker never recovered). Read as a
-    // time, not as a remainder: the step read its clock somewhere in [s0, s1], so a park at the hold's end puts that
-    // read at end - wakeInMs.
-    const end = Number(storage.sql.exec("SELECT taken_at FROM ap_model_jobs WHERE id = ?", id).toArray()[0]!.taken_at) + HOLD;
-    check(during.wakeInMs !== null && during.wakeInMs > 0 && end - during.wakeInMs >= s0 && end - during.wakeInMs <= s1,
-      `parked for ${show(during)}, the hold's end at ${end}, the step in [${s0}, ${s1}]`);
+    // Parked for the end of the hold: not at once (a busy loop), not past it (a dead taker never recovered).
+    check(during.wakeInMs === HOLD - (RED + 50), `parked for ${show(during)}, the hold ends in ${HOLD - (RED + 50)} ms`);
     // The taker died without releasing: at the end of the hold the job is sent again and taken.
-    await sleep(during.wakeInMs);
+    clock.advance(during.wakeInMs);
     const after = await a.step();
     check(show(sent) === show([id, id]), `sends after the hold: ${show(sent)}`);
     check(await a.takeJob(id, "try-3") !== null, "the taker after the hold was refused");
-    check(after.wakeInMs !== null && after.wakeInMs > 0, `after the resend: ${show(after)}`);
+    check(after.wakeInMs === RED, `after the resend: ${show(after)}`);
     await a.close();
   });
 
