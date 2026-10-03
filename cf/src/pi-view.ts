@@ -44,6 +44,15 @@ export function entriesToEvents(entries: Entry[]): ViewEvent[] {
       });
       continue;
     }
+    // A reset starts the model's context over at this entry, and nothing else in the transcript says so: the entries
+    // before it are all still here. Its handoff, when one was given, is the first thing the model reads. Only pd writes
+    // one (src/runtime/pd-transcript.ts). Other custom entries stay out: the only one written today is the Agents API's
+    // cancel marker, which pi 0.85 writes too, and its console has never shown it (test/pd-transcript.ts pins that).
+    if (e.type === "custom" && (e as { customType?: string }).customType === "pi.reset") {
+      const handoff = ((e as { data?: unknown }).data as { handoff?: unknown } | undefined)?.handoff;
+      out.push({ sequence: e.seq, kind: "reset", payload: { ...(typeof handoff === "string" ? { handoff } : {}), at: e.timestamp } });
+      continue;
+    }
     if (e.type !== "message") continue;
     const m: any = (e as any).message;
 
