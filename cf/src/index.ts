@@ -893,8 +893,9 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * Whether the runner has finished this bench agent's task (benchSweFinish). Keyed by agent, so on a shared
-   * object one task's end never reads as another's; and a task name cannot be started twice (its mounts are
-   * already there), so the row is never cleared for a rerun.
+   * object one task's end never reads as another's. benchSweStart clears its own agent's row once the start
+   * has gone through: a name can be started again after /bench/purge (which keeps bench_config), and that
+   * run is not over.
    */
   #benchEnded(agentId: string): boolean {
     return this.sql.exec("SELECT 1 FROM bench_config WHERE k=?", `ended:${agentId}`).toArray().length > 0;
@@ -976,6 +977,8 @@ export class AgentDO extends DurableObject<Env> {
         },
         secretRef: OPERATOR_RUN9_REF, policy: null,
       });
+      // Last, so a start that fails part way (the name's mounts still there) leaves a finished task finished.
+      this.sql.exec("DELETE FROM bench_config WHERE k=?", `ended:${agentId}`);
       return { taskId, agentId, offload: this.#offloadOn(), mode: "swe", network: o.network ?? "none", engine };
     });
   }

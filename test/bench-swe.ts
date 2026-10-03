@@ -472,6 +472,33 @@ for (const engine of ["pd", "pi085"] as const) {
   });
 }
 
+await check("pi085: a task name started again after purge is not born ended, and a failed restart leaves it ended", async () => {
+  // Only pi085 shares an object between tasks. /bench/purge clears the mounts but keeps bench_config, so a
+  // rerun under the same name on the same object would otherwise read the earlier run's end.
+  const taskId = "swe_rerun_pi085", agentId = `b_${taskId}`;
+  const o = object();
+  run9.reset();
+  await o.D.benchSweStart(taskId, { policy: "fix it", image: IMAGE, engine: "pi085" });
+  await o.D.benchSweFinish(taskId);
+  must((await o.D.benchSay(taskId, "more"))?.refused, "the finished task took a message, so this case tests nothing");
+  // Without a purge the name's mounts are still there: the restart fails, and the task must stay ended.
+  const failed = await o.D.benchSweStart(taskId, { policy: "fix it", image: IMAGE, engine: "pi085" }).then(() => null, (e: any) => String(e?.message ?? e));
+  must(failed, "a restart without purge went through, so the failed-restart half tests nothing");
+  must((await o.D.benchSay(taskId, "more"))?.refused, "a failed restart revived the ended task");
+  await o.D.benchPurge();
+  await o.D.benchSweStart(taskId, { policy: "fix it", image: IMAGE, engine: "pi085" });
+  o.jobs.length = 0;
+  const said = await o.D.benchSay(taskId, "fix the bug, second run");
+  must(!said?.refused, `the new run was refused as ended: ${show(said)}`);
+  const again = await o.nextJob(agentId);
+  const shellName = SANDBOX_ALIAS_OF(again.job) + "__shell";
+  await o.D.deliverAnswer("bench", agentId, again.id, calls({ id: "c_ls", name: shellName, arguments: { command: "ls" } }), 5);
+  const next = await o.nextJob(agentId);
+  const r = resultOf(next.job, "c_ls");
+  must(r && !r.isError, `the new run's shell call was refused: ${show(r).slice(0, 300)}`);
+  o.raw.dispose();
+});
+
 await check("a withheld address is refused at dispatch, and nothing else is", () => {
   const held = new Set(["sandbox.release"]);
   const r = refuseWithheld("sandbox.release", held);
