@@ -373,6 +373,21 @@ await check("route: add refusals are 400 with the reason, and store nothing", as
   must(text.status === 400 && /cannot be added/.test(text.text), `plain refusal: ${text.text}`);
 });
 
+await check("route: an inward server url is refused by /ui/mount/add and by /admin/mounts alike (mcp's configProblem), before anything is stored", async () => {
+  const INWARD = "https://169.254.169.254.nip.io/mcp";
+  const before = seenHeaders.length;
+  const ui = await post("/ui/mount/add", { plugin: "mcp", alias: "meta", url: INWARD }, { json: true });
+  must(ui.status === 400 && /public host/.test(ui.json().error), `console: ${ui.status} ${ui.text}`);
+  const admin = await worker.fetch(new Request("https://console.test/admin/mounts", {
+    method: "POST", headers: { "x-harness-token": "operator-token", "content-type": "application/json" },
+    body: JSON.stringify({ tenantId: T, agentId: A, alias: "meta", plugin: "mcp", config: { url: INWARD } }),
+  }), env as never);
+  const body = await admin.json() as { error?: string };
+  must(admin.status === 400 && /public host/.test(body.error ?? ""), `admin: ${admin.status} ${show(body)}`);
+  must(!(await home().runtime().store.getMountByAlias(T, A, "meta")), "the inward mount was stored");
+  must(seenHeaders.length === before, "the inward server was asked for its tools");
+});
+
 await check("route: a snapshot failure is 200 with the mount, and the error is kept on it", async () => {
   // The slot names a secret not kept yet, so the listing fails before anything is sent.
   const r = await post("/ui/mount/add", { plugin: "mcp", alias: "docs", url: MCP_URL, headers: "X-Api-Key: {{docs-key}}\n" }, { json: true });
