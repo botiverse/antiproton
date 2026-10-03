@@ -551,15 +551,62 @@ check("adding a mount from the console: one form per addable plugin, fields from
     "at the cap the button disables and says why");
 });
 
-check("a console-added mount carries refresh and remove; a failed snapshot says so on the mount", () => {
+check("a console-added mount carries refresh and remove in the full view; the single-mount view stays read-only", () => {
   const base = { installed: [{ id: "mcp", version: "1", tools: [], config: [], credential: null }], used: {} };
-  const added = mountFragment({ ...base, mounts: [{ alias: "srv", plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: ["srv.ping"], fromConsole: true }] }, "srv");
-  must(/hx-post="\/ui\/mount\/refresh"[\s\S]*name="alias" value="srv"/.test(added), "a console-added mount can refresh its tool list");
-  must(/hx-post="\/ui\/mount\/remove"[\s\S]*name="alias" value="srv"/.test(added), "and can be removed");
+  const full = plugins({ ...base, mounts: [{ alias: "srv", plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: ["srv.ping"], fromConsole: true }] });
+  must(/hx-post="\/ui\/mount\/refresh"[\s\S]*name="alias" value="srv"/.test(full), "a console-added mount can refresh its tool list in the full view");
+  must(/hx-post="\/ui\/mount\/remove"[\s\S]*name="alias" value="srv"/.test(full), "and can be removed there");
+  const alone = mountFragment({ ...base, mounts: [{ alias: "srv", plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: ["srv.ping"], fromConsole: true }] }, "srv");
+  must(!/hx-post="\/ui\/mount\//.test(alone), "the single-mount fragment is read-only: it lands in the inspector tab, which re-reads on its own poll, and after a remove there is no mount left to show");
+  const seededFull = plugins({ ...base, mounts: [{ alias: "gh", plugin: "github", version: "2", connected: true, config: {}, problems: [], tools: [] }] });
+  must(!/hx-post="\/ui\/mount\//.test(seededFull), "a catalogue mount gets neither control in the full view either");
   const seeded = mountFragment({ ...base, mounts: [{ alias: "gh", plugin: "github", version: "2", connected: true, config: {}, problems: [], tools: [] }] }, "gh");
-  must(!/hx-post="\/ui\/mount\//.test(seeded), "a catalogue mount gets neither control — removal refusal stays server-side");
-  const broken = mountFragment({ ...base, mounts: [{ alias: "srv", plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: [], fromConsole: true, snapshotError: "502 from the server" }] }, "srv");
-  must(/tool list not fetched: 502 from the server/.test(broken), "a failed snapshot renders its reason on the mount");
+  must(!/hx-post="\/ui\/mount\//.test(seeded), "nor in the single-mount fragment — removal refusal stays server-side");
+});
+
+check("everything the server hands the mount sections is escaped, including a hostile snapshot error and kept name", () => {
+  // cody's review of #701: dropping esc() from snapshotError or a kept name leaves
+  // the suite green. The remote MCP server writes the first; an owner types the
+  // second. Both carry markup-shaped text here and must come out as text.
+  const hostile = `bad <b>"quoted"</b>`;
+  const base = { installed: [{ id: "mcp", version: "1", tools: [], config: [], credential: null }], used: {} };
+  const broken = mountFragment({ ...base, mounts: [{ alias: "srv", plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: [], fromConsole: true, snapshotError: hostile }] }, "srv");
+  must(/&lt;b&gt;&quot;quoted&quot;&lt;\/b&gt;/.test(broken), "a snapshot error renders escaped");
+  must(!/<b>"quoted"<\/b>/.test(broken), "its raw markup never reaches the page");
+  const kept = plugins({ ...base, mounts: [], kept: [{ name: `A"B<c>`, storedAt: 1_000, lastReadAt: null }] });
+  must(/<code>A&quot;B&lt;c&gt;<\/code>/.test(kept), "a kept name renders escaped");
+  must(/name="name" value="A&quot;B&lt;c&gt;"/.test(kept), "and the remove form's hidden name is escaped too");
+  must(!/hx-confirm="[^"]*A"B<c>/.test(kept), "and the remove confirm, where the name also rides, is escaped");
+});
+
+check("a field's summary rides under it inside the add form, escaped, so the headers box explains the {{secret}} shape", () => {
+  // The catalogue's own table also prints summaries, so a page-wide text check
+  // can't fail: the assertion has to be inside the add form. And the summary
+  // is owner-adjacent text — a hostile one must render as text too.
+  const installed = [{ id: "mcp", version: "1", tools: [], config: [
+    { name: "headers", type: "string[]", required: false, summary: `one Name: {{secret}} <i>per</i> "line"` }], credential: null, addable: true }];
+  const html = plugins({ installed, mounts: [], used: {} });
+  const form = (html.match(/<form class="mount-add"[\s\S]*?<\/form>/) ?? [""])[0]!;
+  must(form.length > 0, "the add form renders");
+  must(/one Name: \{\{secret\}\} &lt;i&gt;per&lt;\/i&gt; &quot;line&quot;/.test(form),
+    "the summary is under the field, inside the form, escaped");
+});
+
+check("form limits match the server: alias pattern and cap, secret-name length", () => {
+  const installed = [{ id: "mcp", version: "1", tools: [], config: [], credential: null, addable: true }];
+  const html = plugins({ installed, mounts: [], used: {} });
+  // Browsers compile `pattern` with the v flag, where a trailing unescaped `-`
+  // in a class is a syntax error and the whole check is dropped (cody, #708
+  // review) — so the extracted pattern must compile under v and accept and
+  // reject what the server does.
+  const attr = (html.match(/name="alias"[^>]*pattern="([^"]+)"/) ?? [])[1];
+  must(typeof attr === "string" && attr.length > 0, "the alias box carries the pattern");
+  let rule: RegExp | null = null;
+  try { rule = new RegExp(`^(?:${attr})$`, "v"); } catch { rule = null; }
+  must(rule instanceof RegExp, "the pattern compiles under the v flag");
+  must(rule!.test("srv-1") && !rule!.test("Bad_Alias") && !rule!.test("9srv") && !rule!.test("a".repeat(25)),
+    "it accepts and rejects what the server does");
+  must(/name="name" required maxlength="64"/.test(html.replace(/\n/g, " ")), "a secret name may be as long as the server allows");
 });
 
 check("kept secrets are named only: the value never renders, removal says who starts failing", () => {

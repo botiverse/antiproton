@@ -2049,14 +2049,18 @@ function credentialRegion(m: any, spec: CredentialSpec | null | undefined): stri
     </div>`;
 }
 
-/** One mount, rendered on its own: what the credential routes return. */
+/** One mount, rendered on its own: what the credential routes return. Read-only
+ *  by design: this fragment lands in the inspector's plugins tab, which re-reads
+ *  on its own poll, so refresh/remove controls would fight the poll — and after a
+ *  remove there is no mount left for the fragment to show. The full plugins view
+ *  carries the controls. */
 export function mountFragment(d: any, alias: string): string {
   const m = (d.mounts ?? []).find((x: any) => x.alias === alias);
   if (!m) return `<div class="mount" id="${mountBlockId(alias)}"><div class="empty">no mount named ${esc(alias)}</div></div>`;
   return mountBlock(d, m);
 }
 
-function mountBlock(d: any, m: any): string {
+function mountBlock(d: any, m: any, controls = false): string {
   const used: Record<string, number> = d.used ?? {};
   const installed: any[] = d.installed ?? [];
   const spec = installed.find((p) => p.id === m.plugin)?.credential ?? null;
@@ -2103,7 +2107,7 @@ function mountBlock(d: any, m: any): string {
       ${typeof m.snapshotError === "string" && m.snapshotError
         ? `<div class="err">tool list not fetched: ${esc(m.snapshotError)} — the mount stands; refresh to try again</div>`
         : ""}
-      ${m.fromConsole === true
+      ${controls && m.fromConsole === true
         ? `<div class="row" style="padding-top:6px">
         <form hx-post="/ui/mount/refresh" hx-target="closest .plugins-root" hx-swap="innerHTML">
           <input type="hidden" name="alias" value="${esc(m.alias)}"><button type="submit" class="ghost">refresh tools</button>
@@ -2219,17 +2223,21 @@ function mountAddSection(d: any): string {
   if (!addable.length) return `<div class="empty">nothing here can be added from the console</div>`;
   const full = added >= cap;
   // `required` renders only when the declaration says true: an optional setting
-  // leaves the key out entirely, and absence must not read as required.
+  // leaves the key out entirely, and absence must not read as required. The
+  // summary rides under each field — for a headers box that means the
+  // `Name: {{secret}}` shape is on the page, so an owner never types a full
+  // key into what becomes a public setting.
   const field = (c: any) => {
     const label = `<span>${esc(c.name)}${c.required === true ? "" : " <i>(optional)</i>"}</span>`;
-    if (c.type === "string[]") return `<label>${label}<textarea name="${esc(c.name)}" rows="3" autocomplete="off" spellcheck="false" placeholder="one value per line"></textarea></label>`;
-    if (c.type === "number") return `<label>${label}<input type="number" name="${esc(c.name)}" autocomplete="off"></label>`;
-    return `<label>${label}<input type="text" name="${esc(c.name)}"${c.required === true ? " required" : ""} autocomplete="off" spellcheck="false"></label>`;
+    const hint = c.summary ? `<div class="hint" style="padding:2px 0 0">${esc(c.summary)}</div>` : "";
+    if (c.type === "string[]") return `<label>${label}<textarea name="${esc(c.name)}" rows="3" autocomplete="off" spellcheck="false" placeholder="one value per line"></textarea>${hint}</label>`;
+    if (c.type === "number") return `<label>${label}<input type="number" name="${esc(c.name)}" autocomplete="off">${hint}</label>`;
+    return `<label>${label}<input type="text" name="${esc(c.name)}"${c.required === true ? " required" : ""} autocomplete="off" spellcheck="false">${hint}</label>`;
   };
   return `<div class="hint" style="padding:0 0 4px">${added} of ${cap} added this way.</div>` + addable.map((p: any) => `
   <form class="mount-add" hx-post="/ui/mount/add" hx-target="closest .plugins-root" hx-swap="innerHTML">
     <input type="hidden" name="plugin" value="${esc(p.id)}">
-    <label><span>alias</span><input type="text" name="alias" required maxlength="60" autocomplete="off" spellcheck="false" placeholder="what the agent calls it"></label>
+    <label><span>alias</span><input type="text" name="alias" required maxlength="24" pattern="[a-z][a-z0-9\\-]{0,23}" autocomplete="off" spellcheck="false" placeholder="what the agent calls it — lowercase letters, digits, dashes"></label>
     ${(p.config ?? []).map(field).join("")}
     <div class="row"><button type="submit"${full ? ` disabled title="${cap} console-added mounts is the most"` : ""}>mount ${esc(p.id)}</button></div>
   </form>`).join("");
@@ -2251,7 +2259,7 @@ function secretsBlock(d: any): string {
     </form></td></tr>`;
   return `
   <form class="secret-add" hx-post="/ui/secret" hx-target="closest .plugins-root" hx-swap="innerHTML">
-    <label><span>name</span><input type="text" name="name" required maxlength="60" autocomplete="off" spellcheck="false" placeholder="what headers call it"></label>
+    <label><span>name</span><input type="text" name="name" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="what headers call it"></label>
     <label><span>value</span><input type="password" name="value" required autocomplete="off" spellcheck="false"></label>
     <div class="row"><button type="submit">keep it</button></div>
   </form>
@@ -2267,7 +2275,7 @@ export function plugins(d: any): string {
 <div class="hint">A mount is an authority, not a plugin. The same plugin mounted twice
   against two accounts is two mounts, with two credentials and two session states.
   No credential is shown here — only whether one is attached.</div>
-${mounts.length ? mounts.map((m) => mountBlock(d, m)).join("") : `<div class="empty">nothing mounted</div>`}
+${mounts.length ? mounts.map((m) => mountBlock(d, m, true)).join("") : `<div class="empty">nothing mounted</div>`}
 
 <h3 style="margin-top:18px">add a mount</h3>
 <div class="hint">Only what the deployment marks addable from here — today that is remote MCP
