@@ -156,28 +156,45 @@ export function readPdModelJobs(sql: ReadSql, limit: number): Array<{ id: string
  * still billed (src/store/ap-store.ts); it is `cancelled`, and nothing waits on it.
  */
 export function pdOutstandingJobs(sql: ReadSql): number {
-  const table = prefixedNamespace("ap").qualify("model_jobs", "table");
-  if (!tableExists(sql, table)) return 0;
-  const n = (q: string) => Number(sql.exec(AP.rewrite(q)).toArray()[0]?.n ?? 0);
-  // `state` is added by a migration (ApStore.ensure); a table from before it has no cancelled job to leave out.
-  try { return n("SELECT COUNT(*) AS n FROM model_jobs WHERE answer IS NULL AND state IS NULL"); }
-  catch { return n("SELECT COUNT(*) AS n FROM model_jobs WHERE answer IS NULL"); }
+  if (!tableExists(sql, prefixedNamespace("ap").qualify("model_jobs", "table"))) return 0;
+  // `state` is added by a migration (ApStore.ensure); a table from before it has no cancelled job to leave out. Probed
+  // the way ApStore.ensure probes it: a select of a missing column fails as it is prepared. Any other failure of the
+  // count itself is not caught.
+  let hasState = true;
+  try { sql.exec(AP.rewrite("SELECT state FROM model_jobs WHERE 0")); } catch { hasState = false; }
+  return Number(sql.exec(AP.rewrite(
+    `SELECT COUNT(*) AS n FROM model_jobs WHERE answer IS NULL${hasState ? " AND state IS NULL" : ""}`)).toArray()[0]?.n ?? 0);
 }
+
+/**
+ * Every status a task has before it is terminal: pi-durable's `tasks.status` CHECK (dist/storage/sqlite/migrations.js,
+ * @earendil-works/pi-durable 1.0.0) is these and `terminal`. Named rather than `!= 'terminal'` so that a read of live
+ * tasks searches `tasks_by_status` instead of scanning every task the object ever ran.
+ */
+const LIVE = "('pending', 'running', 'waiting', 'completing')";
+
+/** `tasks.kind` as pi-durable stores it: JSON-encoded (storage.js `encodeIndexedString`). */
+const GENERATION_KIND = JSON.stringify("pi.generation");
 
 /** The object's tasks that are not finished (pending, running, waiting, completing): what its harness is still doing. */
 export function readPdLiveTasks(sql: ReadSql, limit: number): Array<{ id: number; conversationId: number; kind: string; status: string; background: boolean }> {
   if (!tableExists(sql, prefixedNamespace("pd").qualify("tasks", "table"))) return [];
-  return sql.exec(PD.rewrite("SELECT record FROM tasks WHERE status != 'terminal' ORDER BY id DESC LIMIT ?"), limit).toArray()
+  return sql.exec(PD.rewrite(`SELECT record FROM tasks WHERE status IN ${LIVE} ORDER BY id DESC LIMIT ?`), limit).toArray()
     .map((r) => JSON.parse(String(r.record)) as { id: number; conversationId: number; kind: string; state: { status: string }; background: boolean })
     .map((t) => ({ id: Number(t.id), conversationId: Number(t.conversationId), kind: t.kind, status: t.state.status, background: !!t.background }));
 }
 
-/** A session's compaction entries, newest first, with the size of each stored record. */
+/**
+ * A session's compaction entries, newest first, with the size of each stored record. A compaction entry always has a
+ * `head` (its first kept entry: harness/compaction.js `placeSummary`), so the read goes through the partial index of
+ * entries that have one (`entry_heads_by_conversation`) — a reset and a compaction, not the whole transcript.
+ */
 export function readPdCompactions(sql: ReadSql, session: string, limit: number): Array<{ id: string; seq: number; timestamp: number; bytes: number }> {
   const id = pdConversationId(sql, session);
   if (id === null || !tableExists(sql, prefixedNamespace("pd").qualify("entries", "table"))) return [];
   return sql.exec(PD.rewrite(
-    "SELECT record, LENGTH(record) AS bytes FROM entries WHERE conversation_id = ? AND json_extract(record, '$.kind') = 'pi.compaction' ORDER BY id DESC LIMIT ?"),
+    "SELECT record, LENGTH(record) AS bytes FROM entries WHERE conversation_id = ? AND head IS NOT NULL " +
+    "AND json_extract(record, '$.kind') = 'pi.compaction' ORDER BY id DESC LIMIT ?"),
   id, limit).toArray().map((r) => {
     const [e] = projectEntries([JSON.parse(String(r.record)) as EntryRecord]);
     return { id: String(e?.id), seq: Number(e?.seq), timestamp: Number(e?.timestamp ?? 0), bytes: Number(r.bytes) };
@@ -185,64 +202,100 @@ export function readPdCompactions(sql: ReadSql, session: string, limit: number):
 }
 
 /**
- * Model calls of a session that ended without an answer and left no assistant entry: a generation that failed before
- * its request went out (no model, a context overflow it could not compact away), faulted, or was orphaned. pi-durable
- * records each as its `pi.generation` task's terminal outcome and appends nothing, so the transcript shows the message
- * and then nothing. A generation whose model call came back with an error is not here: it appended that reply, which
- * the transcript shows. Aborted ones are a cancel, which has its own marker entry.
+ * Model calls of a session whose generation ended failed, faulted or orphaned with nothing in the transcript saying so.
+ * pi-durable records the ending only as the `pi.generation` task's terminal outcome, so without this the transcript
+ * shows the input and then nothing: a generation that failed before its request went out (no model, a context overflow
+ * it could not compact away), one that threw (faulted), one whose definition could not be resolved (orphaned) — before
+ * its first call, or after it appended a tool-calling reply — and one that failed on a retry after an error reply.
  *
- * `seq` is the task's id, from the same id space as entry ids (pi-durable's `record_ids`), so it sorts after the input
- * that started it; `at` is the last entry before it, as pi 0.85's failed run takes the tip it started from.
+ * The one ending the transcript already shows is a reply that is itself the failure: the generation's last assistant
+ * entry is an error whose message is the outcome's (harness/generation.js `classify` appends it and fails with its
+ * `errorMessage`). That one is left out, so no failure is drawn twice. Aborted generations are a cancel, which has its
+ * own marker entry.
+ *
+ * Bounded reads: the failed generations come from `tasks` filtered in SQL, and a generation's own entries are looked
+ * for only between its id and the next generation's, since a generation appends nothing once it is terminal and the
+ * next one is created no earlier (ids only grow: pi-durable's `record_ids`). Entries have no task column, so `byTaskId`
+ * is read from the record, but only in that range.
+ *
+ * `seq` is the generation's last entry in that range, its own or its tool tasks' (the tool-calling reply and the
+ * results), else its own id, which sorts after the input that started it; `at` is that entry's time, else the last
+ * entry's before it, as pi 0.85's failed run takes the tip it started from.
  */
 export function pdFailedRuns(sql: ReadSql, session: string): Array<{ seq: number; operationId: string; code: string; message: string; at: number }> {
   const id = pdConversationId(sql, session);
   if (id === null || !tableExists(sql, prefixedNamespace("pd").qualify("tasks", "table"))) return [];
   type Outcome = { status: string; error?: { message?: string; detail?: { reason?: unknown } }; reason?: string };
-  const ended = sql.exec(PD.rewrite("SELECT id, record FROM tasks WHERE conversation_id = ? AND status = 'terminal' ORDER BY id ASC"), id).toArray()
-    .map((r) => JSON.parse(String(r.record)) as { id: number; kind: string; state: { outcome?: Outcome } })
-    .filter((t) => t.kind === "pi.generation" && ["failed", "faulted", "orphaned"].includes(String(t.state.outcome?.status)));
+  const ended = sql.exec(PD.rewrite(
+    // `+conversation_id` keeps the planner off tasks_by_conversation, which holds every task of the conversation; by
+    // kind it reads the generations only. The outcome is in the record alone, so each generation's row is still read.
+    "SELECT id, record FROM tasks WHERE +conversation_id = ? AND kind = ? AND status = 'terminal' " +
+    "AND json_extract(record, '$.state.outcome.status') IN ('failed', 'faulted', 'orphaned') ORDER BY id ASC"), id, GENERATION_KIND).toArray()
+    .map((r) => JSON.parse(String(r.record)) as { id: number; state: { outcome: Outcome } });
   if (ended.length === 0) return [];
   const hasEntries = tableExists(sql, prefixedNamespace("pd").qualify("entries", "table"));
-  const answered = new Set(hasEntries
-    ? sql.exec(PD.rewrite("SELECT json_extract(record, '$.byTaskId') AS t FROM entries WHERE conversation_id = ? AND json_extract(record, '$.kind') = 'pi.assistant'"), id)
-      .toArray().map((r) => Number(r.t))
-    : []);
-  return ended.filter((t) => !answered.has(Number(t.id))).map((t) => {
-    const o = t.state.outcome!;
-    const before = hasEntries
-      ? sql.exec(PD.rewrite("SELECT record FROM entries WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT 1"), id, t.id).toArray()[0]
+  const timeOf = (record: unknown): number => {
+    const e = JSON.parse(String(record)) as EntryRecord;
+    const data = e.data as Record<string, unknown> | undefined;
+    return typeof e.model?.[0]?.timestamp === "number" ? e.model[0].timestamp : typeof data?.at === "number" ? data.at : 0;
+  };
+  const out: Array<{ seq: number; operationId: string; code: string; message: string; at: number }> = [];
+  for (const t of ended) {
+    const o = t.state.outcome;
+    const gen = Number(t.id);
+    const next = sql.exec(PD.rewrite("SELECT MIN(id) AS n FROM tasks WHERE +conversation_id = ? AND kind = ? AND id > ?"), id, GENERATION_KIND, gen)
+      .toArray()[0]?.n;
+    const bound = next === null || next === undefined ? Number.MAX_SAFE_INTEGER : Number(next);
+    // Its tool tasks: owned by it, so created after it and before the next generation.
+    const tools = sql.exec(PD.rewrite("SELECT id FROM tasks WHERE conversation_id = ? AND id > ? AND id < ? AND json_extract(record, '$.owner') = ?"),
+      id, gen, bound, gen).toArray().map((r) => Number(r.id));
+    const by = [gen, ...tools];
+    const own = hasEntries
+      ? sql.exec(PD.rewrite(
+        `SELECT id, record, json_extract(record, '$.kind') AS kind, json_extract(record, '$.byTaskId') AS task FROM entries
+           WHERE conversation_id = ? AND id > ? AND id < ? AND json_extract(record, '$.byTaskId') IN (${by.map(() => "?").join(", ")})
+           ORDER BY id ASC`), id, gen, bound, ...by).toArray()
+      : [];
+    const reply = own.filter((e) => e.kind === "pi.assistant" && Number(e.task) === gen).at(-1);
+    const said = reply ? (JSON.parse(String(reply.record)) as EntryRecord).model?.[0] as { stopReason?: string; errorMessage?: string } | undefined : undefined;
+    if (said?.stopReason === "error" && o.error?.message !== undefined && said.errorMessage === o.error.message) continue;
+    const shown = own.filter((e) => e.kind !== "pi.system").at(-1);
+    const before = shown === undefined && hasEntries
+      ? sql.exec(PD.rewrite("SELECT record FROM entries WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT 1"), id, gen).toArray()[0]
       : undefined;
-    const prior = before ? JSON.parse(String(before.record)) as EntryRecord : undefined;
-    const data = prior?.data as Record<string, unknown> | undefined;
-    const at = typeof prior?.model?.[0]?.timestamp === "number" ? prior.model[0].timestamp : typeof data?.at === "number" ? data.at : 0;
     const reason = o.error?.detail?.reason;
-    return {
-      seq: Number(t.id), operationId: String(t.id),
+    out.push({
+      seq: shown ? Number(shown.id) : gen, operationId: String(gen),
       code: o.status === "failed" ? String(typeof reason === "string" ? reason : "failed") : o.status,
       message: String(o.error?.message ?? o.reason ?? ""),
-      at,
-    };
-  });
+      at: shown ? timeOf(shown.record) : before ? timeOf(before.record) : 0,
+    });
+  }
+  return out;
 }
 
 /**
- * What moves when a session's transcript does, cheaply: its last entry id, its entry count, how many of its tasks have
- * ended, and the object's unanswered model jobs. The console polls this (cf/src/index.ts `uiVersion`) to decide whether
- * to re-render. The ended tasks are there for a run that fails before its first model call: it appends no entry and
- * leaves no job, so without them the version would not move and the failure (`pdFailedRuns`) would never be drawn.
+ * What moves when a session's transcript does, cheaply: its last entry id and entry count, how many of its tasks are
+ * live and the newest of them, and the object's unanswered model jobs. The console polls this (cf/src/index.ts
+ * `uiVersion`) to decide whether to re-render. The live tasks are there for a run that fails before its first model
+ * call: it appends no entry and leaves no job, so without them the version would not move and the failure
+ * (`pdFailedRuns`) would never be drawn. A task ending changes the count, or, when its successor starts in the same
+ * commit, the newest id; read through `tasks_by_status` (`+conversation_id` keeps the planner off tasks_by_conversation,
+ * which holds every task the conversation ever ran), so it reads the few live tasks however many have ended.
  */
 export function pdVersion(sql: ReadSql, session: string): string {
-  let last = 0, count = 0, ended = 0, open = 0;
+  let last = 0, count = 0, live = 0, newest = 0, open = 0;
   const id = pdConversationId(sql, session);
   if (id !== null && tableExists(sql, prefixedNamespace("pd").qualify("entries", "table"))) {
     const r = sql.exec(PD.rewrite("SELECT MAX(id) AS s, COUNT(*) AS n FROM entries WHERE conversation_id = ?"), id).toArray()[0];
     last = Number(r?.s ?? 0); count = Number(r?.n ?? 0);
   }
   if (id !== null && tableExists(sql, prefixedNamespace("pd").qualify("tasks", "table"))) {
-    ended = Number(sql.exec(PD.rewrite("SELECT COUNT(*) AS n FROM tasks WHERE conversation_id = ? AND status = 'terminal'"), id).toArray()[0]?.n ?? 0);
+    const r = sql.exec(PD.rewrite(`SELECT COUNT(*) AS n, MAX(id) AS m FROM tasks WHERE status IN ${LIVE} AND +conversation_id = ?`), id).toArray()[0];
+    live = Number(r?.n ?? 0); newest = Number(r?.m ?? 0);
   }
   if (tableExists(sql, prefixedNamespace("ap").qualify("model_jobs", "table"))) {
     open = Number(sql.exec(AP.rewrite("SELECT COUNT(*) AS n FROM model_jobs WHERE answer IS NULL")).toArray()[0]?.n ?? 0);
   }
-  return `${last}.${count}.${ended}.${open}`;
+  return `${last}.${count}.${live}.${newest}.${open}`;
 }

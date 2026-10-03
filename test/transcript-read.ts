@@ -124,9 +124,13 @@ await check("pd: a run that failed before its first model call and a transcript 
     await unansweredObject(host);
     const before = dump(host);
     const read = readTranscript(host.sql, "demo", "u-a", "t_u-a")!;
-    const kinds = read.events.map((e) => `${e.sequence}:${e.kind}`).join();
-    // 8 is the generation that never called a model; 13 is the error reply the other one appended, already an entry.
-    assert(kinds === "6:message,8:model.failed,9:message,13:model.failed,14:compaction,15:reset", `events: ${kinds}`);
+    const kinds = read.events.map((e) => e.kind).join();
+    // pd-unanswered.ts's runs in order; each failure follows what its run left, and run 2's is its own reply.
+    assert(kinds === [
+      "message", "model.failed", "message", "model.failed", "message", "model.failed",
+      "message", "model.response", "tool.result", "model.failed", "message", "model.failed", "model.failed",
+      "message", "model.response", "message", "model.response", "model.failed",
+      "compaction", "message", "model.response", "compaction", "reset"].join(), `events: ${kinds}`);
     const failed = read.events[1]!;
     assert(failed.payload.error === "no_model: Model gone/m is not available" && failed.createdAt === read.events[0]!.createdAt,
       `the failure: ${JSON.stringify(failed)}`);

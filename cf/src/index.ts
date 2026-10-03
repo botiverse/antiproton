@@ -69,7 +69,7 @@ import { adminDiagnose } from "./admin-diagnose.ts";
 import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
-import { readTranscript, transcriptEvents, approvalsByOp, isPd, sessionFor, type TranscriptEvents } from "./transcript-read.ts";
+import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
 import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
@@ -1579,8 +1579,10 @@ export class AgentDO extends DurableObject<Env> {
       try { return Number((rows(`SELECT COUNT(*) AS n FROM ${t}`)[0] ?? {}).n ?? 0); }
       catch { return 0; }
     };
-    // The engine's own records (engine-read.ts): a pd agent has pi's tables too, and they stay empty.
-    const engine = readEngineStorage(this.sql, sessionFor(this.sql, tenantId, agentId, taskId) ?? MAIN_SESSION);
+    // The engine's own records (engine-read.ts): a pd agent has pi's tables too, and they stay empty. The
+    // conversation is looked up as the transcript and version handlers look it up, so a task id this agent does not
+    // have is refused the same way rather than read as the main conversation.
+    const engine = readEngineStorage(this.sql, await this.#conversation(tenantId, agentId, taskId));
     const tables = ["agents", "agent_state", "approvals", "plugin_db", "counters",
       "model_bindings", "mounts", "operations", "quotas", ...engine.tables];
     return {

@@ -11,11 +11,11 @@ import { readFileSync } from "node:fs";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 import { readEngineStorage, readFailedRuns, readModelJobs } from "../cf/src/engine-read.ts";
 import { failedRuns } from "../src/runtime/pi-agent.ts";
-import { pdVersion } from "../src/runtime/pd-transcript.ts";
+import { pdFailedRuns, pdVersion, readPdCompactions, readPdLiveTasks } from "../src/runtime/pd-transcript.ts";
 import { PiSqliteStorage, MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { converse } from "./spec/pd-conversation.ts";
-import { unansweredObject } from "./spec/pd-unanswered.ts";
+import { unansweredObject, SUMMARIES, NOT_RETRYABLE, RETRYABLE } from "./spec/pd-unanswered.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -45,7 +45,10 @@ await check("pd: the storage panel's jobs, outstanding count, compactions, lane 
     // Two rows have no answer; the cancelled one is owed nothing, as the engine counts it.
     assert(n(host, "SELECT COUNT(*) AS n FROM ap_model_jobs WHERE answer IS NULL") === 2, "control: the fixture has no cancelled job to leave out");
     assert(s.outstanding === 1, `outstanding: ${s.outstanding}`);
-    assert(s.compactions.length === 1 && s.compactions[0]!.seq === 14 && s.compactions[0]!.bytes > 0, `compactions: ${show(s.compactions)}`);
+    // Newest first: the second compaction, then the first.
+    const written = host.sql.exec("SELECT id FROM pd_entries WHERE json_extract(record, '$.kind') = 'pi.compaction' ORDER BY id").toArray().map((r) => Number(r.id));
+    assert(written.length === SUMMARIES.length, `control: the fixture wrote ${written.length} compactions`);
+    assert(show(s.compactions.map((c) => c.seq)) === show([...written].reverse()) && s.compactions.every((c) => c.bytes > 0), `compactions: ${show(s.compactions)}`);
     assert(s.lane.length === 1 && (s.lane[0] as any).kind === "test.parked" && (s.lane[0] as any).status === "pending", `lane: ${show(s.lane)}`);
     for (const t of ["ap_model_jobs", "pd_entries", "pd_tasks"]) assert(s.tables.includes(t), `${t} is not counted: ${show(s.tables)}`);
     assert(!s.tables.some((t) => t.startsWith("pi_")), `pi's tables are counted for a pd agent: ${show(s.tables)}`);
@@ -66,19 +69,36 @@ await check("pd, through the runtime: jobs and tables of a real conversation; pi
   } finally { host.dispose(); }
 });
 
-await check("pd: a run that failed before its first model call is a failed run; one whose model replied with an error is not", async () => {
+await check("pd: every generation that ended failed, faulted or orphaned is a failed run, once; one whose reply is the failure is not", async () => {
   const host = sqliteHost();
   try {
-    await unansweredObject(host);
-    const failed = host.sql.exec("SELECT id FROM pd_tasks WHERE json_extract(record, '$.state.outcome.status') = 'failed'").toArray().map((r) => Number(r.id));
-    assert(failed.join() === "8,11", `control: both generations failed (${show(failed)})`);
+    const { generations: g } = await unansweredObject(host);
+    const ended = host.sql.exec("SELECT id, json_extract(record, '$.state.outcome.status') AS o FROM pd_tasks WHERE kind = ? ORDER BY id", JSON.stringify("pi.generation"))
+      .toArray().map((r) => `${r.id}:${r.o}`);
+    // The control: the fixture's seven runs, six of which did not complete, then the one between its compactions.
+    assert(ended.slice(0, 7).join() === [`${g[0]}:failed`, `${g[1]}:failed`, `${g[2]}:faulted`, `${g[3]}:faulted`, `${g[4]}:failed`, `${g[5]}:completed`, `${g[6]}:orphaned`].join()
+      && g.length >= 7, `control: generations ${show(ended)}`);
+    const entry = (q: string, ...b: Array<string | number>) => host.sql.exec(q, ...b).toArray().map((r) => r as Record<string, unknown>);
+    const own = (gen: number) => entry("SELECT id, json_extract(record, '$.kind') AS kind, json_extract(record, '$.model[0].stopReason') AS stop, json_extract(record, '$.model[0].errorMessage') AS err FROM pd_entries WHERE json_extract(record, '$.byTaskId') = ? ORDER BY id", gen);
+    assert(own(g[1]!).some((e) => e.kind === "pi.assistant" && e.err === NOT_RETRYABLE), "control: run 2 did not append its error reply");
+
     const runs = readFailedRuns(host.sql, MAIN_SESSION);
-    assert(runs.length === 1, `failed runs: ${show(runs)}`);
-    assert(runs[0]!.seq === 8 && runs[0]!.operationId === "8" && runs[0]!.code === "no_model" && runs[0]!.message === "Model gone/m is not available",
-      `failed run: ${show(runs[0])}`);
-    // Its time is the input it answered; it sorts after that input and before the next.
-    const hello = host.sql.exec("SELECT json_extract(record, '$.model[0].timestamp') AS t FROM pd_entries WHERE id = 6").toArray()[0]!.t;
-    assert(runs[0]!.at === Number(hello), `at ${runs[0]!.at}, the input's ${hello}`);
+    assert(show(runs.map((r) => `${r.operationId}:${r.code}`)) === show([`${g[0]}:no_model`, `${g[2]}:faulted`, `${g[3]}:faulted`, `${g[4]}:no_model`, `${g[6]}:orphaned`]),
+      `failed runs: ${show(runs)}`);
+    const by = Object.fromEntries(runs.map((r) => [r.operationId, r]));
+    // Before its first call: at its own id, after the input that started it, at that input's time.
+    const hello = entry("SELECT id, json_extract(record, '$.model[0].timestamp') AS t FROM pd_entries WHERE id < ? ORDER BY id DESC LIMIT 1", g[0]!)[0]!;
+    assert(by[g[0]!]!.seq === g[0] && by[g[0]!]!.at === Number(hello.t) && by[g[0]!]!.message === "Model gone/m is not available", `run 1: ${show(by[g[0]!])}`);
+    // Faulted in its tools phase: after its tool-calling reply and the tool's result, the last of them.
+    const toolRound = entry("SELECT id, json_extract(record, '$.kind') AS kind FROM pd_entries WHERE id > ? AND id < ? ORDER BY id", g[3]!, g[4]!)
+      .filter((e) => e.kind === "pi.assistant" || e.kind === "pi.tool-result");
+    assert(toolRound.map((e) => e.kind).join() === "pi.assistant,pi.tool-result", `control: run 4's round ${show(toolRound)}`);
+    assert(by[g[3]!]!.seq === Number(toolRound.at(-1)!.id), `run 4 sorts at ${by[g[3]!]!.seq}, its round ends at ${toolRound.at(-1)!.id}`);
+    // Failed on the retry after a retryable error reply: the reply is shown, and so is the failure, after it.
+    const retried = own(g[4]!).filter((e) => e.kind === "pi.assistant");
+    assert(retried.length === 1 && retried[0]!.err === RETRYABLE, `control: run 5's reply ${show(retried)}`);
+    assert(by[g[4]!]!.seq === Number(retried[0]!.id) && by[g[4]!]!.message === "Model flaky/m is not available", `run 5: ${show(by[g[4]!])}`);
+    assert(by[g[6]!]!.message === "missing_task", `run 7: ${show(by[g[6]!])}`);
     assert(readFailedRuns(host.sql, "task_nope").length === 0, "a session with no conversation has failed runs");
   } finally { host.dispose(); }
 });
@@ -86,12 +106,41 @@ await check("pd: a run that failed before its first model call is a failed run; 
 await check("pd: the console's version moves when a run fails without an entry", async () => {
   const host = sqliteHost();
   try {
-    await unansweredObject(host);
+    const { generations } = await unansweredObject(host);
     const failed = pdVersion(host.sql, MAIN_SESSION);
     // The same entries and jobs, with the failed generation still running: what the console last drew.
-    host.sql.exec("UPDATE pd_tasks SET status = 'running' WHERE id = 8");
+    host.sql.exec("UPDATE pd_tasks SET status = 'running' WHERE id = ?", generations[0]!);
     const running = pdVersion(host.sql, MAIN_SESSION);
     assert(failed !== running, `the version did not move: ${failed}`);
+  } finally { host.dispose(); }
+});
+
+await check("pd: the reads the console repeats use pi-durable's indexes rather than every entry or task the conversation has", async () => {
+  const host = sqliteHost();
+  try {
+    await unansweredObject(host);
+    // Each statement a reader issues, with the plan SQLite chose for it.
+    const plans = (read: (sql: any) => unknown) => {
+      const seen: string[] = [];
+      read({ exec(q: string, ...b: unknown[]) {
+        if (/^\s*SELECT/i.test(q) && !q.includes("sqlite_master")) {
+          seen.push(`${q.replace(/\s+/g, " ").slice(0, 60)} => ${host.sql.exec(`EXPLAIN QUERY PLAN ${q}`, ...(b as never[])).toArray().map((r: any) => r.detail).join(" / ")}`);
+        }
+        return host.sql.exec(q, ...(b as never[]));
+      } });
+      return seen;
+    };
+    const compactions = plans((sql) => readPdCompactions(sql, MAIN_SESSION, 20)).filter((p) => p.includes("pd_entries"));
+    assert(compactions.length === 1 && compactions[0]!.includes("pd_entry_heads_by_conversation"), `compactions: ${show(compactions)}`);
+    const lane = plans((sql) => readPdLiveTasks(sql, 40));
+    assert(lane.length === 1 && lane[0]!.includes("pd_tasks_by_status"), `lane: ${show(lane)}`);
+    const version = plans((sql) => pdVersion(sql, MAIN_SESSION)).filter((p) => p.includes("pd_tasks"));
+    assert(version.length === 1 && version[0]!.includes("pd_tasks_by_status"), `version: ${show(version)}`);
+    // The failed generations by kind; each one's own entries and tool tasks by a range of ids, never the whole table.
+    const failed = plans((sql) => pdFailedRuns(sql, MAIN_SESSION)).filter((p) => p.includes("pd_entries") || p.includes("pd_tasks"));
+    assert(failed[0]!.includes("pd_tasks_by_kind"), `the failed generations: ${failed[0]}`);
+    const ranged = failed.slice(1).filter((p) => !p.includes("id<?") && !p.includes("id>?") && !/id\W+[<>]/.test(p));
+    assert(failed.length > 1 && ranged.length === 0, `a per-generation read is not bounded: ${show(ranged)}`);
   } finally { host.dispose(); }
 });
 
