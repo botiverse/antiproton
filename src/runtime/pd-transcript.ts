@@ -186,8 +186,9 @@ export function readPdLiveTasks(sql: ReadSql, limit: number): Array<{ id: number
 
 /**
  * A session's compaction entries, newest first, with the size of each stored record. A compaction entry always has a
- * `head` (its first kept entry: harness/compaction.js `placeSummary`), so the read goes through the partial index of
- * entries that have one (`entry_heads_by_conversation`) — a reset and a compaction, not the whole transcript.
+ * `head`, its first kept entry (src/vendor/pi/pi-durable/dist/harness/compaction.js `placeSummary`), so the read goes
+ * through the partial index of entries that have one (`entry_heads_by_conversation`): resets and compactions, not the
+ * whole transcript.
  */
 export function readPdCompactions(sql: ReadSql, session: string, limit: number): Array<{ id: string; seq: number; timestamp: number; bytes: number }> {
   const id = pdConversationId(sql, session);
@@ -209,8 +210,8 @@ export function readPdCompactions(sql: ReadSql, session: string, limit: number):
  * its first call, or after it appended a tool-calling reply — and one that failed on a retry after an error reply.
  *
  * The one ending the transcript already shows is a reply that is itself the failure: the generation's last assistant
- * entry is an error whose message is the outcome's (harness/generation.js `classify` appends it and fails with its
- * `errorMessage`). That one is left out, so no failure is drawn twice. Aborted generations are a cancel, which has its
+ * entry is an error whose message is the outcome's (harness/generation.js `classify`, @earendil-works/pi-durable 1.0.0,
+ * appends it and fails with its `errorMessage`). That one is left out, so no failure is drawn twice. Aborted generations are a cancel, which has its
  * own marker entry.
  *
  * Bounded reads: the failed generations come from `tasks` filtered in SQL, and a generation's own entries are looked

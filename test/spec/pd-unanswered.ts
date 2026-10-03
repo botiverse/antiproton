@@ -64,7 +64,7 @@ export async function unansweredObject(host: Host): Promise<Unanswered> {
 
   // Resolving the conversation's agent reads each selected extension's tools. This one's throw on demand, which faults
   // the phase resolving it: pi-durable reports a throwing hook, section or wrap, but not a failed agent resolution
-  // (harness/scheduler.js `hooks.each` awaits it outside its catch). `reads` counts down the resolutions still let
+  // (src/vendor/pi/pi-durable/dist/harness/scheduler.js `hooks.each` awaits it outside its catch). `reads` counts down the resolutions still let
   // through; at 0 the next read throws.
   let reads = Number.POSITIVE_INFINITY;
   const extension = defineExtension({ name: "unanswered" });
