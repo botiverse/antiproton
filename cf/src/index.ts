@@ -2804,9 +2804,20 @@ const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/u
  *     be this request's own origin.
  *  4. Neither: refused. Every browser sends one of the two on a POST, so this
  *     is a client that is not a browser, and such a client has rule 1.
+ *
+ * Before all of these, a write carrying both a session cookie and a token is
+ * refused: a writer is a browser or a script, not both. Rule 1 asks whether the
+ * token names someone, but the identity the route then acts as is resolved
+ * cookie first (`resolveViewer`), so a request with someone's cookie and a
+ * valid token would pass as the script and write as the cookie's owner. No
+ * path is open to that today — no page can add the header without a preflight
+ * nobody approves — but rule 1 would quietly become one the day one is.
  */
 async function forgedWrite(request: Request, url: URL, env: Env): Promise<string | null> {
   const token = request.headers.get("x-harness-token");
+  if (token && readCookie(request, SESSION_COOKIE)) {
+    return "refused: a console write carries a session cookie or x-harness-token, not both";
+  }
   if (token && await resolveViewer(new Request(url, { headers: { "x-harness-token": token } }), viewerEnv(env))) return null;
   const site = request.headers.get("sec-fetch-site");
   if (site !== null) return site === "same-origin" ? null : "refused: a console write must come from this console's own pages, not another origin";

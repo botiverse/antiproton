@@ -357,7 +357,10 @@ returns a value. Use `ownerSecret` only for a value sent where the mount's own
 settings say, never where a tool call's arguments say, or the agent could send
 the owner's credential anywhere. `mcp` fills a `{{name}}` header from the
 owner's secret of that name first, then the agent's, so the agent cannot shadow
-the owner's.
+the owner's. What a server sends back can still carry one: mcp masks every value
+it filled in, verbatim, in results, errors and the tool list it stores, and a
+server that echoes one encoded is not caught. `test/console-mounts.ts` keeps
+`mcp.ts` the only plugin file that names `ownerSecret`.
 
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.

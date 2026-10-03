@@ -148,6 +148,14 @@ async function connect(ctx: PluginContext, kept: Map<string, string>): Promise<M
   return client;
 }
 
+/** A listed tool with every kept secret in its name, summary or parameters replaced by the secret's name. */
+function maskSchema(t: ToolSchema, kept: Map<string, string>): ToolSchema {
+  if (!kept.size) return t;
+  // The mask is `[secret <name>]`, and a name has no quote or backslash, so the JSON stays JSON.
+  return { ...t, name: hideSecrets(t.name, kept), summary: hideSecrets(t.summary, kept),
+    parameters: JSON.parse(hideSecrets(JSON.stringify(t.parameters ?? null), kept)) as Json };
+}
+
 /** A failure as the model reads it, with every kept secret replaced by its name. */
 function failure(e: unknown, kept: Map<string, string>, what: string, mayHaveLanded: boolean): Error {
   const err = e as { message?: unknown; status?: unknown; name?: unknown };
@@ -188,7 +196,11 @@ export const mcpPlugin: Plugin = {
       // `timeoutMs` bounds each request; pi-mcp follows `nextCursor` for up to
       // 1000 pages, so the whole listing gets the same budget as one request.
       const listed = await client.listTools({ signal: AbortSignal.timeout(Number(ctx.publicConfig?.timeoutMs ?? DEFAULT_TIMEOUT_MS)) });
-      return { tools: listed.map(toolSchemaOf) };
+      // What a server lists is stored and put in the model's prompt, so a secret it echoes into a
+      // tool's name, description or schema is masked here, as it is in a result or an error.
+      // Verbatim only (`hideSecrets`); a name that was masked is no longer one the model can call,
+      // and the kernel skips it with the reason.
+      return { tools: listed.map((t) => maskSchema(toolSchemaOf(t), kept)) };
     } catch (e) {
       throw failure(e, kept, `listing ${ctx.alias}'s tools failed`, false);
     } finally {

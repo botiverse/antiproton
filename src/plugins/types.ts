@@ -352,7 +352,10 @@ export interface PluginContext {
   agentSecret(name: string): Promise<string | null>;
   /**
    * A secret the agent's owner kept from the console (`/ui/secret`), by name;
-   * null when there is none. The model can neither read nor change these.
+   * null when there is none. The model can neither read nor change these
+   * through its tools. What the far end sends back is another matter: a plugin
+   * using one masks it in everything it returns (`hideSecrets`, verbatim only),
+   * so a server that echoes it encoded still shows it to the model.
    *
    * Only for a value sent where the mount's own settings say — the mount's
    * server, in a header its settings name — and never where a tool call's

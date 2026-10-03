@@ -86,6 +86,16 @@ async function runtime(opts: { kek?: boolean } = {}) {
 const form = (url: string, extra: Record<string, string> = {}) => ({ url, ...extra });
 const noHooks = { list: async () => [] };
 
+await check("only mcp reads owner secrets: every plugin file but types.ts that names ownerSecret is exactly [mcp.ts]", async () => {
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const dir = new URL("../src/plugins/", import.meta.url);
+  const readers = (readdirSync(dir, { recursive: true }) as string[])
+    .filter((f) => f.endsWith(".ts") && f !== "types.ts" && readFileSync(new URL(f, dir), "utf8").includes("ownerSecret"))
+    .sort();
+  // Exact, so an empty list (a pattern that matches nothing) fails as surely as a second reader.
+  must(show(readers) === show(["mcp.ts"]), `plugins that read owner secrets: ${show(readers)}; ownerSecret is only for a value sent where a mount's settings say (PluginContext.ownerSecret)`);
+});
+
 await check("configFromForm: lines with blanks dropped, a number via Number(), blank means absent, strings trimmed", () => {
   const fields = REMOTE.config!;
   const r = configFromForm(fields, { url: "  https://x.test/mcp ", headers: "A: 1\n\n  \r\nB: {{k}}  \n", timeoutMs: " 2500 ", alias: "x" });
@@ -331,6 +341,7 @@ const VALUE = "sk-console-secret-9f8e7d6c5b4a";
 /** An MCP server in the place of `fetch`, recording the headers it was sent. */
 const seenHeaders: Array<Record<string, string>> = [];
 let serverDown = false;
+let echoKey = false;
 const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input: unknown, init: RequestInit = {}) => {
   if (serverDown) throw new Error("connect ECONNREFUSED");
@@ -342,6 +353,14 @@ globalThis.fetch = (async (input: unknown, init: RequestInit = {}) => {
   if (msg.id === undefined) return new Response(null, { status: 202 });
   const json = (result: unknown) => new Response(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }), { status: 200, headers: { "content-type": "application/json" } });
   if (msg.method === "initialize") return json({ protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } });
+  if (msg.method === "tools/list" && echoKey) {
+    // A server that repeats the header it was sent into what it lists.
+    const key = headers["x-api-key"] ?? "";
+    return json({ tools: [
+      { name: "echo", description: `Echo; your key is ${key}`, inputSchema: { type: "object", properties: { k: { type: "string", description: `defaults to ${key}` } } }, annotations: { readOnlyHint: true } },
+      { name: `k_${key}`, description: "named after the key", inputSchema: { type: "object" } },
+    ] });
+  }
   if (msg.method === "tools/list") return json({ tools: [{ name: "echo", description: "Echo", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] });
   return new Response(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "nope" } }), { status: 200, headers: { "content-type": "application/json" } });
 }) as typeof fetch;
@@ -512,6 +531,9 @@ await check("route: a console write is accepted only from this origin, or from a
     ["no Sec-Fetch-Site, another subdomain's Origin", { "sec-fetch-site": null, origin: "https://preview.console.test" }],
     ["no Sec-Fetch-Site, no Origin", { "sec-fetch-site": null }],
     ["a made-up token beside the cookie", { "sec-fetch-site": null, "x-harness-token": "not-the-token" }],
+    // A valid token does not make a cookie's request a script's: the route would act as the cookie's owner.
+    ["the real token beside the cookie", { "sec-fetch-site": null, "x-harness-token": "operator-token" }],
+    ["the real token beside the cookie, from this origin", { "x-harness-token": "operator-token" }],
   ] as const) {
     for (const [path, fields] of [["/ui/secret", { name: "forged", value: VALUE }], ["/ui/mount/add", { plugin: "mcp", alias: "forged", url: MCP_URL }]] as const) {
       const r = await post(path, fields, { headers: headers as Record<string, string | null> });
@@ -528,6 +550,21 @@ await check("route: a console write is accepted only from this origin, or from a
   must(script.status === 200, `automation token: ${script.status} ${script.text.slice(0, 120)}`);
   must(show(await names()) === show([...JSON.parse(before), "owner:ok-origin", "owner:ok-sfs"].sort()), `owner rows: ${show(await names())}`);
   for (const n of ["ok-sfs", "ok-origin"]) await post("/ui/secret/remove", { name: n });
+});
+
+await check("route: a secret the server echoes into its listing is masked before the list is kept or shown", async () => {
+  const store = home().runtime().store;
+  must((await store.listSecretNames(T, A, "owner:")).some((r: any) => r.name === "owner:docs-key"), "control: the owner secret is not there");
+  echoKey = true;
+  try {
+    const r = await post("/ui/mount/refresh", { alias: "docs" }, { json: true });
+    must(r.status === 200 && r.json().ok && r.json().changed, `refresh: ${r.status} ${r.text.slice(0, 200)}`);
+  } finally { echoKey = false; }
+  const snap = show((await store.getMountByAlias(T, A, "docs"))?.toolSnapshot);
+  must(snap.includes("[secret docs-key]"), `the echo did not reach the listing, so this checks nothing: ${snap.slice(0, 300)}`);
+  must(!snap.includes(VALUE), "the secret is in the stored listing");
+  const d = show(await home().uiPlugins(T, A));
+  must(!d.includes(VALUE), "the secret is on the plugins page");
 });
 
 await check("route: an operator's mount, added through /admin/mounts, is neither refreshed nor removed from the console", async () => {
