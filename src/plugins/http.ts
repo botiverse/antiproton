@@ -49,10 +49,10 @@ export interface HttpConfig {
  */
 export function internalHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, "");
-  if (/(^|\.)(localhost|local|internal)$/.test(h)) return true;
   // A name with no dot is only ever found through a local search domain
-  // (`internal`, `metadata`); no public server is reached that way.
+  // (`localhost`, `internal`, `metadata`); no public server is reached that way.
   if (!h.startsWith("[") && !h.includes(".")) return true;
+  if (/\.(localhost|local|internal)$/.test(h)) return true;
   if (h.startsWith("[")) {
     const v6 = h.slice(1, -1);
     if (v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6)) return true;
