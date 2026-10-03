@@ -8,7 +8,7 @@
  * source, django's test client). The scratch repository below has such a file. The parsers are checked on logs shaped
  * like each test runner's, and the verdict on more tests than the old 12-per-side cap ran.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -75,14 +75,16 @@ function testbed() {
   git("init", "-q"); git("-c", "user.email=t@t", "-c", "user.name=t", "add", ".");
   git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
   const base = git("rev-parse", "HEAD");
-  // F2P passes only when the fix is in place and the official test is there; P2P always passes.
+  // F2P passes only when the fix is in place and the official test is there; P2P always passes. It exits 1
+  // when a test failed, as pytest does, so the grading script is run against the status a real run leaves.
   writeFileSync(join(bin, "pytest"), [
     "#!/bin/sh",
+    "status=0",
     "if grep -q FIXED src/_pytest/python.py && grep -q 'the official test' testing/test_python.py; then",
-    "  echo 'PASSED testing/test_python.py::test_fix'; else echo 'FAILED testing/test_python.py::test_fix - AssertionError'; fi",
+    "  echo 'PASSED testing/test_python.py::test_fix'; else echo 'FAILED testing/test_python.py::test_fix - AssertionError'; status=1; fi",
     "echo 'PASSED testing/test_python.py::test_old'",
     "[ -f testing/test_new.py ] && echo 'PASSED testing/test_new.py::test_new'",
-    "exit 0",
+    "exit $status",
   ].join("\n"));
   chmodSync(join(bin, "pytest"), 0o755);
   return { dir, repo, bin, base, git };
@@ -108,6 +110,39 @@ await check("the grading script keeps the agent's fix and resets only the files 
     must(readFileSync(join(tb.repo, "src/_pytest/python.py"), "utf8") === "FIXED\n", "the agent's fix was reverted");
     const report = gradeFromLog(inst, text);
     must(report.resolved, `not resolved: ${show(report)}\n${text}`);
+  } finally { rmSync(tb.dir, { recursive: true, force: true }); }
+});
+
+await check("an instance whose fix is absent: pytest exits 1, the script exits 0, and it grades unresolved, not ungraded", async () => {
+  const tb = testbed();
+  try {
+    const inst: GradedInstance = {
+      instance_id: "pytest-dev__pytest-1", repo: "pytest-dev/pytest", version: "8.0", base_commit: tb.base,
+      test_patch: TEST_PATCH,
+      FAIL_TO_PASS: show(["testing/test_python.py::test_fix"]),
+      PASS_TO_PASS: show(["testing/test_python.py::test_old", "testing/test_new.py::test_new"]),
+    };
+    const log = join(tb.dir, "grade.log");
+    const env = { ...process.env, PATH: `${tb.bin}:${process.env.PATH}`, HOME: tb.dir };
+    // The box's shell, here: the answer carries the state and exit code as the sandbox's result does
+    // (src/plugins/sandbox.ts `finished`), and goes through settleShell as the runners' does.
+    const shell = async (command: string) => {
+      const r = spawnSync("bash", ["-c", command], { env });
+      const exitCode = r.status ?? -1;
+      return settleShell({ status: "succeeded", result: { state: exitCode === 0 ? "succeeded" : "failed", exitCode, output: r.stdout.toString() } },
+        async () => { throw new Error("nothing was backgrounded"); }, { deadlineAt: Date.now() + 60_000 });
+    };
+    const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log));
+    must(graded.status === "succeeded" && graded.result.exitCode === 0, `the grading script failed as a command: ${show(graded)}`);
+    const text = gunzipSync(await readBoxFile(async (c) => {
+      const a = await shell(c);
+      if (a.status !== "succeeded") throw new Error(show(a));
+      return String(a.result.output);
+    }, `${log}.gz`)).toString("utf8");
+    must(/FAILED testing\/test_python.py::test_fix/.test(text), `the fixture's test did not fail, so this tests nothing:\n${text}`);
+    const report = gradeFromLog(inst, text);
+    must(!report.resolved && report.error === undefined && show(report.failToPass.failed) === show(["testing/test_python.py::test_fix"])
+      && report.passToPass.failed.length === 0, show(report));
   } finally { rmSync(tb.dir, { recursive: true, force: true }); }
 });
 

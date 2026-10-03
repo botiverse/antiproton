@@ -15,11 +15,12 @@
  * `specs["install"]`). Where that install is editable (`pip install -e`), the source tree is what gets
  * imported and the re-run changes nothing a Python change needs, so it is left out: the box has no network by
  * default (cf/src/index.ts `benchSweStart`), and a `pip install` there cannot fetch build dependencies. Where
- * it is not editable, the image imports a copy in site-packages and an agent's fix is invisible to the tests
- * until it is reinstalled, so the reinstall is run (`REINSTALL`). In SWE-bench Verified that is django 1.11
- * and 2.2 (`python setup.py install`; django__django-7530, django__django-10097) and every requests instance
+ * it is not editable, the reinstall is run (`REINSTALL`). In SWE-bench Verified that is django 1.11 and 2.2
+ * (`python setup.py install`; django__django-7530, django__django-10097) and every requests instance
  * (`pip install .`); every other Verified repo@version installs editable (constants/python.py, read against
- * the 500 Verified rows on 2026-10-03). A change to a compiled extension (astropy, scikit-learn, matplotlib)
+ * the 500 Verified rows on 2026-10-03). Django needs it: tests/runtests.py imports the copy in site-packages,
+ * so without it an agent's fix is not what the tests run. Requests does not, since pytest's default import
+ * mode puts the checkout first on sys.path; it is reinstalled only to match the harness's eval script. A change to a compiled extension (astropy, scikit-learn, matplotlib)
  * is not rebuilt by an editable install either, so such an instance can grade lower here than in the harness.
  */
 import { gunzipSync } from "node:zlib";
