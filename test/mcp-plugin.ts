@@ -208,7 +208,9 @@ await check("an inward host is refused when the mount is written and again when 
   for (const u of ["https://fcbarcelona.example/mcp", "https://fd.example/mcp", "https://10x.example/mcp", "https://[2606:4700::1]/mcp", "https://[::ffff:8.8.8.8]/mcp",
     "https://[64:ff9b::808:808]/mcp", "https://[2002:808:808::]/mcp", "https://a-1-2-3.example/mcp",
     // Four numbers that are not an address: one is over 255.
-    "https://10.0.0.300.example/mcp", "https://node-10-1-2-256.example/mcp"]) {
+    "https://10.0.0.300.example/mcp", "https://node-10-1-2-256.example/mcp",
+    // A public address written in an ordinary name is not refused for being an address.
+    "https://8.8.8.8.example.com/mcp", "https://node-8-8-8-8.example/mcp"]) {
     must(serverUrlProblem(u) === null, `${u} was refused: ${serverUrlProblem(u)}`);
   }
   must(mcpConfigProblem({ url: URL_ }) === undefined, "a public https url failed the mount-time check");
