@@ -53,7 +53,11 @@ const run9 = {
   /** `doneAt` Infinity is a command that never ends by itself (HANG); `killable` false is one a kill does not stop (UNKILLABLE). */
   execs: new Map<string, { doneAt: number; output: string; killable: boolean; killed?: boolean }>(),
   ops: [] as Array<{ method: string; path: string; body: string }>,
-  reset() { this.boxes.clear(); this.execs.clear(); this.ops.length = 0; },
+  /** Run, not awaited, when a command containing FINISH starts: the runner ending the task while the agent's call
+   *  is in flight. Not awaited because the runner's request is its own event, not part of the call: a cancel
+   *  waits for the running turn, and the turn is waiting on this call. */
+  onFinishCommand: null as null | (() => void),
+  reset() { this.boxes.clear(); this.execs.clear(); this.ops.length = 0; this.onFinishCommand = null; },
   deletes() { return this.ops.filter((o) => o.method === "DELETE" && /\/boxes\/[^/]+$/.test(o.path)); },
   creates() { return this.ops.filter((o) => o.method === "POST" && /\/workspace\/boxes$/.test(o.path)); },
 };
@@ -80,6 +84,7 @@ globalThis.fetch = (async (input: any, init?: any) => {
     const argv = JSON.parse(body).command as string[];
     const line = argv.join(" ");
     const slow = line.includes("SLOW");
+    if (line.includes("FINISH") && run9.onFinishCommand) run9.onFinishCommand();
     const id = `e${++execN}`;
     run9.execs.set(id, {
       doneAt: line.includes("HANG") ? Infinity : clock + (slow ? SLOW_MS : 0), output: slow ? SLOW_OUTPUT : "fast",
@@ -281,6 +286,13 @@ for (const engine of ["pd", "pi085"] as const) {
   o.raw.dispose();
 }
 
+/** The sandbox mount's alias, read from the shell the model was offered. */
+const SANDBOX_ALIAS_OF = (job: any) => {
+  const shell = (job?.context?.tools ?? []).map((t: any) => String(t.name)).find((n: string) => n.endsWith("__shell"));
+  must(shell, "no shell offered");
+  return shell.slice(0, -"__shell".length);
+};
+
 /**
  * How a SWE task ends, on both engines (bench/swebench/cf.ts, cf/src/index.ts `benchSweFinish`). Each case is a
  * fault seen on a production run: the runner graded at an agent's "waiting for the queued commands" while a
@@ -361,6 +373,42 @@ for (const engine of ["pd", "pi085"] as const) {
     must(run9.execs.size === execsBefore && run9.creates().length === createsBefore, `the agent reached the machine after finish: ${show(run9.ops.slice(-4))}`);
     const graded: ShellAnswer = await o.D.benchSweShell(taskId, "git diff --stat");
     must(graded.status === "succeeded", `the grader's shell was refused after finish: ${show(graded)}`);
+    o.raw.dispose();
+  });
+
+  await check(`${engine}: after finish, a message to the agent is refused and starts no model call`, async () => {
+    const { o, taskId, agentId, first } = await begin("say");
+    await o.D.deliverAnswer("bench", agentId, first.id, say("Done."), 5);
+    await o.passAlarms(1);
+    await o.D.benchSweFinish(taskId);
+    o.jobs.length = 0;
+    // Anything that reaches the transcript after the end — here a message — must not become a turn.
+    const said = await o.D.benchSay(taskId, "one more thing");
+    must(said?.refused, `the message was taken: ${show(said).slice(0, 200)}`);
+    await o.passAlarms(5);
+    must(o.jobs.length === 0, `a turn started after finish: ${o.jobs.length} model call(s)`);
+    o.raw.dispose();
+  });
+
+  await check(`${engine}: a program's calls after the task ends mid-program are refused and reach no machine`, async () => {
+    const { o, taskId, agentId, first } = await begin("midway");
+    const alias = SANDBOX_ALIAS_OF(first.job);
+    // The first call starts a box; the runner ends the task while that call is in flight (finish: a release
+    // would wait on the mount the call holds); the second is the stalled agent's next command.
+    let finished: Promise<unknown> | null = null;
+    run9.onFinishCommand = () => { finished = o.D.benchSweFinish(taskId); };
+    program = [{ tool: `${alias}.shell`, args: { command: "echo FINISH" } }, { tool: `${alias}.shell`, args: { command: "ls" } }];
+    await o.D.deliverAnswer("bench", agentId, first.id, calls({ id: "c_js", name: "run_js", arguments: { source: "ignored by the fake loader" } }), 5);
+    await o.passAlarms(5);
+    must(finished, "the task was never finished mid-program, so this case tests nothing");
+    await finished;
+    const lsRuns = run9.ops.filter((r) => r.method === "POST" && /background-execs$/.test(r.path) && r.body.includes("\"ls\""));
+    must(lsRuns.length === 0, `the call after the end ran: ${show(lsRuns.map((r) => r.path))}`);
+    must(run9.creates().length === 1, `boxes provisioned: ${run9.creates().length}`);
+    // The machine is the grader's now; releasing it leaves nothing behind.
+    await o.D.benchSweRelease(taskId);
+    await o.passAlarms(5);
+    must(run9.boxes.size === 0 && run9.creates().length === 1, `after release: boxes ${show([...run9.boxes.keys()])}, provisioned ${run9.creates().length}`);
     o.raw.dispose();
   });
 

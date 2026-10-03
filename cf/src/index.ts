@@ -1127,6 +1127,8 @@ export class AgentDO extends DurableObject<Env> {
 
   async benchSay(taskId: string, text: string) {
     return this.#busy("benchSay", async () => {
+      // A message is a turn, and an ended task's turns are over (benchSweFinish).
+      if (this.#benchEnded(`b_${taskId}`)) return { refused: "this task has ended" };
       const rt = this.#activeRuntime();
       const r = await rt.postMessage("bench", `b_${taskId}`, text);
       await this.#wake();

@@ -489,7 +489,7 @@ export interface RuntimeDeps {
   withholdTools?: readonly string[];
   /**
    * Whether this agent's task is over and owned by someone else from here on: a benchmark task the runner has
-   * finished (graded, or out of budget) while the agent may still be mid-turn or have background work out.
+   * finished (it answered, or the budget ran out) while the agent may still be mid-turn or have background work out.
    *
    * When it answers true, every call the agent or one of its programs makes is refused at dispatch, so a
    * stalled agent's next shell command cannot provision a fresh machine after its own was handed back; and a
@@ -2260,14 +2260,13 @@ export class AgentRuntime {
       deliver,
     });
     // A task that is over (`ended`) keeps its jobs polled — the row records how each one ended, and a job
-    // past its ceiling is still asked to stop — but no ending is delivered, and no session is stepped: a
-    // late result must not start a turn whose next call would provision a machine nobody is watching.
+    // past its ceiling is still asked to stop — but no ending is delivered: a late result must not start a
+    // turn whose next call would provision a machine nobody is watching.
     const over = this.#deps.ended?.(owner) === true;
     const bg = await pass(async (session, text) => {
       if (over) return;
       await this.postMessage(tenantId, agentId, text, "prompt", session);
     });
-    if (over) return { open: 0, wakeInMs: bg.wakeInMs, settled: [] as Array<{ operationId: string; status: string }>, releaseFailed: [] as Array<{ alias: string; error: string }> };
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
     const sessions = pd ? [MAIN_SESSION] : sessionsWithWork(sql);
