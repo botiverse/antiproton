@@ -294,8 +294,9 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     for (let i = 0; i < 3; i++) await o.agent.step();
     const failed = compactionTasks(storage).filter((t) => t.outcome?.error?.detail?.reason === "model_error");
     check(failed.length === 1, `control: the compaction did not fail model_error: ${show(compactionTasks(storage))}`);
-    check(jobs(storage).find((j) => j.id === job.id)?.state === "consumed", `job ${show(jobs(storage).find((j) => j.id === job.id))}`);
+    // Billing first: a cancel of this job would bill the answer a second time, and that is what this guards.
     check(show(usagePairs(storage)) === show([...before, ...SUMMARY_USAGE]), `billed ${show(usagePairs(storage))}`);
+    check(jobs(storage).find((j) => j.id === job.id)?.state === "consumed", `job ${show(jobs(storage).find((j) => j.id === job.id))}`);
     await o.agent.close();
   });
 
