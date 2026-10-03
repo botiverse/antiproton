@@ -47,9 +47,13 @@ export interface HttpConfig {
  * one 32-bit number) into dotted decimal, so only that form is read.
  *
  * A public name that resolves inward is not seen here; nothing before the
- * request can see that. The one case refused anyway is a name that spells an
- * inward address in its labels (10.0.0.1.nip.io, 10-0-0-1.sslip.io), since
- * services exist whose whole purpose is to resolve those back to the address.
+ * request can see that. One case is refused anyway: a name whose labels spell
+ * an inward v4 in dotted or dashed decimal (10.0.0.1.nip.io, 10-0-0-1.sslip.io),
+ * the common spellings of services that resolve such names back to the address.
+ * Only those two spellings: the same services accept hex and v6 forms too
+ * (a9fea9fe.nip.io, fe80--1.sslip.io), which pass here like any other name
+ * that resolves inward. The rule also refuses a public name that merely
+ * contains such a run (node-10-1-2-3.example.com); the refusal names the host.
  */
 export function internalHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.+$/, "");
