@@ -45,7 +45,7 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  * stands where the identifier used to be until those follow.
  */
 const LEGACY_TASK = "main";
-import { ToolGateway } from "../../src/runtime/gateway.ts";
+import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
@@ -65,6 +65,24 @@ export function personaOf(config: unknown): { name?: string; description?: strin
   const name = typeof c.name === "string" ? c.name : undefined;
   const description = typeof c.description === "string" ? c.description : undefined;
   return name || description ? { name, description } : null;
+}
+
+/**
+ * The gateway options a call through the agent's tool host may carry: `confirm`
+ * (only ever true) and `idempotencyKey` from the call, `callId` beside it.
+ * Nothing else is forwarded, because the host's callers include `run_js`,
+ * which hands a program's own options in, and the gateway reads `approved` as
+ * "a person already said yes" and `operationId` as "this is that operation".
+ * Both are set by the gateway's own approval path (`applyApproval`), which does
+ * not come through here.
+ */
+export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeOpts {
+  const o = (call.opts ?? {}) as { confirm?: unknown; idempotencyKey?: unknown };
+  return {
+    ...(o.confirm === true ? { confirm: true } : {}),
+    ...(typeof o.idempotencyKey === "string" ? { idempotencyKey: o.idempotencyKey } : {}),
+    ...(call.callId === undefined ? {} : { callId: call.callId }),
+  };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
 import type { HookDirectory } from "./control-plane.ts";
@@ -1265,8 +1283,7 @@ export class AgentRuntime {
     // finished exactly as a call's is (a job, a parked result, the held line).
     const dispatch = async (
       call: { tool: string; args: any; opts?: any; callId?: string },
-      send: () => Promise<ToolResult> = () => gw.invoke(ctx, call.tool, call.args,
-        { ...(call.opts ?? {}), ...(call.callId === undefined ? {} : { callId: call.callId }) }),
+      send: () => Promise<ToolResult> = () => gw.invoke(ctx, call.tool, call.args, hostCallOpts(call)),
     ): Promise<ToolResult> => {
         const res = await send();
         // Work that has started and outlives this call (task #16). The model is
