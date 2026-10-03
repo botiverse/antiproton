@@ -297,15 +297,17 @@ await check("drop sends nothing, and the plugin declares no cancel: an in-proces
   if (sent !== 0) throw new Error(`drop reached Raft ${sent} time(s)`);
 });
 
-await check("the interrupt's CLI argv never reaches the model: not in the question, its context, or what resume and drop return", async () => {
-  // The key is distinctive so its presence in the SDK's argv is a positive control for the absence below.
+await check("the held send's key and the CLI's draft flags never reach the model: not in the question, its context, or what resume and drop return", async () => {
+  // The key is distinctive so its presence in the SDK's interrupt is a positive control for the absence below.
   const KEY = "k-argv-sentinel-5e1d";
   const CLI = ["--send-draft", "--discard-draft", "--expected-draft-key", KEY];
   one(HELD());
   const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
     .messages.send({ target: "#general", content: "done", idempotencyKey: KEY });
-  const argv = isInterrupted(raw) ? JSON.stringify([raw.interrupt.resume.argv, raw.interrupt.cancel?.argv ?? null]) : "";
-  if (!argv.includes(KEY) || !argv.includes("--send-draft")) throw new Error(`control: the SDK's argv carries no sentinel: ${JSON.stringify(raw)}`);
+  // An in-process held send: the original key to send again with, and no command form or cancel at all.
+  if (!isInterrupted(raw) || raw.interrupt.resume.idempotencyKey !== KEY || raw.interrupt.resume.argv !== undefined || raw.interrupt.cancel !== undefined) {
+    throw new Error(`control: the SDK's interrupt: ${JSON.stringify(raw)}`);
+  }
   const m = mount();
   one(HELD());
   const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: KEY }, m.ctx) as any;
@@ -319,6 +321,30 @@ await check("the interrupt's CLI argv never reaches the model: not in the questi
     const text = JSON.stringify(value);
     const leaked = CLI.filter((piece) => text.includes(piece));
     if (leaked.length) throw new Error(`${where} carries ${leaked.join(", ")}: ${text}`);
+  }
+});
+
+await check("the held send's question is the plugin's own: the SDK's held text, which names a CLI command, is not in it", async () => {
+  // The SDK's `interrupt.context` (and the outcome's `text`) is the CLI's held text: it ends "Full text: raft message
+  // read --target …", a command this mount has no tool for. 7341 formal @mentions is a fact only that text states,
+  // so it is the sentinel: present there, and absent from what the model is shown.
+  const SENTINEL = "Note: 7341 of these messages formally @mention you.";
+  const held = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+    mentionAnnotation: { formalMentionCount: 7341 },
+    heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
+  one(held());
+  const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
+    .messages.send({ target: "#general", content: "done", idempotencyKey: "k-context" });
+  if (!isInterrupted(raw) || !raw.interrupt.context.includes(SENTINEL) || !raw.text.includes(SENTINEL) || !raw.interrupt.context.includes("raft message read")) {
+    throw new Error(`control: the SDK's held text: ${JSON.stringify(raw)}`);
+  }
+  const m = mount();
+  one(held());
+  const asked = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-context" }, m.ctx) as any;
+  if (!(asked instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(asked)}`);
+  const shown = JSON.stringify({ question: asked.question, context: asked.context, answer: asked.answer });
+  for (const piece of [SENTINEL, "raft message read", raw.interrupt.context, raw.text]) {
+    if (shown.includes(JSON.stringify(piece).slice(1, -1))) throw new Error(`the question carries ${JSON.stringify(piece.slice(0, 60))}: ${shown}`);
   }
 });
 

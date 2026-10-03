@@ -732,9 +732,9 @@ export const raftPlugin: Plugin = {
    * unless the conversation moved again since, which asks again with the newer messages. "drop" sends
    * nothing; the model changes a message by dropping it and sending a new one. Expiry and cancel send
    * nothing either, so no `cancel` is declared: an in-process held send leaves nothing on the Server, and
-   * cancelling is not calling send again. The interrupt's `resume.argv` and `cancel.argv` are the CLI's and
-   * the command endpoint's; for an in-process send they are ignored here and never reach the model's text
-   * (0.4.0 still fills them with draft flags for an in-process send).
+   * cancelling is not calling send again. An in-process send's interrupt carries neither `resume.argv` nor
+   * `cancel`; those belong to the CLI and the command endpoint, and if one ever appears it is ignored here
+   * and never reaches the model's text.
    */
   interrupts: {
     async resume(tool, state, answer, ctx) {
