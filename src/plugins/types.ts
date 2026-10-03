@@ -350,6 +350,25 @@ export interface PluginContext {
    * the call says and nowhere else: not into a result, an error, or `ctx.db`.
    */
   agentSecret(name: string): Promise<string | null>;
+  /**
+   * A secret the agent's owner kept from the console (`/ui/secret`), by name;
+   * null when there is none. The model can neither read nor change these
+   * through its tools. What the far end sends back is another matter: a plugin
+   * using one masks it in everything it returns (`hideSecrets`, verbatim only),
+   * so a server that echoes it encoded still shows it to the model.
+   *
+   * Only for a value sent where the mount's own settings say — the mount's
+   * server, in a header its settings name — and never where a tool call's
+   * arguments say: a plugin that let the agent choose the destination would
+   * hand the agent an owner's credential to send anywhere, which is the one
+   * thing keeping these apart from `agentSecret` exists to prevent. As with
+   * `agentSecret`, the value goes nowhere else: not into a result, an error,
+   * or `ctx.db`.
+   *
+   * Absent where a context has no owner secrets to offer (a credential check,
+   * a diagnosis); a plugin reads its absence as "none".
+   */
+  ownerSecret?(name: string): Promise<string | null>;
 }
 
 /**
@@ -1645,6 +1664,33 @@ export interface Plugin {
 
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
+  /**
+   * A person may add a mount of this plugin from the console, with the settings
+   * in `config` as the form (`POST /ui/mount/add`), and remove one again.
+   *
+   * Opt-in, and `true` or absent, because the console is the one path where a
+   * signed-in owner rather than an operator chooses the settings, and that is
+   * a decision about this plugin that only its author can make: the settings
+   * must be ones a stranger may type, and a mount of it must be safe to delete
+   * (nothing outside this agent depends on its alias). Absent: the operator's
+   * route (`/admin/mounts`) is the only way to add one, as before.
+   */
+  consoleMount?: true;
+  /**
+   * The plugin's own verdict on a mount's settings, for a rule `config` cannot
+   * declare. A string is the reason the mount is refused, shown to whoever
+   * asked; `undefined` accepts it.
+   *
+   * Asked by `validateMount`, so wherever a mount's settings are judged: when
+   * one is added (the console, `/admin/mounts`, provisioning's seeds), when a
+   * seed is reconciled onto one, when a credential is attached to one — each
+   * before anything is stored, so a refusal leaves nothing behind — and on the
+   * console's mount page, for a mount stored before the rule existed. Only after
+   * the declared checks have passed, so `config` holds declared settings of the
+   * declared types with every required one present. Synchronous and local: it
+   * must not reach a server (the tool snapshot is the step that does).
+   */
+  configProblem?(config: Record<string, Json>): string | undefined;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */
   database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */

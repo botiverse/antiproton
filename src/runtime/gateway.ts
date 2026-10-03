@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { StorageAdapter } from "../core/store.ts";
 import type { Json, MountPolicy, MountRecord, OperationStatus, PolicyDecision } from "../core/types.ts";
-import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, secretRefKind } from "./secrets.ts";
+import { AGENT_REF, agentRef, isAgentRef, KEPT_NAME, KEPT_PREFIX, OWNER_PREFIX, secretRefKind } from "./secrets.ts";
 import type { ToolError, ToolResult } from "../core/tools.ts";
 import { parseToolRef } from "../core/tools.ts";
 import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, InboundHooks, InboundResult, HeldListing, HeldRead } from "../plugins/types.ts";
@@ -1064,6 +1064,11 @@ export class ToolGateway {
         if (!KEPT_NAME.test(name)) return null;
         return secrets.resolve(agentRef(KEPT_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
       },
+      // The owner's rows only (`owner:`), apart from the agent's: see `PluginContext.ownerSecret`.
+      async ownerSecret(name: string) {
+        if (!KEPT_NAME.test(name)) return null;
+        return secrets.resolve(agentRef(OWNER_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
+      },
     };
   }
 
@@ -1198,7 +1203,7 @@ export class ToolGateway {
    */
   async refreshMountTools(tenantId: string, agentId: string, alias: string): Promise<
     | { ok: true; changed: boolean; hash: string; tools: string[]; skipped: Array<{ name: string; reason: string }> }
-    | { ok: false; error: string }
+    | { ok: false; error: string; stale?: true }
   > {
     const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
@@ -1221,7 +1226,16 @@ export class ToolGateway {
     } catch (e) {
       return { ok: false, error: `could not list ${alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
     }
-    const changed = mount.toolSnapshot?.hash !== snapshot.hash;
+    // The listing awaited a server, and the mount may have been removed, or removed and added
+    // again under the same alias, meanwhile. The list is the old mount's server's answer, so it is
+    // written only onto the mount it was asked for: the same alias and the same `installationId`,
+    // which a console add makes fresh every time. Read and written with no await between them
+    // that yields to another request: the store's calls are synchronous SQL behind a promise.
+    const now = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!now || now.installationId !== mount.installationId) {
+      return { ok: false, stale: true, error: `${alias} was removed or replaced while its tools were being listed; nothing was kept` };
+    }
+    const changed = now.toolSnapshot?.hash !== snapshot.hash;
     // A write that fails is a failed snapshot, answered like one: the mount and
     // whatever list it had stay as they were, and the operator reads why.
     if (changed) {
@@ -1231,7 +1245,7 @@ export class ToolGateway {
         return { ok: false, error: `could not keep ${alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
       }
     }
-    const kept = changed ? snapshot : mount.toolSnapshot!;
+    const kept = changed ? snapshot : now.toolSnapshot!;
     return { ok: true, changed, hash: kept.hash, tools: kept.tools.map((t) => t.name), skipped: kept.skipped };
   }
 

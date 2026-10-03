@@ -328,6 +328,40 @@ reads as `Bearer …`/`Basic …`/`Token …` under any name; keep the value as 
 secret and write `Bearer {{name}}`. Read the value through the same function at
 call time, so a value stored before a rule existed is refused there too.
 
+**A rule `config` cannot say goes in `configProblem(config)`.** Return the
+reason as a string, or `undefined` to accept. `validateMount` asks it once every
+setting is declared, typed and present, so it runs wherever settings are judged:
+a mount added from the console or `/admin/mounts`, a seed in provisioning, a
+reconcile, a credential being attached, and the console's problems column. It is
+synchronous and must not reach a server.
+
+**`consoleMount: true` lets an agent's owner add a mount from the console.**
+Opt-in (`mcp` is the one that does): the console builds a form from `config`,
+one field per setting, and `POST /ui/mount/add` coerces each (`configFromForm`
+in `src/runtime/mount-config.ts`) before the usual checks. Declare it only when
+every setting is one a stranger may type, and a mount is safe to delete: the
+console can also refresh and remove the mounts it added (at most eight per
+agent), refusing a removal while the mount holds a credential, a live inbound
+hook, a held call or running work (the last two only for a plugin that holds
+or backgrounds something; `mcp` does neither, so a call already in flight
+finishes and the next one is refused with `not_mounted`).
+
+**Two kinds of kept secret, and who reads which.** The agent keeps its own with
+`state.secret_put` under `kept:`; a plugin reaches them by name through
+`ctx.agentSecret`, and the model can read them back (`secret_get`), list,
+overwrite and delete them. The owner keeps theirs from the console
+(`POST /ui/secret`) under `owner:`; a plugin reaches them through
+`ctx.ownerSecret`, and nothing the model can call reads, lists, overwrites or
+deletes them — the console shows only their names and times, and no route
+returns a value. Use `ownerSecret` only for a value sent where the mount's own
+settings say, never where a tool call's arguments say, or the agent could send
+the owner's credential anywhere. `mcp` fills a `{{name}}` header from the
+owner's secret of that name first, then the agent's, so the agent cannot shadow
+the owner's. What a server sends back can still carry one: mcp masks every value
+it filled in, verbatim, in results, errors and the tool list it stores, and a
+server that echoes one encoded is not caught. `test/console-mounts.ts` keeps
+`mcp.ts` the only plugin file that names `ownerSecret`.
+
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.
 

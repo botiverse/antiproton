@@ -36,6 +36,15 @@ export const AGENT_REF = "agent:";
  * agent can reach.
  */
 export const KEPT_PREFIX = "kept:";
+/**
+ * The rows an agent's owner keeps from the console (`/ui/secret`), for a
+ * mount's `{{name}}` header slots. Apart from `kept:` on purpose: the agent's
+ * `secret_*` tools read, list, overwrite and delete only under `kept:`, so it
+ * can do none of those to these, and `ctx.agentSecret` (what a plugin hands
+ * out at the agent's direction) never reaches them. Only `ctx.ownerSecret`
+ * does, for a value sent where a mount's own settings say.
+ */
+export const OWNER_PREFIX = "owner:";
 /** A name the agent may keep a secret under. */
 export const KEPT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 export function agentRef(name: string): string { return AGENT_REF + name; }

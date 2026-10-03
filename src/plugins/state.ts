@@ -8,7 +8,46 @@ import { importKek, KEPT_NAME, KEPT_PREFIX, open, seal } from "../runtime/secret
 
 type SealingKey = Awaited<ReturnType<typeof importKek>>;
 
-const SECRET_VALUE_MAX = 8_000;
+export const SECRET_VALUE_MAX = 8_000;
+
+/*
+ * Kept secrets, one set of rules for both ways in: the agent's own `secret_*`
+ * tools below, under `kept:`, and the owner's console (`/ui/secret`), under
+ * `owner:` (src/runtime/secrets.ts says who reads which). One copy, so a name or
+ * a value one of them accepts is one the other accepts too. `prefix` picks the
+ * namespace; the tools below only ever pass the default.
+ */
+
+/** Why `name` cannot name a kept secret, or null. */
+export function keptNameProblem(name: unknown): string | null {
+  return typeof name === "string" && KEPT_NAME.test(name) ? null : "name must be 1–64 letters, digits, . _ or -";
+}
+
+/** Why `value` cannot be kept, or null. */
+export function keptValueProblem(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return "value must be a non-empty string";
+  if (value.length > SECRET_VALUE_MAX) return `value is longer than ${SECRET_VALUE_MAX} characters`;
+  return null;
+}
+
+/** Seal and keep one value under a name the caller has checked. */
+export async function keptPut(store: StorageAdapter, key: SealingKey, tenantId: string, agentId: string, name: string, value: string, prefix = KEPT_PREFIX): Promise<void> {
+  await store.putSecret(tenantId, agentId, prefix + name, await seal(key, value));
+}
+
+/** Whether there was one to delete. */
+export async function keptDelete(store: StorageAdapter, tenantId: string, agentId: string, name: string, prefix = KEPT_PREFIX): Promise<boolean> {
+  return store.removeSecret(tenantId, agentId, prefix + name);
+}
+
+/** The names with their times, never a value: what `secret_list` answers. */
+export async function keptList(store: StorageAdapter, tenantId: string, agentId: string, prefix = KEPT_PREFIX) {
+  const rows = await store.listSecretNames(tenantId, agentId, prefix);
+  return rows.map((r) => ({
+    name: r.name.slice(prefix.length), storedAt: new Date(r.updatedAt).toISOString(),
+    lastReadAt: r.lastUsedAt === null ? null : new Date(r.lastUsedAt).toISOString(),
+  }));
+}
 
 /**
  * Somewhere for the agent to put things down.
@@ -271,23 +310,19 @@ export function statePlugin(
 
       if (tool.startsWith("secret_")) {
         const s = (args ?? {}) as { name?: unknown; value?: unknown };
-        if (tool === "secret_list") {
-          const rows = await store.listSecretNames(tenantId, agentId, KEPT_PREFIX);
-          return { secrets: rows.map((r) => ({
-            name: r.name.slice(KEPT_PREFIX.length), storedAt: new Date(r.updatedAt).toISOString(),
-            lastReadAt: r.lastUsedAt === null ? null : new Date(r.lastUsedAt).toISOString(),
-          })) };
-        }
-        if (typeof s.name !== "string" || !KEPT_NAME.test(s.name)) throw new Error("name must be 1–64 letters, digits, . _ or -");
-        const row = KEPT_PREFIX + s.name;
-        if (tool === "secret_delete") return { name: s.name, deleted: await store.removeSecret(tenantId, agentId, row) };
+        if (tool === "secret_list") return { secrets: await keptList(store, tenantId, agentId) };
+        const badName = keptNameProblem(s.name);
+        if (badName) throw new Error(badName);
+        const name = s.name as string;
+        const row = KEPT_PREFIX + name;
+        if (tool === "secret_delete") return { name, deleted: await keptDelete(store, tenantId, agentId, name) };
         const key = await kek();
         if (!key) throw new Error("this deployment has no key for sealing secrets, so it cannot keep one");
         if (tool === "secret_put") {
-          if (typeof s.value !== "string" || s.value.length === 0) throw new Error("value must be a non-empty string");
-          if (s.value.length > SECRET_VALUE_MAX) throw new Error(`value is longer than ${SECRET_VALUE_MAX} characters`);
-          await store.putSecret(tenantId, agentId, row, await seal(key, s.value));
-          return { name: s.name, kept: true };
+          const badValue = keptValueProblem(s.value);
+          if (badValue) throw new Error(badValue);
+          await keptPut(store, key, tenantId, agentId, name, s.value as string);
+          return { name, kept: true };
         }
         if (tool === "secret_get") {
           const sealed = await store.getSecret(tenantId, agentId, row);

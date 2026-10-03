@@ -420,4 +420,20 @@ export interface StorageAdapter {
     tenantId: string, agentId: string, from: string, to: string,
     secret: { newRef: string } | null,
   ): Promise<{ ok: true } | { ok: false; error: string }>;
+
+  /**
+   * Delete a mount and everything keyed by its alias: the row (and with it the
+   * tool snapshot it carries) and every plugin database filed under it, in one
+   * transaction, so a mount added later under the same alias inherits nothing.
+   *
+   * `secretName` is the credential row to drop with it, passed in for the
+   * reason `renameMount` takes `secret`: which row a mount's own credential
+   * lives under is the runtime's convention, not the store's.
+   *
+   * History is not deleted, for the reason `renameMount` gives: `operations`
+   * and `approvals` record the alias a call happened under. Whether removing is
+   * safe (nothing held, nothing running) is the caller's question; this only
+   * makes it all-or-nothing. False when there was no such mount.
+   */
+  removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null): Promise<boolean>;
 }
