@@ -11,12 +11,16 @@
  *   - how a log becomes per-test statuses: log_parsers/python.py `MAP_REPO_TO_PARSER_PY`;
  *   - what counts as resolved: grading.py `test_passed` / `test_failed` / `get_resolution_status` (FULL only).
  *
- * One step of the harness is left out, on purpose: it re-runs the repository's install command before the
- * tests. The box has no network by default (cf/src/index.ts `benchSweStart`), so a `pip install` there
- * cannot fetch build dependencies, and every repository in SWE-bench Verified except requests is installed
- * editable in its image, so a change to a Python file is already what gets imported. A change to a compiled
- * extension (astropy, scikit-learn, matplotlib) is not rebuilt, so such an instance can grade lower here than
- * in the harness.
+ * The harness re-runs the repository's install command before the tests (make_eval_script_list_py,
+ * `specs["install"]`). Where that install is editable (`pip install -e`), the source tree is what gets
+ * imported and the re-run changes nothing a Python change needs, so it is left out: the box has no network by
+ * default (cf/src/index.ts `benchSweStart`), and a `pip install` there cannot fetch build dependencies. Where
+ * it is not editable, the image imports a copy in site-packages and an agent's fix is invisible to the tests
+ * until it is reinstalled, so the reinstall is run (`REINSTALL`). In SWE-bench Verified that is django 1.11
+ * and 2.2 (`python setup.py install`; django__django-7530, django__django-10097) and every requests instance
+ * (`pip install .`); every other Verified repo@version installs editable (constants/python.py, read against
+ * the 500 Verified rows on 2026-10-03). A change to a compiled extension (astropy, scikit-learn, matplotlib)
+ * is not rebuilt by an editable install either, so such an instance can grade lower here than in the harness.
  */
 import { gunzipSync } from "node:zlib";
 
@@ -53,6 +57,31 @@ const TEST_CMD: Record<string, { cmd: string; byVersion?: Record<string, string>
   "sphinx-doc/sphinx": { cmd: "tox --current-env -epy39 -v --" },
   "sympy/sympy": { cmd: "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose" },
 };
+
+/**
+ * The install command to re-run before the tests, for the specs whose install is not editable; none for the
+ * rest (see the header). As in constants/python.py, except that `pip install .` is given `--no-index
+ * --no-build-isolation`, so it builds with what the image has instead of reaching for an index the box
+ * cannot reach.
+ */
+const REINSTALL: Record<string, { cmd: string; versions: string[] | "all" }> = {
+  "django/django": {
+    cmd: "python setup.py install",
+    versions: ["1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "2.0", "2.1", "2.2"],
+  },
+  "matplotlib/matplotlib": {
+    cmd: "python setup.py build; python setup.py install",
+    versions: ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "2.0", "2.1", "2.2"],
+  },
+  "psf/requests": { cmd: "python -m pip install --no-index --no-build-isolation .", versions: "all" },
+};
+
+export function reinstallCommand(repo: string, version: string): string | null {
+  const r = REINSTALL[repo];
+  return r && (r.versions === "all" || r.versions.includes(version)) ? r.cmd : null;
+}
+
+export const REINSTALL_FAILED = ">>>>> Reinstall Failed";
 
 /** Commands run before the tests, where SWE-bench has any (django's locale). */
 function evalCommands(repo: string, version: string): string[] {
@@ -114,12 +143,15 @@ export const START = ">>>>> Start Test Output";
 export const END = ">>>>> End Test Output";
 
 /**
- * One shell command that grades: reset the files the test patch modifies to the base commit, apply the test
- * patch, run the repository's test command over the test patch's files, and leave the whole log, gzipped, at
- * `${GRADE_LOG}.gz`. It prints only the log's size, so its own answer is never the thing that gets cut.
+ * One shell command that grades: reinstall where the image's install is not editable, reset the files the
+ * test patch modifies to the base commit, apply the test patch, run the repository's test command over the
+ * test patch's files, and leave the whole log, gzipped, at `${GRADE_LOG}.gz`. It prints only the log's size,
+ * so its own answer is never the thing that gets cut. A reinstall that fails leaves its marker and the
+ * instance is not graded: the tests would run against the image's copy, not the agent's fix.
  */
 export function gradeCommand(inst: GradedInstance, workdir = "/testbed"): string {
   const reset = modifiedFiles(inst.test_patch);
+  const reinstall = reinstallCommand(inst.repo, inst.version);
   const b64 = Buffer.from(inst.test_patch, "utf8").toString("base64");
   const test = [testCommand(inst.repo, inst.version), ...testDirectives(inst).map(q)].join(" ");
   return [
@@ -127,6 +159,7 @@ export function gradeCommand(inst: GradedInstance, workdir = "/testbed"): string
     ...evalCommands(inst.repo, inst.version),
     `git config --global --add safe.directory ${q(workdir)} >/dev/null 2>&1`,
     `{`,
+    ...(reinstall ? [`( ${reinstall} ) || echo ${q(REINSTALL_FAILED)}`] : []),
     ...(reset.length ? [`git checkout ${q(inst.base_commit)} -- ${reset.map(q).join(" ")} || echo ${q(">>>>> Reset Failed")}`] : []),
     `printf %s ${q(b64)} | base64 -d > /tmp/swe-test.patch`,
     `if git apply -v /tmp/swe-test.patch; then`,
@@ -279,7 +312,7 @@ export function parseTestLog(repo: string, log: string): StatusMap {
 
 export interface GradeReport {
   resolved: boolean;
-  /** Why nothing was graded, when nothing was: the test patch did not apply, a reset failed, or no log. */
+  /** Why nothing was graded, when nothing was: the test patch did not apply, a reset or reinstall failed, or no log. */
   error?: string;
   failToPass: { total: number; passed: number; failed: string[] };
   passToPass: { total: number; passed: number; failed: string[] };
@@ -293,7 +326,7 @@ export function gradeFromLog(inst: GradedInstance, log: string): GradeReport {
   const f2p: string[] = JSON.parse(inst.FAIL_TO_PASS);
   const p2p: string[] = JSON.parse(inst.PASS_TO_PASS);
   const none = (ids: string[]) => ({ total: ids.length, passed: 0, failed: ids });
-  const bad = [APPLY_FAILED, ">>>>> Reset Failed"].find((c) => log.includes(c))
+  const bad = [APPLY_FAILED, ">>>>> Reset Failed", REINSTALL_FAILED].find((c) => log.includes(c))
     ?? (!(log.includes(START) && log.includes(END)) ? "the test output markers are missing" : undefined);
   if (bad) return { resolved: false, error: bad, failToPass: none(f2p), passToPass: none(p2p) };
   const m = parseTestLog(inst.repo, log);
@@ -323,23 +356,56 @@ export interface ShellAnswer {
  * `running` with no output. Grading reads output, so it waits here, polling the job, until it ends or the
  * deadline passes. Waited for by the runner and not by the object: an object held open on a sleep loop is
  * billed for the whole of it, which is why the window exists (83f0658).
+ *
+ * The call succeeding is not the command succeeding: the result carries the execution's `state` and
+ * `exitCode` (src/plugins/sandbox.ts `finished`), and an answer whose command failed is `failed` here, with
+ * the result kept, so a caller that checks `status` cannot read a failed command's output as its answer. A
+ * poll that throws is retried, with backoff, up to `pollRetries` times in a row: one network error is not the
+ * job's end, and ending the grade on it discards a test run that may be minutes from done.
  */
 export async function settleShell(
   first: ShellAnswer,
   poll: (bg: NonNullable<ShellAnswer["background"]>) => Promise<{ done: boolean; result?: any }>,
-  o: { deadlineAt: number; intervalMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void> },
+  o: {
+    deadlineAt: number; intervalMs?: number; pollRetries?: number;
+    now?: () => number; sleep?: (ms: number) => Promise<void>;
+  },
 ): Promise<ShellAnswer> {
-  if (first.status !== "running" || !first.background) return first;
+  if (first.status !== "running" || !first.background) return commandOutcome(first);
   const now = o.now ?? Date.now;
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const interval = o.intervalMs ?? 5_000, retries = o.pollRetries ?? 3;
+  let failures = 0;
   for (;;) {
     if (now() > o.deadlineAt) {
       return { status: "failed", error: { code: "grading_timeout", message: "the grading command was still running at the deadline" } };
     }
-    await sleep(o.intervalMs ?? 5_000);
-    const p = await poll(first.background);
-    if (p.done) return { status: "succeeded", result: p.result };
+    await sleep(failures ? interval * 2 ** failures : interval);
+    let p: { done: boolean; result?: any };
+    try {
+      p = await poll(first.background);
+    } catch (e) {
+      if (++failures > retries) {
+        return { status: "failed", error: { code: "poll_failed", message: `polling the grading command failed ${failures} times in a row: ${String((e as Error)?.message ?? e)}` } };
+      }
+      continue;
+    }
+    failures = 0;
+    if (p.done) return commandOutcome({ status: "succeeded", result: p.result });
   }
+}
+
+/** A succeeded call whose command did not: `failed`, naming the state and exit code, the result kept. */
+function commandOutcome(a: ShellAnswer): ShellAnswer {
+  if (a.status !== "succeeded") return a;
+  const state = a.result?.state, exitCode = a.result?.exitCode;
+  const stateBad = typeof state === "string" && state !== "succeeded";
+  const exitBad = typeof exitCode === "number" && exitCode !== 0;
+  if (!stateBad && !exitBad) return a;
+  return {
+    ...a, status: "failed",
+    error: { code: "command_failed", message: `the command ended ${state ?? "with no state"}, exit code ${exitCode ?? "none"}${a.result?.error ? `: ${a.result.error}` : ""}` },
+  };
 }
 
 /**
