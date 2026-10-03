@@ -402,7 +402,9 @@ for (const engine of ["pd", "pi085"] as const) {
     await o.passAlarms(5);
     must(finished, "the task was never finished mid-program, so this case tests nothing");
     await finished;
-    const lsRuns = run9.ops.filter((r) => r.method === "POST" && /background-execs$/.test(r.path) && r.body.includes("\"ls\""));
+    const execs = run9.ops.filter((r) => r.method === "POST" && /background-execs$/.test(r.path));
+    must(execs.length >= 1 && execs[0]!.body.includes("FINISH"), `the program's first call did not run, so this case tests nothing: ${execs.length}`);
+    const lsRuns = execs.slice(1);
     must(lsRuns.length === 0, `the call after the end ran: ${show(lsRuns.map((r) => r.path))}`);
     must(run9.creates().length === 1, `boxes provisioned: ${run9.creates().length}`);
     // The machine is the grader's now; releasing it leaves nothing behind.
