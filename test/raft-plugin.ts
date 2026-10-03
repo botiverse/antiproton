@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { createRaft, isInterrupted } from "@botiverse/raft-sdk";
 import { raftPlugin, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
 import { Interrupt, type PluginErrorFields } from "../src/plugins/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -281,6 +282,55 @@ await check("resume \"drop\" sends nothing", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
   const out = await raftPlugin.interrupts!.resume("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, "drop", m.ctx) as any;
   if (out.state !== "dropped" || !/new idempotencyKey/.test(out.note)) throw new Error(`drop: ${JSON.stringify(out)}`);
+});
+
+await check("a held send's interrupt carries a cancel, which in-process is not a request: drop and the gateway's cancel send nothing", async () => {
+  // What the SDK hands back for a held send: a resume under the original key, and a cancel that is a CLI argv
+  // (`--discard-draft`) with no in-process call behind it. Asserted here so an SDK that grows one shows up.
+  one(HELD());
+  const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
+    .messages.send({ target: "#general", content: "done", idempotencyKey: "k-cancel" });
+  if (!isInterrupted(raw) || raw.interrupt.resume.idempotencyKey !== "k-cancel" || !raw.interrupt.cancel?.argv.includes("--discard-draft")) {
+    throw new Error(`the SDK's interrupt: ${JSON.stringify(raw)}`);
+  }
+  const m = mount();
+  one(HELD());
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-cancel" }, m.ctx) as any;
+  if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const dropped = await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx) as any;
+  if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
+  // The plugin declares no cancel: an expired or cancelled question needs nothing from Raft.
+  if (raftPlugin.interrupts!.cancel !== undefined) throw new Error("the plugin grew a cancel; this case no longer says what it does");
+  if (sent !== 0) throw new Error(`drop reached Raft ${sent} time(s)`);
+});
+
+await check("a send held under SDK 0.3.2, still waiting across the upgrade, resumes and drops as before", async () => {
+  // The state 0.3.2's plugin recorded: the send plus `out.data.continuation` ({ idempotencyKey, seen? }).
+  const old = { target: "#general", content: "done", idempotencyKey: "k-032", seen: { upToSeq: 20 } };
+  const m = mount();
+  const calls = many(json(200, { ok: true, state: "sent", messageId: "m-032", messageSeq: 21 }));
+  const sent = await raftPlugin.interrupts!.resume("send_message", old, "send", m.ctx) as any;
+  const body = JSON.parse(String(calls[0]!.init.body));
+  if (sent.state !== "sent" || body.idempotencyKey !== "k-032" || body.seenUpToSeq !== 20 || body.content !== "done" || body.target !== "#general") {
+    throw new Error(`resumed: ${JSON.stringify({ sent, body })}`);
+  }
+  const { seen: _seen, ...withoutSeen } = old;
+  const plain = many(json(200, { ok: true, state: "sent", messageId: "m-033", messageSeq: 22 }));
+  await raftPlugin.interrupts!.resume("send_message", withoutSeen, "send", m.ctx);
+  if (JSON.parse(String(plain[0]!.init.body)).idempotencyKey !== "k-032") throw new Error(`no-seen resume: ${plain[0]!.init.body}`);
+  globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
+  const dropped = await raftPlugin.interrupts!.resume("send_message", old, "drop", m.ctx) as any;
+  if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
+});
+
+await check("a draft already pending (DRAFT_PENDING) is an ordinary refusal: not retryable, nothing landed", async () => {
+  one(json(409, { errorCode: "DRAFT_PENDING", message: "a draft is pending" }));
+  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-draft" }, ctx()));
+  if (why.retryable !== false || why.transient !== false || why.mayHaveLanded === true) {
+    throw new Error(`marks: retryable=${why.retryable} transient=${why.transient} mayHaveLanded=${why.mayHaveLanded} ${why.message}`);
+  }
 });
 
 await check("resume refuses an answer that is neither send nor drop, and sends nothing", async () => {

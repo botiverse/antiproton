@@ -8,7 +8,7 @@
  */
 import { clip, logEvent, routeOf } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
-import { createRaft, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
+import { createRaft, isInterrupted, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
 import { interrupt, originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Interrupt, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -444,8 +444,11 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * instead of being held again. The SDK records nothing when the context was withheld, and then a send is
  * held again with the same count; that is the SDK's rule, not something this can attest for the model.
  *
- * The state is the send itself plus the SDK's continuation (the key and the `seen` boundary): plain data,
- * which is what the SDK hands out for a send continued in a later step. Nothing in it is a credential.
+ * The state is the send itself: target, content, the interrupt's `resume.idempotencyKey` (the original key),
+ * and the `seen` boundary when the question showed every new message. Plain data, nothing a credential. It is
+ * the shape 0.3.2's continuation produced (`{ target, content, idempotencyKey, seen? }`), so a send held before
+ * an upgrade resumes the same way: going ahead is the same send again under the same key, which is what the
+ * SDK's interrupt says resuming is in-process.
  */
 async function sendMessage(
   ctx: PluginContext,
@@ -454,32 +457,34 @@ async function sendMessage(
   const raft = raftFor(ctx);
   const out = await raft.messages.send(send);
   if (!out.ok) throw sdkFailure(out, true);
-  if (out.state === "held") {
-    const n = out.data.newMessageCount;
+  if (isInterrupted(out)) {
+    const held = out.interrupt;
+    const n = held.newMessageCount;
     // Attesting says the model saw what it was held for, so it happens only when the question can show all
     // of it. The SDK refuses (returns false, records nothing) when the context was withheld, does not account
     // for every new message (`contextComplete` — the counts are the Server's, as the SDK reports them), or
     // came without a boundary; then nothing is attested and the model reads the conversation first.
-    const attested = raft.frontier.recordHeld(out.data);
+    const attested = raft.frontier.recordHeld(held);
     if (attested) await raft.state.save();
-    const unshown = out.data.withheld ? n : Math.max(0, n - out.data.heldMessages.length - out.data.omittedMessageCount);
+    const unshown = held.withheld ? n : Math.max(0, n - held.heldMessages.length - held.omittedMessageCount);
     return interrupt({
-      question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${out.data.target} since you last read it; ` +
+      question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${held.target} since you last read it; ` +
         (attested
           ? "send your message anyway?"
           : `${unshown && unshown < n ? `${unshown} of them are not shown here, so ` : unshown ? "they are not shown here, so " : ""}` +
-            `read ${out.data.target} with receive_events first, then answer "send" to send your message or "drop".`),
+            `read ${held.target} with receive_events first, then answer "send" to send your message or "drop".`),
       context: {
-        target: out.data.target, newMessages: n,
-        messages: out.data.heldMessages.map(modelLine),
-        ...(out.data.omittedMessageCount ? { omitted: out.data.omittedMessageCount } : {}),
-        ...(out.data.withheld ? { withheld: true } : {}),
+        target: held.target, newMessages: n,
+        messages: held.heldMessages.map(modelLine),
+        ...(held.omittedMessageCount ? { omitted: held.omittedMessageCount } : {}),
+        ...(held.withheld ? { withheld: true } : {}),
         ...(unshown ? { unshown } : {}),
       },
       answer: { choices: ["send", "drop"] },
       state: {
-        target: send.target, content: send.content, idempotencyKey: out.data.continuation.idempotencyKey,
-        ...(out.data.continuation.seen ? { seen: { upToSeq: out.data.continuation.seen.upToSeq } } : {}),
+        target: send.target, content: send.content, idempotencyKey: held.resume.idempotencyKey ?? send.idempotencyKey,
+        // What 0.3.2's continuation carried as `seen`: the boundary, when the question accounts for every new message.
+        ...(held.contextComplete && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
       },
     });
   }
@@ -723,10 +728,12 @@ export const raftPlugin: Plugin = {
 
   /**
    * A held send's question, answered. "send" sends the same message under the same key, attesting what
-   * the question showed (the continuation's `seen`, and the frontier `recordHeld` saved): so it goes
-   * through unless the conversation moved again since, which asks again with the newer messages. "drop"
-   * sends nothing; the model changes a message by dropping it and sending a new one. Expiry and cancel
-   * need nothing back: holding a send takes nothing on the Server.
+   * the question showed (the state's `seen`, and the frontier `recordHeld` saved): so it goes through
+   * unless the conversation moved again since, which asks again with the newer messages. "drop" sends
+   * nothing; the model changes a message by dropping it and sending a new one. Expiry and cancel send
+   * nothing either, so no `cancel` is declared: the SDK's interrupt carries a `cancel`, but it is the CLI's
+   * `--discard-draft` argv, and in-process the SDK keeps no draft and has no call that clears one —
+   * "cancelling is not calling it" (its README, 0.4.0).
    */
   interrupts: {
     async resume(tool, state, answer, ctx) {
