@@ -94,6 +94,17 @@ await check("only mcp reads owner secrets: every plugin file but types.ts that n
     .sort();
   // Exact, so an empty list (a pattern that matches nothing) fails as surely as a second reader.
   must(show(readers) === show(["mcp.ts"]), `plugins that read owner secrets: ${show(readers)}; ownerSecret is only for a value sent where a mount's settings say (PluginContext.ownerSecret)`);
+  // The grant itself (`Plugin.readsOwnerSecrets`), which is what the gateway reads.
+  const granted = (readdirSync(dir, { recursive: true }) as string[])
+    .filter((f) => f.endsWith(".ts") && f !== "types.ts" && /readsOwnerSecrets\s*:\s*true/.test(readFileSync(new URL(f, dir), "utf8")))
+    .sort();
+  must(show(granted) === show(["mcp.ts"]), `plugins that declare readsOwnerSecrets: ${show(granted)}`);
+  // The one way round the grant: holding the sealed store itself. Only `state`, whose tools read `kept:` alone.
+  const holders = (readdirSync(dir, { recursive: true }) as string[])
+    .filter((f) => f.endsWith(".ts") && /from\s+["']\.\.\/runtime\/secrets\.ts["']/.test(readFileSync(new URL(f, dir), "utf8")))
+    .sort();
+  must(show(holders) === show(["state.ts"]), `plugins that import the sealed store: ${show(holders)}; only state may, and only under kept: (Plugin.readsOwnerSecrets)`);
+  must(!/OWNER_PREFIX/.test(readFileSync(new URL("state.ts", dir), "utf8")), "state.ts names OWNER_PREFIX; its tools read only kept: (Plugin.readsOwnerSecrets)");
 });
 
 await check("configFromForm: lines with blanks dropped, a number via Number(), blank means absent, strings trimmed", () => {

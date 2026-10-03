@@ -351,7 +351,8 @@ finishes and the next one is refused with `not_mounted`).
 `ctx.agentSecret`, and the model can read them back (`secret_get`), list,
 overwrite and delete them. The owner keeps theirs from the console
 (`POST /ui/secret`) under `owner:`; a plugin reaches them through
-`ctx.ownerSecret`, and nothing the model can call reads, lists, overwrites or
+`ctx.ownerSecret`, which the gateway hands only to a plugin that declares
+`readsOwnerSecrets: true`, and nothing the model can call reads, lists, overwrites or
 deletes them — the console shows only their names and times, and no route
 returns a value. Use `ownerSecret` only for a value sent where the mount's own
 settings say, never where a tool call's arguments say, or the agent could send
@@ -359,8 +360,15 @@ the owner's credential anywhere. `mcp` fills a `{{name}}` header from the
 owner's secret of that name first, then the agent's, so the agent cannot shadow
 the owner's. What a server sends back can still carry one: mcp masks every value
 it filled in, verbatim, in results, errors and the tool list it stores, and a
-server that echoes one encoded is not caught. `test/console-mounts.ts` keeps
-`mcp.ts` the only plugin file that names `ownerSecret`.
+server that echoes one encoded is not caught; a number in the tool list is read
+as the text it prints as, so a digits-only secret is masked there too. The rule
+is held by `test/mcp-plugin.ts` ("a plugin is handed ownerSecret only when it
+declares readsOwnerSecrets": the gateway withholds it), and
+`test/console-mounts.ts` keeps `mcp.ts` the only plugin file that names
+`ownerSecret` and `mcp` the only plugin that declares `readsOwnerSecrets`. One
+plugin reaches the sealed store without the flag: `state`, which holds the store
+and its key because it is the store's own surface, and whose tools read only
+`kept:`; the same test keeps `state.ts` the only plugin file that imports it.
 
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.
