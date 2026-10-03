@@ -38,7 +38,6 @@ for (const level of ["log", "info", "warn", "error", "debug"] as const) {
   const real = console[level].bind(console);
   console[level] = (...args: unknown[]) => { logged.push(args.map((a) => (typeof a === "string" ? a : show(a))).join(" ")); if (level !== "log") real(...args); };
 }
-const print = (s: string) => process.stdout.write(s + "\n");
 
 const KEK = Buffer.alloc(32, 7).toString("base64");
 
@@ -527,10 +526,12 @@ await check("no secret value appears in any response or log line", async () => {
 globalThis.fetch = realFetch;
 for (const h of hosts) h.dispose();
 
-print(`\n  Console mounts and kept secrets\n  ${"─".repeat(56)}`);
+// One write, and the exit only once it has drained: a failure that quotes a whole panel is tens of KB,
+// and `process.exit` on a pipe drops what is still queued — the summary line first.
+const lines = [`\n  Console mounts and kept secrets\n  ${"─".repeat(56)}`];
 for (const r of results) {
-  print(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);
+  lines.push(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${String(r.error).slice(0, 1_500)}\x1b[0m`);
 }
 const pass = results.filter((r) => r.ok).length;
-print(`  ${"─".repeat(56)}\n  ${pass} passed, ${results.length - pass} failed\n`);
-process.exit(pass === results.length ? 0 : 1);
+lines.push(`  ${"─".repeat(56)}\n  ${pass} passed, ${results.length - pass} failed\n`);
+process.stdout.write(lines.join("\n") + "\n", () => process.exit(pass === results.length ? 0 : 1));
