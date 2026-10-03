@@ -43,6 +43,11 @@ const KEK = Buffer.alloc(32, 7).toString("base64");
 
 // ---- the runtime ------------------------------------------------------------
 
+/** Holds a "slow" server's listing until the case lets it go. */
+let releaseSlow: () => void = () => {};
+const slowListing = () => new Promise<void>((r) => { releaseSlow = r; });
+let slowGate: Promise<void> | null = null;
+
 /** A plugin offered to the console, whose server is the case's to decide. */
 const REMOTE: Plugin = {
   id: "remote", version: "1.0.0", consoleMount: true, tools: [],
@@ -55,6 +60,10 @@ const REMOTE: Plugin = {
   mountTools: (m) => m.toolSnapshot?.tools ?? [],
   async snapshotTools(ctx) {
     if (String(ctx.publicConfig?.url).includes("down")) throw new Error("the server is down");
+    if (String(ctx.publicConfig?.url).includes("slow") && slowGate) {
+      await slowGate;
+      return { tools: [{ name: "old_tool", summary: "From the removed mount's server.", parameters: { type: "object" }, sideEffects: "read", idempotency: "none" }] };
+    }
     return { tools: [{ name: "ping", summary: "Ping.", parameters: { type: "object" }, sideEffects: "read", idempotency: "none" }] };
   },
   async invoke() { return {}; },
@@ -207,6 +216,52 @@ await check("both stores' removeMount delete the row, its databases and the name
     must(!(await store.getSecret("t", "a", "srv")) && await store.getSecret("t", "a", "other"), `${name}: credential rows after`);
     must(!(await store.removeMount("t", "a", "srv", null)), `${name}: a second remove answered true`);
   }
+  // Another agent's mount under the same alias, in each store: a remove is scoped to its agent.
+  for (const [name, store] of [["durable-object", doStore], ["sqlite", lite]] as const) {
+    for (const agentId of ["a", "b"]) {
+      await store.addMount({ tenantId: "t", agentId, alias: "same", plugin: "remote", installationId: "console:same", connectionId: null,
+        toolVersion: "1.0.0", publicConfig: { url: "https://x.test" }, secretRef: null, policy: null });
+      store.pluginDb.put({ tenantId: "t", agentId, alias: "same", plugin: "remote" }, "s", "k", "v", null);
+      await store.putSecret("t", agentId, "same", { ciphertext: "c", iv: "i" });
+    }
+    must(await store.removeMount("t", "a", "same", "same"), `${name}: remove`);
+    must(await store.getMountByAlias("t", "b", "same"), `${name}: the other agent's mount went`);
+    must(store.pluginDb.summary("t", "b").some((r: any) => r.alias === "same"), `${name}: the other agent's plugin database went`);
+    must(await store.getSecret("t", "b", "same"), `${name}: the other agent's credential row went`);
+  }
+});
+
+await check("remove keeps a credential row another mount still references", async () => {
+  const { rt } = await runtime();
+  await rt.addConsoleMount("t", "a", "remote", "srv", form("https://srv.test"));
+  await rt.addMount("t", "a", { alias: "user", plugin: "remote", config: { url: "https://user.test" } });
+  await rt.store.putSecret("t", "a", "srv", { ciphertext: "c", iv: "i" });
+  await rt.store.setMountSecretRef("t", "a", "user", "agent:srv");
+  must((await rt.removeMount("t", "a", "srv", noHooks)).ok, "remove");
+  must(await rt.store.getSecret("t", "a", "srv"), "the row another mount references was deleted");
+  // Control: with no reference, the same row is a leftover and goes.
+  await rt.store.setMountSecretRef("t", "a", "user", null);
+  await rt.addConsoleMount("t", "a", "remote", "srv", form("https://srv.test"));
+  must((await rt.removeMount("t", "a", "srv", noHooks)).ok && !(await rt.store.getSecret("t", "a", "srv")), "an unreferenced leftover row stayed");
+});
+
+await check("a listing still in flight when its mount is removed and added again is not written onto the new mount", async () => {
+  const { rt } = await runtime();
+  slowGate = slowListing();
+  try {
+    const first = rt.addConsoleMount("t", "a", "remote", "srv", form("https://slow.test"));
+    await new Promise((r) => setTimeout(r, 20));
+    must((await rt.removeMount("t", "a", "srv", noHooks)).ok, "remove while the listing is out");
+    slowGate = null;
+    const second = await rt.addConsoleMount("t", "a", "remote", "srv", form("https://down.test"));
+    must(second.ok && second.added && !second.tools.ok, `the new mount: ${show(second)}`);
+    releaseSlow();
+    const late = await first;
+    must(late.ok && late.tools && !late.tools.ok && /removed or replaced/.test(late.tools.error), `the old listing: ${show(late)}`);
+    const m = await rt.store.getMountByAlias("t", "a", "srv");
+    must(m && !m.toolSnapshot && m.publicConfig.url === "https://down.test", `the old list reached the new mount: ${show(m?.toolSnapshot)}`);
+    must(/server is down/.test(rt.snapshotError("srv") ?? ""), `the new mount's own error was overwritten: ${rt.snapshotError("srv")}`);
+  } finally { slowGate = null; releaseSlow(); }
 });
 
 await check("remove is refused while a credential, a live hook or a held call is on the mount, and for an operator-only plugin", async () => {
@@ -236,26 +291,34 @@ await check("remove is refused while a credential, a live hook or a held call is
   must(!op.ok && op.conflict && /cannot be removed from the console/.test(op.error), `operator-only: ${show(op)}`);
 });
 
-await check("kept secrets: the agent's own rows and rules, readable by secret_list, sealed, never returned", async () => {
+await check("owner secrets: sealed under owner:, listed for the console, and out of the agent's secret_* tools entirely", async () => {
   const { rt, host } = await runtime();
   const value = "sk-live-0123456789abcdef";
-  must(show(await rt.putKeptSecret("t", "a", "key", value)) === show({ ok: true }), "put");
+  must(show(await rt.putOwnerSecret("t", "a", "key", value)) === show({ ok: true }), "put");
+  const listed = await rt.ownerSecrets("t", "a");
+  must(listed.length === 1 && listed[0].name === "key" && typeof listed[0].storedAt === "string" && listed[0].lastReadAt === null, `console list: ${show(listed)}`);
+  const raw = () => show(host.sql.exec("SELECT name, ciphertext FROM secrets").toArray());
+  must(raw().includes("owner:key") && !raw().includes("kept:key") && !raw().includes(value), `rows: ${raw()}`);
+  // The model's tools: cannot read, list, overwrite or delete it.
   const state = rt.plugins().find((p: Plugin) => p.id === "state");
-  const listed: any = await state.invoke("secret_list", {}, { caller: { tenantId: "t", agentId: "a", taskId: "main" }, publicConfig: {} });
-  must(listed.secrets.length === 1 && listed.secrets[0].name === "key", `secret_list: ${show(listed)}`);
-  must(show(await rt.keptSecrets("t", "a")) === show(listed.secrets), "the console's list is not secret_list's");
-  const got: any = await state.invoke("secret_get", { name: "key" }, { caller: { tenantId: "t", agentId: "a", taskId: "main" }, publicConfig: {} });
-  must(got.value === value, "the agent cannot read back what the owner kept");
-  const raw = show(host.sql.exec("SELECT * FROM secrets").toArray());
-  must(raw.includes("kept:key") && !raw.includes(value), "the row is not a sealed kept: row");
+  const call = (tool: string, args: Record<string, unknown>) =>
+    state.invoke(tool, args, { caller: { tenantId: "t", agentId: "a", taskId: "main" }, publicConfig: {} }).then((r: any) => r, (e: Error) => ({ error: e.message }));
+  const got = await call("secret_get", { name: "key" });
+  must(!("value" in got) && /no secret named key/.test(got.error), `secret_get reached it: ${show(got)}`);
+  must(show(await call("secret_list", {})) === show({ secrets: [] }), "secret_list shows it");
+  await call("secret_put", { name: "key", value: "agent-own-value" });
+  await call("secret_delete", { name: "key" });
+  const owner = host.sql.exec("SELECT ciphertext FROM secrets WHERE name = 'owner:key'").toArray();
+  must(owner.length === 1, "the agent's put or delete reached the owner's row");
+  must(show((await rt.ownerSecrets("t", "a")).map((x: any) => x.name)) === show(["key"]), "the owner's list changed");
   for (const [name, v, why] of [["bad name", value, /name must be/], ["key", "", /non-empty/], ["key", "x".repeat(8_001), /longer than 8000/]] as const) {
-    const r = await rt.putKeptSecret("t", "a", name, v);
+    const r = await rt.putOwnerSecret("t", "a", name, v);
     must(!r.ok && why.test(r.error) && !r.error.includes(value), `${name}/${v.length}: ${show(r)}`);
   }
-  must(show(await rt.removeKeptSecret("t", "a", "key")) === show({ ok: true, removed: true }), "remove");
-  must((await rt.keptSecrets("t", "a")).length === 0, "still listed");
+  must(show(await rt.removeOwnerSecret("t", "a", "key")) === show({ ok: true, removed: true }), "remove");
+  must((await rt.ownerSecrets("t", "a")).length === 0, "still listed");
   const { rt: bare } = await runtime({ kek: false });
-  const nokek = await bare.putKeptSecret("t", "a", "key", value);
+  const nokek = await bare.putOwnerSecret("t", "a", "key", value);
   must(!nokek.ok && /SECRET_KEK/.test(nokek.error), `without a KEK: ${show(nokek)}`);
 });
 
@@ -319,9 +382,11 @@ const cookieOf = async (tenantId: string, agentId: string) =>
 const mine = await cookieOf(T, A);
 const theirs = await cookieOf(OTHER_T, OTHER_A);
 const responses: string[] = [];
-async function post(path: string, fields: Record<string, string>, opts: { cookie?: string | null; json?: boolean } = {}) {
+/** A form post as the console's own page sends one: `Sec-Fetch-Site: same-origin`, unless `headers` says otherwise. */
+async function post(path: string, fields: Record<string, string>, opts: { cookie?: string | null; json?: boolean; headers?: Record<string, string | null> } = {}) {
   const body = new URLSearchParams(fields);
-  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded", "sec-fetch-site": "same-origin" };
+  for (const [k, v] of Object.entries(opts.headers ?? {})) { if (v === null) delete headers[k]; else headers[k] = v; }
   if (opts.cookie !== null) headers.cookie = opts.cookie ?? mine;
   if (opts.json) headers.accept = "application/json";
   const r = await worker.fetch(new Request(`https://console.test${path}`, { method: "POST", headers, body }), env as never);
@@ -406,14 +471,25 @@ await check("route: a snapshot failure is 200 with the mount, and the error is k
   must(row("docs").fromConsole === true, "not marked as added from the console");
 });
 
-await check("route: a kept secret fills the header slot on refresh, which clears the kept error", async () => {
+await check("route: an owner secret fills the header slot on refresh — ahead of the agent's own of that name — and clears the kept error", async () => {
   const before = seenHeaders.length;
+  // The agent kept its own value under the same name first: the owner's must win the slot.
+  const state = home().runtime().plugins().find((p: Plugin) => p.id === "state");
+  const agentCtx = { caller: { tenantId: T, agentId: A, taskId: "main" }, publicConfig: {} };
+  await state.invoke("secret_put", { name: "docs-key", value: "the-agents-own-value" }, agentCtx);
   const put = await post("/ui/secret", { name: "docs-key", value: VALUE }, { json: true });
   must(put.status === 200 && put.json().ok && panel(put.json().html) && show(put.json().secrets.map((s: any) => s.name)) === show(["docs-key"]), `${put.status} ${put.text}`);
   const r = await post("/ui/mount/refresh", { alias: "docs" }, { json: true });
   const j = r.json();
   must(r.status === 200 && j.ok && j.changed === true && show(j.tools) === show(["echo"]) && Array.isArray(j.skipped) && typeof j.toolsTakenAt === "number", `refresh: ${r.status} ${r.text}`);
-  must(seenHeaders.slice(before).some((h) => h["x-api-key"] === VALUE), "the slot was not filled from the kept secret");
+  must(seenHeaders.slice(before).some((h) => h["x-api-key"] === VALUE), "the slot was not filled from the owner's secret");
+  must(!seenHeaders.slice(before).some((h) => h["x-api-key"] === "the-agents-own-value"), "the agent's own value shadowed the owner's");
+  // The model, through its own tools, sees only its own row and never the owner's value.
+  const got: any = await state.invoke("secret_get", { name: "docs-key" }, agentCtx);
+  must(got.value === "the-agents-own-value", `secret_get: ${show(got)}`);
+  const list: any = await state.invoke("secret_list", {}, agentCtx);
+  must(list.secrets.length === 1 && !show(list).includes(VALUE), `secret_list: ${show(list)}`);
+  await state.invoke("secret_delete", { name: "docs-key" }, agentCtx);
   const d = await home().uiPlugins(T, A);
   must(d.mounts.find((x: any) => x.alias === "docs")?.snapshotError === null, "a successful refresh left the error");
   must(show(d.kept.map((k: any) => k.name)) === show(["docs-key"]) && typeof d.kept[0].storedAt === "string" && typeof d.kept[0].lastReadAt === "string", `kept: ${show(d.kept)}`);
@@ -424,6 +500,34 @@ await check("route: a kept secret fills the header slot on refresh, which clears
   must(failed.status === 200 && !failed.json().ok && /no mount named/.test(failed.json().error), `refresh of nothing: ${failed.text}`);
   const noAlias = await post("/ui/mount/refresh", {}, { json: true });
   must(noAlias.status === 400, `refresh without an alias: ${noAlias.status}`);
+});
+
+await check("route: a console write is accepted only from this origin, or from a script holding a token", async () => {
+  const store = home().runtime().store;
+  const names = async () => (await store.listSecretNames(T, A, "owner:")).map((r: any) => r.name);
+  const before = show(await names());
+  for (const [label, headers] of [
+    ["cross-site", { "sec-fetch-site": "cross-site", origin: "https://evil.example" }],
+    ["same-site (another subdomain)", { "sec-fetch-site": "same-site", origin: "https://preview.console.test" }],
+    ["no Sec-Fetch-Site, another subdomain's Origin", { "sec-fetch-site": null, origin: "https://preview.console.test" }],
+    ["no Sec-Fetch-Site, no Origin", { "sec-fetch-site": null }],
+    ["a made-up token beside the cookie", { "sec-fetch-site": null, "x-harness-token": "not-the-token" }],
+  ] as const) {
+    for (const [path, fields] of [["/ui/secret", { name: "forged", value: VALUE }], ["/ui/mount/add", { plugin: "mcp", alias: "forged", url: MCP_URL }]] as const) {
+      const r = await post(path, fields, { headers: headers as Record<string, string | null> });
+      must(r.status === 403 && /refused/.test(r.text), `${label} ${path}: ${r.status} ${r.text.slice(0, 120)}`);
+    }
+  }
+  must(show(await names()) === before && !(await store.getMountByAlias(T, A, "forged")), "a refused write wrote something");
+  // Accepted: the console's own page (Sec-Fetch-Site), an older browser on this origin (Origin only), and a script with the token.
+  const same = await post("/ui/secret", { name: "ok-sfs", value: VALUE });
+  must(same.status === 200, `same-origin: ${same.status} ${same.text.slice(0, 120)}`);
+  const legacy = await post("/ui/secret", { name: "ok-origin", value: VALUE }, { headers: { "sec-fetch-site": null, origin: "https://console.test" } });
+  must(legacy.status === 200, `Origin only: ${legacy.status} ${legacy.text.slice(0, 120)}`);
+  const script = await post("/ui/secret", { name: "ok-token", value: VALUE }, { cookie: null, headers: { "sec-fetch-site": null, "x-harness-token": "operator-token" } });
+  must(script.status === 200, `automation token: ${script.status} ${script.text.slice(0, 120)}`);
+  must(show(await names()) === show([...JSON.parse(before), "owner:ok-origin", "owner:ok-sfs"].sort()), `owner rows: ${show(await names())}`);
+  for (const n of ["ok-sfs", "ok-origin"]) await post("/ui/secret/remove", { name: n });
 });
 
 await check("route: an operator's mount, added through /admin/mounts, is neither refreshed nor removed from the console", async () => {

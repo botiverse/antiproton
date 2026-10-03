@@ -1678,8 +1678,9 @@ export class AgentDO extends DurableObject<Env> {
     const choices = await rt.store.pluginChoices(tenantId, agentId);
     return {
       installed: installedRows(installed, choices, SEEDED_PLUGINS),
-      // The secrets this agent kept, by name: what `state.secret_list` answers, never a value.
-      kept: await rt.keptSecrets(tenantId, agentId),
+      // The secrets the owner kept from this console (`owner:`), by name and times, never a value.
+      // Not the agent's own `kept:` rows: those are the agent's, and `secret_list` is where it reads them.
+      kept: await rt.ownerSecrets(tenantId, agentId),
       // How many mounts the console may add (`fromConsole` counts them), so the page need not copy the number.
       consoleMountsMax: CONSOLE_MOUNTS_MAX,
       // The column means "what the agent can call", so the names come from the
@@ -1871,12 +1872,12 @@ export class AgentDO extends DurableObject<Env> {
 
   async uiPutSecret(tenantId: string, agentId: string, name: string, value: string) {
     this.#claim(tenantId, agentId);
-    return this.#busy("uiPutSecret", () => this.runtime().putKeptSecret(tenantId, agentId, name, value));
+    return this.#busy("uiPutSecret", () => this.runtime().putOwnerSecret(tenantId, agentId, name, value));
   }
 
   async uiRemoveSecret(tenantId: string, agentId: string, name: string) {
     this.#claim(tenantId, agentId);
-    return this.#busy("uiRemoveSecret", () => this.runtime().removeKeptSecret(tenantId, agentId, name));
+    return this.#busy("uiRemoveSecret", () => this.runtime().removeOwnerSecret(tenantId, agentId, name));
   }
 
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
@@ -2779,6 +2780,42 @@ const LEGACY_TASK_ID = MAIN_SESSION;
 const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release", "/ui/plugin/choice", "/ui/mount/add", "/ui/mount/refresh", "/ui/mount/remove", "/ui/secret", "/ui/secret/remove"]);
 
 /**
+ * Why a console write is refused as one this console's pages did not send, or
+ * null to let it through.
+ *
+ * The session cookie is SameSite=Lax, and Lax stops only cross-*site*
+ * requests: every other host under the same registrable domain (preview.,
+ * admin., report.) is the same site, so a page there — or a script injected
+ * into one — could post a form here with the signed-in person's cookie. One
+ * such post to `/ui/mount/add` with its own server's url and a `{{name}}`
+ * header is enough to carry an owner's secret away, because the add lists the
+ * server's tools at once. So a write must come from this origin, not this site:
+ *
+ *  1. A request carrying `x-harness-token` that names someone by itself — the
+ *     automation token or a service token, resolved without the cookie — is a
+ *     script holding a credential, not a browser carrying an ambient one. A
+ *     page on another origin cannot set that header on a form, and a fetch
+ *     that sets it is preflighted, which this Worker never approves; and it
+ *     would need the token. Resolved alone so a cookie beside a made-up token
+ *     does not pass as the token.
+ *  2. Otherwise `Sec-Fetch-Site`, which the browser sets and a page cannot:
+ *     only `same-origin`. `same-site` is exactly the case above.
+ *  3. A browser too old to send it still sends `Origin` on every POST: it must
+ *     be this request's own origin.
+ *  4. Neither: refused. Every browser sends one of the two on a POST, so this
+ *     is a client that is not a browser, and such a client has rule 1.
+ */
+async function forgedWrite(request: Request, url: URL, env: Env): Promise<string | null> {
+  const token = request.headers.get("x-harness-token");
+  if (token && await resolveViewer(new Request(url, { headers: { "x-harness-token": token } }), viewerEnv(env))) return null;
+  const site = request.headers.get("sec-fetch-site");
+  if (site !== null) return site === "same-origin" ? null : "refused: a console write must come from this console's own pages, not another origin";
+  const origin = request.headers.get("origin");
+  if (origin !== null) return origin === url.origin ? null : "refused: a console write must come from this console's own pages, not another origin";
+  return "refused: a console write from a browser names its origin, and this one does not; a script presents x-harness-token";
+}
+
+/**
  * The answer to a console mount or secret write. htmx gets the panel; a caller
  * that sends `Accept: application/json` gets the result as JSON with the same
  * panel under `html`, so one route serves a swap and a script.
@@ -3397,6 +3434,10 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (who.startsWith("anonymous") && UI_WRITE_ROUTES.has(url.pathname)) {
         return new Response("read-only: the console is open to anonymous viewers, but not for writes", { status: 403 });
       }
+      if (UI_WRITE_ROUTES.has(url.pathname)) {
+        const forged = await forgedWrite(request, url, env);
+        if (forged) return new Response(forged, { status: 403 });
+      }
       // Which of the person's agents. The identity names their first one;
       // any other must be in that first object's directory, or it is 404,
       // reads and writes alike, so "not yours" and "does not exist" look the
@@ -3870,9 +3911,10 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (!r.ok) return consoleRefusal(request, r.error, r.conflict ? 409 : 400);
           return consoleAnswer(request, plugins(await stub.uiPlugins(gate.tenantId, agentId)), { ok: true, alias, removed: true });
         }
-        // A secret the owner keeps for the agent, for a mount's {{name}} header slots: the agent's
-        // own `kept:` rows, by the rules of `state.secret_put`. The value comes in once and goes
-        // nowhere back out — not in the answer, not on a refusal, not in a log line.
+        // A secret the owner keeps for a mount's {{name}} header slots, under `owner:`
+        // (src/runtime/secrets.ts): by `state.secret_put`'s rules, but out of the agent's reach.
+        // The value comes in once and goes nowhere back out — not in the answer, not on a
+        // refusal, not in a log line, not to the model.
         case "/ui/secret":
         case "/ui/secret/remove": {
           const gate = await requireViewer(request, env);

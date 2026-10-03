@@ -350,6 +350,22 @@ export interface PluginContext {
    * the call says and nowhere else: not into a result, an error, or `ctx.db`.
    */
   agentSecret(name: string): Promise<string | null>;
+  /**
+   * A secret the agent's owner kept from the console (`/ui/secret`), by name;
+   * null when there is none. The model can neither read nor change these.
+   *
+   * Only for a value sent where the mount's own settings say — the mount's
+   * server, in a header its settings name — and never where a tool call's
+   * arguments say: a plugin that let the agent choose the destination would
+   * hand the agent an owner's credential to send anywhere, which is the one
+   * thing keeping these apart from `agentSecret` exists to prevent. As with
+   * `agentSecret`, the value goes nowhere else: not into a result, an error,
+   * or `ctx.db`.
+   *
+   * Absent where a context has no owner secrets to offer (a credential check,
+   * a diagnosis); a plugin reads its absence as "none".
+   */
+  ownerSecret?(name: string): Promise<string | null>;
 }
 
 /**

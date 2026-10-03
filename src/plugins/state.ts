@@ -11,10 +11,11 @@ type SealingKey = Awaited<ReturnType<typeof importKek>>;
 export const SECRET_VALUE_MAX = 8_000;
 
 /*
- * The agent's kept secrets, one set of rules for both ways in: the agent's own
- * `secret_*` tools below and the owner's console (`/ui/secret`). One copy, so a
- * name or a value one of them accepts is one the other accepts too, and both
- * land in the same `kept:` rows the `{{name}}` slots read.
+ * Kept secrets, one set of rules for both ways in: the agent's own `secret_*`
+ * tools below, under `kept:`, and the owner's console (`/ui/secret`), under
+ * `owner:` (src/runtime/secrets.ts says who reads which). One copy, so a name or
+ * a value one of them accepts is one the other accepts too. `prefix` picks the
+ * namespace; the tools below only ever pass the default.
  */
 
 /** Why `name` cannot name a kept secret, or null. */
@@ -30,20 +31,20 @@ export function keptValueProblem(value: unknown): string | null {
 }
 
 /** Seal and keep one value under a name the caller has checked. */
-export async function keptPut(store: StorageAdapter, key: SealingKey, tenantId: string, agentId: string, name: string, value: string): Promise<void> {
-  await store.putSecret(tenantId, agentId, KEPT_PREFIX + name, await seal(key, value));
+export async function keptPut(store: StorageAdapter, key: SealingKey, tenantId: string, agentId: string, name: string, value: string, prefix = KEPT_PREFIX): Promise<void> {
+  await store.putSecret(tenantId, agentId, prefix + name, await seal(key, value));
 }
 
 /** Whether there was one to delete. */
-export async function keptDelete(store: StorageAdapter, tenantId: string, agentId: string, name: string): Promise<boolean> {
-  return store.removeSecret(tenantId, agentId, KEPT_PREFIX + name);
+export async function keptDelete(store: StorageAdapter, tenantId: string, agentId: string, name: string, prefix = KEPT_PREFIX): Promise<boolean> {
+  return store.removeSecret(tenantId, agentId, prefix + name);
 }
 
 /** The names with their times, never a value: what `secret_list` answers. */
-export async function keptList(store: StorageAdapter, tenantId: string, agentId: string) {
-  const rows = await store.listSecretNames(tenantId, agentId, KEPT_PREFIX);
+export async function keptList(store: StorageAdapter, tenantId: string, agentId: string, prefix = KEPT_PREFIX) {
+  const rows = await store.listSecretNames(tenantId, agentId, prefix);
   return rows.map((r) => ({
-    name: r.name.slice(KEPT_PREFIX.length), storedAt: new Date(r.updatedAt).toISOString(),
+    name: r.name.slice(prefix.length), storedAt: new Date(r.updatedAt).toISOString(),
     lastReadAt: r.lastUsedAt === null ? null : new Date(r.lastUsedAt).toISOString(),
   }));
 }

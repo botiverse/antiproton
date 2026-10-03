@@ -48,7 +48,7 @@ import { ToolGateway } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
-import { agentSecrets, agentRef, importKek, isAgentRef, open, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
+import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
   ensureInboundTable, hookSecretName, inboundMessage, newHookId, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
   INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
@@ -75,9 +75,11 @@ export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
 
 /**
  * How a mount added from the console is told apart: its `installationId`
- * starts with this. That field is stored on every mount, read by nothing else,
- * and kept by a rename, so marking it needs no new column in either store and
- * no migration, and the mark survives the mount being renamed. Every other path
+ * starts with this (`console:<alias>:<uuid>`, fresh on every add). That field is
+ * stored on every mount and kept by a rename, and otherwise read only as the
+ * mount's identity when a tool listing is written back, so marking it needs no
+ * new column in either store and no migration, and the mark survives the mount
+ * being renamed. Every other path
  * writes `inst-<alias>` (or a fixed id), so no mount predating the console
  * route reads as console-added.
  */
@@ -1575,7 +1577,9 @@ export class AgentRuntime {
     if (switchOn) await this.store.setPluginChoice(tenantId, agentId, plugin.id, "enable");
     await this.store.addMount({
       tenantId, agentId, alias: seed.alias, plugin: plugin.id,
-      installationId: `${opts.console ? CONSOLE_INSTALLATION : "inst-"}${seed.alias}`, connectionId: null,
+      // A console mount's id is new on every add, so a listing still in flight for a removed one
+      // cannot be written onto its successor under the same alias (gateway `refreshMountTools`).
+      installationId: opts.console ? `${CONSOLE_INSTALLATION}${seed.alias}:${crypto.randomUUID()}` : `inst-${seed.alias}`, connectionId: null,
       toolVersion: this.pluginVersion(plugin.id) ?? "1.0.0",
       publicConfig: seed.config, secretRef: null, policy: null,
     });
@@ -1641,7 +1645,8 @@ export class AgentRuntime {
     const sql = this.#snapshotErrors();
     if (sql) {
       if (r.ok) sql.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
-      else if (await this.store.getMountByAlias(tenantId, agentId, alias)) {
+      // A stale answer is about a mount that is gone; the one now under the alias has its own.
+      else if (!("stale" in r) && await this.store.getMountByAlias(tenantId, agentId, alias)) {
         sql.exec("INSERT INTO mount_snapshot_errors(alias, error, at) VALUES (?,?,?) ON CONFLICT(alias) DO UPDATE SET error = excluded.error, at = excluded.at",
           alias, r.error, Date.now());
       }
@@ -1715,9 +1720,13 @@ export class AgentRuntime {
     }
     const safety = renameSafety(await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias), Date.now());
     if (!safety.safe) return refuse(`${safety.reason} (${safety.live.id}, idle ${Math.round(safety.live.idleMs / 60_000)}m)`);
-    // The row a credential attached here would have been kept under: none is
-    // referenced (refused above), so any row of that name is left over.
-    if (!(await this.store.removeMount(tenantId, agentId, alias, alias))) return { ok: false, error: `no mount named ${alias}` };
+    // The row a credential attached here would have been kept under. This mount
+    // does not reference it (refused above), but another may: a reference is a
+    // name, and `agent:<alias>` can sit on any mount. Only an unreferenced row
+    // is a leftover; a referenced one is someone's credential and stays.
+    const row = agentRef(alias);
+    const shared = (await this.store.listMounts(tenantId, agentId)).some((m) => m.alias !== alias && m.secretRef === row);
+    if (!(await this.store.removeMount(tenantId, agentId, alias, shared ? null : alias))) return { ok: false, error: `no mount named ${alias}` };
     this.#unchecked.delete(`${tenantId}/${agentId}/${alias}`);
     const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
     if (warned) sql.exec("DELETE FROM held_warnings WHERE alias = ?", alias);
@@ -1726,31 +1735,34 @@ export class AgentRuntime {
   }
 
   /**
-   * The owner keeps a secret for the agent from the console (`/ui/secret`):
-   * the same rows, rules and sealing as the agent's own `state.secret_put`, so
-   * a `{{name}}` slot reads either the same way. The value is never returned.
+   * The owner keeps a secret from the console (`/ui/secret`), for a mount's
+   * `{{name}}` header slots. Under `owner:`, not the agent's `kept:`: the same
+   * name and value rules and the same sealing as `state.secret_put`, but the
+   * agent's `secret_*` tools cannot read, list, overwrite or delete it, and
+   * only `ctx.ownerSecret` resolves it (src/runtime/secrets.ts). The value is
+   * never returned.
    */
-  async putKeptSecret(tenantId: string, agentId: string, name: string, value: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  async putOwnerSecret(tenantId: string, agentId: string, name: string, value: string): Promise<{ ok: true } | { ok: false; error: string }> {
     await this.ready();
     const bad = keptNameProblem(name) ?? keptValueProblem(value);
     if (bad) return { ok: false, error: bad };
     const kek = await this.#kek;
     if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a secret" };
-    await keptPut(this.store, kek, tenantId, agentId, name, value);
+    await keptPut(this.store, kek, tenantId, agentId, name, value, OWNER_PREFIX);
     return { ok: true };
   }
 
-  async removeKeptSecret(tenantId: string, agentId: string, name: string): Promise<{ ok: true; removed: boolean } | { ok: false; error: string }> {
+  async removeOwnerSecret(tenantId: string, agentId: string, name: string): Promise<{ ok: true; removed: boolean } | { ok: false; error: string }> {
     await this.ready();
     const bad = keptNameProblem(name);
     if (bad) return { ok: false, error: bad };
-    return { ok: true, removed: await keptDelete(this.store, tenantId, agentId, name) };
+    return { ok: true, removed: await keptDelete(this.store, tenantId, agentId, name, OWNER_PREFIX) };
   }
 
-  /** What `state.secret_list` answers: names and times, never a value. */
-  async keptSecrets(tenantId: string, agentId: string) {
+  /** The owner's secrets, in `secret_list`'s shape: names and times, never a value. */
+  async ownerSecrets(tenantId: string, agentId: string) {
     await this.ready();
-    return keptList(this.store, tenantId, agentId);
+    return keptList(this.store, tenantId, agentId, OWNER_PREFIX);
   }
 
   /**

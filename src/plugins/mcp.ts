@@ -16,8 +16,9 @@
  * `StreamableHttpTransport` and `toLlmContent` (and the type `McpFetch`, which
  * leaves nothing in the bundle), and `test/mcp-plugin.ts` checks
  * both the list and that the bundle carries no `child_process`. No OAuth: a server
- * that needs a key gets it from a header whose value names a secret the agent
- * kept (`{{name}}`), filled in server-side on every request.
+ * that needs a key gets it from a header whose value names a secret (`{{name}}`)
+ * the owner kept from the console or the agent kept itself, filled in
+ * server-side on every request.
  *
  * The transport has no way to take a session id from an earlier connection, so
  * every call opens a fresh connection and initializes again: one `initialize`,
@@ -130,8 +131,12 @@ async function connect(ctx: PluginContext, kept: Map<string, string>): Promise<M
   if (typeof timeoutMs !== "number" || !(timeoutMs >= 1 && timeoutMs <= MAX_TIMEOUT_MS)) {
     throw new Error(`the ${ctx.alias} mount is misconfigured: timeoutMs must be between 1 and ${MAX_TIMEOUT_MS}`);
   }
+  // `{{name}}`: the owner's secret of that name first, then the agent's own. The owner's wins so
+  // that the agent cannot shadow it with a `secret_put` of the same name; the url is the mount's
+  // setting, not a call's argument, which is what lets an owner's secret go there at all.
+  const lookup = { agentSecret: async (n: string) => (await ctx.ownerSecret?.(n)) ?? ctx.agentSecret(n) };
   const headers: Record<string, string> = {};
-  for (const [name, spec] of parsed.headers) headers[name] = await fillSecrets(spec, kept, ctx);
+  for (const [name, spec] of parsed.headers) headers[name] = await fillSecrets(spec, kept, lookup);
   const client = new McpClient({ name: "antiproton", version: VERSION, requestTimeoutMs: timeoutMs });
   try {
     // No GET stream: nothing here listens between calls, and the connection is closed after one.
@@ -166,7 +171,7 @@ export const mcpPlugin: Plugin = {
     { name: "url", type: "string", required: true,
       summary: "The server's Streamable HTTP endpoint, such as https://mcp.example.com/mcp. https to a public host only." },
     { name: "headers", type: "string[]", format: "header-lines",
-      summary: "Sent with every request, one \"Name: value\" per line. A value may contain {{name}}, filled in on each request from a secret the agent kept under that name; the value is never written here." },
+      summary: "Sent with every request, one \"Name: value\" per line. A value may contain {{name}}, filled in on each request from the secret kept under that name: the one the owner kept from the console, else the one the agent kept itself. The value is never written here." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1, max: MAX_TIMEOUT_MS,
       summary: "How long one request to the server may take, in milliseconds; at most 60000. Listing the server's tools gets the same budget in total, however many pages it takes." },
   ],
