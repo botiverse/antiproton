@@ -626,6 +626,158 @@ await check("channel_members passes Raft's refusal on as a failure that landed n
   if (why.mayHaveLanded === true || why.retryable === true) throw new Error(`a read claimed it may have landed: ${why.message}`);
 });
 
+/** One message of `GET /internal/agent-api/history` as the Server sends it. */
+function historyMessage(seq: number, content: string, extra: Record<string, unknown> = {}) {
+  return {
+    id: `m-${seq}cccccc`, seq, content, sender_type: "human", sender_name: "tygg", timestamp: "2026-09-28T10:00:00Z",
+    channel_name: "wg-raft-sdk", channel_type: "channel", ...extra,
+  };
+}
+function history(messages: unknown[], more: { has_older?: boolean; has_newer?: boolean; target?: string } = {}) {
+  return json(200, {
+    target: more.target ?? "#wg-raft-sdk", messages,
+    has_more: Boolean(more.has_older || more.has_newer), has_older: more.has_older ?? false, has_newer: more.has_newer ?? false,
+  });
+}
+const line = (seq: number, content: string) =>
+  `[target=#wg-raft-sdk msg=m-${seq}cccc time=2026-09-28 10:00:00Z type=human] @tygg: ${content}`;
+
+await check("read_messages and search_messages are reads that repeat safely", async () => {
+  for (const name of ["read_messages", "search_messages"]) {
+    const tool = raftPlugin.tools.find((x) => x.name === name);
+    if (tool?.sideEffects !== "read" || tool.idempotency !== "native" || tool.replay !== undefined) {
+      throw new Error(`${name} declaration: ${JSON.stringify(tool)}`);
+    }
+  }
+});
+
+await check("read_messages passes before and limit through, and says how to read older in its own terms", async () => {
+  const calls = one(history([historyMessage(41, "one"), historyMessage(42, "two", { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true }));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", before: 43, limit: 7 }, ctx()) as any;
+  const url = new URL(calls[0]!.url);
+  if (url.pathname !== "/internal/agent-api/history" || url.searchParams.get("channel") !== "#wg-raft-sdk" ||
+      url.searchParams.get("before") !== "43" || url.searchParams.get("limit") !== "7" ||
+      url.searchParams.has("after") || url.searchParams.has("around")) {
+    throw new Error(`request: ${calls[0]!.url}`);
+  }
+  // The attachment is said as receive_events says it, not as the CLI's `raft attachment view`.
+  const want = [line(41, "one"), `${line(42, "two")} [1 attachment: plan.pdf — this mount has no tool to open attachments]`, "Older exist: call read_messages with target #wg-raft-sdk, before 41."];
+  if (JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want)) throw new Error(`text: ${out.text}`);
+  if (/raft message read/.test(out.text)) throw new Error(`names a CLI command this mount lacks: ${out.text}`);
+  if (out.target !== "#wg-raft-sdk" || out.hasOlder !== true || out.hasNewer !== false || out.oldestSeq !== 41 || out.newestSeq !== 42) {
+    throw new Error(`cursors: ${JSON.stringify(out)}`);
+  }
+});
+
+await check("read_messages passes after through, and says how to read newer in its own terms", async () => {
+  const calls = one(history([historyMessage(78, "three")], { has_newer: true }));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 77 }, ctx()) as any;
+  const url = new URL(calls[0]!.url);
+  if (url.searchParams.get("after") !== "77" || url.searchParams.has("before") || url.searchParams.has("limit")) throw new Error(`request: ${calls[0]!.url}`);
+  const want = [line(78, "three"), "Newer exist: call read_messages with target #wg-raft-sdk, after 78."];
+  if (JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want) || out.hasNewer !== true) throw new Error(`text: ${out.text}`);
+});
+
+await check("read_messages passes around through, as a seq or a message id, into a thread target", async () => {
+  const calls = one(history([historyMessage(55, "in the thread")], { target: "#wg-raft-sdk:abcd1234" }));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk:abcd1234", around: 55 }, ctx()) as any;
+  const url = new URL(calls[0]!.url);
+  if (url.searchParams.get("channel") !== "#wg-raft-sdk:abcd1234" || url.searchParams.get("around") !== "55") throw new Error(`request: ${calls[0]!.url}`);
+  if (out.target !== "#wg-raft-sdk:abcd1234" || /exist:/.test(out.text) || out.hasOlder !== false || out.hasNewer !== false) {
+    throw new Error(JSON.stringify(out));
+  }
+  const byId = one(history([historyMessage(55, "in the thread")]));
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", around: "m-55cccccc" }, ctx());
+  if (new URL(byId[0]!.url).searchParams.get("around") !== "m-55cccccc") throw new Error(`request: ${byId[0]!.url}`);
+});
+
+await check("read_messages on an empty window says so, with no cursors", async () => {
+  one(history([]));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 99 }, ctx()) as any;
+  if (out.text !== "No messages in #wg-raft-sdk." || out.hasOlder !== false || "oldestSeq" in out || "newestSeq" in out) {
+    throw new Error(JSON.stringify(out));
+  }
+});
+
+await check("read_messages refuses two cursors, a bad limit, and a bad cursor before reaching Raft", async () => {
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  for (const args of [{ before: 43, after: 12 }, { before: 43, around: 30 }, { after: 12, around: "m-1" }]) {
+    const why = await failure(() => raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", ...args }, ctx()));
+    if (!/at most one of before, after and around/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+  for (const args of [{ limit: 0 }, { limit: 201 }, { limit: 2.5 }, { before: -1 }, { after: "12" }, { around: "" }, { around: 1.5 }, { target: "" }]) {
+    const why = await failure(() => raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", ...args }, ctx()));
+    if (!/limit must|before must|after must|around must|target is required/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
+});
+
+/** One result of `GET /internal/agent-api/search` as the Server sends it. */
+function searchResult(n: number) {
+  return {
+    id: `r-${n}`, seq: n, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
+    parentChannelName: "wg-raft-sdk", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human",
+    senderName: "tygg", channelName: "wg-raft-sdk", channelType: "channel", channelArchivedAt: null,
+    content: "the launch plan is ready", snippet: "launch", createdAt: `2026-09-2${n}T10:00:00.000Z`,
+  };
+}
+
+await check("search_messages passes every parameter through and says how to page in its own terms", async () => {
+  const calls = one(json(200, { results: [searchResult(1), searchResult(2)], hasMore: true }));
+  const out = await raftPlugin.invoke("search_messages", {
+    query: "launch plan", target: "#wg-raft-sdk", sender: "tygg", sort: "relevance",
+    after: "2026-09-01T00:00:00Z", before: "2026-09-30T00:00:00Z", limit: 2, offset: 4,
+  }, ctx()) as any;
+  const p = new URL(calls[0]!.url).searchParams;
+  const sent = Object.fromEntries(p.entries());
+  const want = { q: "launch plan", channel: "#wg-raft-sdk", sender: "tygg", sort: "relevance", before: "2026-09-30T00:00:00Z", after: "2026-09-01T00:00:00Z", limit: "2", offset: "4" };
+  if (new URL(calls[0]!.url).pathname !== "/internal/agent-api/search" || JSON.stringify(sent, Object.keys(want).sort()) !== JSON.stringify(want, Object.keys(want).sort())) {
+    throw new Error(`request: ${calls[0]!.url}`);
+  }
+  const lines = String(out.text).split("\n");
+  if (lines[0] !== 'Search results for: "launch plan" (2 results · truncated=true · more results exist, call search_messages again with offset 6)') {
+    throw new Error(`head: ${lines[0]}`);
+  }
+  if (!lines.includes('<result ref="msg:r-1">') || !lines.includes("the <match>launch plan</match> is ready") || /--\w/.test(out.text)) {
+    throw new Error(`body: ${out.text}`);
+  }
+  if (out.results !== 2 || out.hasMore !== true || out.nextOffset !== 6 || "nextBefore" in out) throw new Error(JSON.stringify(out));
+});
+
+await check("search_messages sorted by recent pages by before, and a page at the cap names parameters, not flags", async () => {
+  one(json(200, { results: [searchResult(3)], hasMore: true }));
+  const recent = await raftPlugin.invoke("search_messages", { sender: "tygg", sort: "recent", limit: 1 }, ctx()) as any;
+  const head = String(recent.text).split("\n")[0]!;
+  if (!head.startsWith("Filtered message results (1 result · truncated=true · more results exist, call search_messages again with before 2026-09-23T10:00:00.000Z (pages OLDER only;") ||
+      recent.nextBefore !== "2026-09-23T10:00:00.000Z" || "nextOffset" in recent) {
+    throw new Error(JSON.stringify(recent));
+  }
+  one(json(200, { results: Array.from({ length: 3 }, (_, i) => searchResult(i + 1)), hasMore: false }));
+  const capped = await raftPlugin.invoke("search_messages", { query: "plan", limit: 3 }, ctx()) as any;
+  const cappedHead = String(capped.text).split("\n")[0]!;
+  if (!cappedHead.includes("exactly the limit 3 that was requested") || !cappedHead.endsWith("re-run with a higher limit to tell the two apart)") || /--/.test(cappedHead) || "nextOffset" in capped) {
+    throw new Error(cappedHead);
+  }
+});
+
+await check("search_messages with no results says so; without query, target or sender it is refused before reaching Raft", async () => {
+  one(json(200, { results: [], hasMore: false }));
+  const out = await raftPlugin.invoke("search_messages", { query: "nothing like it" }, ctx()) as any;
+  if (out.text !== "No search results. (truncated=false)" || out.results !== 0 || out.hasMore !== false || "nextOffset" in out) throw new Error(JSON.stringify(out));
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const refusals: Array<[Record<string, unknown>, RegExp]> = [
+    [{}, /query, or filter by target or sender/], [{ query: "x", limit: 51 }, /limit must/], [{ query: "x", limit: 0 }, /limit must/],
+    [{ query: "x", offset: -1 }, /offset must/], [{ query: "x", sort: "oldest" }, /sort must/], [{ query: 5 }, /query must/],
+  ];
+  for (const [args, reason] of refusals) {
+    const why = await failure(() => raftPlugin.invoke("search_messages", args, ctx()));
+    if (!reason.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
+});
+
 await check("the mount setting cannot redirect a credential to a path or embedded user", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
   for (const serverUrl of ["https://evil.example/path", "https://user@evil.example", "file:///tmp/socket"]) {

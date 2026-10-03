@@ -16,6 +16,9 @@ const MAX_EVENTS = 200;
 /** The SDK's own page size, named here so the tool's description cannot disagree with it. */
 const DEFAULT_CHANNEL_PAGE = 50;
 const MAX_CHANNELS = 200;
+const MAX_HISTORY = 200;
+/** The Server's own cap: a larger limit is clamped there, and the result text then says so in CLI terms. */
+const MAX_SEARCH = 50;
 /**
  * Raft's push is a NOTICE that the inbox changed — the same "Inbox update" text
  * Raft's daemon injects into a managed agent — never the messages (tygg,
@@ -394,6 +397,25 @@ function modelLine(m: RaftMessage): string {
   return line;
 }
 
+/**
+ * Search results as the model reads them: the SDK's text, which is the CLI's, with the CLI's flags in its first
+ * line said as this tool's parameters. That line's count says how to page and how to narrow, as `--offset`,
+ * `--before`, `--limit` and the like, which a model would go looking for as a command. Only the part after the
+ * quoted query is rewritten: the query is the model's own text, and the previews below are other people's.
+ */
+function searchText(text: string, query: string): string {
+  const [head = "", ...rest] = text.split("\n");
+  const prefix = head.startsWith("No search results. (") ? "No search results. ("
+    : query ? `Search results for: ${JSON.stringify(query)} (` : "Filtered message results (";
+  // `JSON.stringify` matches the CLI's quoting only for a query with no quote or backslash in it; for any other,
+  // the head is left alone rather than rewritten from a guessed position.
+  if (!head.startsWith(prefix)) return text;
+  const tail = head.slice(prefix.length)
+    .replace(/page with --(offset|before) /g, "call search_messages again with $1 ")
+    .replace(/--(limit|sender|target|after|before|offset)\b/g, "$1");
+  return [prefix + tail, ...rest].join("\n");
+}
+
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
@@ -495,7 +517,7 @@ export const raftPlugin: Plugin = {
     required: true,
     summary: "A Raft agent credential for the agent account this mount represents.",
     shape: "token",
-    grants: "Send messages, receive queued events, list and join visible channels, see their members, and post action cards as that Raft agent.",
+    grants: "Send messages, receive queued events, read and search visible history, list and join visible channels, see their members, and post action cards as that Raft agent.",
     looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
   },
   tools: [
@@ -630,6 +652,46 @@ export const raftPlugin: Plugin = {
         type: "object", additionalProperties: false,
         properties: { target: { type: "string", description: "A channel such as #engineering; a DM (dm:@name) or thread target also works." } },
         required: ["target"],
+      },
+      sideEffects: "read",
+      idempotency: "native",
+    },
+    {
+      name: "read_messages",
+      summary: "Read the history of a Raft channel, DM, or thread, one message per line as receive_events shows them. " +
+        "Without a cursor it reads the latest messages; give at most one of before (older than a seq), after (newer than a seq) " +
+        "or around (a seq or message id). hasOlder and hasNewer say whether more exist; oldestSeq and newestSeq are the cursors to page with.",
+      parameters: {
+        type: "object", additionalProperties: false,
+        properties: {
+          target: { type: "string", description: "For example #general, #general:abcd1234, or dm:@name." },
+          before: { type: "integer", minimum: 0, description: "Messages older than this seq." },
+          after: { type: "integer", minimum: 0, description: "Messages newer than this seq." },
+          around: { oneOf: [{ type: "integer", minimum: 0 }, { type: "string" }], description: "A window around this seq or message id." },
+          limit: { type: "integer", minimum: 1, maximum: MAX_HISTORY },
+        },
+        required: ["target"],
+      },
+      sideEffects: "read",
+      idempotency: "native",
+    },
+    {
+      name: "search_messages",
+      summary: "Search Raft messages you can see, by text and/or by conversation or sender. Each result names its source, " +
+        "sender, time and a preview with the match marked; read the surrounding messages with read_messages before relying on one. " +
+        "While hasMore is true, call again with nextOffset as offset (or, sorted by recent, nextBefore as before).",
+      parameters: {
+        type: "object", additionalProperties: false,
+        properties: {
+          query: { type: "string", description: "Free text; may be left out when target or sender is given." },
+          target: { type: "string", description: "Only this channel, DM, or thread, for example #general." },
+          sender: { type: "string", description: "Only messages from this handle." },
+          sort: { enum: ["relevance", "recent"] },
+          before: { type: "string", description: "ISO timestamp, inclusive." },
+          after: { type: "string", description: "ISO timestamp, inclusive." },
+          limit: { type: "integer", minimum: 1, maximum: MAX_SEARCH },
+          offset: { type: "integer", minimum: 0 },
+        },
       },
       sideEffects: "read",
       idempotency: "native",
@@ -883,6 +945,73 @@ export const raftPlugin: Plugin = {
       if (!out.ok) throw sdkFailure(out);
       // The SDK's text, which is the CLI's: agents and humans in their own sections, server role as a label.
       return { target: a.target, text: out.text.trim() };
+    }
+    if (name === "read_messages") {
+      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required, for example #engineering");
+      const before = integer(a.before, "before", 0, Number.MAX_SAFE_INTEGER);
+      const after = integer(a.after, "after", 0, Number.MAX_SAFE_INTEGER);
+      if (a.around !== undefined && !(typeof a.around === "string" && a.around.trim()) &&
+          !(typeof a.around === "number" && Number.isSafeInteger(a.around) && a.around >= 0)) {
+        throw new Error("around must be a message seq or a message id");
+      }
+      const around = a.around as number | string | undefined;
+      // The SDK sends whichever it is given, and what the Server makes of two at once is not its contract.
+      if ([before, after, around].filter((c) => c !== undefined).length > 1) {
+        throw new Error("give at most one of before, after and around");
+      }
+      const limit = integer(a.limit, "limit", 1, MAX_HISTORY);
+      const out = await raftFor(ctx).messages.read({
+        target: a.target,
+        ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}),
+        ...(around !== undefined ? { around } : {}), ...(limit !== undefined ? { limit } : {}),
+      });
+      if (!out.ok) throw sdkFailure(out);
+      const page = out.data;
+      const seqs = page.messages.map((m) => m.seq).filter((s): s is number => s !== null);
+      // The SDK's text is the CLI's: each message's own line (`m.text`, the same formatter), then a hint naming
+      // `raft message read`, which this mount has no tool for. So the text is rebuilt from the lines
+      // receive_events gives (`modelLine`, which puts the CLI's attachment hint right) and the SDK's next step
+      // said in this tool's terms. The tests assert whole lines, so a change to the SDK's wording shows there.
+      const hint = out.next?.args && typeof out.next.args.after === "number"
+        ? `Newer exist: call read_messages with target ${page.target}, after ${out.next.args.after}.`
+        : out.next?.args && typeof out.next.args.before === "number"
+          ? `Older exist: call read_messages with target ${page.target}, before ${out.next.args.before}.`
+          : null;
+      const lines = page.messages.length ? page.messages.map(modelLine) : [out.text.trim()];
+      return {
+        target: page.target,
+        text: [...lines, ...(hint ? [hint] : [])].join("\n"),
+        hasOlder: page.hasOlder, hasNewer: page.hasNewer,
+        ...(seqs.length ? { oldestSeq: Math.min(...seqs), newestSeq: Math.max(...seqs) } : {}),
+      };
+    }
+    if (name === "search_messages") {
+      const strings = ["query", "target", "sender", "before", "after"] as const;
+      for (const field of strings) {
+        if (a[field] !== undefined && typeof a[field] !== "string") throw new Error(`${field} must be a string`);
+      }
+      if (a.sort !== undefined && a.sort !== "relevance" && a.sort !== "recent") throw new Error("sort must be relevance or recent");
+      const limit = integer(a.limit, "limit", 1, MAX_SEARCH);
+      const offset = integer(a.offset, "offset", 0, Number.MAX_SAFE_INTEGER);
+      const request = {
+        ...Object.fromEntries(strings.filter((f) => a[f] !== undefined).map((f) => [f, a[f] as string])),
+        ...(a.sort !== undefined ? { sort: a.sort as "relevance" | "recent" } : {}),
+        ...(limit !== undefined ? { limit } : {}), ...(offset !== undefined ? { offset } : {}),
+      };
+      // The SDK refuses a search with no query, target or sender itself, before any request.
+      const out = await raftFor(ctx).messages.search(request);
+      if (!out.ok) throw sdkFailure(out);
+      const { results, hasMore } = out.data;
+      const recent = request.sort === "recent";
+      const nextBefore = hasMore && recent ? results[results.length - 1]?.createdAt ?? null : null;
+      const nextOffset = hasMore && !recent ? (offset ?? 0) + results.length : null;
+      return {
+        text: searchText(out.text.trim(), out.data.query),
+        results: results.length,
+        hasMore,
+        ...(nextOffset !== null ? { nextOffset } : {}),
+        ...(typeof nextBefore === "string" ? { nextBefore } : {}),
+      };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);
