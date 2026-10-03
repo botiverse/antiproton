@@ -532,6 +532,295 @@ await check("join refuses DMs and thread targets before reaching Raft", async ()
   }
 });
 
+/** The Server's overview as `GET /internal/agent-api/server` answers it: the SDK pages its channels itself. */
+function server(channels: unknown[]) {
+  return json(200, {
+    runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels,
+    agents: [{ name: "other-agent", status: "online" }], humans: [{ name: "tygg", role: "owner" }],
+  });
+}
+const CHANNELS = [
+  { id: "c1", name: "general", joined: true, type: "channel", description: "Everyone" },
+  { id: "c2", name: "secret", joined: true, type: "private" },
+  { id: "c3", name: "eng", joined: false, type: "channel" },
+];
+
+await check("list_channels and channel_members are reads that repeat safely", async () => {
+  for (const name of ["list_channels", "channel_members"]) {
+    const tool = raftPlugin.tools.find((x) => x.name === name);
+    if (tool?.sideEffects !== "read" || tool.idempotency !== "native" || tool.replay !== undefined) {
+      throw new Error(`${name} declaration: ${JSON.stringify(tool)}`);
+    }
+  }
+});
+
+await check("list_channels passes offset and limit to the SDK and says how to get the next page in its own terms", async () => {
+  const calls = one(server(CHANNELS));
+  const first = await raftPlugin.invoke("list_channels", { limit: 2 }, ctx()) as any;
+  const lines = String(first.text).split("\n");
+  const want = [
+    "#general [public, joined] — Everyone",
+    "#secret [private, joined]",
+    "Showing 1-2 of 3.",
+    "More: call list_channels with offset 2, limit 2.",
+  ];
+  if (lines[0] !== "## Server Channels" || JSON.stringify(lines.slice(-4)) !== JSON.stringify(want)) throw new Error(`first page: ${first.text}`);
+  if (first.hasMore !== true || first.nextOffset !== 2 || first.total !== 3) throw new Error(JSON.stringify(first));
+  if (/raft server info/.test(first.text)) throw new Error(`names a CLI command this mount lacks: ${first.text}`);
+  if (/other-agent|tygg/.test(JSON.stringify(first))) throw new Error(`the server's member lists leaked: ${JSON.stringify(first)}`);
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/server" || calls[0]!.init.method !== "GET") throw new Error(`request: ${calls[0]!.url}`);
+
+  one(server(CHANNELS));
+  const last = await raftPlugin.invoke("list_channels", { offset: 2, limit: 2 }, ctx()) as any;
+  if (!String(last.text).endsWith("#eng [public, not joined]\nShowing 3-3 of 3.") || /#general|More:/.test(last.text) ||
+      last.hasMore !== false || "nextOffset" in last) {
+    throw new Error(`last page: ${JSON.stringify(last)}`);
+  }
+
+  one(server(CHANNELS));
+  const joined = await raftPlugin.invoke("list_channels", { joined: true, limit: 1 }, ctx()) as any;
+  if (!String(joined.text).endsWith("#general [public, joined] — Everyone\nShowing 1-1 of 2.\nMore: call list_channels with offset 1, limit 1, joined true.") ||
+      /#eng/.test(joined.text)) {
+    throw new Error(`joined only: ${joined.text}`);
+  }
+});
+
+await check("list_channels on a server with no visible channels says none, and that there is nothing more", async () => {
+  one(server([]));
+  const out = await raftPlugin.invoke("list_channels", {}, ctx()) as any;
+  if (!String(out.text).endsWith("(none)\nShowing 0-0 of 0.") || out.hasMore !== false || out.total !== 0 || /More:/.test(out.text)) {
+    throw new Error(JSON.stringify(out));
+  }
+});
+
+await check("list_channels refuses a bad page before reaching Raft", async () => {
+  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
+  for (const args of [{ offset: -1 }, { limit: 0 }, { limit: 201 }, { offset: 1.5 }, { joined: "yes" }]) {
+    const why = await failure(() => raftPlugin.invoke("list_channels", args, ctx()));
+    if (!/offset must|limit must|joined must/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+});
+
+await check("channel_members lists agents and humans with their role labels, asking for the channel named", async () => {
+  const calls = one(json(200, {
+    channel: { ref: "#launch-room", type: "channel" },
+    agents: [{ name: "piper", status: "online" }],
+    humans: [{ name: "tygg", role: "owner", description: "runs it" }, { name: "bo", role: "member" }],
+  }));
+  const out = await raftPlugin.invoke("channel_members", { target: "#launch-room" }, ctx()) as any;
+  const want = [
+    "## Channel Members", "", "Channel: #launch-room (channel)", "Members means join/post authority for this surface.", "",
+    "### Agents", "Server and stored channel roles are shown separately when available.", "  - @piper (online)", "",
+    "### Humans", "Server and stored channel roles are shown separately when available.", "  - @tygg (owner) — runs it", "  - @bo",
+  ];
+  if (out.target !== "#launch-room" || JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want)) throw new Error(out.text);
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/channel-members?channel=%23launch-room") throw new Error(`request: ${calls[0]!.url}`);
+  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
+  const why = await failure(() => raftPlugin.invoke("channel_members", { target: " " }, ctx()));
+  if (!/target is required/.test(why.message)) throw why;
+});
+
+await check("channel_members passes Raft's refusal on as a failure that landed nothing", async () => {
+  one(json(404, { error: "channel not found", code: "NOT_FOUND" }));
+  const why = await failure(() => raftPlugin.invoke("channel_members", { target: "#nowhere" }, ctx()));
+  if (why.mayHaveLanded === true || why.retryable === true) throw new Error(`a read claimed it may have landed: ${why.message}`);
+});
+
+/** One message of `GET /internal/agent-api/history` as the Server sends it. */
+function historyMessage(seq: number, content: string, extra: Record<string, unknown> = {}) {
+  return {
+    id: `m-${seq}cccccc`, seq, content, sender_type: "human", sender_name: "tygg", timestamp: "2026-09-28T10:00:00Z",
+    channel_name: "wg-raft-sdk", channel_type: "channel", ...extra,
+  };
+}
+function history(messages: unknown[], more: { has_older?: boolean; has_newer?: boolean; target?: string } = {}) {
+  return json(200, {
+    target: more.target ?? "#wg-raft-sdk", messages,
+    has_more: Boolean(more.has_older || more.has_newer), has_older: more.has_older ?? false, has_newer: more.has_newer ?? false,
+  });
+}
+const line = (seq: number, content: string) =>
+  `[target=#wg-raft-sdk msg=m-${seq}cccc time=2026-09-28 10:00:00Z type=human] @tygg: ${content}`;
+
+await check("read_messages and search_messages are reads that repeat safely", async () => {
+  for (const name of ["read_messages", "search_messages"]) {
+    const tool = raftPlugin.tools.find((x) => x.name === name);
+    if (tool?.sideEffects !== "read" || tool.idempotency !== "native" || tool.replay !== undefined) {
+      throw new Error(`${name} declaration: ${JSON.stringify(tool)}`);
+    }
+  }
+});
+
+await check("read_messages passes before and limit through, and says how to read older in its own terms", async () => {
+  const calls = one(history([historyMessage(41, "one"), historyMessage(42, "two", { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true }));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", before: 43, limit: 7 }, ctx()) as any;
+  const url = new URL(calls[0]!.url);
+  if (url.pathname !== "/internal/agent-api/history" || url.searchParams.get("channel") !== "#wg-raft-sdk" ||
+      url.searchParams.get("before") !== "43" || url.searchParams.get("limit") !== "7" ||
+      url.searchParams.has("after") || url.searchParams.has("around")) {
+    throw new Error(`request: ${calls[0]!.url}`);
+  }
+  // The attachment is said as receive_events says it, not as the CLI's `raft attachment view`.
+  const want = [line(41, "one"), `${line(42, "two")} [1 attachment: plan.pdf — this mount has no tool to open attachments]`, "Older exist: call read_messages with target #wg-raft-sdk, before 41."];
+  if (JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want)) throw new Error(`text: ${out.text}`);
+  if (/raft message read/.test(out.text)) throw new Error(`names a CLI command this mount lacks: ${out.text}`);
+  if (out.target !== "#wg-raft-sdk" || out.hasOlder !== true || out.hasNewer !== false || out.oldestSeq !== 41 || out.newestSeq !== 42) {
+    throw new Error(`cursors: ${JSON.stringify(out)}`);
+  }
+});
+
+await check("read_messages passes after through, and says how to read newer in its own terms", async () => {
+  const calls = one(history([historyMessage(78, "three")], { has_newer: true }));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 77 }, ctx()) as any;
+  const url = new URL(calls[0]!.url);
+  if (url.searchParams.get("after") !== "77" || url.searchParams.has("before") || url.searchParams.has("limit")) throw new Error(`request: ${calls[0]!.url}`);
+  const want = [line(78, "three"), "Newer exist: call read_messages with target #wg-raft-sdk, after 78."];
+  if (JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want) || out.hasNewer !== true) throw new Error(`text: ${out.text}`);
+});
+
+await check("read_messages passes around through, as a seq or a message id, into a thread target", async () => {
+  const calls = one(history([historyMessage(55, "in the thread")], { target: "#wg-raft-sdk:abcd1234" }));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk:abcd1234", around: 55 }, ctx()) as any;
+  const url = new URL(calls[0]!.url);
+  if (url.searchParams.get("channel") !== "#wg-raft-sdk:abcd1234" || url.searchParams.get("around") !== "55") throw new Error(`request: ${calls[0]!.url}`);
+  if (out.target !== "#wg-raft-sdk:abcd1234" || /exist:/.test(out.text) || out.hasOlder !== false || out.hasNewer !== false) {
+    throw new Error(JSON.stringify(out));
+  }
+  const byId = one(history([historyMessage(55, "in the thread")]));
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", around: "m-55cccccc" }, ctx());
+  if (new URL(byId[0]!.url).searchParams.get("around") !== "m-55cccccc") throw new Error(`request: ${byId[0]!.url}`);
+});
+
+await check("read_messages on an empty window says so, with no cursors", async () => {
+  one(history([]));
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 99 }, ctx()) as any;
+  if (out.text !== "No messages in #wg-raft-sdk." || out.hasOlder !== false || "oldestSeq" in out || "newestSeq" in out) {
+    throw new Error(JSON.stringify(out));
+  }
+});
+
+await check("read_messages refuses two cursors, a bad limit, and a bad cursor before reaching Raft", async () => {
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  for (const args of [{ before: 43, after: 12 }, { before: 43, around: 30 }, { after: 12, around: "m-1" }]) {
+    const why = await failure(() => raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", ...args }, ctx()));
+    if (!/at most one of before, after and around/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+  for (const args of [{ limit: 0 }, { limit: 201 }, { limit: 2.5 }, { before: -1 }, { after: "12" }, { around: "" }, { around: 1.5 }, { target: "" }]) {
+    const why = await failure(() => raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", ...args }, ctx()));
+    if (!/limit must|before must|after must|around must|target is required/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
+});
+
+/**
+ * A Server that holds a send into #wg-raft-sdk unless the send attests seq 42, the newest message there: what
+ * Raft does with the `seenUpToSeq` / `seenExactSeqs` the SDK attests from the mount's saved frontier.
+ */
+function freshnessServer(answers: { history?: Response; events?: Response }) {
+  const sends: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith("/history")) return answers.history!;
+    if (path.endsWith("/events")) return answers.events!;
+    const body = JSON.parse(String(init?.body));
+    sends.push(body);
+    const attested = (body.seenUpToSeq ?? 0) >= 42 || (body.seenExactSeqs ?? []).includes(42);
+    return attested
+      ? json(200, { ok: true, state: "sent", messageId: "m-sent", messageSeq: 43 })
+      : json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 41, omittedMessageCount: 0, freshnessContextMode: "inline",
+        heldMessages: [historyMessage(42, "wait, one more thing")] });
+  }) as any;
+  return sends;
+}
+
+await check("read_messages does not count as the model having seen a conversation: a send after it is still held", async () => {
+  // Called from run_js, a read's result may never reach the model, so it must not resolve the read-before-send
+  // question that only the model may answer. The Server's model-seen boundary is in the answer, as Raft sends it.
+  const m = mount();
+  const sends = freshnessServer({
+    history: json(200, { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
+      has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 }),
+  });
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk" }, m.ctx);
+  const out = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-read" }, m.ctx);
+  if (!(out instanceof Interrupt)) throw new Error(`the read let the send through: attested ${JSON.stringify({ upTo: sends[0]?.seenUpToSeq, exact: sends[0]?.seenExactSeqs })}`);
+  // Positive control: the same conversation handed over by receive_events is what the model reads, and that
+  // send goes through, so the fake Server above can tell the two apart.
+  const control = mount();
+  const controlSends = freshnessServer({
+    events: events([historyMessage(42, "wait, one more thing")], { last_seen_seq: 42 }),
+  });
+  await raftPlugin.invoke("receive_events", {}, control.ctx);
+  const sent = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-receive" }, control.ctx) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`control: receive_events did not attest: ${JSON.stringify(controlSends)}`);
+});
+
+/** One result of `GET /internal/agent-api/search` as the Server sends it. */
+function searchResult(n: number) {
+  return {
+    id: `r-${n}`, seq: n, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
+    parentChannelName: "wg-raft-sdk", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human",
+    senderName: "tygg", channelName: "wg-raft-sdk", channelType: "channel", channelArchivedAt: null,
+    content: "the launch plan is ready", snippet: "launch", createdAt: `2026-09-2${n}T10:00:00.000Z`,
+  };
+}
+
+await check("search_messages passes every parameter through and says how to page in its own terms", async () => {
+  const calls = one(json(200, { results: [searchResult(1), searchResult(2)], hasMore: true }));
+  const out = await raftPlugin.invoke("search_messages", {
+    query: "launch plan", target: "#wg-raft-sdk", sender: "tygg", sort: "relevance",
+    after: "2026-09-01T00:00:00Z", before: "2026-09-30T00:00:00Z", limit: 2, offset: 4,
+  }, ctx()) as any;
+  const p = new URL(calls[0]!.url).searchParams;
+  const sent = Object.fromEntries(p.entries());
+  const want = { q: "launch plan", channel: "#wg-raft-sdk", sender: "tygg", sort: "relevance", before: "2026-09-30T00:00:00Z", after: "2026-09-01T00:00:00Z", limit: "2", offset: "4" };
+  if (new URL(calls[0]!.url).pathname !== "/internal/agent-api/search" || JSON.stringify(sent, Object.keys(want).sort()) !== JSON.stringify(want, Object.keys(want).sort())) {
+    throw new Error(`request: ${calls[0]!.url}`);
+  }
+  const lines = String(out.text).split("\n");
+  if (lines[0] !== 'Search results for: "launch plan" (2 results · truncated=true · more results exist, call search_messages again with offset 6)') {
+    throw new Error(`head: ${lines[0]}`);
+  }
+  if (!lines.includes('<result ref="msg:r-1">') || !lines.includes("the <match>launch plan</match> is ready") || /--\w/.test(out.text)) {
+    throw new Error(`body: ${out.text}`);
+  }
+  if (out.results !== 2 || out.hasMore !== true || out.nextOffset !== 6 || "nextBefore" in out) throw new Error(JSON.stringify(out));
+});
+
+await check("search_messages sorted by recent pages by before, and a page at the cap names parameters, not flags", async () => {
+  one(json(200, { results: [searchResult(3)], hasMore: true }));
+  const recent = await raftPlugin.invoke("search_messages", { sender: "tygg", sort: "recent", limit: 1 }, ctx()) as any;
+  const head = String(recent.text).split("\n")[0]!;
+  if (!head.startsWith("Filtered message results (1 result · truncated=true · more results exist, call search_messages again with before 2026-09-23T10:00:00.000Z (pages OLDER only;") ||
+      recent.nextBefore !== "2026-09-23T10:00:00.000Z" || "nextOffset" in recent) {
+    throw new Error(JSON.stringify(recent));
+  }
+  one(json(200, { results: Array.from({ length: 3 }, (_, i) => searchResult(i + 1)), hasMore: false }));
+  const capped = await raftPlugin.invoke("search_messages", { query: "plan", limit: 3 }, ctx()) as any;
+  const cappedHead = String(capped.text).split("\n")[0]!;
+  if (!cappedHead.includes("exactly the limit 3 that was requested") || !cappedHead.endsWith("re-run with a higher limit to tell the two apart)") || /--/.test(cappedHead) || "nextOffset" in capped) {
+    throw new Error(cappedHead);
+  }
+});
+
+await check("search_messages with no results says so; without query, target or sender it is refused before reaching Raft", async () => {
+  one(json(200, { results: [], hasMore: false }));
+  const out = await raftPlugin.invoke("search_messages", { query: "nothing like it" }, ctx()) as any;
+  if (out.text !== "No search results. (truncated=false)" || out.results !== 0 || out.hasMore !== false || "nextOffset" in out) throw new Error(JSON.stringify(out));
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const refusals: Array<[Record<string, unknown>, RegExp]> = [
+    [{}, /query, or filter by target or sender/], [{ query: "x", limit: 51 }, /limit must/], [{ query: "x", limit: 0 }, /limit must/],
+    [{ query: "x", offset: -1 }, /offset must/], [{ query: "x", sort: "oldest" }, /sort must/], [{ query: 5 }, /query must/],
+  ];
+  for (const [args, reason] of refusals) {
+    const why = await failure(() => raftPlugin.invoke("search_messages", args, ctx()));
+    if (!reason.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
+});
+
 await check("the mount setting cannot redirect a credential to a path or embedded user", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
   for (const serverUrl of ["https://evil.example/path", "https://user@evil.example", "file:///tmp/socket"]) {
