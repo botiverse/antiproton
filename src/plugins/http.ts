@@ -41,7 +41,7 @@ export interface HttpConfig {
 /**
  * Whether `hostname`, as `URL` writes it, names somewhere inward by
  * construction: loopback, link-local, private or shared address space, or a
- * name reserved for a local network. The cloud metadata address
+ * name reserved for a local network, or a name with no dot at all. The cloud metadata address
  * (169.254.169.254) is the one most worth refusing. `URL` has already turned
  * every IPv4 spelling (`0x7f.1`, `2130706433`) into dotted decimal, so only
  * that form is read. A public name that resolves inward is not seen here;
@@ -49,7 +49,10 @@ export interface HttpConfig {
  */
 export function internalHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, "");
-  if (h === "localhost" || /\.(localhost|local|internal)$/.test(h)) return true;
+  if (/(^|\.)(localhost|local|internal)$/.test(h)) return true;
+  // A name with no dot is only ever found through a local search domain
+  // (`internal`, `metadata`); no public server is reached that way.
+  if (!h.startsWith("[") && !h.includes(".")) return true;
   if (h.startsWith("[")) {
     const v6 = h.slice(1, -1);
     if (v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6)) return true;

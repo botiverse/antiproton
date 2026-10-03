@@ -188,7 +188,7 @@ await check("an inward host is refused when the mount is written and again when 
   // Each as `URL` writes it: the decimal, hex and IPv4-in-IPv6 spellings arrive here already normalised.
   for (const u of ["https://169.254.169.254/mcp", "https://10.1.2.3/mcp", "https://172.20.0.1/mcp", "https://192.168.0.9/mcp",
     "https://127.0.0.1/mcp", "https://2130706433/mcp", "https://0x7f.1/mcp", "https://100.64.0.1/mcp", "https://0.0.0.0/mcp",
-    "https://localhost/mcp", "https://a.localhost/mcp", "https://svc.internal/mcp", "https://printer.local/mcp",
+    "https://localhost/mcp", "https://a.localhost/mcp", "https://internal/mcp", "https://local/mcp", "https://metadata/mcp", "https://svc.internal/mcp", "https://printer.local/mcp",
     "https://[::1]/mcp", "https://[fd00::1]/mcp", "https://[fe80::1]/mcp", "https://[::ffff:10.0.0.1]/mcp", "https://[::ffff:169.254.169.254]/mcp"]) {
     must(/public host/.test(serverUrlProblem(u) ?? ""), `${u} was not refused as inward: ${serverUrlProblem(u)}`);
     must(mcpConfigProblem({ url: u }) !== undefined, `${u} passed the mount-time check`);
