@@ -32,6 +32,12 @@ export interface BenchPollBody {
   status: "running" | "idle";
   /** How many entries the transcript has — kept because it is what the runner's logs have always printed. */
   entries: number;
+  /**
+   * Background jobs of the agent still running. An agent can reply with text alone while one runs ("waiting
+   * for the queued commands") and be woken by its result later, so idle with a job out is not finished: the
+   * runner takes an answer only when this is 0 (bench/poll-fallback.ts `verdictFromEvidence`).
+   */
+  background: number;
   /** The last answer, when the object is idle: what a lost push would have delivered. */
   answer: string | null;
   /** The highest sequence for each kind the decision compares; -1 when that kind is not there. */
@@ -39,13 +45,14 @@ export interface BenchPollBody {
   tail: Array<{ seq: number; kind: string }>;
 }
 
-export function benchPollBody(events: readonly PollEvent[], running: boolean): BenchPollBody {
+export function benchPollBody(events: readonly PollEvent[], running: boolean, background: number): BenchPollBody {
   const last = (kind: string) => events.reduce((m, e) => (e.kind === kind && e.sequence > m ? e.sequence : m), -1);
   const answered = [...events].reverse()
     .find((e) => e.kind === "model.response" && !(e.payload as { toolCalls?: unknown } | undefined)?.toolCalls);
   return {
     status: running ? "running" : "idle",
     entries: events.length,
+    background,
     answer: running ? null : ((answered?.payload as { text?: unknown } | undefined)?.text as string ?? null),
     last: { message: last("message"), response: last("model.response"), failed: last("model.failed") },
     tail: events.slice(-POLL_TAIL).map((e) => ({ seq: e.sequence, kind: e.kind })),

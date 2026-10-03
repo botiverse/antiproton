@@ -26,7 +26,7 @@ const turn: PollEvent[] = [
   { sequence: 193, kind: "model.response", payload: said("Your exchange has been submitted.") },
 ];
 /** The body the endpoint would answer with, for these events. */
-const wire = (events: PollEvent[], running = false): Poll => benchPollBody(events, running);
+const wire = (events: PollEvent[], running = false, background = 0): Poll => benchPollBody(events, running, background);
 
 await check("the lost final answer is taken from poll (the stalled trial: answered at seq 193, socket stopped at 71)", () => {
   const d = decideFromPoll(wire(turn), 71);
@@ -136,6 +136,19 @@ await check("a poll that fails, or none at all, claims nothing rather than an id
     assert(threw.stall === "unknown" && threw.stallWhy.status === null, `a poll that threw: ${threw.stall}`);
     assert(empty.stall === "unknown" && empty.stallWhy.status === null, `no poll at all: ${empty.stall}`);
   });
+});
+
+await check("a text reply with a background job out is a pause, not an answer, and a stall then is an agent still working", () => {
+  // The production pause: the agent said it was waiting on its jobs, the object went idle, a job was out.
+  const paused = wire(turn, false, 1);
+  assert(decideFromPoll(paused, 0) === null, `taken as answered with a job out: ${JSON.stringify(decideFromPoll(paused, 0))}`);
+  assert(stallCause(paused, 0) === "still_running", `a stall with a job out: ${stallCause(paused, 0)}`);
+  assert(stallEvidence(paused, 0).background === 1, "the evidence dropped the job count it was decided from");
+  // The same body with nothing out is the answer, so the count is what refused it.
+  assert(decideFromPoll(wire(turn, false, 0), 0)?.kind === "answer", "with no job out, the answer was not taken");
+  // A model call that failed is a failure whether or not a job is out.
+  const failedWithJob = wire([{ sequence: 4, kind: "message" }, { sequence: 9, kind: "model.failed" }], false, 1);
+  assert(decideFromPoll(failedWithJob, 4)?.kind === "failed", "a failed model call with a job out was not a failure");
 });
 
 for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"} - ${r.name}${r.error ? `\n    ${r.error}` : ""}`);

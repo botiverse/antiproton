@@ -90,7 +90,7 @@ check("an ignored answer must not move the cursor — asked of the runner's own 
 check("what the fallback then reads, with the real decision functions", () => {
   // The consequence of the case above, end to end: cursor left alone => the deadline sees an answer
   // nobody took; cursor moved => it reads as delivered and the name is wrong.
-  const body = benchPollBody(turn, false);
+  const body = benchPollBody(turn, false, 0);
   assert(causeFromEvidence(stallEvidence(body, 4)) === "answer_undelivered", "the name this injection exists for");
   assert(causeFromEvidence(stallEvidence(body, 9)) === "idle_without_answer", "the defeat it must avoid");
 });
