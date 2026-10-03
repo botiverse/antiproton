@@ -74,12 +74,15 @@ export function personaOf(config: unknown): { name?: string; description?: strin
  * which hands a program's own options in, and the gateway reads `approved` as
  * "a person already said yes" and `operationId` as "this is that operation".
  * Both are set by the gateway's own approval path (`applyApproval`), which does
- * not come through here.
+ * not come through here. `fromProgram` (only ever true) is forwarded too: run_js
+ * sets it on every call it makes, after the program's options, and the gateway
+ * refuses a `modelOnly` tool on it — dropped here, that refusal never fires.
  */
 export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeOpts {
-  const o = (call.opts ?? {}) as { confirm?: unknown; idempotencyKey?: unknown };
+  const o = (call.opts ?? {}) as { confirm?: unknown; idempotencyKey?: unknown; fromProgram?: unknown };
   return {
     ...(o.confirm === true ? { confirm: true } : {}),
+    ...(o.fromProgram === true ? { fromProgram: true } : {}),
     ...(typeof o.idempotencyKey === "string" ? { idempotencyKey: o.idempotencyKey } : {}),
     ...(call.callId === undefined ? {} : { callId: call.callId }),
   };

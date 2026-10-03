@@ -142,10 +142,11 @@ await check("a direct model call on the approval mount is held, and the person's
   must(ok.ok && ok.executed && w.ran.length === 1, `approval did not run it: ${JSON.stringify(ok)}`);
 });
 
-await check("the production host forwards confirm, idempotencyKey and callId, and drops approved and operationId", async () => {
-  const o = hostCallOpts({ opts: { confirm: true, idempotencyKey: "k:0", approved: true, operationId: "op_x", extra: 1 }, callId: "c" });
-  must(JSON.stringify(o) === '{"confirm":true,"idempotencyKey":"k:0","callId":"c"}', `forwarded ${JSON.stringify(o)}`);
+await check("the production host forwards confirm, fromProgram, idempotencyKey and callId, and drops approved and operationId", async () => {
+  const o = hostCallOpts({ opts: { confirm: true, fromProgram: true, idempotencyKey: "k:0", approved: true, operationId: "op_x", extra: 1 }, callId: "c" });
+  must(JSON.stringify(o) === '{"confirm":true,"fromProgram":true,"idempotencyKey":"k:0","callId":"c"}', `forwarded ${JSON.stringify(o)}`);
   must(JSON.stringify(hostCallOpts({ opts: { confirm: "yes" } })) === "{}", "a confirm that is not true was forwarded");
+  must(JSON.stringify(hostCallOpts({ opts: { fromProgram: "yes" } })) === "{}", "a fromProgram that is not true was forwarded");
   must(JSON.stringify(hostCallOpts({})) === "{}", "no options");
 });
 
@@ -153,6 +154,31 @@ await check("through the production host's filter, approved: true on an approval
   const w = await world();
   const r = await w.gw.invoke(CTX, "ops.deploy", {}, hostCallOpts({ opts: { approved: true }, callId: "c" }));
   must(r.status === "pending" && w.ran.length === 0, `not held: ${JSON.stringify(r)}`);
+});
+
+await check("through the production host's filter, a program's call to a modelOnly tool is still refused", async () => {
+  // run_js's own options, as it hands them to the host (src/runtime/pi-tools.ts `runJsTool`).
+  const ran: string[] = [];
+  const plugin: Plugin = {
+    id: "inbox", version: "1.0.0",
+    tools: [
+      { name: "pull", description: "", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none", modelOnly: true },
+    ] as any,
+    async invoke(tool) { ran.push(tool); return { ran: tool }; },
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "box", plugin: "inbox", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: {},
+  });
+  const gw = new ToolGateway(store, [plugin], new Set(["inbox"]), { async resolve() { return null; } });
+  const refused = await gw.invoke(CTX, "inbox.pull", {}, hostCallOpts({ opts: { idempotencyKey: "c:0", fromProgram: true }, callId: "c" }));
+  must(refused.status === "rejected" && (refused as any).error?.code === "not_from_a_program" && ran.length === 0, `not refused: ${JSON.stringify(refused)}`);
+  // The model's own call, which run_js does not mark, runs.
+  const ok = await gw.invoke(CTX, "box.pull", {}, hostCallOpts({ opts: { idempotencyKey: "m:0" }, callId: "m" }));
+  must(ok.status === "succeeded" && ran.length === 1, `the model's call did not run: ${JSON.stringify(ok)}`);
 });
 
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
