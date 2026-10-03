@@ -86,25 +86,43 @@ async function runtime(opts: { kek?: boolean } = {}) {
 const form = (url: string, extra: Record<string, string> = {}) => ({ url, ...extra });
 const noHooks = { list: async () => [] };
 
-await check("only mcp reads owner secrets: every plugin file but types.ts that names ownerSecret is exactly [mcp.ts]", async () => {
+// Who can reach an owner's secret, one property per case so a red names which one broke.
+const pluginsDir = new URL("../src/plugins/", import.meta.url);
+async function pluginFilesMatching(re: RegExp): Promise<string[]> {
   const { readdirSync, readFileSync } = await import("node:fs");
-  const dir = new URL("../src/plugins/", import.meta.url);
-  const readers = (readdirSync(dir, { recursive: true }) as string[])
-    .filter((f) => f.endsWith(".ts") && f !== "types.ts" && readFileSync(new URL(f, dir), "utf8").includes("ownerSecret"))
+  return (readdirSync(pluginsDir, { recursive: true }) as string[])
+    .filter((f) => f.endsWith(".ts") && f !== "types.ts" && re.test(readFileSync(new URL(f, pluginsDir), "utf8")))
     .sort();
-  // Exact, so an empty list (a pattern that matches nothing) fails as surely as a second reader.
+}
+/** Each entry of the deployment's plugin list, as written in cf/src/runtime.ts. */
+async function deployedPluginEntries(): Promise<string[]> {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
+  const list = /plugins\.push\(\n([\s\S]*?)\n\s*\);/.exec(src);
+  must(list, "cf/src/runtime.ts has no plugins.push( list; this test reads the deployment's plugins from it");
+  return list![1]!.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("//"));
+}
+
+// Exact lists below, so a pattern that matches nothing fails as surely as a second member.
+await check("only mcp.ts, of the plugin files but types.ts, names ownerSecret", async () => {
+  const readers = await pluginFilesMatching(/ownerSecret/);
   must(show(readers) === show(["mcp.ts"]), `plugins that read owner secrets: ${show(readers)}; ownerSecret is only for a value sent where a mount's settings say (PluginContext.ownerSecret)`);
-  // The grant itself (`Plugin.readsOwnerSecrets`), which is what the gateway reads.
-  const granted = (readdirSync(dir, { recursive: true }) as string[])
-    .filter((f) => f.endsWith(".ts") && f !== "types.ts" && /readsOwnerSecrets\s*:\s*true/.test(readFileSync(new URL(f, dir), "utf8")))
-    .sort();
+});
+
+await check("only mcp declares readsOwnerSecrets, the grant the gateway reads", async () => {
+  const granted = await pluginFilesMatching(/readsOwnerSecrets\s*:\s*true/);
   must(show(granted) === show(["mcp.ts"]), `plugins that declare readsOwnerSecrets: ${show(granted)}`);
-  // The one way round the grant: holding the sealed store itself. Only `state`, whose tools read `kept:` alone.
-  const holders = (readdirSync(dir, { recursive: true }) as string[])
-    .filter((f) => f.endsWith(".ts") && /from\s+["']\.\.\/runtime\/secrets\.ts["']/.test(readFileSync(new URL(f, dir), "utf8")))
-    .sort();
-  must(show(holders) === show(["state.ts"]), `plugins that import the sealed store: ${show(holders)}; only state may, and only under kept: (Plugin.readsOwnerSecrets)`);
-  must(!/OWNER_PREFIX/.test(readFileSync(new URL("state.ts", dir), "utf8")), "state.ts names OWNER_PREFIX; its tools read only kept: (Plugin.readsOwnerSecrets)");
+});
+
+await check("only statePlugin is handed the sealing key, only it and builtin the raw store, and state.ts never names the owner's prefix", async () => {
+  // The key, not an import, is what decrypts: read where the deployment hands it out.
+  const entries = await deployedPluginEntries();
+  const keyed = entries.filter((e) => /kek/i.test(e)).map((e) => e.split("(")[0]);
+  must(show(keyed) === show(["statePlugin"]), `plugins handed the sealing key: ${show(keyed)}; only state may, and only under kept: (Plugin.readsOwnerSecrets)`);
+  const stores = entries.filter((e) => /this\.store\b/.test(e)).map((e) => e.split("(")[0]);
+  must(show(stores) === show(["statePlugin", "builtinToolsPlugin"]), `plugins handed the raw store: ${show(stores)}; with it, a plugin can list owner-secret names (Plugin.readsOwnerSecrets)`);
+  const { readFileSync } = await import("node:fs");
+  must(!/OWNER_PREFIX/.test(readFileSync(new URL("state.ts", pluginsDir), "utf8")), "state.ts names OWNER_PREFIX; its tools read only kept: (Plugin.readsOwnerSecrets)");
 });
 
 await check("configFromForm: lines with blanks dropped, a number via Number(), blank means absent, strings trimmed", () => {
