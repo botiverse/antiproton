@@ -2214,15 +2214,17 @@ ${installed.length ? installed.map(pluginBlock).join("") : `<div class="empty">n
  */
 function mountAddSection(d: any): string {
   const addable: any[] = (d.installed ?? []).filter((p: any) => p.addable === true);
-  const cap = 8;
+  const cap = typeof d.consoleMountsMax === "number" ? d.consoleMountsMax : 8;
   const added = (d.mounts ?? []).filter((m: any) => m.fromConsole === true).length;
   if (!addable.length) return `<div class="empty">nothing here can be added from the console</div>`;
   const full = added >= cap;
+  // `required` renders only when the declaration says true: an optional setting
+  // leaves the key out entirely, and absence must not read as required.
   const field = (c: any) => {
-    const label = `<span>${esc(c.name)}${c.required === false ? " <i>(optional)</i>" : ""}</span>`;
+    const label = `<span>${esc(c.name)}${c.required === true ? "" : " <i>(optional)</i>"}</span>`;
     if (c.type === "string[]") return `<label>${label}<textarea name="${esc(c.name)}" rows="3" autocomplete="off" spellcheck="false" placeholder="one value per line"></textarea></label>`;
     if (c.type === "number") return `<label>${label}<input type="number" name="${esc(c.name)}" autocomplete="off"></label>`;
-    return `<label>${label}<input type="text" name="${esc(c.name)}"${c.required === false ? "" : " required"} autocomplete="off" spellcheck="false"></label>`;
+    return `<label>${label}<input type="text" name="${esc(c.name)}"${c.required === true ? " required" : ""} autocomplete="off" spellcheck="false"></label>`;
   };
   return `<div class="hint" style="padding:0 0 4px">${added} of ${cap} added this way.</div>` + addable.map((p: any) => `
   <form class="mount-add" hx-post="/ui/mount/add" hx-target="closest .plugins-root" hx-swap="innerHTML">

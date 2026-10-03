@@ -525,27 +525,29 @@ check("a refused seed reconcile shows on the mount block, and only while it stan
 check("adding a mount from the console: one form per addable plugin, fields from its own config", () => {
   // The contract (cody, #core:efe60db4): POST /ui/mount/add takes plugin, alias, and one
   // field per config entry; string[] from textarea lines, number may be empty; only
-  // plugins the deployment marks addable are offered; 8 console-added mounts is the cap.
+  // plugins the deployment marks addable are offered; the cap arrives as consoleMountsMax.
   const installed = [
     { id: "mcp", version: "1", tools: [], config: [
-      { name: "url", type: "string", summary: "server URL" },
+      { name: "url", type: "string", required: true, summary: "server URL" },
+      { name: "label", type: "string", summary: "a note" },
       { name: "headers", type: "string[]", summary: "extra headers" },
       { name: "timeout", type: "number", summary: "seconds" }], credential: null, addable: true },
     { id: "github", version: "2", tools: [], config: [], credential: null },
   ];
-  const d = { installed, mounts: [], used: {} };
+  const d = { installed, mounts: [], used: {}, consoleMountsMax: 3 };
   const html = plugins(d);
   must(/<form class="mount-add" hx-post="\/ui\/mount\/add"/.test(html), "the add form posts to /ui/mount/add");
   must(/name="plugin" value="mcp"/.test(html), "the form names its plugin");
   must(/name="alias"/.test(html), "an alias field rides along");
-  must(/<input type="text" name="url" required/.test(html), "a string field is a required text input");
+  must(/<input type="text" name="url" required/.test(html), "a required string field says so");
+  must(/<input type="text" name="label"(?! required)/.test(html.replace(/\n/g, " ")), "a setting that leaves required out is optional, not required");
   must(/<textarea name="headers" rows="3"/.test(html), "a string[] field is a textarea");
   must(/<input type="number" name="timeout"/.test(html.replace(/\n/g, " ")), "a number field is a number input");
   const addForms = [...html.matchAll(/<form class="mount-add"[\s\S]*?<\/form>/g)].map((m) => m[0]);
   must(addForms.length === 1 && !/name="plugin" value="github"/.test(addForms[0]!), "a plugin not marked addable gets no form");
-  must(/0 of 8 added this way\./.test(html), "the cap is stated");
-  const full = plugins({ installed, mounts: Array.from({ length: 8 }, (_, i) => ({ alias: `m${i}`, plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: [], fromConsole: true })), used: {} });
-  must(/8 of 8 added this way\./.test(full) && /disabled title="8 console-added mounts is the most"/.test(full.replace(/\n/g, " ")),
+  must(/0 of 3 added this way\./.test(html), "the cap is the payload's, not the page's own");
+  const full = plugins({ installed, mounts: Array.from({ length: 3 }, (_, i) => ({ alias: `m${i}`, plugin: "mcp", version: "1", connected: true, config: {}, problems: [], tools: [], fromConsole: true })), used: {}, consoleMountsMax: 3 });
+  must(/3 of 3 added this way\./.test(full) && /disabled title="3 console-added mounts is the most"/.test(full.replace(/\n/g, " ")),
     "at the cap the button disables and says why");
 });
 
