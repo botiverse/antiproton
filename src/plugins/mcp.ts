@@ -159,10 +159,16 @@ function maskSchema(t: ToolSchema, kept: Map<string, string>): ToolSchema {
  * Every string in a JSON value, keys included, with kept secrets masked. On the
  * parsed value, never the JSON text: there a secret with a quote or a backslash
  * in it is written escaped and no longer matches, and a mask landing across the
- * text's syntax could leave it unparseable.
+ * text's syntax could leave it unparseable. A number or a boolean is read as the
+ * text it prints as, so a digits-only secret in a `default` is masked too — and
+ * becomes a string, since the mask is one.
  */
 function maskJson(v: Json, kept: Map<string, string>): Json {
   if (typeof v === "string") return hideSecrets(v, kept);
+  if (typeof v === "number" || typeof v === "boolean") {
+    const masked = hideSecrets(String(v), kept);
+    return masked === String(v) ? v : masked;
+  }
   if (Array.isArray(v)) return v.map((x) => maskJson(x, kept));
   if (v && typeof v === "object") {
     return Object.fromEntries(Object.entries(v).map(([k, x]) => [hideSecrets(k, kept), maskJson(x as Json, kept)]));

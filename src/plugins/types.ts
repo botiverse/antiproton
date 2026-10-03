@@ -1699,7 +1699,10 @@ export interface Plugin {
    * the mount's settings name, never one a tool call's arguments name. The grant
    * is per plugin rather than on every context so that the rule is a decision
    * someone makes where the plugin is defined, not a comment a new reader has to
-   * find: a plugin that never declared it has nothing to misuse.
+   * find: a plugin that never declared it has nothing to misuse. One plugin
+   * reaches the sealed store without it: `state` holds the raw store and the key
+   * because it is the store's own surface, and its tools only ever read `kept:`
+   * (test/console-mounts.ts keeps it the only plugin file importing the store).
    */
   readsOwnerSecrets?: true;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */

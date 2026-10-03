@@ -198,9 +198,13 @@ export async function fillSecrets(spec: string, kept: Map<string, string>, ctx: 
  * verbatim: a server that encodes the value (URL, JSON escapes, base64) is not
  * recognised, so this narrows the leak and does not close it. Values shorter
  * than four characters are left alone, or every `a` in a page would be a secret.
+ * Longest first: a value that contains another is longer than it, so the
+ * container is always masked before the part could split it — the whole
+ * containment case, not a usual one. In insertion order the shorter could go
+ * first and leave the rest of the longer in the text.
  */
 export function hideSecrets(text: string, kept: Map<string, string>): string {
-  return [...kept].reduce(
+  return [...kept].sort(([, a], [, b]) => b.length - a.length).reduce(
     (t, [name, value]) => (value.length >= 4 ? t.split(value).join(`[secret ${name}]`) : t), text);
 }
 
