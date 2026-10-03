@@ -16,7 +16,7 @@
  * same container the agent worked in, before the runner hands the container
  * back. The object holds the container open across the agent's finish for
  * exactly that reason, and never offers the agent the tool that would
- * destroy the evidence (`node.release`).
+ * destroy the evidence (`sandbox.release`).
  *
  * What only this runner can report: how long the object itself was billed,
  * and how much of the wall clock the container existed for.
@@ -30,6 +30,7 @@ import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild } from "../record.ts";
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
+import { SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -101,7 +102,7 @@ const imageFor = (id: string) =>
 
 const POLICY = `
 You are fixing a bug in a Python repository checked out at /testbed.
-Use node.shell to explore and edit it — that is a real machine with git, python and the test suite.
+Use the ${SANDBOX_ALIAS} mount's shell tool to explore and edit it — that is a real machine with git, python and the test suite.
 Work in small steps: read the failing code first, then make the smallest change that fixes it.
 Do not modify test files; the graders supply their own.
 When the fix is in place, say so and stop.
@@ -254,7 +255,7 @@ async function runOne(inst: Instance) {
       failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
     };
   } finally {
-    const release: any = await post("/bench/swe/release", { taskId }, undefined, obj).catch((e) => ({ failed: [{ alias: "sandbox", error: String(e) }] }));
+    const release: any = await post("/bench/swe/release", { taskId }, undefined, obj).catch((e) => ({ failed: [{ alias: SANDBOX_ALIAS, error: String(e) }] }));
     for (const f of release?.failed ?? []) {
       console.log(`      \x1b[31mrelease failed: ${f.alias}: ${f.error}\x1b[0m`);
     }

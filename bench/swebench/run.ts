@@ -34,7 +34,7 @@ import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { runJsTool, bridgeTools, type MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
-import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
+import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import { isExclusive } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
@@ -91,7 +91,7 @@ const model = new OpenAiCompatibleModel({
 
 const POLICY = `
 You are fixing a bug in a Python repository checked out at /testbed.
-Use node.shell to explore and edit it — that is a real machine with git, python and the test suite.
+Use the ${SANDBOX_ALIAS} mount's shell tool to explore and edit it — that is a real machine with git, python and the test suite.
 Work in small steps: read the failing code first, then make the smallest change that fixes it.
 Do not modify test files; the graders supply their own.
 When the fix is in place, say so and stop.
@@ -149,7 +149,7 @@ async function runOne(inst: Instance) {
 
   const plugins: Plugin[] = [sandboxPlugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
   await store.addMount({
-    tenantId: T, agentId: AGENT, alias: "sandbox", plugin: "sandbox",
+    tenantId: T, agentId: AGENT, alias: SANDBOX_ALIAS, plugin: "sandbox",
     installationId: "i-node", connectionId: null, toolVersion: "1.0.0",
     publicConfig: {
       image: imageFor(inst.instance_id), workdir: "/testbed", shape: "2c4g", timeoutMs: 300_000,
@@ -195,7 +195,7 @@ async function runOne(inst: Instance) {
    *
    * The runner owns the container's lifetime, so the agent is not offered it.
    */
-  const OWNED_BY_THE_RUNNER = new Set(["node.release"]);
+  const OWNED_BY_THE_RUNNER = new Set([`${SANDBOX_ALIAS}.release`]);
   const tools: MountedTool[] = mounted.flatMap((m) =>
     (byId.get(m.plugin)?.tools ?? []).map((t) => ({
       name: t.name, description: t.summary, parameters: t.parameters,
@@ -265,7 +265,7 @@ async function runOne(inst: Instance) {
   const p2p: string[] = JSON.parse(inst.PASS_TO_PASS);
   const grade = async (ids: string[]) => {
     if (!ids.length) return { ok: true, out: "(none)" };
-    const res: any = await gw.invoke(ctx, "node.shell", {
+    const res: any = await gw.invoke(ctx, `${SANDBOX_ALIAS}.shell`, {
       command:
         `cd /testbed && echo '${b64(inst.test_patch)}' | base64 -d > /tmp/test.patch && ` +
         `git checkout -- $(git diff --name-only -- '*test*' 2>/dev/null) 2>/dev/null; ` +
@@ -276,7 +276,7 @@ async function runOne(inst: Instance) {
     const tail = out.split("\n").slice(-3).join(" ");
     return { ok: /\d+ passed/.test(tail) && !/\d+ (failed|error)/.test(tail), out };
   };
-  const diffRes: any = await gw.invoke(ctx, "node.shell",
+  const diffRes: any = await gw.invoke(ctx, `${SANDBOX_ALIAS}.shell`,
     { command: "cd /testbed && git diff --stat | tail -3" });
   const fail = await grade(f2p.slice(0, 12));
   const pass = await grade(p2p.slice(0, 12));
@@ -319,7 +319,7 @@ async function runOne(inst: Instance) {
 
   // Read after release: a session is written into the mount's connection state
   // when the box is handed back, precisely so the meter outlives the box.
-  const meter = await readMeter(store, T, AGENT, ["sandbox"], Date.now() - t0, {
+  const meter = await readMeter(store, T, AGENT, [SANDBOX_ALIAS], Date.now() - t0, {
     promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
   });
 

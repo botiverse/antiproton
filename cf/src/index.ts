@@ -45,6 +45,7 @@ import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { pluginEnabled, toolsOf, type Plugin } from "../../src/plugins/types.ts";
+import { SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { skippedToolNotes } from "../../src/runtime/mount-tools.ts";
 
 /** What the plugins page is handed about each mount; declared and checked in cf/src/mount-reports.ts. */
@@ -878,7 +879,7 @@ export class AgentDO extends DurableObject<Env> {
       // agent is never offered the tool that destroys it, and a settled run
       // does not hand the machine back on its own: the runner does, after
       // grading, through benchSweRelease — and owns the bill if it forgets.
-      withholdTools: swe ? ["node.release"] : undefined,
+      withholdTools: swe ? [`${SANDBOX_ALIAS}.release`] : undefined,
       autoRelease: !swe,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
@@ -943,7 +944,7 @@ export class AgentDO extends DurableObject<Env> {
       // The machine, from the instance's own image. Config is per mount, so a
       // different repository is a different mount record, not different code.
       await rt.store.addMount({
-        tenantId: "bench", agentId, alias: "sandbox", plugin: "sandbox",
+        tenantId: "bench", agentId, alias: SANDBOX_ALIAS, plugin: "sandbox",
         installationId: "inst-node", connectionId: null,
         toolVersion: rt.pluginVersion("sandbox") ?? "1.0.0",
         publicConfig: {
@@ -973,7 +974,7 @@ export class AgentDO extends DurableObject<Env> {
       const rt = this.#activeRuntime();
       await rt.ready();
       return rt.gateway().invoke(
-        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, "node.shell", { command });
+        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, `${SANDBOX_ALIAS}.shell`, { command });
     });
   }
 
@@ -1020,7 +1021,7 @@ export class AgentDO extends DurableObject<Env> {
       e.type === "message" && e.message?.role === "toolResult").length;
     const toolErrors = entries.filter((e: any) =>
       e.type === "message" && e.message?.role === "toolResult" && e.message.isError).length;
-    const meter = await readMeter(rt.store as any, "bench", agentId, ["sandbox"], wallMs, {
+    const meter = await readMeter(rt.store as any, "bench", agentId, [SANDBOX_ALIAS], wallMs, {
       promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
     });
     return { taskId, usage, byTool, modelTurns, toolTurns, toolErrors, entries: entries.length, meter };

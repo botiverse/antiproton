@@ -107,6 +107,7 @@
     "test/pd-object-reads.ts",
     "test/spec/pd-writes-spec.ts",
     "test/usage-flush.ts",
-    "test/bench-pd.ts"
+    "test/bench-pd.ts",
+    "test/bench-swe.ts"
   ]
 }

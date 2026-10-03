@@ -26,6 +26,7 @@ import {
 import {
   bridgeTools, offeredToolName, offersPlugin, offersCapability, qualifyMountedTools, resumeTool, runJsTools, type MountedTool,
   withholdTools,
+  refuseWithheld,
 } from "../../src/runtime/pi-tools.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
 import { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
@@ -134,7 +135,7 @@ import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
 import { keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, statePlugin } from "../../src/plugins/state.ts";
-import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
+import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
 import { raftPlugin } from "../../src/plugins/raft.ts";
@@ -448,9 +449,13 @@ export interface RuntimeDeps {
    * Mount-qualified addresses the model is never offered.
    *
    * For a benchmark whose grader runs after the agent in the same container:
-   * `node.release` says it destroys the box and stops the meter, so an agent
+   * `sandbox.release` says it destroys the box and stops the meter, so an agent
    * tidying up calls it — rightly, in production — and the grader then scores
    * a fresh box from the base image. The runner owns that lifetime instead.
+   *
+   * Withheld twice: left out of the catalogue both engines are offered, and
+   * refused where both engines dispatch (`#host`), because run_js passes a
+   * dotted address straight through and so could still name it.
    */
   withholdTools?: string[];
   /**
@@ -1249,6 +1254,7 @@ export class AgentRuntime {
     heldOn: (alias: string) => Promise<string | null> = async () => null,
   ) {
     const readBack = reader?.name ?? null;
+    const withheld = new Set(this.#deps.withholdTools ?? []);
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
@@ -1340,6 +1346,8 @@ export class AgentRuntime {
        * parked into storage along with the body the model cannot see.
        */
       async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
+        const refused = refuseWithheld(call.tool, withheld);
+        if (refused) return refused;
         return held(call.tool, await dispatch(call));
       },
       /** The model's answer to a tool's question (pi-tools.ts `resume`), finished as a call's result is. */
@@ -1403,7 +1411,7 @@ export class AgentRuntime {
     // themselves as a last resort so the agent reaches for free in-process
     // JS first, and the framework releases the box once the agent has no
     // conversation with work open (the scope is the agent, not a task).
-    { alias: "sandbox", plugin: "sandbox", config: { account: "container" },
+    { alias: SANDBOX_ALIAS, plugin: "sandbox", config: { account: "container" },
       secretRef: OPERATOR_RUN9_REF, policy: null },
     // The agent's own store. Deliberately not behind approval: an agent
     // that must ask a person before writing a note will not keep notes, and
