@@ -1012,7 +1012,14 @@ export function runJsTool(
             // which is exactly why the id is not the idempotency key below: that one has to differ
             // per request, and this one has to be the same for all of them.
             callId: toolCallId,
-            opts: { ...(call.opts ?? {}), ...(lifted.confirm ? { confirm: true } : {}), idempotencyKey: `${toolCallId}:${n++}` },
+            // Built field by field, never spread from the program's second slot: the gateway's options
+            // include `approved`, which skips the mount's policy, and `operationId`, which names an
+            // operation the program did not start (InvokeOpts, src/runtime/gateway.ts). The only one
+            // a program may set is `confirm`, and only to true: it can hold its own call, never free one.
+            opts: {
+              ...(lifted.confirm || (call.opts as { confirm?: unknown } | undefined)?.confirm === true ? { confirm: true } : {}),
+              idempotencyKey: `${toolCallId}:${n++}`,
+            },
           }).then((res) => {
             // A tool asking the model a question. The program never sees it —
             // the interrupt carries the plugin's `state`, which is not the
