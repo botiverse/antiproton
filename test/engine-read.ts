@@ -103,6 +103,25 @@ await check("pd: every generation that ended failed, faulted or orphaned is a fa
   } finally { host.dispose(); }
 });
 
+await check("pd: an error reply with no errorMessage is the failure itself, shown once, as one with a message is", async () => {
+  const host = sqliteHost();
+  try {
+    const { generations: g } = await unansweredObject(host);
+    // Run 2's error reply, as pi-durable records one whose provider gave no message: the reply without
+    // `errorMessage`, and the outcome's message the one generation.js makes of it.
+    const reply = host.sql.exec("SELECT id FROM pd_entries WHERE json_extract(record, '$.byTaskId') = ? AND json_extract(record, '$.kind') = 'pi.assistant'", g[1]!)
+      .toArray().map((r) => Number(r.id));
+    assert(reply.length === 1, `control: run 2's replies ${show(reply)}`);
+    host.sql.exec("UPDATE pd_entries SET record = json_remove(record, '$.model[0].errorMessage') WHERE id = ?", reply[0]!);
+    host.sql.exec("UPDATE pd_tasks SET record = json_set(record, '$.state.outcome.error.message', 'Model response ended with stop reason error') WHERE id = ?", g[1]!);
+    const runs = readFailedRuns(host.sql, MAIN_SESSION);
+    assert(!runs.some((r) => r.operationId === String(g[1])), `run 2 is shown again as a failed run: ${show(runs.filter((r) => r.operationId === String(g[1])))}`);
+    // The control: an outcome that does not match its reply is still a failed run.
+    host.sql.exec("UPDATE pd_tasks SET record = json_set(record, '$.state.outcome.error.message', 'something else') WHERE id = ?", g[1]!);
+    assert(readFailedRuns(host.sql, MAIN_SESSION).some((r) => r.operationId === String(g[1])), "control: a different failure is not shown");
+  } finally { host.dispose(); }
+});
+
 await check("pd: the console's version moves when a run fails without an entry", async () => {
   const host = sqliteHost();
   try {
@@ -112,6 +131,14 @@ await check("pd: the console's version moves when a run fails without an entry",
     host.sql.exec("UPDATE pd_tasks SET status = 'running' WHERE id = ?", generations[0]!);
     const running = pdVersion(host.sql, MAIN_SESSION);
     assert(failed !== running, `the version did not move: ${failed}`);
+    // And when, before the console polls again, a task that appends no entry of its own starts (the fixture's parked
+    // task; a manual compaction is one in production): the live count is what it was, so only the newest live task
+    // tells the two states apart. Drawn: the generation running, the parked task not there yet.
+    const parked = Number(host.sql.exec("SELECT id FROM pd_tasks WHERE kind = ?", JSON.stringify("test.parked")).toArray()[0]!.id);
+    host.sql.exec("UPDATE pd_tasks SET status = 'terminal' WHERE id = ?", parked);
+    const drawn = pdVersion(host.sql, MAIN_SESSION);
+    assert(drawn.split(".")[2] === failed.split(".")[2], `control: the live counts differ (${drawn} vs ${failed}), so the count alone would move`);
+    assert(failed !== drawn, `the version did not move when a failed run was followed by a task with no entry: ${failed}`);
   } finally { host.dispose(); }
 });
 

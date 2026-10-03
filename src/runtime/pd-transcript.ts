@@ -259,7 +259,10 @@ export function pdFailedRuns(sql: ReadSql, session: string): Array<{ seq: number
       : [];
     const reply = own.filter((e) => e.kind === "pi.assistant" && Number(e.task) === gen).at(-1);
     const said = reply ? (JSON.parse(String(reply.record)) as EntryRecord).model?.[0] as { stopReason?: string; errorMessage?: string } | undefined : undefined;
-    if (said?.stopReason === "error" && o.error?.message !== undefined && said.errorMessage === o.error.message) continue;
+    // The failure is its own reply when the outcome's message is the one pi-durable makes of that reply (generation.js
+    // `respond`): the reply's error, or, when it carries none, what it says instead.
+    const repliedWith = said?.errorMessage ?? `Model response ended with stop reason ${said?.stopReason}`;
+    if (said?.stopReason === "error" && o.error?.message !== undefined && repliedWith === o.error.message) continue;
     const shown = own.filter((e) => e.kind !== "pi.system").at(-1);
     const before = shown === undefined && hasEntries
       ? sql.exec(PD.rewrite("SELECT record FROM entries WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT 1"), id, gen).toArray()[0]
@@ -280,8 +283,9 @@ export function pdFailedRuns(sql: ReadSql, session: string): Array<{ seq: number
  * live and the newest of them, and the object's unanswered model jobs. The console polls this (cf/src/index.ts
  * `uiVersion`) to decide whether to re-render. The live tasks are there for a run that fails before its first model
  * call: it appends no entry and leaves no job, so without them the version would not move and the failure
- * (`pdFailedRuns`) would never be drawn. A task ending changes the count, or, when its successor starts in the same
- * commit, the newest id; read through `tasks_by_status` (`+conversation_id` keeps the planner off tasks_by_conversation,
+ * (`pdFailedRuns`) would never be drawn. A task ending changes the count, or, when another task that appends no entry
+ * of its own starts before the next read (a manual compaction; a generation's successor at a tool round's end, created
+ * in the same commit), the newest id; read through `tasks_by_status` (`+conversation_id` keeps the planner off tasks_by_conversation,
  * which holds every task the conversation ever ran), so it reads the few live tasks however many have ended.
  */
 export function pdVersion(sql: ReadSql, session: string): string {
