@@ -94,6 +94,11 @@ await check("only mcp reads owner secrets: every plugin file but types.ts that n
     .sort();
   // Exact, so an empty list (a pattern that matches nothing) fails as surely as a second reader.
   must(show(readers) === show(["mcp.ts"]), `plugins that read owner secrets: ${show(readers)}; ownerSecret is only for a value sent where a mount's settings say (PluginContext.ownerSecret)`);
+  // The grant itself (`Plugin.readsOwnerSecrets`), which is what the gateway reads.
+  const granted = (readdirSync(dir, { recursive: true }) as string[])
+    .filter((f) => f.endsWith(".ts") && f !== "types.ts" && /readsOwnerSecrets\s*:\s*true/.test(readFileSync(new URL(f, dir), "utf8")))
+    .sort();
+  must(show(granted) === show(["mcp.ts"]), `plugins that declare readsOwnerSecrets: ${show(granted)}`);
 });
 
 await check("configFromForm: lines with blanks dropped, a number via Number(), blank means absent, strings trimmed", () => {

@@ -1064,11 +1064,14 @@ export class ToolGateway {
         if (!KEPT_NAME.test(name)) return null;
         return secrets.resolve(agentRef(KEPT_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
       },
-      // The owner's rows only (`owner:`), apart from the agent's: see `PluginContext.ownerSecret`.
-      async ownerSecret(name: string) {
-        if (!KEPT_NAME.test(name)) return null;
-        return secrets.resolve(agentRef(OWNER_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
-      },
+      // The owner's rows only (`owner:`), apart from the agent's, and only to a plugin that declared
+      // it reads them (`Plugin.readsOwnerSecrets`): see `PluginContext.ownerSecret`.
+      ...(this.#plugins.get(mount.plugin)?.readsOwnerSecrets ? {
+        async ownerSecret(name: string) {
+          if (!KEPT_NAME.test(name)) return null;
+          return secrets.resolve(agentRef(OWNER_PREFIX + name), { tenantId: ctx.tenantId, agentId: ctx.agentId });
+        },
+      } : {}),
     };
   }
 

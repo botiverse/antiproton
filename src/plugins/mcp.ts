@@ -151,9 +151,23 @@ async function connect(ctx: PluginContext, kept: Map<string, string>): Promise<M
 /** A listed tool with every kept secret in its name, summary or parameters replaced by the secret's name. */
 function maskSchema(t: ToolSchema, kept: Map<string, string>): ToolSchema {
   if (!kept.size) return t;
-  // The mask is `[secret <name>]`, and a name has no quote or backslash, so the JSON stays JSON.
   return { ...t, name: hideSecrets(t.name, kept), summary: hideSecrets(t.summary, kept),
-    parameters: JSON.parse(hideSecrets(JSON.stringify(t.parameters ?? null), kept)) as Json };
+    parameters: maskJson(t.parameters ?? null, kept) };
+}
+
+/**
+ * Every string in a JSON value, keys included, with kept secrets masked. On the
+ * parsed value, never the JSON text: there a secret with a quote or a backslash
+ * in it is written escaped and no longer matches, and a mask landing across the
+ * text's syntax could leave it unparseable.
+ */
+function maskJson(v: Json, kept: Map<string, string>): Json {
+  if (typeof v === "string") return hideSecrets(v, kept);
+  if (Array.isArray(v)) return v.map((x) => maskJson(x, kept));
+  if (v && typeof v === "object") {
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [hideSecrets(k, kept), maskJson(x as Json, kept)]));
+  }
+  return v;
 }
 
 /** A failure as the model reads it, with every kept secret replaced by its name. */
@@ -173,6 +187,8 @@ export const mcpPlugin: Plugin = {
   // An owner may add a server from the console: the settings are a URL and header lines that hold names, never values.
   consoleMount: true,
   configProblem: mcpConfigProblem,
+  // Owner secrets go only into the header lines of the mount's settings, sent to the mount's url.
+  readsOwnerSecrets: true,
   // Empty on purpose: a mount's tools are what its server listed (`mountTools`).
   tools: [],
   config: [

@@ -309,6 +309,45 @@ await check("a header with a credential written out is refused with the way to f
   }
 });
 
+await check("a secret with a quote or a backslash in it is masked in the stored tool list, keys and nested values included", async () => {
+  const tok = 'sk"q\\x-secret';
+  serve(fakeServer({ tools: () => [{ name: "leak", description: `uses ${tok}`,
+    inputSchema: { type: "object", properties: { [`k${tok}`]: { type: "string", default: tok, enum: [`a${tok}b`] } } } }] }));
+  try {
+    const { gw, store } = await fixture({ url: URL_, headers: ["Authorization: Bearer {{tok}}"] }, { tok });
+    const r: any = await gw.refreshMountTools("t", "a", "srv");
+    must(r.ok, `the listing was refused: ${JSON.stringify(r)}`);
+    const stored = (await store.getMountByAlias("t", "a", "srv"))!.toolSnapshot!;
+    const text = JSON.stringify(stored);
+    // Both forms: the value as it is, and as JSON escapes it, which is the form the old mask missed.
+    must(!text.includes(JSON.stringify(tok).slice(1, -1)) && !JSON.stringify(stored.tools).includes("q\\\\x"), `the secret is in the stored list: ${text}`);
+    must(text.includes("[secret tok]"), `nothing was masked: ${text}`);
+    const props = (stored.tools[0]!.parameters as any).properties;
+    must(Object.keys(props)[0] === "k[secret tok]" && props["k[secret tok]"].default === "[secret tok]", JSON.stringify(props));
+  } finally { globalThis.fetch = realFetch; }
+});
+
+await check("a plugin is handed ownerSecret only when it declares readsOwnerSecrets", async () => {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  const seen: Record<string, string> = {};
+  const probe = (id: string, reads: boolean): Plugin => ({
+    id, version: "1.0.0", ...(reads ? { readsOwnerSecrets: true as const } : {}),
+    tools: [{ name: "look", summary: "", parameters: { type: "object" }, sideEffects: "read", idempotency: "native" }],
+    async invoke(_t, _a, ctx) { seen[id] = typeof ctx.ownerSecret; return {}; },
+  });
+  const plugins = [probe("plain", false), probe("granted", true)];
+  for (const p of plugins) {
+    await store.addMount({ tenantId: "t", agentId: "a", alias: p.id, plugin: p.id, installationId: p.id, connectionId: null,
+      toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  }
+  const gw = new ToolGateway(store, plugins, new Set(["plain", "granted"]), { async resolve() { return null; } });
+  for (const p of plugins) await gw.invoke(ctx, `${p.id}.look`, {});
+  must(seen.plain === "undefined", `a plugin that did not declare it was handed ownerSecret: ${JSON.stringify(seen)}`);
+  must(seen.granted === "function", `a plugin that declared it was not handed ownerSecret: ${JSON.stringify(seen)}`);
+});
+
 // ---- snapshot, catalogue, gateway, discovery --------------------------------
 
 await check("the snapshot reaches the catalogue and the gateway: a listed tool is offered and callable, an unlisted one is unknown_tool", async () => {

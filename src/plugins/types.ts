@@ -366,7 +366,8 @@ export interface PluginContext {
    * or `ctx.db`.
    *
    * Absent where a context has no owner secrets to offer (a credential check,
-   * a diagnosis); a plugin reads its absence as "none".
+   * a diagnosis), and for every plugin that does not declare
+   * {@link Plugin.readsOwnerSecrets}; a plugin reads its absence as "none".
    */
   ownerSecret?(name: string): Promise<string | null>;
 }
@@ -1691,6 +1692,16 @@ export interface Plugin {
    * must not reach a server (the tool snapshot is the step that does).
    */
   configProblem?(config: Record<string, Json>): string | undefined;
+  /**
+   * This plugin is handed `PluginContext.ownerSecret`; without it, it is not.
+   *
+   * Declare it only when every place the plugin sends an owner's secret is one
+   * the mount's settings name, never one a tool call's arguments name. The grant
+   * is per plugin rather than on every context so that the rule is a decision
+   * someone makes where the plugin is defined, not a comment a new reader has to
+   * find: a plugin that never declared it has nothing to misuse.
+   */
+  readsOwnerSecrets?: true;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */
   database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */
