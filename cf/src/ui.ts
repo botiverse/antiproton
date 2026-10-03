@@ -2100,6 +2100,20 @@ function mountBlock(d: any, m: any): string {
         : ""}
       ${settings()}
       ${credentialRegion(m, spec)}
+      ${typeof m.snapshotError === "string" && m.snapshotError
+        ? `<div class="err">tool list not fetched: ${esc(m.snapshotError)} — the mount stands; refresh to try again</div>`
+        : ""}
+      ${m.fromConsole === true
+        ? `<div class="row" style="padding-top:6px">
+        <form hx-post="/ui/mount/refresh" hx-target="closest .plugins-root" hx-swap="innerHTML">
+          <input type="hidden" name="alias" value="${esc(m.alias)}"><button type="submit" class="ghost">refresh tools</button>
+        </form>
+        <form hx-post="/ui/mount/remove" hx-target="closest .plugins-root" hx-swap="innerHTML"
+              hx-confirm="Remove the ${esc(m.alias)} mount? The agent loses these tools at once.">
+          <input type="hidden" name="alias" value="${esc(m.alias)}"><button type="submit" class="ghost">remove</button>
+        </form>
+      </div>`
+        : ""}
       <div class="hint" style="padding-top:6px">${
         m.tools.length
           ? m.tools.map((t: string) => {
@@ -2192,6 +2206,57 @@ export function catalogue(d: any): string {
 ${installed.length ? installed.map(pluginBlock).join("") : `<div class="empty">nothing installed</div>`}`;
 }
 
+/**
+ * The console's way to add a mount: one form per plugin the deployment marks addable
+ * here. The fields come from the plugin's own `config` declaration, so the section
+ * never hard-codes a plugin's shape — a new addable plugin appears with its own form.
+ * A string[] field takes one value per line; a number field may be left empty.
+ */
+function mountAddSection(d: any): string {
+  const addable: any[] = (d.installed ?? []).filter((p: any) => p.addable === true);
+  const cap = 8;
+  const added = (d.mounts ?? []).filter((m: any) => m.fromConsole === true).length;
+  if (!addable.length) return `<div class="empty">nothing here can be added from the console</div>`;
+  const full = added >= cap;
+  const field = (c: any) => {
+    const label = `<span>${esc(c.name)}${c.required === false ? " <i>(optional)</i>" : ""}</span>`;
+    if (c.type === "string[]") return `<label>${label}<textarea name="${esc(c.name)}" rows="3" autocomplete="off" spellcheck="false" placeholder="one value per line"></textarea></label>`;
+    if (c.type === "number") return `<label>${label}<input type="number" name="${esc(c.name)}" autocomplete="off"></label>`;
+    return `<label>${label}<input type="text" name="${esc(c.name)}"${c.required === false ? "" : " required"} autocomplete="off" spellcheck="false"></label>`;
+  };
+  return `<div class="hint" style="padding:0 0 4px">${added} of ${cap} added this way.</div>` + addable.map((p: any) => `
+  <form class="mount-add" hx-post="/ui/mount/add" hx-target="closest .plugins-root" hx-swap="innerHTML">
+    <input type="hidden" name="plugin" value="${esc(p.id)}">
+    <label><span>alias</span><input type="text" name="alias" required maxlength="60" autocomplete="off" spellcheck="false" placeholder="what the agent calls it"></label>
+    ${(p.config ?? []).map(field).join("")}
+    <div class="row"><button type="submit"${full ? ` disabled title="${cap} console-added mounts is the most"` : ""}>mount ${esc(p.id)}</button></div>
+  </form>`).join("");
+}
+
+/**
+ * The agent's kept secrets, named only. Values are write-only — the store never
+ * returns one, so the page can list names and times and nothing more. Each name's
+ * last-read time is the honest signal that a mount's {{name}} header actually read it.
+ */
+function secretsBlock(d: any): string {
+  const kept: any[] = d.kept ?? [];
+  const row = (s: any) => `<tr>
+    <td><code>${esc(s.name)}</code></td><td>${when(s.storedAt) ?? ""}</td><td>${when(s.lastReadAt) ?? "not read yet"}</td>
+    <td><form hx-post="/ui/secret/remove" hx-target="closest .plugins-root" hx-swap="innerHTML"
+          hx-confirm="Forget ${esc(s.name)}? Mounts reading it with {{${esc(s.name)}}} start failing at once.">
+      <input type="hidden" name="name" value="${esc(s.name)}"><button type="submit" class="ghost">remove</button>
+    </form></td></tr>`;
+  return `
+  <form class="secret-add" hx-post="/ui/secret" hx-target="closest .plugins-root" hx-swap="innerHTML">
+    <label><span>name</span><input type="text" name="name" required maxlength="60" autocomplete="off" spellcheck="false" placeholder="what headers call it"></label>
+    <label><span>value</span><input type="password" name="value" required autocomplete="off" spellcheck="false"></label>
+    <div class="row"><button type="submit">keep it</button></div>
+  </form>
+  ${kept.length
+    ? `<table class="kept"><thead><tr><th>name</th><th>kept at</th><th>last read</th><th></th></tr></thead><tbody>${kept.map(row).join("")}</tbody></table>`
+    : `<div class="empty">none kept yet</div>`}`;
+}
+
 export function plugins(d: any): string {
   const mounts: any[] = d.mounts ?? [];
   return `
@@ -2200,6 +2265,17 @@ export function plugins(d: any): string {
   against two accounts is two mounts, with two credentials and two session states.
   No credential is shown here — only whether one is attached.</div>
 ${mounts.length ? mounts.map((m) => mountBlock(d, m)).join("") : `<div class="empty">nothing mounted</div>`}
+
+<h3 style="margin-top:18px">add a mount</h3>
+<div class="hint">Only what the deployment marks addable from here — today that is remote MCP
+  servers. The form is built from the plugin's own config fields, so a new addable plugin
+  needs no page change.</div>
+${mountAddSection(d)}
+
+<h3 style="margin-top:18px">kept secrets</h3>
+<div class="hint">Name-and-value pairs this agent keeps server-side. A mount's request headers
+  read them by <code>{{name}}</code>; the value never leaves the store and never shows here.</div>
+${secretsBlock(d)}
 
 <h3 style="margin-top:18px">installed on this deployment</h3>
 ${catalogue(d)}`;
