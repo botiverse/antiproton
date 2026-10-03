@@ -3,8 +3,8 @@
  * compactions, lane and tables (`AgentDO.uiStorage`), the operator's job list (cf/src/diagnose-read.ts), and the runs
  * that failed with no entry (cf/src/transcript-read.ts).
  *
- * On pd every one of them must come from pd's own records: pi's tables exist for a pd agent and stay empty, so a read
- * that went there would show no jobs, no compactions and nothing outstanding. On pi085 every one must be what the
+ * On pd every one of them must come from pd's own records: a pd object has no pi tables, so a read that went there
+ * would fail. On pi085 every one must be what the
  * console read before these readers existed; the queries it used are kept here, verbatim, as the reference.
  */
 import { readFileSync } from "node:fs";
@@ -56,13 +56,13 @@ await check("pd: the storage panel's jobs, outstanding count, compactions, lane 
   } finally { host.dispose(); }
 });
 
-await check("pd, through the runtime: jobs and tables of a real conversation; pi's job table is there and empty", async () => {
+await check("pd, through the runtime: jobs and tables of a real conversation, on an object with no pi table", async () => {
   const host = sqliteHost();
   try {
     const { agent } = await converse(host, "pd");
     await agent.close();
-    // The control: pi's tables exist for a pd agent, so a read of them would answer — with nothing.
-    assert(n(host, "SELECT COUNT(*) AS n FROM pi_model_jobs") === 0 && n(host, "SELECT COUNT(*) AS n FROM pi_entries") === 0, "pi's tables are not empty");
+    // The control: a pd object has no pi table, so these reads can only have come from pd's records.
+    assert(n(host, "SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE 'pi\\_%' ESCAPE '\\'") === 0, "a pd object has pi tables");
     const s = readEngineStorage(host.sql, MAIN_SESSION);
     assert(s.modelJobs.length === 2 && s.modelJobs.every((j) => typeof j.answered_at === "number" && j.request_bytes > 0), `jobs: ${show(s.modelJobs)}`);
     assert(s.outstanding === 0 && s.lane.length === 0, `outstanding ${s.outstanding}, lane ${show(s.lane)}`);

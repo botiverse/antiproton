@@ -1580,7 +1580,7 @@ export class AgentDO extends DurableObject<Env> {
       try { return Number((rows(`SELECT COUNT(*) AS n FROM ${t}`)[0] ?? {}).n ?? 0); }
       catch { return 0; }
     };
-    // The engine's own records (engine-read.ts): a pd agent has pi's tables too, and they stay empty. The
+    // The engine's own records (engine-read.ts): a pd object has no pi tables, or pi085's from before a migration. The
     // conversation is looked up as the transcript and version handlers look it up, so a task id this agent does not
     // have is refused the same way rather than read as the main conversation.
     const engine = readEngineStorage(this.sql, await this.#conversation(tenantId, agentId, taskId));

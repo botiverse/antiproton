@@ -14,8 +14,8 @@
  * through the harness, so the operator's read leaves `busy` out rather than guess.
  *
  * An agent on the `pd` engine (`recordedEngine`, src/runtime/durable-agent.ts) keeps its transcript in
- * pi-durable's tables, not pi's: the runtime makes pi's tables for it too, and they stay empty, so reading
- * them would show an empty conversation rather than fail. `readEntries` and `transcriptEvents` ask the
+ * pi-durable's tables, not pi's: a pd object has none of pi's (one migrated from pi085 keeps that engine's,
+ * unread), so reading them would fail or show the conversation as it was before the migration. `readEntries` and `transcriptEvents` ask the
  * engine first, and a pd session is read through src/runtime/pd-transcript.ts, as SELECTs as well.
  */
 import type { Entry } from "@earendil-works/pi-agent-core/harness/session";
