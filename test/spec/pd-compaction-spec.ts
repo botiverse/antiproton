@@ -136,7 +136,7 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
   const add = (group: string, name: string, body: (host: DurableSqlHost) => Promise<void>) =>
     cases.push({ group, name, run: () => withHost(body) });
 
-  add("manual", "compact on a long conversation: one deferred summary job, parked while it is out, the real summary placed, its usage metered once, at its delivery, and the next turn sent the summary instead of the turn", async (storage) => {
+  add("manual", "compact on a long conversation: one deferred summary job, parked while it is out, the real summary placed, its usage metered once, at its delivery, its end reported as no settled run, and the next turn sent the summary instead of the turn", async (storage) => {
     const o = pdObject(storage, MANUAL);
     await longConversation(storage, o.agent);
     const before = usagePairs(storage);
@@ -166,6 +166,8 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     check(show(usagePairs(storage)) === show([...before, ...SUMMARY_USAGE]), `at the delivery: ${show(usagePairs(storage))}`);
     const end = await run(storage, o.agent, () => null);
     check(end.wakeInMs === null && !o.host.open, `then idle: ${show(end)}`);
+    // A manual compaction is not a run: the step it ends on reports no settled run, so nothing is auto-released for it.
+    check(show(end.settled) === "[]", `the compaction's end reported settled runs: ${show(end.settled)}`);
     check(jobs(storage).find((j) => j.id === job!.id)?.state === "consumed", `the summary job ${show(jobs(storage).find((j) => j.id === job!.id))}`);
     check(show(usagePairs(storage)) === show([...before, ...SUMMARY_USAGE]), `usage ${show(usagePairs(storage))}`);
     check(traceRows(storage).length === 2 && traceRows(storage).every((r) => r.spanId !== job!.id), `trace: the two turns' calls only, ${show(traceRows(storage).map((r) => [r.kind, r.spanId, r.status]))}`);
@@ -184,7 +186,9 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     check(jobs(storage).length === 3, `jobs ${jobs(storage).length}`);
 
     await next.agent.say("third");
-    await run(storage, next.agent, turnsOnly("three"));
+    const third = await run(storage, next.agent, turnsOnly("three"));
+    // The control for the compaction's empty `settled`: a turn's end is reported, once.
+    check(third.wakeInMs === null && third.settled.length === 1, `the turn's end: ${show(third)}`);
     const sent = lastSent(storage);
     check(sent.includes(SUMMARY_PREFIX) && sent.includes("the offloaded summary"), `the next request carries the summary: ${sent.slice(0, 300)}`);
     check(!sent.includes("first lorem") && sent.includes("second lorem") && sent.includes("third"), "and not the summarized turn");
