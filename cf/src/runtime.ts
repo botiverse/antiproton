@@ -1592,14 +1592,13 @@ export class AgentRuntime {
   /**
    * `addMount` from the console's form: the settings arrive as one string per
    * declared field and are coerced to the declared types (`configFromForm`)
-   * before the add judges them. A plugin that is not offered to the console is
-   * refused before its form is read.
+   * before the add judges them; `addMount` refuses a plugin that is not offered
+   * to the console.
    */
   async addConsoleMount(tenantId: string, agentId: string, pluginId: string, alias: string, form: Record<string, string>) {
     await this.ready();
     const plugin = this.#plugins.find((p) => p.id === pluginId);
     if (!plugin) return { ok: false as const, error: `no plugin named ${pluginId}` };
-    if (plugin.consoleMount !== true) return { ok: false as const, error: `${plugin.id} cannot be added from the console` };
     const parsed = configFromForm(plugin.config ?? [], form);
     if (!parsed.ok) return { ok: false as const, error: `cannot mount ${plugin.id}: ${parsed.error}` };
     return this.addMount(tenantId, agentId, { alias, plugin: plugin.id, config: parsed.config }, { console: true });

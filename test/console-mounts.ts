@@ -187,6 +187,29 @@ await check("remove deletes the mount, its tool snapshot, its databases and a le
   must(!gone.ok && !gone.conflict && /no mount named/.test(gone.error), `unknown alias: ${show(gone)}`);
 });
 
+await check("both stores' removeMount delete the row, its databases and the named credential row, and nothing of another mount", async () => {
+  const { DurableObjectStore } = await import("../src/store/durable-object.ts");
+  const { SqliteStore } = await import("../src/store/sqlite.ts");
+  const host = sqliteHost();
+  const doStore = new DurableObjectStore({ storage: { sql: host.sql, transactionSync: host.transactionSync } } as any);
+  const lite = new SqliteStore(":memory:");
+  for (const [name, store] of [["durable-object", doStore], ["sqlite", lite]] as const) {
+    await store.init();
+    for (const alias of ["srv", "other"]) {
+      await store.addMount({ tenantId: "t", agentId: "a", alias, plugin: "remote", installationId: `console:${alias}`, connectionId: null,
+        toolVersion: "1.0.0", publicConfig: { url: "https://x.test" }, secretRef: null, policy: null });
+      store.pluginDb.ensure().put({ tenantId: "t", agentId: "a", alias, plugin: "remote" }, "s", "k", "v", null);
+      await store.putSecret("t", "a", alias, { ciphertext: "c", iv: "i" });
+    }
+    must(await store.removeMount("t", "a", "srv", "srv"), `${name}: removeMount answered false`);
+    must(!(await store.getMountByAlias("t", "a", "srv")) && await store.getMountByAlias("t", "a", "other"), `${name}: the wrong rows went`);
+    const dbs = store.pluginDb.summary("t", "a").map((r: any) => r.alias);
+    must(show(dbs) === show(["other"]), `${name}: plugin databases after: ${show(dbs)}`);
+    must(!(await store.getSecret("t", "a", "srv")) && await store.getSecret("t", "a", "other"), `${name}: credential rows after`);
+    must(!(await store.removeMount("t", "a", "srv", null)), `${name}: a second remove answered true`);
+  }
+});
+
 await check("remove is refused while a credential, a live hook or a held call is on the mount, and for an operator-only plugin", async () => {
   const { rt } = await runtime();
   await rt.addConsoleMount("t", "a", "remote", "srv", form("https://srv.test"));
