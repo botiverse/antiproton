@@ -48,12 +48,13 @@ ledger, the transcript and `pi.usage` all name it.
 
 pi085 shares the consumer, and meters an answer under the model its entry
 names (`#modelOf`, `src/store/pi-storage.ts`), so its key moves too, in one
-narrow case: when the binding at take time does not spend the operator's
-account while the job asked for another model — the model was changed or
-unbound while the call was queued, or a legacy binding does not use the
-operator's secret. The call then went to the deployment's model, and pi085
-now meters it under that name rather than the one the job asked for. When the
-two agree, which is every operator binding left in place, nothing changes.
+narrow case: whenever the model called (`operatorModel ?? HARNESS_MODEL`)
+differs from the model the job asked for. That happens when the binding's
+model is changed or the binding removed while the call was queued, or when a
+legacy binding does not use the operator's secret. pi085 then meters the
+answer under the model called rather than the one the job asked for. When the
+two agree, which is every binding left unchanged while its calls run, nothing
+changes.
 
 ## Verdicts
 

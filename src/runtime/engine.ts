@@ -80,7 +80,7 @@ export interface AgentEngine {
   releaseJob?(id: string, taker: string): boolean | Promise<boolean>;
   /**
    * `taker`: the attempt that called the model (`takeJob`); pd meters each attempt once (`PdHost.deliver`). PiAgent ignores it.
-   * Required, though it may be undefined: a caller that drops it would make every replay of a delivery bill again.
+   * Required, though it may be undefined: a caller that drops it would record every replay of a delivery again, as unaccepted.
    */
   deliver(id: string, answer: AnsweredMessage, taker: string | undefined): boolean | Promise<boolean>;
   close(): Promise<void>;
