@@ -33,6 +33,32 @@ export interface ToolSchema {
    * anything else wherever a replay is decided.
    */
   replay?: "never";
+  /**
+   * Only the model may call this tool. Refused with `not_from_a_program` on the
+   * two roads that reach a plugin with no model reading the result:
+   * - a run_js program's call, under any name the gateway resolves — its
+   *   offered name, its address, or `plugin.tool` — refused by the gateway on
+   *   `InvokeOpts.fromProgram` (`ToolGateway` `#invoke`), which run_js sets
+   *   where the program cannot clear it (`runJsTool`, src/runtime/pi-tools.ts,
+   *   which also answers an offered name early);
+   * - a call held for approval, which would then run on its own: refused when
+   *   it would be held (`#invoke`), and, for one held before, when approved
+   *   (`ToolGateway.applyApproval`).
+   *
+   * For a tool whose result only counts once the model has read it. Raft's
+   * `receive_events` is the case: the call acknowledges the previous batch and
+   * records what it hands over as seen, which a later send attests. From a
+   * program the batch goes to code the model may never print, so the model
+   * would have acknowledged and attested messages it never saw — and skipped
+   * the question a send asks when something new arrived, which is the model's
+   * to answer (docs/ax-design.md §3, "Code cannot skip it"). Raft's
+   * `read_messages` is the other: Raft marks what a history read returns as
+   * read.
+   *
+   * Not a policy: an operator cannot allow it from code, because what it
+   * protects is what the model saw, not what the operator permits.
+   */
+  modelOnly?: true;
 }
 
 /**
