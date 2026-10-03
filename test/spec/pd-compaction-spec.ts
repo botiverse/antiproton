@@ -281,6 +281,24 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     await moved.close();
   });
 
+  add("no_model", "a summary answer that is an error, read by the poll: the compaction fails model_error, the job is consumed, and its usage is billed once, through pi.usage", async (storage) => {
+    const o = pdObject(storage, MANUAL);
+    await longConversation(storage, o.agent);
+    const before = usagePairs(storage);
+    await o.agent.compact();
+    await o.agent.step();
+    const job = open(storage).find(isSummary);
+    check(job, `no summary job; tasks ${show(compactionTasks(storage))}`);
+    // Cut off before it said anything: not a transient error, so not retried, and no summary to place.
+    await answer(o.agent, job.id, { text: "", finishReason: "length", truncated: true, usage: { promptTokens: 300, completionTokens: 40, reasoningTokens: 0, cachedPromptTokens: 0 } });
+    for (let i = 0; i < 3; i++) await o.agent.step();
+    const failed = compactionTasks(storage).filter((t) => t.outcome?.error?.detail?.reason === "model_error");
+    check(failed.length === 1, `control: the compaction did not fail model_error: ${show(compactionTasks(storage))}`);
+    check(jobs(storage).find((j) => j.id === job.id)?.state === "consumed", `job ${show(jobs(storage).find((j) => j.id === job.id))}`);
+    check(show(usagePairs(storage)) === show([...before, ...SUMMARY_USAGE]), `billed ${show(usagePairs(storage))}`);
+    await o.agent.close();
+  });
+
   add("crash", "a new object while the summary is out: it resumes the poll, places the summary once and bills it once, with the one job dispatched once", async (storage) => {
     const first = pdObject(storage, MANUAL);
     await longConversation(storage, first.agent);

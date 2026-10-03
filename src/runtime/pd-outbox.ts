@@ -27,8 +27,8 @@
  *   compaction's (the vendored harness/compaction.js) — and dispatched after that commit; a commit that
  *   never lands leaves no row and nothing dispatched. The batch that appends a job's answer marks it
  *   `consumed`, and so does the batch that moves a task off the `poll` of an answered job: a summary's
- *   answer is never an entry. The batch that ends a `poll` unread — pi-durable's `no_model` failure, or an abort —
- *   marks its job `cancelled`, billing an answer already in, as a cancel does (`cancelJob`).
+ *   answer is never an entry. The batch that ends a task on `poll` without its response (`no_model`, an abort, a
+ *   fault, an orphaning) marks its job `cancelled`, billing an answer already in, as a cancel does (`cancelJob`).
  *
  * Usage, the job rows and the consumed and cancelled marks are all-or-nothing with the batch: a failure
  * there throws, and the commit rolls back. The trace row is not billing, so a failure building it is
@@ -184,16 +184,16 @@ function pollHandles(writes: readonly StorageWrite[], staged: BookContext["stage
 
 /**
  * The jobs whose summary `poll` this batch ended: a compaction task's write whose stored record (the state the batch
- * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle, and
- * that did not end it unread (`unreadPolls`, whose jobs are cancelled instead): the poll read an answer and the batch
- * acts on it. An abort is not one of these: its handler cancels the job only while the model the poll names is still
- * registered, so its job may well be open here. A generation's answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not
- * (the vendored harness/compaction.js places a summary entry, or nothing), so this is how its job is consumed.
+ * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle. Most read
+ * an answer and the batch acts on it; one that ended without its response (`unreadPolls`) is listed here too, and is
+ * left alone because the hook cancels its job first and the consumed mark requires `state IS NULL`. A generation's
+ * answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not (the vendored
+ * harness/compaction.js places a summary entry, or nothing), so this is how its job is consumed.
  */
 function endedSummaryPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
   const out: string[] = [];
   for (const w of writes) {
-    if (w.type !== "task" || w.value.kind !== COMPACTION || endedUnread(w.value.state)) continue;
+    if (w.type !== "task" || w.value.kind !== COMPACTION) continue;
     const was = storedPoll(exec, Number(w.value.id));
     if (was === undefined) continue;
     const now = (w.value.state as { checkpoint?: unknown } | undefined)?.checkpoint;
@@ -212,30 +212,36 @@ function storedPoll(exec: SqliteSyncExecutor, taskId: number): string | undefine
 }
 
 /**
- * Whether a task's new state is an outcome that ends a `poll` without reading its answer: pi-durable's `no_model`
- * failure, or an abort. Both a generation and a compaction write them (harness/generation.js and the vendored
- * harness/compaction.js): `failNoModel` when the model the poll names is no longer registered — the agent's binding
- * moved while the call was out — and it fails before fetching; `abort` settles the task without fetching at all.
+ * Whether a task's new state ends it (an outcome, `completing` or `terminal`) without its response. A poll's response
+ * is recorded in the commit that moves the task off `poll` — its usage, and its entry or summary — and that commit ends
+ * the task only as `completed` (an answer placed: generation.js `answer`, the vendored compaction.js `placeSummary`) or
+ * `failed` with `model_error` (an answer that was an error: generation.js `classify`, compaction.js `respond`). Every
+ * other ending of a task on `poll` is written without reading the answer: `failed` with `no_model` (the model the poll
+ * names is no longer registered: it fails before fetching), `aborted` (the abort handler fetches nothing), and the
+ * scheduler's own `faulted` and `orphaned` (the vendored harness/scheduler.js: `#step`, `abort`, the abort pass), which run no
+ * task code. The two response endings are excluded rather than trusted to the order of the marks: a summary's answer
+ * is billed through `pi.usage` in that very commit, and cancelling its job would bill it a second time.
  */
-function endedUnread(state: unknown): boolean {
+function endedWithoutResponse(state: unknown): boolean {
   const outcome = isObject(state) ? state.outcome : undefined;
   if (!isObject(outcome)) return false;
-  if (outcome.status === "aborted") return true;
-  return outcome.status === "failed" && isObject(outcome.error) && isObject(outcome.error.detail) && outcome.error.detail.reason === "no_model";
+  if (outcome.status === "completed") return false;
+  const reason = outcome.status === "failed" && isObject(outcome.error) && isObject(outcome.error.detail) ? outcome.error.detail.reason : undefined;
+  return reason !== "model_error";
 }
 
 /**
- * The jobs whose `poll` this batch ended unread (`endedUnread`): a task, a generation's or a compaction's, whose stored
- * record is a `poll` checkpoint and whose new state is such an outcome. No entry will name the job and nothing will add
- * its usage to `pi.usage`. An abort's handler cancels the job through the provider's port (`PdHost.#dropJob`), but only
- * while the model the poll names is registered; after the binding moved it skips the cancel, and the job would stay
- * open, to be sent again and its answer stored unbilled. Read from the outcome pi-durable commits, not inferred from
- * the binding: the outcome is the fact, and this batch is the one that records it.
+ * The jobs whose `poll` this batch ended without its response (`endedWithoutResponse`): a task, a generation's or a
+ * compaction's, whose stored record is a `poll` checkpoint with a handle. No entry will name the job and nothing will
+ * add its usage to `pi.usage`. An abort's handler cancels the job through the provider's port (`PdHost.#dropJob`), but
+ * only while the model the poll names is registered; after the binding moved it skips the cancel, and the scheduler's
+ * endings never cancel. Read from the record pi-durable commits, not inferred from the binding: the ending is the fact,
+ * and this batch is the one that records it.
  */
 function unreadPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
   const out: string[] = [];
   for (const w of writes) {
-    if (w.type !== "task" || !endedUnread(w.value.state)) continue;
+    if (w.type !== "task" || !endedWithoutResponse(w.value.state)) continue;
     const job = storedPoll(exec, Number(w.value.id));
     if (job !== undefined) out.push(job);
   }
@@ -303,7 +309,7 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
     }
   }
 
-  // A poll that ended unread (`no_model`, or an abort) never read its answer: the job is cancelled, as `PdHost.#dropJob`
+  // A poll that ended without its response never read its answer: the job is cancelled, as `PdHost.#dropJob`
   // does — a no-op for one that already did it — so its answer is billed as a stranded one: here if it is in already, by
   // `deliver` when it comes.
   const who = { tenantId: ctx.owner?.tenantId ?? "", agentId: ctx.owner?.agentId ?? "" };

@@ -466,6 +466,30 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await again.agent.close();
   });
 
+  add("jobs", "a task on poll the scheduler orphans (its record from a newer definition, then cancelled) with the answer in: the job is cancelled and the answer billed once", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    await o.agent.close();
+    await o.host.close();
+    // A record no registered definition can take: a newer build wrote it (`task_too_old`, harness/scheduler.js `#fit`).
+    // An abort of it runs no task code; the scheduler settles it `orphaned`, from the stored poll.
+    storage.sql.exec("UPDATE pd_tasks SET record = json_set(record, '$.version', 99) WHERE json_extract(record, '$.kind') = 'pi.generation'");
+    const next = pdObject(storage);
+    await next.agent.cancel("cancelled").catch(() => null);
+    const orphaned = storage.sql.exec("SELECT COUNT(*) AS n FROM pd_tasks WHERE json_extract(record, '$.state.outcome.status') = 'orphaned'").toArray()[0]!.n;
+    check(Number(orphaned) === 1, `control: no task was orphaned: ${show(storage.sql.exec("SELECT record FROM pd_tasks").toArray().map((r) => JSON.parse(String(r.record)).state))}`);
+    check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))}`);
+    check(await next.agent.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === false, "a second delivery was taken");
+    for (let i = 0; i < 2; i++) await next.agent.step().catch(() => null);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps: ${show(usagePairs(storage))}`);
+    await next.agent.close();
+  });
+
   add("jobs", "cancelJob twice on one answered job: the first bills the answer, the second bills nothing", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
