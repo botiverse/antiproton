@@ -148,6 +148,7 @@ await check("the report says what the old one said about mounts, events, jobs an
   assert(r.rendered.ok === true && r.rendered.bytes > 0, `rendered: ${JSON.stringify(r.rendered)}`);
   assert(r.execution.readable === false, `execution: ${JSON.stringify(r.execution)}`);
   assert(r.alarmFailures === 0 && Array.isArray(r.releaseErrors) && Array.isArray(r.alarmErrors) && Array.isArray(r.modelJobs), "optional tables read as empty");
+  assert(r.usageDrift === null, `a pi085 agent has no drift check: ${JSON.stringify(r.usageDrift)}`);
   host.dispose();
 });
 
@@ -228,7 +229,7 @@ await check("an agent or conversation the object does not hold is null, and an u
   empty.dispose();
 });
 
-await check("a pd agent's report counts pi-durable's entries and lists ap_model_jobs, and reading it writes nothing", async () => {
+await check("a pd agent's report counts pi-durable's entries, lists ap_model_jobs and reports the metering's drift from pi.usage, and reading it writes nothing", async () => {
   const host = sqliteHost();
   try {
     const { rt, agent } = await converse(host, "pd");
@@ -241,7 +242,13 @@ await check("a pd agent's report counts pi-durable's entries and lists ap_model_
     // The control for the jobs: a pd object has no pi job table, so the jobs above cannot have come from one.
     assert(host.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'pi_model_jobs'").toArray().length === 0, "a pd object has pi_model_jobs");
     assert(r.rendered.ok === true && r.rendered.steps > 0, `rendered: ${JSON.stringify(r.rendered)}`);
+    assert(JSON.stringify(r.usageDrift) === "{}", `the metering and pi.usage disagree: ${JSON.stringify(r.usageDrift)}`);
     assert(dump(host) === before, "the database changed while the report was read");
+    // The drift check reads the two sources, not a constant: an answer that carries more than pi.usage recorded shows.
+    const [job] = host.sql.exec("SELECT id, json_extract(answer, '$.provider') || '/' || json_extract(answer, '$.model') AS k FROM ap_model_jobs WHERE state = 'consumed' LIMIT 1").toArray() as any[];
+    host.sql.exec("UPDATE ap_model_jobs SET answer = json_set(answer, '$.usage.output', json_extract(answer, '$.usage.output') + 2) WHERE id = ?", job.id);
+    const drifted = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { store: rt.store as any, plugins: [], alarm: async () => null, now: () => Date.now() }) as any;
+    assert(JSON.stringify(drifted.usageDrift) === JSON.stringify({ [job.k]: { output: 2 } }), `drift: ${JSON.stringify(drifted.usageDrift)}`);
   } finally { host.dispose(); }
 });
 

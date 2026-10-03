@@ -58,7 +58,7 @@ function stubOver(rt: AgentRuntime, calls: string[]): ModelJobStub {
   return {
     takeJob: (t, a, j, taker) => { calls.push(`take ${j}`); return replyingUnknownJob(() => rt.takeJob(t, a, j, taker)); },
     releaseJob: (t, a, j, taker) => { calls.push(`release ${j}`); return replyingUnknownJob(() => rt.releaseJob(t, a, j, taker)); },
-    deliverAnswer: (t, a, j, answer) => { calls.push(`deliver ${j}`); return replyingUnknownJob(() => rt.deliverAnswer(t, a, j, answer)); },
+    deliverAnswer: (t, a, j, answer, _ms, taker) => { calls.push(`deliver ${j}`); return replyingUnknownJob(() => rt.deliverAnswer(t, a, j, answer, taker)); },
   };
 }
 
@@ -190,12 +190,12 @@ await check("consumer: a known job is taken, called and delivered into its sessi
   host.dispose();
 });
 
-await check("consumer: each attempt, giving up too, takes under a fresh name; a failed one releases that name and is retried", async () => {
+await check("consumer: each attempt, giving up too, takes under a fresh name and delivers under it; a failed one releases that name and is retried", async () => {
   const log: string[] = [];
   const stub: ModelJobStub = {
     async takeJob(_t, _a, _j, taker) { log.push(`take ${taker}`); return REQUEST; },
     async releaseJob(_t, _a, _j, taker) { log.push(`release ${taker}`); return true; },
-    async deliverAnswer() { log.push("deliver"); return true; },
+    async deliverAnswer(_t, _a, _j, _answer, _ms, taker) { log.push(`deliver ${taker}`); return true; },
   };
   const failing: ModelQueueDeps = { ...deps(stub, []), async call() { throw new Error("provider 503"); } };
   const { msg, m } = message("job-a");
@@ -203,12 +203,15 @@ await check("consumer: each attempt, giving up too, takes under a fresh name; a 
   try {
     await consumeModelCalls({ queue: "model-calls", messages: [msg, msg] }, failing);
     await consumeModelCalls({ queue: "model-calls-dlq", messages: [msg] }, deps(stub, []));
+    await consumeModelCalls({ queue: "model-calls", messages: [msg] }, deps(stub, []));
   } finally { console.error = err; }
-  must(m.retried === 2 && m.acked === 1, JSON.stringify(m));
+  must(m.retried === 2 && m.acked === 2, JSON.stringify(m));
   const names = log.map((l) => l.split(" ")[1]);
-  must(log.map((l) => l.split(" ")[0]).join("|") === "take|release|take|release|take|deliver", log.join("|"));
+  must(log.map((l) => l.split(" ")[0]).join("|") === "take|release|take|release|take|deliver|take|deliver", log.join("|"));
   must(names[0] && names[0] === names[1] && names[2] === names[3] && names[0] !== names[2] && names[4] && names[4] !== names[0] && names[4] !== names[2],
     `takers ${log.join("|")}`);
+  // Each delivery names the attempt that made it, so a replay of that delivery is metered once (PdHost.deliver).
+  must(names[5] === names[4] && names[6] && names[7] === names[6] && names[6] !== names[4], `delivered under ${log.join("|")}`);
 });
 
 await check("consumer: any other failure is still retried, not acked", async () => {

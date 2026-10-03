@@ -62,7 +62,8 @@ export interface ModelJobStub {
   takeJob(tenantId: string, agentId: string, jobId: string, taker?: string): Promise<unknown>;
   /** Gives back the taker's take when its attempt failed, so a retry can take the job. */
   releaseJob(tenantId: string, agentId: string, jobId: string, taker: string): Promise<unknown>;
-  deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs: number): Promise<unknown>;
+  /** `taker`: the attempt whose call this answers, so a replay of this RPC is metered once (`PdHost.deliver`). */
+  deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs: number, taker?: string): Promise<unknown>;
 }
 
 export interface ModelQueueDeps {
@@ -97,13 +98,13 @@ function newTaker(): string { return crypto.randomUUID(); }
  * retry (or the dead letter queue) can take the job at once; a release that fails leaves the take to lapse.
  */
 async function withTake(
-  m: QueuedModelCall, stub: ModelJobStub, phase: "take" | "give_up", use: (job: unknown) => Promise<void>,
+  m: QueuedModelCall, stub: ModelJobStub, phase: "take" | "give_up", use: (job: unknown, taker: string) => Promise<void>,
 ): Promise<void> {
   const taker = newTaker();
   const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId, taker);
   if (isUnknownJobReply(job)) return unknownJob(m, phase);
   if (!job) return;
-  try { await use(job); }
+  try { await use(job, taker); }
   catch (e) {
     try { await stub.releaseJob(m.tenantId, m.agentId, m.jobId, taker); }
     catch (r) { logEvent("model_job.release_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, error: String((r as Error)?.message ?? r).slice(0, 200) }); }
@@ -118,10 +119,10 @@ async function withTake(
  */
 export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
   const stub = deps.stub(m);
-  await withTake(m, stub, "take", async (job) => {
+  await withTake(m, stub, "take", async (job, taker) => {
     const t0 = Date.now();
     const answer = await deps.call(job, m);
-    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, Date.now() - t0);
+    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, Date.now() - t0, taker);
     if (isUnknownJobReply(wrote)) unknownJob(m, "deliver");
   });
 }
@@ -133,8 +134,8 @@ export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Pr
  */
 export async function failLoudly(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
   const stub = deps.stub(m);
-  await withTake(m, stub, "give_up", async () => {
-    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, deps.givenUp(m), 0);
+  await withTake(m, stub, "give_up", async (_job, taker) => {
+    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, deps.givenUp(m), 0, taker);
     if (isUnknownJobReply(wrote)) unknownJob(m, "give_up");
   });
 }

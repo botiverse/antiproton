@@ -301,21 +301,22 @@ that had one). It rests on:
 pi 0.85 lets us write the usage and trace outboxes inside `Storage.commit`; on
 pi-durable the vendored storage calls a commit hook inside the transaction that
 applies each batch (see *Changing upstream files*), and `bookCommit` in
-`src/runtime/pd-outbox.ts` writes there: usage rows, `model.call` trace rows and
-the `ap_model_jobs` rows, all committing or rolling back with the batch. It
+`src/runtime/pd-outbox.ts` writes there: `model.call` trace rows and the
+`ap_model_jobs` rows, committing or rolling back with the batch. Usage is not
+written there: a pd model call is metered when its answer is delivered
+(`PdHost.deliver`), as [`metering.md`](metering.md) sets out, and pi-durable's
+`pi.usage` is the independent source that metering is reconciled against. It
 rests on:
 
-- **`pi.usage` is the ledger.** Every writer that records spend adds to the
-  conversation's `pi.usage` document in the commit that records it: a response
+- **`pi.usage` records every answer the harness consumed**: a response
   (`appendAssistant` in `harness/generation.js`, a failed attempt that is
-  retried included), compaction's model call (the vendored `harness/compaction.js`,
-  which appends no entry for it) and a tool result that carries usage (`appendToolResult`
-  in `harness/tool.js`). Usage rows are the batch's change to those documents,
-  so a writer that appends an entry without touching `pi.usage` bills nothing,
-  and a writer that spends without recording it would bill nothing either.
-- `pi.usage` keys a model as `provider/model`; the row names the model as an
-  assistant entry of the same batch names it, otherwise the part after the
-  first `/`.
+  retried included) and compaction's model call (the vendored
+  `harness/compaction.js`, which appends no entry for it) each add to the
+  conversation's `pi.usage` `models` bucket, keyed `provider/model` as the
+  answer names them, in the commit that records the response. A tool result
+  that carries usage (`appendToolResult` in `harness/tool.js`) adds to the
+  `tools` bucket, which is not money we pay. The drift check
+  (`pdUsageDrift`) reads these documents and nothing else of pi-durable's.
 - **A generation records a deferred handle in a `poll` checkpoint**, in the
   commit after the provider returned it (`classify` in `harness/generation.js`),
   and so does a compaction's summary (`respond` in the vendored
@@ -331,8 +332,8 @@ rests on:
 - `cancelDeferred` is called only for a generation or a compaction whose
   committed checkpoint is `poll` (`abort` in `harness/generation.js` and the
   vendored `harness/compaction.js`), so a cancelled job's answer
-  is never appended; an answer that reaches a cancelled row is billed where it
-  is stored (`PdHost.deliver`, `#dropJob`).
+  is never appended. The `consumed` and `cancelled` marks are what `takeJob`
+  and the sweep read; neither moves money.
 
 `test/pd-outbox.ts` and `npm run pd-outbox:do` compare the rows with PiAgent's
 for the same conversation, and cover the jobs' crash, cancel and rollback cases.

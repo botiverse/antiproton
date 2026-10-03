@@ -145,6 +145,14 @@ export function modelTokenRows(
 }
 
 /**
+ * The resource of a delivered model answer that no job accepted (docs/metering.md): a second answer to a job that has
+ * one, or an answer to a job the agent's object does not hold. Same keys and unit as `model.tokens`. It is our cost,
+ * not the tenant's usage: the tenant's usage reads leave it out (cf/src/usage-d1.ts), and no price applies to it
+ * unless one names this resource (`priceFor` matches a resource exactly).
+ */
+export const UNACCEPTED_TOKENS = "model.tokens.unaccepted";
+
+/**
  * A tool call through a mount: one call, one more failure if it failed, and
  * how long it took. The key is the tool alone; `failed` is a unit, so a
  * reader sums calls and failures for one tool without joining two keys.

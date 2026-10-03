@@ -18,8 +18,8 @@
  *   in flight; an answer that came after the move would land nowhere and go unbilled.
  *
  * Each session is imported in one pi-durable commit, through `tx.appendEntry` and nothing else: no generation runs, no
- * `pi.usage` document moves, so the commit hook (src/runtime/pd-outbox.ts `bookCommit`) bills nothing and writes no
- * trace row. The commit ends with an `ap.migrated` entry naming the pi085 tip it copied; a session whose conversation
+ * answer is delivered, so nothing is metered (docs/metering.md), no `pi.usage` document moves, and the commit hook
+ * (src/runtime/pd-outbox.ts `bookCommit`) writes no trace row. The commit ends with an `ap.migrated` entry naming the pi085 tip it copied; a session whose conversation
  * has one for the tip its branch still has is not imported again, so a migration that stopped part-way is finished by
  * running it again. One whose branch moved since (the agent stayed on pi085 and was spoken to) makes the next run drop
  * every pd conversation and import them all afresh. The engine moves last (`ApStore.migrateEngine`), so until then

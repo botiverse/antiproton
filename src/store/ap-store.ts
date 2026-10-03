@@ -20,7 +20,8 @@
  * - `model_jobs`: `pi_model_jobs` (src/runtime/pi-agent.ts), with the session
  *   replaced by pi-durable's conversation id, and a `state`: null while the job
  *   is out, `consumed` once a commit appended its answer, `cancelled` once its
- *   generation was aborted (the row is kept, so a late answer is still billed).
+ *   generation was aborted (the row is kept, so a late answer is still accepted
+ *   and metered as the tenant's).
  *   `taken_at` and `taken_by`: when a queue message last took the job for a
  *   model call, and which message (`PdHost.takeJob`).
  *   The row is inserted inside pi-durable's commit (src/runtime/pd-outbox.ts),
@@ -34,6 +35,10 @@
  *   reports them (`PdHost.takeSettled`), so a run that ended between two steps,
  *   in whichever isolate, is reported once. pi 0.85 has no counterpart: its
  *   step reports the operations its own drive settled.
+ * - `deliveries(job_id, taker)`: each delivery attempt `PdHost.deliver`
+ *   metered (docs/metering.md) and its verdict (`accepted`, `refused`,
+ *   `unknown`), kept for a day so a replayed delivery of the same attempt
+ *   meters nothing a second time.
  *
  * The engine and the directory have operations here; `model_jobs` is read and
  * written through `query` by the pd engine (src/runtime/durable-agent.ts,
@@ -43,7 +48,7 @@
  */
 import { SqlQualifier, type SqlNamespace, type SqlObjects } from "./sql-namespace.ts";
 
-export const AP_TABLES = ["meta", "model_jobs", "conversations", "settled_runs"] as const;
+export const AP_TABLES = ["meta", "model_jobs", "conversations", "settled_runs", "deliveries"] as const;
 export const AP_INDEXES = ["model_jobs_open"] as const;
 export const AP_OBJECTS: SqlObjects = { tables: AP_TABLES, indexes: AP_INDEXES };
 
@@ -60,6 +65,9 @@ const SCHEMA = [
      conversation_id INTEGER NOT NULL UNIQUE, created_at INTEGER NOT NULL) STRICT`,
   `CREATE TABLE IF NOT EXISTS settled_runs (
      operation_id TEXT PRIMARY KEY, status TEXT NOT NULL, settled_at INTEGER NOT NULL) STRICT`,
+  `CREATE TABLE IF NOT EXISTS deliveries (
+     job_id TEXT NOT NULL, taker TEXT NOT NULL, verdict TEXT NOT NULL, at INTEGER NOT NULL,
+     PRIMARY KEY (job_id, taker)) STRICT`,
 ];
 /** Columns added after a table was first made: each is added where it is missing (an object made before it). */
 const ADDED_COLUMNS = [

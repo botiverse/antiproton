@@ -3,7 +3,7 @@
  * token in its own header, DeepSeek's key only with a DeepSeek model, no key for a provider the
  * gateway holds one for, and a `provider/model` name sized by the model's own window.
  */
-import { operatorModelRequest } from "../cf/src/model-request.ts";
+import { callQueuedModel, operatorModelRequest } from "../cf/src/model-request.ts";
 import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
 import { contextWindowFor } from "../src/model/context-windows.ts";
 import { ModelResolver } from "../src/runtime/model-resolver.ts";
@@ -55,6 +55,28 @@ await check("an agent bound to the operator's model is called the same way: no D
   try { await (await resolver.resolve({ tenantId: "t", agentId: "a" })).complete([{ role: "user", content: "hi" }]); }
   finally { globalThis.fetch = real; }
   must(seen[0]?.model === "anthropic/claude-sonnet-5" && !("authorization" in seen[0]!) && seen[0]!["cf-aig-authorization"] === "Bearer gt", JSON.stringify(seen));
+});
+
+await check("the queue consumer's answer names the model it called, which the ledger meters: the deployment's for a binding that spends no operator credential, the binding's when it does", async () => {
+  const env = { DEEPSEEK_BASE_URL: "https://api.deepseek.com", DEEPSEEK_API_KEY: "dk", HARNESS_MODEL: "deepseek-flash" };
+  const sent: string[] = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (_url: any, init?: any) => {
+    sent.push(JSON.parse(init.body).model);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 1 } }), { headers: { "content-type": "application/json" } });
+  }) as any;
+  const job = (operatorModel: string | null) => ({
+    model: { api: "offloaded", provider: "queue", id: "bound-model" }, operatorModel,
+    context: { systemPrompt: "be brief", messages: [{ role: "user", content: "hi", timestamp: 0 }] },
+  });
+  let own, operator;
+  try {
+    own = await callQueuedModel(env, job(null), "mj_1");
+    operator = await callQueuedModel(env, job("deepseek-pro"), "mj_2");
+  } finally { globalThis.fetch = real; }
+  must(sent[0] === "deepseek-flash" && own.model === "deepseek-flash", `own credential: called ${sent[0]}, answer names ${own.model}`);
+  must(sent[1] === "deepseek-pro" && operator.model === "deepseek-pro", `operator binding: called ${sent[1]}, answer names ${operator.model}`);
+  must(own.provider === "queue" && own.jobId === "mj_1" && own.usage.input === 5, `the rest of the answer: ${JSON.stringify(own)}`);
 });
 
 await check("a `provider/model` name is sized by the model's own window", () => {
