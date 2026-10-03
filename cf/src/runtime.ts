@@ -2195,8 +2195,11 @@ export class AgentRuntime {
     return agent.releaseJob ? await agent.releaseJob(jobId, taker) : false;
   }
 
-  /** `taker`: the attempt that called the model (`takeJob`), so a replayed delivery is metered once (`PdHost.deliver`). */
-  async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, taker?: string) {
+  /**
+   * `taker`: the attempt that called the model (`takeJob`), so a replayed delivery is metered once (`PdHost.deliver`).
+   * Required, though it may be undefined, so that a caller cannot drop it by omission.
+   */
+  async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, taker: string | undefined) {
     await this.ready();
     const session = this.#jobSessionFor(jobId);
     return (await this.agent(tenantId, agentId, session)).deliver(jobId, answer as any, taker);

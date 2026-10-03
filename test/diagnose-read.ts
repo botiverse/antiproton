@@ -249,6 +249,12 @@ await check("a pd agent's report counts pi-durable's entries, lists ap_model_job
     host.sql.exec("UPDATE ap_model_jobs SET answer = json_set(answer, '$.usage.output', json_extract(answer, '$.usage.output') + 2) WHERE id = ?", job.id);
     const drifted = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { store: rt.store as any, plugins: [], alarm: async () => null, now: () => Date.now() }) as any;
     assert(JSON.stringify(drifted.usageDrift) === JSON.stringify({ [job.k]: { output: 2 } }), `drift: ${JSON.stringify(drifted.usageDrift)}`);
+    // A pi.usage revision that does not parse fails the drift check alone: the rest of the report is still read.
+    const usageDoc = host.sql.exec("SELECT id FROM pd_documents WHERE json_extract(record, '$.kind') = 'pi.usage' LIMIT 1").toArray()[0] as any;
+    host.sql.exec("INSERT INTO pd_document_revisions (document_id, seq, kind, version, content) VALUES (?, 1000000, 'delta', 1, '[{\"not\":\"an op\"}]')", usageDoc.id);
+    const broken = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", { store: rt.store as any, plugins: [], alarm: async () => null, now: () => Date.now() }) as any;
+    assert(broken !== null && typeof broken.usageDrift?.error === "string" && broken.usageDrift.error.length > 0, `drift: ${JSON.stringify(broken?.usageDrift)}`);
+    assert(broken.entries === 4 && broken.modelJobs.length === 2 && broken.rendered.ok === true, `the rest of the report: ${JSON.stringify({ e: broken.entries, j: broken.modelJobs?.length })}`);
   } finally { host.dispose(); }
 });
 

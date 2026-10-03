@@ -78,7 +78,10 @@ export interface AgentEngine {
   takeJob(id: string, taker?: string): unknown;
   /** The taker's call failed: its take ends, so a retry can take the job. Absent where a take holds nothing (PiAgent). */
   releaseJob?(id: string, taker: string): boolean | Promise<boolean>;
-  /** `taker`: the attempt that called the model (`takeJob`); pd meters each attempt once (`PdHost.deliver`). PiAgent ignores it. */
-  deliver(id: string, answer: AnsweredMessage, taker?: string): boolean | Promise<boolean>;
+  /**
+   * `taker`: the attempt that called the model (`takeJob`); pd meters each attempt once (`PdHost.deliver`). PiAgent ignores it.
+   * Required, though it may be undefined: a caller that drops it would make every replay of a delivery bill again.
+   */
+  deliver(id: string, answer: AnsweredMessage, taker: string | undefined): boolean | Promise<boolean>;
   close(): Promise<void>;
 }

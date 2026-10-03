@@ -80,9 +80,9 @@ const runtimeCases: DriveCase[] = [
         check(toRequest(job.context).messages.some((m) => m.role === "user" && m.content === "Capital of France?"), `job ${show(job)}`);
         const answer = fromResponse({ text: "Paris", finishReason: "stop", truncated: false, usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 } },
           job.model, sent[0]!);
-        check(await rt.deliverAnswer("t", "a", sent[0]!, answer) === true, "deliverAnswer refused");
+        check(await rt.deliverAnswer("t", "a", sent[0]!, answer, undefined) === true, "deliverAnswer refused");
         let thrown: unknown;
-        try { await rt.deliverAnswer("t", "a", "mj_nope", answer); } catch (e) { thrown = e; }
+        try { await rt.deliverAnswer("t", "a", "mj_nope", answer, undefined); } catch (e) { thrown = e; }
         check(thrown instanceof UnknownJob, `pd unknown job: ${String(thrown)}`);
         // The delivery's wake (index.ts `deliverAnswer`), now, as on pi085: that step reads the answer, long before
         // the park alarm, which is only the backstop for a lost wake.
@@ -140,7 +140,7 @@ const runtimeCases: DriveCase[] = [
         check(sent.length === 2, `dispatched ${show(sent)}`);
         const answer = async (id: string, text: string) => {
           const job = await rt.takeJob("t", "a", id) as { model: { api: string; provider: string; id: string } };
-          check(await rt.deliverAnswer("t", "a", id, fromResponse({ text, finishReason: "stop", truncated: false, usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 } }, job.model, id)), `${id} refused`);
+          check(await rt.deliverAnswer("t", "a", id, fromResponse({ text, finishReason: "stop", truncated: false, usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 } }, job.model, id), undefined), `${id} refused`);
         };
         await answer(sent[0]!, "one");
         const first = await rt.step("t", "a");

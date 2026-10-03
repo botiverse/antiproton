@@ -98,7 +98,7 @@ await check("runtime: an unknown job id throws UnknownJob on take and on deliver
     let thrown: unknown = null;
     try {
       if (op === "take") await rt.takeJob(T, A, "job-missing");
-      else await rt.deliverAnswer(T, A, "job-missing", { role: "assistant", content: [] });
+      else await rt.deliverAnswer(T, A, "job-missing", { role: "assistant", content: [] }, undefined);
     } catch (e) { thrown = e; }
     must(thrown instanceof UnknownJob && thrown.jobId === "job-missing", `${op}: ${String(thrown)}`);
   }
@@ -111,10 +111,10 @@ await check("runtime: a known job is taken and answered in its own session, unch
   addJob("job-a", SESSION);
   const job = await rt.takeJob(T, A, "job-a") as Record<string, unknown> | null;
   must(job && JSON.stringify(job.model) === JSON.stringify(REQUEST.model) && "operatorModel" in job, JSON.stringify(job));
-  must(await rt.deliverAnswer(T, A, "job-a", { role: "assistant", content: [], jobId: "job-a" }) === true, "deliver did not write");
+  must(await rt.deliverAnswer(T, A, "job-a", { role: "assistant", content: [], jobId: "job-a" }, undefined) === true, "deliver did not write");
   must(answerOf("job-a"), "no answer on the row");
   must(await rt.takeJob(T, A, "job-a") === null, "an answered job was taken again");
-  must(await rt.deliverAnswer(T, A, "job-a", { role: "assistant", content: [] }) === false, "an answered job was answered twice");
+  must(await rt.deliverAnswer(T, A, "job-a", { role: "assistant", content: [] }, undefined) === false, "an answered job was answered twice");
   must(opened.length === 4 && opened.every((s) => s === SESSION), `sessions opened: ${opened.join(",")}`);
   host.dispose();
 });

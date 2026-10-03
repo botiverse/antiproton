@@ -51,7 +51,7 @@ async function apiAgent() {
         requests.push(toRequest(job.context));
         const reply = replies.shift();
         check(reply, `an unscripted model call: ${show(toRequest(job.context).messages.slice(-2))}`);
-        await rt.deliverAnswer("t", "a", id, fromResponse(reply(), job.model, id));
+        await rt.deliverAnswer("t", "a", id, fromResponse(reply(), job.model, id), undefined);
         delivered = true;
       }
       if (delivered) continue;
@@ -136,7 +136,7 @@ const runtimeCases: DriveCase[] = [{
       for (let i = 0; i < 200 && a.sent.length === before; i++) await sleep(5);
       const id = a.sent.at(-1)!;
       const job = await a.rt.takeJob("t", "a", id) as Job;
-      await a.rt.deliverAnswer("t", "a", id, fromResponse({ text: "first", finishReason: "stop", truncated: false, usage: USAGE }, job.model, id));
+      await a.rt.deliverAnswer("t", "a", id, fromResponse({ text: "first", finishReason: "stop", truncated: false, usage: USAGE }, job.model, id), undefined);
       for (let i = 0; i < 200 && a.rows("ap_settled_runs") === 0; i++) await sleep(5);
       const stale = a.raw.sql.exec("SELECT operation_id FROM ap_settled_runs").toArray().map((r) => String(r.operation_id));
       check(stale.length === 1, `control: no unreported run end before the rollback: ${show(stale)}`);
@@ -155,7 +155,7 @@ const runtimeCases: DriveCase[] = [{
         reported = out.settled;
         for (const j of a.sent.filter((x) => x !== id)) {
           const next = await a.rt.takeJob("t", "a", j).catch(() => null) as Job | null;
-          if (next) await a.rt.deliverAnswer("t", "a", j, fromResponse(a.replies.shift()!(), next.model, j));
+          if (next) await a.rt.deliverAnswer("t", "a", j, fromResponse(a.replies.shift()!(), next.model, j), undefined);
         }
         if (reported.length === 0 && out.wakeInMs !== null) await sleep(Math.min(out.wakeInMs, 50));
       }

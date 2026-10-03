@@ -3,7 +3,8 @@
 What a model call costs, where that cost is recorded, and how the record is
 checked. This is the contract for the `pd` engine (pi-durable). pi 0.85
 (`pi085`) still meters at commit, from its own `pi_usage` rows
-(`src/store/pi-storage.ts`), and is not changed by it.
+(`src/store/pi-storage.ts`); the one thing it shares is the model name the
+consumer stamps on an answer (below).
 
 ## The contract
 
@@ -45,6 +46,15 @@ operator's model when the binding spends the operator's account and the
 deployment's model otherwise, and it stamps that model on the answer, so the
 ledger, the transcript and `pi.usage` all name it.
 
+pi085 shares the consumer, and meters an answer under the model its entry
+names (`#modelOf`, `src/store/pi-storage.ts`), so its key moves too, in one
+narrow case: when the binding at take time does not spend the operator's
+account while the job asked for another model — the model was changed or
+unbound while the call was queued, or a legacy binding does not use the
+operator's secret. The call then went to the deployment's model, and pi085
+now meters it under that name rather than the one the job asked for. When the
+two agree, which is every operator binding left in place, nothing changes.
+
 ## Verdicts
 
 | delivery | what it is | how it is recorded |
@@ -76,6 +86,11 @@ of the usage on the answers of **consumed** jobs, minus the sum of every
 conversation's `pi.usage` `models` bucket. Both are read with plain SQL on the
 object, on demand, and nothing is written. On a healthy object every difference
 is zero.
+
+Its cost is on demand only, and grows with the object's age: SQLite reads the
+usage out of every consumed job's stored answer (`json_extract`, no parse in
+JavaScript), and nothing prunes `ap_model_jobs`. Nothing runs it on a
+schedule.
 
 What it compares and what it leaves out, on purpose:
 

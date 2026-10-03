@@ -192,13 +192,14 @@ export async function usageFirstHours(db: D1Database, tenantId: string): Promise
   // asking usage_hourly alone would report a record that begins later every
   // time a fold runs, and the page would tell a reader that a resource started
   // being counted on a day it was in fact already counted.
+  // Unaccepted model answers are left out, as `readUsage` leaves them out: they are not the tenant's usage.
   const { results } = await db.prepare(
     `SELECT resource, MIN(first) AS first FROM (
        SELECT resource, MIN(hour) AS first FROM usage_hourly WHERE tenant_id = ? GROUP BY resource
        UNION ALL
        SELECT resource, MIN(day) AS first FROM usage_daily WHERE tenant_id = ? GROUP BY resource
-     ) GROUP BY resource`,
-  ).bind(tenantId, tenantId).all();
+     ) WHERE resource <> ? GROUP BY resource`,
+  ).bind(tenantId, tenantId, UNACCEPTED_TOKENS).all();
   return Object.fromEntries((results as any[]).map((r) => [String(r.resource), Number(r.first)]));
 }
 

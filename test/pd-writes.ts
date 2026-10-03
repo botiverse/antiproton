@@ -187,12 +187,59 @@ const wholeObject: DriveCase = {
   },
 };
 
+/** The model queue's replay of one delivery, through AgentDO's own entry points down to `PdHost.deliver`. */
+const replayedDelivery: DriveCase = {
+  group: "the whole object", name: "a delivery replayed under the same taker, through AgentDO → runtime → PdHost, meters nothing more; another taker's answer to the answered job is metered unaccepted",
+  async run() {
+    const raw = sqliteHost();
+    try {
+      const ap = new ApStore(raw, prefixedNamespace("ap"));
+      ap.ensure();
+      ap.setEngineOnce("pd");
+      const jobs: string[] = [];
+      let alarmAt: number | null = null;
+      const ctx = {
+        storage: {
+          sql: raw.sql, transactionSync: raw.transactionSync,
+          getAlarm: async () => alarmAt, setAlarm: async (at: number) => { alarmAt = at; }, deleteAlarm: async () => { alarmAt = null; },
+        },
+        id: { toString: () => "do-1" }, getWebSockets: () => [], exports: {},
+      };
+      const env = {
+        MODEL_QUEUE: { send: async (m: { jobId: string }) => { jobs.push(m.jobId); } },
+        ARTIFACTS: { put: async () => ({}), get: async () => null, head: async () => null, list: async () => ({ objects: [] }) },
+        ARTIFACT_BUCKET: "b", CONTROL_DB: d1(), HARNESS_MODEL: "m1", DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k",
+      };
+      const D = new AgentDO(ctx as never, env as never);
+      await D.uiAdoptAgent(T, A, { name: "n", description: "d", avatar: "x" });
+      await D.runtime().bindOperatorModel(T, A);
+      await D.uiSay(T, A, `t_${A}`, "go", "steer");
+      for (let i = 0; i < 100 && jobs.length === 0; i++) { await D.alarm(); if (jobs.length === 0) await sleep(10); }
+      const id = jobs[0];
+      check(id, "the agent asked the model nothing");
+      const job = await D.takeJob(T, A, id, "attempt-1") as { model?: { api?: string; provider?: string } } | null;
+      check(job && !("unknownJob" in job), `job ${id}: ${show(job)}`);
+      const answer = { role: "assistant", content: [{ type: "text", text: "ok" }], api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1", usage: USAGE, stopReason: "stop", timestamp: 0, jobId: id };
+      const rows = () => raw.sql.exec("SELECT resource, key, quantity FROM usage_outbox ORDER BY seq").toArray().map((r) => `${r.resource} ${r.key} ${r.quantity}`);
+      check(await D.deliverAnswer(T, A, id, answer, 5, "attempt-1") === true, "the first delivery was refused");
+      const first = rows();
+      check(show(first) === show(["model.tokens m1:input 1", "model.tokens m1:output 1"]), `the first delivery metered ${show(first)}`);
+      check(await D.deliverAnswer(T, A, id, answer, 5, "attempt-1") === true, "the replay did not answer as the first delivery did");
+      check(show(rows()) === show(first), `the replay metered again: ${show(rows())}`);
+      check(await D.deliverAnswer(T, A, id, answer, 5, "attempt-2") === false, "another attempt's answer was taken");
+      check(show(rows()) === show([...first, "model.tokens.unaccepted m1:input 1", "model.tokens.unaccepted m1:output 1"]), `another attempt: ${show(rows())}`);
+      await (await D.runtime().agent(T, A)).close?.();
+    } finally { raw.dispose(); }
+  },
+};
+
 const results = await runDriveCases([
   ...pdWritesCases(async (use) => {
     const host = sqliteHost();
     try { await use(host); } finally { host.dispose(); }
   }),
   wholeObject,
+  replayedDelivery,
 ]);
 
 let g = "";

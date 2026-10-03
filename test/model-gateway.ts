@@ -8,6 +8,9 @@ import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
 import { contextWindowFor } from "../src/model/context-windows.ts";
 import { ModelResolver } from "../src/runtime/model-resolver.ts";
 import { operatorRequest } from "../src/model/operator-request.ts";
+import { PiAgent } from "../src/runtime/pi-agent.ts";
+import { sqliteHost } from "../src/store/sqlite-host.ts";
+import { pendingUsage } from "../src/usage/outbox.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => void | Promise<void>) {
@@ -77,6 +80,37 @@ await check("the queue consumer's answer names the model it called, which the le
   must(sent[0] === "deepseek-flash" && own.model === "deepseek-flash", `own credential: called ${sent[0]}, answer names ${own.model}`);
   must(sent[1] === "deepseek-pro" && operator.model === "deepseek-pro", `operator binding: called ${sent[1]}, answer names ${operator.model}`);
   must(own.provider === "queue" && own.jobId === "mj_1" && own.usage.input === 5, `the rest of the answer: ${JSON.stringify(own)}`);
+});
+
+await check("pi085 meters a queued answer under the model the consumer called, not the model its job asked for, when the two differ", async () => {
+  // A binding that spends no operator credential (a legacy one, or one changed or unbound while the call was queued):
+  // the job asks for `m1`, the take carries no operatorModel, and the consumer calls the deployment's `h9`.
+  const host = sqliteHost();
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 2 } }), { headers: { "content-type": "application/json" } })) as any;
+  try {
+    const agent = await PiAgent.open({
+      host: host as never, sessionId: "s", systemPrompt: "be brief", model: { provider: "queue", id: "m1", contextWindow: 100_000 }, tools: [],
+      toolHost: { async invoke() { throw new Error("no tool is offered"); } } as never,
+      usageOwner: { tenantId: "t", agentId: "a" }, dispatch: async () => {},
+    });
+    await agent.say("hi");
+    let out = await agent.step();
+    for (let guard = 0; out.wakeInMs !== null || out.open > 0; guard++) {
+      must(guard < 50, `the turn did not end: ${JSON.stringify(out)}`);
+      const open = host.sql.exec("SELECT id FROM pi_model_jobs WHERE answer IS NULL").toArray()[0];
+      if (open) {
+        const id = String(open.id);
+        const job = agent.takeJob(id) as { model: { id: string } };
+        must(job.model.id === "m1", `control: the job asks for ${job.model.id}`);
+        agent.deliver(id, await callQueuedModel({ DEEPSEEK_BASE_URL: "https://api.deepseek.com", DEEPSEEK_API_KEY: "dk", HARNESS_MODEL: "h9" }, { ...job, operatorModel: null }, id));
+      }
+      out = await agent.step();
+    }
+    await agent.close();
+    const keys = pendingUsage(host.sql as never, 0).filter((r) => r.resource === "model.tokens").map((r) => `${r.key}=${r.quantity}`);
+    must(JSON.stringify(keys) === JSON.stringify(["h9:input=5", "h9:output=2"]), `pi085 metered ${JSON.stringify(keys)}`);
+  } finally { globalThis.fetch = real; host.dispose(); }
 });
 
 await check("a `provider/model` name is sized by the model's own window", () => {

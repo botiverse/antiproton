@@ -356,7 +356,7 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     assert(daily.every((r) => r.resource === "model.tokens" && r.key === "m1:input" && r.unit === "tokens"), JSON.stringify(daily));
   });
 
-  add("an unaccepted model answer reaches the tables and is left out of the tenant's usage and the agent's ledger, whatever model.tokens is priced at", async () => {
+  add("an unaccepted model answer reaches the tables and is left out of the tenant's usage, its first hours and the agent's ledger, whatever model.tokens is priced at", async () => {
     await sendUsage(db, "t", "a", 0, [row(1, { quantity: 3 }), row(2, { resource: UNACCEPTED_TOKENS, quantity: 40 })]);
     await db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', '*', 'tokens', 0.001, 0)").run();
     const stored: any = await db.prepare("SELECT SUM(quantity) AS q FROM usage_hourly WHERE resource = ?").bind(UNACCEPTED_TOKENS).first();
@@ -367,6 +367,10 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     }
     const ledger = await readAgentLedger(db, "t", "a", T0, T0 + DAY_MS, DAY_MS);
     assert(JSON.stringify(ledger.map((r) => [r.resource, r.quantity])) === JSON.stringify([["model.tokens", 3]]), `ledger ${JSON.stringify(ledger)}`);
+    // Nor does the page's record of when each resource began name it.
+    const { firstHours } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + DAY_MS, bucket: "1d", by: "total" });
+    assert(JSON.stringify(Object.keys(firstHours)) === JSON.stringify(["model.tokens"]), `firstHours ${JSON.stringify(firstHours)}`);
+    assert(JSON.stringify(Object.keys(await usageFirstHours(db, "t"))) === JSON.stringify(["model.tokens"]), "usageFirstHours names the unaccepted resource");
   });
 
   add("what an object has not sent: nothing without tables, the oldest unsent row's time after a partial send, nothing once all is sent", async () => {

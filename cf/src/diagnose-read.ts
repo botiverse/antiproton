@@ -204,8 +204,12 @@ export async function readDiagnosis(
     traceErrors: rows(sql, "trace_errors", "SELECT at, message FROM trace_errors ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), message: String(r.message) })),
     // A pd object's metering against pi-durable's own record (docs/metering.md): per `provider/model` and counter, what
-    // the consumed answers carried minus what `pi.usage` holds. Empty when they agree; null on pi 0.85.
-    usageDrift: isPd(sql) ? pdUsageDrift(sql) : null,
+    // the consumed answers carried minus what `pi.usage` holds. Empty when they agree; null on pi 0.85. A record it
+    // cannot read is reported here, as `rendered` reports its own failure, rather than failing the whole report.
+    usageDrift: isPd(sql) ? (() => {
+      try { return pdUsageDrift(sql); }
+      catch (e) { return { error: String((e as Error)?.message ?? e).slice(0, 300) }; }
+    })() : null,
     // The last ten model jobs, answered ones included. A pending job shows how long it has waited; an
     // answered one shows how long the queue and the model took together (created → answered). The third
     // instant, when the answer was applied to the lane, is the assistant message's `at` in the transcript,
