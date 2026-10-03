@@ -101,6 +101,8 @@ export interface WorldOptions {
   autoRelease?: boolean;
   idle?: { warnMs: number; maxMs: number };
   runJsResumeMs?: number;
+  /** Offer the agent a function the API caller runs, `get_weather`. */
+  callerTools?: boolean;
 }
 
 /** A `pd` agent `t/a` with the three plugins mounted, on `raw`. */
@@ -125,7 +127,9 @@ export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
     offloadModel: async (j: { commandId: string }) => { sent.push(j.commandId); },
   } as never);
   await rt.ready();
-  await rt.store.createAgent(T, A);
+  await rt.store.createAgent(T, A, o.callerTools
+    ? { openai: { tools: [{ name: "get_weather", description: "weather", parameters: { type: "object", properties: {} } }] } } as never
+    : undefined);
   await rt.bindOperatorModel(T, A);
   for (const plugin of ["web", "box", "lease"]) {
     await rt.store.setPluginChoice(T, A, plugin, "enable");
@@ -309,6 +313,21 @@ export function pdWritesCases(withRawHost: WithDriveHost): DriveCase[] {
       await w.answer([text("done")], "stop");
       await w.settle();
       check(w.seen.includes("lease.release"), `nothing was released: ${show(w.seen)}`);
+    }));
+
+  add("auto-release on pd follows the run's end: a turn waiting on the caller's function keeps what it holds", () =>
+    world({ autoRelease: true, callerTools: true }, async (w) => {
+      await w.rt.postMessage(T, A, "take it, then ask");
+      await w.answer([call("c1", "lease__take")], "toolUse");
+      await w.answer([call("c2", "get_weather")], "toolUse");
+      await w.settle();
+      const [waiting] = await w.rt.waitingClientCalls(T, A, "main");
+      check(waiting?.call_id === "c2", "control: the caller's function is not waiting");
+      check(!w.seen.includes("lease.release"), `released while the run waits on the caller: ${show(w.seen)}`);
+      await w.rt.submitToolResults(T, A, "main", [{ turnId: waiting.turn_id, callId: "c2", output: "cold", isError: false }]);
+      await w.answer([text("done")], "stop");
+      await w.settle();
+      check(w.seen.includes("lease.release"), `nothing was released once the run ended: ${show(w.seen)}`);
     }));
 
   add("the idle pass on pd warns the agent with a turn, then releases at the release time", () =>

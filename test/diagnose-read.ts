@@ -238,8 +238,8 @@ await check("a pd agent's report counts pi-durable's entries and lists ap_model_
     assert(r !== null && r.entries === 4 && r.compaction.messages === 4, `entries: ${JSON.stringify({ e: r?.entries, c: r?.compaction })}`);
     assert(r.eventKinds.message === 2 && r.eventKinds["model.response"] === 2, `kinds: ${JSON.stringify(r.eventKinds)}`);
     assert(r.modelJobs.length === 2 && r.modelJobs.every((j: any) => typeof j.answerMs === "number"), `jobs: ${JSON.stringify(r.modelJobs)}`);
-    // The control for the jobs: pi's job table exists for a pd agent and is empty.
-    assert(host.sql.exec("SELECT COUNT(*) AS n FROM pi_model_jobs").toArray()[0]!.n === 0, "pi_model_jobs is not empty");
+    // The control for the jobs: a pd object has no pi job table, so the jobs above cannot have come from one.
+    assert(host.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'pi_model_jobs'").toArray().length === 0, "a pd object has pi_model_jobs");
     assert(r.rendered.ok === true && r.rendered.steps > 0, `rendered: ${JSON.stringify(r.rendered)}`);
     assert(dump(host) === before, "the database changed while the report was read");
   } finally { host.dispose(); }

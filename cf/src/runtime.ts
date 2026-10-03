@@ -677,8 +677,6 @@ export class AgentRuntime {
   #agents = new Map<string, { agent: AgentEngine; builtFrom: string }>();
   /** The object's one pi-durable harness, made when a `pd` agent is first opened (src/runtime/durable-agent.ts). */
   #pd: PdHost | null = null;
-  /** Whether a pd agent was opened in this object: what a delivered answer's wake depends on (cf/src/index.ts). */
-  get servesPd(): boolean { return this.#pd !== null; }
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
@@ -1767,8 +1765,6 @@ export class AgentRuntime {
       // (src/runtime/durable-tools.ts). The caller's functions are pd's own tools there (`clientTool`), which record
       // their call in pi-durable state and wait for the caller, so they are handed over as definitions.
       const pdHost = this.#pd ??= new PdHost({ storage: this.#deps.ctx.storage });
-      // `pi_sessions` is which sessions a wake steps (`postMessage` and `step` below), whichever engine runs them.
-      ensureAgentTables(this.#deps.ctx.storage.sql, session);
       const pd = DurableAgent.open({
         host: pdHost, tenantId, agentId, session, systemPrompt: prompt, model, dispatch,
         unknownJob: (id) => new UnknownJob(id),
@@ -1895,8 +1891,9 @@ export class AgentRuntime {
   ) {
     const agent = await this.agent(tenantId, agentId, session);
     // A conversation that has just been spoken to has work until a step says
-    // otherwise, so the next wake steps it.
-    markSession(this.#deps.ctx.storage.sql, session, true);
+    // otherwise, so the next wake steps it. pd keeps no such list: its harness
+    // holds the input, and a step drives every conversation (`step` below).
+    if (!this.#isPd()) markSession(this.#deps.ctx.storage.sql, session, true);
     const res: any = await agent.say(text, mode);
     return { ...messageLanded(res, mode), result: res };
   }
@@ -1912,7 +1909,7 @@ export class AgentRuntime {
     const agent = await this.agent(tenantId, agentId, session);
     const cancelledTurn = await agent.cancel(TURN_CANCELLED);
     const sql = this.#deps.ctx.storage.sql;
-    ensureAgentTables(sql);
+    if (!this.#isPd()) ensureAgentTables(sql);
     // A turn waiting for the caller has no run to abort on pi085; it still ends, and says so. On pd the waiting
     // tool is the run, so `cancel` already wrote the marker and forgot the calls.
     if ((await agent.dropClientCalls()) > 0 && !cancelledTurn) {
@@ -1934,10 +1931,10 @@ export class AgentRuntime {
 
   /** Function calls this session waits on its API caller for, with the turn each belongs to. */
   async waitingClientCalls(tenantId: string, agentId: string, session: string) {
-    // pi085 reads its table directly, building no agent (a catalogue read on every status poll). Only a pd object
-    // keeps its calls in the engine's own state; `#pd` is set once a pd agent is opened, which both callers
-    // (AgentDO `apiSessionStatus`, `apiTranscript`) do before asking.
-    const rows = this.#pd
+    // pi085 reads its table directly, building no agent (a catalogue read on every status poll). A pd object
+    // keeps its calls in the engine's own state, so the recorded engine decides, not whether this isolate has
+    // opened a pd agent yet.
+    const rows = this.#isPd()
       ? await (await this.agent(tenantId, agentId, session)).waitingClientCalls()
       : pendingClientCalls(this.#deps.ctx.storage.sql, session);
     if (!rows.length) return [];
@@ -1957,11 +1954,15 @@ export class AgentRuntime {
     const turns = callTurns(await this.branchEntries(tenantId, agentId, session));
     const unknown = results.filter((r) => turns.get(r.callId) !== r.turnId).map((r) => r.callId);
     if (unknown.length) return { unknown };
+    // As `waitingClientCalls`: pi085 writes its table directly, building no agent; pd hands them to its engine,
+    // which resumes the harness, so there is no session to mark.
+    if (this.#isPd()) {
+      await (await this.agent(tenantId, agentId, session)).answerClientCalls(results);
+      return { unknown: [] };
+    }
     const sql = this.#deps.ctx.storage.sql;
     ensureAgentTables(sql);
-    // As `waitingClientCalls`: pi085 writes its table directly, building no agent; pd hands them to its engine.
-    if (this.#pd) await (await this.agent(tenantId, agentId, session)).answerClientCalls(results);
-    else for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
+    for (const r of results) answerClientCall(sql, session, r.callId, { output: r.output, isError: r.isError });
     markSession(sql, session, true);
     return { unknown: [] };
   }
@@ -1975,7 +1976,8 @@ export class AgentRuntime {
   async step(tenantId: string, agentId: string) {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
-    ensureAgentTables(sql);
+    const pd = this.#isPd();
+    if (!pd) ensureAgentTables(sql);
     // Background work first (task #16). A job that ended is delivered as a
     // message, which marks its session as having work, so the loop below steps
     // it in this same pass; the rest say when they want checking again.
@@ -1990,13 +1992,12 @@ export class AgentRuntime {
       deliver,
     });
     const bg = await pass(async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); });
-    const sessions = sessionsWithWork(sql);
-    // Which sessions had work coming into this pass: on pd, one of them ending idle is a turn that settled.
-    const hadWork = new Set(sessions);
+    // pd: one harness runs every conversation of the object, and one step drives it whole
+    // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
+    const sessions = pd ? [MAIN_SESSION] : sessionsWithWork(sql);
     if (!sessions.length) sessions.push(MAIN_SESSION);
     let open = 0, wakeInMs: number | null = bg.wakeInMs;
     const settled: Array<{ operationId: string; status: string }> = [];
-    let pdSettled = false;
     for (const session of sessions) {
       const agent = await this.agent(tenantId, agentId, session);
       const out = await agent.step();
@@ -2007,10 +2008,7 @@ export class AgentRuntime {
       settled.push(...out.settled);
       const wake = resumed ? 0 : out.wakeInMs;
       if (wake !== null) wakeInMs = wakeInMs === null ? wake : Math.min(wakeInMs, wake);
-      // pi-durable reports no settled operations (`DurableAgent.step`), so a pd session that came in with work
-      // and leaves idle is what "a turn settled" means here.
-      if (this.#pd && hadWork.has(session) && !resumed && out.open === 0 && out.wakeInMs === null) pdSettled = true;
-      markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
+      if (!pd) markSession(sql, session, resumed || out.open > 0 || out.wakeInMs !== null);
     }
     // A finished run should not still be holding a metered container — either
     // by handing it back at once, or, where the deployment leases them, by
@@ -2027,7 +2025,7 @@ export class AgentRuntime {
     if (keep !== null) wakeInMs = wakeInMs === null ? keep : Math.min(wakeInMs, keep);
     if (this.#deps.autoRelease !== false && open === 0 && !backgroundRunning && keep === null) {
       if (!this.#deps.idle) {
-        if (settled.length || pdSettled) {
+        if (settled.length) {
           const r = await this.#gateway.releaseTask({ tenantId, agentId, taskId: LEGACY_TASK });
           releaseFailed = r.failed;
         }
@@ -2152,6 +2150,11 @@ export class AgentRuntime {
     return { wakeInMs, releaseFailed };
   }
 
+  /** Whether this object's recorded engine is pd (`recordedEngine`, which reads `ap_meta` and creates nothing). */
+  #isPd(): boolean {
+    return recordedEngine(this.#deps.ctx.storage.sql) === "pd";
+  }
+
   /** What the worker asks for, and what it hands back. The job row says which
    *  session asked, so the answer lands in the transcript that is waiting. */
   async takeJob(tenantId: string, agentId: string, jobId: string, taker?: string) {
@@ -2184,7 +2187,7 @@ export class AgentRuntime {
    * throws `UnknownJob` for an id with no row. Elsewhere, the `pi_model_jobs` row says which session.
    */
   #jobSessionFor(jobId: string): string {
-    return recordedEngine(this.#deps.ctx.storage.sql) === "pd" ? MAIN_SESSION : this.#jobSession(jobId);
+    return this.#isPd() ? MAIN_SESSION : this.#jobSession(jobId);
   }
 
   /** The session whose job this is. No row means no session holds it, so the main

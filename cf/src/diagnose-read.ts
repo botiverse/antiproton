@@ -207,7 +207,7 @@ export async function readDiagnosis(
     // instant, when the answer was applied to the lane, is the assistant message's `at` in the transcript,
     // under the same job id. Listing only pending jobs hid a 105-second answer on a provisioned agent
     // (2026-09-28 16:59:52Z call, applied 17:01:38Z): once it was answered there was nothing left to read.
-    // Each engine's own jobs (engine-read.ts): a pd agent's are `ap_model_jobs`, and its `pi_model_jobs` stays empty.
+    // Each engine's own jobs (engine-read.ts): a pd agent's are `ap_model_jobs`; a `pi_model_jobs` on its object is pi085's, from before a migration.
     modelJobs: readModelJobs(sql, 10)
       .map((r) => r.answered_at === null || r.answered_at === undefined
         ? { id: r.id, createdAt: Number(r.created_at), answeredAt: null, ageMs: now - Number(r.created_at) }

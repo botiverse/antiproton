@@ -48,7 +48,7 @@ const runtimeCases: DriveCase[] = [
       try {
         const { rt } = await runtime(host);
         const agent = await rt.agent("t", "a");
-        check(agent instanceof PiAgent && !rt.servesPd, `opened ${agent.constructor.name}, servesPd ${rt.servesPd}`);
+        check(agent instanceof PiAgent, `opened ${agent.constructor.name}`);
         check(objects(host, "ap_").length === 0 && objects(host, "pd_").length === 0,
           `created ${show([...objects(host, "ap_"), ...objects(host, "pd_")])}`);
         // The control for the probe: the pi085 tables are there, so the query sees what opening created.
@@ -86,9 +86,18 @@ const runtimeCases: DriveCase[] = [
         check(thrown instanceof UnknownJob, `pd unknown job: ${String(thrown)}`);
         // The delivery's wake (index.ts `deliverAnswer`), now, as on pi085: that step reads the answer, long before
         // the park alarm, which is only the backstop for a lost wake.
-        check(rt.servesPd, "control: not a pd runtime");
         const done = await rt.step("t", "a");
         check(done.wakeInMs === null, `the wake at delivery did not finish the turn: ${show(done)}`);
+        // The run's end, as pi-durable recorded it: the input `say` placed, by the id it returned, once.
+        check(show(done.settled.map((s) => s.status)) === show(["done"]), `settled ${show(done.settled)}`);
+        check((await rt.step("t", "a")).settled.length === 0, "a run's end was reported twice");
+        // A cancel, a status poll's read of the caller's calls and an empty submission reach the pd engine, which
+        // keeps its own records: no pi085 table or index is made, by any of them or by the turn above.
+        await rt.cancelSession("t", "a");
+        check((await rt.waitingClientCalls("t", "a", "main")).length === 0, "control: a call waits");
+        check((await rt.submitToolResults("t", "a", "main", [])).unknown.length === 0, "an empty submission was refused");
+        await rt.step("t", "a");
+        check(objects(host, "pi_").length === 0, `a pd object made pi085 objects: ${show(objects(host, "pi_"))}`);
         check(Date.now() < parkAlarm - 60_000, "the turn finished only near the park alarm");
         // The other half of the first case's probe: on this object the same query does see ap_ and pd_ objects.
         check(objects(host, "ap_").length > 0 && objects(host, "pd_").length > 0, "control: ap_/pd_ objects not seen");
@@ -96,6 +105,36 @@ const runtimeCases: DriveCase[] = [
         const last = (branch.at(-1) as { message?: { role?: string; content?: Array<{ text?: string }> } } | undefined)?.message;
         check(last?.role === "assistant" && last.content?.[0]?.text === "Paris", `branch ${show(branch)}`);
         await agent.close();
+      } finally { host.dispose(); }
+    },
+  },
+  {
+    group: "runtime", name: "engine pd: a run that ends while another conversation's is still out is reported by the step that finds the object at rest",
+    run: async () => {
+      const host = sqliteHost();
+      try {
+        const ap = new ApStore(host, prefixedNamespace("ap"));
+        ap.ensure();
+        ap.setEngineOnce("pd");
+        const { rt, sent } = await runtime(host);
+        await rt.postMessage("t", "a", "Q1");
+        await rt.postMessage("t", "a", "Q2", "prompt", "s2");
+        for (let i = 0; i < 20 && sent.length < 2; i++) await rt.step("t", "a");
+        check(sent.length === 2, `dispatched ${show(sent)}`);
+        const answer = async (id: string, text: string) => {
+          const job = await rt.takeJob("t", "a", id) as { model: { api: string; provider: string; id: string } };
+          check(await rt.deliverAnswer("t", "a", id, fromResponse({ text, finishReason: "stop", truncated: false, usage: { promptTokens: 1, completionTokens: 1, reasoningTokens: 0, cachedPromptTokens: 0 } }, job.model, id)), `${id} refused`);
+        };
+        await answer(sent[0]!, "one");
+        const first = await rt.step("t", "a");
+        check(first.open > 0 && first.settled.length === 0, `with the other run still out: ${show(first)}`);
+        const ended = (await rt.branchEntries("t", "a", "main")).at(-1) as { message?: { content?: Array<{ text?: string }> } } | undefined;
+        check(ended?.message?.content?.[0]?.text === "one", `control: the main run had not ended: ${show(ended)}`);
+        await answer(sent[1]!, "two");
+        const rest = await rt.step("t", "a");
+        check(rest.open === 0 && show(rest.settled.map((r) => r.status)) === show(["done", "done"]), `at rest: ${show(rest)}`);
+        check((await rt.step("t", "a")).settled.length === 0, "reported twice");
+        await (await rt.agent("t", "a")).close();
       } finally { host.dispose(); }
     },
   },

@@ -362,10 +362,11 @@ export class AgentDO extends DurableObject<Env> {
     // Created here rather than on first claim: the alarm reads it, and an alarm
     // can fire on an object nothing has claimed yet.
     this.sql.exec("CREATE TABLE IF NOT EXISTS owner(k TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT)");
-    // Everything an agent keeps, from this object's first breath. The console
+    // Everything a pi085 agent keeps, from this object's first breath. The console
     // reads some of it directly for its change check, which happens long
-    // before anyone opens an agent.
-    ensureAgentTables(this.sql as any);
+    // before anyone opens an agent. An object recorded as pd keeps its own
+    // records (`ap_*`, pi-durable's `pd_*`) and gets none of these.
+    if (!isPd(this.sql)) ensureAgentTables(this.sql as any);
     // The bench runtime has to survive eviction: an alarm on a fresh instance
     // must rebuild the same harness, not fall back to the default one.
     this.sql.exec("CREATE TABLE IF NOT EXISTS bench_config(k TEXT PRIMARY KEY, v TEXT)");
@@ -2023,8 +2024,8 @@ export class AgentDO extends DurableObject<Env> {
    */
   async uiVersion(tenantId: string, agentId: string, taskId: string) {
     const session = await this.#conversation(tenantId, agentId, taskId);
-    // A pd agent's entries and jobs are pi-durable's and `ap_model_jobs`; pi's tables exist for it and stay
-    // empty, so a version read from them would never move and the console would never redraw.
+    // A pd agent's entries and jobs are pi-durable's and `ap_model_jobs`; pi's tables, where its object has them,
+    // are pi085's from before a migration, so a version read from them would never move and the console would never redraw.
     const moved = isPd(this.sql) ? pdVersion(this.sql, session) : (() => {
       ensureAgentTables(this.sql, session);
       const t = piTables(session);

@@ -330,6 +330,7 @@ export class PdHost {
         now: this.#now(), raw: this.#opts.storage.sql, ap: this.#ap, staged: this.#staged,
         ...(this.#opts.commitFault ? { fault: this.#opts.commitFault } : {}),
       });
+      recordSettledRuns(this.#ap, writes, this.#now());
     } finally {
       queueMicrotask(() => void this.#afterCommit(jobs, seq, harness));
     }
@@ -349,6 +350,15 @@ export class PdHost {
       this.#staged.delete(id);
       await this.#dispatch(id);
     }
+  }
+
+  /**
+   * The runs that ended since the last call, each once: inputs a landed commit settled (`recordSettledRuns`), by
+   * submission id, the operation id `say` returns, with pi-durable's terminal status.
+   */
+  async takeSettled(): Promise<StepOutcome["settled"]> {
+    return (await this.#store()).query("DELETE FROM settled_runs RETURNING operation_id, status")
+      .map((r) => ({ operationId: String(r.operation_id), status: String(r.status) }));
   }
 
   /** Run `fn` on the open harness; if that harness closed under it (a park), once more on a fresh one. */
@@ -832,22 +842,27 @@ export class DurableAgent implements AgentEngine {
   /**
    * One pass over the harness. Parked: the harness is closed and `wakeInMs` is the earliest sleeper's
    * end. Idle: closed, nothing to wake for. Timed out with work still running: left open, and asked
-   * again in a second.
+   * again in a second. `settled` is every run that ended since the last step that left nothing open, in any
+   * conversation: the harness is the object's, so one step reports for all of them (`PdHost.takeSettled`). A run
+   * that ends while other work is still open stays recorded until the step that finds the object at rest, which is
+   * the step whose report decides anything (cf/src/runtime.ts `step`, auto-release).
    */
   async step(): Promise<StepOutcome> {
     await this.#host.conversation(this.#session);
     const result = await this.#host.drive();
-    if (result.state === "idle") return { open: 0, wakeInMs: null, settled: [] };
+    const at = async (out: Omit<StepOutcome, "settled">): Promise<StepOutcome> =>
+      ({ ...out, settled: out.open === 0 ? await this.#host.takeSettled() : [] });
+    if (result.state === "idle") return at({ open: 0, wakeInMs: null });
     if (result.state === "parked") {
       // Back for the sweep too: a lost dispatch is resent within the redelivery interval, not at the poll backstop.
       const redeliver = await this.#host.redeliveryDue();
-      const at = redeliver === null ? result.parkedUntil : Math.min(result.parkedUntil, redeliver);
-      return { open: result.sleepers.length, wakeInMs: Math.max(0, at - this.#host.now), settled: [] };
+      const until = redeliver === null ? result.parkedUntil : Math.min(result.parkedUntil, redeliver);
+      return at({ open: result.sleepers.length, wakeInMs: Math.max(0, until - this.#host.now) });
     }
     // Closed, waiting on the API caller: nothing is open in the object, and nothing to wake for. The caller's results
     // wake it (`answerClientCalls`).
-    if (result.state === "external") return { open: 0, wakeInMs: null, settled: [] };
-    return { open: 1, wakeInMs: 1_000, settled: [] };
+    if (result.state === "external") return at({ open: 0, wakeInMs: null });
+    return at({ open: 1, wakeInMs: 1_000 });
   }
 
   /** Never: a caller's answer is committed where its waiting tool reads it (`answerClientCalls`), so no run is left to start. */
@@ -962,6 +977,20 @@ export class DurableAgent implements AgentEngine {
 
   /** Closes the object's harness, which every session shares. Safe at any point: a reopened one resumes each task from its checkpoint. */
   close(): Promise<void> { return this.#host.close(); }
+}
+
+/**
+ * Inside a pi-durable commit: the inputs it settles, each the end of the run that held it (pi-durable's `endRun`
+ * settles a run's inputs as it ends it, done or unanswered), written to `ap_settled_runs` in the same transaction, so
+ * the record lands exactly when the end does. A passive write's submission is no run's. Nothing is written for a
+ * commit that settles none.
+ */
+function recordSettledRuns(ap: ApStore, writes: readonly StorageWrite[], now: number): void {
+  for (const w of writes) {
+    if (w.type !== "submission" || w.value.type !== "input") continue;
+    if (w.value.status !== "done" && w.value.status !== "unanswered") continue;
+    ap.query("INSERT OR IGNORE INTO settled_runs (operation_id, status, settled_at) VALUES (?, ?, ?)", String(w.value.id), w.value.status, now);
+  }
 }
 
 /**
