@@ -50,11 +50,18 @@ export interface HttpConfig {
  * request can see that. One case is refused anyway: a name whose labels spell
  * an inward v4 in dotted or dashed decimal (10.0.0.1.nip.io, 10-0-0-1.sslip.io),
  * the common spellings of services that resolve such names back to the address.
- * Only those two spellings: the same services accept hex and v6 forms too
- * (a9fea9fe.nip.io, fe80--1.sslip.io), which pass here like any other name
- * that resolves inward. The rule also refuses a public name that merely
- * contains such a run (node-10-1-2-3.example.com); the refusal names the host.
+ * Only those two spellings; the same services also accept hex and v6 forms
+ * (a9fea9fe.nip.io, fe80--1.sslip.io), so the services whose only purpose is
+ * to resolve a name to an address written in it, or to loopback, are refused
+ * by suffix whatever the spelling (`RESOLVER_SUFFIX`). That list is the ones
+ * known here, not all that exist: someone else's wildcard DNS passes like any
+ * other name that resolves inward. The rule also refuses a public name that
+ * merely contains such a run (node-10-1-2-3.example.com); the refusal names
+ * the host.
  */
+/** Public DNS services that answer with the address written in the name, or with loopback for any name. */
+const RESOLVER_SUFFIX = /(^|\.)(nip\.io|sslip\.io|xip\.io|localtest\.me|lvh\.me)$/;
+
 export function internalHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.+$/, "");
   if (h.startsWith("[")) return internalV6(h.slice(1, -1));
@@ -62,6 +69,7 @@ export function internalHost(hostname: string): boolean {
   // (`localhost`, `internal`, `metadata`); no public server is reached that way.
   if (!h.includes(".")) return true;
   if (/\.(localhost|local|internal|home\.arpa)$/.test(h)) return true;
+  if (RESOLVER_SUFFIX.test(h)) return true;
   const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
   if (v4) return internalV4(v4.slice(1, 5).map(Number));
   for (const m of h.matchAll(/(?:^|[.-])(\d{1,3})[.-](\d{1,3})[.-](\d{1,3})[.-](\d{1,3})(?=[.-]|$)/g)) {
