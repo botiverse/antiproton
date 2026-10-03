@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { createRaft, isInterrupted } from "@botiverse/raft-sdk";
 import { raftPlugin, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
 import { Interrupt, type PluginErrorFields } from "../src/plugins/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -281,6 +282,71 @@ await check("resume \"drop\" sends nothing", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
   const out = await raftPlugin.interrupts!.resume("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, "drop", m.ctx) as any;
   if (out.state !== "dropped" || !/new idempotencyKey/.test(out.note)) throw new Error(`drop: ${JSON.stringify(out)}`);
+});
+
+await check("drop sends nothing, and the plugin declares no cancel: an in-process held send leaves nothing to clear", async () => {
+  const m = mount();
+  one(HELD());
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-cancel" }, m.ctx) as any;
+  if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const dropped = await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx) as any;
+  if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
+  if (raftPlugin.interrupts!.cancel !== undefined) throw new Error("the plugin grew a cancel; this case no longer says what it does");
+  if (sent !== 0) throw new Error(`drop reached Raft ${sent} time(s)`);
+});
+
+await check("the interrupt's CLI argv never reaches the model: not in the question, its context, or what resume and drop return", async () => {
+  // The key is distinctive so its presence in the SDK's argv is a positive control for the absence below.
+  const KEY = "k-argv-sentinel-5e1d";
+  const CLI = ["--send-draft", "--discard-draft", "--expected-draft-key", KEY];
+  one(HELD());
+  const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
+    .messages.send({ target: "#general", content: "done", idempotencyKey: KEY });
+  const argv = isInterrupted(raw) ? JSON.stringify([raw.interrupt.resume.argv, raw.interrupt.cancel?.argv ?? null]) : "";
+  if (!argv.includes(KEY) || !argv.includes("--send-draft")) throw new Error(`control: the SDK's argv carries no sentinel: ${JSON.stringify(raw)}`);
+  const m = mount();
+  one(HELD());
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: KEY }, m.ctx) as any;
+  if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
+  // What run_js and resume show the model of a question: question, context and answer (the state stays host-side).
+  const shown: Array<[string, unknown]> = [["the question", { question: held.question, context: held.context, answer: held.answer }]];
+  one(json(200, { ok: true, state: "sent", messageId: "m-argv", messageSeq: 21 }));
+  shown.push(["resume send", await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx)]);
+  shown.push(["resume drop", await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx)]);
+  for (const [where, value] of shown) {
+    const text = JSON.stringify(value);
+    const leaked = CLI.filter((piece) => text.includes(piece));
+    if (leaked.length) throw new Error(`${where} carries ${leaked.join(", ")}: ${text}`);
+  }
+});
+
+await check("a send held under SDK 0.3.2, still waiting across the upgrade, resumes and drops as before", async () => {
+  // The state 0.3.2's plugin recorded: the send plus `out.data.continuation` ({ idempotencyKey, seen? }).
+  const old = { target: "#general", content: "done", idempotencyKey: "k-032", seen: { upToSeq: 20 } };
+  const m = mount();
+  const calls = many(json(200, { ok: true, state: "sent", messageId: "m-032", messageSeq: 21 }));
+  const sent = await raftPlugin.interrupts!.resume("send_message", old, "send", m.ctx) as any;
+  const body = JSON.parse(String(calls[0]!.init.body));
+  if (sent.state !== "sent" || body.idempotencyKey !== "k-032" || body.seenUpToSeq !== 20 || body.content !== "done" || body.target !== "#general") {
+    throw new Error(`resumed: ${JSON.stringify({ sent, body })}`);
+  }
+  const { seen: _seen, ...withoutSeen } = old;
+  const plain = many(json(200, { ok: true, state: "sent", messageId: "m-033", messageSeq: 22 }));
+  await raftPlugin.interrupts!.resume("send_message", withoutSeen, "send", m.ctx);
+  if (JSON.parse(String(plain[0]!.init.body)).idempotencyKey !== "k-032") throw new Error(`no-seen resume: ${plain[0]!.init.body}`);
+  globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
+  const dropped = await raftPlugin.interrupts!.resume("send_message", old, "drop", m.ctx) as any;
+  if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
+});
+
+await check("a Server conflict on a send is an ordinary refusal: not retryable, nothing landed", async () => {
+  one(json(409, { errorCode: "conflict", message: "conflict" }));
+  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-conflict" }, ctx()));
+  if (why.retryable !== false || why.transient !== false || why.mayHaveLanded === true) {
+    throw new Error(`marks: retryable=${why.retryable} transient=${why.transient} mayHaveLanded=${why.mayHaveLanded} ${why.message}`);
+  }
 });
 
 await check("resume refuses an answer that is neither send nor drop, and sends nothing", async () => {
