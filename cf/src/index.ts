@@ -2791,13 +2791,12 @@ const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/u
  * header is enough to carry an owner's secret away, because the add lists the
  * server's tools at once. So a write must come from this origin, not this site:
  *
- *  1. A request carrying `x-harness-token` that names someone by itself — the
- *     automation token or a service token, resolved without the cookie — is a
- *     script holding a credential, not a browser carrying an ambient one. A
- *     page on another origin cannot set that header on a form, and a fetch
- *     that sets it is preflighted, which this Worker never approves; and it
- *     would need the token. Resolved alone so a cookie beside a made-up token
- *     does not pass as the token.
+ *  1. A request carrying `x-harness-token` that names someone — the
+ *     automation token or a service token; it carries no session cookie, see
+ *     below — is a script holding a credential, not a browser carrying an
+ *     ambient one. A page on another origin cannot set that header on a form,
+ *     and a fetch that sets it is preflighted, which this Worker never
+ *     approves; and it would need the token.
  *  2. Otherwise `Sec-Fetch-Site`, which the browser sets and a page cannot:
  *     only `same-origin`. `same-site` is exactly the case above.
  *  3. A browser too old to send it still sends `Origin` on every POST: it must
@@ -2818,7 +2817,7 @@ async function forgedWrite(request: Request, url: URL, env: Env): Promise<string
   if (token && readCookie(request, SESSION_COOKIE)) {
     return "refused: a console write carries a session cookie or x-harness-token, not both";
   }
-  if (token && await resolveViewer(new Request(url, { headers: { "x-harness-token": token } }), viewerEnv(env))) return null;
+  if (token && await resolveViewer(request, viewerEnv(env))) return null;
   const site = request.headers.get("sec-fetch-site");
   if (site !== null) return site === "same-origin" ? null : "refused: a console write must come from this console's own pages, not another origin";
   const origin = request.headers.get("origin");
