@@ -140,6 +140,8 @@ export interface PdHostOptions {
   commitFault?: (writes: readonly StorageWrite[]) => void;
   /** pi-durable's compaction thresholds, over its defaults (harness/agent.js `DEFAULT_COMPACTION_POLICY`). For tests. */
   compaction?: { reserveTokens?: number; keepRecentTokens?: number; backgroundTokens?: number };
+  /** Extensions installed beside the sessions' tools. For tests: a task of their own, such as one that sleeps after work it did not commit. */
+  extensions?: ReadonlyArray<Parameters<ReturnType<typeof createRegistry>["install"]>[0]>;
 }
 
 /** What binds a host to the one agent it serves. */
@@ -187,11 +189,14 @@ export class PdHost {
    * forgotten after `STAGED_MS`; its commit follows the provider's return at once, so that is far past it.
    */
   readonly #staged = new Map<string, { request: string; at: number }>();
+  /** What a `settle` in flight is told when a task starts to sleep (`drive`, settle's `subscribe`). */
+  readonly #onSleep = new Set<() => void>();
 
   constructor(opts: PdHostOptions) {
     this.#opts = opts;
     this.#now = opts.now ?? Date.now;
     this.#ap = new ApStore(opts.storage, AP);
+    for (const extension of opts.extensions ?? []) this.#registry.install(extension);
   }
 
   get now(): number { return this.#now(); }
@@ -283,13 +288,14 @@ export class PdHost {
           compaction: { ...this.#opts.compaction, enabled: true },
         },
         now: this.#now,
-        // Not for settle: every sleep this harness runs (pi-durable's generation and compaction polls and retries; the
-        // registry holds only tool extensions, and a tool cannot sleep) starts right after the commit of its
-        // checkpoint, and the read that commit brings already sees it. settle's 1 s recheck is the backstop if that
-        // ever changes.
+        // For settle: a sleep commits nothing, so a settle in flight is told (`drive`) and reads again at once,
+        // rather than at its recheck, whether or not a commit came just before the sleep.
         // For the wake: an answer delivered while its poll was fetching (not sleeping, so `Harness.wake` passes it
         // by) is found when the poll's next sleep starts.
-        onSleep: ({ taskId }) => { void this.#wakeOnSleep(taskId); },
+        onSleep: ({ taskId }) => {
+          for (const notify of this.#onSleep) notify();
+          void this.#wakeOnSleep(taskId);
+        },
       }, bg);
       // Settle closes the harness when it parks; whoever asks next opens a fresh one.
       h.subscribeClose(() => {
@@ -427,6 +433,7 @@ export class PdHost {
       return settle(h, {
         context: bg, now: this.#now,
         externalWaits: (ids) => externalWaitsOf(h, ids),
+        subscribe: (notify) => { this.#onSleep.add(notify); return () => { this.#onSleep.delete(notify); }; },
         ...(this.#opts.minParkMs === undefined ? {} : { minParkMs: this.#opts.minParkMs }),
         deadlineMs: this.#opts.stepDeadlineMs ?? STEP_DEADLINE_MS,
       });
