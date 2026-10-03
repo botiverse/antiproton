@@ -27,11 +27,13 @@
  *   compaction's (the vendored harness/compaction.js) — and dispatched after that commit; a commit that
  *   never lands leaves no row and nothing dispatched. The batch that appends a job's answer marks it
  *   `consumed`, and so does the batch that moves a task off the `poll` of an answered job: a summary's
- *   answer is never an entry.
+ *   answer is never an entry. The batch that ends a task on `poll` without its response (`no_model`, an abort, a
+ *   fault, an orphaning) marks its job `cancelled`, billing an answer already in, as a cancel does (`cancelJob`).
  *
- * Usage, the job rows and the consumed mark are all-or-nothing with the batch: a failure there throws,
- * and the commit rolls back. The trace row is not billing, so a failure building it is logged and the
- * batch commits without it; an entry whose messages are not in the shape this reads is logged and
+ * Usage, the job rows and the consumed and cancelled marks are all-or-nothing with the batch: a failure
+ * there throws, and the commit rolls back. The trace row is not billing, so a failure building it is
+ * logged, kept in `trace_errors` for /admin/diagnose (cf/src/diagnose-read.ts), and the batch commits
+ * without it; an entry whose messages are not in the shape this reads is logged and
  * skipped, as it bills nothing (billing reads `pi.usage`, not entries).
  *
  * A row's `at` is the commit's time, as pi085's is.
@@ -44,6 +46,20 @@ import { appendTrace, type TraceRow } from "../trace/outbox.ts";
 import { answerEnded, modelCallRow } from "../trace/seams.ts";
 import { appendUsage, modelTokenRows, type UsageRow } from "../usage/outbox.ts";
 import type { ApStore } from "../store/ap-store.ts";
+
+const TRACE_ERRORS = "CREATE TABLE IF NOT EXISTS trace_errors (at INTEGER NOT NULL, message TEXT NOT NULL)";
+/**
+ * How long a trace error stays on record: `TRACE_DROPS_KEEP_MS` (cf/src/trace-r2.ts), for the same reason — a fault
+ * that repeats writes a line per commit, and the table would only grow. /admin/diagnose shows the last three.
+ */
+const TRACE_ERRORS_KEEP_MS = 7 * 24 * 60 * 60_000;
+
+/** One line in `trace_errors`, in the commit's transaction: a trace row this commit failed to write. */
+function recordTraceError(raw: Raw, at: number, message: string): void {
+  raw.exec(TRACE_ERRORS);
+  raw.exec("DELETE FROM trace_errors WHERE at < ?", at - TRACE_ERRORS_KEEP_MS);
+  raw.exec("INSERT INTO trace_errors(at, message) VALUES (?, ?)", at, message);
+}
 
 /** The counters a usage row bills (`modelTokenRows`). */
 const COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning"] as const;
@@ -168,24 +184,78 @@ function pollHandles(writes: readonly StorageWrite[], staged: BookContext["stage
 
 /**
  * The jobs whose summary `poll` this batch ended: a compaction task's write whose stored record (the state the batch
- * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle. The
- * poll read an answer and the batch acts on it — or the task was aborted, whose cancel marked the job already. A
- * generation's answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not
- * (the vendored harness/compaction.js places a summary entry, or nothing), so this is how its job is consumed.
+ * is applied to) is a `poll` checkpoint with a handle, and whose new state is not a `poll` of the same handle. Most read
+ * an answer and the batch acts on it; one that ended without its response (`unreadPolls`) is listed here too, and is
+ * left alone because the hook cancels its job first and the consumed mark requires `state IS NULL`. A generation's
+ * answer is an entry naming its job, which marks it (and writes its trace row); a summary's is not (the vendored
+ * harness/compaction.js places a summary entry, or nothing), so this is how its job is consumed.
  */
 function endedSummaryPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
   const out: string[] = [];
   for (const w of writes) {
     if (w.type !== "task" || w.value.kind !== COMPACTION) continue;
-    const row = exec.get<{ record: string }>("SELECT record FROM tasks WHERE id = ?", Number(w.value.id));
-    if (row === undefined) continue;
-    const was = (JSON.parse(row.record) as { state?: { checkpoint?: unknown } }).state?.checkpoint;
-    if (!isObject(was) || was.phase !== "poll" || !isObject(was.handle) || typeof was.handle.id !== "string") continue;
+    const was = storedPoll(exec, Number(w.value.id));
+    if (was === undefined) continue;
     const now = (w.value.state as { checkpoint?: unknown } | undefined)?.checkpoint;
-    if (isObject(now) && now.phase === "poll" && isObject(now.handle) && now.handle.id === was.handle.id) continue;
-    out.push(was.handle.id);
+    if (isObject(now) && now.phase === "poll" && isObject(now.handle) && now.handle.id === was) continue;
+    out.push(was);
   }
   return out;
+}
+
+/** The job whose `poll` checkpoint a task's stored record (the state the batch is applied to) holds, if any. */
+function storedPoll(exec: SqliteSyncExecutor, taskId: number): string | undefined {
+  const row = exec.get<{ record: string }>("SELECT record FROM tasks WHERE id = ?", taskId);
+  if (row === undefined) return undefined;
+  const was = (JSON.parse(row.record) as { state?: { checkpoint?: unknown } }).state?.checkpoint;
+  return isObject(was) && was.phase === "poll" && isObject(was.handle) && typeof was.handle.id === "string" ? was.handle.id : undefined;
+}
+
+/**
+ * Whether a task's new state ends it (an outcome, `completing` or `terminal`) without its response. A poll's response
+ * is recorded in the commit that moves the task off `poll` — its usage, and its entry or summary — and that commit ends
+ * the task only as `completed` (an answer placed: generation.js `answer`, the vendored compaction.js `placeSummary`) or
+ * `failed` with `model_error` (an answer that was an error: generation.js `classify`, compaction.js `respond`). Every
+ * other ending of a task on `poll` is written without reading the answer: `failed` with `no_model` (the model the poll
+ * names is no longer registered: it fails before fetching), `aborted` (the abort handler fetches nothing), and the
+ * scheduler's own `faulted` and `orphaned` (the vendored harness/scheduler.js: `#step`, `abort`, the abort pass), which run no
+ * task code. The two response endings are excluded rather than trusted to the order of the marks: a summary's answer
+ * is billed through `pi.usage` in that very commit, and cancelling its job would bill it a second time.
+ */
+function endedWithoutResponse(state: unknown): boolean {
+  const outcome = isObject(state) ? state.outcome : undefined;
+  if (!isObject(outcome)) return false;
+  if (outcome.status === "completed") return false;
+  const reason = outcome.status === "failed" && isObject(outcome.error) && isObject(outcome.error.detail) ? outcome.error.detail.reason : undefined;
+  return reason !== "model_error";
+}
+
+/**
+ * The jobs whose `poll` this batch ended without its response (`endedWithoutResponse`): a task, a generation's or a
+ * compaction's, whose stored record is a `poll` checkpoint with a handle. No entry will name the job and nothing will
+ * add its usage to `pi.usage`. An abort's handler cancels the job through the provider's port (`PdHost.#dropJob`), but
+ * only while the model the poll names is registered; after the binding moved it skips the cancel, and the scheduler's
+ * endings never cancel. Read from the record pi-durable commits, not inferred from the binding: the ending is the fact,
+ * and this batch is the one that records it.
+ */
+function unreadPolls(exec: SqliteSyncExecutor, writes: readonly StorageWrite[]): string[] {
+  const out: string[] = [];
+  for (const w of writes) {
+    if (w.type !== "task" || !endedWithoutResponse(w.value.state)) continue;
+    const job = storedPoll(exec, Number(w.value.id));
+    if (job !== undefined) out.push(job);
+  }
+  return out;
+}
+
+/**
+ * Mark a job cancelled, in the caller's transaction, and return the usage rows of an answer already delivered to it:
+ * no commit will append that answer now, so this is where it is billed. One delivered later is billed by
+ * `PdHost.deliver`, which reads the mark. Nothing for a job already consumed or cancelled.
+ */
+export function cancelJob(ap: Pick<ApStore, "query">, id: string, owner: { tenantId: string; agentId: string }, now: number): UsageRow[] {
+  const [row] = ap.query("UPDATE model_jobs SET state = 'cancelled' WHERE id = ? AND state IS NULL RETURNING answer", id);
+  return row && typeof row.answer === "string" ? strandedAnswerRows(owner, now, row.answer) : [];
 }
 
 /** Subtract `usage` from `delta[bucket][key]`: spend already billed elsewhere. */
@@ -239,6 +309,17 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
     }
   }
 
+  // A poll that ended without its response never read its answer: the job is cancelled, as `PdHost.#dropJob`
+  // does — a no-op for one that already did it — so its answer is billed as a stranded one: here if it is in already, by
+  // `deliver` when it comes.
+  const who = { tenantId: ctx.owner?.tenantId ?? "", agentId: ctx.owner?.agentId ?? "" };
+  const base = { at: ctx.now, ...who };
+  for (const id of unreadPolls(exec, writes)) {
+    const rows = cancelJob(ctx.ap, id, who, ctx.now);
+    booked.usage.push(...rows);
+    logEvent("pd.jobs.cancelled_unread", { ...(ctx.owner ?? {}), jobId: id, billed: rows.length > 0 });
+  }
+
   // A poll that ended with no entry naming its job (a compaction's summary): consumed, once answered. No trace row:
   // a `model.call` row reads as the turn's own call (src/runtime/status.ts), and a summary is not one.
   for (const id of endedSummaryPolls(exec, writes)) {
@@ -246,7 +327,6 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
   }
 
   // Usage: the pi.usage delta, as rows.
-  const base = { at: ctx.now, tenantId: ctx.owner?.tenantId ?? "", agentId: ctx.owner?.agentId ?? "" };
   for (const [key, usage] of Object.entries(delta.models)) booked.usage.push(...modelTokenRows(base, modelOf(key, named), usage));
   for (const usage of Object.values(delta.tools)) booked.usage.push(...modelTokenRows(base, "unknown", usage));
   if (booked.usage.length > 0 && ctx.owner === null) {
@@ -272,8 +352,13 @@ export function bookCommit(exec: SqliteSyncExecutor, writes: readonly StorageWri
       }
       appendTrace(ctx.raw as Parameters<typeof appendTrace>[0], booked.trace);
     } catch (error) {
-      logEvent("pd.commit.trace_error", { ...owner, error: String((error as Error)?.message ?? error).slice(0, 200) });
+      const message = String((error as Error)?.message ?? error).slice(0, 200);
+      logEvent("pd.commit.trace_error", { ...owner, error: message });
       booked.trace = [];
+      // Kept where an operator reads, as the drain's refusals are (`trace_drops`, cf/src/trace-r2.ts): a log line
+      // alone is gone once it scrolls. Not billing either, so failing to keep it does not fail the commit.
+      try { recordTraceError(ctx.raw, ctx.now, message); }
+      catch (e) { logEvent("pd.commit.trace_error_unrecorded", { ...owner, error: String((e as Error)?.message ?? e).slice(0, 200) }); }
     }
   }
 
