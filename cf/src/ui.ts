@@ -2237,7 +2237,7 @@ function mountAddSection(d: any): string {
   return `<div class="hint" style="padding:0 0 4px">${added} of ${cap} added this way.</div>` + addable.map((p: any) => `
   <form class="mount-add" hx-post="/ui/mount/add" hx-target="closest .plugins-root" hx-swap="innerHTML">
     <input type="hidden" name="plugin" value="${esc(p.id)}">
-    <label><span>alias</span><input type="text" name="alias" required maxlength="24" pattern="[a-z][a-z0-9-]{0,23}" autocomplete="off" spellcheck="false" placeholder="what the agent calls it — lowercase letters, digits, dashes"></label>
+    <label><span>alias</span><input type="text" name="alias" required maxlength="24" pattern="[a-z][a-z0-9\\-]{0,23}" autocomplete="off" spellcheck="false" placeholder="what the agent calls it — lowercase letters, digits, dashes"></label>
     ${(p.config ?? []).map(field).join("")}
     <div class="row"><button type="submit"${full ? ` disabled title="${cap} console-added mounts is the most"` : ""}>mount ${esc(p.id)}</button></div>
   </form>`).join("");
