@@ -45,7 +45,7 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  */
 const LEGACY_TASK = "main";
 import { ToolGateway } from "../../src/runtime/gateway.ts";
-import { assertMountConfig, validateMount } from "../../src/runtime/mount-config.ts";
+import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, open, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
@@ -72,6 +72,26 @@ import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
 /** What an operator may call a mount: it becomes the `<alias>__` prefix of every tool name. */
 export const MOUNT_ALIAS = /^[a-z][a-z0-9-]{0,23}$/;
+
+/**
+ * How a mount added from the console is told apart: its `installationId`
+ * starts with this. That field is stored on every mount, read by nothing else,
+ * and kept by a rename, so marking it needs no new column in either store and
+ * no migration, and the mark survives the mount being renamed. Every other path
+ * writes `inst-<alias>` (or a fixed id), so no mount predating the console
+ * route reads as console-added.
+ */
+export const CONSOLE_INSTALLATION = "console:";
+/** Whether a person added this mount from the console. */
+export function consoleAdded(m: Pick<MountRecord, "installationId">): boolean {
+  return m.installationId.startsWith(CONSOLE_INSTALLATION);
+}
+/**
+ * How many mounts one agent may have added from the console. Each is a server
+ * asked for its tools at add time and a block of tools in every prompt, and a
+ * form is cheaper to submit than either is to carry.
+ */
+export const CONSOLE_MOUNTS_MAX = 8;
 
 /**
  * What the console's reconcile does with one seed whose alias exists (the
@@ -111,7 +131,7 @@ import { githubPlugin } from "../../src/plugins/github.ts";
 import { demoPlugin } from "../../src/plugins/demo.ts";
 import { httpPlugin } from "../../src/plugins/http.ts";
 import { exaPlugin } from "../../src/plugins/exa.ts";
-import { statePlugin } from "../../src/plugins/state.ts";
+import { keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, statePlugin } from "../../src/plugins/state.ts";
 import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
@@ -1146,7 +1166,10 @@ export class AgentRuntime {
     // something the deployment owns, under a name that has nothing to do with
     // this mount's alias.
     const own = isAgentRef(mount.secretRef);
-    return this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
+    const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
+    // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.
+    if (r.ok) this.#snapshotErrors()?.exec("UPDATE mount_snapshot_errors SET alias = ? WHERE alias = ?", to, from);
+    return r;
   }
 
   /**
@@ -1499,12 +1522,22 @@ export class AgentRuntime {
    * because a mount carries a credential and a database that a replace
    * would orphan. It is always added without a credential.
    */
-  async addMount(tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> }):
-    Promise<{ ok: true; added: boolean; tools?: Awaited<ReturnType<ToolGateway["refreshMountTools"]>> } | { ok: false; error: string }> {
+  async addMount(
+    tenantId: string, agentId: string, seed: { alias: string; plugin: string; config: Record<string, Json> },
+    /**
+     * `console`: a signed-in owner asked (`/ui/mount/add`), not the operator.
+     * Only a plugin that declares `consoleMount`, at most CONSOLE_MOUNTS_MAX
+     * such mounts, and a plugin the agent never spoke about is switched on as
+     * part of the add (the way provisioning's explicit seed list does) rather
+     * than refused. The mount is marked (`CONSOLE_INSTALLATION`).
+     */
+    opts: { console?: boolean } = {},
+  ): Promise<{ ok: true; added: boolean; tools?: Awaited<ReturnType<ToolGateway["refreshMountTools"]>> } | { ok: false; error: string }> {
     await this.ready();
     if (!MOUNT_ALIAS.test(seed.alias)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
     const plugin = this.#plugins.find((p) => p.id === seed.plugin);
     if (!plugin) return { ok: false, error: `no plugin named ${seed.plugin}` };
+    if (opts.console && plugin.consoleMount !== true) return { ok: false, error: `${plugin.id} cannot be added from the console` };
     // A default alias stays its seed's, even while that plugin is switched
     // off and the alias is free: the seed would come back to find it taken.
     const seeded = AgentRuntime.DEFAULT_MOUNTS.find((d) => d.alias === seed.alias);
@@ -1518,8 +1551,17 @@ export class AgentRuntime {
       }
       return { ok: false, error: `${seed.alias} is already a different mount` };
     }
+    if (opts.console) {
+      const mine = (await this.store.listMounts(tenantId, agentId)).filter(consoleAdded).length;
+      if (mine >= CONSOLE_MOUNTS_MAX) {
+        return { ok: false, error: `this agent already has ${mine} mounts added from the console, the most it may have; remove one first` };
+      }
+    }
     const choices = await this.store.pluginChoices(tenantId, agentId);
-    if (!pluginEnabled(SEEDED_PLUGINS.has(plugin.id), choices[plugin.id])) {
+    // The console switches on a plugin the agent never spoke about, after every
+    // check below has passed; an explicit "disable" is the owner's and still wins.
+    const switchOn = !!opts.console && choices[plugin.id] === undefined && !SEEDED_PLUGINS.has(plugin.id);
+    if (!switchOn && !pluginEnabled(SEEDED_PLUGINS.has(plugin.id), choices[plugin.id])) {
       return { ok: false, error: `${plugin.id} is switched off for this agent; switch it on first` };
     }
     // Judged as a mount with no account yet, minus the one rule that says it
@@ -1530,9 +1572,10 @@ export class AgentRuntime {
     const accountLater = plugin.credential ? { ...plugin, credential: { ...plugin.credential, required: false } } : plugin;
     const problems = validateMount(accountLater, seed.config, null);
     if (problems.length) return { ok: false, error: `cannot mount ${plugin.id}: ${problems.map((p) => p.message).join("; ")}` };
+    if (switchOn) await this.store.setPluginChoice(tenantId, agentId, plugin.id, "enable");
     await this.store.addMount({
       tenantId, agentId, alias: seed.alias, plugin: plugin.id,
-      installationId: `inst-${seed.alias}`, connectionId: null,
+      installationId: `${opts.console ? CONSOLE_INSTALLATION : "inst-"}${seed.alias}`, connectionId: null,
       toolVersion: this.pluginVersion(plugin.id) ?? "1.0.0",
       publicConfig: seed.config, secretRef: null, policy: null,
     });
@@ -1541,9 +1584,25 @@ export class AgentRuntime {
     // mount: the server may want a secret the agent has not kept yet, and the
     // mount offers nothing until a refresh succeeds.
     if (plugin.snapshotTools) {
-      return { ok: true, added: true, tools: await this.#gateway.refreshMountTools(tenantId, agentId, seed.alias) };
+      return { ok: true, added: true, tools: await this.#snapshot(tenantId, agentId, seed.alias) };
     }
     return { ok: true, added: true };
+  }
+
+  /**
+   * `addMount` from the console's form: the settings arrive as one string per
+   * declared field and are coerced to the declared types (`configFromForm`)
+   * before the add judges them. A plugin that is not offered to the console is
+   * refused before its form is read.
+   */
+  async addConsoleMount(tenantId: string, agentId: string, pluginId: string, alias: string, form: Record<string, string>) {
+    await this.ready();
+    const plugin = this.#plugins.find((p) => p.id === pluginId);
+    if (!plugin) return { ok: false as const, error: `no plugin named ${pluginId}` };
+    if (plugin.consoleMount !== true) return { ok: false as const, error: `${plugin.id} cannot be added from the console` };
+    const parsed = configFromForm(plugin.config ?? [], form);
+    if (!parsed.ok) return { ok: false as const, error: `cannot mount ${plugin.id}: ${parsed.error}` };
+    return this.addMount(tenantId, agentId, { alias, plugin: plugin.id, config: parsed.config }, { console: true });
   }
 
   /**
@@ -1554,7 +1613,145 @@ export class AgentRuntime {
    */
   async refreshMountTools(tenantId: string, agentId: string, alias: string) {
     await this.ready();
-    return this.#gateway.refreshMountTools(tenantId, agentId, alias);
+    return this.#snapshot(tenantId, agentId, alias);
+  }
+
+  /**
+   * The console's refresh (`/ui/mount/refresh`): only a mount the console added.
+   * A mount the operator added offers what the operator chose, and its refresh
+   * stays theirs (`/admin/mounts`).
+   */
+  async refreshConsoleMount(tenantId: string, agentId: string, alias: string) {
+    await this.ready();
+    const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { ok: false as const, error: `no mount named ${alias}` };
+    if (!consoleAdded(mount)) return { ok: false as const, error: `${alias} was not added from the console; its tools are the operator's to refresh` };
+    return this.#snapshot(tenantId, agentId, alias);
+  }
+
+  /**
+   * Ask for a mount's tools, and keep why it failed when it did
+   * (`snapshotError`): the person who added a mount whose server could not be
+   * listed reads the reason on the mount's page later, not only in the answer
+   * to the click. A table of the object's own, keyed by alias like
+   * `held_warnings` (one object is one agent), so neither store's schema moves;
+   * a success, a rename and a remove each update it.
+   */
+  async #snapshot(tenantId: string, agentId: string, alias: string) {
+    const r = await this.#gateway.refreshMountTools(tenantId, agentId, alias);
+    const sql = this.#snapshotErrors();
+    if (sql) {
+      if (r.ok) sql.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
+      else if (await this.store.getMountByAlias(tenantId, agentId, alias)) {
+        sql.exec("INSERT INTO mount_snapshot_errors(alias, error, at) VALUES (?,?,?) ON CONFLICT(alias) DO UPDATE SET error = excluded.error, at = excluded.at",
+          alias, r.error, Date.now());
+      }
+    }
+    return r;
+  }
+
+  #snapshotErrors() {
+    const sql = this.#deps.ctx.storage?.sql;
+    if (!sql) return null;
+    sql.exec("CREATE TABLE IF NOT EXISTS mount_snapshot_errors(alias TEXT PRIMARY KEY, error TEXT NOT NULL, at INTEGER NOT NULL)");
+    return sql;
+  }
+
+  /** Why this mount's last tool listing failed, or null when it succeeded or was never asked. */
+  snapshotError(alias: string): string | null {
+    const row = this.#snapshotErrors()?.exec("SELECT error FROM mount_snapshot_errors WHERE alias = ?", alias).toArray()[0] as any;
+    return row ? String(row.error) : null;
+  }
+
+  /**
+   * Delete one mount a person added from the console (`/ui/mount/remove`), and
+   * everything filed under its alias.
+   *
+   * Only a mount the console added (`consoleAdded`), of a plugin that still
+   * declares `consoleMount`, and only one nothing else depends on, because a delete cannot be switched back on the way turning a
+   * plugin off can. Each refusal names what is in the way:
+   *  - a credential reference: an account on it is the owner's to take back
+   *    first (or the operator's, for one this agent did not attach);
+   *  - a live inbound hook: a service is still posting to this alias, and a
+   *    mount added later under the same name would receive it;
+   *  - a held call waiting for a person: deciding it would run against a mount
+   *    that is gone;
+   *  - something running under it, or a background job: the same guard a
+   *    rename and a release use (`renameSafety`, `mountsWithRunningJobs`).
+   *
+   * `hooks` is the hook index, passed in by the caller that holds it: the
+   * runtime's own handle exists only where plugins may make hooks, while the
+   * operator's route can make one anywhere. An index that cannot be read
+   * refuses, rather than deleting past a hook nobody checked for.
+   *
+   * After the store's delete, the caches keyed by the alias go too: a
+   * credential check's held error, the held-thing warnings and the last
+   * snapshot error. A cached
+   * harness is rebuilt because its key (`catalogueKey`) names the mounts.
+   */
+  async removeMount(
+    tenantId: string, agentId: string, alias: string,
+    hooks: Pick<HookDirectory, "list"> | null,
+  ): Promise<{ ok: true } | { ok: false; error: string; conflict?: true }> {
+    await this.ready();
+    const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return { ok: false, error: `no mount named ${alias}` };
+    const plugin = this.#plugins.find((p) => p.id === mount.plugin);
+    const refuse = (error: string) => ({ ok: false as const, error, conflict: true as const });
+    if (plugin?.consoleMount !== true) return refuse(`${mount.plugin} mounts cannot be removed from the console`);
+    if (!consoleAdded(mount)) return refuse(`${alias} was not added from the console; only the operator can remove it`);
+    if (mount.secretRef) return refuse(`${alias} has an account attached; remove it first`);
+    let live: number;
+    try {
+      live = hooks ? (await hooks.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null).length : 0;
+    } catch (e) {
+      return refuse(`could not check ${alias}'s inbound hooks, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    }
+    if (live) return refuse(`${alias} has ${live} live inbound hook${live === 1 ? "" : "s"}; revoke ${live === 1 ? "it" : "them"} first`);
+    const held = (await this.store.listApprovals(tenantId, "pending")).filter((a) => a.agentId === agentId && a.mountAlias === alias).length;
+    if (held) return refuse(`${alias} has ${held} call${held === 1 ? "" : "s"} waiting for a decision; decide ${held === 1 ? "it" : "them"} first`);
+    const sql = this.#deps.ctx.storage.sql;
+    if (mountsWithRunningJobs(sql, { tenantId, agentId }).has(alias)) {
+      return refuse(`${alias} is running a background job; wait for it or cancel it first`);
+    }
+    const safety = renameSafety(await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias), Date.now());
+    if (!safety.safe) return refuse(`${safety.reason} (${safety.live.id}, idle ${Math.round(safety.live.idleMs / 60_000)}m)`);
+    // The row a credential attached here would have been kept under: none is
+    // referenced (refused above), so any row of that name is left over.
+    if (!(await this.store.removeMount(tenantId, agentId, alias, alias))) return { ok: false, error: `no mount named ${alias}` };
+    this.#unchecked.delete(`${tenantId}/${agentId}/${alias}`);
+    const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
+    if (warned) sql.exec("DELETE FROM held_warnings WHERE alias = ?", alias);
+    this.#snapshotErrors()?.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
+    return { ok: true };
+  }
+
+  /**
+   * The owner keeps a secret for the agent from the console (`/ui/secret`):
+   * the same rows, rules and sealing as the agent's own `state.secret_put`, so
+   * a `{{name}}` slot reads either the same way. The value is never returned.
+   */
+  async putKeptSecret(tenantId: string, agentId: string, name: string, value: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    await this.ready();
+    const bad = keptNameProblem(name) ?? keptValueProblem(value);
+    if (bad) return { ok: false, error: bad };
+    const kek = await this.#kek;
+    if (!kek) return { ok: false, error: "this deployment has no SECRET_KEK, so it cannot keep a secret" };
+    await keptPut(this.store, kek, tenantId, agentId, name, value);
+    return { ok: true };
+  }
+
+  async removeKeptSecret(tenantId: string, agentId: string, name: string): Promise<{ ok: true; removed: boolean } | { ok: false; error: string }> {
+    await this.ready();
+    const bad = keptNameProblem(name);
+    if (bad) return { ok: false, error: bad };
+    return { ok: true, removed: await keptDelete(this.store, tenantId, agentId, name) };
+  }
+
+  /** What `state.secret_list` answers: names and times, never a value. */
+  async keptSecrets(tenantId: string, agentId: string) {
+    await this.ready();
+    return keptList(this.store, tenantId, agentId);
   }
 
   /**
@@ -2284,6 +2481,8 @@ export function installedRows(
     // own has no list to show; the page says where they come from instead of
     // reporting the empty static list as "0 tools".
     toolsPerMount: !!p.mountTools,
+    // A person may add a mount of it from the console (`Plugin.consoleMount`).
+    addable: p.consoleMount === true,
   }));
 }
 

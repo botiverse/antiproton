@@ -136,6 +136,13 @@ export class PluginDbTables {
     }
   }
 
+  /** Deletes every database filed under one mount alias, whichever plugin's. */
+  remove(tenantId: string, agentId: string, alias: string): void {
+    for (const table of ["plugin_db", "plugin_db_versions"]) {
+      this.#host.sql.exec(`DELETE FROM ${table} WHERE tenant_id=? AND agent_id=? AND alias=?`, tenantId, agentId, alias);
+    }
+  }
+
   /**
    * One line per (mount, plugin, store) for an operator's storage page: how many
    * keys and when the last one changed. Never a key, never a value — which keys

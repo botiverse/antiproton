@@ -51,7 +51,7 @@ function near(a: string, b: string): number {
 }
 
 export function validateMount(
-  plugin: Pick<Plugin, "id" | "config" | "credential">,
+  plugin: Pick<Plugin, "id" | "config" | "credential" | "configProblem">,
   publicConfig: Record<string, Json> | null | undefined,
   secretRef: string | null | undefined,
 ): MountProblem[] {
@@ -140,12 +140,22 @@ export function validateMount(
     });
   }
 
+  // The plugin's own rule (`Plugin.configProblem`), asked here so that every path that judges a
+  // mount's settings asks it too: adding one (console, `/admin/mounts`), seeding one
+  // (`assertMountConfig` in provisioning), reconciling one, attaching a credential to one, and the
+  // console's problems column. Only once every setting is declared, typed and present, which is what
+  // the hook is promised; a missing account is not about the settings and does not hold it back.
+  if (plugin.configProblem && !problems.some((p) => p.key !== undefined)) {
+    const own = plugin.configProblem(given);
+    if (own) problems.push({ message: own });
+  }
+
   return problems;
 }
 
 /** The same check, as the thing a caller actually wants to do with it. */
 export function assertMountConfig(
-  plugin: Pick<Plugin, "id" | "config" | "credential">,
+  plugin: Pick<Plugin, "id" | "config" | "credential" | "configProblem">,
   publicConfig: Record<string, Json> | null | undefined,
   secretRef: string | null | undefined,
 ): void {
@@ -153,4 +163,49 @@ export function assertMountConfig(
   if (problems.length) {
     throw new Error(`cannot mount ${plugin.id}: ${problems.map((p) => p.message).join("; ")}`);
   }
+}
+
+/**
+ * A mount's settings from a form (`/ui/mount/add`): one field per declared
+ * setting, each a string, coerced to the type the plugin declared, so the
+ * result is judged by `validateMount` like any other config.
+ *
+ * - `string`: trimmed.
+ * - `string[]`: one entry per line, each trimmed, blank lines dropped.
+ * - `number`: `Number()` of the trimmed text; anything that is not a finite
+ *   number is refused here, because `NaN` is a number to the type check and
+ *   slips past `min`/`max`, every comparison with it being false.
+ * - `boolean`: `true`/`on`/`1` or `false`/`off`/`0`.
+ *
+ * Empty after that means absent, so a field left blank takes the plugin's
+ * default. Only declared settings are read: the form's other fields (the
+ * alias, the plugin, the agent) are not settings.
+ */
+export function configFromForm(
+  fields: readonly ConfigField[], form: Readonly<Record<string, string>>,
+): { ok: true; config: Record<string, Json> } | { ok: false; error: string } {
+  const config: Record<string, Json> = {};
+  for (const f of fields) {
+    const raw = form[f.name];
+    if (typeof raw !== "string") continue;
+    const text = raw.trim();
+    if (f.type === "string[]") {
+      const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+      if (lines.length) config[f.name] = lines;
+      continue;
+    }
+    if (!text) continue;
+    if (f.type === "number") {
+      const n = Number(text);
+      if (!Number.isFinite(n)) return { ok: false, error: `"${f.name}" should be a number, got ${JSON.stringify(text.slice(0, 40))}` };
+      config[f.name] = n;
+    } else if (f.type === "boolean") {
+      const b = /^(true|on|1)$/i.test(text) ? true : /^(false|off|0)$/i.test(text) ? false : null;
+      if (b === null) return { ok: false, error: `"${f.name}" should be true or false` };
+      config[f.name] = b;
+    } else {
+      config[f.name] = text;
+    }
+  }
+  return { ok: true, config };
 }

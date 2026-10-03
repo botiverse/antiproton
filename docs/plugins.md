@@ -328,6 +328,23 @@ reads as `Bearer …`/`Basic …`/`Token …` under any name; keep the value as 
 secret and write `Bearer {{name}}`. Read the value through the same function at
 call time, so a value stored before a rule existed is refused there too.
 
+**A rule `config` cannot say goes in `configProblem(config)`.** Return the
+reason as a string, or `undefined` to accept. `validateMount` asks it once every
+setting is declared, typed and present, so it runs wherever settings are judged:
+a mount added from the console or `/admin/mounts`, a seed in provisioning, a
+reconcile, a credential being attached, and the console's problems column. It is
+synchronous and must not reach a server.
+
+**`consoleMount: true` lets an agent's owner add a mount from the console.**
+Opt-in (`mcp` is the one that does): the console builds a form from `config`,
+one field per setting, and `POST /ui/mount/add` coerces each (`configFromForm`
+in `src/runtime/mount-config.ts`) before the usual checks. Declare it only when
+every setting is one a stranger may type, and a mount is safe to delete: the
+console can also refresh and remove the mounts it added (at most eight per
+agent), refusing a removal while the mount holds a credential, a live inbound
+hook, a held call or running work. A `{{name}}` slot reads a secret the owner
+keeps from the same page (`POST /ui/secret`), in the same rows `secret_put` writes.
+
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.
 

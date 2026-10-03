@@ -35,7 +35,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal } from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
@@ -57,7 +57,7 @@ import {
   resolveViewer,
   programmaticAccess,
   seal, open, randomToken, readCookie, cookieHeader, clearCookieHeader, sessionCookieFor,
-  constantTimeEqual, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER, QA_KEY_SUBJECT, serviceViewer, uiAgent,
+  constantTimeEqual, isOperator, SESSION_COOKIE, LOGIN_COOKIE, LOGIN_TTL_MS, QA_VIEWER, QA_KEY_SUBJECT, serviceViewer, uiAgent,
   type Viewer, type LoginState, type RefusalReason, type GithubConfig,
   githubAuthorizeUrl, githubExchangeCode, githubFetchProfile, githubIdentityKey, githubViewer, githubDefaultAgentId, githubDefaultTenantId,
   isAdmin,
@@ -1678,6 +1678,10 @@ export class AgentDO extends DurableObject<Env> {
     const choices = await rt.store.pluginChoices(tenantId, agentId);
     return {
       installed: installedRows(installed, choices, SEEDED_PLUGINS),
+      // The secrets this agent kept, by name: what `state.secret_list` answers, never a value.
+      kept: await rt.keptSecrets(tenantId, agentId),
+      // How many mounts the console may add (`fromConsole` counts them), so the page need not copy the number.
+      consoleMountsMax: CONSOLE_MOUNTS_MAX,
       // The column means "what the agent can call", so the names come from the
       // same function that names them for the model, over the whole catalogue
       // at once: the tie-break at the length cap is a property of the set, and
@@ -1714,7 +1718,9 @@ export class AgentDO extends DurableObject<Env> {
           // `problems`, which are about the mount's settings: these are about
           // what a server said, and changing a setting does not fix them.
           toolNotes: skippedToolNotes(m.toolSnapshot),
-          ...(plugin?.snapshotTools ? { toolsTakenAt: m.toolSnapshot?.takenAt ?? null } : {}),
+          ...(plugin?.snapshotTools ? { toolsTakenAt: m.toolSnapshot?.takenAt ?? null, snapshotError: rt.snapshotError(m.alias) } : {}),
+          // Added by a person from this console: only these may be refreshed and removed here.
+          fromConsole: consoleAdded(m),
         };
       })),
       used,
@@ -1840,6 +1846,37 @@ export class AgentDO extends DurableObject<Env> {
   async adminRefreshMountTools(tenantId: string, agentId: string, alias: string) {
     this.#claim(tenantId, agentId);
     return this.#busy("adminRefreshMountTools", () => this.runtime().refreshMountTools(tenantId, agentId, alias));
+  }
+
+  // The console's mount and kept-secret writes (`/ui/mount/*`, `/ui/secret*`). The owner's
+  // counterparts of the two admin calls above, with the console's own limits (runtime `addMount`).
+  async uiAddMount(tenantId: string, agentId: string, plugin: string, alias: string, form: Record<string, string>) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiAddMount", () => this.runtime().addConsoleMount(tenantId, agentId, plugin, alias, form));
+  }
+
+  async uiRefreshMountTools(tenantId: string, agentId: string, alias: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiRefreshMountTools", () => this.runtime().refreshConsoleMount(tenantId, agentId, alias));
+  }
+
+  async uiRemoveMount(tenantId: string, agentId: string, alias: string) {
+    this.#claim(tenantId, agentId);
+    const r = await this.#busy("uiRemoveMount", () =>
+      this.runtime().removeMount(tenantId, agentId, alias, d1InboundHooks(this.env.CONTROL_DB)));
+    // Keyed by alias here too; a mount added later under it must not show this one's refusal.
+    if (r.ok) this.#reconcileRefused.delete(alias);
+    return r;
+  }
+
+  async uiPutSecret(tenantId: string, agentId: string, name: string, value: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiPutSecret", () => this.runtime().putKeptSecret(tenantId, agentId, name, value));
+  }
+
+  async uiRemoveSecret(tenantId: string, agentId: string, name: string) {
+    this.#claim(tenantId, agentId);
+    return this.#busy("uiRemoveSecret", () => this.runtime().removeKeptSecret(tenantId, agentId, name));
   }
 
   /** Provisioning's record + model + mount, in this agent's object (cf/src/provision/steps.ts). */
@@ -2739,7 +2776,23 @@ async function formOf(request: Request): Promise<FormData | null> {
  *  authorised as (credential, credential/remove). */
 // What a held call in the first conversation is recorded under (runtime.ts LEGACY_TASK).
 const LEGACY_TASK_ID = MAIN_SESSION;
-const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release"]);
+const UI_WRITE_ROUTES = new Set(["/ui/message", "/ui/decide", "/ui/compact", "/ui/credential", "/ui/credential/remove", "/ui/agent", "/ui/api-keys/new", "/ui/api-keys/revoke", "/ui/sandbox/release", "/ui/plugin/choice", "/ui/mount/add", "/ui/mount/refresh", "/ui/mount/remove", "/ui/secret", "/ui/secret/remove"]);
+
+/**
+ * The answer to a console mount or secret write. htmx gets the panel; a caller
+ * that sends `Accept: application/json` gets the result as JSON with the same
+ * panel under `html`, so one route serves a swap and a script.
+ */
+function consoleAnswer(request: Request, fragment: string, result: Record<string, unknown>): Response {
+  if ((request.headers.get("accept") ?? "").includes("application/json")) return Response.json({ ...result, html: fragment });
+  return html(fragment);
+}
+
+/** A refusal, as plain text the way `/ui/plugin/choice` answers one, or `{error}` for a JSON caller. */
+function consoleRefusal(request: Request, error: string, status: number): Response {
+  if ((request.headers.get("accept") ?? "").includes("application/json")) return Response.json({ error }, { status });
+  return new Response(error, { status });
+}
 
 /**
  * What a person may name an agent. Checked in the route before any object is
@@ -2851,7 +2904,7 @@ async function adminHooks(request: Request, env: Env, url: URL): Promise<Respons
  * offers the agent is the operator's to change, not the agent's.
  */
 async function adminMounts(request: Request, env: Env): Promise<Response> {
-  if (!env.AUTOMATION_TOKEN || request.headers.get("x-harness-token") !== env.AUTOMATION_TOKEN) {
+  if (!isOperator(env.AUTOMATION_TOKEN, request.headers.get("x-harness-token"))) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   if (request.method !== "POST") return Response.json({ error: "POST" }, { status: 405 });
@@ -3758,6 +3811,85 @@ async function route(request: Request, env: Env): Promise<Response> {
           const alias = String(form.get("alias") ?? "").trim();
           if (alias) await stub.uiRemoveCredential(gate.tenantId, agentId, alias);
           return html(mountFragment(await stub.uiPlugins(gate.tenantId, agentId), alias));
+        }
+        // The console's mount and kept-secret writes. Each answers the whole plugins panel, as
+        // `/ui/plugin/choice` does: the page swaps it into `.plugins-root`, and one write can move
+        // several of its parts at once (the mount, the "n of 8", the catalogue's switch, the kept
+        // list). A caller sending `Accept: application/json` gets the result with that panel under
+        // `html` (`consoleAnswer`); a refusal is plain text, or `{error}`, with its status.
+        //
+        // Add: the plugin must offer it (`consoleMount`), and the runtime refuses before storing
+        // anything (runtime `addMount`). The settings arrive as one form field per declared setting.
+        // A server that cannot be listed still leaves the mount, with why kept on it
+        // (`snapshotError`): the {{name}} secret it needs may be the next thing the person keeps.
+        case "/ui/mount/add": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          if (request.method !== "POST") return new Response("POST", { status: 405 });
+          const form = await formOf(request);
+          if (!form) return consoleRefusal(request, "expected a form body", 400);
+          const alias = String(form.get("alias") ?? "").trim();
+          const plugin = String(form.get("plugin") ?? "").trim();
+          const fields: Record<string, string> = {};
+          for (const [k, v] of form.entries()) if (typeof v === "string" && !["agentId", "alias", "plugin"].includes(k)) fields[k] = v;
+          const r = await stub.uiAddMount(gate.tenantId, agentId, plugin, alias, fields);
+          if (!r.ok) return consoleRefusal(request, r.error, 400);
+          return consoleAnswer(request, plugins(await stub.uiPlugins(gate.tenantId, agentId)),
+            { ok: true, alias, added: r.added, ...(r.tools ? { tools: r.tools } : {}) });
+        }
+        // Refresh: a server that could not be asked is the answer, not an error page (200, `ok:
+        // false`): the mount and the list it kept are still the truth, and the reason is kept on it.
+        case "/ui/mount/refresh": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          if (request.method !== "POST") return new Response("POST", { status: 405 });
+          const form = await formOf(request);
+          if (!form) return consoleRefusal(request, "expected a form body", 400);
+          const alias = String(form.get("alias") ?? "").trim();
+          if (!alias) return consoleRefusal(request, "expected an alias", 400);
+          const r = await stub.uiRefreshMountTools(gate.tenantId, agentId, alias);
+          const d: any = await stub.uiPlugins(gate.tenantId, agentId);
+          if (!r.ok) return consoleAnswer(request, plugins(d), { ok: false, error: r.error });
+          const toolsTakenAt = (d.mounts ?? []).find((m: any) => m.alias === alias)?.toolsTakenAt ?? null;
+          return consoleAnswer(request, plugins(d),
+            { ok: true, changed: r.changed, hash: r.hash, tools: r.tools, skipped: r.skipped, toolsTakenAt });
+        }
+        // Remove: 409 with the reason while anything depends on the mount (runtime `removeMount`).
+        case "/ui/mount/remove": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          if (request.method !== "POST") return new Response("POST", { status: 405 });
+          const form = await formOf(request);
+          if (!form) return consoleRefusal(request, "expected a form body", 400);
+          const alias = String(form.get("alias") ?? "").trim();
+          if (!alias) return consoleRefusal(request, "expected an alias", 400);
+          const r = await stub.uiRemoveMount(gate.tenantId, agentId, alias);
+          if (!r.ok) return consoleRefusal(request, r.error, r.conflict ? 409 : 400);
+          return consoleAnswer(request, plugins(await stub.uiPlugins(gate.tenantId, agentId)), { ok: true, alias, removed: true });
+        }
+        // A secret the owner keeps for the agent, for a mount's {{name}} header slots: the agent's
+        // own `kept:` rows, by the rules of `state.secret_put`. The value comes in once and goes
+        // nowhere back out — not in the answer, not on a refusal, not in a log line.
+        case "/ui/secret":
+        case "/ui/secret/remove": {
+          const gate = await requireViewer(request, env);
+          if (gate instanceof Response) return gate;
+          const agentId = uiSelected?.agentId ?? gate.agentId;
+          if (request.method !== "POST") return new Response("POST", { status: 405 });
+          const form = await formOf(request);
+          if (!form) return consoleRefusal(request, "expected a form body", 400);
+          const name = String(form.get("name") ?? "").trim();
+          const r = url.pathname === "/ui/secret"
+            ? await stub.uiPutSecret(gate.tenantId, agentId, name, String(form.get("value") ?? ""))
+            : await stub.uiRemoveSecret(gate.tenantId, agentId, name);
+          if (!r.ok) return consoleRefusal(request, r.error, 400);
+          const d: any = await stub.uiPlugins(gate.tenantId, agentId);
+          return consoleAnswer(request, plugins(d), {
+            ok: true, name, ...("removed" in r ? { removed: r.removed } : { kept: true }), secrets: d.kept,
+          });
         }
         // An operator handing a container back, from the panel that shows it
         // billing (Nova, 2026-09-16). The alias travels in the form body like

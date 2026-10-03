@@ -1645,6 +1645,33 @@ export interface Plugin {
 
   /** What a mount of this plugin may be configured with. */
   config?: ConfigField[];
+  /**
+   * A person may add a mount of this plugin from the console, with the settings
+   * in `config` as the form (`POST /ui/mount/add`), and remove one again.
+   *
+   * Opt-in, and `true` or absent, because the console is the one path where a
+   * signed-in owner rather than an operator chooses the settings, and that is
+   * a decision about this plugin that only its author can make: the settings
+   * must be ones a stranger may type, and a mount of it must be safe to delete
+   * (nothing outside this agent depends on its alias). Absent: the operator's
+   * route (`/admin/mounts`) is the only way to add one, as before.
+   */
+  consoleMount?: true;
+  /**
+   * The plugin's own verdict on a mount's settings, for a rule `config` cannot
+   * declare. A string is the reason the mount is refused, shown to whoever
+   * asked; `undefined` accepts it.
+   *
+   * Asked by `validateMount`, so wherever a mount's settings are judged: when
+   * one is added (the console, `/admin/mounts`, provisioning's seeds), when a
+   * seed is reconciled onto one, when a credential is attached to one — each
+   * before anything is stored, so a refusal leaves nothing behind — and on the
+   * console's mount page, for a mount stored before the rule existed. Only after
+   * the declared checks have passed, so `config` holds declared settings of the
+   * declared types with every required one present. Synchronous and local: it
+   * must not reach a server (the tool snapshot is the step that does).
+   */
+  configProblem?(config: Record<string, Json>): string | undefined;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */
   database?: DbSpec;
   /** What credential it needs, if any. Absent means it never uses one. */

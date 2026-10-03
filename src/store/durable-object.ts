@@ -827,6 +827,16 @@ export class DurableObjectStore implements StorageAdapter {
     }
   }
 
+  async removeMount(tenantId: string, agentId: string, alias: string, secretName: string | null) {
+    return this.#tx(() => {
+      if (!this.#one("SELECT alias FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, alias)) return false;
+      this.#sql.exec("DELETE FROM mounts WHERE tenant_id=? AND agent_id=? AND alias=?", tenantId, agentId, alias);
+      this.pluginDb.remove(tenantId, agentId, alias);
+      if (secretName !== null) this.#sql.exec("DELETE FROM secrets WHERE tenant_id=? AND agent_id=? AND name=?", tenantId, agentId, secretName);
+      return true;
+    });
+  }
+
   async setMountSecretRef(tenantId: string, agentId: string, alias: string, secretRef: string | null) {
     this.#sql.exec("UPDATE mounts SET secret_ref=? WHERE tenant_id=? AND agent_id=? AND alias=?",
       secretRef, tenantId, agentId, alias);

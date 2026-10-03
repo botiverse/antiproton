@@ -157,6 +157,8 @@ function failure(e: unknown, kept: Map<string, string>, what: string, mayHaveLan
 export const mcpPlugin: Plugin = {
   id: "mcp",
   version: VERSION,
+  // An owner may add a server from the console: the settings are a URL and header lines that hold names, never values.
+  consoleMount: true,
   // Empty on purpose: a mount's tools are what its server listed (`mountTools`).
   tools: [],
   config: [

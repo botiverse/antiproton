@@ -102,6 +102,7 @@
     "test/pd-migrate.ts",
     "test/spec/pd-migrate-spec.ts",
     "test/pd-migrate-object.ts",
+    "test/console-mounts.ts",
     "test/pd-writes.ts",
     "test/pd-object-reads.ts",
     "test/spec/pd-writes-spec.ts",
