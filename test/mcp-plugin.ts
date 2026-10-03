@@ -200,7 +200,10 @@ await check("an inward host is refused when the mount is written and again when 
     "https://192.168.1.1.example.com/mcp",
     // The same services in their other spellings, refused by name.
     "https://a9fea9fe.nip.io/mcp", "https://0a000001.nip.io/mcp", "https://--1.sslip.io/mcp", "https://fe80--1.sslip.io/mcp",
-    "https://app.localtest.me/mcp", "https://lvh.me/mcp"]) {
+    "https://app.localtest.me/mcp", "https://lvh.me/mcp", "https://a9fea9fe.traefik.me/mcp", "https://x.localho.st/mcp",
+    "https://localhost.direct/mcp", "https://x.lacolhost.com/mcp",
+    // The dashed spelling on a domain no list names: only the address scan sees it.
+    "https://node-10-0-0-1.example.com/mcp"]) {
     must(/public host/.test(serverUrlProblem(u) ?? ""), `${u} was not refused as inward: ${serverUrlProblem(u)}`);
     must(mcpConfigProblem({ url: u }) !== undefined, `${u} passed the mount-time check`);
   }
@@ -210,7 +213,9 @@ await check("an inward host is refused when the mount is written and again when 
     // Four numbers that are not an address: one is over 255.
     "https://10.0.0.300.example/mcp", "https://node-10-1-2-256.example/mcp",
     // A public address written in an ordinary name is not refused for being an address.
-    "https://8.8.8.8.example.com/mcp", "https://node-8-8-8-8.example/mcp"]) {
+    "https://8.8.8.8.example.com/mcp", "https://node-8-8-8-8.example/mcp",
+    // A listed service's name inside another name is not that service.
+    "https://notnip.io/mcp", "https://mylvh.me/mcp", "https://nip.io.example.com/mcp"]) {
     must(serverUrlProblem(u) === null, `${u} was refused: ${serverUrlProblem(u)}`);
   }
   must(mcpConfigProblem({ url: URL_ }) === undefined, "a public https url failed the mount-time check");
