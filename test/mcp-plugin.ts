@@ -196,7 +196,8 @@ await check("an inward host is refused when the mount is written and again when 
     "https://[64:ff9b:1::1]/mcp", "https://[2002:a9fe:a9fe::]/mcp", "https://[fec0::1]/mcp", "https://[ff02::1]/mcp",
     "https://nas.home.arpa/mcp", "https://198.18.0.1/mcp", "https://240.0.0.1/mcp", "https://224.0.0.1/mcp",
     // Names that spell an inward address, for services that resolve them back to it.
-    "https://10.0.0.1.nip.io/mcp", "https://169.254.169.254.nip.io/mcp", "https://10-0-0-1.sslip.io/mcp"]) {
+    "https://10.0.0.1.nip.io/mcp", "https://169.254.169.254.nip.io/mcp", "https://10-0-0-1.sslip.io/mcp",
+    "https://192.168.1.1.example.com/mcp"]) {
     must(/public host/.test(serverUrlProblem(u) ?? ""), `${u} was not refused as inward: ${serverUrlProblem(u)}`);
     must(mcpConfigProblem({ url: u }) !== undefined, `${u} passed the mount-time check`);
   }
