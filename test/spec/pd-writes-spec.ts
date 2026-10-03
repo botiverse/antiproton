@@ -366,8 +366,8 @@ export function pdWritesCases(withRawHost: WithDriveHost): DriveCase[] {
       await w.settle();
       const [waiting] = await w.rt.waitingClientCalls(T, A, "main");
       check(waiting?.call_id === "c2", "control: the caller's function is not waiting");
-      check(w.raw.sql.exec("SELECT COUNT(*) AS n FROM ap_settled_runs").toArray()[0]!.n === 1, "control: the first run's end is not pending");
       check(!w.seen.includes("lease.release"), `released while the next run waits on the caller: ${show(w.seen)}`);
+      check(w.raw.sql.exec("SELECT COUNT(*) AS n FROM ap_settled_runs").toArray()[0]!.n === 1, "control: the first run's end is not pending");
       await w.rt.submitToolResults(T, A, "main", [{ turnId: waiting.turn_id, callId: "c2", output: "cold", isError: false }]);
       await w.answer([text("done")], "stop");
       await w.settle();
