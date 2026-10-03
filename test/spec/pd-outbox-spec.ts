@@ -425,7 +425,8 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(pdJobs(storage)[0]!.state === "consumed", `job ${show(pdJobs(storage))}`);
     check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
     check(outboxes(storage).trace.length === 0, `trace ${show(outboxes(storage).trace)}`);
-    const errors = storage.sql.exec("SELECT at, message FROM trace_errors").toArray();
+    const kept = storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'trace_errors'").toArray().length > 0;
+    const errors = kept ? storage.sql.exec("SELECT at, message FROM trace_errors").toArray() : [];
     check(errors.length === 1 && String(errors[0]!.message).includes("trace refused for the test") && Number(errors[0]!.at) > 0, `trace_errors ${show(errors)}`);
     await o.agent.close();
   });
