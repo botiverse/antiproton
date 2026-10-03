@@ -1626,7 +1626,7 @@ export class AgentRuntime {
     // says so. Every creation path still leaves that row absent, so an agent is opened as `PiAgent` unless
     // the operator migrated it (`migrateEngine` below, src/runtime/pd-migrate.ts). An object with no
     // `ap_meta` table is read without creating one.
-    const engine = recordedEngine(this.#deps.ctx.storage.sql);
+    const engine = this.#engine();
     // Before the catalogue is read: a stale pin is a mount whose every call
     // the gateway refuses, and the harness opening is the one moment every
     // agent passes through, console-made or API-made.
@@ -1830,6 +1830,13 @@ export class AgentRuntime {
    * cancelled, with the marker `cancelSession` writes.
    */
   async migrateEngine(tenantId: string, agentId: string, op: "migrate" | "revert", opts: { dryRun?: boolean } = {}):
+    Promise<MigrationResult | RevertResult | null> {
+    // The recorded engine is what this moves: read it again afterwards, whatever the outcome.
+    try { return await this.#migrateEngine(tenantId, agentId, op, opts); }
+    finally { this.#recorded = undefined; }
+  }
+
+  async #migrateEngine(tenantId: string, agentId: string, op: "migrate" | "revert", opts: { dryRun?: boolean }):
     Promise<MigrationResult | RevertResult | null> {
     await this.ready();
     if (!(await this.store.loadAgent(tenantId, agentId))) return null;
@@ -2150,9 +2157,22 @@ export class AgentRuntime {
     return { wakeInMs, releaseFailed };
   }
 
-  /** Whether this object's recorded engine is pd (`recordedEngine`, which reads `ap_meta` and creates nothing). */
+  /**
+   * This object's recorded engine (`recordedEngine`, which reads `ap_meta` and creates nothing). A recorded engine is
+   * kept for this runtime: only `migrateEngine` moves it, and it forgets it. None recorded is asked again every time,
+   * because a pd bench object records its engine after the object exists (cf/src/bench.ts `chooseBenchEngine`).
+   */
+  #engine(): "pi085" | "pd" | null {
+    if (this.#recorded !== undefined) return this.#recorded;
+    const engine = recordedEngine(this.#deps.ctx.storage.sql);
+    if (engine !== null) this.#recorded = engine;
+    return engine;
+  }
+  #recorded: "pi085" | "pd" | undefined;
+
+  /** Whether this object's recorded engine is pd. */
   #isPd(): boolean {
-    return recordedEngine(this.#deps.ctx.storage.sql) === "pd";
+    return this.#engine() === "pd";
   }
 
   /** What the worker asks for, and what it hands back. The job row says which

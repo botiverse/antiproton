@@ -109,6 +109,23 @@ const runtimeCases: DriveCase[] = [
     },
   },
   {
+    group: "runtime", name: "no engine recorded is asked again: a runtime that read none opens pd once the bench records it",
+    run: async () => {
+      const host = sqliteHost();
+      try {
+        const { rt } = await runtime(host);
+        check((await rt.waitingClientCalls("t", "a", "main")).length === 0, "control: a call waits");
+        // What `chooseBenchEngine` does on an object that already exists (cf/src/bench.ts).
+        const ap = new ApStore(host, prefixedNamespace("ap"));
+        ap.ensure();
+        ap.setEngineOnce("pd");
+        const agent = await rt.agent("t", "a");
+        check(agent instanceof DurableAgent, `opened ${agent.constructor.name} after pd was recorded`);
+        await agent.close();
+      } finally { host.dispose(); }
+    },
+  },
+  {
     group: "runtime", name: "engine pd: a run that ends while another conversation's is still out is reported by the step that finds the object at rest",
     run: async () => {
       const host = sqliteHost();

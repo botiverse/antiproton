@@ -330,6 +330,50 @@ export function pdWritesCases(withRawHost: WithDriveHost): DriveCase[] {
       check(w.seen.includes("lease.release"), `nothing was released once the run ended: ${show(w.seen)}`);
     }));
 
+  add("auto-release on pd waits for every conversation: another conversation's run ending while main waits on the caller releases nothing", () =>
+    world({ autoRelease: true, callerTools: true }, async (w) => {
+      await w.rt.postMessage(T, A, "take it, then ask");
+      await w.answer([call("c1", "lease__take")], "toolUse");
+      await w.answer([call("c2", "get_weather")], "toolUse");
+      await w.settle();
+      const [waiting] = await w.rt.waitingClientCalls(T, A, "main");
+      check(waiting?.call_id === "c2", "control: the caller's function is not waiting");
+      check(!w.seen.includes("lease.release"), `control: released early: ${show(w.seen)}`);
+      await w.rt.postMessage(T, A, "hello from s2", "prompt", "s2");
+      await w.answer([text("hi")], "stop");
+      await w.settle();
+      const ended = await w.rt.branchEntries(T, A, "s2");
+      check(show(ended.at(-1)).includes("\"hi\""), `control: s2's run did not end: ${show(ended.at(-1))}`);
+      const [still] = await w.rt.waitingClientCalls(T, A, "main");
+      check(still?.call_id === "c2", "control: main no longer waits");
+      check(!w.seen.includes("lease.release"), `released while main waits on the caller: ${show(w.seen)}`);
+      // Once main's run ends too, the object is at rest and both runs are reported.
+      await w.rt.submitToolResults(T, A, "main", [{ turnId: still.turn_id, callId: "c2", output: "cold", isError: false }]);
+      await w.answer([text("done")], "stop");
+      await w.settle();
+      check(w.seen.includes("lease.release"), `nothing was released once every run ended: ${show(w.seen)}`);
+    }));
+
+  add("auto-release on pd: a run's end still unreported when the next run reaches a caller wait releases nothing", () =>
+    world({ autoRelease: true, callerTools: true }, async (w) => {
+      await w.rt.postMessage(T, A, "take it");
+      await w.answer([call("c1", "lease__take")], "toolUse");
+      // Queued behind the run: it starts the next run in the pass that ends this one, so no step finds the object idle
+      // between them, and the first run's end is still unreported when the second waits on the caller.
+      await w.rt.postMessage(T, A, "then ask", "followUp");
+      await w.answer([text("taken")], "stop");
+      await w.answer([call("c2", "get_weather")], "toolUse");
+      await w.settle();
+      const [waiting] = await w.rt.waitingClientCalls(T, A, "main");
+      check(waiting?.call_id === "c2", "control: the caller's function is not waiting");
+      check(w.raw.sql.exec("SELECT COUNT(*) AS n FROM ap_settled_runs").toArray()[0]!.n === 1, "control: the first run's end is not pending");
+      check(!w.seen.includes("lease.release"), `released while the next run waits on the caller: ${show(w.seen)}`);
+      await w.rt.submitToolResults(T, A, "main", [{ turnId: waiting.turn_id, callId: "c2", output: "cold", isError: false }]);
+      await w.answer([text("done")], "stop");
+      await w.settle();
+      check(w.seen.includes("lease.release"), `nothing was released once the run ended: ${show(w.seen)}`);
+    }));
+
   add("the idle pass on pd warns the agent with a turn, then releases at the release time", () =>
     world({ autoRelease: true, idle: { warnMs: 60_000, maxMs: 120_000 } }, async (w) => {
       await w.rt.postMessage(T, A, "take it");

@@ -120,6 +120,50 @@ const runtimeCases: DriveCase[] = [{
     } finally { a.raw.dispose(); }
   },
 }, {
+  group: "runtime", name: "the rollback forgets pd's unreported run ends: pi-durable's ids restart after it, so a stale one would hide the next pd run's end",
+  run: async () => {
+    const a = await apiAgent();
+    try {
+      a.replies.push(() => ({ text: "hello", finishReason: "stop", truncated: false, usage: USAGE }));
+      await a.rt.postMessage("t", "a", "hi");
+      await a.settle();
+      const migrated = await a.rt.migrateEngine("t", "a", "migrate");
+      check(migrated?.ok && migrated.action === "migrated", `migrated: ${show(migrated)}`);
+      // A pd run that ends with no step after it (the harness `say` opened answers it in this isolate): its end is
+      // recorded and nothing has reported it when the operator rolls back.
+      const before = a.sent.length;
+      await a.rt.postMessage("t", "a", "one");
+      for (let i = 0; i < 200 && a.sent.length === before; i++) await sleep(5);
+      const id = a.sent.at(-1)!;
+      const job = await a.rt.takeJob("t", "a", id) as Job;
+      await a.rt.deliverAnswer("t", "a", id, fromResponse({ text: "first", finishReason: "stop", truncated: false, usage: USAGE }, job.model, id));
+      for (let i = 0; i < 200 && a.rows("ap_settled_runs") === 0; i++) await sleep(5);
+      const stale = a.raw.sql.exec("SELECT operation_id FROM ap_settled_runs").toArray().map((r) => String(r.operation_id));
+      check(stale.length === 1, `control: no unreported run end before the rollback: ${show(stale)}`);
+      await (await a.rt.agent("t", "a")).close();
+      const back = await a.rt.migrateEngine("t", "a", "revert");
+      check(back?.ok && back.action === "reverted", `reverted: ${show(back)}`);
+      check(a.rows("ap_settled_runs") === 0, "the rollback kept pd's unreported run ends");
+      // On pd again, the next run's end is reported, under an id pi-durable hands out afresh.
+      const again = await a.rt.migrateEngine("t", "a", "migrate");
+      check(again?.ok && again.action === "migrated", `migrated again: ${show(again)}`);
+      await a.rt.postMessage("t", "a", "two");
+      a.replies.push(() => ({ text: "second", finishReason: "stop", truncated: false, usage: USAGE }));
+      let reported: Array<{ operationId: string }> = [];
+      for (let guard = 0; guard < 60 && reported.length === 0; guard++) {
+        const out = await a.rt.step("t", "a");
+        reported = out.settled;
+        for (const j of a.sent.filter((x) => x !== id)) {
+          const next = await a.rt.takeJob("t", "a", j).catch(() => null) as Job | null;
+          if (next) await a.rt.deliverAnswer("t", "a", j, fromResponse(a.replies.shift()!(), next.model, j));
+        }
+        if (reported.length === 0 && out.wakeInMs !== null) await sleep(Math.min(out.wakeInMs, 50));
+      }
+      // The control for why the rows must go: the new run's end carries the stale row's id.
+      check(reported.some((r) => stale.includes(r.operationId)), `control: pi-durable did not hand out the stale id again: ${show(reported)} vs ${show(stale)}`);
+    } finally { a.raw.dispose(); }
+  },
+}, {
   group: "route", name: "POST /admin/migrate-engine: the operator's token, POST, both ids, op and dryRun checked before the object is asked; 404, 409 and 200 from its answer",
   run: async () => {
     const asked: unknown[] = [];
