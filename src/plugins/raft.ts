@@ -447,8 +447,8 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * The state is the send itself: target, content, the interrupt's `resume.idempotencyKey` (the original key),
  * and the `seen` boundary when the question showed every new message. Plain data, nothing a credential. It is
  * the shape 0.3.2's continuation produced (`{ target, content, idempotencyKey, seen? }`), so a send held before
- * an upgrade resumes the same way: going ahead is the same send again under the same key, which is what the
- * SDK's interrupt says resuming is in-process.
+ * an upgrade resumes the same way: going ahead is `messages.send` again with the original input under the same
+ * key. Of the interrupt only `resume.idempotencyKey` and the hold's facts are used; its argv is not.
  */
 async function sendMessage(
   ctx: PluginContext,
@@ -731,9 +731,10 @@ export const raftPlugin: Plugin = {
    * the question showed (the state's `seen`, and the frontier `recordHeld` saved): so it goes through
    * unless the conversation moved again since, which asks again with the newer messages. "drop" sends
    * nothing; the model changes a message by dropping it and sending a new one. Expiry and cancel send
-   * nothing either, so no `cancel` is declared: the SDK's interrupt carries a `cancel`, but it is the CLI's
-   * `--discard-draft` argv, and in-process the SDK keeps no draft and has no call that clears one —
-   * "cancelling is not calling it" (its README, 0.4.0).
+   * nothing either, so no `cancel` is declared: an in-process held send leaves nothing on the Server, and
+   * cancelling is not calling send again. The interrupt's `resume.argv` and `cancel.argv` are the CLI's and
+   * the command endpoint's; for an in-process send they are ignored here and never reach the model's text
+   * (0.4.0 still fills them with draft flags for an in-process send).
    */
   interrupts: {
     async resume(tool, state, answer, ctx) {

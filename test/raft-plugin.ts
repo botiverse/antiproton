@@ -284,15 +284,7 @@ await check("resume \"drop\" sends nothing", async () => {
   if (out.state !== "dropped" || !/new idempotencyKey/.test(out.note)) throw new Error(`drop: ${JSON.stringify(out)}`);
 });
 
-await check("a held send's interrupt carries a cancel, which in-process is not a request: drop and the gateway's cancel send nothing", async () => {
-  // What the SDK hands back for a held send: a resume under the original key, and a cancel that is a CLI argv
-  // (`--discard-draft`) with no in-process call behind it. Asserted here so an SDK that grows one shows up.
-  one(HELD());
-  const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
-    .messages.send({ target: "#general", content: "done", idempotencyKey: "k-cancel" });
-  if (!isInterrupted(raw) || raw.interrupt.resume.idempotencyKey !== "k-cancel" || !raw.interrupt.cancel?.argv.includes("--discard-draft")) {
-    throw new Error(`the SDK's interrupt: ${JSON.stringify(raw)}`);
-  }
+await check("drop sends nothing, and the plugin declares no cancel: an in-process held send leaves nothing to clear", async () => {
   const m = mount();
   one(HELD());
   const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-cancel" }, m.ctx) as any;
@@ -301,9 +293,33 @@ await check("a held send's interrupt carries a cancel, which in-process is not a
   globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
   const dropped = await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx) as any;
   if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
-  // The plugin declares no cancel: an expired or cancelled question needs nothing from Raft.
   if (raftPlugin.interrupts!.cancel !== undefined) throw new Error("the plugin grew a cancel; this case no longer says what it does");
   if (sent !== 0) throw new Error(`drop reached Raft ${sent} time(s)`);
+});
+
+await check("the interrupt's CLI argv never reaches the model: not in the question, its context, or what resume and drop return", async () => {
+  // The key is distinctive so its presence in the SDK's argv is a positive control for the absence below.
+  const KEY = "k-argv-sentinel-5e1d";
+  const CLI = ["--send-draft", "--discard-draft", "--expected-draft-key", KEY];
+  one(HELD());
+  const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
+    .messages.send({ target: "#general", content: "done", idempotencyKey: KEY });
+  const argv = isInterrupted(raw) ? JSON.stringify([raw.interrupt.resume.argv, raw.interrupt.cancel?.argv ?? null]) : "";
+  if (!argv.includes(KEY) || !argv.includes("--send-draft")) throw new Error(`control: the SDK's argv carries no sentinel: ${JSON.stringify(raw)}`);
+  const m = mount();
+  one(HELD());
+  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: KEY }, m.ctx) as any;
+  if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
+  // What run_js and resume show the model of a question: question, context and answer (the state stays host-side).
+  const shown: Array<[string, unknown]> = [["the question", { question: held.question, context: held.context, answer: held.answer }]];
+  one(json(200, { ok: true, state: "sent", messageId: "m-argv", messageSeq: 21 }));
+  shown.push(["resume send", await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx)]);
+  shown.push(["resume drop", await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx)]);
+  for (const [where, value] of shown) {
+    const text = JSON.stringify(value);
+    const leaked = CLI.filter((piece) => text.includes(piece));
+    if (leaked.length) throw new Error(`${where} carries ${leaked.join(", ")}: ${text}`);
+  }
 });
 
 await check("a send held under SDK 0.3.2, still waiting across the upgrade, resumes and drops as before", async () => {
@@ -325,9 +341,9 @@ await check("a send held under SDK 0.3.2, still waiting across the upgrade, resu
   if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
 });
 
-await check("a draft already pending (DRAFT_PENDING) is an ordinary refusal: not retryable, nothing landed", async () => {
-  one(json(409, { errorCode: "DRAFT_PENDING", message: "a draft is pending" }));
-  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-draft" }, ctx()));
+await check("a Server conflict on a send is an ordinary refusal: not retryable, nothing landed", async () => {
+  one(json(409, { errorCode: "conflict", message: "conflict" }));
+  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-conflict" }, ctx()));
   if (why.retryable !== false || why.transient !== false || why.mayHaveLanded === true) {
     throw new Error(`marks: retryable=${why.retryable} transient=${why.transient} mayHaveLanded=${why.mayHaveLanded} ${why.message}`);
   }
