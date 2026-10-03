@@ -371,8 +371,10 @@ store and its key because it is the store's own surface, and whose tools read
 only `kept:`. `builtin` holds the raw store too, without the key, so it could
 list, overwrite or delete an owner's secrets but not read a value. The same test
 is a tripwire over the plugin list as `cf/src/runtime.ts` writes it: another
-entry naming the key or `this.store`, an entry handed the whole runtime, or a
-second change to the list turns it red. A key or store bound to another name
+entry naming the key, the runtime's secret resolver (`this.#secrets`) or
+`this.store`, an entry handed the whole runtime, or a second change to the list
+(including a non-empty initial list or a different list kept as the runtime's)
+turns it red. A key or store bound to another name
 first is not seen, and a plugin built elsewhere (the `extraPlugins` entries
 arrive already built) is outside it: what such a plugin can reach was decided
 where it was constructed.

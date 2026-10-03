@@ -99,12 +99,19 @@ async function pluginFilesMatching(re: RegExp): Promise<string[]> {
  * A tripwire over that text, not a proof: a key or store bound to a name before
  * the list and passed by that name is not seen, and a `Plugin` built elsewhere
  * (`extraPlugins` arrive built) is outside it: its reach was decided where it was
- * constructed. What it does refuse is a second change to the list and an entry
- * handed the whole runtime, the two routes that would bypass it in plain sight.
+ * constructed. What it does refuse is a second change to the list (a non-empty
+ * starting list, or another list kept as the runtime's, included), an entry
+ * handed the whole runtime, and an entry handed `#secrets` (the resolver that
+ * decrypts `agent:` references), the routes that would bypass it in plain sight.
  */
 async function deployedPluginEntries(): Promise<string[]> {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
+  // The list starts empty and is the one the runtime keeps, so the push below is the only place an entry is written.
+  const inits = src.match(/(?<![#.\w])plugins\s*(:[^=;]*)?=(?!=)[^;]*;/g) ?? [];
+  must(show(inits) === show(["plugins: Plugin[] = [];"]), `cf/src/runtime.ts sets up the plugin list as ${show(inits)}, not one empty \`const plugins: Plugin[] = [];\`; this test reads only the one plugins.push( list`);
+  const kept = src.match(/this\.#plugins\s*=(?!=)[^;]*;/g) ?? [];
+  must(show(kept) === show(["this.#plugins = plugins;"]), `cf/src/runtime.ts keeps ${show(kept)} as its plugins, not the one list; this test reads only the one plugins.push( list`);
   const writes = src.match(/\bplugins\s*(\.\s*(push|unshift|splice|fill|copyWithin)\b|\[[^\]]*\]\s*=(?!=))/g) ?? [];
   must(writes.length === 1, `cf/src/runtime.ts changes the plugin list ${writes.length} times (${show(writes)}); this test reads only the one plugins.push( list`);
   const list = /plugins\.push\(\n([\s\S]*?)\n\s*\);/.exec(src);
@@ -126,11 +133,12 @@ await check("only mcp declares readsOwnerSecrets, the grant the gateway reads", 
   must(show(granted) === show(["mcp.ts"]), `plugins that declare readsOwnerSecrets: ${show(granted)}`);
 });
 
-await check("only statePlugin is handed the sealing key, only it and builtin the raw store, and state.ts never names the owner's prefix", async () => {
+await check("only statePlugin is handed the sealing key or the secret resolver, only it and builtin the raw store, and state.ts never names the owner's prefix", async () => {
   // The key, not an import, is what decrypts: read where the deployment hands it out.
   const entries = await deployedPluginEntries();
-  const keyed = entries.filter((e) => /kek/i.test(e)).map((e) => e.split("(")[0]);
-  must(show(keyed) === show(["statePlugin"]), `plugins handed the sealing key: ${show(keyed)}; only state may, and only under kept: (Plugin.readsOwnerSecrets)`);
+  // The resolver (`#secrets`) already opens what the key opens, so handing it out counts the same.
+  const keyed = entries.filter((e) => /kek|#secrets\b/i.test(e)).map((e) => e.split("(")[0]);
+  must(show(keyed) === show(["statePlugin"]), `plugins handed the sealing key or the secret resolver: ${show(keyed)}; only state may, and only under kept: (Plugin.readsOwnerSecrets)`);
   const stores = entries.filter((e) => /this\.store\b/.test(e)).map((e) => e.split("(")[0]);
   must(show(stores) === show(["statePlugin", "builtinToolsPlugin"]), `plugins handed the raw store: ${show(stores)}; with it, a plugin can list, overwrite and delete owner secrets (Plugin.readsOwnerSecrets)`);
   const { readFileSync } = await import("node:fs");
