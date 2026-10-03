@@ -84,24 +84,36 @@ async function modelOnlyFixture(policy: any = null) {
     toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy,
   });
   const gw = new ToolGateway(store, [plugin], new Set([plugin.id]), { async resolve() { return null; } });
-  return { store, gw, seen, ctx: { tenantId: "t", agentId: "a", taskId: "k" } };
+  return { store, gw, seen, plugin, ctx: { tenantId: "t", agentId: "a", taskId: "k" } };
 }
 
-await check("an approved model-only call is not run: nobody would read its result, and the card says why", async () => {
+await check("a model-only call that would be held is refused at once: no card, nothing run, the operation ended", async () => {
   for (const [how, policy, opts] of [["the model's confirm", null, { confirm: true }], ["a write policy", { write: "approval" }, {}]] as const) {
     const f = await modelOnlyFixture(policy);
     const r: any = await f.gw.invoke(f.ctx, "box.pull", {}, opts as any);
-    must(r.status === "pending", `${how}: not held: ${JSON.stringify(r)}`);
-    const out: any = await f.gw.applyApproval("t", r.operationId, "approved", "tygg");
-    must(out.ok && !out.executed && (out.result as any)?.error?.code === "not_from_a_program", `${how}: ${JSON.stringify(out)}`);
-    must(/box\.pull was not run: its result only counts once the agent reads it/.test((out.result as any).error.message), `${how}: ${JSON.stringify(out)}`);
-    must(f.seen.length === 0, `${how}: the plugin ran: ${f.seen.join()}`);
-    must((await f.store.getOperation("t", r.operationId))?.status === "cancelled", `${how}: the operation was left open`);
-    // Positive control: on the same mount, under the same hold, an ordinary tool's approval runs it.
+    must(r.status === "rejected" && r.error?.code === "not_from_a_program", `${how}: ${JSON.stringify(r)}`);
+    must((await f.store.listApprovals("t", "pending")).length === 0 && f.seen.length === 0, `${how}: a card was made or the plugin ran`);
+    // Positive control: on the same mount, under the same hold, an ordinary tool is held and its approval runs it.
     const z: any = await f.gw.invoke(f.ctx, "box.zap", {}, opts as any);
+    must(z.status === "pending", `${how}: zap was not held: ${JSON.stringify(z)}`);
     const ran: any = await f.gw.applyApproval("t", z.operationId, "approved", "tygg");
     must(ran.ok && ran.executed && ran.result?.status === "succeeded" && f.seen.join() === "zap", `${how}: zap: ${JSON.stringify(ran)}`);
   }
+});
+
+await check("a model-only call held before it stopped being held is not run when approved, and the card says why", async () => {
+  const f = await modelOnlyFixture({ write: "approval" });
+  // Held while the tool did not yet declare it, as a deployment before this change held it.
+  const tool = (f.plugin.tools as any[]).find((t) => t.name === "pull");
+  delete tool.modelOnly;
+  const r: any = await f.gw.invoke(f.ctx, "box.pull", {});
+  must(r.status === "pending", `not held: ${JSON.stringify(r)}`);
+  tool.modelOnly = true;
+  const out: any = await f.gw.applyApproval("t", r.operationId, "approved", "tygg");
+  must(out.ok && !out.executed && out.result?.error?.code === "not_from_a_program", JSON.stringify(out));
+  must(/box\.pull was not run: its result only counts once the agent reads it/.test(out.result.error.message), JSON.stringify(out));
+  must(f.seen.length === 0, `the plugin ran: ${f.seen.join()}`);
+  must((await f.store.getOperation("t", r.operationId))?.status === "cancelled", "the operation was left open");
 });
 
 await check("the bridge lifts confirm out of the model's arguments into the call's options", async () => {

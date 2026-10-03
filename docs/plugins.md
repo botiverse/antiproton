@@ -318,13 +318,16 @@ a remote `readOnlyHint` is that server's word, not reviewed code.
 
 **Declare `modelOnly: true` on a tool whose result only counts once the model
 has read it.** A run_js program's call to it is refused with
-`not_from_a_program` (`runJsTool` in `src/runtime/pi-tools.ts`), whether the
-program names it the model's way (`raft__receive_events`) or by address
-(`raft.receive_events`); the model's own call goes through as before. A call
-held for approval is not run when a person approves it either
-(`ToolGateway.applyApproval`), since it would then run with nobody reading the
-result; such a tool is usable only on a mount whose policy lets the agent call
-it without approval. Raft's `receive_events` declares it: it acknowledges the
+`not_from_a_program` whatever name the program uses — the model's
+(`inbox__receive_events`), the address (`inbox.receive_events`), or the
+plugin's (`raft.receive_events`, which the gateway resolves when one mount uses
+the plugin): run_js marks every call it makes `fromProgram`
+(`src/runtime/pi-tools.ts`) and the gateway refuses on that
+(`src/runtime/gateway.ts`). The model's own call goes through as before. Such a
+tool is also never held for approval, since an approved call runs with nobody
+reading the result: where the mount's policy or the model's `confirm` would
+hold it, the call is refused and the model told why, so it is usable only on a
+mount whose policy lets the agent call it without approval. Raft's `receive_events` declares it: it acknowledges the
 previous batch and records what it hands over as seen, so from a program the
 model would have acknowledged, and attested to having read, messages it never
 saw. So does `read_messages`, because Raft marks what a history read returns

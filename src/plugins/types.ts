@@ -35,10 +35,15 @@ export interface ToolSchema {
   replay?: "never";
   /**
    * Only the model may call this tool. Refused with `not_from_a_program` on the
-   * two roads that reach a plugin with no model reading the result: a run_js
-   * program's call, in either name form, before it reaches the gateway
-   * (`runJsTool`'s host `invoke`, src/runtime/pi-tools.ts); and a held call a
-   * person approves, which then runs on its own (`ToolGateway.applyApproval`).
+   * two roads that reach a plugin with no model reading the result:
+   * - a run_js program's call, under any name the gateway resolves — its
+   *   offered name, its address, or `plugin.tool` — refused by the gateway on
+   *   `InvokeOpts.fromProgram` (`ToolGateway` `#invoke`), which run_js sets
+   *   where the program cannot clear it (`runJsTool`, src/runtime/pi-tools.ts,
+   *   which also answers an offered name early);
+   * - a call held for approval, which would then run on its own: refused when
+   *   it would be held (`#invoke`), and, for one held before, when approved
+   *   (`ToolGateway.applyApproval`).
    *
    * For a tool whose result only counts once the model has read it. Raft's
    * `receive_events` is the case: the call acknowledges the previous batch and

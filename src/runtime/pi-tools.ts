@@ -1007,8 +1007,9 @@ export function runJsTool(
           const addr = address(call.tool);
           const target = typeof addr === "string" ? byAddress.get(addr) : undefined;
           // A tool whose result only counts once the model has read it (`ToolSchema.modelOnly`): from a
-          // program, what it consumes or attests would go to code the model may never print. Asked of the
-          // resolved target, so the model's name and the dotted address are refused alike.
+          // program, what it consumes or attests would go to code the model may never print. The gateway is
+          // what holds the line (`fromProgram` below), since only it resolves every name a program can write;
+          // this is the early answer for a name the model was offered, in the model's own words.
           if (target?.modelOnly) {
             return Promise.resolve({
               status: "rejected" as const,
@@ -1031,9 +1032,12 @@ export function runJsTool(
             // include `approved`, which skips the mount's policy, and `operationId`, which names an
             // operation the program did not start (InvokeOpts, src/runtime/gateway.ts). The only one
             // a program may set is `confirm`, and only to true: it can hold its own call, never free one.
+            // `fromProgram` is ours, always set: the gateway refuses a model-only tool on it whatever
+            // name the program used (`InvokeOpts.fromProgram`).
             opts: {
               ...(lifted.confirm || (call.opts as { confirm?: unknown } | undefined)?.confirm === true ? { confirm: true } : {}),
               idempotencyKey: `${toolCallId}:${n++}`,
+              fromProgram: true,
             },
           }).then((res) => {
             // A tool asking the model a question. The program never sees it —

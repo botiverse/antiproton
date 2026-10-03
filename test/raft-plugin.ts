@@ -6,6 +6,8 @@ import { SqliteStore } from "../src/store/sqlite.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { openPluginDatabase } from "../src/runtime/plugin-db.ts";
+import { QuickJsExecutor } from "../src/runtime/executor.ts";
+import { bridgeTools, qualifyMountedTools, runJsTool, type MountedTool } from "../src/runtime/pi-tools.ts";
 
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
@@ -508,6 +510,81 @@ await check("the gateway records a failed pull as failed, not unknown: under cur
       throw new Error(`${name} leaked: ${message}`);
     }
   }
+});
+
+/**
+ * Raft mounted under an alias that is not the plugin's id, behind a real gateway, and the host the runtime gives
+ * run_js (cf/src/runtime.ts `dispatch`): the program's options go to the gateway as they are.
+ */
+async function raftBehindGateway(policy: unknown = null) {
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({
+    tenantId: "tenant", agentId: "agent", alias: "inbox", plugin: "raft",
+    installationId: "raft-test", connectionId: null, toolVersion: raftPlugin.version,
+    publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: policy as any,
+  });
+  const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
+  const ctx = { tenantId: "tenant", agentId: "agent", taskId: "task" };
+  const host = {
+    seen: [] as any[],
+    async invoke(call: any) { host.seen.push(call); return gateway.invoke(ctx, call.tool, call.args, { ...(call.opts ?? {}), ...(call.callId ? { callId: call.callId } : {}) }) as any; },
+  };
+  const offered = (aliases: string[]) => qualifyMountedTools(aliases.flatMap((alias) => raftPlugin.tools.map((t) => ({
+    name: t.name, description: t.summary, parameters: t.parameters, address: `${alias}.${t.name}`,
+    sideEffects: t.sideEffects, idempotency: t.idempotency, ...(t.modelOnly ? { modelOnly: t.modelOnly } : {}),
+  })))) as MountedTool[];
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return events([], { last_seen_seq: null }); }) as any;
+  return { store, gateway, ctx, host, offered, fetched: () => fetched };
+}
+const program = async (host: any, tools: MountedTool[], source: string) =>
+  JSON.parse((await (runJsTool(new QuickJsExecutor() as any, host, { tools }) as any).execute("p", { source })).content[0].text);
+
+await check("a program cannot pull by a name run_js did not offer: the plugin's name, or a mount added after the list was made", async () => {
+  for (const [what, tools, source] of [
+    // `raft.receive_events` resolves to the one raft mount, `inbox`, in the gateway; run_js offered `inbox__…`.
+    ["the plugin's name", ["inbox"], "output(await tool`raft.receive_events ${{}}`);"],
+    // The offered list predates the mount: nothing in run_js knows `inbox.receive_events`.
+    ["an unoffered mount", [], "output(await tool`inbox.receive_events ${{}}`);"],
+    // A program's own options cannot clear the mark run_js sets.
+    ["fromProgram: false", ["inbox"], "output(await tool`raft.receive_events ${{}} ${{ fromProgram: false }}`);"],
+  ] as const) {
+    const g = await raftBehindGateway();
+    const out = await program(g.host, g.offered([...tools]), source);
+    if (out[0]?.status !== "rejected" || out[0]?.error?.code !== "not_from_a_program" ||
+        !/inbox\.receive_events is yours to call, not a program's: its result only counts once you have read it/.test(out[0]?.error?.message)) {
+      throw new Error(`${what}: ${JSON.stringify(out)}`);
+    }
+    if (g.host.seen.length !== 1 || g.fetched() !== 0) throw new Error(`${what}: reached Raft ${g.fetched()} time(s)`);
+  }
+});
+
+await check("controls: the model's own pull runs, and a program's call to a tool that is not model-only runs, through the same gateway", async () => {
+  const g = await raftBehindGateway();
+  const pull: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__receive_events");
+  const direct = JSON.parse((await pull.execute("d", {})).content[0].text);
+  if (!Array.isArray(direct.messages) || g.fetched() !== 1) throw new Error(`the model's pull: ${JSON.stringify(direct)} fetched=${g.fetched()}`);
+  globalThis.fetch = (async () => json(200, { channel: { ref: "#launch-room", type: "channel" }, agents: [], humans: [] })) as any;
+  const out = await program(g.host, g.offered(["inbox"]), "const r = await tool`raft.channel_members ${{ target: '#launch-room' }}`; output(r.status);");
+  if (out[0] !== "succeeded") throw new Error(`a program's members call: ${JSON.stringify(out)}`);
+});
+
+await check("a model-only tool the mount's policy or the model's confirm would hold is refused now, with no card and nothing run", async () => {
+  for (const [what, policy, opts, reason] of [
+    ["a write policy", { write: "approval" }, {}, /the `inbox` mount's approval policy holds receive_events, but it can only run in your own call/],
+    ["the model's confirm", null, { confirm: true }, /inbox\.receive_events cannot be held for approval: .* Call it without confirm\./],
+  ] as const) {
+    const g = await raftBehindGateway(policy);
+    const out: any = await g.gateway.invoke(g.ctx, "inbox.receive_events", {}, opts as any);
+    if (out.status !== "rejected" || out.error?.code !== "not_from_a_program" || !reason.test(out.error?.message)) throw new Error(`${what}: ${JSON.stringify(out)}`);
+    if ((await g.store.listApprovals("tenant", "pending")).length !== 0 || g.fetched() !== 0) throw new Error(`${what}: a card was made or Raft reached`);
+  }
+  // Control: under the same write policy, an ordinary write is held for a person as before.
+  const g = await raftBehindGateway({ write: "approval" });
+  const join: any = await g.gateway.invoke(g.ctx, "inbox.join_channel", { target: "#launch-room" });
+  if (join.status !== "pending" || (await g.store.listApprovals("tenant", "pending")).length !== 1) throw new Error(`join: ${JSON.stringify(join)}`);
 });
 
 await check("join resolves a visible channel, then joins its encoded id", async () => {

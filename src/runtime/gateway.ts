@@ -134,6 +134,14 @@ export interface InvokeOpts {
    * calls under one id. See `CompletedFacts` in src/core/store.ts.
    */
   callId?: string;
+  /**
+   * The call comes from a run_js program, not from the model: set by `runJsTool`
+   * after the program's own options, so a program cannot clear it. A tool that
+   * declares `modelOnly` is refused for it here, whatever name reached the
+   * gateway — run_js can only check the names it offered, and `plugin.tool`
+   * resolves here to the one mount of that plugin under any alias.
+   */
+  fromProgram?: true;
 }
 
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
@@ -313,11 +321,10 @@ export class ToolGateway {
 
     const req = a.request as { tool: string; args: Json };
     const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
-    // A model-only tool (`ToolSchema.modelOnly`) is held like any other — by a policy, or by the model's own
-    // `confirm` — but run here it runs with no model reading the result, which is the one thing it needs:
-    // Raft's pull would acknowledge, and its history read mark read, what nobody saw. So it is not run, and the
-    // card says why to the person who approved it. run_js refuses a program's call for the same reason
-    // (`runJsTool`); this is the other way a call reaches a plugin with no model behind it.
+    // A model-only tool (`ToolSchema.modelOnly`) run here runs with no model reading the result, which is the one
+    // thing it needs: Raft's pull would acknowledge, and its history read mark read, what nobody saw. `#invoke`
+    // no longer holds one, so this is the backstop for a call held before it stopped: it is not run, and the card
+    // says why to the person who approved it. A program's call is refused for the same reason (`fromProgram`).
     const r = await this.resolve(ctx, req.tool);
     const held = "error" in r ? undefined : this.#plugins.get(r.mount.plugin);
     if (!("error" in r) && held && toolsOf(held, r.mount).find((t) => t.name === r.tool)?.modelOnly) {
@@ -727,6 +734,14 @@ export class ToolGateway {
     if (!schema) {
       return { status: "rejected", error: { code: "unknown_tool", message: unknownToolMessage(r.mount.alias, r.tool) } };
     }
+    // A model-only tool from a program: what it consumes or attests would go to code the model may never print
+    // (`ToolSchema.modelOnly`). Refused at the door, before an operation exists, as an unknown name is.
+    if (schema.modelOnly && opts.fromProgram === true) {
+      return {
+        status: "rejected",
+        error: { code: "not_from_a_program", message: `${r.mount.alias}.${r.tool} is yours to call, not a program's: its result only counts once you have read it` },
+      };
+    }
 
     const operationId = opts.operationId ?? (opts.idempotencyKey
       ? `op_${createHash("sha256").update(`${ctx.tenantId}|${ctx.taskId}|${opts.idempotencyKey}`).digest("hex").slice(0, 20)}`
@@ -772,6 +787,21 @@ export class ToolGateway {
         // The one the model must act on: it says the road is closed, so the
         // next thing it does is choose another tool or explain to a person.
         error: { code: "policy_denied", message: `this call is denied by the \`${r.mount.alias}\` mount's policy` },
+      };
+    }
+    if (verdict === "approval" && schema.modelOnly) {
+      // Held, it would be run by `applyApproval` with nobody reading the result, which that refuses; a card a person
+      // can approve and nothing then runs would cost them a decision for nothing. So the model is told now, and the
+      // operation ends as a refused one does: nothing ran.
+      await this.#store.completeOperation(ctx.tenantId, operationId, "rejected", null, undefined, facts());
+      return {
+        status: "rejected",
+        error: {
+          code: "not_from_a_program",
+          message: confirm
+            ? `${r.mount.alias}.${r.tool} cannot be held for approval: its result only counts once you read it in your own call, and an approved call runs without you. Call it without confirm.`
+            : `the \`${r.mount.alias}\` mount's approval policy holds ${r.tool}, but it can only run in your own call, where you read its result; an approved call runs without you. Ask the operator to let you call it without approval.`,
+        },
       };
     }
     if (verdict === "approval") {
