@@ -308,9 +308,13 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
 
     const next = pdObject(storage, { redeliveryMs: REDELIVERY });
     const resumed = await next.agent.step();
-    check(next.dispatched.length === 0, `dispatched inside the redelivery interval: ${show(next.dispatched)}`);
+    const t1 = Date.now();
+    // Read as a time: the step's sweep read its clock before t1, so only a step that ended before the redelivery must
+    // have sent nothing. A slower one may have found the job due.
+    const due = Number(job.dispatched_at) + REDELIVERY;
+    check(next.dispatched.length === 0 || t1 >= due, `dispatched inside the redelivery interval: ${show(next.dispatched)}, the step ended ${due - t1} ms before it`);
     check(resumed.wakeInMs !== null && resumed.wakeInMs <= REDELIVERY, `the park passes the redelivery: ${show(resumed)}`);
-    await sleep(Number(job.dispatched_at) + REDELIVERY - Date.now());
+    await sleep(due - Date.now());
     for (let i = 0; i < 3; i++) await next.agent.step();
     check(show(next.dispatched) === show([job.id]), `dispatched at the redelivery: ${show(next.dispatched)}`);
     await pdTurn(storage, next.agent, null, [replying(SCRIPT[0]!.reply)]);
