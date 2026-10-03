@@ -373,6 +373,8 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await again.agent.step();
     check(allUsage(storage) === metered, `after more steps and a new object: ${allUsage(storage)}`);
     check(outboxes(storage).trace.length === 0, `trace ${show(outboxes(storage).trace)}`);
+    // Tenant usage that pi.usage never holds: an accepted answer to a cancelled job is not a drift.
+    check(show(pdUsageDrift(storage.sql as never)) === "{}", `drift ${show(pdUsageDrift(storage.sql as never))}`);
     await o.agent.close();
     await again.agent.close();
   });
