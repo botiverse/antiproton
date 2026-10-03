@@ -278,6 +278,7 @@ check("the mount list names each mount, its plugin and its credential state, and
   const cat = catalogue(d);
   must(/<details class="plug">/.test(cat) && /somewhere/.test(cat), "the catalogue lists the installed plugins");
   must(/Mounting one is a separate, deliberate act/.test(cat), "and says mounting is separate");
+  must(!/The catalogue is shown twice/.test(cat), "a // comment inside the template must not render as page text");
   must(plugins(d).includes(cat.slice(0, 60)), "the whole page still composes the catalogue");
 });
 

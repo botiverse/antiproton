@@ -2176,6 +2176,9 @@ export function catalogue(d: any): string {
       : p.enabled
         ? `<span class="tag ok">on — this agent answered "enable"</span>`
         : `<span class="tag bad">off — this agent answered "disable"</span>`;
+  // The catalogue is shown twice: in the rail's plugins view and in the
+  // inspector's plugins tab. The select must repaint whichever panel is
+  // showing it, not a fixed id that is half-hidden in the other view.
   const pluginBlock = (p: any) => `
     <details class="plug">
       <summary><b>${esc(p.id)}</b> <span class="sub">${esc(p.version)} · ${
@@ -2184,9 +2187,6 @@ export function catalogue(d: any): string {
           ? `<span class="tag ${p.credential.required ? "bad" : ""}">${
               p.credential.required ? "account required" : "account optional"}</span>`
           : ""}</summary>
-      // The catalogue is shown twice: in the rail's plugins view and in the
-      // inspector's plugins tab. The select must repaint whichever panel is
-      // showing it, not a fixed id that is half-hidden in the other view.
       <form class="plug-choice">
         <input type="hidden" name="plugin" value="${esc(p.id)}">
         <select name="choice" hx-post="/ui/plugin/choice" hx-target="closest .plugins-root" hx-swap="innerHTML" hx-trigger="change">
