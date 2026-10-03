@@ -313,6 +313,25 @@ export class ToolGateway {
 
     const req = a.request as { tool: string; args: Json };
     const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
+    // A model-only tool (`ToolSchema.modelOnly`) is held like any other — by a policy, or by the model's own
+    // `confirm` — but run here it runs with no model reading the result, which is the one thing it needs:
+    // Raft's pull would acknowledge, and its history read mark read, what nobody saw. So it is not run, and the
+    // card says why to the person who approved it. run_js refuses a program's call for the same reason
+    // (`runJsTool`); this is the other way a call reaches a plugin with no model behind it.
+    const r = await this.resolve(ctx, req.tool);
+    const held = "error" in r ? undefined : this.#plugins.get(r.mount.plugin);
+    if (!("error" in r) && held && toolsOf(held, r.mount).find((t) => t.name === r.tool)?.modelOnly) {
+      const result: ToolResult = {
+        status: "cancelled", operationId,
+        error: {
+          code: "not_from_a_program",
+          message: `approved, but ${r.mount.alias}.${r.tool} was not run: its result only counts once the agent reads it, ` +
+            "and an approved call runs with nobody reading it. For the agent to use it, the mount's policy has to let it call it without approval.",
+        },
+      };
+      await this.#store.completeOperation(tenantId, operationId, "cancelled", null, result as unknown as Json);
+      return { ok: true, executed: false, result };
+    }
     // `approved` bypasses the policy check for this one recorded call only.
     let result = await this.invoke(ctx, req.tool, req.args, { approved: true, operationId });
     // An approved call that asks the model a question has nobody to ask: it

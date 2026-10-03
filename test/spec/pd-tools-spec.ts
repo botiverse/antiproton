@@ -116,12 +116,15 @@ export async function world(storage: DurableSqlHost) {
       { name: "send", summary: "Post to a page.", parameters: obj({ url: { type: "string" } }, ["url"]), sideEffects: "write", idempotency: "none" },
       { name: "slow", summary: "Takes its time.", parameters: obj(), sideEffects: "write", idempotency: "none" },
       { name: "slow_read", summary: "Takes its time, reading.", parameters: obj(), sideEffects: "read", idempotency: "none" },
+      // Its result only counts once the model reads it: a program's call is refused (ToolSchema.modelOnly).
+      { name: "inbox", summary: "Take what arrived.", parameters: obj(), sideEffects: "write", idempotency: "native", modelOnly: true },
     ] as never,
     async invoke(tool, args) {
       w.invoked.push(`web.${tool}`);
       const a = args as { url?: string };
       if (tool === "read_page") return busy(() => ({ title: `page ${a.url}` }));
       if (tool === "send") return { sent: a.url ?? null };
+      if (tool === "inbox") return { taken: 2 };
       // Waits for the case: the call a close cuts off.
       w.slow.reached();
       await w.slow.opened;
@@ -180,6 +183,7 @@ export async function world(storage: DurableSqlHost) {
     (p as Plugin).tools!.map((t) => ({
       name: t.name, description: (t as { summary: string }).summary, parameters: t.parameters as Json,
       address: `${alias as string}.${t.name}`, sideEffects: t.sideEffects, idempotency: t.idempotency,
+      ...((t as { modelOnly?: true }).modelOnly ? { modelOnly: true as const } : {}),
       ...(alias === "box" ? { exclusive: true } : {}),
     }))));
   const continuations = new RunJsContinuations();
@@ -430,6 +434,21 @@ export function pdToolsCases(withHost: WithDriveHost): DriveCase[] {
     for (const run of [r.pi, r.pd]) {
       check(show(run.world.invoked) === show(["web.read_page", "web.read_page", "web.read_page", "db.query DELETE FROM logs"]),
         `${run.engine.name}: the plugins ran ${show(run.world.invoked)}`);
+    }
+  });
+
+  add("run_js", "a model-only tool is refused from a program by its name and by its address, never reaching the plugin; the model's own call runs it", async () => {
+    const r = await both(withHost, "take the inbox", [
+      calls(["c1", "run_js", { source: show({ calls: [["web__inbox", {}], ["web.inbox", {}], ["web__read_page", { url: "z" }]] }) }]),
+      calls(["c2", "web__inbox", {}]),
+      say("taken"),
+    ]);
+    same(r);
+    const program = lastResult(r.pd.requests[1]!);
+    check(show(program) === show([{ error: "not_from_a_program" }, { error: "not_from_a_program" }, { title: "page z" }]), `the program: ${show(program)}`);
+    check(show(lastResult(r.pd.requests[2]!)) === show({ taken: 2 }), `the model's own call: ${show(lastResult(r.pd.requests[2]!))}`);
+    for (const run of [r.pi, r.pd]) {
+      check(show(run.world.invoked) === show(["web.read_page", "web.inbox"]), `${run.engine.name}: the plugin ran ${show(run.world.invoked)}`);
     }
   });
 

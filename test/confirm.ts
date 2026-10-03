@@ -65,6 +65,45 @@ await check("approval runs the recorded call without the confirm field", async (
   must(JSON.stringify(f.seen[0]) === JSON.stringify({ x: 1 }), `the plugin saw ${JSON.stringify(f.seen[0])}`);
 });
 
+/** A mount whose plugin has one model-only tool beside an ordinary one, under an alias that is not the plugin id. */
+async function modelOnlyFixture(policy: any = null) {
+  const seen: string[] = [];
+  const plugin: Plugin = {
+    id: "inboxy", version: "1.0.0",
+    tools: [
+      { name: "pull", summary: "", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "native", modelOnly: true },
+      { name: "zap", summary: "", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
+    ],
+    async invoke(tool) { seen.push(tool); return { ran: tool }; },
+  };
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("t", "a");
+  await store.addMount({
+    tenantId: "t", agentId: "a", alias: "box", plugin: "inboxy", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy,
+  });
+  const gw = new ToolGateway(store, [plugin], new Set([plugin.id]), { async resolve() { return null; } });
+  return { store, gw, seen, ctx: { tenantId: "t", agentId: "a", taskId: "k" } };
+}
+
+await check("an approved model-only call is not run: nobody would read its result, and the card says why", async () => {
+  for (const [how, policy, opts] of [["the model's confirm", null, { confirm: true }], ["a write policy", { write: "approval" }, {}]] as const) {
+    const f = await modelOnlyFixture(policy);
+    const r: any = await f.gw.invoke(f.ctx, "box.pull", {}, opts as any);
+    must(r.status === "pending", `${how}: not held: ${JSON.stringify(r)}`);
+    const out: any = await f.gw.applyApproval("t", r.operationId, "approved", "tygg");
+    must(out.ok && !out.executed && (out.result as any)?.error?.code === "not_from_a_program", `${how}: ${JSON.stringify(out)}`);
+    must(/box\.pull was not run: its result only counts once the agent reads it/.test((out.result as any).error.message), `${how}: ${JSON.stringify(out)}`);
+    must(f.seen.length === 0, `${how}: the plugin ran: ${f.seen.join()}`);
+    must((await f.store.getOperation("t", r.operationId))?.status === "cancelled", `${how}: the operation was left open`);
+    // Positive control: on the same mount, under the same hold, an ordinary tool's approval runs it.
+    const z: any = await f.gw.invoke(f.ctx, "box.zap", {}, opts as any);
+    const ran: any = await f.gw.applyApproval("t", z.operationId, "approved", "tygg");
+    must(ran.ok && ran.executed && ran.result?.status === "succeeded" && f.seen.join() === "zap", `${how}: zap: ${JSON.stringify(ran)}`);
+  }
+});
+
 await check("the bridge lifts confirm out of the model's arguments into the call's options", async () => {
   const calls: any[] = [];
   const host = { async invoke(call: any) { calls.push(call); return { status: "succeeded", operationId: "op", result: {} }; } };

@@ -16,6 +16,9 @@ import {
 } from "../src/runtime/pi-tools.ts";
 import { RUN_JS_KEEP_ALIVE_MS, RUN_JS_RESUME_MS, RunJsContinuations, answerProblem, answerSpecOf } from "../src/runtime/run-js-resume.ts";
 import { nextAlarm } from "../cf/src/alarm-next.ts";
+import { mountedToolEntries } from "../cf/src/runtime.ts";
+import { raftPlugin } from "../src/plugins/raft.ts";
+import { bridgeTools } from "../src/runtime/pi-tools.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import type { Continuation } from "../src/core/execution.ts";
 
@@ -164,6 +167,36 @@ for (const [label, exec] of EXECUTORS) {
     const out = body(await run.execute("f1", { source: "const r = await tool`resume ${{ token: 'rjc_x', answer: 1 }}`; output(r);" }));
     must(out[0]?.status === "rejected" && out[0]?.error?.code === "not_from_a_program", `not refused: ${JSON.stringify(out)}`);
     must(host.seen.length === 0, "nothing reached the host");
+  });
+
+  // The catalogue as the runtime builds it from the real plugin, under an alias that is not the plugin's id,
+  // so the flag is shown to travel from `ToolSchema` through `mountedToolEntries` to what run_js resolves.
+  const INBOX = qualifyMountedTools([
+    ...mountedToolEntries([{ alias: "inbox", plugin: "raft" } as any], new Map([["raft", raftPlugin]])),
+    named("get", "web.get"),
+  ]);
+
+  await check(`${label}: a model-only tool is refused from inside a program, by its name and by its address, and never reaches the host`, async () => {
+    for (const name of ["inbox__receive_events", "inbox.receive_events"]) {
+      const host = recordingHost();
+      const run: any = runJsTool(exec, host as any, { tools: INBOX });
+      const out = body(await run.execute("m1", { source: `const r = await tool\`${name} \${{}}\`; output(r);` }));
+      must(out[0]?.status === "rejected" && out[0]?.error?.code === "not_from_a_program", `${name} not refused: ${JSON.stringify(out)}`);
+      must(/inbox__receive_events is yours to call, not a program's: its result only counts once you have read it/.test(out[0]?.error?.message),
+        `${name}: the reason: ${out[0]?.error?.message}`);
+      must(host.seen.length === 0, `${name} reached the host: ${JSON.stringify(host.seen)}`);
+    }
+  });
+
+  await check(`${label}: beside it, a tool that is not model-only still runs from a program, and the model may call the model-only one itself`, async () => {
+    const host = recordingHost();
+    const run: any = runJsTool(exec, host as any, { tools: INBOX });
+    const out = body(await run.execute("m2", { source: "const r = await tool`web__get ${{ i: 1 }}`; output(r.status);" }));
+    must(out[0] === "succeeded" && host.seen.length === 1 && host.seen[0].tool === "web.get", `web__get: ${JSON.stringify({ out, seen: host.seen })}`);
+    const direct = recordingHost();
+    const pull: any = bridgeTools(INBOX, direct as any).find((t) => t.name === "inbox__receive_events")!;
+    await pull.execute("m3", {});
+    must(direct.seen.length === 1 && direct.seen[0].tool === "inbox.receive_events", `the model's own call: ${JSON.stringify(direct.seen)}`);
   });
 
   await check(`${label}: a held call still ends the program, with no token`, async () => {

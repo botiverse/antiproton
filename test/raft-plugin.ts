@@ -124,6 +124,14 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
 
 await check("declares the inbox pull as a write that repeats safely, and the rest as before", async () => {
   if (raftPlugin.version !== "1.0.0") throw new Error(`unexpected plugin version: ${raftPlugin.version}`);
+  // Only the model may pull: a program's pull would acknowledge and attest a batch the model never read.
+  const pull = raftPlugin.tools.find((tool) => tool.name === "receive_events");
+  if (pull?.modelOnly !== true) throw new Error(`receive_events is callable from a program: ${JSON.stringify(pull)}`);
+  const read = raftPlugin.tools.find((tool) => tool.name === "read_messages");
+  if (read?.modelOnly !== true) throw new Error(`read_messages is callable from a program: ${JSON.stringify(read)}`);
+  // Reads that consume nothing stay callable from code.
+  const others = raftPlugin.tools.filter((tool) => tool.name !== "receive_events" && tool.name !== "read_messages" && tool.modelOnly);
+  if (others.length) throw new Error(`model-only beyond receive_events and read_messages: ${others.map((t) => t.name).join(", ")}`);
   // Under cursor acknowledgement a pull acknowledges the previous batch (a write) and repeating it hands back
   // the same batch (native), which is what lets a failed pull be retried.
   const receive = raftPlugin.tools.find((tool) => tool.name === "receive_events");
@@ -697,6 +705,21 @@ await check("read_messages on an empty window says so, with no cursors", async (
   if (out.text !== "No messages in #wg-raft-sdk." || out.hasOlder !== false || "oldestSeq" in out || "newestSeq" in out) {
     throw new Error(JSON.stringify(out));
   }
+});
+
+await check("read_messages and channel_members refuse a target that is not a non-empty string in their own words, before reaching Raft", async () => {
+  // The SDK refuses an empty target itself, in words that also say "target is required"; a target that is not a
+  // string reaches it as a TypeError (`request.target?.trim is not a function`). So the plugin's own sentence,
+  // which names the form to use, is what is asserted.
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  for (const tool of ["read_messages", "channel_members"]) {
+    for (const target of [42, undefined, " "]) {
+      const why = await failure(() => raftPlugin.invoke(tool, target === undefined ? {} : { target }, ctx()));
+      if (why.message !== "target is required, for example #engineering") throw new Error(`${tool} ${JSON.stringify(target)}: ${why.message}`);
+    }
+  }
+  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
 });
 
 await check("read_messages refuses two cursors, a bad limit, and a bad cursor before reaching Raft", async () => {

@@ -67,6 +67,9 @@ export interface MountedTool {
   /** Carried from {@link ToolSchema}: `"never"` overrides everything else
    *  `replayPolicy` would conclude. */
   replay?: "never";
+  /** Carried from {@link ToolSchema}: run_js refuses a program's call to it
+   *  (`runJsTool`). Dropped on the way here, the refusal would never fire. */
+  modelOnly?: true;
 }
 
 export interface ToolResult {
@@ -1003,6 +1006,18 @@ export function runJsTool(
           }
           const addr = address(call.tool);
           const target = typeof addr === "string" ? byAddress.get(addr) : undefined;
+          // A tool whose result only counts once the model has read it (`ToolSchema.modelOnly`): from a
+          // program, what it consumes or attests would go to code the model may never print. Asked of the
+          // resolved target, so the model's name and the dotted address are refused alike.
+          if (target?.modelOnly) {
+            return Promise.resolve({
+              status: "rejected" as const,
+              error: {
+                code: "not_from_a_program",
+                message: `${target.name} is yours to call, not a program's: its result only counts once you have read it`,
+              },
+            });
+          }
           const lifted = target && declaresConfirm(target.parameters) ? { args: call.args, confirm: false } : liftConfirm(call.args);
           return host.invoke({
             ...call,

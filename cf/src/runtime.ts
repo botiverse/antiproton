@@ -602,6 +602,7 @@ export function mountedToolEntries(records: MountRecord[], byId: ReadonlyMap<str
       sideEffects: t.sideEffects, idempotency: t.idempotency,
       reads: t.reads,
       ...(t.replay ? { replay: t.replay } : {}),
+      ...(t.modelOnly ? { modelOnly: t.modelOnly } : {}),
       exclusive: pl ? isExclusive(pl) : undefined,
     }));
   });

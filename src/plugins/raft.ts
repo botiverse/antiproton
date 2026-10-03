@@ -335,10 +335,11 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  * A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state.
  *
  * `{ state: false }` gives a client whose state lives only for the call and is never saved. read_messages uses
- * it, because the SDK's `messages.read` advances the seen frontier that a send attests — and a read made from
- * run_js may never reach the model, so it must not answer the read-before-send question only the model may
- * answer (docs/ax-design.md §3, "Code cannot skip it"). What does attest is the hold's own question, which
- * reaches the model whatever called the send.
+ * it, because the SDK's `messages.read` advances the seen frontier that a send attests, and whether the model
+ * read a history page closely enough to answer the read-before-send question is not something a page having
+ * been fetched can say (docs/ax-design.md §3). What does attest is the hold's own question. This covers only the
+ * frontier this mount keeps: the Server marks a history read as read on its side whatever the client keeps,
+ * which is why read_messages is also `modelOnly`.
  */
 function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
   return createRaft({
@@ -562,6 +563,8 @@ export const raftPlugin: Plugin = {
       // It acknowledges the previous batch, so it is a write; repeating it hands back the same batch.
       sideEffects: "write",
       idempotency: "native",
+      // It acknowledges and records as seen what it hands over, which only counts if the model reads it.
+      modelOnly: true,
     },
     {
       name: "join_channel",
@@ -669,7 +672,8 @@ export const raftPlugin: Plugin = {
       summary: "Read the history of a Raft channel, DM, or thread, one message per line as receive_events shows them. " +
         "Without a cursor it reads the latest messages; give at most one of before (older than a seq), after (newer than a seq) " +
         "or around (a seq or message id). hasOlder and hasNewer say whether more exist; oldestSeq and newestSeq are the cursors to page with. " +
-        "Reading here does not count as having seen the conversation: a send_message there may still ask first, showing what is new.",
+        "Reading here does not count as having seen the conversation: a send_message there may still ask first, showing what is new. " +
+        "Raft marks what this reads as read, so only you can call it, not a run_js program, until Raft offers a read that leaves it unread (consume=false).",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
@@ -683,6 +687,9 @@ export const raftPlugin: Plugin = {
       },
       sideEffects: "read",
       idempotency: "native",
+      // Raft marks a history read as read on its side, for every kind of target, with no parameter to stop it:
+      // from a program the messages would leave the model's unread state without the model seeing them.
+      modelOnly: true,
     },
     {
       name: "search_messages",
