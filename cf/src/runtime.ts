@@ -2165,6 +2165,13 @@ export class AgentRuntime {
     return { ...job, operatorModel: b?.secretRef === OPERATOR_SECRET_REF ? b.model : null };
   }
 
+  /** A taker's failed call gives its take back (`AgentEngine.releaseJob`); false where nothing was held. */
+  async releaseJob(tenantId: string, agentId: string, jobId: string, taker: string) {
+    await this.ready();
+    const agent = await this.agent(tenantId, agentId, this.#jobSessionFor(jobId));
+    return agent.releaseJob ? await agent.releaseJob(jobId, taker) : false;
+  }
+
   async deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown) {
     await this.ready();
     const session = this.#jobSessionFor(jobId);

@@ -76,7 +76,7 @@ const NO_USAGE: Usage = {
 };
 
 /**
- * The transcript as job wire format version 2: each system message rendered to text. The first is the prompt
+ * The transcript as job wire format version 2: each system message rendered to text. The first with text is the prompt
  * being declared, so it is rendered whole — content, then its sections — as `getSystemMessageText` renders a
  * leading prompt, and it is placed at the top of the request, before any other message. pi-durable writes it
  * after the first input (its first `pi.system` entry is planned when the first run starts, after the input that
@@ -106,9 +106,11 @@ export function jobContext(context: TranscriptContext): DurableJobContext {
       if (content) messages.push({ role: "system", content });
       continue;
     }
-    declared = true;
+    // The prompt is the first one with text: one before it that only changed the tools declares nothing.
     const content = getSystemMessageText(untagged(m));
-    if (content) messages.unshift({ role: "system", content });
+    if (!content) continue;
+    declared = true;
+    messages.unshift({ role: "system", content });
   }
   return { version: JOB_WIRE_V2, messages, ...(tools.length ? { tools } : {}) };
 }

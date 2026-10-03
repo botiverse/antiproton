@@ -56,10 +56,12 @@ export async function replyingUnknownJob<T>(fn: () => Promise<T>): Promise<T | U
   }
 }
 
-/** The two RPC methods of the agent's object the consumer uses. */
+/** The RPC methods of the agent's object the consumer uses. */
 export interface ModelJobStub {
-  /** `taker`: the queue message that will call the model with the job; absent when nothing is called (giving up). */
+  /** `taker`: this attempt's own name (`newTaker`); a job under another taker's live take is refused (null). */
   takeJob(tenantId: string, agentId: string, jobId: string, taker?: string): Promise<unknown>;
+  /** Gives back the taker's take when its attempt failed, so a retry can take the job. */
+  releaseJob(tenantId: string, agentId: string, jobId: string, taker: string): Promise<unknown>;
   deliverAnswer(tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs: number): Promise<unknown>;
 }
 
@@ -72,8 +74,6 @@ export interface ModelQueueDeps {
 }
 
 export interface ModelQueueMessage {
-  /** The queue's id for the message, the same on each of its retries. */
-  readonly id?: string;
   readonly body: QueuedModelCall;
   ack(): void;
   retry(): void;
@@ -85,30 +85,58 @@ function unknownJob(m: QueuedModelCall, phase: "take" | "deliver" | "give_up"): 
 }
 
 /**
- * The model call, waited on where waiting is free (see index.ts). `taker` is the message's id: the agent
- * refuses the job to a second message while another one may still be calling the model with it.
+ * A name for one attempt at a job, fresh each time. Not the queue message's id: the queue does not promise to keep it
+ * across retries, and two deliveries of one message would share it, so a guard keyed on it could refuse a retry or
+ * grant both deliveries.
  */
-export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps, taker?: string): Promise<void> {
-  const stub = deps.stub(m);
+function newTaker(): string { return crypto.randomUUID(); }
+
+/**
+ * Takes the job as a fresh taker and runs `use` on it; does nothing when the take is null (answered, cancelled, or
+ * under another taker's live take). When `use` throws, the take is given back before the throw goes on, so the queue's
+ * retry (or the dead letter queue) can take the job at once; a release that fails leaves the take to lapse.
+ */
+async function withTake(
+  m: QueuedModelCall, stub: ModelJobStub, phase: "take" | "give_up", use: (job: unknown) => Promise<void>,
+): Promise<void> {
+  const taker = newTaker();
   const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId, taker);
-  if (isUnknownJobReply(job)) return unknownJob(m, "take");
-  // Already answered — a redelivery after success, which must not call the
-  // provider again — or taken by another message that is calling it now.
+  if (isUnknownJobReply(job)) return unknownJob(m, phase);
   if (!job) return;
-  const t0 = Date.now();
-  const answer = await deps.call(job, m);
-  const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, Date.now() - t0);
-  if (isUnknownJobReply(wrote)) unknownJob(m, "deliver");
+  try { await use(job); }
+  catch (e) {
+    try { await stub.releaseJob(m.tenantId, m.agentId, m.jobId, taker); }
+    catch (r) { logEvent("model_job.release_failed", { tenantId: m.tenantId, agentId: m.agentId, jobId: m.jobId, error: String((r as Error)?.message ?? r).slice(0, 200) }); }
+    throw e;
+  }
 }
 
-/** Out of retries. The agent has to hear about it, or it waits for ever. */
+/**
+ * The model call, waited on where waiting is free (see index.ts). Null from the take — already answered (a
+ * redelivery after success, which must not call the provider again), or another attempt is calling it now —
+ * calls nothing.
+ */
+export async function runModelCall(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
+  const stub = deps.stub(m);
+  await withTake(m, stub, "take", async (job) => {
+    const t0 = Date.now();
+    const answer = await deps.call(job, m);
+    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, answer, Date.now() - t0);
+    if (isUnknownJobReply(wrote)) unknownJob(m, "deliver");
+  });
+}
+
+/**
+ * Out of retries. The agent has to hear about it, or it waits for ever. It takes the job like a call does, so a
+ * job another attempt is still calling the model for is left to that attempt: its answer is the one paid for. If
+ * that attempt dies, its take lapses and the job is sent again (src/runtime/durable-agent.ts `#sweep`).
+ */
 export async function failLoudly(m: QueuedModelCall, deps: ModelQueueDeps): Promise<void> {
   const stub = deps.stub(m);
-  const job = await stub.takeJob(m.tenantId, m.agentId, m.jobId);
-  if (isUnknownJobReply(job)) return unknownJob(m, "give_up");
-  if (!job) return;
-  const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, deps.givenUp(m), 0);
-  if (isUnknownJobReply(wrote)) unknownJob(m, "give_up");
+  await withTake(m, stub, "give_up", async () => {
+    const wrote = await stub.deliverAnswer(m.tenantId, m.agentId, m.jobId, deps.givenUp(m), 0);
+    if (isUnknownJobReply(wrote)) unknownJob(m, "give_up");
+  });
 }
 
 /**
@@ -127,7 +155,7 @@ export async function consumeModelCalls(
       continue;
     }
     try {
-      await runModelCall(message.body, deps, message.id);
+      await runModelCall(message.body, deps);
       message.ack();
     } catch (e) {
       // Deliberately not acked: the queue redelivers, and after max_retries

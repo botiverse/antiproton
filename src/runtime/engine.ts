@@ -73,9 +73,11 @@ export interface AgentEngine {
   tools(): Promise<Array<{ name: string }>>;
   /**
    * The worker's side of an offloaded model call: the request (null once answered), then the answer. A value or a promise of one.
-   * `taker` is the queue message that will call the model with it; pd refuses a job another message took recently (`PdHost.takeJob`).
+   * `taker` names the attempt that will call the model with it; pd refuses a job under another taker's live take (`PdHost.takeJob`).
    */
   takeJob(id: string, taker?: string): unknown;
+  /** The taker's call failed: its take ends, so a retry can take the job. Absent where a take holds nothing (PiAgent). */
+  releaseJob?(id: string, taker: string): boolean | Promise<boolean>;
   deliver(id: string, answer: AnsweredMessage): boolean | Promise<boolean>;
   close(): Promise<void>;
 }

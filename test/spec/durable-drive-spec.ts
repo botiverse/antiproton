@@ -494,6 +494,11 @@ export async function wireFormatCases(old: {
     return [first, { role: "system", content: "", sections: { instructions: `<instructions>\n${c.systemPrompt}\n</instructions>` }, toolsAdded: c.tools, timestamp: 1 }, ...rest];
   })();
   const placed = JSON.stringify({ messages: placedMessages });
+  // A first system message that only adds the tools, then the prompt: the prompt is still what leads.
+  const toolsFirst = (() => {
+    const [first, prompt, ...rest] = placedMessages;
+    return JSON.stringify({ messages: [first, { role: "system", content: "", toolsAdded: prompt.toolsAdded, timestamp: 1 }, { ...prompt, toolsAdded: undefined }, ...rest] });
+  })();
   const placedThenPatched = JSON.stringify({ messages: [
     ...placedMessages,
     { role: "system", content: "", sections: { style: "Answer in French." }, timestamp: 4 },
@@ -542,6 +547,13 @@ export async function wireFormatCases(old: {
     run: async () => {
       const before = toRequest(JSON.parse(await old.startOldJob(conversation)).context);
       const after = toRequest(JSON.parse(await startNewJob(placed)).context);
+      check(show(after) === show(before), `toRequest differs:\n 0.85 ${show(before)}\n 1.0  ${show(after)}`);
+    },
+  }, {
+    group: "provider", name: "a first system message that only adds tools declares no prompt: the prompt after it leads the request, the 0.85 request",
+    run: async () => {
+      const before = toRequest(JSON.parse(await old.startOldJob(conversation)).context);
+      const after = toRequest(JSON.parse(await startNewJob(toolsFirst)).context);
       check(show(after) === show(before), `toRequest differs:\n 0.85 ${show(before)}\n 1.0  ${show(after)}`);
     },
   }, {

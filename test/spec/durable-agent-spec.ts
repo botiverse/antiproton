@@ -16,7 +16,7 @@ import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost, POLL_BACKSTOP_MS, type DurableAgentOptions, type PdHostOptions } from "../../src/runtime/durable-agent.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { createModels } from "pi-ai-1/models";
-import { replyingUnknownJob, UnknownJob } from "../../cf/src/model-queue.ts";
+import { consumeModelCalls, replyingUnknownJob, UnknownJob, type ModelJobStub, type ModelQueueDeps } from "../../cf/src/model-queue.ts";
 import type { DriveCase, TimerProbe, WithDriveHost } from "./durable-drive-spec.ts";
 
 /**
@@ -481,8 +481,8 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await a.close();
   });
 
-  add("jobs", "a message and the wake it asks for, while the dispatch is in flight: one queue send, and a second message for the job is refused while the first is calling the model", async (storage) => {
-    const o = object(storage, [], { redeliveryMs: 600 });
+  add("jobs", "a message and the wake it asks for, while the dispatch is in flight: one queue send, and a second taker is refused while the first holds the job", async (storage) => {
+    const o = object(storage, [], { redeliveryMs: 600, takeHoldMs: 1_200 });
     // The commit's dispatch is held open, as a queue send that has not returned: the window the wake's sweep ran in.
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -497,17 +497,128 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await sleep(20);
     const id = jobs(storage)[0]!.id;
     check(show(sent) === show([id]), `queue sends ${show(sent)}: the wake's sweep sent a job whose dispatch was in flight`);
-    // Two messages for it anyway (a queue that delivered twice): one model call.
-    const [first, second] = [await a.takeJob(id, "msg-1"), await a.takeJob(id, "msg-2")];
-    check(first !== null && second === null, `takes: msg-1 ${first === null ? "refused" : "granted"}, msg-2 ${second === null ? "refused" : "granted"}`);
-    // The first message's retry (its call failed) is not refused.
-    check(await a.takeJob(id, "msg-1") !== null, "the first message's retry was refused");
-    // Taken longer ago than the redelivery interval: presumed lost, as the sweep presumes, and handed out again.
-    await sleep(650);
-    check(await a.takeJob(id, "msg-3") !== null, "a message after the redelivery interval was refused");
-    check(await a.takeJob(id, "msg-2") === null, "a second taker within the interval of the redelivered take was granted");
-    // Giving up calls no model: never refused.
-    check(await a.takeJob(id) !== null, "the give-up's take was refused");
+    // Two attempts for it anyway (a queue that delivered twice): one model call.
+    const [first, second] = [await a.takeJob(id, "try-1"), await a.takeJob(id, "try-2")];
+    check(first !== null && second === null, `takes: try-1 ${first === null ? "refused" : "granted"}, try-2 ${second === null ? "refused" : "granted"}`);
+    // The holder's own name is no key: only a release ends a take, and only the holder's.
+    check(await a.takeJob(id, "try-1") === null, "the holder's name took the job again while it held it");
+    check(await a.releaseJob(id, "try-2") === false && await a.takeJob(id, "try-3") === null, "a non-holder released the take");
+    check(await a.releaseJob(id, "try-1") === true, "the holder's release did nothing");
+    check(await a.takeJob(id, "try-3") !== null, "a taker after the release was refused");
+    // A holder that died: its take lapses after the hold, and the next taker is granted.
+    await sleep(1_250);
+    check(await a.takeJob(id, "try-4") !== null, "a taker after the hold was refused");
+    check(await a.takeJob(id, "try-3") === null, "a second taker within the new take's hold was granted");
+    // Without a taker the request is only read.
+    check(await a.takeJob(id) !== null, "a read without a taker was refused");
+    await a.close();
+  });
+
+  add("jobs", "a model call longer than the redelivery interval: the sweep does not send the job again and no second taker is granted; once the hold lapses it is sent and taken", async (storage) => {
+    const RED = 300, HOLD = 1_500;
+    const o = object(storage, [], { redeliveryMs: RED, takeHoldMs: HOLD });
+    const sent: string[] = [];
+    const a = o.agent(undefined, { dispatch: async (id) => { sent.push(id); } });
+    await a.say("Q1");
+    for (let i = 0; i < 400 && sent.length === 0; i++) await sleep(5);
+    const parked = await a.step();
+    const id = sent[0]!;
+    check(await a.takeJob(id, "try-1") !== null, "the first taker was refused");
+    const takenAt = Date.now();
+    // The model call runs on past the redelivery the object parked for.
+    check(parked.wakeInMs !== null && parked.wakeInMs <= RED, `parked for ${show(parked)}`);
+    await sleep(RED + 50);
+    const during = await a.step();
+    check(show(sent) === show([id]), `sends while the call runs: ${show(sent)}`);
+    check(await a.takeJob(id, "try-2") === null, "a second taker was granted while the first one's call runs");
+    // Parked for the end of the hold: not at once (a busy loop), not past it (a dead taker never recovered).
+    const holdLeft = takenAt + HOLD - Date.now();
+    check(during.wakeInMs !== null && during.wakeInMs <= holdLeft + 50 && during.wakeInMs >= holdLeft - 300,
+      `parked for ${show(during)} with ${holdLeft} ms of the hold left`);
+    // The taker died without releasing: at the end of the hold the job is sent again and taken.
+    await sleep(during.wakeInMs);
+    const after = await a.step();
+    check(show(sent) === show([id, id]), `sends after the hold: ${show(sent)}`);
+    check(await a.takeJob(id, "try-3") !== null, "the taker after the hold was refused");
+    check(after.wakeInMs !== null && after.wakeInMs > 0, `after the resend: ${show(after)}`);
+    await a.close();
+  });
+
+  add("jobs", "the consumer: a failed call gives its take back, so the retry takes the job; another attempt during a call is refused; a give-up does not answer a job a live call holds", async (storage) => {
+    const o = object(storage, [], { redeliveryMs: 600 });
+    const sent: string[] = [];
+    const a = o.agent(undefined, { dispatch: async (id) => { sent.push(id); } });
+    await a.say("Q1");
+    for (let i = 0; i < 400 && sent.length === 0; i++) await sleep(5);
+    await a.step();
+    const id = sent[0]!;
+    const stub: ModelJobStub = {
+      takeJob: (_t, _a, j, taker) => replyingUnknownJob(() => a.takeJob(j, taker)),
+      releaseJob: (_t, _a, j, taker) => replyingUnknownJob(() => a.releaseJob(j, taker)),
+      deliverAnswer: (_t, _a, j, answer) => replyingUnknownJob(() => a.deliver(j, answer as Parameters<DurableAgent["deliver"]>[1])),
+    };
+    const calls: string[] = [];
+    let behaviour: "fail" | "hold" | "answer" = "fail";
+    let unhold!: () => void;
+    const deps: ModelQueueDeps = {
+      stub: () => stub,
+      async call(job, m) {
+        calls.push(behaviour);
+        if (behaviour === "fail") throw new Error("provider 503");
+        if (behaviour === "hold") await new Promise<void>((resolve) => { unhold = resolve; });
+        return fromResponse(reply("A1"), (job as { model: { api: string; provider: string; id: string } }).model, m.jobId);
+      },
+      givenUp: (m) => ({ ...errorMessage("given up", { api: "x", provider: "queue", id: "m1" }), jobId: m.jobId }),
+    };
+    const message = () => {
+      const m = { acked: 0, retried: 0 };
+      return { m, msg: { body: { doId: "d", tenantId: "t", agentId: "a", jobId: id }, ack() { m.acked++; }, retry() { m.retried++; } } };
+    };
+    const err = console.error; console.error = () => {};
+    try {
+      const one = message();
+      await consumeModelCalls({ queue: "model-calls", messages: [one.msg] }, deps);
+      check(one.m.retried === 1 && show(calls) === show(["fail"]), `the failing attempt: ${show(one.m)} calls ${show(calls)}`);
+      // The retry: whatever id the queue gives it, it takes the job and calls the model.
+      behaviour = "hold";
+      const two = message();
+      const running = consumeModelCalls({ queue: "model-calls", messages: [two.msg] }, deps);
+      for (let i = 0; i < 400 && calls.length < 2; i++) await sleep(5);
+      check(show(calls) === show(["fail", "hold"]), `the retry after a failed call was refused: calls ${show(calls)}`);
+      // While it calls: a duplicate is acked without a call, and the dead letter queue's give-up answers nothing.
+      const dup = message(), dead = message();
+      await consumeModelCalls({ queue: "model-calls", messages: [dup.msg] }, deps);
+      await consumeModelCalls({ queue: "model-calls-dlq", messages: [dead.msg] }, deps);
+      check(dup.m.acked === 1 && dead.m.acked === 1 && calls.length === 2, `during the call: dup ${show(dup.m)} dead ${show(dead.m)} calls ${show(calls)}`);
+      check(jobs(storage)[0]!.answer === null, `the give-up answered a job a live call holds: ${jobs(storage)[0]!.answer}`);
+      unhold();
+      await running;
+      check(two.m.acked === 1 && JSON.stringify(JSON.parse(jobs(storage)[0]!.answer!)).includes("A1"), `the live call's answer: ${jobs(storage)[0]!.answer}`);
+    } finally { console.error = err; }
+    await a.close();
+  });
+
+  add("jobs", "the consumer: the dead letter queue's give-up answers a job no live call holds", async (storage) => {
+    const o = object(storage, [], { redeliveryMs: 600 });
+    const sent: string[] = [];
+    const a = o.agent(undefined, { dispatch: async (id) => { sent.push(id); } });
+    await a.say("Q1");
+    for (let i = 0; i < 400 && sent.length === 0; i++) await sleep(5);
+    await a.step();
+    const id = sent[0]!;
+    const stub: ModelJobStub = {
+      takeJob: (_t, _a, j, taker) => replyingUnknownJob(() => a.takeJob(j, taker)),
+      releaseJob: (_t, _a, j, taker) => replyingUnknownJob(() => a.releaseJob(j, taker)),
+      deliverAnswer: (_t, _a, j, answer) => replyingUnknownJob(() => a.deliver(j, answer as Parameters<DurableAgent["deliver"]>[1])),
+    };
+    const deps: ModelQueueDeps = {
+      stub: () => stub,
+      async call() { throw new Error("no model call on the dead letter queue"); },
+      givenUp: (m) => ({ ...errorMessage("given up", { api: "x", provider: "queue", id: "m1" }), jobId: m.jobId }),
+    };
+    let acked = 0;
+    await consumeModelCalls({ queue: "model-calls-dlq", messages: [{ body: { doId: "d", tenantId: "t", agentId: "a", jobId: id }, ack() { acked++; }, retry() {} }] }, deps);
+    check(acked === 1 && String(jobs(storage)[0]!.answer).includes("given up"), `give-up: acked ${acked}, answer ${jobs(storage)[0]!.answer}`);
     await a.close();
   });
 

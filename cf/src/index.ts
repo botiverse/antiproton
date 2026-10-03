@@ -723,6 +723,11 @@ export class AgentDO extends DurableObject<Env> {
     return replyingUnknownJob(() => this.#activeRuntime().takeJob(tenantId, agentId, jobId, taker));
   }
 
+  /** A taker's failed call gives its take back, so the queue's retry can take the job (cf/src/model-queue.ts). */
+  async releaseJob(tenantId: string, agentId: string, jobId: string, taker: string) {
+    return replyingUnknownJob(() => this.#activeRuntime().releaseJob(tenantId, agentId, jobId, taker));
+  }
+
   async deliverAnswer(
     tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs = 0,
   ): Promise<boolean | UnknownJobReply> {
