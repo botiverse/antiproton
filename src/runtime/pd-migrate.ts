@@ -388,6 +388,7 @@ function dropPdState(storage: DurableSqlHost): void {
     for (const t of PI_DURABLE_TABLES) storage.sql.exec(`DROP TABLE IF EXISTS ${PD.qualify(t, "table")}`);
     ap.query("DELETE FROM conversations");
     ap.query("DELETE FROM model_jobs");
+    ap.query("DELETE FROM settled_runs");
   });
 }
 

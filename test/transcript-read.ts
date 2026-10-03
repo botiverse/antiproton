@@ -106,8 +106,8 @@ await check("a pd agent is read from pi-durable's entries, not pi's tables: what
       byOp: approvalsByOp(await rt.store.listApprovals("demo")),
     };
     await agent.close();
-    // The control: pi's tables exist for a pd agent and are empty, so reading them would show no conversation.
-    assert(host.sql.exec("SELECT COUNT(*) AS n FROM pi_entries").toArray()[0]!.n === 0, "pi_entries is not empty, so this does not tell the reads apart");
+    // The control: a pd object has no pi tables, so a read of them could not show this conversation.
+    assert(host.sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'pi_entries'").toArray().length === 0, "a pd object has pi_entries, so this does not tell the reads apart");
     const before = dump(host);
     const read = readTranscript(host.sql, "demo", "u-a", "t_u-a");
     assert(read !== null && read.events.map((e) => e.kind).join() === "message,model.response,message,model.response",

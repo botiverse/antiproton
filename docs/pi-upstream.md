@@ -16,7 +16,8 @@ agent loop onto pi's durable harness. On it is the second engine, `pd`
 (`src/model/durable-offloaded.ts`) and the park decision
 (`src/runtime/durable-drive.ts`). `cf/src/runtime.ts` opens it for an object
 whose `ap_meta` records `pd` (`recordedEngine`): one the operator migrated
-(`migrateEngine`, `src/runtime/pd-migrate.ts`) or a pd bench object
+(`AgentRuntime.migrateEngine` in `cf/src/runtime.ts`, which runs `src/runtime/pd-migrate.ts`
+and records the move with `ApStore.migrateEngine`) or a pd bench object
 (`cf/src/bench.ts`). No creation path records it, so every production agent
 still runs on `pi-agent-core` (`pi085`).
 

@@ -41,13 +41,15 @@ async function apiAgent(engine: "pi085" | "pd") {
     ap.setEngineOnce("pd");
   }
   const sent: string[] = [];
-  const rt = new AgentRuntime({
+  /** A runtime over this object, as a fresh isolate makes one: nothing opened, nothing remembered. */
+  const isolate = () => new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
     operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
+  const rt = isolate();
   await rt.ready();
   await rt.store.createAgent("t", "a", { openai: { tools: [WEATHER] } });
   await rt.bindOperatorModel("t", "a");
@@ -93,7 +95,9 @@ async function apiAgent(engine: "pi085" | "pd") {
       items: items.map(({ id: _i, turn_id: _t, ...rest }) => show(rest)),
     };
   };
-  return { rt, agent, sent, requests, replies, settle, view, holdNext, dispose: () => raw.dispose() };
+  /** The object's schema objects named with `prefix` (compared in JS: LIKE would read `_` as a wildcard). */
+  const objects = (prefix: string) => raw.sql.exec("SELECT name FROM sqlite_master").toArray().map((r) => String(r.name)).filter((n) => n.startsWith(prefix));
+  return { rt, agent, sent, requests, replies, settle, view, holdNext, isolate, objects, dispose: () => raw.dispose() };
 }
 
 const runtimeCases: DriveCase[] = [{
@@ -135,6 +139,9 @@ const runtimeCases: DriveCase[] = [{
         await a.settle();
         views.push(await a.view());
         out[engine] = { views, cancelled, requests: a.requests.map((r) => r.messages.filter((m) => m.role !== "system")) };
+        // pd keeps its own records: none of the calls above made a pi085 table. The control is pi085's object.
+        const made = a.objects("pi_");
+        check(engine === "pd" ? made.length === 0 : made.includes("pi_model_jobs"), `${engine}: pi085 objects ${show(made)}`);
         await a.agent.close();
       } finally { a.dispose(); }
     }
@@ -160,6 +167,30 @@ const runtimeCases: DriveCase[] = [{
     }
   },
 }];
+
+/**
+ * Which engine answers for the caller's calls is the object's record, not what this isolate happens to have opened:
+ * a status poll is often the first thing a fresh isolate is asked, before any agent is built.
+ */
+runtimeCases.push({
+  group: "runtime", name: "pd: a fresh isolate's first question, the calls waiting on the caller, is answered by the pd engine",
+  run: async () => {
+    const a = await apiAgent("pd");
+    try {
+      a.replies.push(() => ({ text: "", finishReason: "tool_calls", truncated: false, usage: USAGE, toolCalls: [{ id: "call_f", name: "get_weather", arguments: { city: "Rome" } }] }));
+      await a.rt.postMessage("t", "a", "weather in Rome?");
+      await a.settle();
+      check((await a.rt.waitingClientCalls("t", "a", "main")).length === 1, "control: no call waits on the caller");
+      await a.agent.close();
+      const fresh = a.isolate();
+      const waiting = await fresh.waitingClientCalls("t", "a", "main");
+      check(show(waiting.map((c) => c.call_id)) === show(["call_f"]) && waiting[0]!.turn_id !== "", `a fresh isolate read ${show(waiting)}`);
+      const kept = await fresh.submitToolResults("t", "a", "main", [{ turnId: waiting[0]!.turn_id, callId: "call_f", output: "warm", isError: false }]);
+      check(kept.unknown.length === 0 && (await fresh.waitingClientCalls("t", "a", "main")).length === 0, `the result was not taken: ${show(kept)}`);
+      await (await fresh.agent("t", "a")).close();
+    } finally { a.dispose(); }
+  },
+});
 
 /**
  * `submitToolResults` and `cancelSession` on a pd object, each with another session's message committing in the

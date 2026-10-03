@@ -3,8 +3,8 @@
  * compactions, what its lane is doing, the runs that failed with no entry, and which tables hold all that.
  *
  * Each read asks the engine first (`isPd`) and goes to that engine's own records. An agent on `pd` keeps them in
- * pi-durable's tables and `ap_*` (src/runtime/pd-transcript.ts); pi 0.85's tables exist for it too and stay empty, so a
- * read that went to them would show a pd agent with no jobs, no compactions and nothing outstanding rather than fail.
+ * pi-durable's tables and `ap_*` (src/runtime/pd-transcript.ts). A pd object has no pi 0.85 tables of its own (one
+ * migrated from pi085 keeps that engine's, unread), so a read that went to them would fail or show the old agent.
  *
  * The pd arms are the readers; the pi085 arms are kept apart at the bottom of this file, each a function of its own
  * that nothing else calls, so removing pi 0.85 removes that block and the `isPd` test above each call. Every read is a
