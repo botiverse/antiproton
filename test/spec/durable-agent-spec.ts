@@ -10,6 +10,7 @@
  * eviction leaves: the rows, and nothing in memory.
  */
 import { BACKGROUND_CONTEXT as BACKGROUND } from "@earendil-works/chord/context";
+import { defineExtension, defineTask } from "@earendil-works/pi-durable";
 import { durableOffloadedProvider } from "../../src/model/durable-offloaded.ts";
 import { errorMessage, fromResponse, toRequest } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
@@ -133,8 +134,8 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const rows = jobs(storage);
     check(rows.length === 1 && rows[0]!.answer === null && rows[0]!.dispatched_at !== null, `jobs ${show(rows)}`);
     check(show(o.dispatched) === show([rows[0]!.id]), `dispatched ${show(o.dispatched)}`);
-    // Also what pins PdHost passing no `onSleep`: the poll sleep must be seen by the read its checkpoint's commit
-    // brings. Seen only at settle's 1 s recheck, the step would take that second.
+    // The poll sleep is seen at once: by the read its checkpoint's commit brings, or by the harness's `onSleep` notice.
+    // Seen only at settle's 1 s recheck, the step would take that second.
     check(o.polls.length === 0, `polled before the park ended: ${show(o.polls)}`);
     check(took < 900, `the park took ${took} ms (did it wait for settle's 1 s recheck?)`);
     const id = rows[0]!.id;
@@ -153,6 +154,36 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(e.length === 1 && turns(e)[0] === "assistant(stop): Paris" && e[0]!.type === "message", `desc/limit ${show(e)}`);
     check(!(await a.running()), "still running after the answer");
     check(show(await a.tools()) === "[]", "an agent opened with no tools is offered some");
+    await a.close();
+  });
+
+  add("turn", "a task that sleeps after work it did not commit parks at once: the harness's onSleep reaches the step's settle", async (storage) => {
+    let until = 0;
+    // It works a moment, commits nothing, then sleeps: no commit brings a read after the sleep starts.
+    const Nap = defineTask<Record<string, never>, { phase: "nap" }, null>({
+      name: "pd-test.nap", version: 1, initial: () => ({ phase: "nap" }),
+      phases: {
+        nap: async (_task, runtime, context) => {
+          await sleep(50);
+          until = runtime.now() + 60_000;
+          await runtime.sleep(until, context);
+          await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+        },
+      },
+      abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
+    });
+    const o = object(storage, [], { extensions: [defineExtension({ name: "pd-test", tasks: [Nap] })] });
+    const a = o.agent();
+    await o.host.withHarness(async (h) => {
+      const root = await h.root(BACKGROUND);
+      await root.commit((tx) => tx.createTask(Nap, {}, { ownership: { kind: "conversation" } }), BACKGROUND);
+    });
+    const t0 = Date.now();
+    const parked = await a.step();
+    const took = Date.now() - t0;
+    check(until > t0 && parked.open === 1 && parked.wakeInMs !== null && Math.abs(Date.now() + parked.wakeInMs - until) < 1_000,
+      `step ${show(parked)}, the task sleeps until ${until - t0} ms after it started`);
+    check(took < 900, `the park took ${took} ms: settle saw the sleep only at its 1 s recheck`);
     await a.close();
   });
 

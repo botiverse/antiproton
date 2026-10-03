@@ -10,12 +10,15 @@ the same repository and is held to the same rules; its contracts are in their
 own section below.
 
 `@earendil-works/pi-durable` 1.0.0 is installed beside it, for the move of the
-agent loop onto pi's durable harness. What exists on it so far is its SQLite
-storage core behind `src/store/pi-durable-sqlite.ts`, the offloaded provider
-on pi-ai 1.0 (`src/model/durable-offloaded.ts`) and the park decision
-(`src/runtime/durable-drive.ts`). Nothing in `cf/src` or the live runtime
-reaches any of them yet (only the never-deployed conformance worker does); the
-runtime still runs on `pi-agent-core`.
+agent loop onto pi's durable harness. On it is the second engine, `pd`
+(`src/runtime/durable-agent.ts`): its SQLite storage behind
+`src/store/pi-durable-sqlite.ts`, the offloaded provider on pi-ai 1.0
+(`src/model/durable-offloaded.ts`) and the park decision
+(`src/runtime/durable-drive.ts`). `cf/src/runtime.ts` opens it for an object
+whose `ap_meta` records `pd` (`recordedEngine`): one the operator migrated
+(`migrateEngine`, `src/runtime/pd-migrate.ts`) or a pd bench object
+(`cf/src/bench.ts`). No creation path records it, so every production agent
+still runs on `pi-agent-core` (`pi085`).
 
 ## The pin is exact, on purpose
 
@@ -223,11 +226,11 @@ rests on:
   the task's invocation is inside `runtime.sleep`. It also calls
   `HarnessOptions.onSleep` when a sleep starts, for a task that works without
   committing and then sleeps — no commit brings the read that would see it.
-  `settle` does not need it: its harness runs only pi-durable's poll and retry
-  sleeps (its registry holds tool extensions, and a tool cannot sleep), each the
-  first act after its checkpoint's commit, and the read that commit brings sees
-  the sleep; `test/spec/durable-agent-spec.ts` fails if a park waits for the
-  1 s recheck instead. This replaced
+  `PdHost` passes that notice to `settle` (its `subscribe`), so such a sleep is
+  read at once rather than at settle's 1 s recheck; pi-durable's own poll and
+  retry sleeps start right after their checkpoint's commit and are seen either
+  way. `test/spec/durable-agent-spec.ts` fails if a park waits for the recheck,
+  for a poll and for a task that sleeps after uncommitted work. This replaced
   reading `poll`/`retry` checkpoints and a table of every phase pi-durable
   writes, which a new upstream sleep or an extension's own would have turned
   into a billed wait. The sleep reads the harness clock (`HarnessOptions.now`),

@@ -77,13 +77,14 @@ const nodeCases: DriveCase[] = [
       check(show(pd.names) === show(pi.names) && show(pd.names) === show(names), `engine.tools(): pi085 ${show(pi.names)}, pd ${show(pd.names)}`);
       const system = (r: typeof pi.request) => r.messages.filter((m) => m.role === "system").map((m) => String(m.content)).join("\n");
       check(system(pd.request).includes("special tool, run_js"), `pd's prompt has no sandbox paragraph: ${system(pd.request).slice(0, 300)}`);
-      // pd's prompt is pi-durable's `instructions` section, sent out of its tag at the top (src/model/durable-offloaded.ts `jobContext`).
+      // pd's prompt is pi-durable's `instructions` section, sent at the top as pi-durable renders it, in its tag
+      // (src/model/durable-offloaded.ts `jobContext`); pi085 sends the same prompt bare as its system prompt.
       check(pd.request.messages[0]?.role === "system" && pi.request.messages[0]?.role === "system",
         `the prompt does not lead: pi085 ${show(pi.request.messages[0]?.role)}, pd ${show(pd.request.messages[0]?.role)}`);
-      const [a, b] = [system(pi.request), system(pd.request)];
+      const [a, b] = [`<instructions>\n${system(pi.request)}\n</instructions>`, system(pd.request)];
       let at = 0;
       while (at < a.length && a[at] === b[at]) at++;
-      check(a === b, `system prompts differ at ${at}\n pi085 …${show(a.slice(Math.max(0, at - 60), at + 120))}\n pd    …${show(b.slice(Math.max(0, at - 60), at + 120))}`);
+      check(a === b, `pd's prompt is not the catalogue's in pi-durable's tag, at ${at}\n want …${show(a.slice(Math.max(0, at - 60), at + 120))}\n pd   …${show(b.slice(Math.max(0, at - 60), at + 120))}`);
     },
   },
 ];

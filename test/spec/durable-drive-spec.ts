@@ -189,7 +189,7 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
   const add = (group: string, name: string, body: (host: DurableSqlHost) => Promise<void>) =>
     cases.push({ group, name, run: () => withHost(body) });
 
-  add("provider", "a job is wire format v2: the prompt pi-durable put after the input leads the request, its `instructions` untagged; tools as a field", async (host) => {
+  add("provider", "a job is wire format v2: the prompt pi-durable put after the input leads the request as pi-durable renders it; tools as a field", async (host) => {
     const w = world(host);
     const r = parked(await w.submit("Capital of France?"));
     const [row] = w.jobs.rows();
@@ -200,8 +200,8 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
       `context ${show(Object.keys(job.context))} version ${show(job.context.version)}`);
     const { messages, tools } = toRequest(job.context);
     check(messages.length === 2, `request messages ${show(messages)}`);
-    // The extension's untagged `preamble` section, then the agent's `instructions` out of its `<instructions>` tag.
-    check(messages[0]?.role === "system" && messages[0].content === "You are a terse test assistant.\n\nAnswer in one word.",
+    // The extension's untagged `preamble` section, then the agent's `instructions` in the tag pi-durable wraps it in.
+    check(messages[0]?.role === "system" && messages[0].content === "You are a terse test assistant.\n\n<instructions>\nAnswer in one word.\n</instructions>",
       `system prompt ${show(messages[0])}`);
     check(messages[1]?.role === "user" && messages[1].content === "Capital of France?", `user turn ${show(messages[1])}`);
     check(tools?.length === 1 && tools[0]?.name === "count", `tools ${show(tools)}`);
@@ -454,9 +454,12 @@ export async function runDriveCases(cases: DriveCase[]) {
  * The 0.85 provider writes wire format version 1 and the 1.0 one version 2
  * (src/model/pi-bridge.ts), so the stored contexts differ by design; what
  * `toRequest` makes of them is what reaches the model. A conversation whose only
- * system message leads must build a byte-identical request either way. One with
- * later system messages has no version 1 form at all: there the request must be
- * the version 1 request up to the first of them, then each where it stood.
+ * system message leads must build a byte-identical request either way: that is
+ * the bridge reading both versions alike. One with later system messages has no
+ * version 1 form at all: there the request must be the version 1 request up to
+ * the first of them, then each where it stood. Where pi-durable writes the prompt
+ * (after the first input, as its tagged `instructions` section), the request is
+ * pd's own: that prompt, as pi-durable renders it, first, then the conversation.
  */
 export async function wireFormatCases(old: {
   /** `offloadedProvider` from src/model/pi-offloaded.ts and `createModels` from 0.85, wired by the caller. */
@@ -494,6 +497,19 @@ export async function wireFormatCases(old: {
     return [first, { role: "system", content: "", sections: { instructions: `<instructions>\n${c.systemPrompt}\n</instructions>` }, toolsAdded: c.tools, timestamp: 1 }, ...rest];
   })();
   const placed = JSON.stringify({ messages: placedMessages });
+  // The request pd intends for it: the prompt first, as pi-durable renders it (tag included), then the conversation.
+  const placedRequest = (() => {
+    const c = JSON.parse(conversation);
+    return {
+      messages: [
+        { role: "system", content: `<instructions>\n${c.systemPrompt}\n</instructions>` },
+        { role: "user", content: "Capital of France?" },
+        { role: "assistant", content: "Let me count.", tool_calls: [{ id: "c1", type: "function", function: { name: "count", arguments: "{\"n\":2}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "1\n2\n" },
+      ],
+      tools: c.tools,
+    };
+  })();
   // A first system message that only adds the tools, then the prompt: the prompt is still what leads.
   const toolsFirst = (() => {
     const [first, prompt, ...rest] = placedMessages;
@@ -543,18 +559,16 @@ export async function wireFormatCases(old: {
       check(show(after.tools?.map((t) => t.name)) === show(["count", "shout"]), `tools ${show(after.tools)}`);
     },
   }, {
-    group: "provider", name: "the prompt pi-durable writes after the first input, tagged as its `instructions` section, leads the request untagged: the 0.85 request",
+    group: "provider", name: "the prompt pi-durable writes after the first input, as its tagged `instructions` section, leads the request as pi-durable renders it",
     run: async () => {
-      const before = toRequest(JSON.parse(await old.startOldJob(conversation)).context);
       const after = toRequest(JSON.parse(await startNewJob(placed)).context);
-      check(show(after) === show(before), `toRequest differs:\n 0.85 ${show(before)}\n 1.0  ${show(after)}`);
+      check(show(after) === show(placedRequest), `toRequest:\n want ${show(placedRequest)}\n got  ${show(after)}`);
     },
   }, {
-    group: "provider", name: "a first system message that only adds tools declares no prompt: the prompt after it leads the request, the 0.85 request",
+    group: "provider", name: "a first system message that only adds tools declares no prompt: the prompt after it leads the request",
     run: async () => {
-      const before = toRequest(JSON.parse(await old.startOldJob(conversation)).context);
       const after = toRequest(JSON.parse(await startNewJob(toolsFirst)).context);
-      check(show(after) === show(before), `toRequest differs:\n 0.85 ${show(before)}\n 1.0  ${show(after)}`);
+      check(show(after) === show(placedRequest), `toRequest:\n want ${show(placedRequest)}\n got  ${show(after)}`);
     },
   }, {
     group: "provider", name: "a later prompt change stays where it stood when the first prompt is moved to the top",
