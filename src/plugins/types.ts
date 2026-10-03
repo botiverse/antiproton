@@ -1703,7 +1703,8 @@ export interface Plugin {
    * reaches the sealed store without it: `state` holds the raw store and the key
    * because it is the store's own surface, and its tools only ever read `kept:`
    * (test/console-mounts.ts trips if another entry of cf/src/runtime.ts's plugin
-   * list names the key; a key passed under another name, or a plugin built
+   * list names the key or `#secrets`, the resolver that opens what it opens; a
+   * key passed under another name, or a plugin built
    * elsewhere such as an `extraPlugins` entry, is outside what it sees).
    */
   readsOwnerSecrets?: true;
