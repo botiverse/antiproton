@@ -59,7 +59,10 @@ run_suite() {  # name, command...
   local name="$1"; shift
   suite_name "$name"
   local out n
-  if ! out=$("$@" 2>&1); then echo FAIL; exit 1; fi
+  # The failing suite's own lines, as gate.sh prints them: a bare FAIL could not be diagnosed. Nothing secret is in
+  # them: the secrets file is sourced only after every suite (below), wrangler dev prints .dev.vars values as
+  # "(hidden)", and the suites' keys are fixtures.
+  if ! out=$("$@" 2>&1); then echo FAIL; printf '%s\n' "$out" | tail -40; exit 1; fi
   n=$(printf '%s\n' "$out" | suite_passed_count)
   if [ -z "$n" ] || [ "$n" -eq 0 ]; then echo "FAIL (asserted nothing: ${n:-no pass count})"; exit 1; fi
   echo "ok ($n)"

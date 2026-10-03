@@ -185,8 +185,13 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await a.say("Q1");
     // Closed, so both steps race to open the harness and to resume the generation.
     await a.close();
+    const t0 = Date.now();
     const [x, y] = await Promise.all([a.step(), again.step()]);
-    check(show(x) === show(y) && x.wakeInMs !== null, `outcomes ${show([x, y])}`);
+    const t1 = Date.now();
+    // The same park, but `wakeInMs` is relative to the moment each step read the clock, and two steps need not read
+    // it in the same millisecond. Both reads fall in [t0, t1], so one park time puts them at most t1 - t0 apart.
+    check(x.wakeInMs !== null && y.wakeInMs !== null && Math.abs(x.wakeInMs - y.wakeInMs) <= t1 - t0
+      && show({ ...x, wakeInMs: 0 }) === show({ ...y, wakeInMs: 0 }), `outcomes ${show([x, y])} within ${t1 - t0} ms`);
     const rows = jobs(storage);
     check(rows.length === 1 && o.dispatched.length === 1, `jobs ${rows.length}, dispatches ${o.dispatched.length}: the generation ran twice`);
     await consume(a, rows[0]!.id, "A1");
@@ -474,10 +479,20 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(sent.length as number === 0 && jobs(storage).length === 1, `control: the dispatch was not lost: ${show(jobs(storage))} / sent ${show(sent)}`);
     check(parked.wakeInMs !== null && parked.wakeInMs <= 400, `parked for ${parked.wakeInMs} ms, past the redelivery`);
     await sleep(parked.wakeInMs);
+    const t0 = Date.now();
     const again = await a.step();
+    const t1 = Date.now();
     check(sent.length === 1, `not resent: ${show(jobs(storage))}`);
-    // Dispatched now: the park comes back at its redelivery, still before the backstop.
-    check(again.wakeInMs !== null && again.wakeInMs <= 400 && again.wakeInMs > 200, `after the resend: ${show(again)}`);
+    // Dispatched now: the park comes back at its redelivery, still before the backstop. Read as a time, not as a
+    // remainder: how much of the 400 ms is left depends on how long the step took after the resend. The step read
+    // its clock somewhere in [t0, t1], so a park at the resend's redelivery puts that read at
+    // dispatched_at + 400 - wakeInMs. A step longer than the interval finds the resend already due, and parks one
+    // interval from `PdHost.redeliveryDue`'s clock read; `step()` reads the clock again after it, also in [t0, t1],
+    // so that park is 400 less at most t1 - t0. The resend itself was stamped inside the step.
+    const resent = Number(jobs(storage)[0]!.dispatched_at), due = resent + 400;
+    check(resent >= t0 && resent <= t1 && again.wakeInMs !== null && again.wakeInMs > 0 && again.wakeInMs <= 400
+      && (again.wakeInMs >= 400 - (t1 - t0) || (due - again.wakeInMs >= t0 && due - again.wakeInMs <= t1)),
+      `after the resend: ${show(again)}, the resend's redelivery at ${due}, the step in [${t0}, ${t1}]`);
     await a.close();
   });
 
@@ -524,17 +539,20 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const parked = await a.step();
     const id = sent[0]!;
     check(await a.takeJob(id, "try-1") !== null, "the first taker was refused");
-    const takenAt = Date.now();
     // The model call runs on past the redelivery the object parked for.
     check(parked.wakeInMs !== null && parked.wakeInMs <= RED, `parked for ${show(parked)}`);
     await sleep(RED + 50);
+    const s0 = Date.now();
     const during = await a.step();
+    const s1 = Date.now();
     check(show(sent) === show([id]), `sends while the call runs: ${show(sent)}`);
     check(await a.takeJob(id, "try-2") === null, "a second taker was granted while the first one's call runs");
-    // Parked for the end of the hold: not at once (a busy loop), not past it (a dead taker never recovered).
-    const holdLeft = takenAt + HOLD - Date.now();
-    check(during.wakeInMs !== null && during.wakeInMs <= holdLeft + 50 && during.wakeInMs >= holdLeft - 300,
-      `parked for ${show(during)} with ${holdLeft} ms of the hold left`);
+    // Parked for the end of the hold: not at once (a busy loop), not past it (a dead taker never recovered). Read as a
+    // time, not as a remainder: the step read its clock somewhere in [s0, s1], so a park at the hold's end puts that
+    // read at end - wakeInMs.
+    const end = Number(storage.sql.exec("SELECT taken_at FROM ap_model_jobs WHERE id = ?", id).toArray()[0]!.taken_at) + HOLD;
+    check(during.wakeInMs !== null && during.wakeInMs > 0 && end - during.wakeInMs >= s0 && end - during.wakeInMs <= s1,
+      `parked for ${show(during)}, the hold's end at ${end}, the step in [${s0}, ${s1}]`);
     // The taker died without releasing: at the end of the hold the job is sent again and taken.
     await sleep(during.wakeInMs);
     const after = await a.step();
