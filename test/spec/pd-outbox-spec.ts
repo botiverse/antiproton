@@ -475,7 +475,7 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
     await o.agent.close();
     await o.host.close();
-    // A record no registered definition can take: a newer build wrote it (`task_too_old`, harness/scheduler.js `#fit`).
+    // A record no registered definition can take: a newer build wrote it (`task_too_old`, src/vendor/pi/pi-durable/dist/harness/scheduler.js `#fit`).
     // An abort of it runs no task code; the scheduler settles it `orphaned`, from the stored poll.
     storage.sql.exec("UPDATE pd_tasks SET record = json_set(record, '$.version', 99) WHERE json_extract(record, '$.kind') = 'pi.generation'");
     const next = pdObject(storage);
