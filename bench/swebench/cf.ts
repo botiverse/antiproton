@@ -15,8 +15,9 @@
  * ones to still pass — executed *by this runner* through the object, in the
  * same container the agent worked in, before the runner hands the container
  * back. The object holds the container open across the agent's finish for
- * exactly that reason, and never offers the agent the tool that would
- * destroy the evidence (`sandbox.release`).
+ * exactly that reason, and never offers the agent the tools that would
+ * destroy the evidence (withheld.ts). The grading itself is grade.ts: the
+ * repository's own test command, every FAIL_TO_PASS and PASS_TO_PASS test.
  *
  * What only this runner can report: how long the object itself was billed,
  * and how much of the wall clock the container existed for.
@@ -31,6 +32,7 @@ import { beginRun, driverCommit, recordRun, teeRun, workerBuild } from "../recor
 import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
 import { SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
+import { gradeCommand, gradeFromLog, readGradeLog, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -58,10 +60,8 @@ const OBJECTS = objectsShape(ENGINE, process.env.OBJECTS);
 const objOf = (taskId: string) => taskObject(OBJ, OBJECTS, taskId);
 const withObj = (path: string, obj = OBJ) => path + (path.includes("?") ? "&" : "?") + `obj=${obj}`;
 
-interface Instance {
-  instance_id: string; repo: string; base_commit: string;
-  problem_statement: string; patch: string; test_patch: string;
-  FAIL_TO_PASS: string; PASS_TO_PASS: string;
+interface Instance extends GradedInstance {
+  problem_statement: string; patch: string;
 }
 
 async function api(path: string, init: RequestInit = {}, timeoutMs = 120_000, obj = OBJ): Promise<any> {
@@ -179,11 +179,34 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
 
 // ------------------------------------------------------------ one instance
 
-/** A shell command in the agent's container, run by the runner. Long: the
- *  test suite of a real repository is behind it, so the timeout is the
- *  mount's own (300 s) plus the trip. */
-const shell = (taskId: string, command: string) =>
-  post("/bench/swe/shell", { taskId, command }, 360_000, objOf(taskId));
+/** How long one grading command may run: SWE-bench's own harness allows 1,800 s per instance. */
+const GRADE_DEADLINE_MS = Number(process.env.GRADE_DEADLINE_MS ?? 1_800_000);
+
+/** A shell command in the agent's container, run by the runner, and its finished answer. A command that
+ *  outlives the sandbox's grace window comes back `running`; it is polled until it ends (grade.ts
+ *  `settleShell`), so grading reads the output and not an empty string. */
+const shell = async (taskId: string, command: string): Promise<ShellAnswer> => {
+  const deadlineAt = Date.now() + GRADE_DEADLINE_MS;
+  const first: ShellAnswer = await post("/bench/swe/shell", { taskId, command }, 360_000, objOf(taskId));
+  return settleShell(first, (bg) => post("/bench/swe/job", { taskId, alias: bg.alias, handle: bg.handle }, undefined, objOf(taskId)),
+    { deadlineAt });
+};
+/** The output of a command that must succeed; anything else is the grade's error, not an empty output. */
+const shellOut = async (taskId: string, command: string): Promise<string> => {
+  const r = await shell(taskId, command);
+  if (r.status !== "succeeded") throw new Error(`grading command ${r.status}: ${r.error?.message ?? JSON.stringify(r.error ?? null)}`);
+  return String(r.result?.output ?? "");
+};
+
+/** What the run record keeps of a grade: both verdicts, the counts, and the first few failing names. */
+function gradeRecord(r: ReturnType<typeof gradeFromLog>, diff: string) {
+  return {
+    resolved: r.resolved, failToPass: r.failToPass.failed.length === 0, passToPass: r.passToPass.failed.length === 0, diff,
+    f2p: { total: r.failToPass.total, passed: r.failToPass.passed, failed: r.failToPass.failed.length, firstFailed: r.failToPass.failed.slice(0, 5) },
+    p2p: { total: r.passToPass.total, passed: r.passToPass.passed, failed: r.passToPass.failed.length, firstFailed: r.passToPass.failed.slice(0, 5) },
+    ...(r.error ? { gradeError: r.error } : {}),
+  };
+}
 
 async function runOne(inst: Instance) {
   const t0 = Date.now();
@@ -215,7 +238,7 @@ async function runOne(inst: Instance) {
   // Everything after this point must release the container, whatever happens
   // in between: a box that outlives its run is billed for existing, and this
   // benchmark starts one per instance.
-  let grade: any = { failToPass: false, passToPass: false, diff: "", failOut: "" };
+  let grade: any = { failToPass: false, passToPass: false, diff: "" };
   let agentSeconds = 0, answered: string | null = null;
   // Why a turn ran out of time, and what that was read from. This runner used to record the word
   // `agent_stalled` and nothing else: it held the evidence for one call and threw it away, so a stall here
@@ -231,29 +254,16 @@ async function runOne(inst: Instance) {
     agentSeconds = Math.round((Date.now() - t0) / 1000);
     if (TRACE) console.log(`    agent > ${(answered ?? "(no answer)").replace(/\s+/g, " ").slice(0, 160)}`);
 
-    // Grade with SWE-bench's own criterion, in the box the agent worked in.
-    const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
-    const f2p: string[] = JSON.parse(inst.FAIL_TO_PASS);
-    const p2p: string[] = JSON.parse(inst.PASS_TO_PASS);
-    const diffRes: any = await shell(taskId, "cd /testbed && git diff --stat | tail -3");
-    const diff = String(diffRes.result?.output ?? "").trim().split("\n").pop() ?? "";
-    const gradeIds = async (ids: string[]) => {
-      if (!ids.length) return { ok: true, out: "(none)" };
-      const r: any = await shell(taskId,
-        `cd /testbed && echo '${b64(inst.test_patch)}' | base64 -d > /tmp/test.patch && ` +
-        `git checkout -- $(git diff --name-only -- '*test*' 2>/dev/null) 2>/dev/null; ` +
-        `git apply -v /tmp/test.patch 2>&1 | tail -2; ` +
-        `python -m pytest -q ${ids.map((i) => `'${i}'`).join(" ")} 2>&1 | tail -12`);
-      const out = String(r.result?.output ?? r.error?.message ?? "");
-      const tail = out.split("\n").slice(-3).join(" ");
-      return { ok: /\d+ passed/.test(tail) && !/\d+ (failed|error)/.test(tail), out };
-    };
-    const fail = await gradeIds(f2p.slice(0, 12));
-    const pass = await gradeIds(p2p.slice(0, 12));
-    grade = {
-      failToPass: fail.ok, passToPass: pass.ok, diff,
-      failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
-    };
+    // Grade with SWE-bench's own criterion, in the box the agent worked in (grade.ts): every FAIL_TO_PASS
+    // and PASS_TO_PASS test, from one run of the repository's own test command over the test patch's files.
+    const diff = (await shellOut(taskId, "cd /testbed && git diff --stat | tail -3").catch(() => "")).trim().split("\n").pop() ?? "";
+    try {
+      await shellOut(taskId, gradeCommand(inst));
+      const report = gradeFromLog(inst, await readGradeLog((c) => shellOut(taskId, c)));
+      grade = gradeRecord(report, diff);
+    } catch (e) {
+      grade = { ...grade, diff, gradeError: String((e as Error)?.message ?? e).slice(0, 300) };
+    }
   } finally {
     const release: any = await post("/bench/swe/release", { taskId }, undefined, obj).catch((e) => ({ failed: [{ alias: SANDBOX_ALIAS, error: String(e) }] }));
     for (const f of release?.failed ?? []) {
@@ -268,14 +278,14 @@ async function runOne(inst: Instance) {
   // shown apart: the activity log is per object and keeps every kind, so the
   // window since this instance started is this instance.
   const act: any = await api(`/bench/activity?since=${t0}`, {}, undefined, obj).catch(() => null);
-  const gradingMs = (act?.byKind ?? []).filter((k: any) => k.kind === "benchSweShell")
+  const gradingMs = (act?.byKind ?? []).filter((k: any) => (k.kind === "benchSweShell" || k.kind === "benchSweJob"))
     .reduce((a: number, k: any) => a + Number(k.ms), 0);
   const objectMs = Number(act?.activeMs ?? 0);
   return {
     id: inst.instance_id, taskId, engine, object: `bench-${obj}`,
     // Per task, the run's activity is the sum of its objects' (bench/objects.ts), so each one's is kept.
     ...(OBJECTS === "per-task" ? { activity: act } : {}),
-    resolved: grade.failToPass && grade.passToPass,
+    resolved: grade.resolved === true,
     ...grade,
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds,
     ended: answered ? "answered" : failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled",
@@ -323,7 +333,11 @@ for (const inst of instances) {
       `${r.seconds ? Math.round((r.objectMs / 1000 / r.seconds) * 100) : 0}% of wall` +
       (r.gradingMs ? ` (${(r.gradingMs / 1000).toFixed(1)}s of it grading)` : ""));
   }
-  if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
+  if (r.f2p) {
+    console.log(`      graded: FAIL_TO_PASS ${r.f2p.passed}/${r.f2p.total}, PASS_TO_PASS ${r.p2p.passed}/${r.p2p.total}` +
+      (r.f2p.firstFailed.length ? `  first failing: ${[...r.f2p.firstFailed, ...r.p2p.firstFailed].slice(0, 3).join(", ")}` : ""));
+  }
+  if (r.gradeError) console.log(`      \x1b[31mnot graded: ${r.gradeError}\x1b[0m`);
 }
 
 const solved = out.filter((r) => r.resolved).length;
@@ -347,7 +361,7 @@ const act = OBJECTS === "shared"
   ? await api("/bench/activity").catch(() => null)
   : sumActivity(out.map((r: any) => r.activity));
 if (act) {
-  const grading = (act.byKind ?? []).filter((k: any) => k.kind === "benchSweShell")
+  const grading = (act.byKind ?? []).filter((k: any) => (k.kind === "benchSweShell" || k.kind === "benchSweJob"))
     .reduce((a: number, k: any) => a + Number(k.ms), 0);
   console.log(`  object billed ${(act.activeMs / 1000).toFixed(1)}s of ${wall}s wall ` +
     `(${wall ? Math.round((act.activeMs / 1000 / wall) * 100) : 0}%)` +

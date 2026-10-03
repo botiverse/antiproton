@@ -111,7 +111,8 @@
     "test/spec/pd-writes-spec.ts",
     "test/usage-flush.ts",
     "test/bench-pd.ts",
-    "test/bench-swe.ts"
+    "test/bench-swe.ts",
+    "test/bench-swe-grade.ts"
   ],
   "exclude": ["node_modules"]
 }

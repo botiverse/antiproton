@@ -37,6 +37,7 @@ import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
   AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
+import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
@@ -876,10 +877,11 @@ export class AgentDO extends DurableObject<Env> {
       // offer it, so the object arm does too — same rule, opposite answer.
       sandbox: swe,
       // The grader runs after the agent, in the agent's container. So the
-      // agent is never offered the tool that destroys it, and a settled run
+      // agent is never offered the tools that hand it back (BENCH_SWE_WITHHELD,
+      // bench/swebench/withheld.ts), and a settled run
       // does not hand the machine back on its own: the runner does, after
       // grading, through benchSweRelease — and owns the bill if it forgets.
-      withholdTools: swe ? [`${SANDBOX_ALIAS}.release`] : undefined,
+      withholdTools: swe ? BENCH_SWE_WITHHELD : undefined,
       autoRelease: !swe,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
@@ -975,6 +977,18 @@ export class AgentDO extends DurableObject<Env> {
       await rt.ready();
       return rt.gateway().invoke(
         { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, `${SANDBOX_ALIAS}.shell`, { command });
+    });
+  }
+
+  /** One look at a grading command the sandbox handed to the background (bench/swebench/grade.ts
+   *  `settleShell`): the runner polls this rather than the object waiting, so the object is not held awake
+   *  for as long as a test suite runs. */
+  async benchSweJob(taskId: string, alias: string, handle: unknown) {
+    return this.#busy("benchSweJob", async () => {
+      const rt = this.#activeRuntime();
+      await rt.ready();
+      return rt.gateway().pollBackground(
+        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, alias, handle as Json);
     });
   }
 
@@ -3569,6 +3583,12 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSweShell(String(b.taskId), String(b.command)));
+        }
+        case "/bench/swe/job": {
+          const g = await guardSpending(request, env);
+          if (g) return g;
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSweJob(String(b.taskId), String(b.alias), b.handle));
         }
         case "/bench/swe/release": {
           const g = await guardSpending(request, env);

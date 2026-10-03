@@ -457,7 +457,7 @@ export interface RuntimeDeps {
    * refused where both engines dispatch (`#host`), because run_js passes a
    * dotted address straight through and so could still name it.
    */
-  withholdTools?: string[];
+  withholdTools?: readonly string[];
   /**
    * Whether a settled run hands its containers back by itself.
    *
@@ -729,7 +729,8 @@ export class AgentRuntime {
       raftPlugin,
       mcpPlugin,
       ...(deps.extraPlugins ?? []),
-      builtinToolsPlugin(this.store, () => plugins),
+      // Discovery agrees with dispatch: a withheld tool is not found by searching for it either.
+      builtinToolsPlugin(this.store, () => plugins, deps.withholdTools ?? []),
     );
     this.#plugins = plugins;
     // Three reference forms, one resolver: the operator's sandbox account,

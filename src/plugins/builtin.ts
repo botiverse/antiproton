@@ -3,15 +3,22 @@ import { toolsOf, type Plugin } from "./types.ts";
 import { skippedToolNotes } from "../runtime/mount-tools.ts";
 // The one function that decides what the model may call a tool. Imported rather
 // than reimplemented: discovery that formats its own names is discovery that can
-// disagree with dispatch, which is what it did — it answered `node.save`, the
-// gateway's address, while the harness offered `node__save`.
-import { qualifyMountedTools } from "../runtime/pi-tools.ts";
+// disagree with dispatch, which is what it did — it answered `sandbox.save`, the
+// gateway's address, while the harness offered `sandbox__save`.
+import { qualifyMountedTools, withholdTools } from "../runtime/pi-tools.ts";
 
 /**
  * Discovery tools. They answer with the name the harness registered, so a tool
  * found here can be called by the string it was found under.
  */
-export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin[]): Plugin {
+export function builtinToolsPlugin(
+  store: StorageAdapter, registry: () => Plugin[],
+  /** Addresses the agent is not offered (cf/src/runtime.ts `withholdTools`): not found here either, so
+   *  discovery never names a tool the agent would be refused. Filtered before the names are qualified,
+   *  as the harness does, so both qualify the same set. */
+  withheld: Iterable<string> = [],
+): Plugin {
+  const held = [...withheld];
   return {
     id: "tools",
     version: "1.0.0",
@@ -33,7 +40,7 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
       // Each mount's own tools (`toolsOf`), the same list `describe` reads its
       // schema from below: the two must be one list, or a name found here has
       // no schema there.
-      const catalogue = qualifyMountedTools(mounts.flatMap((m) => {
+      const catalogue = qualifyMountedTools(withholdTools(mounts.flatMap((m) => {
         const plugin = plugins.get(m.plugin);
         return (plugin ? toolsOf(plugin, m) : []).map((t) => ({
           name: t.name,
@@ -48,7 +55,7 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
           summary: t.summary,
           sideEffects: t.sideEffects,
         }));
-      })).map(({ parameters: _p, description: _d, ...rest }) => rest);
+      }), held)).map(({ parameters: _p, description: _d, ...rest }) => rest);
       // The address is the gateway's key and stays out of every answer: an agent
       // that is shown one will use one. It is kept on the entry above only so
       // `describe` can still recognise a name an older transcript taught it.
@@ -87,7 +94,7 @@ export function builtinToolsPlugin(store: StorageAdapter, registry: () => Plugin
         case "describe": {
           const want = String((args as any).name);
           // Three ways an agent may ask, and only the first is the name it was
-          // offered: a model that read `node.save` in an older transcript, or
+          // offered: a model that read `sandbox.save` in an older transcript, or
           // typed the bare `save`, gets an answer rather than a correction.
           const bare = catalogue.filter((t) => t.address.split(".").slice(1).join(".") === want);
           // A bare name can belong to two mounts — `get` is both memory's and

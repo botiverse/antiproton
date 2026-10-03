@@ -17,7 +17,7 @@ export interface BackgroundJob {
   id: string;
   /** The mount's alias: where the work is polled and cancelled. */
   mount: string;
-  /** The tool as the model was offered it (`node__shell`), never the dispatch address. */
+  /** The tool as the model was offered it (`sandbox__shell`), never the dispatch address. */
   tool: string;
   /** Whatever the plugin needs to find the work again. Never a credential. */
   handle: unknown;
