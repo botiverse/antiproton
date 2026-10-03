@@ -713,6 +713,49 @@ await check("read_messages refuses two cursors, a bad limit, and a bad cursor be
   if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
 });
 
+/**
+ * A Server that holds a send into #wg-raft-sdk unless the send attests seq 42, the newest message there: what
+ * Raft does with the `seenUpToSeq` / `seenExactSeqs` the SDK attests from the mount's saved frontier.
+ */
+function freshnessServer(answers: { history?: Response; events?: Response }) {
+  const sends: any[] = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path.endsWith("/history")) return answers.history!;
+    if (path.endsWith("/events")) return answers.events!;
+    const body = JSON.parse(String(init?.body));
+    sends.push(body);
+    const attested = (body.seenUpToSeq ?? 0) >= 42 || (body.seenExactSeqs ?? []).includes(42);
+    return attested
+      ? json(200, { ok: true, state: "sent", messageId: "m-sent", messageSeq: 43 })
+      : json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 41, omittedMessageCount: 0, freshnessContextMode: "inline",
+        heldMessages: [historyMessage(42, "wait, one more thing")] });
+  }) as any;
+  return sends;
+}
+
+await check("read_messages does not count as the model having seen a conversation: a send after it is still held", async () => {
+  // Called from run_js, a read's result may never reach the model, so it must not resolve the read-before-send
+  // question that only the model may answer. The Server's model-seen boundary is in the answer, as Raft sends it.
+  const m = mount();
+  const sends = freshnessServer({
+    history: json(200, { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
+      has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 }),
+  });
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk" }, m.ctx);
+  const out = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-read" }, m.ctx);
+  if (!(out instanceof Interrupt)) throw new Error(`the read let the send through: attested ${JSON.stringify({ upTo: sends[0]?.seenUpToSeq, exact: sends[0]?.seenExactSeqs })}`);
+  // Positive control: the same conversation handed over by receive_events is what the model reads, and that
+  // send goes through, so the fake Server above can tell the two apart.
+  const control = mount();
+  const controlSends = freshnessServer({
+    events: events([historyMessage(42, "wait, one more thing")], { last_seen_seq: 42 }),
+  });
+  await raftPlugin.invoke("receive_events", {}, control.ctx);
+  const sent = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-receive" }, control.ctx) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`control: receive_events did not attest: ${JSON.stringify(controlSends)}`);
+});
+
 /** One result of `GET /internal/agent-api/search` as the Server sends it. */
 function searchResult(n: number) {
   return {

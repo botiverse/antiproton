@@ -331,8 +331,16 @@ function stateStore(ctx: PluginContext): RaftStateStore {
   };
 }
 
-/** A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state. */
-function raftFor(ctx: PluginContext): Raft {
+/**
+ * A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state.
+ *
+ * `{ state: false }` gives a client whose state lives only for the call and is never saved. read_messages uses
+ * it, because the SDK's `messages.read` advances the seen frontier that a send attests — and a read made from
+ * run_js may never reach the model, so it must not answer the read-before-send question only the model may
+ * answer (docs/ax-design.md §3, "Code cannot skip it"). What does attest is the hold's own question, which
+ * reaches the model whatever called the send.
+ */
+function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
   return createRaft({
     serverUrl: baseUrl(ctx).origin, credential: requireCredential(ctx),
     // Redirects stay manual, as on every other request here, so a 3xx never carries the credential elsewhere.
@@ -350,7 +358,7 @@ function raftFor(ctx: PluginContext): Raft {
       logEvent("raft.call", { ...line, status: res.status, ms: Date.now() - started });
       return res;
     },
-    state: stateStore(ctx),
+    ...(options.state === false ? {} : { state: stateStore(ctx) }),
     // A save that failed or lost a race costs at most one repeated batch or one extra hold; it never fails
     // the call, and the SDK does not retry it. Said in the Worker's log, where an operator would look.
     onStateSaveError: (error, { phase }) => console.warn(`raft state ${phase} failed for mount ${ctx.alias}: ${String((error as Error)?.message ?? error)}`),
@@ -660,7 +668,8 @@ export const raftPlugin: Plugin = {
       name: "read_messages",
       summary: "Read the history of a Raft channel, DM, or thread, one message per line as receive_events shows them. " +
         "Without a cursor it reads the latest messages; give at most one of before (older than a seq), after (newer than a seq) " +
-        "or around (a seq or message id). hasOlder and hasNewer say whether more exist; oldestSeq and newestSeq are the cursors to page with.",
+        "or around (a seq or message id). hasOlder and hasNewer say whether more exist; oldestSeq and newestSeq are the cursors to page with. " +
+        "Reading here does not count as having seen the conversation: a send_message there may still ask first, showing what is new.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
@@ -960,7 +969,8 @@ export const raftPlugin: Plugin = {
         throw new Error("give at most one of before, after and around");
       }
       const limit = integer(a.limit, "limit", 1, MAX_HISTORY);
-      const out = await raftFor(ctx).messages.read({
+      // A client that saves nothing: this read does not count as the model having seen the conversation (see raftFor).
+      const out = await raftFor(ctx, { state: false }).messages.read({
         target: a.target,
         ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}),
         ...(around !== undefined ? { around } : {}), ...(limit !== undefined ? { limit } : {}),
