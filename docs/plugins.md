@@ -366,9 +366,18 @@ is held by `test/mcp-plugin.ts` ("a plugin is handed ownerSecret only when it
 declares readsOwnerSecrets": the gateway withholds it), and
 `test/console-mounts.ts` keeps `mcp.ts` the only plugin file that names
 `ownerSecret` and `mcp` the only plugin that declares `readsOwnerSecrets`. One
-plugin reaches the sealed store without the flag: `state`, which holds the store
-and its key because it is the store's own surface, and whose tools read only
-`kept:`; the same test keeps `state.ts` the only plugin file that imports it.
+plugin can decrypt the sealed store without the flag: `state`, which holds the
+store and its key because it is the store's own surface, and whose tools read
+only `kept:`. `builtin` holds the raw store too, without the key, so it could
+list, overwrite or delete an owner's secrets but not read a value. The same test
+is a tripwire over the plugin list as `cf/src/runtime.ts` writes it: another
+entry naming the key, the runtime's secret resolver (`this.#secrets`) or
+`this.store`, an entry handed the whole runtime, or a second change to the list
+(including a non-empty initial list or a different list kept as the runtime's)
+turns it red. A key or store bound to another name
+first is not seen, and a plugin built elsewhere (the `extraPlugins` entries
+arrive already built) is outside it: what such a plugin can reach was decided
+where it was constructed.
 
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.
