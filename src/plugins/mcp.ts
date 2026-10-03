@@ -87,11 +87,11 @@ export function mcpConfigProblem(config: Record<string, unknown>): string | unde
 const noRedirectFetch: McpFetch = async (input, init) => {
   const fetch = globalThis.fetch;
   const res = await fetch(input, { ...init, redirect: "manual" });
-  // Status 0 is a redirect as a browser-shaped fetch reports one under "manual".
-  if ((res.status >= 300 && res.status < 400) || res.status === 0) {
+  if (res.status >= 300 && res.status < 400) {
     await res.body?.cancel().catch(() => {});
+    // Whole, not cut: the caller's `failure` masks kept secrets in this text, and a cut through one would leave its head unmasked.
     const to = res.headers.get("location");
-    throw new Error(`the server answered ${res.status} redirect${to ? ` to ${to.slice(0, 200)}` : ""}; redirects are not followed — set url to the address it moved to`);
+    throw new Error(`the server answered ${res.status} redirect${to ? ` to ${to}` : ""}; redirects are not followed — set url to the address it moved to`);
   }
   return res;
 };

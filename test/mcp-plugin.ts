@@ -189,12 +189,20 @@ await check("an inward host is refused when the mount is written and again when 
   for (const u of ["https://169.254.169.254/mcp", "https://10.1.2.3/mcp", "https://172.20.0.1/mcp", "https://192.168.0.9/mcp",
     "https://127.0.0.1/mcp", "https://2130706433/mcp", "https://0x7f.1/mcp", "https://100.64.0.1/mcp", "https://0.0.0.0/mcp",
     "https://localhost/mcp", "https://a.localhost/mcp", "https://internal/mcp", "https://local/mcp", "https://metadata/mcp", "https://svc.internal/mcp", "https://printer.local/mcp",
-    "https://[::1]/mcp", "https://[fd00::1]/mcp", "https://[fe80::1]/mcp", "https://[::ffff:10.0.0.1]/mcp", "https://[::ffff:169.254.169.254]/mcp"]) {
+    "https://[::1]/mcp", "https://[fd00::1]/mcp", "https://[fe80::1]/mcp", "https://[::ffff:10.0.0.1]/mcp", "https://[::ffff:169.254.169.254]/mcp",
+    // A trailing dot names the same host; one or several.
+    "https://localhost./mcp", "https://metadata./mcp", "https://foo.internal./mcp", "https://metadata../mcp",
+    "https://[::]/mcp", "https://[::10.0.0.1]/mcp", "https://[::ffff:0:10.0.0.1]/mcp", "https://[64:ff9b::a9fe:a9fe]/mcp",
+    "https://[64:ff9b:1::1]/mcp", "https://[2002:a9fe:a9fe::]/mcp", "https://[fec0::1]/mcp", "https://[ff02::1]/mcp",
+    "https://nas.home.arpa/mcp", "https://198.18.0.1/mcp", "https://240.0.0.1/mcp", "https://224.0.0.1/mcp",
+    // Names that spell an inward address, for services that resolve them back to it.
+    "https://10.0.0.1.nip.io/mcp", "https://169.254.169.254.nip.io/mcp", "https://10-0-0-1.sslip.io/mcp"]) {
     must(/public host/.test(serverUrlProblem(u) ?? ""), `${u} was not refused as inward: ${serverUrlProblem(u)}`);
     must(mcpConfigProblem({ url: u }) !== undefined, `${u} passed the mount-time check`);
   }
   // Public hosts whose names merely start like a private range are not swept up.
-  for (const u of ["https://fcbarcelona.example/mcp", "https://fd.example/mcp", "https://10x.example/mcp", "https://[2606:4700::1]/mcp", "https://[::ffff:8.8.8.8]/mcp"]) {
+  for (const u of ["https://fcbarcelona.example/mcp", "https://fd.example/mcp", "https://10x.example/mcp", "https://[2606:4700::1]/mcp", "https://[::ffff:8.8.8.8]/mcp",
+    "https://[64:ff9b::808:808]/mcp", "https://[2002:808:808::]/mcp", "https://8.8.8.8.nip.io/mcp", "https://a-1-2-3.example/mcp"]) {
     must(serverUrlProblem(u) === null, `${u} was refused: ${serverUrlProblem(u)}`);
   }
   must(mcpConfigProblem({ url: URL_ }) === undefined, "a public https url failed the mount-time check");
@@ -213,7 +221,8 @@ await check("a redirect is refused, not followed: the mount's headers never reac
   const asked: Array<{ url: string; redirect: unknown; auth: string | null }> = [];
   globalThis.fetch = (async (input: unknown, init: RequestInit = {}) => {
     asked.push({ url: String(input), redirect: init.redirect, auth: new Headers(init.headers).get("authorization") });
-    return new Response(null, { status: 307, headers: { location: "https://169.254.169.254/latest/meta-data/" } });
+    // The secret sits past the 200th character, where a cut before masking would leave its head showing.
+    return new Response(null, { status: 307, headers: { location: `https://169.254.169.254/latest/meta-data/?${"p".repeat(150)}=sk-very-secret` } });
   }) as typeof fetch;
   try {
     const { gw } = await fixture({ url: URL_, headers: ["Authorization: Bearer {{tok}}"] }, { tok: "sk-very-secret" });
@@ -222,7 +231,7 @@ await check("a redirect is refused, not followed: the mount's headers never reac
     must(/307 redirect to https:\/\/169\.254\.169\.254/.test(said), `the refusal does not say where it pointed: ${said}`);
     must(asked.length > 0 && asked.every((a) => a.url === URL_), `a request went somewhere else: ${JSON.stringify(asked.map((a) => a.url))}`);
     must(asked.every((a) => a.redirect === "manual"), `a request was sent with redirect ${JSON.stringify(asked.map((a) => a.redirect))}`);
-    must(!said.includes("sk-very-secret"), "the secret came back in the refusal");
+    must(!said.includes("sk-very"), `the secret, or its head, came back in the refusal: ${said}`);
   } finally { globalThis.fetch = realFetch; }
 });
 

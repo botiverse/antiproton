@@ -40,33 +40,73 @@ export interface HttpConfig {
 
 /**
  * Whether `hostname`, as `URL` writes it, names somewhere inward by
- * construction: loopback, link-local, private or shared address space, or a
- * name reserved for a local network, or a name with no dot at all. The cloud metadata address
- * (169.254.169.254) is the one most worth refusing. `URL` has already turned
- * every IPv4 spelling (`0x7f.1`, `2130706433`) into dotted decimal, so only
- * that form is read. A public name that resolves inward is not seen here;
- * nothing before the request can see that.
+ * construction: a name with no dot, a name under a suffix reserved for a local
+ * network, or an address in a range that is not the public internet — v4, or
+ * v4 carried inside v6. The cloud metadata address (169.254.169.254) is the one
+ * most worth refusing. `URL` has already turned every IPv4 spelling (hex, or
+ * one 32-bit number) into dotted decimal, so only that form is read.
+ *
+ * A public name that resolves inward is not seen here; nothing before the
+ * request can see that. The one case refused anyway is a name that spells an
+ * inward address in its labels (10.0.0.1.nip.io, 10-0-0-1.sslip.io), since
+ * services exist whose whole purpose is to resolve those back to the address.
  */
 export function internalHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/\.$/, "");
+  const h = hostname.toLowerCase().replace(/\.+$/, "");
+  if (h.startsWith("[")) return internalV6(h.slice(1, -1));
   // A name with no dot is only ever found through a local search domain
   // (`localhost`, `internal`, `metadata`); no public server is reached that way.
-  if (!h.startsWith("[") && !h.includes(".")) return true;
-  if (/\.(localhost|local|internal)$/.test(h)) return true;
-  if (h.startsWith("[")) {
-    const v6 = h.slice(1, -1);
-    if (v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6)) return true;
-    // An IPv4 address carried in IPv6 (`::ffff:a00:1` is 10.0.0.1): judged as that address.
-    const mapped = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(v6);
-    if (!mapped) return false;
-    const hi = parseInt(mapped[1]!, 16), lo = parseInt(mapped[2]!, 16);
-    return internalHost(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
-  }
+  if (!h.includes(".")) return true;
+  if (/\.(localhost|local|internal|home\.arpa)$/.test(h)) return true;
   const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
-  if (!v4) return false;
-  const [a, b] = [Number(v4[1]), Number(v4[2])];
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  if (v4) return internalV4(v4.slice(1, 5).map(Number));
+  for (const m of h.matchAll(/(?:^|[.-])(\d{1,3})[.-](\d{1,3})[.-](\d{1,3})[.-](\d{1,3})(?=[.-]|$)/g)) {
+    const quad = m.slice(1, 5).map(Number);
+    if (quad.every((n) => n <= 255) && internalV4(quad)) return true;
+  }
+  return false;
+}
+
+/** Not the public internet: this-network, private, shared, loopback, link-local, benchmarking, multicast, reserved. */
+function internalV4([a, b]: number[]): boolean {
+  return a === 0 || a === 10 || a === 127 || a! >= 224 || (a === 169 && b === 254) || (a === 172 && b! >= 16 && b! <= 31) ||
+    (a === 192 && b === 168) || (a === 100 && b! >= 64 && b! <= 127) || (a === 198 && (b === 18 || b === 19));
+}
+
+/** The eight 16-bit groups of an IPv6 address as `URL` writes it (no embedded dotted quad), or null. */
+function groupsOf(v6: string): number[] | null {
+  const halves = v6.split("::");
+  if (halves.length > 2) return null;
+  const part = (s: string) => (s ? s.split(":").map((g) => parseInt(g, 16)) : []);
+  const head = part(halves[0]!), tail = halves.length === 2 ? part(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0 || (halves.length === 1 && fill !== 0) || [...head, ...tail].some((g) => !(g >= 0 && g <= 0xffff))) return null;
+  return [...head, ...Array(fill).fill(0), ...tail];
+}
+
+/**
+ * Loopback, unspecified, unique-local, link- and site-local, multicast, and
+ * every form that carries a v4 address — compatible (::/96), mapped
+ * (::ffff:0:0/96), translated (::ffff:0:0:0/96), NAT64 (64:ff9b::/96), 6to4
+ * (2002::/16) — judged by the v4 it carries. 64:ff9b:1::/48 is local-use NAT64
+ * with no fixed place for the v4, so the whole prefix is refused. Unparseable
+ * is refused: `URL` only hands over what it parsed.
+ */
+function internalV6(v6: string): boolean {
+  const g = groupsOf(v6);
+  if (!g) return true;
+  const v4 = (hi: number, lo: number) => internalV4([hi >> 8, hi & 255, lo >> 8, lo & 255]);
+  const zeros = (from: number, to: number) => g.slice(from, to).every((x) => x === 0);
+  if (g[0]! >= 0xfc00 && g[0]! <= 0xfdff) return true;
+  if (g[0]! >= 0xfe80 && g[0]! <= 0xffff) return true; // link-local, site-local, multicast
+  // :: and ::1 included: they read as 0.0.0.0 and 0.0.0.1, both in this-network.
+  if (zeros(0, 6)) return v4(g[6]!, g[7]!);
+  if (zeros(0, 5) && g[5] === 0xffff) return v4(g[6]!, g[7]!);
+  if (zeros(0, 4) && g[4] === 0xffff && g[5] === 0) return v4(g[6]!, g[7]!);
+  if (g[0] === 0x64 && g[1] === 0xff9b && zeros(2, 6)) return v4(g[6]!, g[7]!);
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return true;
+  if (g[0] === 0x2002) return v4(g[1]!, g[2]!);
+  return false;
 }
 
 /**
