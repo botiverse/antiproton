@@ -1074,14 +1074,14 @@ export function closestNames(typed: string, names: string[], limit = 10): string
  *
  * This is for the case where something the runner owns must not be the
  * agent's to call. The one instance so far: a benchmark whose grader runs
- * *after* the agent in the same container. `node.release` says it destroys
+ * *after* the agent in the same container. `sandbox.release` says it destroys
  * the box and stops the meter, so an agent tidying up calls it — rightly, in
  * production — and the grader then scores a fresh box from the base image:
  * no diff, every test still failing, a zero that looks exactly like the model
  * being wrong. Withholding the tool is the fix; the runner releases instead.
  *
  * Applied before the names are qualified, so the address is the mount's own
- * (`node.release`), not whatever the provider-safe name became.
+ * (`sandbox.release`), not whatever the provider-safe name became.
  */
 export function withholdTools<T extends { address: string }>(
   tools: T[],
@@ -1089,4 +1089,26 @@ export function withholdTools<T extends { address: string }>(
 ): T[] {
   const held = new Set(addresses);
   return tools.filter((t) => !held.has(t.address));
+}
+
+/**
+ * The refusal for a call to a withheld address, or null when it is not one.
+ *
+ * Leaving a tool out of the list is not enough on its own: run_js hands a
+ * dotted address (`sandbox.release`) to the host without looking it up in the
+ * list, so a program could still call what the model was never offered. The
+ * host asks this before dispatching, for the model's calls and a program's
+ * alike.
+ */
+export function refuseWithheld(
+  address: string, withheld: ReadonlySet<string>,
+): { status: "rejected"; error: { code: string; message: string } } | null {
+  if (!withheld.has(address)) return null;
+  return {
+    status: "rejected",
+    error: {
+      code: "withheld",
+      message: `${address} is not yours to call here: whoever started this task owns that, and does it after you finish`,
+    },
+  };
 }

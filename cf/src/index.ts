@@ -37,6 +37,7 @@ import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
   AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
+import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
@@ -45,6 +46,7 @@ import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
 import { pluginEnabled, toolsOf, type Plugin } from "../../src/plugins/types.ts";
+import { SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { skippedToolNotes } from "../../src/runtime/mount-tools.ts";
 
 /** What the plugins page is handed about each mount; declared and checked in cf/src/mount-reports.ts. */
@@ -875,10 +877,11 @@ export class AgentDO extends DurableObject<Env> {
       // offer it, so the object arm does too — same rule, opposite answer.
       sandbox: swe,
       // The grader runs after the agent, in the agent's container. So the
-      // agent is never offered the tool that destroys it, and a settled run
+      // agent is never offered the tools that hand it back (BENCH_SWE_WITHHELD,
+      // bench/swebench/withheld.ts), and a settled run
       // does not hand the machine back on its own: the runner does, after
       // grading, through benchSweRelease — and owns the bill if it forgets.
-      withholdTools: swe ? ["node.release"] : undefined,
+      withholdTools: swe ? BENCH_SWE_WITHHELD : undefined,
       autoRelease: !swe,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
@@ -943,7 +946,7 @@ export class AgentDO extends DurableObject<Env> {
       // The machine, from the instance's own image. Config is per mount, so a
       // different repository is a different mount record, not different code.
       await rt.store.addMount({
-        tenantId: "bench", agentId, alias: "sandbox", plugin: "sandbox",
+        tenantId: "bench", agentId, alias: SANDBOX_ALIAS, plugin: "sandbox",
         installationId: "inst-node", connectionId: null,
         toolVersion: rt.pluginVersion("sandbox") ?? "1.0.0",
         publicConfig: {
@@ -973,7 +976,19 @@ export class AgentDO extends DurableObject<Env> {
       const rt = this.#activeRuntime();
       await rt.ready();
       return rt.gateway().invoke(
-        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, "node.shell", { command });
+        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, `${SANDBOX_ALIAS}.shell`, { command });
+    });
+  }
+
+  /** One look at a grading command the sandbox handed to the background (bench/swebench/grade.ts
+   *  `settleShell`): the runner polls this rather than the object waiting, so the object is not held awake
+   *  for as long as a test suite runs. */
+  async benchSweJob(taskId: string, alias: string, handle: unknown) {
+    return this.#busy("benchSweJob", async () => {
+      const rt = this.#activeRuntime();
+      await rt.ready();
+      return rt.gateway().pollBackground(
+        { tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" }, alias, handle as Json);
     });
   }
 
@@ -1020,7 +1035,7 @@ export class AgentDO extends DurableObject<Env> {
       e.type === "message" && e.message?.role === "toolResult").length;
     const toolErrors = entries.filter((e: any) =>
       e.type === "message" && e.message?.role === "toolResult" && e.message.isError).length;
-    const meter = await readMeter(rt.store as any, "bench", agentId, ["sandbox"], wallMs, {
+    const meter = await readMeter(rt.store as any, "bench", agentId, [SANDBOX_ALIAS], wallMs, {
       promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
     });
     return { taskId, usage, byTool, modelTurns, toolTurns, toolErrors, entries: entries.length, meter };
@@ -3568,6 +3583,12 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSweShell(String(b.taskId), String(b.command)));
+        }
+        case "/bench/swe/job": {
+          const g = await guardSpending(request, env);
+          if (g) return g;
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSweJob(String(b.taskId), String(b.alias), b.handle));
         }
         case "/bench/swe/release": {
           const g = await guardSpending(request, env);

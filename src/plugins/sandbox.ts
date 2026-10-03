@@ -234,6 +234,16 @@ interface MountState {
   envs?: Env[];
 }
 
+/**
+ * The alias every agent's container is mounted under: the catalogue's seed
+ * (cf/src/runtime.ts `AgentRuntime.DEFAULT_MOUNTS`) and both SWE-bench runners (cf/src/index.ts
+ * `benchSweStart`, bench/swebench/run.ts). A runner that addresses the box
+ * itself (its grader's shell, the release it withholds from the agent) builds
+ * the address from this, so a rename moves every caller at once instead of
+ * leaving one answering `no mount named ...`.
+ */
+export const SANDBOX_ALIAS = "sandbox";
+
 /** The machine a call uses when it names none: what the mount's one box always was. */
 export const MAIN_MACHINE = "main";
 

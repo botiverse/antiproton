@@ -9,9 +9,10 @@
  * credentials, so an agent editing a repo there cannot reach the gateway, the
  * tenant's tokens, or anything else we hold.
  *
- * Scoring is SWE-bench's own: apply the official test patch, run the tests that
- * were failing, and require the ones that were passing to still pass. The
- * agent's own claim that it fixed something is not evidence.
+ * Scoring is SWE-bench's own (grade.ts): apply the official test patch, run the
+ * repository's own test command, and require every test that was failing to pass
+ * and every one that was passing to still pass. The agent's own claim that it
+ * fixed something is not evidence.
  *
  * What is different since the loop was replaced: there is no kernel to step and
  * no command executor. The object-side runtime is `PiAgent`, driven exactly as
@@ -32,13 +33,15 @@ import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
 import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { systemPrompt } from "../../src/runtime/pi-prompt.ts";
-import { runJsTool, bridgeTools, type MountedTool } from "../../src/runtime/pi-tools.ts";
+import { runJsTool, bridgeTools, refuseWithheld, type MountedTool } from "../../src/runtime/pi-tools.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
-import { sandboxPlugin } from "../../src/plugins/sandbox.ts";
+import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import type { Plugin } from "../../src/plugins/types.ts";
 import { isExclusive } from "../../src/plugins/types.ts";
 import type { ToolResult } from "../../src/core/tools.ts";
 import { readMeter, ratesFromEnv, meterLine } from "../meter.ts";
+import { gradeCommand, gradeFromLog, readGradeLog, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
+import { BENCH_SWE_WITHHELD } from "./withheld.ts";
 import { BACKGROUND_CONTEXT as CTX } from "@earendil-works/pi-agent-core/harness/context";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
@@ -53,10 +56,8 @@ const OFFSET = Number(process.env.OFFSET ?? 0);
 const BUDGET_MS = Number(process.env.BUDGET_MS ?? 900_000);
 const MODEL_ID = process.env.HARNESS_MODEL ?? "deepseek-v4-pro";
 
-interface Instance {
-  instance_id: string; repo: string; base_commit: string;
-  problem_statement: string; patch: string; test_patch: string;
-  FAIL_TO_PASS: string; PASS_TO_PASS: string;
+interface Instance extends GradedInstance {
+  problem_statement: string; patch: string;
 }
 
 const res = await fetch(
@@ -91,7 +92,7 @@ const model = new OpenAiCompatibleModel({
 
 const POLICY = `
 You are fixing a bug in a Python repository checked out at /testbed.
-Use node.shell to explore and edit it — that is a real machine with git, python and the test suite.
+Use the ${SANDBOX_ALIAS} mount's shell tool to explore and edit it — that is a real machine with git, python and the test suite.
 Work in small steps: read the failing code first, then make the smallest change that fixes it.
 Do not modify test files; the graders supply their own.
 When the fix is in place, say so and stop.
@@ -147,9 +148,9 @@ async function runOne(inst: Instance) {
   await store.init();
   await store.createAgent(T, AGENT);
 
-  const plugins: Plugin[] = [sandboxPlugin(null, "local"), builtinToolsPlugin(store, () => plugins)];
+  const plugins: Plugin[] = [sandboxPlugin(null, "local"), builtinToolsPlugin(store, () => plugins, BENCH_SWE_WITHHELD)];
   await store.addMount({
-    tenantId: T, agentId: AGENT, alias: "sandbox", plugin: "sandbox",
+    tenantId: T, agentId: AGENT, alias: SANDBOX_ALIAS, plugin: "sandbox",
     installationId: "i-node", connectionId: null, toolVersion: "1.0.0",
     publicConfig: {
       image: imageFor(inst.instance_id), workdir: "/testbed", shape: "2c4g", timeoutMs: 300_000,
@@ -177,25 +178,22 @@ async function runOne(inst: Instance) {
     },
   });
   const ctx = { tenantId: T, agentId: AGENT, taskId: "main" };
-  const host = { invoke: (c: any): Promise<ToolResult> => gw.invoke(ctx, c.tool, c.args, c.opts) };
+  // Refused at dispatch as well as left out of the list: run_js hands a dotted address straight here.
+  const withheld = new Set(BENCH_SWE_WITHHELD);
+  const host = {
+    invoke: async (c: any): Promise<ToolResult> => refuseWithheld(c.tool, withheld) ?? gw.invoke(ctx, c.tool, c.args, c.opts),
+  };
 
   // The catalogue, built the way the deployment builds it, so the benchmark
   // measures the code that runs rather than a second wiring of its own.
   const mounted = await store.listMounts(T, AGENT);
   const byId = new Map(plugins.map((pl) => [pl.id, pl]));
   /**
-   * The catalogue, minus the one tool that can destroy the evidence.
-   *
-   * `run9.release` says it destroys the container and stops the meter, so an
-   * agent tidying up at the end of a task calls it — and it is right to, in
-   * production. Here the grader runs *after* the agent, in the same box, so a
-   * released container means grading a fresh one from the base image: no diff,
-   * every test still failing, and a spurious zero that looks exactly like the
-   * model being wrong. It cost one instance before it was noticed.
-   *
-   * The runner owns the container's lifetime, so the agent is not offered it.
+   * The catalogue, minus the tools that hand the container back (withheld.ts): the grader runs *after* the
+   * agent, in the same box, and the runner owns the container's lifetime. Releasing it cost one instance
+   * before it was noticed.
    */
-  const OWNED_BY_THE_RUNNER = new Set(["node.release"]);
+  const OWNED_BY_THE_RUNNER = new Set(BENCH_SWE_WITHHELD);
   const tools: MountedTool[] = mounted.flatMap((m) =>
     (byId.get(m.plugin)?.tools ?? []).map((t) => ({
       name: t.name, description: t.summary, parameters: t.parameters,
@@ -259,27 +257,27 @@ async function runOne(inst: Instance) {
     }
   }
 
-  // Grade with SWE-bench's own criterion, in the same box the agent worked in.
-  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
-  const f2p: string[] = JSON.parse(inst.FAIL_TO_PASS);
-  const p2p: string[] = JSON.parse(inst.PASS_TO_PASS);
-  const grade = async (ids: string[]) => {
-    if (!ids.length) return { ok: true, out: "(none)" };
-    const res: any = await gw.invoke(ctx, "node.shell", {
-      command:
-        `cd /testbed && echo '${b64(inst.test_patch)}' | base64 -d > /tmp/test.patch && ` +
-        `git checkout -- $(git diff --name-only -- '*test*' 2>/dev/null) 2>/dev/null; ` +
-        `git apply -v /tmp/test.patch 2>&1 | tail -2; ` +
-        `python -m pytest -q ${ids.map((i) => `'${i}'`).join(" ")} 2>&1 | tail -12`,
-    });
-    const out = String(res.result?.output ?? "");
-    const tail = out.split("\n").slice(-3).join(" ");
-    return { ok: /\d+ passed/.test(tail) && !/\d+ (failed|error)/.test(tail), out };
+  // Grade with SWE-bench's own criterion, in the same box the agent worked in (grade.ts): every
+  // FAIL_TO_PASS and PASS_TO_PASS test, from one run of the repository's own test command. A command that
+  // outlives the sandbox's grace window comes back `running` and is polled until it ends.
+  const GRADE_DEADLINE_MS = Number(process.env.GRADE_DEADLINE_MS ?? 1_800_000);
+  const shellOut = async (command: string): Promise<string> => {
+    const first = await gw.invoke(ctx, `${SANDBOX_ALIAS}.shell`, { command }) as ShellAnswer;
+    const r = await settleShell(first, (bg) => gw.pollBackground(ctx, bg.alias, bg.handle as any),
+      { deadlineAt: Date.now() + GRADE_DEADLINE_MS });
+    if (r.status !== "succeeded") throw new Error(`grading command ${r.status}: ${r.error?.message ?? JSON.stringify(r.error ?? null)}`);
+    return String(r.result?.output ?? "");
   };
-  const diffRes: any = await gw.invoke(ctx, "node.shell",
-    { command: "cd /testbed && git diff --stat | tail -3" });
-  const fail = await grade(f2p.slice(0, 12));
-  const pass = await grade(p2p.slice(0, 12));
+  const diff = (await shellOut("cd /testbed && git diff --stat | tail -3").catch(() => "")).trim().split("\n").pop() ?? "";
+  let report: ReturnType<typeof gradeFromLog> | null = null;
+  let gradeError: string | undefined;
+  try {
+    await shellOut(gradeCommand(inst));
+    report = gradeFromLog(inst, await readGradeLog(shellOut));
+    gradeError = report.error;
+  } catch (e) {
+    gradeError = String((e as Error)?.message ?? e).slice(0, 300);
+  }
   // A box that outlives its run is billed for existing, and this benchmark
   // starts one per instance. Silence here is how thirteen of them were once
   // found alive.
@@ -319,7 +317,7 @@ async function runOne(inst: Instance) {
 
   // Read after release: a session is written into the mount's connection state
   // when the box is handed back, precisely so the meter outlives the box.
-  const meter = await readMeter(store, T, AGENT, ["sandbox"], Date.now() - t0, {
+  const meter = await readMeter(store, T, AGENT, [SANDBOX_ALIAS], Date.now() - t0, {
     promptTokens: usage.prompt, cachedTokens: usage.cached, outputTokens: usage.out,
   });
 
@@ -329,12 +327,17 @@ async function runOne(inst: Instance) {
   await store.close();
 
   return {
-    id: inst.instance_id, resolved: fail.ok && pass.ok,
-    failToPass: fail.ok, passToPass: pass.ok,
-    diff: String(diffRes.result?.output ?? "").trim().split("\n").pop() ?? "",
+    id: inst.instance_id, resolved: report?.resolved === true,
+    failToPass: report ? report.failToPass.failed.length === 0 : false,
+    passToPass: report ? report.passToPass.failed.length === 0 : false,
+    diff,
+    ...(report ? {
+      f2p: { total: report.failToPass.total, passed: report.failToPass.passed, firstFailed: report.failToPass.failed.slice(0, 5) },
+      p2p: { total: report.passToPass.total, passed: report.passToPass.passed, firstFailed: report.passToPass.failed.slice(0, 5) },
+    } : {}),
+    ...(gradeError ? { gradeError } : {}),
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds, modelTurns, toolTurns,
     modelCalls: w.calls, byTool, meter, ...usage,
-    failOut: fail.ok ? "" : fail.out.split("\n").slice(-4).join(" | ").slice(0, 220),
   };
 }
 
@@ -359,7 +362,8 @@ for (const inst of instances) {
     `(${cachePct}% cached)` + (tools ? `  [${tools}]` : "") +
     (r.diff ? `  diff: ${r.diff}` : "") + (r.error ? `  ERROR ${r.error}` : ""));
   if (r.meter) console.log(`      ${meterLine(r.meter, RATES)}`);
-  if (r.failOut) console.log(`      \x1b[31m${r.failOut}\x1b[0m`);
+  if (r.f2p) console.log(`      graded: FAIL_TO_PASS ${r.f2p.passed}/${r.f2p.total}, PASS_TO_PASS ${r.p2p.passed}/${r.p2p.total}`);
+  if (r.gradeError) console.log(`      \x1b[31mnot graded: ${r.gradeError}\x1b[0m`);
 }
 const solved = out.filter((r) => r.resolved).length;
 const totals = out.reduce((a: any, r: any) => {
