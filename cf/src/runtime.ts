@@ -2261,10 +2261,10 @@ export class AgentRuntime {
     });
     // A task that is over (`ended`) keeps its jobs polled — the row records how each one ended, and a job
     // past its ceiling is still asked to stop — but no ending is delivered: a late result must not start a
-    // turn whose next call would provision a machine nobody is watching.
-    const over = this.#deps.ended?.(owner) === true;
+    // turn whose next call would provision a machine nobody is watching. Asked at each delivery, not once
+    // before the pass: the pass awaits the plugin's poll, and the task can end during that await.
     const bg = await pass(async (session, text) => {
-      if (over) return;
+      if (this.#deps.ended?.(owner) === true) return;
       await this.postMessage(tenantId, agentId, text, "prompt", session);
     });
     // pd: one harness runs every conversation of the object, and one step drives it whole

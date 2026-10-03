@@ -560,6 +560,41 @@ await check("runtime: resume is offered without run_js when a mounted plugin can
   host.dispose();
 });
 
+await check("runtime: once the task has ended, a call and the answer to a question already asked are both refused, and the plugin runs neither", async () => {
+  // The runtime's `ended` (cf/src/runtime.ts): a benchmark task the runner has finished. The question was asked
+  // before the end, and the answer comes after it — that answer is a call too, and must not act.
+  const { AgentRuntime } = await import("../cf/src/runtime.ts");
+  const { sqliteHost } = await import("../src/store/sqlite-host.ts");
+  const db: Db = { rows: new Map([["users", [1, 2]]]), ran: [], resumes: [], cancels: [] };
+  const host = sqliteHost();
+  let ended = false;
+  const rt = new AgentRuntime({
+    ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
+    bucket: {} as any, bucketName: "b", loader: {} as any, makeToolBinding: () => ({}),
+    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "k", model: "deepseek-flash" },
+    extraPlugins: [sqlPlugin(db)], sandbox: false, autoRelease: false,
+    ended: (o: { agentId: string }) => ended && o.agentId === "a",
+  } as any);
+  await rt.ready();
+  await rt.store.createAgent("t", "a");
+  await rt.bindOperatorModel("t", "a");
+  await rt.store.setPluginChoice("t", "a", "sql", "enable");
+  await rt.store.addMount({ tenantId: "t", agentId: "a", alias: "db", plugin: "sql", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const tools = await (await rt.agent("t", "a")).tools() as any[];
+  const y = body(await tools.find((t) => t.name === "db__query").execute("c1", { sql: "DELETE FROM users" }));
+  must(y.state === "yielded" && typeof y.token === "string", `the question was not asked, so this case tests nothing: ${JSON.stringify(y)}`);
+  ended = true;
+  const answered = await tools.find((t) => t.name === "resume").execute("r1", { token: y.token, answer: "confirm" }).then(
+    (out: any) => JSON.stringify(out), (e: any) => String(e?.message ?? e));
+  must(/task_ended|has ended/.test(answered), `the answer was not refused as ended: ${answered.slice(0, 300)}`);
+  must(db.resumes.length === 0 && JSON.stringify(db.rows.get("users")) === "[1,2]", `the plugin acted on the answer: ${JSON.stringify(db)}`);
+  const called = await tools.find((t) => t.name === "db__query").execute("c2", { sql: "DELETE FROM users WHERE id = 1" }).then(
+    (out: any) => JSON.stringify(out), (e: any) => String(e?.message ?? e));
+  must(/task_ended|has ended/.test(called) && db.ran.length === 0, `a call after the end ran: ${called.slice(0, 300)} ran=${JSON.stringify(db.ran)}`);
+  host.dispose();
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.ok ? "" : `\n      ${r.error}`}`);
 console.log("  ────────────────────────────────────────────────────────");

@@ -57,7 +57,9 @@ const run9 = {
    *  is in flight. Not awaited because the runner's request is its own event, not part of the call: a cancel
    *  waits for the running turn, and the turn is waiting on this call. */
   onFinishCommand: null as null | (() => void),
-  reset() { this.boxes.clear(); this.execs.clear(); this.ops.length = 0; this.onFinishCommand = null; },
+  /** Run, awaited, inside the next look at an execution: something that lands while the object awaits a poll. */
+  onPoll: null as null | (() => Promise<void>),
+  reset() { this.boxes.clear(); this.execs.clear(); this.ops.length = 0; this.onFinishCommand = null; this.onPoll = null; },
   deletes() { return this.ops.filter((o) => o.method === "DELETE" && /\/boxes\/[^/]+$/.test(o.path)); },
   creates() { return this.ops.filter((o) => o.method === "POST" && /\/workspace\/boxes$/.test(o.path)); },
 };
@@ -95,6 +97,7 @@ globalThis.fetch = (async (input: any, init?: any) => {
   if ((m = /\/workspace\/execs\/([^/]+)$/.exec(path)) && method === "GET") {
     const e = run9.execs.get(m[1]!);
     if (!e) return json({ error: "no such exec" }, 404);
+    if (run9.onPoll) { const f = run9.onPoll; run9.onPoll = null; await f(); }
     clock += STEP_MS;
     if (e.killed) return json({ state: "killed", exit_code: 137, output_summary: "" });
     return clock < e.doneAt ? json({ state: "running" }) : json({ state: "succeeded", exit_code: 0, output_summary: e.output });
@@ -362,7 +365,7 @@ for (const engine of ["pd", "pi085"] as const) {
     o.raw.dispose();
   });
 
-  await check(`${engine}: after finish, a call the agent makes is refused and the runner's grading shell still works`, async () => {
+  await check(`${engine}: after finish, the model's late answer reaches no machine and the runner's grading shell still works`, async () => {
     const { o, taskId, agentId, first, shellName } = await begin("finish");
     await o.D.deliverAnswer("bench", agentId, first.id, calls({ id: "c_ls", name: shellName, arguments: { command: "ls" } }), 5);
     const second = await o.nextJob(agentId);
@@ -411,6 +414,35 @@ for (const engine of ["pd", "pi085"] as const) {
     await o.D.benchSweRelease(taskId);
     await o.passAlarms(5);
     must(run9.boxes.size === 0 && run9.creates().length === 1, `after release: boxes ${show([...run9.boxes.keys()])}, provisioned ${run9.creates().length}`);
+    o.raw.dispose();
+  });
+
+  await check(`${engine}: a task that ends while a job's result is being polled is not woken by that result`, async () => {
+    const { o, taskId, agentId, first, shellName } = await begin("race");
+    // Unkillable, so finish cannot stop it and it is still there to finish afterwards.
+    await o.D.deliverAnswer("bench", agentId, first.id, calls({ id: "c_slow", name: shellName, arguments: { command: "echo SLOW UNKILLABLE && x" } }), 5);
+    const second = await o.nextJob(agentId);
+    await o.D.deliverAnswer("bench", agentId, second.id, say("Waiting."), 5);
+    await o.passAlarms(1);
+    must((await o.D.benchPoll(taskId)).background === 1, "the command is not a background job, so this case tests nothing");
+    o.jobs.length = 0;
+    clock += SLOW_MS + 1_000;
+    // The runner finishes the task while the alarm's background pass is awaiting run9's answer about the job;
+    // the job is held running across the finish (so finish cannot see it end) and then answers done.
+    let finished: Promise<any> | null = null;
+    run9.onPoll = async () => {
+      for (const e of run9.execs.values()) e.doneAt = Infinity;
+      finished = o.D.benchSweFinish(taskId);
+      await finished;
+      for (const e of run9.execs.values()) e.doneAt = 0;
+    };
+    await o.passAlarms(1);
+    must(finished, "finish never landed inside a poll, so this case tests nothing");
+    const fin = await finished as any;
+    must(fin?.stillRunning?.length === 1, `finish should have been unable to stop the job: ${show(fin)}`);
+    must((await o.D.benchPoll(taskId)).background === 0, "the job did not finish in the pass finish landed in, so this case tests nothing");
+    await o.passAlarms(5);
+    must(o.jobs.length === 0, `the job's result started a turn after finish: ${o.jobs.length} model call(s)`);
     o.raw.dispose();
   });
 

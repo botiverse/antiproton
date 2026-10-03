@@ -891,7 +891,11 @@ export class AgentDO extends DurableObject<Env> {
     return this.#benchRuntime;
   }
 
-  /** Whether the runner has finished this bench agent's task (benchSweFinish). */
+  /**
+   * Whether the runner has finished this bench agent's task (benchSweFinish). Keyed by agent, so on a shared
+   * object one task's end never reads as another's; and a task name cannot be started twice (its mounts are
+   * already there), so the row is never cleared for a rerun.
+   */
   #benchEnded(agentId: string): boolean {
     return this.sql.exec("SELECT 1 FROM bench_config WHERE k=?", `ended:${agentId}`).toArray().length > 0;
   }
@@ -938,8 +942,6 @@ export class AgentDO extends DurableObject<Env> {
       const engine = this.#takeBenchEngine(o.engine);
       this.#setBenchConfig("mode", "swe");
       this.#setBenchConfig("policy", o.policy);
-      // A shared object hosts tasks one after another; the previous task's end is not this one's.
-      this.sql.exec("DELETE FROM bench_config WHERE k LIKE 'ended:%'");
       this.#benchRuntime = null;
       this.#takeBenchAgent(agentId);
       const rt = this.#benchRt(o.policy);
