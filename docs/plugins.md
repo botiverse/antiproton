@@ -369,9 +369,13 @@ declares readsOwnerSecrets": the gateway withholds it), and
 plugin can decrypt the sealed store without the flag: `state`, which holds the
 store and its key because it is the store's own surface, and whose tools read
 only `kept:`. `builtin` holds the raw store too, without the key, so it could
-list owner-secret names but not read a value. The same test keeps `statePlugin`
-the only plugin `cf/src/runtime.ts` hands the key, and those two the only ones
-it hands the store.
+list, overwrite or delete an owner's secrets but not read a value. The same test
+is a tripwire over the plugin list as `cf/src/runtime.ts` writes it: another
+entry naming the key or `this.store`, an entry handed the whole runtime, or a
+second change to the list turns it red. A key or store bound to another name
+first is not seen, and a plugin built elsewhere (the `extraPlugins` entries
+arrive already built) is outside it: what such a plugin can reach was decided
+where it was constructed.
 
 **Node runs the source as strip-only TypeScript.** Parameter properties
 (`constructor(readonly x)`) and `enum` are syntax errors there.

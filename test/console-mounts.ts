@@ -94,13 +94,25 @@ async function pluginFilesMatching(re: RegExp): Promise<string[]> {
     .filter((f) => f.endsWith(".ts") && f !== "types.ts" && re.test(readFileSync(new URL(f, pluginsDir), "utf8")))
     .sort();
 }
-/** Each entry of the deployment's plugin list, as written in cf/src/runtime.ts. */
+/**
+ * Each entry of the deployment's plugin list, as written in cf/src/runtime.ts.
+ * A tripwire over that text, not a proof: a key or store bound to a name before
+ * the list and passed by that name is not seen, and a `Plugin` built elsewhere
+ * (`extraPlugins` arrive built) is outside it: its reach was decided where it was
+ * constructed. What it does refuse is a second change to the list and an entry
+ * handed the whole runtime, the two routes that would bypass it in plain sight.
+ */
 async function deployedPluginEntries(): Promise<string[]> {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../cf/src/runtime.ts", import.meta.url), "utf8");
+  const writes = src.match(/\bplugins\s*(\.\s*(push|unshift|splice|fill|copyWithin)\b|\[[^\]]*\]\s*=(?!=))/g) ?? [];
+  must(writes.length === 1, `cf/src/runtime.ts changes the plugin list ${writes.length} times (${show(writes)}); this test reads only the one plugins.push( list`);
   const list = /plugins\.push\(\n([\s\S]*?)\n\s*\);/.exec(src);
   must(list, "cf/src/runtime.ts has no plugins.push( list; this test reads the deployment's plugins from it");
-  return list![1]!.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("//"));
+  const entries = list![1]!.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("//"));
+  const handedRuntime = entries.filter((e) => /\bthis\b(?!\s*\.)/.test(e));
+  must(!handedRuntime.length, `plugins handed the whole runtime, and with it the key and the store: ${show(handedRuntime)}`);
+  return entries;
 }
 
 // Exact lists below, so a pattern that matches nothing fails as surely as a second member.
@@ -120,7 +132,7 @@ await check("only statePlugin is handed the sealing key, only it and builtin the
   const keyed = entries.filter((e) => /kek/i.test(e)).map((e) => e.split("(")[0]);
   must(show(keyed) === show(["statePlugin"]), `plugins handed the sealing key: ${show(keyed)}; only state may, and only under kept: (Plugin.readsOwnerSecrets)`);
   const stores = entries.filter((e) => /this\.store\b/.test(e)).map((e) => e.split("(")[0]);
-  must(show(stores) === show(["statePlugin", "builtinToolsPlugin"]), `plugins handed the raw store: ${show(stores)}; with it, a plugin can list owner-secret names (Plugin.readsOwnerSecrets)`);
+  must(show(stores) === show(["statePlugin", "builtinToolsPlugin"]), `plugins handed the raw store: ${show(stores)}; with it, a plugin can list, overwrite and delete owner secrets (Plugin.readsOwnerSecrets)`);
   const { readFileSync } = await import("node:fs");
   must(!/OWNER_PREFIX/.test(readFileSync(new URL("state.ts", pluginsDir), "utf8")), "state.ts names OWNER_PREFIX; its tools read only kept: (Plugin.readsOwnerSecrets)");
 });

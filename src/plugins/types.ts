@@ -1702,7 +1702,9 @@ export interface Plugin {
    * find: a plugin that never declared it has nothing to misuse. One plugin
    * reaches the sealed store without it: `state` holds the raw store and the key
    * because it is the store's own surface, and its tools only ever read `kept:`
-   * (test/console-mounts.ts keeps it the only plugin cf/src/runtime.ts hands the key).
+   * (test/console-mounts.ts trips if another entry of cf/src/runtime.ts's plugin
+   * list names the key; a key passed under another name, or a plugin built
+   * elsewhere such as an `extraPlugins` entry, is outside what it sees).
    */
   readsOwnerSecrets?: true;
   /** The database each mount of this plugin keeps; see {@link DbSpec}. */
