@@ -199,6 +199,9 @@ export async function readDiagnosis(
     // be seen, beside what else this object has had go wrong.
     traceDrops: rows(sql, "trace_drops", "SELECT at, dropped FROM trace_drops ORDER BY at DESC LIMIT 3")
       .map((r) => ({ at: Number(r.at), dropped: Number(r.dropped) })),
+    // Trace rows a pd commit failed to write (src/runtime/pd-outbox.ts): the commit lands without them.
+    traceErrors: rows(sql, "trace_errors", "SELECT at, message FROM trace_errors ORDER BY at DESC LIMIT 3")
+      .map((r) => ({ at: Number(r.at), message: String(r.message) })),
     // The last ten model jobs, answered ones included. A pending job shows how long it has waited; an
     // answered one shows how long the queue and the model took together (created → answered). The third
     // instant, when the answer was applied to the lane, is the assistant message's `at` in the transcript,

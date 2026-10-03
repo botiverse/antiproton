@@ -201,6 +201,18 @@ await check("model jobs are listed answered or not: a pending one by its wait, a
   host.dispose();
 });
 
+await check("trace rows a pd commit failed to write are listed, newest three first; none without the table", async () => {
+  const { host, store } = await agentObject();
+  const none = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  assert(Array.isArray(none.traceErrors) && none.traceErrors.length === 0, `without the table: ${JSON.stringify(none.traceErrors)}`);
+  // The table src/runtime/pd-outbox.ts writes (`recordTraceError`).
+  host.sql.exec("CREATE TABLE trace_errors (at INTEGER NOT NULL, message TEXT NOT NULL)");
+  for (const at of [10, 40, 20, 30]) host.sql.exec("INSERT INTO trace_errors(at, message) VALUES (?, ?)", at, `failed at ${at}`);
+  const r = await readDiagnosis(host.sql, "demo", "u-a", "t_u-a", deps(store)) as any;
+  assert(JSON.stringify(r.traceErrors) === JSON.stringify([40, 30, 20].map((at) => ({ at, message: `failed at ${at}` }))), `traceErrors: ${JSON.stringify(r.traceErrors)}`);
+  host.dispose();
+});
+
 await check("an agent or conversation the object does not hold is null, and an unclaimed object gains no table", async () => {
   const { host, store } = await agentObject();
   const before = dump(host);

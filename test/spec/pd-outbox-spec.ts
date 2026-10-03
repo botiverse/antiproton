@@ -362,6 +362,74 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await o.agent.close();
   });
 
+  // The agent's model binding moves while a call is out: pi-durable's poll finds the model it names unregistered and
+  // fails the run `no_model` without reading the answer. The call was paid for all the same.
+  const rebound = (o: ReturnType<typeof pdObject>) => DurableAgent.open({
+    host: o.host, ...OWNER, model: { ...MODEL, id: "m2" }, systemPrompt: PROMPT,
+    dispatch: async (id) => { o.dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),
+  });
+  const noModelFailures = (storage: DurableSqlHost) => storage.sql.exec(
+    "SELECT COUNT(*) AS n FROM pd_tasks WHERE json_extract(record, '$.state.outcome.error.detail.reason') = 'no_model'").toArray()[0]!.n;
+
+  add("jobs", "the model changes while the call is out and the answer arrives after the run failed no_model: the job is cancelled, and the late answer is billed once, under the model that answered", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job && job.state === null, `no open job: ${show(pdJobs(storage))}`);
+    check(await o.agent.takeJob(job.id), "the job was not handed out");
+    const moved = rebound(o);
+    for (let i = 0; i < 2; i++) await moved.step();
+    check(Number(noModelFailures(storage)) === 1, `control: the run did not fail no_model (${noModelFailures(storage)} failures)`);
+    check(pdJobs(storage)[0]!.state === "cancelled", `after the no_model failure ${show(pdJobs(storage))}`);
+    check(outboxes(storage).usage.length === 0, `billed before any answer: ${show(usagePairs(storage))}`);
+    check(await moved.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === true, "the late answer was refused");
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer billed ${show(usagePairs(storage))}`);
+    for (let i = 0; i < 2; i++) await moved.step();
+    const again = pdObject(storage);
+    await again.agent.step();
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    check(outboxes(storage).usage.every((r) => r.tenantId === "t" && r.agentId === "a"), `usage owner ${show(outboxes(storage).usage)}`);
+    await moved.close();
+    await again.agent.close();
+  });
+
+  add("jobs", "the model changes after the answer arrived and before a poll read it: the no_model commit cancels the job and bills the answer once, under the model that answered", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    check(outboxes(storage).usage.length === 0, `billed on delivery: ${show(usagePairs(storage))}`);
+    const moved = rebound(o);
+    for (let i = 0; i < 2; i++) await moved.step();
+    check(Number(noModelFailures(storage)) === 1, `control: the run did not fail no_model (${noModelFailures(storage)} failures)`);
+    check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))}`);
+    check(await moved.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === false, "a second delivery was taken");
+    const again = pdObject(storage);
+    await again.agent.step();
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `after a redelivery and a new object: ${show(usagePairs(storage))}`);
+    await moved.close();
+    await again.agent.close();
+  });
+
+  add("trace", "a trace row the commit fails to write: the commit lands and bills, and the error is kept in trace_errors", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    // The outbox refuses every row from here: the trace write throws inside the answer's commit.
+    storage.sql.exec("CREATE TRIGGER refuse_trace BEFORE INSERT ON trace_outbox BEGIN SELECT RAISE(ABORT, 'trace refused for the test'); END");
+    await pdTurn(storage, o.agent, null, [replying(SCRIPT[0]!.reply)]);
+    check(pdJobs(storage)[0]!.state === "consumed", `job ${show(pdJobs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
+    check(outboxes(storage).trace.length === 0, `trace ${show(outboxes(storage).trace)}`);
+    const errors = storage.sql.exec("SELECT at, message FROM trace_errors").toArray();
+    check(errors.length === 1 && String(errors[0]!.message).includes("trace refused for the test") && Number(errors[0]!.at) > 0, `trace_errors ${show(errors)}`);
+    await o.agent.close();
+  });
+
   add("all-or-nothing", "a throw in the commit hook rolls the commit back: pi-durable's state, the job and the outboxes as before; the next object completes the turn and bills once", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");

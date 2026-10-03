@@ -64,7 +64,7 @@ import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { MODEL_CALL_DEADLINE_MS } from "../model/openai-compatible.ts";
 import { logEvent } from "../core/log.ts";
 import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
-import { bookCommit, strandedAnswerRows } from "./pd-outbox.ts";
+import { bookCommit, cancelJob, strandedAnswerRows } from "./pd-outbox.ts";
 import { appendUsage } from "../usage/outbox.ts";
 import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
@@ -521,8 +521,7 @@ export class PdHost {
     const owner = this.#bound();
     const ap = await this.#store();
     this.#opts.storage.transactionSync(() => {
-      const [row] = ap.query("UPDATE model_jobs SET state = 'cancelled' WHERE id = ? AND state IS NULL RETURNING answer", id);
-      if (row && typeof row.answer === "string") appendUsage(this.#opts.storage.sql as never, strandedAnswerRows(owner, this.#now(), row.answer));
+      appendUsage(this.#opts.storage.sql as never, cancelJob(ap, id, { tenantId: owner.tenantId, agentId: owner.agentId }, this.#now()));
     });
   }
 

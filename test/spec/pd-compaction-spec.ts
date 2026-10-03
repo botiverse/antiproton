@@ -233,6 +233,30 @@ export function pdCompactionCases(withHost: WithDriveHost): DriveCase[] {
     await o.agent.close();
   });
 
+  add("no_model", "the model changes after the summary's answer arrived and before its poll read it: the compaction fails no_model, the job is cancelled, and the answer is billed once and never placed", async (storage) => {
+    const o = pdObject(storage, MANUAL);
+    await longConversation(storage, o.agent);
+    const before = usagePairs(storage);
+    await o.agent.compact();
+    await o.agent.step();
+    const job = open(storage).find(isSummary);
+    check(job, `no summary job; tasks ${show(compactionTasks(storage))}`);
+    await answer(o.agent, job.id, reply("## Goal\nunread", 300, 40));
+    check(show(usagePairs(storage)) === show(before), `billed on delivery: ${show(usagePairs(storage))}`);
+    // The agent's binding moves: the summary's poll names a model no longer registered.
+    const moved = DurableAgent.open({
+      host: o.host, ...OWNER, model: { ...MODEL, id: "m2" }, systemPrompt: PROMPT,
+      dispatch: async (id) => { o.dispatched.push(id); }, unknownJob: (id) => new UnknownJob(id),
+    });
+    for (let i = 0; i < 2; i++) await moved.step();
+    const failed = compactionTasks(storage).filter((t) => t.outcome?.error?.detail?.reason === "no_model");
+    check(failed.length === 1, `control: the compaction did not fail no_model: ${show(compactionTasks(storage))}`);
+    check(jobs(storage).find((j) => j.id === job.id)?.state === "cancelled", `job ${show(jobs(storage).find((j) => j.id === job.id))}`);
+    check(show(usagePairs(storage)) === show([...before, ...SUMMARY_USAGE]), `billed ${show(usagePairs(storage))}`);
+    check(!(await moved.branch()).some((e) => e.type === "compaction"), "the unread summary was placed");
+    await moved.close();
+  });
+
   add("crash", "a new object while the summary is out: it resumes the poll, places the summary once and bills it once, with the one job dispatched once", async (storage) => {
     const first = pdObject(storage, MANUAL);
     await longConversation(storage, first.agent);
