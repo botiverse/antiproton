@@ -38,8 +38,33 @@ export interface HttpConfig {
   timeoutMs?: number;
 }
 
-const PRIVATE_HOST =
-  /^(localhost|.*\.local|.*\.internal|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?|\[?f[cd])/i;
+/**
+ * Whether `hostname`, as `URL` writes it, names somewhere inward by
+ * construction: loopback, link-local, private or shared address space, or a
+ * name reserved for a local network. The cloud metadata address
+ * (169.254.169.254) is the one most worth refusing. `URL` has already turned
+ * every IPv4 spelling (`0x7f.1`, `2130706433`) into dotted decimal, so only
+ * that form is read. A public name that resolves inward is not seen here;
+ * nothing before the request can see that.
+ */
+export function internalHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.$/, "");
+  if (h === "localhost" || /\.(localhost|local|internal)$/.test(h)) return true;
+  if (h.startsWith("[")) {
+    const v6 = h.slice(1, -1);
+    if (v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6)) return true;
+    // An IPv4 address carried in IPv6 (`::ffff:a00:1` is 10.0.0.1): judged as that address.
+    const mapped = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(v6);
+    if (!mapped) return false;
+    const hi = parseInt(mapped[1]!, 16), lo = parseInt(mapped[2]!, 16);
+    return internalHost(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+}
 
 /**
  * The response headers, minus the ones that are a credential in disguise.
@@ -72,7 +97,7 @@ export function checkUrl(
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return { ok: false, why: `refused scheme ${url.protocol}` };
   }
-  if (PRIVATE_HOST.test(url.hostname)) {
+  if (internalHost(url.hostname)) {
     return { ok: false, why: `refused internal host ${url.hostname}` };
   }
   if (allowed && !allowed.includes(url.hostname)) {

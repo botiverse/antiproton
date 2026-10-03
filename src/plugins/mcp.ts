@@ -13,7 +13,8 @@
  * file's import resolves `stdio.js` and `cross-spawn` at module level; what
  * keeps them out of the Worker is the bundler dropping the unreferenced
  * `StdioTransport`, not the import list. This file imports exactly `McpClient`,
- * `StreamableHttpTransport` and `toLlmContent`, and `test/mcp-plugin.ts` checks
+ * `StreamableHttpTransport` and `toLlmContent` (and the type `McpFetch`, which
+ * leaves nothing in the bundle), and `test/mcp-plugin.ts` checks
  * both the list and that the bundle carries no `child_process`. No OAuth: a server
  * that needs a key gets it from a header whose value names a secret the agent
  * kept (`{{name}}`), filled in server-side on every request.
@@ -30,9 +31,10 @@
  * tool destructive, gets a write — which a mount's policy can hold for a person.
  */
 import { McpClient, StreamableHttpTransport, toLlmContent } from "@earendil-works/pi-mcp";
+import type { McpFetch } from "@earendil-works/pi-mcp";
 import type { Json, MountRecord } from "../core/types.ts";
 import { headerLines, type ListedTools, type Plugin, type PluginContext, type ToolSchema } from "./types.ts";
-import { fillSecrets, hideSecrets } from "./http.ts";
+import { fillSecrets, hideSecrets, internalHost } from "./http.ts";
 
 const VERSION = "1.0.0";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -44,17 +46,55 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  */
 const MAX_TIMEOUT_MS = 60_000;
 
-/** Why `value` is not a server URL this plugin will call, or null. https, or http to this machine; a path is allowed. */
+/**
+ * Why `value` is not a server URL this plugin will call, or null: https to a
+ * public host, a path allowed. Asked on every connection, so a stored value
+ * that predates this rule is refused too; `mcpConfigProblem` is the same rule
+ * for the moment a mount is written.
+ *
+ * Not http even to localhost: a mount is written by whoever may add one, and
+ * on a host that runs beside other services, loopback is those services.
+ */
 export function serverUrlProblem(value: unknown): string | null {
   if (typeof value !== "string" || !value) return "url is required: the server's Streamable HTTP endpoint, such as https://mcp.example.com/mcp";
   let url: URL;
   try { url = new URL(value); } catch { return `url is not an absolute URL: ${value.slice(0, 80)}`; }
-  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return "url must be https (http only for localhost)";
+  if (url.protocol !== "https:") return "url must be https";
+  if (internalHost(url.hostname)) return `url must be a public host, not ${url.hostname}`;
   if (url.username || url.password) return "url must not carry a user name or password; put a key in a header with {{name}}";
   if (url.hash) return "url must not have a fragment";
   return null;
 }
+
+/**
+ * Why a mount's settings are not ones this plugin will call with, or
+ * undefined. The url rule above; the header and timeout rules are already the
+ * fields' own (`format`, `min`/`max`).
+ */
+export function mcpConfigProblem(config: Record<string, unknown>): string | undefined {
+  return serverUrlProblem(config.url) ?? undefined;
+}
+
+/**
+ * fetch for pi-mcp's transport, refusing every redirect instead of following
+ * it. The url was checked; where a redirect leads was not, and a public server
+ * answering 307 to 169.254.169.254 would otherwise be followed there, carrying
+ * the mount's headers. A server that has moved is reported with where to, so
+ * the mount can be pointed there and checked like any other url.
+ * `globalThis.fetch` is read per request and called without a receiver
+ * (Workers refuse a platform fetch called on another object).
+ */
+const noRedirectFetch: McpFetch = async (input, init) => {
+  const fetch = globalThis.fetch;
+  const res = await fetch(input, { ...init, redirect: "manual" });
+  // Status 0 is a redirect as a browser-shaped fetch reports one under "manual".
+  if ((res.status >= 300 && res.status < 400) || res.status === 0) {
+    await res.body?.cancel().catch(() => {});
+    const to = res.headers.get("location");
+    throw new Error(`the server answered ${res.status} redirect${to ? ` to ${to.slice(0, 200)}` : ""}; redirects are not followed — set url to the address it moved to`);
+  }
+  return res;
+};
 
 /** The tool as the gateway knows it. Remote annotations may only make it more conservative. */
 export function toolSchemaOf(t: {
@@ -95,7 +135,7 @@ async function connect(ctx: PluginContext, kept: Map<string, string>): Promise<M
   const client = new McpClient({ name: "antiproton", version: VERSION, requestTimeoutMs: timeoutMs });
   try {
     // No GET stream: nothing here listens between calls, and the connection is closed after one.
-    await client.connect(new StreamableHttpTransport({ url: String(cfg.url), headers, openGetStream: false }));
+    await client.connect(new StreamableHttpTransport({ url: String(cfg.url), headers, openGetStream: false, fetch: noRedirectFetch }));
   } catch (e) {
     await client.close().catch(() => {});
     throw e;
@@ -121,7 +161,7 @@ export const mcpPlugin: Plugin = {
   tools: [],
   config: [
     { name: "url", type: "string", required: true,
-      summary: "The server's Streamable HTTP endpoint, such as https://mcp.example.com/mcp. https only (http only for localhost)." },
+      summary: "The server's Streamable HTTP endpoint, such as https://mcp.example.com/mcp. https to a public host only." },
     { name: "headers", type: "string[]", format: "header-lines",
       summary: "Sent with every request, one \"Name: value\" per line. A value may contain {{name}}, filled in on each request from a secret the agent kept under that name; the value is never written here." },
     { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1, max: MAX_TIMEOUT_MS,
