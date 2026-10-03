@@ -55,6 +55,11 @@ export interface StallEvidence {
    * confidence out of no data at all.
    */
   last: { message: number; response: number; failed: number } | null;
+  /**
+   * Background jobs still running, as the endpoint gave them; absent when it gave none (a deployment older
+   * than the field). An idle agent with a job out has not finished: the job's result wakes it again.
+   */
+  background?: number;
   tail: Array<{ seq: number; kind: string }>;
 }
 
@@ -65,6 +70,7 @@ export function stallEvidence(poll: Poll | null, seenSeq: number): StallEvidence
     seen: seenSeq,
     answer: known ? !!poll!.answer : false,
     last: known && poll!.last ? { ...poll!.last } : null,
+    ...(known && typeof poll!.background === "number" ? { background: poll!.background } : {}),
     tail: (known ? poll!.tail : undefined) ?? [],
   };
 }
@@ -80,6 +86,10 @@ export function verdictFromEvidence(ev: StallEvidence): { kind: "answer" | "fail
   if (ev.status !== "idle" || !ev.last) return null;
   const { message, response, failed } = ev.last;
   if (failed > message && failed > ev.seen) return { kind: "failed", seq: failed };
+  // A text reply with a background job still out is a pause, not an answer: the job's result arrives as a
+  // message and the agent goes on working. Graded at that pause, a task was scored while its agent was still
+  // editing the tree being graded.
+  if ((ev.background ?? 0) > 0) return null;
   if (!ev.answer || response <= message || response <= ev.seen) return null;
   return { kind: "answer", seq: response };
 }
@@ -144,9 +154,10 @@ export function causeFromEvidence(ev: StallEvidence): StallCause {
   if (!ev.last) return "unknown";
   // Each of the criterion's kinds means something different about who stopped, so each gets its own name;
   // no verdict at all is the only one that reads as "idle with nothing to show".
+  // Idle between turns with a background job out is an agent still at work: the job's end wakes it.
   switch (verdictFromEvidence(ev)?.kind) {
     case "answer": return "answer_undelivered";
     case "failed": return "model_failed";
-    default: return "idle_without_answer";
+    default: return (ev.background ?? 0) > 0 ? "still_running" : "idle_without_answer";
   }
 }

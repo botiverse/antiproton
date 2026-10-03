@@ -45,6 +45,14 @@ export { ASSUMED_CONTEXT_WINDOW } from "../../src/model/context-windows.ts";
  * stands where the identifier used to be until those follow.
  */
 const LEGACY_TASK = "main";
+
+/** The answer to a call made after the agent's task was ended (`RuntimeDeps.ended`). */
+function taskEndedRefusal(address: string): { status: "rejected"; error: { code: string; message: string } } {
+  return {
+    status: "rejected",
+    error: { code: "task_ended", message: `${address} was not run: this task has ended and its machine has been handed back` },
+  };
+}
 import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
 import { ModelResolver } from "../../src/runtime/model-resolver.ts";
@@ -479,6 +487,18 @@ export interface RuntimeDeps {
    * dotted address straight through and so could still name it.
    */
   withholdTools?: readonly string[];
+  /**
+   * Whether this agent's task is over and owned by someone else from here on: a benchmark task the runner has
+   * finished (graded, or out of budget) while the agent may still be mid-turn or have background work out.
+   *
+   * When it answers true, every call the agent or one of its programs makes is refused at dispatch, so a
+   * stalled agent's next shell command cannot provision a fresh machine after its own was handed back; and a
+   * background job that ends afterwards is recorded on its row but not delivered, so it cannot wake an idle
+   * agent into a turn. Both happened on a production SWE-bench run: every stalled task re-provisioned a box
+   * after release, and jobs left on a released box failed about forty minutes later and woke their agents.
+   * Asked on every call and every pass, because the answer changes while the agent is running.
+   */
+  ended?: (owner: { tenantId: string; agentId: string }) => boolean;
   /**
    * Whether a settled run hands its containers back by itself.
    *
@@ -1278,6 +1298,7 @@ export class AgentRuntime {
   ) {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
+    const ended = this.#deps.ended;
     const gw = this.#gateway;
     const store = this.store;
     const artifacts = this.#artifacts;
@@ -1370,11 +1391,13 @@ export class AgentRuntime {
       async invoke(call: { tool: string; args: any; opts?: any; callId?: string }): Promise<ToolResult> {
         const refused = refuseWithheld(call.tool, withheld);
         if (refused) return refused;
+        if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call));
       },
       /** The model's answer to a tool's question (pi-tools.ts `resume`), finished as a call's result is. */
       async resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult> {
         const call = { tool: `${i.alias}.${i.tool}`, args: null, callId };
+        if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
         return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(ctx, i, answer, { callId })));
       },
       async cancelInterrupt(i: ToolInterrupt): Promise<string | null> {
@@ -2236,7 +2259,15 @@ export class AgentRuntime {
       completeOperation: async (id, status) => { await this.store.completeOperation(tenantId, id, status, null); },
       deliver,
     });
-    const bg = await pass(async (session, text) => { await this.postMessage(tenantId, agentId, text, "prompt", session); });
+    // A task that is over (`ended`) keeps its jobs polled — the row records how each one ended, and a job
+    // past its ceiling is still asked to stop — but no ending is delivered, and no session is stepped: a
+    // late result must not start a turn whose next call would provision a machine nobody is watching.
+    const over = this.#deps.ended?.(owner) === true;
+    const bg = await pass(async (session, text) => {
+      if (over) return;
+      await this.postMessage(tenantId, agentId, text, "prompt", session);
+    });
+    if (over) return { open: 0, wakeInMs: bg.wakeInMs, settled: [] as Array<{ operationId: string; status: string }>, releaseFailed: [] as Array<{ alias: string; error: string }> };
     // pd: one harness runs every conversation of the object, and one step drives it whole
     // (`DurableAgent.step`), so there is nothing to choose. pi085: the sessions its list says have work.
     const sessions = pd ? [MAIN_SESSION] : sessionsWithWork(sql);

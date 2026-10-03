@@ -41,7 +41,7 @@ import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
 import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
-import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
+import { recentBackgroundJobs, runningBackgroundJobs } from "../../src/runtime/background-jobs.ts";
 import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
 import { MAIN_SESSION, piTables } from "../../src/store/pi-storage.ts";
 import { validateMount } from "../../src/runtime/mount-config.ts";
@@ -882,10 +882,18 @@ export class AgentDO extends DurableObject<Env> {
       // does not hand the machine back on its own: the runner does, after
       // grading, through benchSweRelease — and owns the bill if it forgets.
       withholdTools: swe ? BENCH_SWE_WITHHELD : undefined,
+      // Once the runner has finished the task (benchSweFinish), the agent may still be mid-turn or have
+      // background work out; from then on none of it may reach a machine or start a turn.
+      ended: swe ? (o) => this.#benchEnded(o.agentId) : undefined,
       autoRelease: !swe,
       offloadModel: this.#offloadOn() ? (job) => this.#dispatch(job) : undefined,
     });
     return this.#benchRuntime;
+  }
+
+  /** Whether the runner has finished this bench agent's task (benchSweFinish). */
+  #benchEnded(agentId: string): boolean {
+    return this.sql.exec("SELECT 1 FROM bench_config WHERE k=?", `ended:${agentId}`).toArray().length > 0;
   }
 
   #setBenchConfig(k: string, v: string) {
@@ -930,6 +938,8 @@ export class AgentDO extends DurableObject<Env> {
       const engine = this.#takeBenchEngine(o.engine);
       this.#setBenchConfig("mode", "swe");
       this.#setBenchConfig("policy", o.policy);
+      // A shared object hosts tasks one after another; the previous task's end is not this one's.
+      this.sql.exec("DELETE FROM bench_config WHERE k LIKE 'ended:%'");
       this.#benchRuntime = null;
       this.#takeBenchAgent(agentId);
       const rt = this.#benchRt(o.policy);
@@ -992,11 +1002,37 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
+  /**
+   * The end of the agent's part of a task: when it has answered and settled, or when the runner's budget ran
+   * out with the agent still going. The task is marked ended first, so nothing the agent does from here on can
+   * reach a machine or start a turn (`ended` in #benchRt); then its turn is cancelled and its background jobs
+   * are stopped, while their machine still exists to stop them on.
+   *
+   * Grading comes after this and still works: the runner's shell (benchSweShell) goes to the gateway, not
+   * through the agent's dispatch, which is where an ended task is refused. Without this, the runner graded
+   * and released while a stalled agent kept running: its next shell command provisioned a new box that
+   * nobody released or counted, and a job left on the released box failed about forty minutes later and woke
+   * the idle agent into doing the same. Idempotent, and release calls it too.
+   */
+  async benchSweFinish(taskId: string) {
+    return this.#busy("benchSweFinish", () => this.#benchSweFinish(taskId));
+  }
+
+  async #benchSweFinish(taskId: string) {
+    const agentId = `b_${taskId}`;
+    this.#setBenchConfig(`ended:${agentId}`, String(Date.now()));
+    const rt = this.#activeRuntime();
+    await rt.ready();
+    return rt.cancelSession("bench", agentId, MAIN_SESSION);
+  }
+
+  /** Hands the machine back, after ending the agent's part (benchSweFinish) so nothing can make another. */
   async benchSweRelease(taskId: string) {
     return this.#busy("benchSweRelease", async () => {
+      const finish = await this.#benchSweFinish(taskId);
       const rt = this.#activeRuntime();
-      await rt.ready();
-      return rt.gateway().releaseTask({ tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" });
+      const released = await rt.gateway().releaseTask({ tenantId: "bench", agentId: `b_${taskId}`, taskId: "main" });
+      return { ...released, finish };
     });
   }
 
@@ -1108,9 +1144,10 @@ export class AgentDO extends DurableObject<Env> {
     const running = await agent.running();
     const events = entriesToEvents(
       await agent.entries({ order: "asc" }));
+    const background = runningBackgroundJobs(this.sql as any, { tenantId: "bench", agentId: `b_${taskId}` }).length;
     // One builder for the body, shared with the runner's tests: a fixture cannot then have a shape this
     // endpoint never sends, which is how the poll fallback stayed inert for four days (src/bench/poll-body.ts).
-    return benchPollBody(events, running);
+    return benchPollBody(events, running, background);
   }
 
   /** What the harness actually handed the provider. Guessing at this cost two
@@ -3589,6 +3626,12 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (g) return g;
           const b = (await request.json()) as any;
           return Response.json(await stub.benchSweJob(String(b.taskId), String(b.alias), b.handle));
+        }
+        case "/bench/swe/finish": {
+          const g = await guardSpending(request, env);
+          if (g) return g;
+          const b = (await request.json()) as any;
+          return Response.json(await stub.benchSweFinish(String(b.taskId)));
         }
         case "/bench/swe/release": {
           const g = await guardSpending(request, env);

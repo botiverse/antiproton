@@ -111,9 +111,16 @@ When the fix is in place, say so and stop.
 // ------------------------------------------------------------ waiting
 
 /**
- * The agent phase is over when the model replies with text and no tool call —
- * the same rule the object applies, read from the same event stream the
- * console reads, over the hibernation-API socket the console uses. Polling
+ * The agent phase is over when the agent has settled: it replied with text and
+ * no tool call, it is not running, and no background job of its is still out.
+ * A text reply alone is not enough — with a job out the agent says "waiting for
+ * the queued commands to finish" and the job's result wakes it again — and
+ * grading at that reply scored a tree the agent was still editing.
+ *
+ * The socket (the hibernation-API one the console uses) says when to look; the
+ * object's own `/bench/poll` decides (`decideFromPoll`), because only the object
+ * knows whether a job is out. A text reply on the socket triggers that look at
+ * once, and a slow look every 20 s covers a push that never came. Polling alone
  * would measure the poller: every poll wakes the object and is billed.
  *
  * Reconnects rather than gives up: a socket dropped mid-turn is not an agent
@@ -146,16 +153,20 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
       try { ws.close(); } catch { /* already gone */ }
       resolve(v);
     };
+    // One task is one message, so no answer has been taken before this one: the floor is 0, not the socket's
+    // cursor, which has already passed the reply that triggered the look.
+    const look = () => {
+      void api(`/bench/poll?taskId=${taskId}`, {}, undefined, objOf(taskId)).then((poll: any) => {
+        const d = decideFromPoll(poll, 0);
+        if (!d) return;
+        if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll)"); stop(null); }
+        else stop(d.text);
+      }).catch(() => { /* the socket or the next tick will do */ });
+    };
     const keepalive = setInterval(() => {
       try { ws.send("ping"); } catch { /* closing */ }
       // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
-      void api(`/bench/poll?taskId=${taskId}`, {}, undefined, objOf(taskId)).then((poll: any) => {
-        const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
-        if (!d) return;
-        seen.set(taskId, d.seq);
-        if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
-        else stop(d.text);
-      }).catch(() => { /* the socket or the next tick will do */ });
+      look();
     }, 20_000);
     const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
     ws.onerror = () => stop(null);
@@ -170,9 +181,8 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
         return;
       }
       if (typeof e.id === "number") seen.set(taskId, e.id);
-      if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) {
-        stop(String(e.payload.text));
-      }
+      // A text reply may be a pause while a job runs: ask the object whether the agent has settled.
+      if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) look();
     };
   });
 }
@@ -244,6 +254,8 @@ async function runOne(inst: Instance) {
   // `agent_stalled` and nothing else: it held the evidence for one call and threw it away, so a stall here
   // could not be told from a lost delivery afterwards (Vera, 2026-09-19).
   let stall: string | undefined, stallWhy: StallEvidence | undefined;
+  /** What ending the agent's part stopped: its turn, its jobs, and any job that could not be confirmed stopped. */
+  let finish: any;
   try {
     await post("/bench/say", { taskId,
       text: `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}` }, undefined, obj);
@@ -252,6 +264,10 @@ async function runOne(inst: Instance) {
       ({ stall, stallWhy } = await stallAtDeadline(() => api(`/bench/poll?taskId=${taskId}`, {}, undefined, obj), seen.get(taskId) ?? 0));
     }
     agentSeconds = Math.round((Date.now() - t0) / 1000);
+    // The agent's part ends here whether it answered or ran out of budget: its turn is cancelled, its jobs
+    // stopped, and nothing it does from now on reaches the machine (cf/src/index.ts `benchSweFinish`). Before
+    // grading, so a stalled agent cannot edit the tree while it is graded.
+    finish = await post("/bench/swe/finish", { taskId }, undefined, obj).catch((e) => ({ error: String((e as Error)?.message ?? e).slice(0, 200) }));
     if (TRACE) console.log(`    agent > ${(answered ?? "(no answer)").replace(/\s+/g, " ").slice(0, 160)}`);
 
     // Grade with SWE-bench's own criterion, in the box the agent worked in (grade.ts): every FAIL_TO_PASS
@@ -273,6 +289,9 @@ async function runOne(inst: Instance) {
 
   // Read after release: the container's session is written into the mount's
   // connection state when the box is handed back, so the meter outlives it.
+  // And after the agent was stopped (finish, release), so the model calls and
+  // tokens are all of the task's, not those up to the moment it answered.
+  if (finish?.error) console.log(`      \x1b[31mfinish failed: ${finish.error}\x1b[0m`);
   const stats: any = await api(`/bench/swe/stats?taskId=${taskId}&wallMs=${Date.now() - t0}`, {}, undefined, obj);
   // What the object was billed for this instance alone, the runner's grading
   // shown apart: the activity log is per object and keeps every kind, so the
@@ -289,7 +308,7 @@ async function runOne(inst: Instance) {
     ...grade,
     seconds: Math.round((Date.now() - t0) / 1000), agentSeconds,
     ended: answered ? "answered" : failed.has(taskId) ? `model: ${failed.get(taskId)}`.slice(0, 60) : "agent_stalled",
-    stall, stallWhy,
+    stall, stallWhy, finish,
     network, modelTurns: stats.modelTurns, toolTurns: stats.toolTurns, toolErrors: stats.toolErrors ?? null, byTool: stats.byTool ?? {},
     calls: stats.usage?.calls ?? 0, prompt: stats.usage?.prompt ?? 0, out: stats.usage?.out ?? 0,
     cached: stats.usage?.cached ?? 0, meter: stats.meter as Meter | undefined,
