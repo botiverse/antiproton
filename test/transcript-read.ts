@@ -15,9 +15,12 @@ import { DurableObjectStore } from "../src/store/durable-object.ts";
 import { PiSqliteStorage, MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { converse } from "./spec/pd-conversation.ts";
+import { unansweredObject, HANDOFF } from "./spec/pd-unanswered.ts";
+import { conversation, eventList, trajectory } from "../cf/src/ui.ts";
+import { entriesToEvents } from "../cf/src/pi-view.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
-async function check(name: string, fn: () => Promise<void>) {
+async function check(name: string, fn: () => Promise<void> | void) {
   try { await fn(); results.push({ name, ok: true }); }
   catch (e) { results.push({ name, ok: false, error: String((e as Error)?.message ?? e) }); }
 }
@@ -113,6 +116,46 @@ await check("a pd agent is read from pi-durable's entries, not pi's tables: what
     assert(readTranscript(host.sql, "demo", "u-a", "task_nope") === null, "a conversation the agent does not hold was read");
     assert(dump(host) === before, "the database changed while it was being read");
   } finally { host.dispose(); }
+});
+
+await check("pd: a run that failed before its first model call and a transcript reset are in the transcript, and the console draws both", async () => {
+  const host = sqliteHost();
+  try {
+    await unansweredObject(host);
+    const before = dump(host);
+    const read = readTranscript(host.sql, "demo", "u-a", "t_u-a")!;
+    const kinds = read.events.map((e) => e.kind).join();
+    // pd-unanswered.ts's runs in order; each failure follows what its run left, and run 2's is its own reply.
+    assert(kinds === [
+      "message", "model.failed", "message", "model.failed", "message", "model.failed",
+      "message", "model.response", "tool.result", "model.failed", "message", "model.failed", "model.failed",
+      "message", "model.response", "message", "model.response", "model.failed",
+      "compaction", "message", "model.response", "compaction", "reset"].join(), `events: ${kinds}`);
+    const failed = read.events[1]!;
+    assert(failed.payload.error === "no_model: Model gone/m is not available" && failed.createdAt === read.events[0]!.createdAt,
+      `the failure: ${JSON.stringify(failed)}`);
+    const reset = read.events.at(-1)!;
+    assert(reset.payload.handoff === HANDOFF && reset.createdAt > 0, `the reset: ${JSON.stringify(reset)}`);
+    assert(dump(host) === before, "the database changed while it was being read");
+
+    // What a person sees: the trajectory and the chat say there was a reset and show its handoff; the events tab too.
+    const drawn = trajectory(read.events, read.byOp, null);
+    assert(drawn.includes("model failed") && drawn.includes("Model gone/m is not available"), "the trajectory does not show the failure");
+    assert(drawn.includes("conversation reset") && drawn.includes("<strong>one</strong>"), "the trajectory does not show the reset and its handoff");
+    const chat = trajectory(conversation(read.events), read.byOp, null);
+    assert(chat.includes("conversation reset"), "the chat does not show the reset");
+    assert(eventList(read.events as any).includes("conversation reset"), "the events tab does not show the reset");
+  } finally { host.dispose(); }
+});
+
+await check("a reset with no handoff is still drawn, and a custom entry that is not a reset is still not an event", () => {
+  const events = entriesToEvents([
+    { type: "custom", customType: "pi.reset", id: "1", parentId: null, seq: 1, timestamp: 5, data: {} },
+    { type: "custom", customType: "agents_api.turn_cancelled", id: "2", parentId: "1", seq: 2, timestamp: 6, data: { operationId: "op" } },
+  ] as any);
+  assert(JSON.stringify(events) === JSON.stringify([{ sequence: 1, kind: "reset", payload: { at: 5 } }]), `events: ${JSON.stringify(events)}`);
+  const drawn = trajectory(events.map((e) => ({ ...e, createdAt: 5 })), {}, null);
+  assert(drawn.includes("conversation reset") && !drawn.includes("handoff the agent starts from"), `drawn: ${drawn.slice(0, 300)}`);
 });
 
 for (const r of results) console.log(`${r.ok ? "ok " : "FAIL"} ${r.name}${r.error ? ` — ${r.error}` : ""}`);

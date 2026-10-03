@@ -70,6 +70,7 @@ import { adminMigrateEngine, type MigrateOp } from "./admin-migrate.ts";
 import { readDiagnosis } from "./diagnose-read.ts";
 import { agentObjectName } from "./object-name.ts";
 import { readTranscript, transcriptEvents, approvalsByOp, isPd, type TranscriptEvents } from "./transcript-read.ts";
+import { readEngineStorage } from "./engine-read.ts";
 import { pdVersion } from "../../src/runtime/pd-transcript.ts";
 import { compactionRefusal, refusingCompaction } from "./compact-refusal.ts";
 import { loginPage, refusedPage, keyPage } from "./login.ts";
@@ -1578,25 +1579,26 @@ export class AgentDO extends DurableObject<Env> {
       try { return Number((rows(`SELECT COUNT(*) AS n FROM ${t}`)[0] ?? {}).n ?? 0); }
       catch { return 0; }
     };
+    // The engine's own records (engine-read.ts): a pd agent has pi's tables too, and they stay empty. The
+    // conversation is looked up as the transcript and version handlers look it up, so a task id this agent does not
+    // have is refused the same way rather than read as the main conversation.
+    const engine = readEngineStorage(this.sql, await this.#conversation(tenantId, agentId, taskId));
     const tables = ["agents", "agent_state", "approvals", "plugin_db", "counters",
-      "model_bindings", "mounts", "operations", "quotas",
-      "pi_entries", "pi_usage", "pi_values", "pi_list", "pi_meta", "pi_model_jobs"];
+      "model_bindings", "mounts", "operations", "quotas", ...engine.tables];
     return {
       tenantId, agentId, taskId,
       counts: Object.fromEntries(tables.map((t) => [t, count(t)])),
       // What the lane is doing, and what it is still owed. Leases, cursors and
       // an outbox are gone: the object is single-threaded and pi's mutation
       // line serialises, so there was never anything for them to protect here.
-      lane: rows("SELECT namespace, key, seq FROM pi_values WHERE namespace LIKE 'pi.%' LIMIT 40"),
-      modelJobs: rows(`SELECT id, created_at, answered_at, LENGTH(request) AS request_bytes
-                         FROM pi_model_jobs ORDER BY created_at DESC LIMIT 20`),
+      lane: engine.lane,
+      modelJobs: engine.modelJobs,
       operations: rows(`SELECT operation_id, tool, status, result_ref, created_at FROM operations
                          WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 40`,
         tenantId, taskId),
       approvals: rows("SELECT * FROM approvals WHERE tenant_id=? AND task_id=? ORDER BY created_at DESC LIMIT 20",
         tenantId, taskId),
-      compactions: rows(`SELECT id, seq, timestamp, LENGTH(body) AS bytes FROM pi_entries
-                          WHERE type='compaction' ORDER BY seq DESC LIMIT 20`),
+      compactions: engine.compactions,
       // The row carries what its plugin provides, so the page can ask a mount
       // what it is instead of which plugin it is: the containers panel picks
       // "container" without ever naming the plugin that declares it.
@@ -1635,7 +1637,7 @@ export class AgentDO extends DurableObject<Env> {
         // computes "is anything still out" its own way will disagree with the
         // thing it is meant to explain — and it did: it counted a `message.out`
         // that answers nothing as a command in flight.
-        outstanding: Number((rows("SELECT COUNT(*) AS n FROM pi_model_jobs WHERE answer IS NULL")[0] ?? {}).n ?? 0),
+        outstanding: engine.outstanding,
         alarm: await this.ctx.storage.getAlarm(),
         alarmFailures: this.#alarmFailures(),
         activity: await this.activity(),

@@ -910,7 +910,7 @@ export function trajectory(
 ): string {
   const who = identityByCall(events);
   const steps: Step[] = events
-    .filter((e) => ["message", "model.response", "model.failed", "tool.result", "js.result", "operation.completed"].includes(e.kind))
+    .filter((e) => ["message", "model.response", "model.failed", "tool.result", "js.result", "operation.completed", "reset"].includes(e.kind))
     .map((e) => ({ at: e.createdAt, sequence: e.sequence, kind: e.kind, payload: e.payload ?? {} }));
   if (!steps.length) return `<div class="empty">nothing yet — say something below.</div>`;
 
@@ -981,6 +981,11 @@ export function trajectory(
       continue;
     }
 
+    if (s.kind === "reset") {
+      out.push(resetCard(p, rel));
+      continue;
+    }
+
     if (s.kind === "js.result" || s.kind === "tool.result") {
       const label = s.kind === "js.result" ? "sandbox" : `tool ${p.tool ?? ""}`;
       // `tool.result` carries the call's return under `result`, not `content`:
@@ -1035,6 +1040,16 @@ export function trajectory(
     );
   }
   return out.join("");
+}
+
+/** A transcript reset (`pi.reset`): the model's context starts over here, carrying only the handoff, if any. */
+function resetCard(p: any, rel: string): string {
+  return `<div class="step decided"><div class="lbl">conversation reset ${rel}</div>
+    ${typeof p.handoff === "string" && p.handoff
+      ? `<details open><summary>the handoff the agent starts from</summary><div class="msg md">${md(p.handoff)}</div></details>`
+      : ""}
+    <div class="hint" style="padding:6px 0 0">The model is shown nothing from before this point.
+      Every event before it is still in the log and on the events tab.</div></div>`;
 }
 
 /**
@@ -1163,7 +1178,8 @@ export function conversation(
   const out: typeof events = [];
   for (let i = 0; i < events.length; i++) {
     const e = events[i]!;
-    if (e.kind === "message") { out.push(e); continue; }
+    // A reset is where the agent's memory of this conversation starts over, which a person needs to see here.
+    if (e.kind === "message" || e.kind === "reset") { out.push(e); continue; }
     if (e.kind !== "model.response") continue;
     // A compaction is bookkeeping, not something the agent said.
     if ((e.payload as any)?.purpose === "compaction") continue;
@@ -1433,6 +1449,8 @@ export function eventList(events: Ev[]): string {
       if (orphan) cards.push(callRow(orphan, t0, who.get(orphan.id)));
     } else if (e.kind === "model.failed") {
       cards.push(`<div class="step fail"><div class="lbl">model failed ${rel}</div><div class="msg">${esc(String(p.error ?? ""))}</div></div>`);
+    } else if (e.kind === "reset") {
+      cards.push(resetCard(p, rel));
     } else if (e.kind === "compaction") {
       cards.push(`<div class="step note"><div class="lbl">compaction ${rel} <span class="badge">${esc(String(p.tokensBefore ?? "?"))} tokens before</span></div>
         <details><summary>summary</summary><div class="msg">${esc(String(p.summary ?? "")).slice(0, 4000)}</div></details></div>`);
