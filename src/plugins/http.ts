@@ -60,7 +60,7 @@ export interface HttpConfig {
  * the host.
  */
 /** Public DNS services that answer with the address written in the name, or with loopback for any name. */
-const RESOLVER_SUFFIX = /(^|\.)(nip\.io|sslip\.io|xip\.io|localtest\.me|lvh\.me)$/;
+const RESOLVER_SUFFIX = /(^|\.)(nip\.io|sslip\.io|xip\.io|traefik\.me|localtest\.me|lvh\.me|localho\.st|localhost\.direct|lacolhost\.com)$/;
 
 export function internalHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.+$/, "");
