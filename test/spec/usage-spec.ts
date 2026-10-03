@@ -4,7 +4,7 @@
  * workerd by cf/src/conformance.ts; see test/control-plane-d1.sh.
  */
 import { flushUsage, foldUsage, parseUsageQuery, priceFor, readAgentLedger, readUsage, sendUsage, usageBacklogSince, usageCursor, usageFirstHours, usageGroup, DAY_MS, KEEP_HOURLY_DAYS, USAGE_WINDOWS, type UsageQuery } from "../../cf/src/usage-d1.ts";
-import { appendUsage, pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
+import { appendUsage, pendingUsage, UNACCEPTED_TOKENS, type OutboxRow } from "../../src/usage/outbox.ts";
 import type { SpecCase } from "./control-plane-spec.ts";
 
 function assert(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
@@ -354,6 +354,23 @@ export function usageCases(db: D1Database, sql: Sql): SpecCase[] {
     const daily = await readAgentLedger(db, "t", "a", T0 - DAY_MS, T0 + 2 * DAY_MS, DAY_MS);
     assert(JSON.stringify(daily.map((r) => [(r.bucket - T0) / DAY_MS, r.quantity])) === "[[-1,9],[0,7],[1,100]]", `daily ${JSON.stringify(daily)}`);
     assert(daily.every((r) => r.resource === "model.tokens" && r.key === "m1:input" && r.unit === "tokens"), JSON.stringify(daily));
+  });
+
+  add("an unaccepted model answer reaches the tables and is left out of the tenant's usage, its first hours and the agent's ledger, whatever model.tokens is priced at", async () => {
+    await sendUsage(db, "t", "a", 0, [row(1, { quantity: 3 }), row(2, { resource: UNACCEPTED_TOKENS, quantity: 40 })]);
+    await db.prepare("INSERT INTO usage_prices VALUES ('model.tokens', '*', 'tokens', 0.001, 0)").run();
+    const stored: any = await db.prepare("SELECT SUM(quantity) AS q FROM usage_hourly WHERE resource = ?").bind(UNACCEPTED_TOKENS).first();
+    assert(Number(stored?.q) === 40, `control: the unaccepted row is not in the table: ${JSON.stringify(stored)}`);
+    for (const by of ["total", "agent", "model"] as const) {
+      const { rows } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + DAY_MS, bucket: "1d", by });
+      assert(JSON.stringify(rows.map((r) => [r.resource, r.quantity, r.cost])) === JSON.stringify([["model.tokens", 3, 0.003]]), `by ${by}: ${JSON.stringify(rows)}`);
+    }
+    const ledger = await readAgentLedger(db, "t", "a", T0, T0 + DAY_MS, DAY_MS);
+    assert(JSON.stringify(ledger.map((r) => [r.resource, r.quantity])) === JSON.stringify([["model.tokens", 3]]), `ledger ${JSON.stringify(ledger)}`);
+    // Nor does the page's record of when each resource began name it.
+    const { firstHours } = await readUsage(db, "t", { window: "custom", from: T0, to: T0 + DAY_MS, bucket: "1d", by: "total" });
+    assert(JSON.stringify(Object.keys(firstHours)) === JSON.stringify(["model.tokens"]), `firstHours ${JSON.stringify(firstHours)}`);
+    assert(JSON.stringify(Object.keys(await usageFirstHours(db, "t"))) === JSON.stringify(["model.tokens"]), "usageFirstHours names the unaccepted resource");
   });
 
   add("what an object has not sent: nothing without tables, the oldest unsent row's time after a partial send, nothing once all is sent", async () => {

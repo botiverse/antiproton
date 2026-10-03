@@ -75,7 +75,7 @@ async function apiAgent(engine: "pi085" | "pd") {
         requests.push(req);
         const reply = replies.shift();
         check(reply, `${engine}: an unscripted model call: ${show(req.messages.slice(-2))}`);
-        await rt.deliverAnswer("t", "a", id, fromResponse(reply(req), job.model, id));
+        await rt.deliverAnswer("t", "a", id, fromResponse(reply(req), job.model, id), undefined);
         delivered = true;
       }
       if (delivered) continue;

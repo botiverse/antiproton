@@ -1,7 +1,8 @@
 /**
- * What the `pd` engine writes inside pi-durable's own commit (src/runtime/pd-outbox.ts, the vendored
- * storage's commit hook): usage and trace outbox rows, and `ap_model_jobs` rows. Run over node:sqlite by
- * test/pd-outbox.ts and on a real Durable Object's storage by cf/src/conformance.ts (test/pd-outbox-do.sh).
+ * What the `pd` engine meters and books (src/runtime/pd-outbox.ts): usage rows when an answer is delivered
+ * (`PdHost.deliver`, docs/metering.md), and inside pi-durable's own commit (the vendored storage's commit hook)
+ * trace outbox rows and `ap_model_jobs` rows. Run over node:sqlite by test/pd-outbox.ts and on a real Durable
+ * Object's storage by cf/src/conformance.ts (test/pd-outbox-do.sh).
  *
  * The parity case runs one scripted conversation through both engines on the same storage — pd first,
  * its rows read and the outboxes emptied, then PiAgent (pi085), which writes its rows inside
@@ -18,14 +19,14 @@ import { setLogSink } from "../../src/core/log.ts";
 import { errorMessage, fromResponse, toRequest, type AnsweredMessage } from "../../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../../src/model/types.ts";
 import { DurableAgent, PdHost } from "../../src/runtime/durable-agent.ts";
-import { cancelJob } from "../../src/runtime/pd-outbox.ts";
+import { cancelJob, pdUsageDrift } from "../../src/runtime/pd-outbox.ts";
 import { ApStore } from "../../src/store/ap-store.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import { PiAgent } from "../../src/runtime/pi-agent.ts";
 import { statusEvents } from "../../src/runtime/status.ts";
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { pendingTrace, type TraceOutboxRow } from "../../src/trace/outbox.ts";
-import { pendingUsage, type OutboxRow } from "../../src/usage/outbox.ts";
+import { pendingUsage, UNACCEPTED_TOKENS, type OutboxRow } from "../../src/usage/outbox.ts";
 import { UnknownJob } from "../../cf/src/model-queue.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 
@@ -139,7 +140,12 @@ const outboxes = (storage: DurableSqlHost) => ({
   usage: pendingUsage(storage.sql as never, 0),
   trace: pendingTrace(storage.sql as never, 0).rows,
 });
-const usagePairs = (storage: DurableSqlHost) => outboxes(storage).usage.map((r) => [r.key, r.quantity]);
+/** The tenant's model usage: `model.tokens` rows, as key and quantity. */
+const usagePairs = (storage: DurableSqlHost) => outboxes(storage).usage.filter((r) => r.resource === "model.tokens").map((r) => [r.key, r.quantity]);
+/** Our cost: delivered answers no job accepted. */
+const unacceptedPairs = (storage: DurableSqlHost) => outboxes(storage).usage.filter((r) => r.resource === UNACCEPTED_TOKENS).map((r) => [r.key, r.quantity]);
+/** Every usage row, whatever its resource: what "metered nothing more" compares. */
+const allUsage = (storage: DurableSqlHost) => show(outboxes(storage).usage);
 /** A row without what names an instance or an instant. */
 const usageShape = (r: OutboxRow) => ({ tenantId: r.tenantId, agentId: r.agentId, resource: r.resource, key: r.key, quantity: r.quantity, unit: r.unit });
 const traceShape = (r: TraceOutboxRow) => ({
@@ -186,6 +192,11 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(show(o.dispatched) === show(jobs.map((j) => j.id)), `dispatched ${show(o.dispatched)}, jobs ${show(jobs.map((j) => j.id))}`);
     check(show(pd.usage.map((r) => [r.key, r.quantity])) === show(EXPECTED_USAGE), `pd usage ${show(pd.usage.map((r) => [r.key, r.quantity]))}`);
     check(pd.usage.every((r) => r.tenantId === "t" && r.agentId === "a" && r.resource === "model.tokens" && r.unit === "tokens"), `pd usage ${show(pd.usage)}`);
+    // Metered at delivery: each row's `at` is its job's answer's, not the commit's that read it.
+    const perJob = [4, 3, 3];
+    const deliveredAt = jobs.flatMap((j, i) => Array(perJob[i]).fill(j.answered_at));
+    check(show(pd.usage.map((r) => r.at)) === show(deliveredAt), `pd usage at ${show(pd.usage.map((r) => r.at))}, answers at ${show(deliveredAt)}`);
+    check(show(pdUsageDrift(storage.sql as never)) === "{}", `drift ${show(pdUsageDrift(storage.sql as never))}`);
     check(show(pd.trace.map((r) => [r.status, r.verdict])) === show(EXPECTED_TRACE), `pd trace ${show(pd.trace)}`);
     // Each span joins back to its job and measures the job's own instants; a row's `at` is its commit's.
     pd.trace.forEach((r, i) => {
@@ -218,32 +229,33 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await o.agent.close();
   });
 
-  add("pi.usage", "a commit that adds to pi.usage with no entry (compaction's shape) bills the delta; a tool's under `unknown`; an importer's entry that leaves pi.usage alone bills nothing, and carrying a consumed job's id again traces nothing", async (storage) => {
+  add("drift", "the drift check: zero after a turn; a commit that adds to pi.usage with no delivery (compaction's shape) meters nothing and shows as drift, under its own key; a tool's usage meters nothing and is not compared; an importer's entry that leaves pi.usage alone, carrying a consumed job's id, meters and traces nothing", async (storage) => {
     const seen: Array<readonly StorageWrite[]> = [];
     const o = pdObject(storage, { commitFault: (writes) => { seen.push(writes); } });
     await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `control: the turn billed ${show(usagePairs(storage))}`);
-    storage.sql.exec("DELETE FROM usage_outbox");
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `control: the turn metered ${show(usagePairs(storage))}`);
+    const drift = () => pdUsageDrift(storage.sql as never);
+    check(show(drift()) === "{}", `drift after a turn: ${show(drift())}`);
+    const metered = allUsage(storage);
     const id = (await o.host.conversation("main")) as ConversationId;
     const commit = (fn: Parameters<Awaited<ReturnType<PdHost["handle"]>>["commit"]>[0]) =>
       o.host.withHarness(async (h) => (await o.host.handle(h, id)).commit(fn, bg));
     const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-    // Compaction's commit: its model call's usage added to an existing key, and to a new one, with no entry.
+    // Compaction's shape with no delivered answer behind it: usage added to an existing key, and to a new one.
     await commit(async (tx) => {
       const u = await tx.doc(UsageDoc, id);
       const m = u.models["queue/m1"]!;
       m.input += 1000; m.output += 25; m.totalTokens += 1025;
       u.models["other/vendor/m2"] = { ...zero, input: 7, cacheWrite: 3, totalTokens: 10 };
     });
-    check(show(usagePairs(storage)) === show([["m1:input", 1000], ["m1:output", 25], ["vendor/m2:input", 7], ["vendor/m2:cache_write", 3]]),
-      `the compaction-shaped commit billed ${show(usagePairs(storage))}`);
-    storage.sql.exec("DELETE FROM usage_outbox");
-    // A tool result's usage: pi-storage bills it under the model `unknown`.
+    check(allUsage(storage) === metered, `a pi.usage commit metered: ${allUsage(storage)}`);
+    check(show(drift()) === show({ "queue/m1": { input: -1000, output: -25 }, "other/vendor/m2": { input: -7, cacheWrite: -3 } }), `drift ${show(drift())}`);
+    // A tool result's usage: what the tool reported, not a call we paid for. Not metered, not compared.
+    const before = show(drift());
     await commit(async (tx) => { (await tx.doc(UsageDoc, id)).tools.search = { ...zero, input: 5, output: 2, totalTokens: 7 }; });
-    check(show(usagePairs(storage)) === show([["unknown:input", 5], ["unknown:output", 2]]), `the tool's usage billed ${show(usagePairs(storage))}`);
-    storage.sql.exec("DELETE FROM usage_outbox");
+    check(allUsage(storage) === metered && show(drift()) === before, `a tool's usage: ${allUsage(storage)}, drift ${show(drift())}`);
     // An importer's entry, usage and all, that does not touch pi.usage, and that carries the id of the job the turn
-    // consumed: not spend, and that job's span was written once already. Nothing billed, nothing traced.
+    // consumed: not spend, and that job's span was written once already. Nothing metered, nothing traced.
     const [job] = pdJobs(storage);
     const traceBefore = show(outboxes(storage).trace);
     check(outboxes(storage).trace.length === 1 && job?.state === "consumed", `control: the turn's trace ${traceBefore}, job ${show(job)}`);
@@ -255,12 +267,23 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
       } as never] });
     });
     check(seen.some((w) => hasAnswer(w)), "control: the imported entry never reached the hook");
-    check(outboxes(storage).usage.length === 0, `the import billed ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `the import metered ${allUsage(storage)}`);
     check(show(outboxes(storage).trace) === traceBefore, `the import traced: ${show(outboxes(storage).trace)}`);
+    check(show(drift()) === before, `the import moved the drift: ${show(drift())}`);
     await o.agent.close();
   });
 
-  add("pi.usage", "an assistant entry whose messages are not a list is logged and skipped: the commit lands and the next one bills", async (storage) => {
+  add("drift", "the drift check sees a consumed answer pi.usage does not hold: the job's answer carries more than pi-durable recorded", async (storage) => {
+    const o = pdObject(storage);
+    await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
+    check(show(pdUsageDrift(storage.sql as never)) === "{}", `control: drift after a turn ${show(pdUsageDrift(storage.sql as never))}`);
+    const [job] = pdJobs(storage);
+    storage.sql.exec("UPDATE ap_model_jobs SET answer = json_set(answer, '$.usage.input', json_extract(answer, '$.usage.input') + 5) WHERE id = ?", job!.id);
+    check(show(pdUsageDrift(storage.sql as never)) === show({ "queue/m1": { input: 5 } }), `drift ${show(pdUsageDrift(storage.sql as never))}`);
+    await o.agent.close();
+  });
+
+  add("pi.usage", "an assistant entry whose messages are not a list is logged and skipped: the commit lands, meters nothing, and the next commit lands", async (storage) => {
     const o = pdObject(storage);
     await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
     const id = (await o.host.conversation("main")) as ConversationId;
@@ -272,9 +295,10 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(lines.some((l) => JSON.parse(l).evt === "pd.commit.unreadable_entry"), `log ${show(lines)}`);
     check(lines.every((l) => JSON.parse(l).evt !== "pd.commit.rolled_back"), `the commit rolled back: ${show(lines)}`);
     check(Number(storage.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE json_extract(record, '$.model') = 5").toArray()[0]!.n) === 1, "the entry did not land");
-    // The Session is not poisoned: the next commit lands and bills.
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
+    // The Session is not poisoned: the next commit lands (the drift check reads what it added to pi.usage).
     await o.host.withHarness(async (h) => (await o.host.handle(h, id)).commit(async (tx) => { (await tx.doc(UsageDoc, id)).models["queue/m1"]!.input += 3; }, bg));
-    check(show(usagePairs(storage)) === show([...Q1_USAGE, ["m1:input", 3]]), `usage ${show(usagePairs(storage))}`);
+    check(show(pdUsageDrift(storage.sql as never)) === show({ "queue/m1": { input: -3 } }), `drift ${show(pdUsageDrift(storage.sql as never))}`);
     await o.agent.close();
   });
 
@@ -326,7 +350,7 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await next.agent.close();
   });
 
-  add("jobs", "cancel, then the answer arrives: the row is kept as cancelled, nothing is called again, and the late answer is billed once", async (storage) => {
+  add("jobs", "cancel, then the answer arrives: the row is kept as cancelled, nothing is called again, and the late answer is metered once, at its delivery, as the tenant's; a second answer is ours", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
@@ -339,29 +363,36 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(outboxes(storage).usage.length === 0, `billed before any answer: ${show(usagePairs(storage))}`);
     check(await o.agent.takeJob(job.id) === null, "a cancelled job was handed out again");
     check(await o.agent.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === true, "the late answer was refused");
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer billed ${show(usagePairs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer metered ${show(usagePairs(storage))}`);
+    check(outboxes(storage).usage.every((r) => r.at === pdJobs(storage)[0]!.answered_at), `not at the delivery: ${show(outboxes(storage).usage)}`);
     check(await o.agent.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === false, "a second delivery was taken");
+    check(show(unacceptedPairs(storage)) === show(Q1_USAGE), `the second answer: ${show(unacceptedPairs(storage))}`);
+    const metered = allUsage(storage);
     for (let i = 0; i < 2; i++) await o.agent.step();
     const again = pdObject(storage);
     await again.agent.step();
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `after more steps and a new object: ${allUsage(storage)}`);
     check(outboxes(storage).trace.length === 0, `trace ${show(outboxes(storage).trace)}`);
+    // Tenant usage that pi.usage never holds: an accepted answer to a cancelled job is not a drift.
+    check(show(pdUsageDrift(storage.sql as never)) === "{}", `drift ${show(pdUsageDrift(storage.sql as never))}`);
     await o.agent.close();
     await again.agent.close();
   });
 
-  add("jobs", "an answer delivered and then cancelled before a poll took it is billed exactly once, whichever got there first", async (storage) => {
+  add("jobs", "an answer delivered and then cancelled before a poll took it is metered exactly once, at its delivery, whichever got there first", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
     const [job] = pdJobs(storage);
     check(job, "no job");
     await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `at the delivery: ${show(usagePairs(storage))}`);
+    const metered = allUsage(storage);
     await o.agent.cancel("cancelled");
     for (let i = 0; i < 2; i++) await o.agent.step();
     const final = pdJobs(storage)[0]!;
     check(final.state === "cancelled" || final.state === "consumed", `job ${show(final)}`);
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))} (job ${final.state})`);
+    check(allUsage(storage) === metered, `metered ${allUsage(storage)} (job ${final.state})`);
     await o.agent.close();
   });
 
@@ -374,7 +405,7 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
   const noModelFailures = (storage: DurableSqlHost) => storage.sql.exec(
     "SELECT COUNT(*) AS n FROM pd_tasks WHERE json_extract(record, '$.state.outcome.error.detail.reason') = 'no_model'").toArray()[0]!.n;
 
-  add("jobs", "the model changes while the call is out and the answer arrives after the run failed no_model: the job is cancelled, and the late answer is billed once, under the model that answered", async (storage) => {
+  add("jobs", "the model changes while the call is out and the answer arrives after the run failed no_model: the job is cancelled, and the late answer is metered once, at its delivery, under the model that answered", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
@@ -387,33 +418,37 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(pdJobs(storage)[0]!.state === "cancelled", `after the no_model failure ${show(pdJobs(storage))}`);
     check(outboxes(storage).usage.length === 0, `billed before any answer: ${show(usagePairs(storage))}`);
     check(await moved.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === true, "the late answer was refused");
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer billed ${show(usagePairs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer metered ${show(usagePairs(storage))}`);
+    const metered = allUsage(storage);
     for (let i = 0; i < 2; i++) await moved.step();
     const again = pdObject(storage);
     await again.agent.step();
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `after more steps and a new object: ${allUsage(storage)}`);
     check(outboxes(storage).usage.every((r) => r.tenantId === "t" && r.agentId === "a"), `usage owner ${show(outboxes(storage).usage)}`);
     await moved.close();
     await again.agent.close();
   });
 
-  add("jobs", "the model changes after the answer arrived and before a poll read it: the no_model commit cancels the job and bills the answer once, under the model that answered", async (storage) => {
+  add("jobs", "the model changes after the answer arrived and before a poll read it: the answer was metered at its delivery, under the model that answered; the no_model commit cancels the job and meters nothing more", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
     const [job] = pdJobs(storage);
     check(job, "no job");
     await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
-    check(outboxes(storage).usage.length === 0, `billed on delivery: ${show(usagePairs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `at the delivery: ${show(usagePairs(storage))}`);
+    const metered = allUsage(storage);
     const moved = rebound(o);
     for (let i = 0; i < 2; i++) await moved.step();
     check(Number(noModelFailures(storage)) === 1, `control: the run did not fail no_model (${noModelFailures(storage)} failures)`);
     check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `the no_model commit metered: ${allUsage(storage)}`);
     check(await moved.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === false, "a second delivery was taken");
+    check(show(usagePairs(storage)) === show(Q1_USAGE) && show(unacceptedPairs(storage)) === show(Q1_USAGE), `after a redelivery: ${allUsage(storage)}`);
+    const after = allUsage(storage);
     const again = pdObject(storage);
     await again.agent.step();
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `after a redelivery and a new object: ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === after, `after a new object: ${allUsage(storage)}`);
     await moved.close();
     await again.agent.close();
   });
@@ -421,7 +456,7 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
   const aborted = (storage: DurableSqlHost) => storage.sql.exec(
     "SELECT COUNT(*) AS n FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.generation' AND json_extract(record, '$.state.outcome.status') = 'aborted'").toArray()[0]!.n;
 
-  add("jobs", "the model changes, then the turn is cancelled before the poll runs, and the answer arrives after: the job is cancelled, never sent again, and the late answer is billed once, under the model that answered", async (storage) => {
+  add("jobs", "the model changes, then the turn is cancelled before the poll runs, and the answer arrives after: the job is cancelled, never sent again, and the late answer is metered once, at its delivery, under the model that answered", async (storage) => {
     const o = pdObject(storage, { redeliveryMs: 1 });
     await o.agent.say("Q1");
     await o.agent.step();
@@ -438,41 +473,46 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(o.dispatched.length === sent, `the cancelled job was sent again: ${show(o.dispatched)}`);
     check(outboxes(storage).usage.length === 0, `billed before any answer: ${show(usagePairs(storage))}`);
     check(await moved.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === true, "the late answer was refused");
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer billed ${show(usagePairs(storage))}`);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `the late answer metered ${show(usagePairs(storage))}`);
+    const metered = allUsage(storage);
     const again = pdObject(storage);
     await again.agent.step();
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `after more steps and a new object: ${allUsage(storage)}`);
     await moved.close();
     await again.agent.close();
   });
 
-  add("jobs", "the answer arrives, the model changes, then the turn is cancelled before a poll read it: the abort's commit cancels the job and bills the answer once", async (storage) => {
+  add("jobs", "the answer arrives, the model changes, then the turn is cancelled before a poll read it: the answer was metered at its delivery; the abort's commit cancels the job and meters nothing more", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
     const [job] = pdJobs(storage);
     check(job, "no job");
     await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `at the delivery: ${show(usagePairs(storage))}`);
+    const metered = allUsage(storage);
     const moved = rebound(o);
     check(await moved.cancel("cancelled") !== null, "nothing was cancelled");
     check(Number(aborted(storage)) === 1, `control: the generation did not end aborted (${aborted(storage)})`);
     check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `the abort metered: ${allUsage(storage)}`);
     for (let i = 0; i < 2; i++) await moved.step();
     const again = pdObject(storage);
     await again.agent.step();
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps and a new object: ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `after more steps and a new object: ${allUsage(storage)}`);
     await moved.close();
     await again.agent.close();
   });
 
-  add("jobs", "a task on poll the scheduler orphans (its record from a newer definition, then cancelled) with the answer in: the job is cancelled and the answer billed once", async (storage) => {
+  add("jobs", "a task on poll the scheduler orphans (its record from a newer definition, then cancelled) with the answer in: the answer was metered at its delivery, the job is cancelled, and nothing more is metered", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
     const [job] = pdJobs(storage);
     check(job, "no job");
     await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `at the delivery: ${show(usagePairs(storage))}`);
+    const metered = allUsage(storage);
     await o.agent.close();
     await o.host.close();
     // A record no registered definition can take: a newer build wrote it (`task_too_old`, src/vendor/pi/pi-durable/dist/harness/scheduler.js `#fit`).
@@ -483,14 +523,16 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     const orphaned = storage.sql.exec("SELECT COUNT(*) AS n FROM pd_tasks WHERE json_extract(record, '$.state.outcome.status') = 'orphaned'").toArray()[0]!.n;
     check(Number(orphaned) === 1, `control: no task was orphaned: ${show(storage.sql.exec("SELECT record FROM pd_tasks").toArray().map((r) => JSON.parse(String(r.record)).state))}`);
     check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `billed ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === metered, `the orphaning metered: ${allUsage(storage)}`);
     check(await next.agent.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id)) === false, "a second delivery was taken");
+    check(show(usagePairs(storage)) === show(Q1_USAGE) && show(unacceptedPairs(storage)) === show(Q1_USAGE), `after a second delivery: ${allUsage(storage)}`);
+    const after = allUsage(storage);
     for (let i = 0; i < 2; i++) await next.agent.step().catch(() => null);
-    check(show(usagePairs(storage)) === show(Q1_USAGE), `after more steps: ${show(usagePairs(storage))}`);
+    check(allUsage(storage) === after, `after more steps: ${allUsage(storage)}`);
     await next.agent.close();
   });
 
-  add("jobs", "cancelJob twice on one answered job: the first bills the answer, the second bills nothing", async (storage) => {
+  add("jobs", "cancelJob twice on one answered job: it marks the job once and meters nothing; the answer's rows are the delivery's", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
@@ -498,15 +540,74 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(job, "no job");
     await consume(o.agent, job.id, replying(SCRIPT[0]!.reply));
     await o.agent.close();
+    const metered = allUsage(storage);
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `control: the delivery metered ${show(usagePairs(storage))}`);
     const ap = new ApStore(storage, prefixedNamespace("ap"));
-    const first = cancelJob(ap, job.id, OWNER, 1);
-    const second = cancelJob(ap, job.id, OWNER, 2);
-    check(show(first.map((r) => [r.key, r.quantity])) === show(Q1_USAGE), `first ${show(first)}`);
-    check(second.length === 0, `the second cancel billed again: ${show(second)}`);
+    cancelJob(ap, job.id);
     check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
+    cancelJob(ap, job.id);
+    check(pdJobs(storage)[0]!.state === "cancelled", `job ${show(pdJobs(storage))}`);
+    check(allUsage(storage) === metered, `a cancel metered: ${allUsage(storage)}`);
   });
 
-  add("trace", "a trace row the commit fails to write: the commit lands and bills, and the error is kept in trace_errors", async (storage) => {
+  add("delivery", "a replayed delivery of the same attempt meters once and answers as the first did; another attempt's answer to the answered job is refused and metered as unaccepted, not as the tenant's", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    check(await o.agent.takeJob(job.id, "attempt-1"), "the job was not handed out");
+    const answer = fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id);
+    check(await o.agent.deliver(job.id, answer, "attempt-1") === true, "the first delivery was refused");
+    check(show(usagePairs(storage)) === show(Q1_USAGE) && unacceptedPairs(storage).length === 0, `after the first: ${allUsage(storage)}`);
+    const metered = allUsage(storage);
+    check(await o.agent.deliver(job.id, answer, "attempt-1") === true, "the replay did not answer as the first did");
+    check(allUsage(storage) === metered, `the replay metered again: ${allUsage(storage)}`);
+    // A second attempt (the sweep resent the job after a take lapsed): a paid call, whose answer the job refuses.
+    check(await o.agent.deliver(job.id, answer, "attempt-2") === false, "a second attempt's answer was taken");
+    check(show(usagePairs(storage)) === show(Q1_USAGE), `the tenant's usage moved: ${show(usagePairs(storage))}`);
+    check(show(unacceptedPairs(storage)) === show(Q1_USAGE), `the refused answer: ${show(unacceptedPairs(storage))}`);
+    const refused = allUsage(storage);
+    check(await o.agent.deliver(job.id, answer, "attempt-2") === false, "the refused attempt's replay was taken");
+    check(allUsage(storage) === refused, `the refused attempt's replay metered again: ${allUsage(storage)}`);
+    await pdTurn(storage, o.agent, null, []);
+    check(allUsage(storage) === refused, `the turn's commit metered: ${allUsage(storage)}`);
+    check(show(pdUsageDrift(storage.sql as never)) === "{}", `drift ${show(pdUsageDrift(storage.sql as never))}`);
+    await o.agent.close();
+  });
+
+  add("delivery", "an answer for a job this pd object does not hold (its row gone) is metered as unaccepted, then UnknownJob", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    storage.sql.exec("DELETE FROM ap_model_jobs WHERE id = ?", job.id);
+    const failed = await o.agent.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id), "attempt-1").then(() => null, (e: unknown) => e);
+    check(failed instanceof UnknownJob, `not UnknownJob: ${String(failed)}`);
+    check(usagePairs(storage).length === 0, `metered as the tenant's: ${show(usagePairs(storage))}`);
+    check(show(unacceptedPairs(storage)) === show(Q1_USAGE), `unaccepted ${show(unacceptedPairs(storage))}`);
+    check(outboxes(storage).usage.every((r) => r.tenantId === "t" && r.agentId === "a"), `owner ${show(outboxes(storage).usage)}`);
+    const metered = allUsage(storage);
+    const replay = await o.agent.deliver(job.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job.id), "attempt-1").then(() => null, (e: unknown) => e);
+    check(replay instanceof UnknownJob && allUsage(storage) === metered, `the replay: ${String(replay)}, ${allUsage(storage)}`);
+    await o.agent.close();
+  });
+
+  add("delivery", "an answer with no usage meters nothing, accepted or not", async (storage) => {
+    const o = pdObject(storage);
+    await o.agent.say("Q1");
+    await o.agent.step();
+    const [job] = pdJobs(storage);
+    check(job, "no job");
+    const given = { ...errorMessage("the model call failed repeatedly and was given up on", MODEL_REF), jobId: job.id } as AnsweredMessage;
+    check(await o.agent.deliver(job.id, given, "attempt-1") === true, "the given-up answer was refused");
+    check(await o.agent.deliver(job.id, given, "attempt-2") === false, "a second answer was taken");
+    check(outboxes(storage).usage.length === 0, `metered ${allUsage(storage)}`);
+    await o.agent.close();
+  });
+
+  add("trace", "a trace row the commit fails to write: the commit lands and the answer is metered once, and the error is kept in trace_errors", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
@@ -522,7 +623,7 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await o.agent.close();
   });
 
-  add("trace", "a trace row the commit fails to write, and keeping the error fails too: the commit still lands and bills", async (storage) => {
+  add("trace", "a trace row the commit fails to write, and keeping the error fails too: the commit still lands and the answer is metered once", async (storage) => {
     const o = pdObject(storage);
     await o.agent.say("Q1");
     await o.agent.step();
@@ -594,12 +695,13 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     await o.agent.close();
   });
 
-  add("replay", "no double billing: steps, new objects and redeliveries after a turn add no row and dispatch nothing", async (storage) => {
+  add("replay", "no double metering: steps and new objects after a turn add no row and dispatch nothing; a redelivery is refused and meters only as unaccepted", async (storage) => {
     const o = pdObject(storage);
     await pdTurn(storage, o.agent, "Q1", [replying(SCRIPT[0]!.reply)]);
-    const rows = show(outboxes(storage));
     const [job] = pdJobs(storage);
     check(await o.agent.deliver(job!.id, fromResponse(SCRIPT[0]!.reply, MODEL_REF, job!.id)) === false, "a redelivery was taken");
+    check(show(usagePairs(storage)) === show(Q1_USAGE) && show(unacceptedPairs(storage)) === show(Q1_USAGE), `after a redelivery: ${allUsage(storage)}`);
+    const rows = show(outboxes(storage));
     for (let i = 0; i < 2; i++) await o.agent.step();
     await o.agent.close();
     for (let i = 0; i < 2; i++) {

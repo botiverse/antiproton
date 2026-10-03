@@ -10,7 +10,7 @@
  * hour a thing happened in, and only for days older than any window the page
  * offers.
  */
-import { pendingUsage, pruneUsage, toHourly, type OutboxRow } from "../../src/usage/outbox.ts";
+import { pendingUsage, pruneUsage, toHourly, UNACCEPTED_TOKENS, type OutboxRow } from "../../src/usage/outbox.ts";
 import { DAY_MS, USAGE_WINDOWS } from "./usage-windows.ts";
 
 // Both live in usage-windows.ts so the page and this parser cannot hold
@@ -192,16 +192,21 @@ export async function usageFirstHours(db: D1Database, tenantId: string): Promise
   // asking usage_hourly alone would report a record that begins later every
   // time a fold runs, and the page would tell a reader that a resource started
   // being counted on a day it was in fact already counted.
+  // Unaccepted model answers are left out, as `readUsage` leaves them out: they are not the tenant's usage.
   const { results } = await db.prepare(
     `SELECT resource, MIN(first) AS first FROM (
        SELECT resource, MIN(hour) AS first FROM usage_hourly WHERE tenant_id = ? GROUP BY resource
        UNION ALL
        SELECT resource, MIN(day) AS first FROM usage_daily WHERE tenant_id = ? GROUP BY resource
-     ) GROUP BY resource`,
-  ).bind(tenantId, tenantId).all();
+     ) WHERE resource <> ? GROUP BY resource`,
+  ).bind(tenantId, tenantId, UNACCEPTED_TOKENS).all();
   return Object.fromEntries((results as any[]).map((r) => [String(r.resource), Number(r.first)]));
 }
 
+/**
+ * The tenant's usage over a window. Unaccepted model answers (`UNACCEPTED_TOKENS`) are left out: they are our cost, not
+ * the tenant's usage (docs/metering.md), and stay in the tables for the operator.
+ */
 export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery):
   Promise<{ rows: UsageReadRow[]; priced: boolean; firstHours: Record<string, number>; partial?: true }> {
   const size = q.bucket === "1d" ? DAY_MS : 3_600_000;
@@ -222,9 +227,10 @@ export async function readUsage(db: D1Database, tenantId: string, q: UsageQuery)
        SELECT (day / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, agent_id, resource, key, unit, quantity
          FROM usage_daily WHERE tenant_id = ? AND day >= ? AND day < ?
      )
+     WHERE resource <> ?
      GROUP BY bucket, ${withAgent ? "agent_id, " : ""}resource, key, unit
      ORDER BY bucket, resource, key, unit`,
-  ).bind(size, size, tenantId, from, q.to, size, size, tenantId, from, q.to).all();
+  ).bind(size, size, tenantId, from, q.to, size, size, tenantId, from, q.to, UNACCEPTED_TOKENS).all();
   const prices = await usagePrices(db);
   const priced = prices.length > 0;
   const firstHours = await usageFirstHours(db, tenantId);
@@ -296,6 +302,7 @@ export async function flushUsage(
 /**
  * One agent's ledger rows with `from <= hour < to`, summed into buckets of `size` ms (UTC), both
  * tables (cf/src/agent-surface/usage.ts reads it; the CASTs are readUsage's, for the same reason).
+ * Unaccepted model answers are left out, as `readUsage` leaves them out.
  */
 export async function readAgentLedger(db: D1Database, tenantId: string, agentId: string, from: number, to: number, size: number):
   Promise<Array<{ bucket: number; resource: string; key: string; unit: string; quantity: number }>> {
@@ -308,9 +315,10 @@ export async function readAgentLedger(db: D1Database, tenantId: string, agentId:
        SELECT (day / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket, resource, key, unit, quantity
          FROM usage_daily WHERE tenant_id = ? AND agent_id = ? AND day >= ? AND day < ?
      )
+     WHERE resource <> ?
      GROUP BY bucket, resource, key, unit
      ORDER BY bucket, resource, key, unit`,
-  ).bind(size, size, tenantId, agentId, from, to, size, size, tenantId, agentId, from, to).all();
+  ).bind(size, size, tenantId, agentId, from, to, size, size, tenantId, agentId, from, to, UNACCEPTED_TOKENS).all();
   return (results as any[]).map((r) => ({
     bucket: Number(r.bucket), resource: String(r.resource), key: String(r.key), unit: String(r.unit), quantity: Number(r.quantity),
   }));

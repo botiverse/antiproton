@@ -62,7 +62,7 @@ export async function converse(host: Host, engine: Engine, script: ScriptedTurn[
         const id = sent[answered++]!;
         const job = await rt.takeJob("demo", "u-a", id) as { model: { api: string; provider: string; id: string } } | null;
         if (!job) continue;
-        await rt.deliverAnswer("demo", "u-a", id, fromResponse({ text: turn.reply, finishReason: "stop", truncated: false, usage: turn.usage }, job.model, id));
+        await rt.deliverAnswer("demo", "u-a", id, fromResponse({ text: turn.reply, finishReason: "stop", truncated: false, usage: turn.usage }, job.model, id), undefined);
       }
       if (out.wakeInMs === null && !(await (await rt.agent("demo", "u-a")).running())) break;
       await sleep(Math.min(out.wakeInMs ?? 0, 2_500));

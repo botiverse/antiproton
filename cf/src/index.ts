@@ -38,8 +38,7 @@ import {
   AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
-import { OpenAiCompatibleModel } from "../../src/model/openai-compatible.ts";
-import { toRequest, fromResponse, errorMessage } from "../../src/model/pi-bridge.ts";
+import { errorMessage } from "../../src/model/pi-bridge.ts";
 import { entriesToEvents } from "./pi-view.ts";
 import { recentBackgroundJobs } from "../../src/runtime/background-jobs.ts";
 import { ensureAgentTables, failedRuns } from "../../src/runtime/pi-agent.ts";
@@ -98,8 +97,7 @@ import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { operatorModelOf } from "./model-request.ts";
-import { operatorRequest } from "../../src/model/operator-request.ts";
+import { callQueuedModel, operatorModelOf } from "./model-request.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
@@ -257,7 +255,8 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
  * that from the outside. A queue does not need noticing: the message is not
  * acked until this returns, so a cancelled invocation is simply redelivered.
  *
- * The request arrives in pi's shape and is converted here rather than by
+ * The request arrives in pi's shape and is converted (`callQueuedModel`,
+ * cf/src/model-request.ts) rather than by
  * importing pi's own provider implementations, which would drag four vendor
  * SDKs into a binary shipped to every tenant. The consumer itself, and what it
  * does with a job id the object does not hold, is cf/src/model-queue.ts.
@@ -265,18 +264,7 @@ export class SandboxTools extends WorkerEntrypoint<Env> {
 function modelQueueDeps(env: Env): ModelQueueDeps {
   return {
     stub: (m) => env.AGENT.get(env.AGENT.idFromString(m.doId)),
-    async call(taken, m) {
-      const job = taken as any;
-      const model = new OpenAiCompatibleModel(operatorRequest(operatorModelOf(env), job.operatorModel ?? env.HARNESS_MODEL));
-      const { messages, tools } = toRequest(job.context);
-      const res = await model.complete(messages, tools ? { tools } : {});
-      const identity = {
-        api: String(job.model?.api ?? "offloaded"),
-        provider: String(job.model?.provider ?? "openai-compatible"),
-        id: String(job.model?.id ?? env.HARNESS_MODEL),
-      };
-      return fromResponse(res, identity, m.jobId);
-    },
+    call: (taken, m) => callQueuedModel(env, taken, m.jobId),
     // A given-up call is still this job's answer, so the entry it becomes names
     // the job like any other (see `jobId` on fromResponse).
     givenUp: (m) => ({
@@ -731,11 +719,11 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   async deliverAnswer(
-    tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs = 0,
+    tenantId: string, agentId: string, jobId: string, answer: unknown, modelMs = 0, taker?: string,
   ): Promise<boolean | UnknownJobReply> {
     const rt = this.#activeRuntime();
     const wrote = await replyingUnknownJob(() => this.#busy("deliver", () =>
-      rt.deliverAnswer(tenantId, agentId, jobId, answer)));
+      rt.deliverAnswer(tenantId, agentId, jobId, answer, taker)));
     if (isUnknownJobReply(wrote)) return wrote;
     if (wrote && modelMs > 0) {
       this.#note(Date.now() - modelMs, modelMs, "offload_provider");

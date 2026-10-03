@@ -27,9 +27,10 @@
  *   Two `DurableAgent`s — two sessions, or the same one rebuilt after the
  *   catalogue changed — share the harness, the step in flight and the job
  *   table. Two harnesses on one storage would run the same task twice.
- * - The usage and trace outbox rows that pi 0.85 writes inside its commit are
- *   written inside pi-durable's commit too, by the vendored storage's commit hook
- *   (`bookCommit`, src/runtime/pd-outbox.ts).
+ * - The trace outbox rows that pi 0.85 writes inside its commit are written
+ *   inside pi-durable's commit too, by the vendored storage's commit hook
+ *   (`bookCommit`, src/runtime/pd-outbox.ts). Usage is not: a model call is
+ *   metered when its answer is delivered (`deliver`, docs/metering.md).
  * - A function the Agents API caller runs itself is a tool that records its call
  *   in the conversation's `ap.clientCalls` document and waits on that document
  *   (`clientTool`, src/runtime/durable-tools.ts). A harness whose only pending work
@@ -64,7 +65,7 @@ import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { MODEL_CALL_DEADLINE_MS } from "../model/openai-compatible.ts";
 import { logEvent } from "../core/log.ts";
 import { ApStore, type ApSqlHost } from "../store/ap-store.ts";
-import { bookCommit, cancelJob, strandedAnswerRows } from "./pd-outbox.ts";
+import { bookCommit, cancelJob, deliveryRows } from "./pd-outbox.ts";
 import { appendUsage } from "../usage/outbox.ts";
 import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteSyncExecutor } from "../vendor/pi/pi-durable/dist/storage/sqlite/storage.js";
@@ -109,6 +110,12 @@ const TAKE_HOLD_MS = MODEL_CALL_DEADLINE_MS + 60_000;
  * comes back at its redelivery instead when that is sooner (`PdHost.redeliveryDue`).
  */
 export const POLL_BACKSTOP_MS = 300_000;
+
+/**
+ * How long a metered delivery attempt is remembered (`ap_deliveries`, `PdHost.deliver`): a replay of the same attempt's
+ * RPC comes within the call's own retries, minutes at most, so a day is far past it.
+ */
+const DELIVERIES_KEEP_MS = 24 * 60 * 60_000;
 
 /** How long a staged job waits for the commit that records it before it is forgotten (`PdHost.#staged`). */
 const STAGED_MS = 10 * 60_000;
@@ -530,16 +537,11 @@ export class PdHost {
 
   /**
    * pi-durable cancels a polling generation's job when the generation is aborted. The row is marked, not deleted:
-   * the worker may already be carrying it, and its answer is spend. An answer already delivered, which no commit
-   * will now append, is billed here, in the same transaction as the mark; one delivered later is billed by `deliver`.
+   * the worker may already be carrying it, and its answer is still delivered, accepted and metered (`deliver`).
    */
   async #dropJob(id: string): Promise<void> {
     this.#staged.delete(id);
-    const owner = this.#bound();
-    const ap = await this.#store();
-    this.#opts.storage.transactionSync(() => {
-      appendUsage(this.#opts.storage.sql as never, cancelJob(ap, id, { tenantId: owner.tenantId, agentId: owner.agentId }, this.#now()));
-    });
+    cancelJob(await this.#store(), id);
   }
 
   /**
@@ -617,21 +619,37 @@ export class PdHost {
   /**
    * The worker's answer. False when one is already in. Writing it is what the next poll reads, and when the
    * harness is open the task waiting for it is woken now. When it is not, the caller wakes the object
-   * (cf/src/index.ts `deliverAnswer`), and that step's `drive` wakes the task. An answer to a job
-   * that was cancelled is read by no poll, so its usage is billed here, in the transaction that stores it.
+   * (cf/src/index.ts `deliverAnswer`), and that step's `drive` wakes the task.
+   *
+   * Every delivery is a paid call, and is metered here, in the transaction that decides it (docs/metering.md): the
+   * job's first answer as the tenant's usage, whatever then becomes of the job; a second answer, or one for a job id
+   * with no row (then `UnknownJob`), as unaccepted. `taker` names the attempt (`takeJob`): a delivery replayed under the
+   * same taker returns the first one's verdict and meters nothing. Without one, each delivery is a call of its own.
    */
-  async deliver(id: string, answer: AnsweredMessage): Promise<boolean> {
+  async deliver(id: string, answer: AnsweredMessage, taker?: string): Promise<boolean> {
     const json = JSON.stringify(answer);
     const now = this.#now();
     const owner = this.#bound();
     const ap = await this.#store();
     // One statement decides it, so two deliveries cannot both see the row unanswered.
-    const won = this.#opts.storage.transactionSync(() => {
-      const [row] = ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING state", json, now, id);
-      if (row?.state === "cancelled") appendUsage(this.#opts.storage.sql as never, strandedAnswerRows(owner, now, json));
-      return row !== undefined;
+    type Verdict = "accepted" | "refused" | "unknown";
+    const verdict = this.#opts.storage.transactionSync((): Verdict => {
+      if (taker !== undefined) {
+        const [seen] = ap.query("SELECT verdict FROM deliveries WHERE job_id = ? AND taker = ?", id, taker);
+        if (seen) return seen.verdict as Verdict;
+      }
+      const won = ap.query("UPDATE model_jobs SET answer = ?, answered_at = ? WHERE id = ? AND answer IS NULL RETURNING id", json, now, id).length > 0;
+      const verdict = won ? "accepted" : ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length > 0 ? "refused" : "unknown";
+      appendUsage(this.#opts.storage.sql as never, deliveryRows(owner, now, answer, won));
+      if (taker !== undefined) {
+        ap.query("DELETE FROM deliveries WHERE at < ?", now - DELIVERIES_KEEP_MS);
+        ap.query("INSERT INTO deliveries (job_id, taker, verdict, at) VALUES (?, ?, ?, ?)", id, taker, verdict, now);
+      }
+      if (!won) logEvent("pd.jobs.unaccepted", { tenantId: owner.tenantId, agentId: owner.agentId, jobId: id, verdict });
+      return verdict;
     });
-    if (won) {
+    if (verdict === "unknown") throw owner.unknownJob(id);
+    if (verdict === "accepted") {
       const open = this.#harness;
       if (open) {
         // The answer is durable: a wake that fails (the harness closed under it) leaves it to the next step's.
@@ -640,7 +658,6 @@ export class PdHost {
       }
       return true;
     }
-    if (ap.query("SELECT 1 AS found FROM model_jobs WHERE id = ?", id).length === 0) throw owner.unknownJob(id);
     return false;
   }
 }
@@ -973,7 +990,7 @@ export class DurableAgent implements AgentEngine {
 
   releaseJob(id: string, taker: string): Promise<boolean> { return this.#host.releaseJob(id, taker); }
 
-  deliver(id: string, answer: AnsweredMessage): Promise<boolean> { return this.#host.deliver(id, answer); }
+  deliver(id: string, answer: AnsweredMessage, taker?: string): Promise<boolean> { return this.#host.deliver(id, answer, taker); }
 
   /** Closes the object's harness, which every session shares. Safe at any point: a reopened one resumes each task from its checkpoint. */
   close(): Promise<void> { return this.#host.close(); }

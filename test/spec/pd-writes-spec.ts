@@ -163,7 +163,7 @@ export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
       await rt.deliverAnswer(T, A, id, {
         role: "assistant", content, api: job.model?.api ?? "x", provider: job.model?.provider ?? "x", model: "m1",
         usage: USAGE, stopReason: stop, timestamp: 0,
-      });
+      }, undefined);
     },
     /** Step until nothing is open and nothing asks to be woken soon. */
     async settle(maxPasses = 100) {

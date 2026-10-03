@@ -5,6 +5,7 @@
 | [`agents-api.md`](agents-api.md) | OpenAI Agents API compatibility guide, SDK configuration, and endpoint reference | yes — preview API guide |
 | [`agent-surface.md`](agent-surface.md) | an agent's usage and workspace files: the three read-only endpoints on `/v1` and their Raft provider binding | yes — endpoint contract |
 | [`ax-design.md`](ax-design.md) | Agent Experience (AX) architecture: how official apps talk to agents in two layers, premise tracking, and structured interruptions | yes — design specification |
+| [`metering.md`](metering.md) | how a model call is metered on the pd engine: at delivery, verdict markers for unaccepted answers, and the drift check against pi-durable's `pi.usage` | yes — metering contract |
 | [`plugins.md`](plugins.md) | how to write, configure, observe, and test plugins in Antiproton | yes — plugin authoring guide |
 | [`philosophy.md`](philosophy.md) | the core philosophy, engineering invariants, and distributed systems rationale behind antiproton | yes — design manifesto |
 | [`pi-upstream.md`](pi-upstream.md) | how to stay in sync with pi — the seams, the copied source, the contracts no type expresses, the deliberate divergences, and the upgrade checklist | yes, for anything pi-related |

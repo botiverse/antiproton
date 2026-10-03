@@ -153,7 +153,7 @@ export function readPdModelJobs(sql: ReadSql, limit: number): Array<{ id: string
 /**
  * The model jobs still owed an answer, as the engine counts them (`PdHost`, src/runtime/durable-agent.ts: `answer IS
  * NULL AND state IS NULL`). A job whose generation was aborted keeps its row with no answer, so that a late answer is
- * still billed (src/store/ap-store.ts); it is `cancelled`, and nothing waits on it.
+ * still accepted and metered (src/store/ap-store.ts); it is `cancelled`, and nothing waits on it.
  */
 export function pdOutstandingJobs(sql: ReadSql): number {
   if (!tableExists(sql, prefixedNamespace("ap").qualify("model_jobs", "table"))) return 0;
