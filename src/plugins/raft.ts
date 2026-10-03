@@ -13,6 +13,9 @@ import { interrupt, originProblem, type ActivityEvent, type InboundEvent, type I
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
+/** The SDK's own page size, named here so the tool's description cannot disagree with it. */
+const DEFAULT_CHANNEL_PAGE = 50;
+const MAX_CHANNELS = 200;
 /**
  * Raft's push is a NOTICE that the inbox changed — the same "Inbox update" text
  * Raft's daemon injects into a managed agent — never the messages (tygg,
@@ -492,7 +495,7 @@ export const raftPlugin: Plugin = {
     required: true,
     summary: "A Raft agent credential for the agent account this mount represents.",
     shape: "token",
-    grants: "Send messages, receive queued events, join visible channels, and post action cards as that Raft agent.",
+    grants: "Send messages, receive queued events, list and join visible channels, see their members, and post action cards as that Raft agent.",
     looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
   },
   tools: [
@@ -604,6 +607,32 @@ export const raftPlugin: Plugin = {
       // Each call posts a card; a repeat posts another.
       sideEffects: "write",
       idempotency: "none",
+    },
+    {
+      name: "list_channels",
+      summary: "List the Raft server's channels you can see, one page at a time: each line is the channel, whether it is public " +
+        "or private, whether you have joined it, and its description. While hasMore is true, call again with nextOffset as offset.",
+      parameters: {
+        type: "object", additionalProperties: false,
+        properties: {
+          offset: { type: "integer", minimum: 0, description: "Rows to skip; 0 is the first page." },
+          limit: { type: "integer", minimum: 1, maximum: MAX_CHANNELS, description: `Rows per page; ${DEFAULT_CHANNEL_PAGE} when omitted.` },
+          joined: { type: "boolean", description: "Only the channels you have joined." },
+        },
+      },
+      sideEffects: "read",
+      idempotency: "native",
+    },
+    {
+      name: "channel_members",
+      summary: "List the agents and humans in a Raft channel, with their server role (owner/admin) where they have one.",
+      parameters: {
+        type: "object", additionalProperties: false,
+        properties: { target: { type: "string", description: "A channel such as #engineering; a DM (dm:@name) or thread target also works." } },
+        required: ["target"],
+      },
+      sideEffects: "read",
+      idempotency: "native",
     },
     {
       name: "push_status",
@@ -820,6 +849,40 @@ export const raftPlugin: Plugin = {
         note: "Nothing has happened yet. A person confirms the card in Raft, acting with their own permissions. " +
           "You are not told when that happens; if it matters, check for its effect later.",
       };
+    }
+    if (name === "list_channels") {
+      const offset = integer(a.offset, "offset", 0, Number.MAX_SAFE_INTEGER) ?? 0;
+      const limit = integer(a.limit, "limit", 1, MAX_CHANNELS) ?? DEFAULT_CHANNEL_PAGE;
+      if (a.joined !== undefined && typeof a.joined !== "boolean") throw new Error("joined must be true or false");
+      const joined = a.joined === true;
+      const out = await raftFor(ctx).server.info({ view: "channels", offset, limit, ...(joined ? { joined } : {}) });
+      if (!out.ok) throw sdkFailure(out);
+      // The SDK fetches the whole server and pages it itself; only the page goes on, never the agent and
+      // human lists that came with it.
+      const page = out.data.page;
+      const nextOffset = page && page.offset + page.limit < page.total ? page.offset + page.limit : null;
+      // The SDK's text is the CLI's, and its "More:" line names `raft server info`, a command this mount has
+      // no tool for; it is put in this tool's terms where it stands. Not found means the SDK's wording changed,
+      // and the test asserting the whole line goes red on that upgrade.
+      const cli = page?.nextCommand ? `More: ${page.nextCommand}` : null;
+      const ours = nextOffset !== null
+        ? `More: call list_channels with offset ${nextOffset}, limit ${page!.limit}${joined ? ", joined true" : ""}.`
+        : null;
+      let listing = out.text.trim();
+      if (ours) listing = cli && listing.includes(cli) ? listing.replace(cli, ours) : `${listing}\n${ours}`;
+      return {
+        text: listing,
+        total: page?.total ?? 0,
+        hasMore: nextOffset !== null,
+        ...(nextOffset !== null ? { nextOffset } : {}),
+      };
+    }
+    if (name === "channel_members") {
+      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required, for example #engineering");
+      const out = await raftFor(ctx).channels.members({ target: a.target });
+      if (!out.ok) throw sdkFailure(out);
+      // The SDK's text, which is the CLI's: agents and humans in their own sections, server role as a label.
+      return { target: a.target, text: out.text.trim() };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);

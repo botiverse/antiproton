@@ -532,6 +532,100 @@ await check("join refuses DMs and thread targets before reaching Raft", async ()
   }
 });
 
+/** The Server's overview as `GET /internal/agent-api/server` answers it: the SDK pages its channels itself. */
+function server(channels: unknown[]) {
+  return json(200, {
+    runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels,
+    agents: [{ name: "other-agent", status: "online" }], humans: [{ name: "tygg", role: "owner" }],
+  });
+}
+const CHANNELS = [
+  { id: "c1", name: "general", joined: true, type: "channel", description: "Everyone" },
+  { id: "c2", name: "secret", joined: true, type: "private" },
+  { id: "c3", name: "eng", joined: false, type: "channel" },
+];
+
+await check("list_channels and channel_members are reads that repeat safely", async () => {
+  for (const name of ["list_channels", "channel_members"]) {
+    const tool = raftPlugin.tools.find((x) => x.name === name);
+    if (tool?.sideEffects !== "read" || tool.idempotency !== "native" || tool.replay !== undefined) {
+      throw new Error(`${name} declaration: ${JSON.stringify(tool)}`);
+    }
+  }
+});
+
+await check("list_channels passes offset and limit to the SDK and says how to get the next page in its own terms", async () => {
+  const calls = one(server(CHANNELS));
+  const first = await raftPlugin.invoke("list_channels", { limit: 2 }, ctx()) as any;
+  const lines = String(first.text).split("\n");
+  const want = [
+    "#general [public, joined] — Everyone",
+    "#secret [private, joined]",
+    "Showing 1-2 of 3.",
+    "More: call list_channels with offset 2, limit 2.",
+  ];
+  if (lines[0] !== "## Server Channels" || JSON.stringify(lines.slice(-4)) !== JSON.stringify(want)) throw new Error(`first page: ${first.text}`);
+  if (first.hasMore !== true || first.nextOffset !== 2 || first.total !== 3) throw new Error(JSON.stringify(first));
+  if (/raft server info/.test(first.text)) throw new Error(`names a CLI command this mount lacks: ${first.text}`);
+  if (/other-agent|tygg/.test(JSON.stringify(first))) throw new Error(`the server's member lists leaked: ${JSON.stringify(first)}`);
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/server" || calls[0]!.init.method !== "GET") throw new Error(`request: ${calls[0]!.url}`);
+
+  one(server(CHANNELS));
+  const last = await raftPlugin.invoke("list_channels", { offset: 2, limit: 2 }, ctx()) as any;
+  if (!String(last.text).endsWith("#eng [public, not joined]\nShowing 3-3 of 3.") || /#general|More:/.test(last.text) ||
+      last.hasMore !== false || "nextOffset" in last) {
+    throw new Error(`last page: ${JSON.stringify(last)}`);
+  }
+
+  one(server(CHANNELS));
+  const joined = await raftPlugin.invoke("list_channels", { joined: true, limit: 1 }, ctx()) as any;
+  if (!String(joined.text).endsWith("#general [public, joined] — Everyone\nShowing 1-1 of 2.\nMore: call list_channels with offset 1, limit 1, joined true.") ||
+      /#eng/.test(joined.text)) {
+    throw new Error(`joined only: ${joined.text}`);
+  }
+});
+
+await check("list_channels on a server with no visible channels says none, and that there is nothing more", async () => {
+  one(server([]));
+  const out = await raftPlugin.invoke("list_channels", {}, ctx()) as any;
+  if (!String(out.text).endsWith("(none)\nShowing 0-0 of 0.") || out.hasMore !== false || out.total !== 0 || /More:/.test(out.text)) {
+    throw new Error(JSON.stringify(out));
+  }
+});
+
+await check("list_channels refuses a bad page before reaching Raft", async () => {
+  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
+  for (const args of [{ offset: -1 }, { limit: 0 }, { limit: 201 }, { offset: 1.5 }, { joined: "yes" }]) {
+    const why = await failure(() => raftPlugin.invoke("list_channels", args, ctx()));
+    if (!/offset must|limit must|joined must/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
+  }
+});
+
+await check("channel_members lists agents and humans with their role labels, asking for the channel named", async () => {
+  const calls = one(json(200, {
+    channel: { ref: "#launch-room", type: "channel" },
+    agents: [{ name: "piper", status: "online" }],
+    humans: [{ name: "tygg", role: "owner", description: "runs it" }, { name: "bo", role: "member" }],
+  }));
+  const out = await raftPlugin.invoke("channel_members", { target: "#launch-room" }, ctx()) as any;
+  const want = [
+    "## Channel Members", "", "Channel: #launch-room (channel)", "Members means join/post authority for this surface.", "",
+    "### Agents", "Server and stored channel roles are shown separately when available.", "  - @piper (online)", "",
+    "### Humans", "Server and stored channel roles are shown separately when available.", "  - @tygg (owner) — runs it", "  - @bo",
+  ];
+  if (out.target !== "#launch-room" || JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want)) throw new Error(out.text);
+  if (calls[0]!.url !== "https://raft.example/internal/agent-api/channel-members?channel=%23launch-room") throw new Error(`request: ${calls[0]!.url}`);
+  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
+  const why = await failure(() => raftPlugin.invoke("channel_members", { target: " " }, ctx()));
+  if (!/target is required/.test(why.message)) throw why;
+});
+
+await check("channel_members passes Raft's refusal on as a failure that landed nothing", async () => {
+  one(json(404, { error: "channel not found", code: "NOT_FOUND" }));
+  const why = await failure(() => raftPlugin.invoke("channel_members", { target: "#nowhere" }, ctx()));
+  if (why.mayHaveLanded === true || why.retryable === true) throw new Error(`a read claimed it may have landed: ${why.message}`);
+});
+
 await check("the mount setting cannot redirect a credential to a path or embedded user", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
   for (const serverUrl of ["https://evil.example/path", "https://user@evil.example", "file:///tmp/socket"]) {
