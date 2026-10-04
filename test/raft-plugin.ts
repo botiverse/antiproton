@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
@@ -1645,6 +1645,82 @@ await check("what a person wrote is never rewritten: message continuations, desc
   if (!/^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \(`actions_prepare`\)\.$/m.test(full)) throw new Error(`overview: ${full}`);
 });
 
+/**
+ * Text shaped as `offeredTerms`'s own placeholder (`<index>`, private-use characters) and its escape
+ * (``): an index that will exist, one that will not, one inside another, and the escape's forms, old and new. Then
+ * the two that an escape writing a word character got wrong: a mark right before the rest of an unoffered tool's name,
+ * which such an escape completed into a call (`` + `ttachments_download_url`), and a mark right before a whole
+ * one, which is a person's call and stays theirs.
+ */
+const MARKS = ["0", "99", "0", "ab", "",
+  "ttachments_download_url({ id: 1 })", "tasks_delete({})", "tasks_delete({})"];
+/** A tool name this mount does not offer, where `offeredTerms` would see one (its `unofferedPattern`). */
+const UNOFFERED_AT = new RegExp(`(?<![\\w.])(?:${NOT_OFFERED.join("|")})(?![\\w])`, "g");
+
+await check("a person's text shaped as offeredTerms' placeholder comes back byte-identical: messages_read, tasks_list, a search preview", async () => {
+  // Each mark in its own message, title and result, so one person's call nearby cannot set aside another's mark.
+  const said = MARKS.map((m) => `marks ${m} end`);
+  const results = (contents: string[]) => contents.map((content, i) => ({ id: `r-${i}`, seq: i + 1, channelId: "c", threadId: null,
+    parentMessageId: null, parentMessageContent: null, parentChannelId: "c", parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null,
+    senderId: "s", senderType: "human", senderName: "tygg", channelName: "ops", channelType: "channel", channelArchivedAt: null, content, snippet: "marks",
+    createdAt: "2026-09-21T10:00:00.000Z" }));
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    // First, a person's call at a tool this mount does not offer, so something is set aside and index 0 exists.
+    if (path === "/history") return history([historyMessage(41, "run inbox_check({}) now"), ...said.map((m, i) => historyMessage(42 + i, m))], { target: "#ops" });
+    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: "fix inbox_check({}) now", description: null },
+      ...said.map((title, i) => ({ taskNumber: 8 + i, status: "todo", title, description: null }))] });
+    if (path === "/search") return json(200, { results: results(["run inbox_check({}) now", ...said]), hasMore: false });
+    return json(404, { error: "not found" });
+  }) as any;
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool" });
+  const problems: string[] = [];
+  for (const [tool, args] of [["messages_read", { target: "#ops" }], ["tasks_list", { target: "#ops" }], ["messages_search", { query: "marks" }]] as const) {
+    const op = GENERATED.find((o) => o.toolName === tool)!;
+    const sdk = String(((await raw.invoke(op.name, { ...args, ...(pagingArg(op) ? { limit: PAGE_ROWS } : {}) }, { origin: "code" })) as any).text);
+    // Control: the SDK prints every mark as the person wrote it, on the lines compared below.
+    // (A search preview marks the hit: `<match>marks</match>`.)
+    const lines = sdk.split("\n").filter((l) => / end$/.test(l) && l.includes("marks"));
+    const missing = MARKS.filter((m) => !lines.some((l) => l.includes(` ${m} end`)));
+    if (missing.length) { problems.push(`${tool}: control: the SDK did not print ${JSON.stringify(missing)}`); continue; }
+    const shown = String(((await raftPlugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
+    for (const line of lines) if (!shown.includes(line)) problems.push(`${tool}: ${JSON.stringify(line)} came back otherwise`);
+  }
+  if (problems.length) throw new Error(problems.join(" | "));
+  // Directly, with nothing set aside and with a quoted form set aside: byte-identical either way, and a hint still in
+  // words. A mark is quoted, as the plugin quotes a person's string, only when it names an unoffered tool as written.
+  for (const m of said) {
+    for (const extra of [[], ["run inbox_check({}) now"]]) {
+      const quoted = [...(m.match(UNOFFERED_AT) ? [m] : []), ...extra];
+      // The hint is not the person's call, which a quoted form would leave alone (`offeredTerms`).
+      const text = `run inbox_check({}) now\n${m}\nnext: inbox_check({ limit: 5 })`;
+      const out = offeredTerms(text, new Set(NOT_OFFERED), quoted);
+      if (out !== `${extra.length ? "run inbox_check({}) now" : "run receive_events() now"}\n${m}\nnext: receive_events()`) throw new Error(JSON.stringify(out));
+    }
+  }
+});
+
+await check("escapeMarks round-trips, and never adds or removes a place offeredTerms sees an unoffered tool: thousands of seeded strings", async () => {
+  // mulberry32: the same strings every run, so a failure names a string that fails again.
+  let seed = 0x5eed;
+  const random = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const alphabet = ["", "", "", "", "", "a", "b", "t", "x", "_", "-", ".", " ", "0", "9", "(", ")", "{", "}", "\n",
+    "attachments_download_url", "ttachments_download_url", "tasks_delete", "asks_delete", "inbox_check", "nbox_check", "mentions_add"];
+  // How many, and which, in order: escaping moves where they stand but must not add, drop or change one.
+  const at = (s: string) => [...s.matchAll(UNOFFERED_AT)].map((m) => m[0]).join(",");
+  let seen = 0;
+  for (let n = 0; n < 5000; n++) {
+    const s = Array.from({ length: Math.floor(random() * 24) }, () => alphabet[Math.floor(random() * alphabet.length)]).join("");
+    const e = escapeMarks(s);
+    if (unescapeMarks(e) !== s) throw new Error(`round trip: ${JSON.stringify(s)} came back ${JSON.stringify(unescapeMarks(e))}`);
+    if (e.includes("")) throw new Error(`a placeholder opener survived escaping: ${JSON.stringify(s)}`);
+    if (at(e) !== at(s)) throw new Error(`escaping changed where an unoffered tool is seen: ${JSON.stringify(s)} → ${JSON.stringify(e)}`);
+    if (/[]/.test(s)) seen++;
+  }
+  // Control: most strings carried a character the escape rewrites.
+  if (seen < 2500) throw new Error(`control: only ${seen} strings carried a mark`);
+});
+
 await check("nothing inside a search preview is rewritten: a hit marked inside a call, a person's literal <match>, a forged </preview>", async () => {
   const contents = [
     'please run mentions_execute({ action: "notify", resolutionIds: ["r-1"] }) for the deploy',
@@ -1664,11 +1740,17 @@ await check("nothing inside a search preview is rewritten: a hit marked inside a
   }
   const ours = String(((await raftPlugin.invoke("messages_search", { query: "notify" }, inTurn(ctx()))) as any).text);
   if (ours !== sdk.trim()) throw new Error(`the previews were rewritten:\n${ours}`);
-  // Positive control: the same text with an SDK hint outside the preview still has the hint put in words — the 0.11.0 add
-  // hint, at a tool this mount does not offer (`NOT_OFFERED`, the tool names of `EXCLUDED`).
+  // Positive control, which also pins where a preview ends: the same text with an SDK hint BETWEEN two results, outside
+  // both previews, has the hint put in words and both previews as they were. The hint is the 0.11.0 add hint, at a tool
+  // this mount does not offer (`NOT_OFFERED`, the tool names of `EXCLUDED`). The line before it names the tag mid-line,
+  // which is not a preview's opening line: a block runs from a line that is exactly `<preview>` to the first line that
+  // is exactly `</preview>`, and neither one reaching across results nor one opened mid-line may swallow the hint.
   if (!NOT_OFFERED.includes("mentions_add")) throw new Error(`control: mentions_add is offered: ${NOT_OFFERED.join(", ")}`);
-  const hinted = offeredTerms(`${sdk}\n  add: mentions_add({ resolutionIds: ["r-2"] })`, new Set(NOT_OFFERED));
-  if (!hinted.endsWith("  add: adding them to the conversation, which this mount does not offer") || !hinted.startsWith(sdk)) throw new Error(hinted);
+  const cut = sdk.indexOf("</result>\n") + "</result>\n".length;
+  if (cut < "</result>\n".length || (sdk.slice(cut).match(/^<preview>$/gm) ?? []).length < 2) throw new Error(`control: no two results after the first: ${sdk}`);
+  const between = (hint: string) => `${sdk.slice(0, cut)}this line names a <preview>\n${hint}\n${sdk.slice(cut)}`;
+  const hinted = offeredTerms(between('  add: mentions_add({ resolutionIds: ["r-2"] })'), new Set(NOT_OFFERED));
+  if (hinted !== between("  add: adding them to the conversation, which this mount does not offer")) throw new Error(hinted);
 });
 
 /** The preview line of the windowed result, as the SDK printed it (for the control that it was cut). */
