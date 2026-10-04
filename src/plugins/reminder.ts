@@ -22,7 +22,7 @@
  */
 import { clip, logEvent } from "../core/log.ts";
 import type { Json } from "../core/types.ts";
-import { identityNote, markIdentity } from "./types.ts";
+import { originProblem } from "./types.ts";
 import type { InboundEvent, InboundResult, Plugin, PluginContext, PluginErrorFields, ToolSchema } from "./types.ts";
 
 // ---- the reminder-app boundary
@@ -46,10 +46,10 @@ export interface ServiceReminder {
   createdAt: number | null;
 }
 
-/** What a call to reminder-app needs from the mount. */
+/** What a call to reminder-app needs: the deployment's origin and credential, and the agent it acts for. */
 export interface ReminderConnection {
   baseUrl: string;
-  /** The deployment's client credential (`rmc.<clientId>.<secret>`); resolved server-side, never shown to the model. */
+  /** The deployment's client credential (`rmc.<clientId>.<secret>`), given to the plugin when it is built; never shown to the model. */
   credential: string;
   /** The agent the call acts for (`X-Reminder-Subject`): always {@link subjectOf} the call's context. */
   subject: string;
@@ -61,8 +61,11 @@ export interface ReminderConnection {
  * stands in for the whole service. Failures are {@link ReminderServiceError}s; the plugin reads their `code`.
  */
 export interface ReminderService {
-  /** Whether the credential and subject are accepted: the subject's hooks, read and dropped. For `checkCredential`. */
-  check(conn: ReminderConnection): Promise<void>;
+  /**
+   * The subject's registrations, as reminder-app shows them: the id and the URL's origin, never the URL (its path may
+   * carry a token). For telling, after an uncertain register, whether that register landed.
+   */
+  listHooks(conn: ReminderConnection): Promise<Array<{ hookId: string; origin: string }>>;
   /** Register a push URL and the secret it signs with; reminder-app's id for the registration. */
   register(conn: ReminderConnection, hook: { url: string; secret: string }): Promise<{ hookId: string }>;
   /** Make one reminder. The same `requestId` and body make one reminder however often they are sent. */
@@ -156,8 +159,8 @@ export function httpReminderService(): ReminderService {
       throw new ReminderServiceError("refused", "reminder-app did not accept this deployment's client credential (unknown, rotated or revoked); whoever deploys has to configure a current one");
     }
     if (response.status === 403) {
-      // TODO(reminder-app): a Raft agent cannot register hooks or create webhook-targeted reminders
-      // (webhook-delivery.md, "Authentication"), and the document names no code for that refusal; until it does,
+      // TODO(reminder-app#7): a Raft agent cannot register hooks or create webhook-targeted reminders
+      // (webhook-delivery.md, "Authentication"); reminder-app#7 gives that refusal its own error.code. Until it lands,
       // every 403 that is not the switched-off client is read as that refusal.
       if (said === CLIENT_SWITCHED_OFF) throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet");
       throw new ReminderServiceError("refused", `reminder-app refused this agent${said ? ` (${said})` : ""}; an agent with a Raft identity sets reminders with Raft's own reminder tools instead`);
@@ -166,8 +169,11 @@ export function httpReminderService(): ReminderService {
     throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP ${response.status})${said ? `: ${said}` : ""}`);
   }
   return {
-    async check(conn) {
-      await call(conn, "GET", ROUTES.hooks);
+    async listHooks(conn) {
+      const { result } = await call(conn, "GET", ROUTES.hooks);
+      return Array.isArray(result?.hooks)
+        ? result.hooks.filter((h: any) => typeof h?.hookId === "string" && typeof h?.origin === "string").map((h: any) => ({ hookId: h.hookId, origin: h.origin }))
+        : [];
     },
     async register(conn, hook) {
       const { result } = await call(conn, "POST", ROUTES.hooks, { url: hook.url, secret: hook.secret });
@@ -218,10 +224,11 @@ function reminderOf(r: any): ServiceReminder | null {
 // ---- who the calls are for
 
 /**
- * The subject a call names: the agent, as this deployment identifies it. Both halves, because an agent id is unique
- * only within its tenant (one Durable Object per pair, cf/src/object-name.ts): two tenants' agents with one id would
- * otherwise share reminders and hooks at reminder-app, which trusts the subject it is told. Neither id may contain a
- * colon there, so no two pairs make one subject, and the result fits reminder-app's 1-200 of `[A-Za-z0-9_.:@-]`.
+ * The subject a call names: the agent, as this deployment identifies it — tenant and agent, the pair the codebase
+ * addresses an agent by everywhere (`loadAgent`, `agentObjectName` in cf/src/object-name.ts). The subject is an
+ * identifier handed to a third party that trusts it and keys every reminder and hook by it, so it carries the agent's
+ * whole identity rather than depending on today's agent ids happening to be unique on their own. Neither id may
+ * contain a colon, so no two pairs make one subject, and the result fits reminder-app's 1-200 of `[A-Za-z0-9_.:@-]`.
  * From the call's context only, never from a tool argument.
  */
 export function subjectOf(ctx: Pick<PluginContext, "caller">): string {
@@ -386,15 +393,28 @@ export function dueTime(a: Record<string, unknown>, now: number): { due: number;
   return { due, schedule };
 }
 
-function connection(ctx: PluginContext): ReminderConnection {
-  const baseUrl = ctx.publicConfig.serviceUrl;
-  if (typeof baseUrl !== "string" || !baseUrl) throw new Error("this mount has no serviceUrl setting; its operator sets reminder-app's origin");
-  if (!ctx.credential) {
-    throw markIdentity(new Error(`reminder-app needs this deployment's client credential and the call has none: ${identityNote(ctx)}`), ctx);
-  }
+/**
+ * What the deployment gives every mount: reminder-app's origin and this deployment's client credential, both from
+ * the Worker's configuration (`REMINDER_APP_ORIGIN`, `REMINDER_APP_CREDENTIAL`), handed to the plugin when it is
+ * built. Neither is a mount setting: a mount can be added from the console, and a credential sent wherever a
+ * setting pointed would go wherever whoever typed the setting chose.
+ */
+export interface ReminderDeployment {
+  serviceUrl: string | null;
+  clientCredential: string | null;
+}
+
+export const NO_CREDENTIAL = "this deployment has no reminder-app credential configured; nothing was sent";
+export const NO_ORIGIN = "this deployment has no reminder-app origin configured; nothing was sent";
+
+function connection(ctx: PluginContext, deployment: ReminderDeployment): ReminderConnection {
+  if (!deployment.clientCredential) throw new Error(NO_CREDENTIAL);
+  // Checked as a mount's origin setting would be: https, no path, written as the origin. The deployment's own value,
+  // but it is where the credential goes.
+  if (!deployment.serviceUrl || originProblem(deployment.serviceUrl)) throw new Error(NO_ORIGIN);
   const t = ctx.publicConfig.timeoutMs;
   const timeoutMs = typeof t === "number" && Number.isFinite(t) ? Math.min(60_000, Math.max(1_000, t)) : DEFAULT_TIMEOUT_MS;
-  return { baseUrl, credential: ctx.credential, subject: subjectOf(ctx), timeoutMs };
+  return { baseUrl: deployment.serviceUrl, credential: deployment.clientCredential, subject: subjectOf(ctx), timeoutMs };
 }
 
 /** A failure from reminder-app as the model sees it: our client's message (which never carries a URL, a secret or the credential), or a plain line. */
@@ -412,10 +432,16 @@ function without(text: string, values: string[]): string {
  *
  * Follows the inbound contract's rules for a hook a plugin makes itself (docs/plugins.md, "Hooks the plugin makes
  * itself"): leftovers of failed attempts are revoked before anything new is made, the new hook's id is written down
- * before it is relied on, and a registration that fails takes its hook away again. Unlike Raft's push, a
- * registration that MAY have landed is revoked too: no reminder can name a registration whose id never came back, so
- * nothing would ever post to that hook. (reminder-app keeps such an orphan until it is deleted; it counts towards
- * the subject's 20 hooks.)
+ * before it is relied on, and a registration that definitely failed (a refusal) takes its hook away again.
+ *
+ * An UNCERTAIN answer (no answer, a 5xx) may have registered the hook anyway, and reminder-app's advice is to list the
+ * hooks before registering again (reminder-app/docs/webhook-delivery.md, reminder-app 0.1.0, PR #6, 311b1f5,
+ * "Register"). Its list shows each hook's origin and never its URL, so ours cannot be found by URL: the subject's hooks
+ * are read before registering, and after an uncertain answer read again, and a single hook that is new and on our
+ * origin is the one this call made, adopted. None new: register again, once, with the same URL and secret. More than
+ * one (another mount of the same agent registering at that moment): which is ours cannot be told, so the hook is
+ * revoked and the call fails. The second register has to happen inside this call, while the secret is still in hand:
+ * the plugin keeps no copy of it, so a later call could not register the same hook again.
  *
  * The secret is the one `ctx.inbound.create()` made — 64 hex characters, inside reminder-app's 32-256 printable
  * ASCII — used once, for `register`, and dropped: see {@link HOOK_STORE}.
@@ -442,14 +468,31 @@ async function ensureRegistered(ctx: PluginContext, service: ReminderService, co
     if (url.protocol !== "https:" || url.port !== "") {
       throw new ReminderServiceError("refused", "this deployment's push endpoints are not https on port 443, which reminder-app requires; nothing was set");
     }
-    let registered: { hookId: string };
-    try { registered = await service.register(conn, { url: created.url, secret: created.secret }); }
-    catch (e) {
-      // Whatever a client put in its message was composed with the URL and the secret in reach, and a tool error
-      // lands in the transcript: both are cut out of it, and anything that is not a service error is not repeated.
+    // Whatever a client put in its message was composed with the URL and the secret in reach, and a tool error lands
+    // in the transcript: both are cut out of it, and anything that is not a service error is not repeated.
+    const scrubbed = (e: unknown) => {
       const code: ReminderServiceErrorCode = e instanceof ReminderServiceError ? e.code : "unavailable";
       const said = e instanceof ReminderServiceError ? without(e.message, [created.secret, created.url, url.host]) : "";
-      throw new ReminderServiceError(code, `reminder-app could not register this mount's push endpoint${said ? ` (${said})` : ""}; nothing was set`);
+      return new ReminderServiceError(code, `reminder-app could not register this mount's push endpoint${said ? ` (${said})` : ""}; nothing was set`);
+    };
+    const register = () => service.register(conn, { url: created.url, secret: created.secret });
+    let before: Set<string> | null;
+    try { before = new Set((await service.listHooks(conn)).map((h) => h.hookId)); } catch { before = null; }
+    let registered: { hookId: string };
+    try { registered = await register(); }
+    catch (e) {
+      const uncertain = !(e instanceof ReminderServiceError) || e.code === "unavailable";
+      if (!uncertain || before === null) throw scrubbed(e);
+      let after: Array<{ hookId: string; origin: string }>;
+      try { after = await service.listHooks(conn); } catch { throw scrubbed(e); }
+      const fresh = after.filter((h) => !before!.has(h.hookId) && h.origin === url.origin);
+      if (fresh.length > 1) {
+        throw new ReminderServiceError("unavailable", "reminder-app's answer was lost and which new registration is this mount's cannot be told; nothing was set, try again");
+      }
+      if (fresh.length === 1) registered = { hookId: fresh[0]!.hookId };
+      else {
+        try { registered = await register(); } catch (again) { throw scrubbed(again); }
+      }
     }
     if (typeof registered?.hookId !== "string" || !ID.test(registered.hookId)) {
       throw new ReminderServiceError("unavailable", "reminder-app's registration answer carried no usable id; nothing was set");
@@ -598,47 +641,22 @@ async function receiveFire(event: InboundEvent, secret: string, ctx: PluginConte
 
 // ---- the plugin
 
-export function createReminderPlugin(deps: { service?: ReminderService; now?: () => number } = {}): Plugin {
+export function createReminderPlugin(deps: { service?: ReminderService; now?: () => number } & Partial<ReminderDeployment> = {}): Plugin {
   const service = deps.service ?? httpReminderService();
   const now = deps.now ?? Date.now;
+  const deployment: ReminderDeployment = { serviceUrl: deps.serviceUrl || null, clientCredential: deps.clientCredential || null };
   return {
     id: "reminder",
     version: "1.0.0",
+    // An owner may add and remove a mount from the console: its one setting is a timeout, and removing it runs
+    // `unmount`, which deletes the registration and every reminder that names it.
+    consoleMount: true,
     /** This mount's registration: whether it exists is listable, what it holds is not. */
     database: { version: 1, stores: { [HOOK_STORE]: { listed: [HOOK_KEY] } } },
     config: [
-      { name: "serviceUrl", type: "string", required: true, format: "origin", summary: "reminder-app's origin, for example https://reminders.example.com." },
       { name: "timeoutMs", type: "number", default: DEFAULT_TIMEOUT_MS, min: 1_000, max: 60_000, summary: "How long one request to reminder-app may take, in milliseconds." },
     ],
-    credential: {
-      required: true,
-      summary: "reminder-app's client credential for this deployment, issued once by reminder-app's operator. One per deployment, " +
-        "not per agent: a mount names operator:reminder, which resolves to the deployment's REMINDER_APP_CREDENTIAL.",
-      shape: "token",
-      grants: "Registering this agent's push endpoint with reminder-app and creating, listing and cancelling the reminders that wake it.",
-      // rmc.<clientId>.<secret>: clientId 1-63 of [a-z0-9-], the secret two UUIDs without dashes
-      // (reminder-app/src/server/workspace.ts and reminder-app/src/server/crypto.ts, reminder-app 0.1.0, PR #6, 311b1f5).
-      looksLike: [{ kind: "reminder-app client credential", pattern: "\\brmc\\.[a-z0-9][a-z0-9-]{0,62}\\.[0-9a-f]{64}\\b" }],
-    },
     tools: TOOLS,
-
-    /**
-     * Asks reminder-app for the subject's hooks, the cheapest call that needs both the credential and the subject. The
-     * account is the client id the credential names (`rmc.<clientId>.…`): the name reminder-app's operator gave this
-     * deployment, and no part of the secret.
-     */
-    async checkCredential(ctx) {
-      if (!ctx.credential) return { ok: false, kind: "rejected", reason: "no reminder-app client credential was supplied" };
-      let conn: ReminderConnection;
-      try { conn = connection(ctx); } catch (e) { return { ok: false, kind: "unreachable", reason: (e as Error).message }; }
-      try { await service.check(conn); }
-      catch (e) {
-        const refused = e instanceof ReminderServiceError && e.code === "refused";
-        return { ok: false, kind: refused ? "rejected" : "unreachable", reason: forModel(e).message };
-      }
-      const client = /^rmc\.([a-z0-9][a-z0-9-]{0,62})\./.exec(ctx.credential)?.[1];
-      return client ? { ok: true, account: `reminder-app client ${client}` } : { ok: true };
-    },
 
     async invoke(tool, raw, ctx): Promise<Json> {
       if (tool === "create") {
@@ -647,7 +665,7 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
         if (!note) throw new Error("note is required: write what the reminder should tell you");
         if (note.length > NOTE_MAX) throw new Error(`note has ${note.length} characters; the limit is ${NOTE_MAX}`);
         const { due, schedule } = dueTime(a, now());
-        const conn = connection(ctx);
+        const conn = connection(ctx, deployment);
         // One key for the whole call, retry included: a create refused with unknown_hook does not use up its key.
         const requestId = await requestIdOf(ctx.operationId);
         const title = oneLine(note.split(/\r?\n/)[0], TITLE_MAX) || "Reminder";
@@ -673,7 +691,8 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
         const state = await loadHook(ctx);
         if (!state.serviceHookId) return { reminders: [], total: 0, nextOffset: null };
         let all: ServiceReminder[];
-        try { all = await service.list(connection(ctx)); } catch (e) { throw forModel(e); }
+        const conn = connection(ctx, deployment);
+        try { all = await service.list(conn); } catch (e) { throw forModel(e); }
         // reminder-app answers with every hook's reminders of this agent; a mount shows those that target its own.
         const mine = all.filter((r) => ownedBy(r, state.serviceHookId!) && r.status === "active")
           .sort((x, y) => (x.nextAt ?? Infinity) - (y.nextAt ?? Infinity));
@@ -687,7 +706,7 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
         const state = await loadHook(ctx);
         const notMine = new Error(`this mount has no pending reminder ${id}; list shows the ones it can cancel`);
         if (!state.serviceHookId) throw notMine;
-        const conn = connection(ctx);
+        const conn = connection(ctx, deployment);
         // reminder-app has no read of one reminder for this caller; its list is what says which hook one targets.
         let found: ServiceReminder | undefined;
         try { found = (await service.list(conn)).find((r) => r.id === id); } catch (e) { throw forModel(e); }
@@ -713,7 +732,8 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
     async unmount(ctx) {
       const state = await loadHook(ctx);
       if (state.serviceHookId) {
-        try { await service.unregister(connection(ctx), state.serviceHookId); }
+        const conn = connection(ctx, deployment);
+        try { await service.unregister(conn, state.serviceHookId); }
         catch (e) {
           if (!(e instanceof ReminderServiceError) || e.code !== "unknown_hook") throw forModel(e);
         }
@@ -727,5 +747,8 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
   };
 }
 
-/** The plugin as the deployment registers it: reminder-app over HTTP. */
+/**
+ * The plugin with no deployment behind it: every call refuses with {@link NO_CREDENTIAL}. For readers that need the
+ * declaration only (the settings checks, the contract page); the runtime builds its own with the Worker's values.
+ */
 export const reminderPlugin: Plugin = createReminderPlugin();
