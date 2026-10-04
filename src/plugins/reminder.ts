@@ -112,7 +112,6 @@ const ROUTES = {
   cancel: "/api/v1/agent/reminders/cancel",     // POST { id } → the cancelled reminder; 404 without a code for an unknown id
 } as const;
 /** The one refusal reminder-app words for a switched-off client (webhook-delivery.md "Authentication"). */
-const CLIENT_SWITCHED_OFF = "Agent-owned reminders are not enabled on this server.";
 
 /**
  * reminder-app over HTTP, against the mount's `serviceUrl` origin.
@@ -159,11 +158,11 @@ export function httpReminderService(): ReminderService {
       throw new ReminderServiceError("refused", "reminder-app did not accept this deployment's client credential (unknown, rotated or revoked); whoever deploys has to configure a current one");
     }
     if (response.status === 403) {
-      // TODO(reminder-app#7): a Raft agent cannot register hooks or create webhook-targeted reminders
-      // (webhook-delivery.md, "Authentication"); reminder-app#7 gives that refusal its own error.code. Until it lands,
-      // every 403 that is not the switched-off client is read as that refusal.
-      if (said === CLIENT_SWITCHED_OFF) throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet");
-      throw new ReminderServiceError("refused", `reminder-app refused this agent${said ? ` (${said})` : ""}; an agent with a Raft identity sets reminders with Raft's own reminder tools instead`);
+      // The two refusals reminder-app names (reminder-app#7): a client switched off, and an agent with a Raft identity,
+      // which reaches its reminders through Raft. Read by code, never by the sentence; any other 403 is passed on as said.
+      if (code === "agent_reminders_disabled") throw new ReminderServiceError("refused", "reminder-app has not switched on reminders for this deployment, so none can be set yet; whoever runs this deployment has to ask for them to be switched on");
+      if (code === "raft_agent_uses_raft_channel") throw new ReminderServiceError("refused", "reminder-app refused this agent because it has a Raft identity; it sets reminders with Raft's own reminder tools instead");
+      throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP 403)${said ? `: ${said}` : ""}`);
     }
     // 400, 409 (a cap reached, a key reused), 413, 415: reminder-app's own sentence is about the request the model made.
     throw new ReminderServiceError("refused", `reminder-app refused the request (HTTP ${response.status})${said ? `: ${said}` : ""}`);

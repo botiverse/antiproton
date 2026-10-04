@@ -657,10 +657,14 @@ await check("the HTTP client maps reminder-app's errors: unknown_hook, an unknow
     must((await codeOf(create())).startsWith("unknown_hook"), `404 unknown_hook became ${await codeOf(create())}`);
     fakeServer(() => fail(404, "Not found."));
     must((await http.cancel(CONN, "rem-x")) === null, "a 404 without a code on cancel was not 'already gone'");
-    fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server."));
+    fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server.", "agent_reminders_disabled"));
     must(/not switched on reminders for this deployment/.test(await codeOf(create())), `switched off became ${await codeOf(create())}`);
-    fakeServer(() => fail(403, "Hooks are registered by webhook clients only."));
-    must(/Raft's own reminder tools/.test(await codeOf(create())), `a refused agent became ${await codeOf(create())}`);
+    fakeServer(() => fail(403, "A Raft agent receives reminders through Raft.", "raft_agent_uses_raft_channel"));
+    must(/Raft's own reminder tools/.test(await codeOf(create())), `a refused Raft agent became ${await codeOf(create())}`);
+    // Read by code: the switched-off sentence without its code, or any other 403, is neither of the two named refusals.
+    fakeServer(() => fail(403, "Agent-owned reminders are not enabled on this server."));
+    const uncoded = await codeOf(create());
+    must(/refused: .*HTTP 403.*not enabled on this server/.test(uncoded) && !/Raft|switched on/.test(uncoded), `an uncoded 403 became ${uncoded}`);
     fakeServer(() => fail(409, "This agent has reached the 500 active reminder limit."));
     must(/refused: .*HTTP 409.*500 active reminder limit/.test(await codeOf(create())), `the cap became ${await codeOf(create())}`);
     fakeServer(() => fail(401, `Unknown credential ${CREDENTIAL}`));
