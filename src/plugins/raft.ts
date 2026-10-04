@@ -534,9 +534,36 @@ const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unk
 };
 
 /**
- * One manifest operation as a tool. The description is the manifest's, with an operation named by its dotted
- * name (`tasks.unassign`) written as the tool name the model is offered (`tasks_unassign`), and, for an
- * operation that may be held, the answers the question takes here. The parameters are the manifest's, with the
+ * The manifest's text in this mount's terms, for a tool's description and every parameter description in its schema:
+ * an operation named by its dotted name (`tasks.unassign`) is written as the tool name the model is offered
+ * (`tasks_unassign`); a parenthesised SDK field path (`(interrupt.resume.idempotencyKey)`), which names an object this
+ * mount never shows, is dropped; a CLI flag (`--after`) is written as the argument it stands for (`after`).
+ * `test/raft-plugin.ts` walks every description and fails on anything of these kinds left over, so a new phrasing in
+ * the manifest is caught there rather than read by a model.
+ */
+function inMountTerms(text: string): string {
+  return text
+    .replace(/\s*\((?:interrupt|resume|next|data)\.[A-Za-z.]+\)/g, "")
+    .replace(/`--([a-z]+)`/g, "`$1`")
+    .replace(/\b[a-z]+\.[a-z][A-Za-z]*\b/g, (name) => TOOL_NAME.get(name) ?? name);
+}
+
+/** Every `description` in a JSON schema, at any depth, put in this mount's terms (`inMountTerms`), in place. */
+function describeInMountTerms(schema: unknown): void {
+  if (!schema || typeof schema !== "object") return;
+  if (Array.isArray(schema)) { for (const s of schema) describeInMountTerms(s); return; }
+  const node = schema as Record<string, unknown>;
+  if (typeof node.description === "string") node.description = inMountTerms(node.description);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "properties" && value && typeof value === "object") for (const p of Object.values(value)) describeInMountTerms(p);
+    else if (key === "items" || key === "anyOf" || key === "oneOf" || key === "allOf" || key === "additionalProperties") describeInMountTerms(value);
+  }
+}
+
+/**
+ * One manifest operation as a tool. The description and every parameter description are the manifest's, in this
+ * mount's terms (`inMountTerms`), and, for an operation that may be held, the description says the answers the
+ * question takes here. The parameters are the manifest's, with the
  * paging argument capped (`pagingArg`). `sideEffect` decides the mount's policy half (an unknown value is a
  * write); `modelOnly` is carried, so the gateway refuses it from a program as a second layer over the SDK's own
  * MODEL_ONLY refusal; idempotency is the manifest's, `natural` being what this runtime calls `native`.
@@ -558,7 +585,8 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
   if (op.idempotency.kind === "key" && parameters.properties?.[op.idempotency.arg]) {
     parameters.properties[op.idempotency.arg].description = keyDescription(op);
   }
-  const described = op.description.replace(/\b[a-z]+\.[a-z][A-Za-z]*\b/g, (name) => TOOL_NAME.get(name) ?? name);
+  describeInMountTerms(parameters);
+  const described = inMountTerms(op.description);
   const held = op.mayInterrupt
     ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.` +
       (op.idempotency.kind === "key"

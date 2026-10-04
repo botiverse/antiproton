@@ -229,6 +229,51 @@ await check("every tool's parameters stay inside the schema subset: inline objec
   }
 });
 
+/**
+ * What a description shown to the model must not carry: an operation's dotted manifest name (the model is offered
+ * tool names), the tool name of an operation this mount does not offer, an SDK field path (`interrupt.…`,
+ * `resume.…`), or a CLI command or flag.
+ */
+const NOT_OFFERED = RAFT_OPERATIONS.filter((op) => Object.hasOwn(EXCLUDED, op.name)).map((op) => op.toolName);
+function sdkTerms(text: string): string[] {
+  const escape = (x: string) => x.replace(/[.]/g, "\\.");
+  return [
+    ...RAFT_OPERATIONS.filter((op) => new RegExp(`(?<![\\w.])${escape(op.name)}(?![\\w])`).test(text)).map((op) => op.name),
+    ...NOT_OFFERED.filter((name) => new RegExp(`\\b${name}\\b`).test(text)),
+    ...(text.match(/\b(?:interrupt|resume)\.[A-Za-z][\w.]*/g) ?? []),
+    ...(text.match(/\braft (?:message|server|inbox|user|task|mention|channel|thread|manual|attachment|action|profile|agent|integration)\b[^.;]*/g) ?? []),
+    ...(text.match(/(?:^|[\s`(])--[a-z][a-z-]*/g) ?? []),
+  ];
+}
+/** Every description in a schema, at any depth, with where it stands. */
+function descriptionsIn(schema: unknown, path: string, out: Array<[string, string]> = []): Array<[string, string]> {
+  if (!schema || typeof schema !== "object") return out;
+  if (Array.isArray(schema)) { schema.forEach((s, i) => descriptionsIn(s, `${path}[${i}]`, out)); return out; }
+  const node = schema as Record<string, unknown>;
+  if (typeof node.description === "string") out.push([path, node.description]);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "properties" && value && typeof value === "object") for (const [name, sub] of Object.entries(value)) descriptionsIn(sub, `${path}.${name}`, out);
+    else if (key !== "description" && value && typeof value === "object") descriptionsIn(value, `${path}/${key}`, out);
+  }
+  return out;
+}
+
+await check("no tool description or parameter description, at any depth, names a dotted operation, an SDK field path or a CLI command", async () => {
+  const found = raftPlugin.tools.flatMap((t) => [[`${t.name}`, t.summary] as [string, string], ...descriptionsIn(t.parameters, t.name)])
+    .flatMap(([where, text]) => sdkTerms(text).map((term) => `${where}: ${term}`));
+  if (found.length) throw new Error(found.join("; "));
+  // Positive control: the same walk over the manifest's own text finds each kind, at the depth it stands.
+  const raw = RAFT_OPERATIONS.flatMap((op) => [[op.toolName, op.description] as [string, string], ...descriptionsIn(op.inputSchema, op.toolName)])
+    .flatMap(([where, text]) => sdkTerms(text).map((term) => `${where}: ${term}`));
+  for (const [where, term] of [["tasks_assign.assignee", "tasks.unassign"], ["messages_send.idempotencyKey", "interrupt.resume.idempotencyKey"],
+    ["messages_read.after", "--after"], ["manual_get.topic", "manual.search"], ["tasks_assign", "tasks.unassign"]]) {
+    if (!raw.some((r) => r.startsWith(`${where}: `) && r.includes(term!))) throw new Error(`control: ${where}: ${term} not found in ${raw.join("; ")}`);
+  }
+  for (const text of ["call inbox_commit first", "run raft message read --target #x", "the `--after` it prints"]) {
+    if (!sdkTerms(text).length) throw new Error(`control: ${JSON.stringify(text)} passed`);
+  }
+});
+
 await check("the manifest's declarations map onto the tool: side effect, model-only, idempotency, description and schema", async () => {
   for (const op of GENERATED) {
     const t = toolNamed(op.toolName)!;

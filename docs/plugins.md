@@ -352,7 +352,9 @@ got a parked preview, so a send into that conversation is still held. The CLI co
 names are rewritten as tool calls in one place (`toolTerms`), a stopgap until
 the SDK can write them that way; only the SDK's own hint lines are touched, and
 what a person wrote (a message, a description, a title, a preview) is passed
-on as written. Its
+on as written. A tool's description and every parameter description in its
+schema name operations by their tool names, never by the manifest's dotted
+names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do
 (`identity.whoami` → `capabilities`) and lists only the operations whose every
 capability the credential holds; `mountTools` offers those names, with each
