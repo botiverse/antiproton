@@ -2148,6 +2148,7 @@ function keyedRaft() {
 /** One call of each keyed tool, with the arguments a model would give it (no key). */
 const KEYED_CALLS: ReadonlyArray<[string, Record<string, unknown>]> = [
   ["messages_send", { target: "#general", content: "done" }],
+  ["messages_reply", { message: { target: "#general" }, content: "done" }],
   ["tasks_create", { target: "#general", tasks: [{ title: "rotate keys" }] }],
   ["actions_prepare", { target: "#general", action: { type: "channel:create", name: "launch-room" } }],
 ];
