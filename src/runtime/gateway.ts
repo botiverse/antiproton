@@ -773,7 +773,7 @@ export class ToolGateway {
     });
 
     const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
-    // The policy's half is chosen per call when the plugin can say (`Plugin.classify`, failing closed to "write").
+    // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
     const verdict = opts.approved ? "allow" : confirm ? "approval"
       : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects));
     if (verdict === "deny") {

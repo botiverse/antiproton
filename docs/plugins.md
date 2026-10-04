@@ -121,14 +121,15 @@ really leaves the same result as calling it once.
 
 **A tool that both reads and writes classifies each call.** One tool that runs
 many commands (a generic tool forwarding a command line, say) cannot pick one
-`sideEffects`: "read" lets its writes past "writes need approval", "write"
-holds every read. Implement `classify(tool, args)` on the plugin, returning
-"read" or "write" for this call; the gateway asks it before choosing the
-policy's half (`callSideEffects` in `src/plugins/types.ts`). It fails closed:
-`undefined`, a throw, or any other value counts as "write", so a command the
-plugin does not recognise is held where writes are held. It selects the policy
-half and nothing else — replay and the duplicate-attempt guard still read the
-declared `sideEffects`, so declare that as what the riskiest call does.
+`sideEffects`: declared "write", every read it makes is held where writes are.
+Declare it "write" and implement `classify(tool, args)` on the plugin: a call
+it answers exactly "read" is a read for the mount's policy (`callSideEffects`
+in `src/plugins/types.ts`). The declaration is the ceiling — `classify` can
+only lower a declared write, and is not asked for a declared read — because
+replay and the duplicate-attempt guard keep reading the declaration: a
+declared read raised to a write would be rerun after a crash under a new
+operation id and land twice. It fails closed: `undefined`, a throw, or any
+other value leaves the call a write.
 
 **Errors are for the model.** Throw an `Error` whose message says what went
 wrong and what to do instead; the gateway returns it as a `tool_error`. When a

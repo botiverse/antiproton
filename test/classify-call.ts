@@ -1,11 +1,11 @@
 /**
  * A mount policy's read or write half, chosen per call (`Plugin.classify`).
  *
- * One tool that runs many commands cannot be declared "read" or "write": half
- * its calls would be held when they should not be, or run when they should be
- * held. The plugin answers per call; anything but "read" or "write" — nothing,
- * a throw, a wrong word — is taken as "write", so a call the plugin cannot
- * place is held where writes are held.
+ * One tool that runs many commands is declared "write", and the plugin may
+ * lower a call to "read" for the policy. Only exactly "read" lowers; nothing,
+ * a throw, a wrong word or a throwing `classify` leaves it a write. A declared
+ * read is the ceiling the other way: `classify` is not asked, since replay
+ * reads the declaration and a raised read would be rerun after a crash.
  */
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
@@ -33,6 +33,10 @@ async function fixture(
     async invoke(_tool, args) { ran.push(args); return { ran: args }; },
     ...(classify ? { classify } : {}),
   };
+  if (classify === THROWING_GETTER) {
+    delete (plugin as any).classify;
+    Object.defineProperty(plugin, "classify", { get() { throw new Error("classify getter broke"); } });
+  }
   const store = new SqliteStore(":memory:");
   await store.init();
   await store.createAgent("t", "a");
@@ -45,6 +49,9 @@ async function fixture(
   const cards = async () => (await store.listApprovals("t", "pending")).length;
   return { call, ran, cards };
 }
+
+/** A marker: install a `classify` whose very property read throws. */
+const THROWING_GETTER: Plugin["classify"] = () => "read";
 
 const byCommand: Plugin["classify"] = (_tool, args) => {
   const cmd = (args as { cmd?: string })?.cmd;
@@ -60,28 +67,31 @@ await check("declared write, classified per call: under write-approval a look ru
   must(f.ran.length === 1 && (await f.cards()) === 1, `the send ran or no card: ran=${f.ran.length}`);
 });
 
-await check("declared read, classified write: under write-approval the call is held", async () => {
-  const f = await fixture("read", () => "write");
-  const r: any = await f.call("look");
-  must(r.status === "pending" && f.ran.length === 0, `not held: ${JSON.stringify(r)}`);
-});
-
-await check("a classifier that cannot place the call fails closed: undefined, a wrong word, or a throw is a write, and the call still answers", async () => {
+await check("declared write, a classifier that cannot place the call leaves it a write: held, not run, and the call answers", async () => {
   const cases: Array<[string, Plugin["classify"]]> = [
     ["undefined", () => undefined],
     ["\"banana\"", () => "banana" as any],
     ["a throw", () => { throw new Error("classifier broke"); }],
+    ["a throwing getter", THROWING_GETTER],
   ];
   for (const [what, classify] of cases) {
-    // Declared read, so only the classifier's failure can make this a write.
-    const f = await fixture("read", classify);
+    const f = await fixture("write", classify);
     const r: any = await f.call("look");
     must(r.status === "pending" && r.error?.code === "awaiting_approval", `${what}: ${JSON.stringify(r)}`);
     must(f.ran.length === 0 && (await f.cards()) === 1, `${what}: ran=${f.ran.length}`);
   }
-  // The unknown command of the per-command classifier, too: declared read, held.
-  const f = await fixture("read", byCommand);
+  const f = await fixture("write", byCommand);
   must(((await f.call("format-disk")) as any).status === "pending", "an unrecognised command was not held");
+});
+
+await check("declared read is the ceiling: classify is not asked, and the call runs as a read under write-approval", async () => {
+  for (const [what, answer] of [["\"write\"", () => "write" as const], ["a throw", () => { throw new Error("must not be asked"); }]] as const) {
+    let asked = 0;
+    const f = await fixture("read", (...a) => { asked++; return (answer as any)(...a); });
+    const r: any = await f.call("send");
+    must(r.status === "succeeded" && f.ran.length === 1, `${what}: ${JSON.stringify(r)}`);
+    must(asked === 0, `${what}: classify was asked ${asked} time(s) for a declared read`);
+  }
 });
 
 await check("without classify the declared sideEffects decides, as before", async () => {
@@ -91,7 +101,7 @@ await check("without classify the declared sideEffects decides, as before", asyn
   must(((await write.call("look")) as any).status === "pending", "a declared write was not held");
 });
 
-await check("classify picks the read half too: under read-approval a classified read is held and a classified write runs", async () => {
+await check("declared write, under read-approval: a call classified read is held and a write runs", async () => {
   const f = await fixture("write", byCommand, { read: "approval" });
   must(((await f.call("look")) as any).status === "pending", "a classified read was not held under read-approval");
   must(((await f.call("send")) as any).status === "succeeded", "a classified write was held under read-approval");
