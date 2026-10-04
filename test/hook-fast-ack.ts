@@ -563,17 +563,21 @@ await check("two hooks whose ids differ only in the last character route apart, 
     };
     const aliasOf = (n: string) => (w.raw.sql.exec("SELECT alias, hook_id FROM inbound_pending WHERE dedupe_key = ?", n).toArray()[0] as any);
     const reads: number[] = [];
+    const from: unknown[] = [];
     for (const round of ["index", "memory", "cache"]) {
       if (round === "cache") clearHookRoutes();
       for (const i of [0, 1]) {
         const n = `${round}-${i}`;
+        lines.length = 0;
         const r = await send(i, n);
         reads.push(r.d1.length);
+        from.push(lines.find((l) => l.evt === "http")?.lookup);
         const got = aliasOf(n);
         must(r.status === 202 && got?.alias === (i === 0 ? "p" : "p2") && got.hook_id === ids[i], `${round} ${i}: ${r.status} ${show(got)}`);
       }
     }
     must(show(reads) === show([1, 1, 0, 0, 0, 0]), `index reads per push: ${show(reads)}`);
+    must(show(from) === show(["index", "index", "memory", "memory", "cache", "cache"]), `where each route came from: ${show(from)}`);
   } finally { delete (globalThis as any).caches; }
 });
 
