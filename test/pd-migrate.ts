@@ -14,6 +14,7 @@ import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
 import { pdMigrateCases } from "./spec/pd-migrate-spec.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
@@ -31,7 +32,7 @@ async function apiAgent() {
     ctx: { storage: { sql: raw.sql, transactionSync: raw.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   await rt.ready();

@@ -19,7 +19,7 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
   const registry = d1ProvisionedAgents(db, () => clock);
   const wipe = () => db.batch([db.prepare("DELETE FROM identities"), db.prepare("DELETE FROM api_keys"), db.prepare("DELETE FROM inbound_hooks"), db.prepare("DELETE FROM service_tokens"),
     db.prepare("DELETE FROM provider_tokens"), db.prepare("DELETE FROM provisioned_agents"),
-    db.prepare("DELETE FROM provisioned_connections"), db.prepare("DELETE FROM connect_links")]);
+    db.prepare("DELETE FROM provisioned_connections"), db.prepare("DELETE FROM connect_links"), db.prepare("DELETE FROM model_overrides")]);
   const cases: SpecCase[] = [];
   const add = (name: string, fn: () => Promise<void>) => cases.push({ name, run: async () => { await wipe(); await fn(); } });
 
@@ -247,18 +247,35 @@ export function controlPlaneCases(db: D1Database): SpecCase[] {
     assert(ev.length === 1 && ev[0].acting_role === "admin" && ev[0].raft_agent_id === "a1", `events: ${JSON.stringify(ev)}`);
   });
 
-  add("a model choice: the agent's own, else its tenant's, else the deployment's, else none", async () => {
+  add("a model choice, provider and model together: the agent's own, else its tenant's, else the deployment's, else none", async () => {
     const m = d1ModelOverrides(db);
+    const eff = async (t: string, a: string) => JSON.stringify(await m.effective(t, a));
     assert((await m.effective("t", "a")) === null, "a choice out of nothing");
-    await m.put({ tenantId: "", agentId: "", model: "deepseek/deepseek-flash", setBy: "u", setAt: 1 });
-    assert((await m.effective("t", "a")) === "deepseek/deepseek-flash", "the deployment's");
-    await m.put({ tenantId: "t", agentId: "", model: "anthropic/claude-sonnet-5", setBy: "u", setAt: 2 });
-    assert((await m.effective("t", "a")) === "anthropic/claude-sonnet-5" && (await m.effective("t2", "a")) === "deepseek/deepseek-flash", "the tenant's, and only for it");
-    await m.put({ tenantId: "t", agentId: "a", model: "openai/gpt-5", setBy: "u", setAt: 3 });
-    assert((await m.effective("t", "a")) === "openai/gpt-5" && (await m.effective("t", "b")) === "anthropic/claude-sonnet-5", "the agent's, and only for it");
-    await m.put({ tenantId: "t", agentId: "a", model: "openai/gpt-5-mini", setBy: "v", setAt: 4 });
-    assert((await m.list()).length === 3 && (await m.effective("t", "a")) === "openai/gpt-5-mini", "a second choice replaced the first");
-    assert((await m.remove("t", "a")) && (await m.effective("t", "a")) === "anthropic/claude-sonnet-5", "removing the agent's falls back to the tenant's");
+    await m.put({ tenantId: "", agentId: "", provider: "deepseek", model: "deepseek-v4-pro", setBy: "u", setAt: 1 });
+    assert((await eff("t", "a")) === '{"provider":"deepseek","model":"deepseek-v4-pro"}', `the deployment's: ${await eff("t", "a")}`);
+    await m.put({ tenantId: "t", agentId: "", provider: "cloudflare", model: "anthropic/claude-sonnet-5", setBy: "u", setAt: 2 });
+    assert((await eff("t", "a")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}' && (await eff("t2", "a")) === '{"provider":"deepseek","model":"deepseek-v4-pro"}', "the tenant's, and only for it");
+    await m.put({ tenantId: "t", agentId: "a", provider: "cloudflare", model: "openai/gpt-5", setBy: "u", setAt: 3 });
+    assert((await eff("t", "a")) === '{"provider":"cloudflare","model":"openai/gpt-5"}' && (await eff("t", "b")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}', "the agent's, and only for it");
+    // A second choice replaces the provider with the model: a row never pairs one choice's provider with another's model.
+    await m.put({ tenantId: "t", agentId: "a", provider: "deepseek", model: "deepseek-flash", setBy: "v", setAt: 4 });
+    assert((await m.list()).length === 3 && (await eff("t", "a")) === '{"provider":"deepseek","model":"deepseek-flash"}', `a second choice replaced the first: ${await eff("t", "a")}`);
+    assert((await m.remove("t", "a")) && (await eff("t", "a")) === '{"provider":"cloudflare","model":"anthropic/claude-sonnet-5"}', "removing the agent's falls back to the tenant's");
+  });
+
+  add("a model choice written before the provider column reads with no provider, which the caller takes as the default", async () => {
+    // The row as 0013 wrote it: the INSERT names no provider, so the column 0014 added holds what it adds.
+    await db.prepare("INSERT INTO model_overrides (tenant_id, agent_id, model, set_by, set_at) VALUES ('t', 'a', 'deepseek-flash', 'u', 1)").run();
+    const m = d1ModelOverrides(db);
+    assert(JSON.stringify(await m.effective("t", "a")) === '{"provider":null,"model":"deepseek-flash"}', JSON.stringify(await m.effective("t", "a")));
+    const listed = (await m.list())[0]!;
+    assert(listed.provider === null && listed.model === "deepseek-flash", JSON.stringify(listed));
+  });
+
+  add("model_overrides has exactly the columns its queries read, the provider among them", async () => {
+    const { results } = await db.prepare("PRAGMA table_info(model_overrides)").all();
+    const cols = (results as any[]).map((r) => `${r.name}${r.notnull ? "!" : ""}`).sort().join(",");
+    assert(cols === "agent_id!,model!,provider,set_at!,set_by!,tenant_id!", `columns ${cols}`);
   });
 
   add("provider_tokens and provisioned_agents have exactly the columns their queries read", async () => {

@@ -21,6 +21,7 @@ import { raftPlugin } from "../src/plugins/raft.ts";
 import { bridgeTools } from "../src/runtime/pi-tools.ts";
 import { standInLoader } from "./spec/worker-stand-in.ts";
 import type { Continuation } from "../src/core/execution.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -308,7 +309,7 @@ await check("runtime: a suspended program asks the object to stay awake and the 
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", loader: {} as any, makeToolBinding: () => ({}),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "k", model: "deepseek-flash" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" }),
     runJsResumeMs: 30_000, keepAlive: (at: number) => { kept.push(at); },
     autoRelease: false,
   } as any);
@@ -365,7 +366,7 @@ await check("runtime: a suspended program holds off the idle pass that would han
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", loader: {} as any, makeToolBinding: () => ({}),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "k", model: "deepseek-flash" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "deepseek-flash" }),
     idle: { warnMs: 60_000, maxMs: 600_000 },
   } as any);
   await rt.ready();

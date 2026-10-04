@@ -227,6 +227,16 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    # or OPENROUTER_API_KEY, etc.
    ```
 
+   **Model providers.** The operator's model account reaches the providers the `MODEL_PROVIDERS` var
+   declares: a JSON array of `{ id, baseUrl, auth: { secret, header }, modelFormat?, passKeys? }`, where
+   `baseUrl` is an https OpenAI-compatible endpoint and `auth.secret` is the *name* of the Worker secret
+   holding the credential, never its value (`src/model/providers.ts` validates it). Unset, the deployment
+   has one provider, `deepseek`, at `DEEPSEEK_BASE_URL` with `DEEPSEEK_API_KEY`. A model choice is a
+   provider and a model under it; one stored with no provider is `deepseek`'s, which is also where
+   `HARNESS_MODEL` is served. `cf/wrangler.preview.jsonc` declares Cloudflare AI Gateway as a second
+   provider (`vendor/model` names, its token in `cf-aig-authorization`, DeepSeek's key passed through only
+   for `deepseek/` models). Admins choose per deployment, tenant or agent through `/admin/models`.
+
 2. **Run locally with Wrangler:**
    ```bash
    cd cf

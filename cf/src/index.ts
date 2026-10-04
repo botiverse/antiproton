@@ -35,7 +35,7 @@ import { secretRefKind } from "../../src/runtime/secrets.ts";
 import { DynamicWorkerExecutor, handleSandboxCall, handleSandboxSuspend, type SuspendRequest } from "../../src/runtime/dynamic-worker-executor.ts";
 import { executorSpec } from "../../test/spec/executor-spec.ts";
 import {
-  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, OPERATOR_SECRET_REF, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX } from "./runtime.ts";
+  AgentRuntime, reconcileSeed, OPERATOR_RUN9_REF, isOperatorModelRef, parsePluginChoice, SEEDED_PLUGINS, installedRows, messageRefusal, consoleAdded, CONSOLE_MOUNTS_MAX } from "./runtime.ts";
 import { readMeter } from "../../bench/meter.ts";
 import { BENCH_SWE_WITHHELD } from "../../bench/swebench/withheld.ts";
 import { contextWindowFor } from "../../src/model/context-windows.ts";
@@ -99,7 +99,8 @@ import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { callQueuedModel, operatorModelOf } from "./model-request.ts";
+import { callQueuedModel, choiceOf, operatorModelOf, planBinding } from "./model-request.ts";
+import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
@@ -123,8 +124,12 @@ export interface Env {
   ADMIN_ORIGIN?: string;
   /** Who administers the deployment besides the operator's token: comma-separated identity keys (`github:<id>`). */
   ADMIN_IDENTITIES?: string;
-  /** Cloudflare AI Gateway token (AI Gateway: Run), when DEEPSEEK_BASE_URL is a gateway with authentication on. */
-  AI_GATEWAY_TOKEN?: string;
+  /**
+   * The model providers the operator's account reaches (src/model/providers.ts): a JSON array of
+   * { id, baseUrl, auth: { secret, header }, modelFormat?, passKeys? }, naming each credential's Worker secret
+   * rather than holding it. Unset: DeepSeek alone, at DEEPSEEK_BASE_URL with DEEPSEEK_API_KEY.
+   */
+  MODEL_PROVIDERS?: unknown;
   DEEPSEEK_BASE_URL: string;
   HARNESS_MODEL: string;
   ARTIFACT_BUCKET: string;
@@ -2001,12 +2006,13 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * The model this agent's operator binding should name: the admin's choice (model_overrides), else the
-   * deployment's. Null when the choice could not be read, which is not the same as "no choice".
+   * The provider and model this agent's operator binding should name: the admin's choice (model_overrides), else
+   * the deployment's. A choice stored with no provider is the default provider's. Null when the choice could not
+   * be read, which is not the same as "no choice".
    */
-  async #modelFor(tenantId: string, agentId: string): Promise<string | null> {
+  async #modelFor(tenantId: string, agentId: string): Promise<ModelChoice | null> {
     try {
-      return (await d1ModelOverrides(this.env.CONTROL_DB).effective(tenantId, agentId)) ?? this.env.HARNESS_MODEL;
+      return choiceOf(await d1ModelOverrides(this.env.CONTROL_DB).effective(tenantId, agentId), this.env.HARNESS_MODEL);
     } catch (e) {
       console.warn(`model choice for ${agentId} could not be read: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
       return null;
@@ -2016,17 +2022,16 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * Bind the operator's model as chosen for this agent. A binding with the agent's own credential is never
    * touched. `onlyIfStale`: leave an operator binding alone unless it no longer names what is chosen (the
-   * model or the endpoint changed). A choice that could not be read changes nothing that exists: an
+   * provider, the model or the provider's endpoint changed). A choice that could not be read changes nothing that exists: an
    * agent the admin moved to another model is not moved back by a control plane that did not answer; a
    * new agent gets the default.
    */
   async #bindModel(rt: AgentRuntime, tenantId: string, agentId: string, opts: { onlyIfStale?: boolean } = {}) {
     const b = await rt.store.getModelBinding(tenantId, agentId);
-    if (b && b.secretRef !== OPERATOR_SECRET_REF) return;
-    const model = await this.#modelFor(tenantId, agentId);
-    if (b && model === null) return;
-    if (b && opts.onlyIfStale && b.model === model && b.baseUrl === this.env.DEEPSEEK_BASE_URL) return;
-    await rt.bindOperatorModel(tenantId, agentId, model ?? this.env.HARNESS_MODEL);
+    if (b && !isOperatorModelRef(b.secretRef)) return;
+    const plan = planBinding(b, await this.#modelFor(tenantId, agentId), operatorModelOf(this.env).providers, opts);
+    if (plan.refused) console.warn(`model choice for ${agentId} refused: ${plan.refused.slice(0, 200)}`);
+    if (plan.bind) await rt.bindOperatorModel(tenantId, agentId, plan.choice);
   }
 
   async hookReceive(tenantId: string, agentId: string, alias: string, hookId: string,
@@ -2772,9 +2777,12 @@ async function handleLogin(request: Request, env: Env, url: URL): Promise<Respon
       return Response.json({
         viewer: v ? { email: v.email, name: v.name, source: v.source, agentId: agentOf(v), tenantId: tenantOf(v), admin: isAdmin(v, env) } : null,
         build: env.GIT_COMMIT ?? null,
-        // The deployment's default model and where it is served from, so a benchmark record can say which
-        // path its run took. An agent may be on another (model_overrides).
-        model: { name: env.HARNESS_MODEL, endpoint: (() => { try { return new URL(env.DEEPSEEK_BASE_URL).host; } catch { return null; } })() },
+        // The deployment's default model, its provider and where that is served from, so a benchmark record can
+        // say which path its run took. An agent may be on another (model_overrides).
+        model: (() => {
+          const p = providerStatus(operatorModelOf(env).providers).find((x) => x.id === DEFAULT_PROVIDER);
+          return { name: env.HARNESS_MODEL, provider: DEFAULT_PROVIDER, endpoint: p?.endpoint || null };
+        })(),
         anonymousAllowed: env.UI_ALLOW_ANONYMOUS === "1",
         loginConfigured: githubConfig(env) !== null,
         qaKeyDistinct: !(env.QA_ACCESS_KEY && env.AUTOMATION_TOKEN && env.QA_ACCESS_KEY === env.AUTOMATION_TOKEN),
@@ -3465,7 +3473,7 @@ async function route(request: Request, env: Env): Promise<Response> {
         try { body = JSON.parse((await request.text()) || "{}"); } catch { return Response.json({ error: { code: "invalid_json", message: "the body is not JSON" } }, { status: 400 }); }
       }
       return adminModels(request.method, body, v!.sub ?? v!.email, {
-        overrides: d1ModelOverrides(env.CONTROL_DB), defaults: { model: env.HARNESS_MODEL, baseUrl: env.DEEPSEEK_BASE_URL }, now: Date.now,
+        overrides: d1ModelOverrides(env.CONTROL_DB), providers: operatorModelOf(env).providers, defaults: { model: env.HARNESS_MODEL }, now: Date.now,
       });
     }
     if (url.pathname.startsWith("/v1/")) return v1(request, env, url);
@@ -4111,7 +4119,8 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (!isAdmin(v, env)) return Response.json({ error: { code: "not_found", message: "no such route" } }, { status: 404 });
           const deps = {
             overrides: d1ModelOverrides(env.CONTROL_DB),
-            defaults: { model: env.HARNESS_MODEL, baseUrl: env.DEEPSEEK_BASE_URL },
+            providers: operatorModelOf(env).providers,
+            defaults: { model: env.HARNESS_MODEL },
             now: Date.now,
           };
           const actor = v!.sub ?? v!.email;
@@ -4119,11 +4128,11 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (request.method === "POST") {
             const form = await formOf(request);
             if (!form) return new Response("expected a form body", { status: 400 });
-            const fields = Object.fromEntries(["tenantId", "agentId", "model"].map((k) => [k, String(form.get(k) ?? "")]));
+            const fields = Object.fromEntries(["tenantId", "agentId", "provider", "model"].map((k) => [k, String(form.get(k) ?? "")]));
             // The handler wants an explicit scope and validates the ids per scope: an agent
             // is named by tenant and id, a tenant by id alone, neither by the deployment.
             const scope = fields.agentId ? "agent" : fields.tenantId ? "tenant" : "deployment";
-            const body = { scope, tenantId: fields.tenantId, agentId: fields.agentId, ...(form.get("action") === "remove" ? {} : { model: fields.model }) };
+            const body = { scope, tenantId: fields.tenantId, agentId: fields.agentId, ...(form.get("action") === "remove" ? {} : { provider: fields.provider, model: fields.model }) };
             const write = await adminModels(form.get("action") === "remove" ? "DELETE" : "PUT", body, actor, deps);
             if (!write.ok) {
               // A refused write must read as a refusal: the handler's reason goes back on

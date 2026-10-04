@@ -18,6 +18,7 @@ import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { prefixedNamespace } from "../../src/store/sql-namespace.ts";
 import type { DriveCase, WithDriveHost } from "./durable-drive-spec.ts";
 import { afterPdCommits } from "./pd-commits.ts";
+import { operatorModelOf } from "../../cf/src/model-request.ts";
 
 function check(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const show = (v: unknown) => JSON.stringify(v);
@@ -123,7 +124,7 @@ export async function pdWorld(raw: DurableSqlHost, o: WorldOptions) {
     autoRelease: o.autoRelease ?? false, ...(o.idle ? { idle: o.idle } : {}),
     ...(o.runJsResumeMs ? { runJsResumeMs: o.runJsResumeMs } : {}),
     extraPlugins: testPlugins(seen, held, hooks),
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "k", model: "m1" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "k", HARNESS_MODEL: "m1" }),
     offloadModel: async (j: { commandId: string }) => { sent.push(j.commandId); },
   } as never);
   await rt.ready();
@@ -260,7 +261,7 @@ export function pdWritesCases(withRawHost: WithDriveHost): DriveCase[] {
 
   add("binding the operator's model as a pd commit ends writes the binding", () =>
     world({}, async (w) => {
-      const bound = w.during(() => w.rt.bindOperatorModel(T, A, "m2"));
+      const bound = w.during(() => w.rt.bindOperatorModel(T, A, { provider: "deepseek", model: "m2" }));
       await w.rt.postMessage(T, A, "hello");
       const r = await bound;
       check(r.ok, `the binding threw: ${r.ok ? "" : r.error}`);

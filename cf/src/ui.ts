@@ -1837,9 +1837,12 @@ ${d.keys.length
  * applies them through the same /admin/models handler and re-renders this panel.
  */
 export function adminPanel(d: {
-  default: { model: string; endpoint: string };
-  gateway: boolean;
-  overrides: Array<{ tenantId: string; agentId: string; model: string; setBy: string; setAt: number }>;
+  default: { provider: string; model: string; endpoint: string };
+  /** The deployment's providers (src/model/providers.ts): never a secret, only whether each is set. */
+  providers: Array<{ id: string; endpoint: string; modelFormat: string; available: boolean; missing: string[] }>;
+  /** Why the deployment's MODEL_PROVIDERS was refused, when it was. */
+  providersError?: string;
+  overrides: Array<{ tenantId: string; agentId: string; provider: string; model: string; setBy: string; setAt: number }>;
   /** Why the last write did not land, straight from the handler. Absent means it landed. */
   error?: string | null;
 }): string {
@@ -1850,16 +1853,26 @@ export function adminPanel(d: {
   // could be any tenant's.
   const scopeOf = (o: { tenantId: string; agentId: string }) =>
     o.agentId ? `agent ${o.tenantId}/${o.agentId}` : o.tenantId ? `tenant ${o.tenantId}` : "deployment";
+  // Only a provider whose secrets are set is offered; the default is listed first, so it is what an
+  // untouched select sends.
+  const offered = d.providers.filter((p) => p.available).sort((a, b) => Number(b.id === d.default.provider) - Number(a.id === d.default.provider));
+  // The model field's example follows the selected provider: the default refuses a `vendor/` name, a
+  // gateway requires one, so one fixed example would be wrong for one of them.
+  const example = (format: string) => (format === "vendor/model" ? "openai/gpt-5" : "deepseek-flash");
+  const providerField = `<label><span>provider</span><select name="provider" onchange="this.form.model.placeholder=this.selectedOptions[0].dataset.example">${offered.map((p) =>
+    `<option value="${esc(p.id)}" data-example="${example(p.modelFormat)}">${esc(p.id)}${p.modelFormat === "vendor/model" ? " (vendor/model)" : ""}</option>`).join("")}</select></label>`;
   const setForm = (action: string, fields: string, button: string) => `
     <form class="admin-set" hx-post="/ui/admin" ${target}>
       <input type="hidden" name="action" value="${action}">${fields}
-      <label><span>model</span><input type="text" name="model" required autocomplete="off" spellcheck="false" placeholder="anthropic/claude-sonnet-5"></label>
+      ${providerField}
+      <label><span>model</span><input type="text" name="model" required autocomplete="off" spellcheck="false" placeholder="${example(offered[0]?.modelFormat ?? "model")}"></label>
       <div class="row"><button type="submit">${button}</button></div>
     </form>`;
   const idField = (name: string, label: string) =>
     `<label><span>${label}</span><input type="text" name="${name}" autocomplete="off" spellcheck="false" placeholder="blank = the whole deployment"></label>`;
   const rows = d.overrides.map((o) => `<tr>
     <td>${esc(scopeOf(o))}</td>
+    <td>${esc(o.provider)}</td>
     <td><code>${esc(o.model)}</code></td>
     <td>${esc(o.setBy)}</td><td>${when(o.setAt) ?? ""}</td>
     <td><form hx-post="/ui/admin" ${target}
@@ -1872,15 +1885,19 @@ export function adminPanel(d: {
   return `
 <h3>AI providers</h3>
 ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
+${d.providersError ? `<div class="err">MODEL_PROVIDERS refused: ${esc(d.providersError)}</div>` : ""}
 <div class="card"><div class="state"><b>${esc(d.default.model)}</b><span>${esc(d.default.endpoint)}</span>
-    ${d.gateway ? `<span class="tag">via AI Gateway</span>` : `<span class="tag">direct</span>`}</div>
+    <span class="tag">${esc(d.default.provider)}</span></div>
   <div class="hint" style="padding:8px 0 0">Every agent runs this model unless an override says otherwise.
     A change takes effect the next time an agent runs.</div>
   ${setForm("set-default", "", "set default")}
 </div>
+<table class="overrides providers"><thead><tr><th>provider</th><th>endpoint</th><th>models</th><th></th></tr></thead><tbody>${d.providers.map((p) => `<tr>
+    <td>${esc(p.id)}</td><td>${esc(p.endpoint)}</td><td>${esc(p.modelFormat)}</td>
+    <td>${p.available ? "available" : `unavailable — ${esc(p.missing.join(", "))} not set`}</td></tr>`).join("")}</tbody></table>
 <h3>overrides — ${d.overrides.length}</h3>
 ${d.overrides.length
-    ? `<table class="overrides"><thead><tr><th>scope</th><th>model</th><th>set by</th><th>set at</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    ? `<table class="overrides"><thead><tr><th>scope</th><th>provider</th><th>model</th><th>set by</th><th>set at</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`
     : `<div class="empty">no overrides — everyone is on the default</div>`}
 <details><summary>set an override</summary>
   <div class="hint" style="padding:4px 0">an agent is named by its tenant and its id; a tenant by its id alone;

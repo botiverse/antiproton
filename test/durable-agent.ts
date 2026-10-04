@@ -15,6 +15,7 @@ import { prefixedNamespace } from "../src/store/sql-namespace.ts";
 import { runDriveCases, type DriveCase } from "./spec/durable-drive-spec.ts";
 import { durableAgentCases } from "./spec/durable-agent-spec.ts";
 import { afterPdCommits } from "./spec/pd-commits.ts";
+import { operatorModelOf } from "../cf/src/model-request.ts";
 
 const activeTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
 
@@ -28,7 +29,7 @@ async function runtime(host: ReturnType<typeof sqliteHost>) {
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } },
     bucket: {} as never, bucketName: "b", models: { resolve: () => null },
     sandbox: false, autoRelease: false,
-    operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
+    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "m1" }),
     offloadModel: async (job: { commandId: string }) => { sent.push(job.commandId); },
   } as never);
   await rt.ready();

@@ -1,39 +1,45 @@
 /**
- * `/admin/models`: which model the operator's account serves, for the deployment, a tenant or one agent
- * (0013_model_overrides.sql). For the admin area of the console; the caller has already been found to
- * be an admin (auth.ts isAdmin), and this decides nothing about who.
+ * `/admin/models`: which provider and model the operator's account serves, for the deployment, a tenant or one
+ * agent (0013_model_overrides.sql, 0014_model_override_provider.sql). For the admin area of the console; the
+ * caller has already been found to be an admin (auth.ts isAdmin), and this decides nothing about who.
  *
- *   GET                       → { default: { model, endpoint }, gateway, overrides: [...] }
- *   PUT    { scope, tenantId?, agentId?, model }  → the row as kept
- *   DELETE { scope, tenantId?, agentId? }         → 204, or 404 when there was none
+ *   GET                                          → { default: { provider, model, endpoint }, providers: [...], overrides: [...] }
+ *   PUT    { scope, tenantId?, agentId?, provider?, model }  → the row as kept
+ *   DELETE { scope, tenantId?, agentId? }                    → 204, or 404 when there was none
  *
- * A choice takes effect on the agent's next run, when its binding is found stale and bound again. The
- * model is a gateway name (`provider/model`) or a bare DeepSeek one; no key is involved here.
+ * A choice takes effect on the agent's next run, when its binding is found stale and bound again. The provider
+ * is one the deployment declares (src/model/providers.ts), DEFAULT_PROVIDER when not named; the model is that
+ * provider's name for it. No key is involved here, and none is listed: a provider says only whether its
+ * secrets are set.
  */
 import type { ModelOverrides } from "./control-plane.ts";
+import { DEFAULT_PROVIDER, modelProblem, providerStatus, type ModelProviders } from "../../src/model/providers.ts";
 
 export interface AdminModelsDeps {
   overrides: ModelOverrides;
-  /** The deployment's default model and endpoint (HARNESS_MODEL, DEEPSEEK_BASE_URL). */
-  defaults: { model: string; baseUrl: string };
+  /** The deployment's providers (MODEL_PROVIDERS, else DeepSeek alone). */
+  providers: ModelProviders;
+  /** The deployment's default model (HARNESS_MODEL), under DEFAULT_PROVIDER. */
+  defaults: { model: string };
   now(): number;
 }
 
-const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:@\/-]{0,127}$/;
 const ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 
 export async function adminModels(method: string, body: unknown, actor: string, deps: AdminModelsDeps): Promise<Response> {
   if (method === "GET") {
-    const endpoint = new URL(deps.defaults.baseUrl).host;
+    const providers = providerStatus(deps.providers);
     return Response.json({
-      default: { model: deps.defaults.model, endpoint },
-      gateway: endpoint === "gateway.ai.cloudflare.com",
-      overrides: await deps.overrides.list(),
+      default: { provider: DEFAULT_PROVIDER, model: deps.defaults.model, endpoint: providers.find((p) => p.id === DEFAULT_PROVIDER)?.endpoint ?? "" },
+      providers,
+      ...(deps.providers.error ? { providersError: deps.providers.error } : {}),
+      // A row from before providers existed is shown as what serves it.
+      overrides: (await deps.overrides.list()).map((o) => ({ ...o, provider: o.provider ?? DEFAULT_PROVIDER })),
     }, { headers: { "cache-control": "no-store" } });
   }
   if (method !== "PUT" && method !== "DELETE") return refuse(405, "method", "GET, PUT or DELETE");
   const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
-  const unknown = Object.keys(b).find((k) => !["scope", "tenantId", "agentId", "model"].includes(k));
+  const unknown = Object.keys(b).find((k) => !["scope", "tenantId", "agentId", "provider", "model"].includes(k));
   if (unknown) return refuse(400, "unknown_field", `unknown field ${unknown}`);
   const where = scopeOf(b);
   if (typeof where === "string") return refuse(422, "invalid", where);
@@ -42,10 +48,15 @@ export async function adminModels(method: string, body: unknown, actor: string, 
       ? new Response(null, { status: 204 })
       : refuse(404, "not_found", "no choice at that scope");
   }
-  if (typeof b.model !== "string" || !MODEL.test(b.model)) {
-    return refuse(422, "invalid", "model is a gateway name like anthropic/claude-sonnet-5, or a bare DeepSeek model");
-  }
-  const row = { ...where, model: b.model, setBy: actor, setAt: deps.now() };
+  if (b.provider !== undefined && typeof b.provider !== "string") return refuse(422, "invalid", "provider is a provider's id");
+  const provider = (b.provider as string | undefined) || DEFAULT_PROVIDER;
+  if (typeof b.model !== "string") return refuse(422, "invalid", "model is the provider's name for it");
+  const problem = modelProblem(deps.providers, { provider, model: b.model });
+  if (problem) return refuse(422, "invalid", problem);
+  // A provider without its secrets is declared but not offered: a choice of it would only fail at the call.
+  const status = providerStatus(deps.providers).find((p) => p.id === provider)!;
+  if (!status.available) return refuse(422, "unavailable", `provider ${provider} is not available: ${status.missing.join(", ")} not set`);
+  const row = { ...where, provider, model: b.model, setBy: actor, setAt: deps.now() };
   await deps.overrides.put(row);
   return Response.json(row);
 }

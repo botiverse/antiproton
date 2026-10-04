@@ -60,26 +60,39 @@ check("the admin host's page is the console's shell around nothing but the panel
     "a way out: the admin host's /logout only takes POST, so the page carries the form");
 });
 
-check("the model block names the default, the endpoint, and whether the Gateway serves it", () => {
-  const via = adminPanel({ default: { model: "deepseek/deepseek-chat", endpoint: "gateway.ai.cloudflare.com" },
-    gateway: true, overrides: [] });
-  must(/<b>deepseek\/deepseek-chat<\/b>/.test(via), "the default model must be named");
-  must(/gateway\.ai\.cloudflare\.com/.test(via), "the endpoint must be shown");
-  must(/via AI Gateway/.test(via), "a Gateway endpoint must say so");
-  const direct = adminPanel({ default: { model: "deepseek-chat", endpoint: "api.deepseek.com" }, gateway: false, overrides: [] });
-  must(/<span class="tag">direct<\/span>/.test(direct), "a direct endpoint must not wear the Gateway badge");
-  must(!/via AI Gateway/.test(direct), "a direct endpoint must not be called a Gateway one");
+const PROVIDERS = [
+  { id: "deepseek", endpoint: "api.deepseek.com", modelFormat: "model", available: true, missing: [] },
+  { id: "cloudflare", endpoint: "gateway.ai.cloudflare.com", modelFormat: "vendor/model", available: true, missing: [] },
+];
+const DEFAULT = { provider: "deepseek", model: "m", endpoint: "e" };
+
+check("the model block names the default, its provider and endpoint, and lists each provider with whether it can be chosen", () => {
+  const html = adminPanel({ default: { provider: "deepseek", model: "deepseek-flash", endpoint: "api.deepseek.com" },
+    providers: [PROVIDERS[0]!, { ...PROVIDERS[1]!, available: false, missing: ["AI_GATEWAY_TOKEN"] }], overrides: [] });
+  must(/<b>deepseek-flash<\/b><span>api\.deepseek\.com<\/span>\s*<span class="tag">deepseek<\/span>/.test(html), "the default model, endpoint and provider must be named");
+  must(/<td>cloudflare<\/td><td>gateway\.ai\.cloudflare\.com<\/td><td>vendor\/model<\/td>\s*<td>unavailable — AI_GATEWAY_TOKEN not set<\/td>/.test(html), "an unavailable provider must say what it lacks");
+  const options = [...html.matchAll(/<option value="([^"]+)"/g)].map((m) => m[1]);
+  must(options.length === 2 && options.every((o) => o === "deepseek"), `only an available provider may be offered, once per form: ${options}`);
+  const both = adminPanel({ default: DEFAULT, providers: [PROVIDERS[1]!, PROVIDERS[0]!], overrides: [] });
+  const first = both.match(/<select name="provider"[^>]*><option value="([^"]+)"/)?.[1];
+  must(first === "deepseek", `the default provider must be what an untouched select sends: ${first}`);
+  const placeholders = [...both.matchAll(/name="model"[^>]*placeholder="([^"]+)"/g)].map((m) => m[1]);
+  must(placeholders.length === 2 && placeholders.every((p) => p === "deepseek-flash"), `the model example must fit the selected (default) provider, which refuses a vendor/ name: ${placeholders}`);
+  must(/<option value="cloudflare" data-example="openai\/gpt-5">/.test(both) && /onchange="this\.form\.model\.placeholder=this\.selectedOptions\[0\]\.dataset\.example"/.test(both),
+    "choosing a vendor/model provider must switch the example to a vendor/model name");
+  must(/MODEL_PROVIDERS refused: bad/.test(adminPanel({ default: DEFAULT, providers: [], providersError: "bad", overrides: [] })), "a refused declaration must be shown");
 });
 
 check("an override row spells its scope and carries a remove that names what falls back", () => {
-  const html = adminPanel({ default: { model: "m", endpoint: "e" }, gateway: false, overrides: [
-    { tenantId: "", agentId: "", model: "anthropic/claude-sonnet-5", setBy: "op@x.dev", setAt: 1_000 },
-    { tenantId: "t9", agentId: "", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 2_000 },
-    { tenantId: "t9", agentId: "a9", model: "google/gemini-2", setBy: "op@x.dev", setAt: 3_000 },
+  const html = adminPanel({ default: DEFAULT, providers: PROVIDERS, overrides: [
+    { tenantId: "", agentId: "", provider: "cloudflare", model: "anthropic/claude-sonnet-5", setBy: "op@x.dev", setAt: 1_000 },
+    { tenantId: "t9", agentId: "", provider: "cloudflare", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 2_000 },
+    { tenantId: "t9", agentId: "a9", provider: "cloudflare", model: "google/gemini-2", setBy: "op@x.dev", setAt: 3_000 },
   ] });
   must(/<td>deployment<\/td>/.test(html), "an override with no ids is the deployment");
   must(/<td>tenant t9<\/td>/.test(html), "an override with a tenant id says tenant");
   must(/<td>agent t9\/a9<\/td>/.test(html), "an override with both ids says agent");
+  must(/<td>agent t9\/a9<\/td>\s*<td>cloudflare<\/td>\s*<td><code>google\/gemini-2<\/code>/.test(html), "an override row names its provider beside its model");
   must(/agent t9\/a9 falls back to the default model/.test(html.replace(/\n/g, " ")),
     "removing an override must say the scope falls back, not that it loses the model");
   const removes = html.match(/name="action" value="remove"/g) ?? [];
@@ -88,26 +101,28 @@ check("an override row spells its scope and carries a remove that names what fal
 });
 
 check("the set forms post to the fragment and the override form takes tenant and agent ids", () => {
-  const html = adminPanel({ default: { model: "m", endpoint: "e" }, gateway: false, overrides: [] });
+  const html = adminPanel({ default: DEFAULT, providers: PROVIDERS, overrides: [] });
   must(/hx-post="\/ui\/admin"[^>]*hx-target="#admin"/.test(html.replace(/\n/g, " ")),
     "writes must post to the fragment and swap the panel back in");
   must(/name="action" value="set-default"/.test(html), "a form sets the default");
   must(/name="action" value="set-override"/.test(html), "a form adds an override");
   must(/name="tenantId"/.test(html) && /name="agentId"/.test(html), "the override form takes both ids");
+  must((html.match(/<select name="provider"[ >]/g) ?? []).length === 2, "both set forms take a provider");
   must(!/undefined|null|NaN/.test(html), "nothing may render as undefined, null or NaN");
 });
 
 check("a refused write says why, above the forms, and the table shows nothing new", () => {
   // The handler's reason comes back on the panel: a bad model name, or an agent named
   // without its tenant, is a 422 with a message — silent re-render would read as success.
-  const reason = "model is a gateway name like anthropic/claude-sonnet-5, or a bare DeepSeek model";
-  const html = adminPanel({ default: { model: "m", endpoint: "e" }, gateway: false,
-    overrides: [{ tenantId: "t9", agentId: "", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }], error: reason });
+  const reason = "a cloudflare model is named vendor/model, like openai/gpt-5";
+  const html = adminPanel({ default: DEFAULT, providers: PROVIDERS,
+    overrides: [{ tenantId: "t9", agentId: "", provider: "cloudflare", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }], error: reason });
   must(html.indexOf(`<div class="err">${reason}</div>`) < html.indexOf("<table"),
     "the reason must sit above the forms, where a returning person reads first");
-  must((html.match(/<tr>/g) ?? []).length === 2, "only the header and the existing row — the refused one must not appear");
-  const clean = adminPanel({ default: { model: "m", endpoint: "e" }, gateway: false,
-    overrides: [{ tenantId: "t9", agentId: "", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }] });
+  const overrides = html.slice(html.indexOf("<h3>overrides"));
+  must((overrides.match(/<tr>/g) ?? []).length === 2, "only the header and the existing row — the refused one must not appear");
+  const clean = adminPanel({ default: DEFAULT, providers: PROVIDERS,
+    overrides: [{ tenantId: "t9", agentId: "", provider: "cloudflare", model: "openai/gpt-5", setBy: "op@x.dev", setAt: 1_000 }] });
   must(!/<div class="err">/.test(clean), "a panel without an error must not draw an error box");
 });
 
