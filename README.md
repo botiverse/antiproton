@@ -236,6 +236,12 @@ Antiproton is designed to run as a Cloudflare Worker backed by Durable Objects:
    `HARNESS_MODEL` is served. `cf/wrangler.preview.jsonc` declares Cloudflare AI Gateway as a second
    provider (`vendor/model` names, its token in `cf-aig-authorization`, DeepSeek's key passed through only
    for `deepseek/` models). Admins choose per deployment, tenant or agent through `/admin/models`.
+   An `openai/…` model is sent the fields pi-ai's OpenAI-compatible provider would send it
+   (`max_completion_tokens`, and a reasoning model's "off" level as `reasoning_effort`, which
+   chat/completions needs before it accepts function tools; `src/model/chat-request-shape.ts`); every
+   other model's request, DeepSeek's included, is unchanged. A provider's refusal of the request itself
+   (HTTP 400, 401, 403, 404, 422) is not retried: the turn fails at once with the provider's status and
+   message. 408, 409, 429, 5xx and network errors are retried, and then dead-lettered, as before.
 
 2. **Run locally with Wrangler:**
    ```bash
