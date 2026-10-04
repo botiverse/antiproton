@@ -481,7 +481,7 @@ await check("while posting keeps failing, a push queued 30 minutes is given up w
   must(jobCount(w) === 0, "something was posted");
 });
 
-await check("a hook with 30 pushes queued is answered as the rate limit answers, and recorded with why", async () => {
+await check("a hook with 30 pushes queued is answered as the rate limit answers, and recorded with why; a busy queue whose head is due says retry in 3 s", async () => {
   const w = await world();
   const realNow = Date.now;
   try {
@@ -522,6 +522,41 @@ await check("a rate-limited push is told to retry when the minute lets it in; on
   } finally { Date.now = realNow; }
   const reasons = (w.raw.sql.exec("SELECT reason FROM inbound_events WHERE outcome = 'rate_limited' ORDER BY rowid").toArray() as any[]).map((r) => r.reason);
   must(reasons.length === 4 && reasons.slice(0, 3).every((r) => /a minute/.test(r)) && /already waiting/.test(reasons[3]), `records: ${show(reasons)}`);
+});
+
+await check("a full queue stuck behind a failing head says to retry at the head's next try, not every 3 s; while a pass is posting it says 3", async () => {
+  const w = await world();
+  const engine = await w.D.runtime().agent(T, A);
+  (engine as any).say = () => Promise.reject(new Error("posting is down"));
+  const realNow = Date.now;
+  const base = realNow();
+  const at = (ms: number) => { Date.now = () => base + ms; };
+  const answers: Array<[string, number, string | null]> = [];
+  try {
+    // 29 queued two seconds apart, so the rate never trips; the head's first try fails at +60 s (next try
+    // in 30 s) and its second at +90 s (next try in 2 min, at +210 s).
+    for (let i = 0; i < 29; i++) { at(i * 2_000); must((await push(w, `s${i}`, "stuck")).status === 202, `push ${i}`); }
+    at(60_000); await w.D.alarm();
+    at(90_000); await w.D.alarm();
+    const head = (w.raw.sql.exec("SELECT attempts, next_at FROM inbound_pending ORDER BY seq LIMIT 1").toArray()[0] as any);
+    must(head.attempts === 2 && head.next_at === base + 210_000, `control: the head is waiting its 2-minute retry: ${show(head)}`);
+    must((await push(w, "s29", "stuck")).status === 202, "the 30th");
+    at(90_700);
+    const stuck = await push(w, "s30", "stuck");
+    answers.push(["stuck", stuck.status, stuck.retryAfter]);
+    // A pass posting right now has claimed the head (its next try set ahead) and is moving the queue.
+    let release!: () => void;
+    (engine as any).say = () => new Promise<void>((_, fail) => { release = () => fail(new Error("still down")); });
+    at(210_000);
+    const pass = w.D.alarm();
+    for (let i = 0; i < 50 && !release; i++) await sleep(5);
+    must(release, "control: the pass reached the post");
+    const moving = await push(w, "s31", "stuck");
+    answers.push(["moving", moving.status, moving.retryAfter]);
+    release();
+    await pass;
+  } finally { Date.now = realNow; }
+  must(show(answers) === show([["stuck", 429, "120"], ["moving", 429, "3"]]), show(answers));
 });
 
 await check("provisioning and the model choice run once in a pass that posts, and not in one that only waits out a retry", async () => {

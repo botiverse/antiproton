@@ -7,7 +7,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import {
   ensureInboundTable, inboundMessage, inboundStatus, lowerHeaders, newHookId, newHookSecret, readCapped,
   recordInbound, recentInbound, seenBefore, underRate, INBOUND_DEDUPE_MS, INBOUND_KEEP_MS, INBOUND_TEXT_MAX,
-  inboundVerdict, acceptInbound, nextPendingInbound, queueFull, rateRetryAfterS, settleInbound, type InboundOutcome,
+  inboundVerdict, acceptInbound, nextPendingInbound, queueFull, queueRetryAfterS, rateRetryAfterS, INBOUND_MAX_AGE_MS, settleInbound, type InboundOutcome,
 } from "../src/runtime/inbound.ts";
 import { pendingTrace, TRACE_VERDICTS } from "../src/trace/outbox.ts";
 
@@ -128,6 +128,26 @@ await check("the rate's Retry-After is the first whole second at which the rate 
     }
   }
   host.dispose();
+});
+
+await check("a full queue's Retry-After is the head's next try, rounded up and held within 3-600 s; a moving queue says 3", () => {
+  const t = 1_800_000_000_000;
+  const head = (nextAt: number, more: Partial<{ state: "queued" | "posting"; receivedAt: number }> = {}) => ({
+    seq: 1, hookId: "h1", alias: "gh", dedupeKey: "k", message: "m", receivedAt: t - 60_000, state: "queued" as const,
+    attempts: 2, nextAt, lastError: "posting is down", ...more,
+  });
+  const got = [
+    queueRetryAfterS(null, t, false),
+    queueRetryAfterS(head(0), t, false), // never tried: due now
+    queueRetryAfterS(head(t - 5_000), t, false), // overdue
+    queueRetryAfterS(head(t + 1_200), t, false), // due within the floor
+    queueRetryAfterS(head(t + 119_300), t, false), // waiting its 2-minute retry
+    queueRetryAfterS(head(t + 119_300), t, true), // a pass is posting right now: the queue is moving
+    queueRetryAfterS(head(t + 119_300, { state: "posting" }), t, false),
+    queueRetryAfterS(head(t + 600_000, { receivedAt: t - INBOUND_MAX_AGE_MS + 40_000 }), t, false), // expires before its retry
+    queueRetryAfterS(head(t + 700_000), t, false), // past the ceiling
+  ];
+  assert(JSON.stringify(got) === JSON.stringify([3, 3, 3, 3, 120, 3, 3, 40, 600]), JSON.stringify(got));
 });
 
 await check("a queued push holds its key and counts against the rate before it has a final record, and a second row for its key throws", () => {

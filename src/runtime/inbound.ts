@@ -178,11 +178,30 @@ const ADDED_COLUMNS = [
 const columnsAdded = new WeakSet<object>();
 
 /**
- * `Retry-After` (seconds) on a 429 for a full queue. When the queue is moving it empties in a few seconds, so
- * a sender that waits this long usually finds room; a sender that ignores the header backs off on its own
- * schedule anyway (Raft's: 5 s, 15 s, 60 s, …), and one that honours it retries no sooner than this.
+ * The bounds of `Retry-After` (seconds) on a 429 for a full queue (`queueRetryAfterS`). The floor is the
+ * answer for a queue that is moving: it empties in a few seconds, so a sender that waits this long usually
+ * finds room. The ceiling is the longest wait in `INBOUND_RETRY_MS` (10 min), so with today's schedule it
+ * never binds; it holds the answer there if that schedule grows.
  */
 export const INBOUND_QUEUE_RETRY_AFTER_S = 3;
+export const INBOUND_QUEUE_RETRY_AFTER_MAX_S = 600;
+
+/**
+ * Seconds until a full queue can move, for `Retry-After`: until the head's next try (or its expiry, if that
+ * comes first, as the pass computes it), rounded up and held within 3–600 s. A queue fills only while posting
+ * is failing, and then the head waits 30 s, 2 min, 5 min, 10 min between tries; a sender told 3 s would be
+ * refused, and recorded, every 3 s of that. The head is the object's oldest row whichever hook it came from,
+ * since delivery order is strict across hooks.
+ *
+ * `passRunning`: a pass is posting right now. It claims the head (setting `nextAt` to the try after this
+ * one) before posting it, so the stored row then reads like one waiting out a failure; the queue is moving,
+ * and the answer is the floor. A head left `posting` with no pass is settled by the next pass at once.
+ */
+export function queueRetryAfterS(head: PendingInbound | null, now: number, passRunning: boolean): number {
+  if (!head || passRunning || head.state === "posting") return INBOUND_QUEUE_RETRY_AFTER_S;
+  const movesAt = Math.min(head.nextAt, head.receivedAt + INBOUND_MAX_AGE_MS);
+  return Math.min(INBOUND_QUEUE_RETRY_AFTER_MAX_S, Math.max(INBOUND_QUEUE_RETRY_AFTER_S, Math.ceil((movesAt - now) / 1000)));
+}
 
 export function ensureInboundTable(sql: SqlHost["sql"]) {
   sql.exec(TABLE);

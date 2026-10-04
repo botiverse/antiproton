@@ -62,7 +62,7 @@ import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal
 import {
   acceptInbound, claimPendingInbound, ensureInboundTable, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
   nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
-  expiredPendingInbound, pendingInboundRow, queueFull, rateRetryAfterS, INBOUND_QUEUE_RETRY_AFTER_S,
+  expiredPendingInbound, pendingInboundRow, queueFull, queueRetryAfterS, rateRetryAfterS, INBOUND_QUEUE_RETRY_AFTER_S,
   INBOUND_MAX_AGE_MS, INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, INBOUND_QUEUE_MAX, type InboundOutcome, type PendingInbound,
 } from "../../src/runtime/inbound.ts";
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
@@ -997,14 +997,15 @@ export class AgentRuntime {
     const installationId = accepting.installationId;
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
-    // Each 429 says when to come back (`Retry-After`): the rate's from the rows it counts, so a sender that
-    // honours it is let in on its first retry rather than refused, and recorded, every few seconds for a minute.
+    // Each 429 says when to come back (`Retry-After`): the rate's from the rows it counts, the queue's from its
+    // head's next try, so a sender that honours it is not refused, and recorded, every few seconds meanwhile.
     if (!underRate(sql, hookId, now)) {
       const retryAfterS = rateRetryAfterS(sql, hookId, now) ?? INBOUND_QUEUE_RETRY_AFTER_S;
       return { ...done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key), retryAfterS };
     }
     if (queueFull(sql, hookId)) {
-      return { ...done("rate_limited", `${INBOUND_QUEUE_MAX} pushes from this hook are already waiting to be posted`, key), retryAfterS: INBOUND_QUEUE_RETRY_AFTER_S };
+      const retryAfterS = queueRetryAfterS(nextPendingInbound(sql), now, this.#inboundPass !== null);
+      return { ...done("rate_limited", `${INBOUND_QUEUE_MAX} pushes from this hook are already waiting to be posted`, key), retryAfterS };
     }
     // The claim on the key: in the same synchronous run as the two checks above, with no await between,
     // so a second push with this key that is already past its own await finds this row (`acceptInbound`).
