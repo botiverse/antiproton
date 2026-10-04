@@ -348,6 +348,8 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     // then the job is one nobody carries, and a sweep a redelivery interval later sends it again by design: steps
     // slowed past that interval (a loaded machine) would read as a double dispatch.
     check(await next.agent.takeJob(job.id, "worker") !== null, "the redelivered job was not taken");
+    // A full redelivery interval passes under the take, so only the take can stop the sweep resending it.
+    await sleep(REDELIVERY);
     for (let i = 0; i < 2; i++) await next.agent.step();
     check(show(next.dispatched) === show([job.id]), `dispatched again under the take: ${show(next.dispatched)}`);
     await pdTurn(storage, next.agent, null, [replying(SCRIPT[0]!.reply)]);
