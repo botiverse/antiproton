@@ -2081,7 +2081,9 @@ export interface Plugin {
    *   tools and its deliveries, not the cleanup owed for what it registered while it was on.
    *
    * Cleanup only: cancel registrations, subscriptions, reminders. It never wakes the agent, posts a message or
-   * calls a model — that is what makes running it for a switched-off plugin safe.
+   * calls a model — that is what makes running it for a switched-off plugin safe. It is a rule, not a limit: the
+   * context has nothing that wakes the agent, but `sibling` hands over another mount's credential and the plugin
+   * can reach the network, so a plugin could still post somewhere. It must not.
    *
    * Never a tool: the model cannot call it. Absent: nothing is asked, and the runtime still revokes the hooks.
    */

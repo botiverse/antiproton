@@ -590,7 +590,10 @@ It runs even when the plugin is switched off or the agent is pinned to another
 version: switching off stops tools and deliveries, not the cleanup owed for what
 the plugin registered while it was on. That is safe because `unmount` is
 **cleanup only** — cancel registrations, subscriptions, reminders — and never
-wakes the agent, posts a message or calls a model.
+wakes the agent, posts a message or calls a model. That is a rule the plugin
+keeps, not a limit the runtime enforces: the context has nothing that wakes the
+agent, but `sibling` hands over another mount's credential and the network is
+open, so a plugin could still post somewhere.
 
 Revoking through `ctx.inbound` inside `unmount` is allowed and changes nothing
 about the order; telling the service to stop sending is the part only the
