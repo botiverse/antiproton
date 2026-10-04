@@ -389,16 +389,25 @@ function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
  * to lose: what its cursor may have acknowledged the previous call showed, and a cursor is spent once sent
  * (`SINCE_KEY`), so the next pull acknowledges nothing of the batch this one asked for.
  */
-function sdkFailure(out: RaftFailure, write = false, retry?: { tool: string; key: string }): Error {
+function sdkFailure(out: RaftFailure, write = false, retry?: { tool: string; key?: string }): Error {
   const unanswered = out.error.code === "TRANSPORT_ERROR" || out.error.code === "UNAVAILABLE" ||
     (out.error.status !== undefined && out.error.status >= 500);
   // The next action is the SDK's own sentence, so its command is rewritten wherever it stands; the message is left
   // as it came (it may repeat what the caller asked for). A keyed write that may have landed says the key it went
   // out under (`retryKey`), so a retry is the same request and Raft answers the first one instead of acting twice.
-  const retried = write && unanswered && retry
+  const retried = write && unanswered && retry?.key
     ? ` It may still have gone through: to try again without doing it twice, call ${retry.tool} again with the same arguments and idempotencyKey ${JSON.stringify(retry.key)}.`
     : "";
-  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${commandsAsTools(out.error.nextAction)}` : ""}${retried}`);
+  // A write whose request got no answer at all. The SDK says "The request did not reach the Raft Server" and "retry if
+  // the operation is safe to repeat", but a timeout or a dropped connection cannot tell a request that never arrived
+  // from one whose answer was lost — which is why it is marked as one that may have landed — so both sentences are
+  // replaced here with what is known: no answer came, and how to try again without acting twice.
+  const lost = write && out.error.code === "TRANSPORT_ERROR";
+  const said = lost
+    ? `No answer came back from the Raft Server, so whether this went through is not known.${retried ||
+      (retry ? ` Check whether it did before calling ${retry.tool} again, or it may happen twice.` : " Check whether it did before trying again, or it may happen twice.")}`
+    : `${out.error.message}${out.error.nextAction ? ` — ${commandsAsTools(out.error.nextAction)}` : ""}${retried}`;
+  const e = new Error(said);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
   // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.
   const landed = write && unanswered;
@@ -825,7 +834,7 @@ async function runOperation(
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
     const key = retryKey(op, out as RaftFailure, keyed);
-    throw sdkFailure(out as RaftFailure, op.sideEffect !== "read", key ? { tool: op.toolName, key } : undefined);
+    throw sdkFailure(out as RaftFailure, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
   }
   if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input);
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints

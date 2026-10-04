@@ -2292,6 +2292,25 @@ await check("a keyed write's failure that is not a retry with the same key names
   }
 });
 
+await check("a write that got no answer says that, not the SDK's \"did not reach the Raft Server\" beside \"it may still have gone through\"", async () => {
+  const lost = "No answer came back from the Raft Server, so whether this went through is not known.";
+  const raft = keyedRaft();
+  raft.lose = true;
+  const keyed = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, underOperation("op_lost")));
+  const want = `${lost} It may still have gone through: to try again without doing it twice, call messages_send again with the same arguments and idempotencyKey "op_lost".`;
+  if (keyed.message !== want || keyed.mayHaveLanded !== true) throw new Error(`keyed: ${keyed.message}`);
+  globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
+  // A send whose key the SDK made (no operation, no key of the model's): the key is unknown here, so none is named.
+  const sdkKey = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, inTurn(mount().ctx)));
+  if (sdkKey.message !== `${lost} Check whether it did before calling messages_send again, or it may happen twice.`) throw new Error(`SDK key: ${sdkKey.message}`);
+  // A write with no key at all.
+  const unkeyed = await failure(() => raftPlugin.invoke("tasks_convert", { target: "#general", messageId: "abcdef12" }, inTurn(mount().ctx)));
+  if (unkeyed.message !== `${lost} Check whether it did before calling tasks_convert again, or it may happen twice.`) throw new Error(`unkeyed: ${unkeyed.message}`);
+  // Control: a read has nothing to lose, and keeps the SDK's own words.
+  const read = await failure(() => raftPlugin.invoke("messages_read", { target: "#general" }, inTurn(mount().ctx)));
+  if (read.message !== "The request did not reach the Raft Server. — Check connectivity to the Raft Server and retry if the operation is safe to repeat.") throw new Error(`read: ${read.message}`);
+});
+
 globalThis.fetch = originalFetch;
 console.log(`\n  raft plugin\n  ${"─".repeat(56)}`);
 for (const result of results) {
