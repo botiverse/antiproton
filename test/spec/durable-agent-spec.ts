@@ -18,7 +18,7 @@ import { DurableAgent, PdHost, POLL_BACKSTOP_MS, type DurableAgentOptions, type 
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { createModels } from "pi-ai-1/models";
 import { consumeModelCalls, replyingUnknownJob, UnknownJob, type ModelJobStub, type ModelQueueDeps } from "../../cf/src/model-queue.ts";
-import type { DriveCase, TimerProbe, WithDriveHost } from "./durable-drive-spec.ts";
+import { movableClock, type DriveCase, type TimerProbe, type WithDriveHost } from "./durable-drive-spec.ts";
 
 /**
  * The poll interval of these objects: longer than a case may take, so a turn that completes after an answer
@@ -42,6 +42,15 @@ const reply = (text: string): ModelResponse => ({
  */
 const STEP_DEADLINE_MS = 3_000;
 const CASE_DEADLINE_MS = 15_000;
+/** How long the onSleep case waits for a park only the notice can bring: past any slowness seen, inside the case's deadline. */
+const NOTICE_WAIT_MS = 10_000;
+/** How long `untilAnswer` waits: past any slowness seen under load, inside the case's deadline, far short of `POLL_MS`. */
+const ANSWER_WAIT_MS = 10_000;
+/**
+ * settle's recheck for a case that must not depend on it: far longer than the case, so every read a step makes is one
+ * a commit or an `onSleep` notice brought, and a step that needed the backstop does not finish within the case.
+ */
+const NO_RECHECK_MS = 60_000;
 /** The hosts the running case opened, closed at its deadline. Cases run one at a time. */
 let caseHosts: PdHost[] = [];
 
@@ -95,13 +104,18 @@ async function untilPolling(host: PdHost) {
   }
   throw new Error("the generation never reached its poll sleep");
 }
-/** Wait until the transcript ends with the answer `text`; how long after `t0` that was. */
-async function untilAnswer(agent: DurableAgent, text: string, t0: number): Promise<number> {
-  for (let i = 0; i < 400; i++) {
-    if (turns(await agent.entries({})).at(-1) === `assistant(stop): ${text}`) return Date.now() - t0;
+/**
+ * Wait until the transcript ends with the answer `text`, for at most `ANSWER_WAIT_MS`. The poll interval is `POLL_MS`,
+ * far longer, so an answer that arrives at all was brought by the delivery's wake, not by the poll: that is the
+ * assertion, rather than a bound of a second that a loaded machine can pass with the wake working.
+ */
+async function untilAnswer(agent: DurableAgent, text: string): Promise<void> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ANSWER_WAIT_MS) {
+    if (turns(await agent.entries({})).at(-1) === `assistant(stop): ${text}`) return;
     await sleep(5);
   }
-  throw new Error(`the answer ${text} never reached the transcript`);
+  throw new Error(`the answer ${text} did not reach the transcript in ${ANSWER_WAIT_MS} ms (the poll is ${POLL_MS} ms away: no wake brought it)`);
 }
 const turns = (entries: Array<{ type: string; message?: unknown }>) => entries.map((e) => {
   const m = (e as { message: { role: string; content: unknown; stopReason?: string } }).message;
@@ -130,23 +144,20 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     }) });
 
   add("turn", `say → an ap job is written and dispatched → step parks${activeTimers ? " with no harness or timer left" : " with no harness left"} → deliver → step: the answer is the transcript`, async (storage) => {
-    const o = object(storage);
+    const o = object(storage, [], { recheckMs: NO_RECHECK_MS });
     const a = o.agent();
     const said = await a.say("Capital of France?") as { value: { operationId?: string } };
     check(said.value.operationId, `an idle conversation did not start a run: ${show(said)}`);
-    const t0 = Date.now();
     const parked = await a.step();
-    const took = Date.now() - t0;
     check(parked.wakeInMs !== null && parked.wakeInMs > 0 && parked.wakeInMs <= POLL_MS && parked.open === 1, `step: ${show(parked)}`);
     check(!o.host.open, "the harness is still open after a park");
     if (activeTimers) check(activeTimers() === 0, `live timers after the park: ${activeTimers()}`);
     const rows = jobs(storage);
     check(rows.length === 1 && rows[0]!.answer === null && rows[0]!.dispatched_at !== null, `jobs ${show(rows)}`);
     check(show(o.dispatched) === show([rows[0]!.id]), `dispatched ${show(o.dispatched)}`);
-    // The poll sleep is seen at once: by the read its checkpoint's commit brings, or by the harness's `onSleep` notice.
-    // Seen only at settle's 1 s recheck, the step would take that second.
+    // The poll sleep is seen by the read its checkpoint's commit brings, or by the harness's `onSleep` notice: with the
+    // recheck off (`NO_RECHECK_MS`), a step that waited for it would not have parked within the case.
     check(o.polls.length === 0, `polled before the park ended: ${show(o.polls)}`);
-    check(took < 900, `the park took ${took} ms (did it wait for settle's 1 s recheck?)`);
     const id = rows[0]!.id;
     const asked = await consume(a, id, "Paris");
     check(asked.some((m) => m.role === "user" && m.content === "Capital of France?") && asked.some((m) => m.role === "system" && m.content.includes("terse test assistant")),
@@ -181,18 +192,27 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
       },
       abort: async (_task, runtime, context) => { await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context); },
     });
-    const o = object(storage, [], { extensions: [defineExtension({ name: "pd-test", tasks: [Nap] })] });
+    // Which read parks is the assertion, not how long the park took: under load the notice can come after a second,
+    // so a time bound could not tell a slow notice from none. With settle's recheck far longer than the case, no
+    // recheck can bring the read that parks, and no commit follows the sleep: the read that parks is the notice's (or one
+    // a commit brought that was still reading as the sleep began, which the notice follows anyway). The step deadline
+    // is lifted to the case's for the same reason: a slow machine must not end the step before the notice.
+    const o = object(storage, [], { extensions: [defineExtension({ name: "pd-test", tasks: [Nap] })], recheckMs: 60_000, stepDeadlineMs: CASE_DEADLINE_MS });
     const a = o.agent();
     await o.host.withHarness(async (h) => {
       const root = await h.root(BACKGROUND);
       await root.commit((tx) => tx.createTask(Nap, {}, { ownership: { kind: "conversation" } }), BACKGROUND);
     });
     const t0 = Date.now();
-    const parked = await a.step();
-    const took = Date.now() - t0;
-    check(until > t0 && parked.open === 1 && parked.wakeInMs !== null && Math.abs(Date.now() + parked.wakeInMs - until) < 1_000,
-      `step ${show(parked)}, the task sleeps until ${until - t0} ms after it started`);
-    check(took < 900, `the park took ${took} ms: settle saw the sleep only at its 1 s recheck`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const noPark = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no park in ${NOTICE_WAIT_MS} ms with settle's recheck off: the onSleep notice did not reach settle`)), NOTICE_WAIT_MS);
+    });
+    const parked = await Promise.race([a.step(), noPark]).finally(() => clearTimeout(timer));
+    const t1 = Date.now();
+    // wakeInMs is `until` less the clock read between t0 and t1.
+    check(until > t0 && parked.open === 1 && parked.wakeInMs !== null && parked.wakeInMs >= until - t1 && parked.wakeInMs <= until - t0,
+      `step ${show(parked)}, the task sleeps until ${until - t0} ms after it started, the step took ${t1 - t0} ms`);
     await a.close();
   });
 
@@ -359,10 +379,8 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await untilPolling(o.host);
     const [row] = jobs(storage);
     check(row && o.host.open, "control: the harness is not open with a job out");
-    const t0 = Date.now();
     await consume(a, row.id, "A1");
-    const ms = await untilAnswer(a, "A1", t0);
-    check(ms < 1_000, `the answer took ${ms} ms to reach the transcript (the poll is ${POLL_MS} ms away)`);
+    await untilAnswer(a, "A1");
     check(show(o.polls) === show([{ id: row.id, ready: true }]), `polls ${show(o.polls)}`);
     const done = await a.step();
     check(done.wakeInMs === null && done.open === 0, `after the answer: ${show(done)}`);
@@ -370,18 +388,17 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("wake", `an answer while parked: the object's next step wakes the generation, which does not wait for its pollAt${activeTimers ? ", and nothing is left running" : ""}`, async (storage) => {
-    const o = object(storage);
+    // With the recheck off, the step after the answer finishes only on the reads its commits bring; had the wake been
+    // lost, it would park for the poll, 60 s away, and say so in `wakeInMs`.
+    const o = object(storage, [], { recheckMs: NO_RECHECK_MS });
     const a = o.agent();
     await a.say("Q1");
     const parked = await a.step();
     check(parked.wakeInMs !== null && parked.wakeInMs > POLL_MS / 2 && !o.host.open, `control: not parked for the poll: ${show(parked)}`);
     const [row] = jobs(storage);
-    const t0 = Date.now();
     await consume(a, row!.id, "A1");
     const done = await a.step();
-    const ms = Date.now() - t0;
     check(done.wakeInMs === null && done.open === 0, `the step after the answer: ${show(done)}`);
-    check(ms < 1_000, `deliver to the answer took ${ms} ms`);
     check(show(o.polls) === show([{ id: row!.id, ready: true }]), `polls ${show(o.polls)}`);
     check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
     if (activeTimers) check(activeTimers() === 0, `live timers after the turn: ${activeTimers()}`);
@@ -406,16 +423,18 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     check(show(o.polls) === show([{ id: row!.id, ready: false }]), `the early wake's fetches: ${show(o.polls)}`);
     check(after.id === before.id && after.at! > before.at!, `pollAt ${before.at} -> ${after.at}`);
     check(jobs(storage).length === 1 && o.dispatched.length === 1, "the early wake called the model again");
-    const t0 = Date.now();
     await consume(a, row!.id, "A1");
-    check(await untilAnswer(a, "A1", t0) < 1_000, "the answer after the early wake was slow");
+    await untilAnswer(a, "A1");
     check(show(o.polls.map((p) => p.ready)) === show([false, true]), `polls ${show(o.polls)}`);
     check(show(turns(await a.entries({}))) === show(["user: Q1", "assistant(stop): A1"]), `entries ${show(turns(await a.entries({})))}`);
     await a.close();
   });
 
   add("wake", "a lost wake (none asked): the step after the answer parks for the poll, and the poll at the backstop completes the turn", async (storage) => {
-    const o = object(storage, [], { noWake: true, pollAfterMs: 400 });
+    // The poll is POLL_MS away and the clock is moved to it. With a 400 ms poll, a step after the answer that read more
+    // than 400 ms after the poll sleep began found the poll due and fetched the answer, and did not park.
+    const clock = movableClock();
+    const o = object(storage, [], { noWake: true, now: clock.now });
     const a = o.agent();
     await a.say("Q1");
     const parked = await a.step();
@@ -425,7 +444,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const early = await a.step();
     check(early.wakeInMs !== null && o.polls.length === 0, `with no wake the step should park for the poll: ${show(early)}, polls ${show(o.polls)}`);
     check(show(turns(await a.entries({}))) === show(["user: Q1"]), "control: the answer arrived with no wake");
-    await sleep(early.wakeInMs);
+    clock.moveTo(clock.now() + early.wakeInMs);
     const done = await a.step();
     check(done.wakeInMs === null, `the backstop's step did not finish: ${show(done)}`);
     check(show(o.polls) === show([{ id: row!.id, ready: true }]), `polls ${show(o.polls)}`);
@@ -498,13 +517,11 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     await untilPolling(o.host);
     const [row] = jobs(storage);
     const job = await a.takeJob(row!.id) as { model: { api: string; provider: string; id: string } };
-    let t0 = 0;
     // The answer lands right after the fetch read the row and found nothing: the poll is not asleep.
-    onFetch = () => { t0 = Date.now(); void a.deliver(row!.id, fromResponse(reply("A1"), job.model, row!.id)); };
+    onFetch = () => { void a.deliver(row!.id, fromResponse(reply("A1"), job.model, row!.id)); };
     const id = await o.host.withHarness(async (h) => (await h.inspect(BACKGROUND)).tasks[0]!.record.id);
     await o.host.withHarness(async (h) => { h.wake([id]); });
-    const ms = await untilAnswer(a, "A1", 0).then(() => Date.now() - t0);
-    check(ms < 1_000, `the answer took ${ms} ms (the poll is ${POLL_MS} ms away)`);
+    await untilAnswer(a, "A1");
     check(show(polls.map((p) => p.ready)) === show([false, true]), `polls ${show(polls)}`);
     await a.close();
   });
