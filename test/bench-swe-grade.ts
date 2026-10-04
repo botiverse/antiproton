@@ -9,14 +9,14 @@
  * like each test runner's, and the verdict on more tests than the old 12-per-side cap ran.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
-  gradeCommand, gradeFromLog, modifiedFiles, parseTestLog, readBoxFile, reinstallCommand, settleShell, testCommand,
-  testDirectives, GRADE_LOG, REINSTALL_FAILED, START, END, type GradedInstance,
+  gradeCommand, gradeFromLog, gradeLogFrom, modifiedFiles, parseTestLog, readBoxFile, readGradeLog, reinstallCommand, settleShell,
+  testCommand, testDirectives, GRADE_LOG, OUTPUT_NOT_WRITTEN, REINSTALL_FAILED, START, END, type GradedInstance,
 } from "../bench/swebench/grade.ts";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -132,7 +132,8 @@ await check("an instance whose fix is absent: pytest exits 1, the script exits 0
       return settleShell({ status: "succeeded", result: { state: exitCode === 0 ? "succeeded" : "failed", exitCode, output: r.stdout.toString() } },
         async () => { throw new Error("nothing was backgrounded"); }, { deadlineAt: Date.now() + 60_000 });
     };
-    const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log));
+    // The test patch's scratch copy goes to the testbed too, not to a /tmp other runs share.
+  const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log).replaceAll("/tmp/swe-test.patch", join(tb.dir, "test.patch")));
     must(graded.status === "succeeded" && graded.result.exitCode === 0, `the grading script failed as a command: ${show(graded)}`);
     const text = gunzipSync(await readBoxFile(async (c) => {
       const a = await shell(c);
@@ -144,6 +145,79 @@ await check("an instance whose fix is absent: pytest exits 1, the script exits 0
     must(!report.resolved && report.error === undefined && show(report.failToPass.failed) === show(["testing/test_python.py::test_fix"])
       && report.passToPass.failed.length === 0, show(report));
   } finally { rmSync(tb.dir, { recursive: true, force: true }); }
+});
+
+/**
+ * The grading script run as the box runs it, and graded the way the runners grade: the command's own answer
+ * through settleShell, then gradeLogFrom and gradeFromLog. `log` is where the script writes its log.
+ */
+async function gradeInBox(tb: ReturnType<typeof testbed>, inst: GradedInstance, log: string) {
+  const env = { ...process.env, PATH: `${tb.bin}:${process.env.PATH}`, HOME: tb.dir };
+  const shell = async (command: string) => {
+    const r = spawnSync("bash", ["-c", command], { env });
+    const exitCode = r.status ?? -1;
+    return settleShell({ status: "succeeded", result: { state: exitCode === 0 ? "succeeded" : "failed", exitCode, output: r.stdout.toString() } },
+      async () => { throw new Error("nothing was backgrounded"); }, { deadlineAt: Date.now() + 60_000 });
+  };
+  const run = async (c: string) => {
+    const a = await shell(c);
+    if (a.status !== "succeeded") throw new Error(show(a));
+    return String(a.result.output);
+  };
+  // The test patch's scratch copy goes to the testbed too, not to a /tmp other runs share.
+  const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log).replaceAll("/tmp/swe-test.patch", join(tb.dir, "test.patch")));
+  // readGradeLog reads GRADE_LOG itself, so the box's path is mapped to the scratch one on the way in.
+  const report = gradeFromLog(inst, await gradeLogFrom(graded, (c) => run(c.replaceAll(GRADE_LOG, log))));
+  return { graded, report };
+}
+const fixed = (tb: ReturnType<typeof testbed>): GradedInstance => {
+  writeFileSync(join(tb.repo, "src/_pytest/python.py"), "FIXED\n");
+  return {
+    instance_id: "pytest-dev__pytest-1", repo: "pytest-dev/pytest", version: "8.0", base_commit: tb.base,
+    test_patch: TEST_PATCH,
+    FAIL_TO_PASS: show(["testing/test_python.py::test_fix"]),
+    PASS_TO_PASS: show(["testing/test_python.py::test_old", "testing/test_new.py::test_new"]),
+  };
+};
+
+await check("a gzip that fails part-way: the script exits non-zero with its marker, and the grade says the output could not be written", async () => {
+  const tb = testbed();
+  try {
+    // A disk that fills while gzip writes: some of the .gz lands, then gzip fails, as on a full disk.
+    writeFileSync(join(tb.bin, "gzip"), ["#!/bin/sh", "printf '\\037\\213\\010\\000'", "echo 'gzip: stdout: No space left on device' >&2", "exit 1"].join("\n"));
+    chmodSync(join(tb.bin, "gzip"), 0o755);
+    const { graded, report } = await gradeInBox(tb, fixed(tb), join(tb.dir, "grade.log"));
+    must(graded.status === "failed" && graded.result?.exitCode === 1, `the script did not fail as a command: ${show(graded)}`);
+    must(String(graded.result?.output).includes(`${OUTPUT_NOT_WRITTEN}: gzip failed`), `no marker: ${show(graded.result?.output)}`);
+    must(readFileSync(join(tb.dir, "grade.log.gz")).length > 0, "the fake gzip wrote nothing, so this is not the cut-file case");
+    must(!report.resolved && /^grading output could not be written \(disk full\?\): gzip failed/.test(report.error ?? ""), show(report));
+  } finally { rmSync(tb.dir, { recursive: true, force: true }); }
+});
+
+await check("a log that cannot be written (ENOSPC, from /dev/full): the script fails with its marker, and the grade names it", async () => {
+  const tb = testbed();
+  try {
+    const log = join(tb.dir, "grade.log");
+    symlinkSync("/dev/full", log);
+    // A gzip that succeeds without reading its input, which from /dev/full would never end: only the log's
+    // own check can stop this script, and without it the grade is the misleading "markers are missing".
+    writeFileSync(join(tb.dir, "empty.gz"), gzipSync(Buffer.alloc(0)));
+    writeFileSync(join(tb.bin, "gzip"), ["#!/bin/sh", `cat '${join(tb.dir, "empty.gz")}'`].join("\n"));
+    chmodSync(join(tb.bin, "gzip"), 0o755);
+    const { graded, report } = await gradeInBox(tb, fixed(tb), log);
+    must(graded.status === "failed" && String(graded.result?.output).includes(`${OUTPUT_NOT_WRITTEN}: writing the log failed`),
+      `the script did not fail with its marker: ${show(graded)}`);
+    must(!report.resolved && /^grading output could not be written \(disk full\?\): writing the log failed/.test(report.error ?? ""), show(report));
+  } finally { rmSync(tb.dir, { recursive: true, force: true }); }
+});
+
+await check("a cut .gz that still reaches the reader is named as that, not as a bare \"unexpected end of file\"", async () => {
+  const gz = gzipSync(Buffer.from(`${START}\nPASSED t.py::test_f\n${END}\n`.repeat(200)));
+  const cut = gz.subarray(0, gz.length - 12);
+  const serve = async (cmd: string) => cmd.startsWith("wc -c") ? `${cut.length}\n` : cut.toString("base64");
+  let msg = "";
+  try { await readGradeLog(serve); } catch (e) { msg = String((e as Error).message); }
+  must(/cut or corrupt \(disk full\?\)/.test(msg), `the error was: ${msg}`);
 });
 
 await check("a spec whose install is not editable is reinstalled before the tests; an editable one is not", () => {

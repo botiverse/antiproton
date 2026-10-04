@@ -29,10 +29,11 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { ratesFromEnv, meterLine, type Meter } from "../meter.ts";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild } from "../record.ts";
-import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
+import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
 import { SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
-import { gradeCommand, gradeFromLog, readGradeLog, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
+import { waitForAnswer, type WaitDeps } from "./wait.ts";
+import { gradeCommand, gradeFromLog, gradeLogFrom, settleShell, type GradedInstance, type ShellAnswer } from "./grade.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
   const m = /^([A-Z0-9_]+)=(.*)$/.exec(l.trim());
@@ -110,82 +111,19 @@ When the fix is in place, say so and stop.
 
 // ------------------------------------------------------------ waiting
 
-/**
- * The agent phase is over when the agent has settled: it replied with text and
- * no tool call, it is not running, and no background job of its is still out.
- * A text reply alone is not enough — with a job out the agent says "waiting for
- * the queued commands to finish" and the job's result wakes it again — and
- * grading at that reply scored a tree the agent was still editing.
- *
- * The socket (the hibernation-API one the console uses) says when to look; the
- * object's own `/bench/poll` decides (`decideFromPoll`), because only the object
- * knows whether a job is out. A text reply on the socket triggers that look at
- * once, and a slow look every 20 s covers a push that never came. Polling alone
- * would measure the poller: every poll wakes the object and is billed.
- *
- * Reconnects rather than gives up: a socket dropped mid-turn is not an agent
- * that stalled, and the cursor means a reconnect resumes rather than replays.
- */
+// The wait itself, and why it ends where it does, is wait.ts.
 const seen = new Map<string, number>();
 const failed = new Map<string, string>();
-
-async function waitForAnswer(taskId: string, deadline: number): Promise<string | null> {
-  while (Date.now() < deadline) {
-    const answer = await oneSocket(taskId, deadline);
-    if (answer !== null) return answer;
-    if (failed.has(taskId)) return null;
-  }
-  return null;
-}
-
-function oneSocket(taskId: string, deadline: number): Promise<string | null> {
+const waitDeps: WaitDeps = {
+  socketUrl: (taskId, after) => BASE.replace(/^http/, "ws") + withObj(
+    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${after}`, objOf(taskId)),
   // The token goes on the upgrade too: /bench/* is gated (task #15), and a
   // refused upgrade reaches a WebSocket client only as close 1006 with no body,
-  // which this runner then scored as a stalled agent (Vera, 2026-09-14).
-  const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
-    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`, objOf(taskId)), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
-  return new Promise<string | null>((resolve) => {
-    let done = false;
-    const stop = (v: string | null) => {
-      if (done) return;
-      done = true;
-      clearInterval(keepalive); clearTimeout(timer);
-      try { ws.close(); } catch { /* already gone */ }
-      resolve(v);
-    };
-    // One task is one message, so no answer has been taken before this one: the floor is 0, not the socket's
-    // cursor, which has already passed the reply that triggered the look.
-    const look = () => {
-      void api(`/bench/poll?taskId=${taskId}`, {}, undefined, objOf(taskId)).then((poll: any) => {
-        const d = decideFromPoll(poll, 0);
-        if (!d) return;
-        if (d.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll)"); stop(null); }
-        else stop(d.text);
-      }).catch(() => { /* the socket or the next tick will do */ });
-    };
-    const keepalive = setInterval(() => {
-      try { ws.send("ping"); } catch { /* closing */ }
-      // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
-      look();
-    }, 20_000);
-    const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
-    ws.onerror = () => stop(null);
-    ws.onclose = () => stop(null);
-    ws.onmessage = (ev: MessageEvent) => {
-      let e: any;
-      try { e = JSON.parse(String(ev.data)); } catch { return; }
-      if (e.kind === "pong") return;
-      if (e.kind === "model.failed") {
-        failed.set(taskId, String(e.payload?.error ?? "the model call failed"));
-        stop(null);
-        return;
-      }
-      if (typeof e.id === "number") seen.set(taskId, e.id);
-      // A text reply may be a pause while a job runs: ask the object whether the agent has settled.
-      if (e.kind === "model.response" && !e.payload?.toolCalls && e.payload?.text) look();
-    };
-  });
-}
+  // which this runner then scored as a stalled agent.
+  headers: { "x-harness-token": TOKEN },
+  poll: (taskId) => api(`/bench/poll?taskId=${taskId}`, {}, undefined, objOf(taskId)),
+  seen, failed,
+};
 
 // ------------------------------------------------------------ one instance
 
@@ -259,7 +197,7 @@ async function runOne(inst: Instance) {
   try {
     await post("/bench/say", { taskId,
       text: `Fix this issue in the repository at /testbed.\n\n${inst.problem_statement.slice(0, 6000)}` }, undefined, obj);
-    answered = await waitForAnswer(taskId, t0 + BUDGET_MS);
+    answered = await waitForAnswer(taskId, t0 + BUDGET_MS, waitDeps);
     if (answered === null && !failed.has(taskId)) {
       ({ stall, stallWhy } = await stallAtDeadline(() => api(`/bench/poll?taskId=${taskId}`, {}, undefined, obj), seen.get(taskId) ?? 0));
     }
@@ -274,8 +212,8 @@ async function runOne(inst: Instance) {
     // and PASS_TO_PASS test, from one run of the repository's own test command over the test patch's files.
     const diff = (await shellOut(taskId, "cd /testbed && git diff --stat | tail -3").catch(() => "")).trim().split("\n").pop() ?? "";
     try {
-      await shellOut(taskId, gradeCommand(inst));
-      const report = gradeFromLog(inst, await readGradeLog((c) => shellOut(taskId, c)));
+      const graded = await shell(taskId, gradeCommand(inst));
+      const report = gradeFromLog(inst, await gradeLogFrom(graded, (c) => shellOut(taskId, c)));
       grade = gradeRecord(report, diff);
     } catch (e) {
       grade = { ...grade, diff, gradeError: String((e as Error)?.message ?? e).slice(0, 300) };
