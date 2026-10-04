@@ -573,6 +573,43 @@ await check("a full queue stuck behind a failing head says to retry at the head'
   must(show(answers) === show([["stuck", 429, "120"], ["opening", 429, "3"], ["posting", 429, "3"]]), show(answers));
 });
 
+await check("a full queue on one hook says to retry at the agent's head's next try when that head is another hook's", async () => {
+  const w = await world();
+  const rt = w.D.runtime();
+  await rt.store.addMount({ tenantId: T, agentId: A, alias: "p2", plugin: "pushy", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const hookA = { id: w.hookId, secret: w.secret };
+  const idB = "B".repeat(43);
+  const made = await w.D.hookCreateSecret(T, A, "p2", idB) as { ok: boolean; secret?: string };
+  must(made.ok && made.secret, "hook B's secret");
+  w.d1.hooks.set(idB, { hook_id: idB, tenant_id: T, agent_id: A, alias: "p2", created_at: 1, revoked_at: null });
+  const hookB = { id: idB, secret: made.secret! };
+  const engine = await rt.agent(T, A);
+  (engine as any).say = () => Promise.reject(new Error("posting is down"));
+  const realNow = Date.now;
+  const base = realNow();
+  const at = (ms: number) => { Date.now = () => base + ms; };
+  const as = (h: { id: string; secret: string }) => { w.hookId = h.id; w.secret = h.secret; };
+  let full: Awaited<ReturnType<typeof push>>;
+  try {
+    // A's push is the agent's oldest; B queues 30 behind it, two seconds apart so B's rate never trips.
+    at(-1_000); as(hookA); must((await push(w, "a0", "A")).status === 202, "A's push");
+    as(hookB);
+    for (let i = 0; i < 30; i++) { at(i * 2_000); must((await push(w, `b${i}`, "B")).status === 202, `B's push ${i}`); }
+    // A's post fails at +60 s (next try in 30 s) and at +90 s (next try in 2 min, at +210 s); B's rows wait behind it.
+    at(60_000); await w.D.alarm();
+    at(90_000); await w.D.alarm();
+    const rows = w.raw.sql.exec("SELECT hook_id, attempts, next_at FROM inbound_pending ORDER BY seq").toArray() as any[];
+    must(rows.length === 31 && rows[0].hook_id === hookA.id && rows[0].attempts === 2 && rows[0].next_at === base + 210_000 &&
+      rows.slice(1).every((r) => r.hook_id === idB && r.attempts === 0 && r.next_at === 0),
+      `control: A's head waits its 2-minute retry, B's 30 untried behind it: ${show(rows.slice(0, 2))}`);
+    at(90_700);
+    full = await push(w, "b30", "B");
+  } finally { Date.now = realNow; }
+  // B's own oldest row is due now (it would say 3); what holds it is A's head, 119.3 s away.
+  must(full.status === 429 && full.body === '{"outcome":"rate_limited"}' && full.retryAfter === "120", `B's 31st: ${show({ ...full, d1: undefined })}`);
+});
+
 await check("provisioning and the model choice run once in a pass that posts, and not in one that only waits out a retry", async () => {
   const w = await world({ raftMade: true });
   await push(w, "a", "P-ONE");

@@ -836,7 +836,10 @@ does need one; see the GitHub example below.
    limit answers. Its `Retry-After` is the time until the oldest queued
    event's next try, rounded up and held between 3 s and 600 s, so a sender
    stuck behind a failing post is sent back when the queue can next move
-   rather than every few seconds; a queue that is moving says 3. An event is never posted twice: if a pass ends
+   rather than every few seconds; a queue that is moving says 3. A push that
+   is both over the rate and behind a full queue is told the rate's wait first
+   (at most 60 s) and the queue's on its next try, so expect one extra refusal
+   there. An event is never posted twice: if a pass ends
    while handing an event over, it cannot tell whether the event arrived, and
    records it as `failed` rather than posting it again.
 
