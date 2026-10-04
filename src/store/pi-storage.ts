@@ -78,6 +78,14 @@ export function piTables(session: string = MAIN_SESSION): PiTables {
   return { entries: `${p}entries`, usage: `${p}usage`, values: `${p}values`, list: `${p}list`, meta: `${p}meta` };
 }
 
+/**
+ * The entries a session's model context is rebuilt from: pi's `compaction` (its context starts at the newest one,
+ * pi-agent-core dist/harness/session/context.js `buildContextEntries`), a `branch_summary` (written when the tip is
+ * moved to another branch with a summary) and a `pi.reset`. One string, used by the index below and by the query that
+ * reads it, because SQLite uses a partial index only for a query whose condition implies the index's.
+ */
+export const CONTEXT_BOUNDARY_WHERE = "type IN ('compaction', 'branch_summary') OR custom_type = 'pi.reset'";
+
 function schemaFor(t: PiTables): string[] {
   return [
     `CREATE TABLE IF NOT EXISTS ${t.entries} (
@@ -85,6 +93,9 @@ function schemaFor(t: PiTables): string[] {
        timestamp INTEGER NOT NULL, type TEXT NOT NULL, custom_type TEXT, body TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS ${t.entries}_seq ON ${t.entries}(seq)`,
     `CREATE INDEX IF NOT EXISTS ${t.entries}_parent ON ${t.entries}(parent_id)`,
+    // The few entries a session's context is rebuilt from, so its newest one is found without reading the
+    // transcript: `contextIdOf` (src/runtime/context-id.ts) asks on every plugin call.
+    `CREATE INDEX IF NOT EXISTS ${t.entries}_boundary ON ${t.entries}(seq) WHERE ${CONTEXT_BOUNDARY_WHERE}`,
     `CREATE TABLE IF NOT EXISTS ${t.usage} (
        id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, body TEXT NOT NULL)`,
     `CREATE INDEX IF NOT EXISTS ${t.usage}_seq ON ${t.usage}(seq)`,

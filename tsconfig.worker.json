@@ -88,6 +88,7 @@
     "test/mount-reports.ts",
     "test/run-js-resume.ts",
     "test/run-js-opts.ts",
+    "test/caller-context.ts",
     "test/tool-interrupts.ts",
     "test/mcp-plugin.ts",
     "test/model-queue.ts",

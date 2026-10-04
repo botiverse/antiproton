@@ -253,7 +253,28 @@ export interface DbSpec {
 
 export interface PluginContext {
   /** Read-only identity of the caller. Plugins cannot use it to escalate. */
-  caller: { tenantId: string; agentId: string; taskId: string };
+  caller: {
+    tenantId: string;
+    agentId: string;
+    taskId: string;
+    /**
+     * Present, and true, exactly when this call came from a run_js program rather than from the model's own tool
+     * call: set from `InvokeOpts.fromProgram`, which run_js sets after the program's options so a program cannot
+     * clear it. Absent for the model's calls, an approved call's replay, provisioning and bench shells. A tool a
+     * program must never reach declares `ToolSchema.modelOnly` instead; this is for a tool that may run from a
+     * program but has to treat the result as not yet seen by the model.
+     */
+    fromProgram?: true;
+    /**
+     * An opaque id for the model's current context window in this agent's session: the same on every call while
+     * what the model read earlier in the session is still in its context, and different after a new session, a
+     * reset or a compaction. Never per turn, and recomputed from durable state, so a restart does not move it.
+     * Absent when the call is not made in a session's turn (an approved call's replay, provisioning, a bench shell,
+     * a background job's poll). Compare it for equality only: how it is made is not part of the contract
+     * (src/runtime/context-id.ts). It can change when nothing was lost; it does not stay when something was.
+     */
+    contextId?: string;
+  };
   /**
    * The name this mount was given, which is the only name the model knows.
    *

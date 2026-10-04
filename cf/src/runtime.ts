@@ -65,6 +65,7 @@ import {
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
 import { MAIN_SESSION } from "../../src/store/pi-storage.ts";
+import { contextIdOf } from "../../src/runtime/context-id.ts";
 import { UnknownJob } from "./model-queue.ts";
 
 /** The persona fields of an agent record, if it carries any. */
@@ -1295,6 +1296,11 @@ export class AgentRuntime {
      * second place that knows what holding means.
      */
     heldOn: (alias: string) => Promise<string | null> = async () => null,
+    /**
+     * The session's context id now (`contextIdOf`, src/runtime/context-id.ts), asked on each call rather than once:
+     * a compaction in the middle of a run moves it, and a call after one belongs to the new context.
+     */
+    contextId: () => string | undefined = () => undefined,
   ) {
     const readBack = reader?.name ?? null;
     const withheld = new Set(this.#deps.withholdTools ?? []);
@@ -1303,12 +1309,18 @@ export class AgentRuntime {
     const store = this.store;
     const artifacts = this.#artifacts;
     const sql = this.#deps.ctx.storage.sql;
+    // Every call through this host is made in the session's turn: the model's own, a program's inside one, the
+    // model's answer to a tool's question. So each carries the context id; nothing a call carries can set it.
+    const inTurn = (): typeof ctx & { contextId?: string } => {
+      const id = contextId();
+      return id === undefined ? ctx : { ...ctx, contextId: id };
+    };
     // `send` is the gateway step behind this result: a call by default, or the
     // answer to a question a tool asked, whose result is the tool's own and is
     // finished exactly as a call's is (a job, a parked result, the held line).
     const dispatch = async (
       call: { tool: string; args: any; opts?: any; callId?: string },
-      send: () => Promise<ToolResult> = () => gw.invoke(ctx, call.tool, call.args, hostCallOpts(call)),
+      send: () => Promise<ToolResult> = () => gw.invoke(inTurn(), call.tool, call.args, hostCallOpts(call)),
     ): Promise<ToolResult> => {
         const res = await send();
         // Work that has started and outlives this call (task #16). The model is
@@ -1398,10 +1410,10 @@ export class AgentRuntime {
       async resumeInterrupt(i: ToolInterrupt, answer: Json, callId: string): Promise<ToolResult> {
         const call = { tool: `${i.alias}.${i.tool}`, args: null, callId };
         if (ended?.({ tenantId: ctx.tenantId, agentId: ctx.agentId })) return taskEndedRefusal(call.tool);
-        return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(ctx, i, answer, { callId })));
+        return held(call.tool, await dispatch(call, () => gw.resumeInterrupt(inTurn(), i, answer, { callId })));
       },
       async cancelInterrupt(i: ToolInterrupt): Promise<string | null> {
-        return gw.cancelInterrupt(ctx, i);
+        return gw.cancelInterrupt(inTurn(), i);
       },
     };
   }
@@ -1915,7 +1927,8 @@ export class AgentRuntime {
     const heldOn = async (alias: string) =>
       heldLines(await heldResources(records.filter((m) => m.alias === alias), this.#plugins, activityOf), nameOf, Date.now());
     const host = this.#host(
-      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn);
+      { tenantId, agentId, taskId: session === MAIN_SESSION ? LEGACY_TASK : session }, reader, offered, heldOn,
+      () => contextIdOf(this.#deps.ctx.storage.sql, { tenantId, agentId, session, engine: engine === "pd" ? "pd" : "pi085" }));
     const store = this.store;
     // The tools the model is offered are the mounts plus the sandbox. run_js is
     // not a mount — it is the one tool whose body is this object rather than a
