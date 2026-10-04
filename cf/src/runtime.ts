@@ -100,7 +100,7 @@ export function hostCallOpts(call: { opts?: unknown; callId?: string }): InvokeO
   };
 }
 import type { MountPolicy, MountRecord } from "../../src/core/types.ts";
-import type { HookDirectory } from "./control-plane.ts";
+import type { HookDirectory, HookRow } from "./control-plane.ts";
 import { jsRunRows } from "../../src/usage/outbox.ts";
 import { RunJsContinuations } from "../../src/runtime/run-js-resume.ts";
 
@@ -466,6 +466,8 @@ export interface RuntimeDeps {
    * are offered no `inbound` and cannot make hooks themselves.
    */
   hooks?: { origin: string; directory: Pick<HookDirectory, "create" | "lookup" | "revoke" | "list"> };
+  /** How long `removeMount` waits on a plugin's `unmount`; {@link UNMOUNT_TIMEOUT_MS} when unset. A test's knob. */
+  unmountTimeoutMs?: number;
   maxTurns?: number;
   /**
    * What the bound model can hold, in tokens.
@@ -704,6 +706,14 @@ export const RETAKE_TIMEOUT_MS = 3_000;
  * the basis should try at once).
  */
 export const RETAKE_BACKOFF_MS = 10 * 60_000;
+/**
+ * How long a removal waits on the plugin's `unmount` (`Plugin.unmount`, `AgentRuntime.removeMount`). A person is
+ * waiting on the console's answer, and the call is a few requests to the plugin's service to cancel what it
+ * registered — a webhook delete is one. Ten seconds is room for a slow service and a couple of those, and the
+ * same order as the ten seconds GitHub gives a webhook delivery, past which nobody reads a service as merely slow.
+ * Running out does not block the removal; it is reported like a failure.
+ */
+export const UNMOUNT_TIMEOUT_MS = 10_000;
 
 /** The refusal's text when `e` is one, or null. `e` is whatever a catch holds, so it is asked before it is
  *  read: an object with a `message` is read there, anything else is read as itself. */
@@ -1972,17 +1982,38 @@ export class AgentRuntime {
    * plugin off can. Each refusal names what is in the way:
    *  - a credential reference: an account on it is the owner's to take back
    *    first (or the operator's, for one this agent did not attach);
-   *  - a live inbound hook: a service is still posting to this alias, and a
-   *    mount added later under the same name would receive it;
    *  - a held call waiting for a person: deciding it would run against a mount
    *    that is gone;
    *  - something running under it, or a background job: the same guard a
    *    rename and a release use (`renameSafety`, `mountsWithRunningJobs`).
    *
+   * Past those, the removal is going to happen, and in this order:
+   *  1. the plugin's `unmount`, if it declares one, bounded by
+   *     `UNMOUNT_TIMEOUT_MS`. A throw or a timeout does not stop the removal —
+   *     a service that is down must not make a mount undeletable — and comes
+   *     back as `unmountError`, for the person who removed it to read. It runs
+   *     after every refusal so a plugin never cancels its registrations for a
+   *     mount that then stays, and before the hooks go so it can still use
+   *     `ctx.inbound` and find its hooks live.
+   *  2. every hook of the alias still live is revoked, the way
+   *     `ctx.inbound.revoke` does it: the index row first, so the URL stops
+   *     resolving, then the secret. A live hook is not a refusal: only the
+   *     plugin's own tools or the operator can revoke one, so "revoke it
+   *     first" would leave the owner with a mount they cannot delete; the hook
+   *     is the runtime's resource, so the runtime closes it. If the index
+   *     cannot be read (it is read once before step 1 too, so an index that is
+   *     down refuses before the plugin has cancelled anything) or a revoke
+   *     fails, the removal is REFUSED with that
+   *     reason, even though `unmount` has already run: a public URL left live
+   *     for an alias that a later mount may take is worse than a mount that
+   *     stays until the index answers, and trying again is safe — an `unmount`
+   *     that finds nothing left to cancel has nothing to do.
+   *  3. the store's delete, as before.
+   *
    * `hooks` is the hook index, passed in by the caller that holds it: the
    * runtime's own handle exists only where plugins may make hooks, while the
-   * operator's route can make one anywhere. An index that cannot be read
-   * refuses, rather than deleting past a hook nobody checked for.
+   * operator's route can make one anywhere. Null means there is no index, so
+   * no hook to revoke.
    *
    * After the store's delete, the caches keyed by the alias go too: a
    * credential check's held error, the held-thing warnings and the last
@@ -1991,8 +2022,8 @@ export class AgentRuntime {
    */
   async removeMount(
     tenantId: string, agentId: string, alias: string,
-    hooks: Pick<HookDirectory, "list"> | null,
-  ): Promise<{ ok: true } | { ok: false; error: string; conflict?: true }> {
+    hooks: Pick<HookDirectory, "list" | "revoke"> | null,
+  ): Promise<{ ok: true; unmountError?: string } | { ok: false; error: string; conflict?: true }> {
     await this.ready();
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     if (!mount) return { ok: false, error: `no mount named ${alias}` };
@@ -2001,13 +2032,6 @@ export class AgentRuntime {
     if (plugin?.consoleMount !== true) return refuse(`${mount.plugin} mounts cannot be removed from the console`);
     if (!consoleAdded(mount)) return refuse(`${alias} was not added from the console; only the operator can remove it`);
     if (mount.secretRef) return refuse(`${alias} has an account attached; remove it first`);
-    let live: number;
-    try {
-      live = hooks ? (await hooks.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null).length : 0;
-    } catch (e) {
-      return refuse(`could not check ${alias}'s inbound hooks, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-    }
-    if (live) return refuse(`${alias} has ${live} live inbound hook${live === 1 ? "" : "s"}; revoke ${live === 1 ? "it" : "them"} first`);
     const held = (await this.store.listApprovals(tenantId, "pending")).filter((a) => a.agentId === agentId && a.mountAlias === alias).length;
     if (held) return refuse(`${alias} has ${held} call${held === 1 ? "" : "s"} waiting for a decision; decide ${held === 1 ? "it" : "them"} first`);
     const sql = this.#deps.ctx.storage.sql;
@@ -2016,6 +2040,29 @@ export class AgentRuntime {
     }
     const safety = renameSafety(await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, alias), Date.now());
     if (!safety.safe) return refuse(`${safety.reason} (${safety.live.id}, idle ${Math.round(safety.live.idleMs / 60_000)}m)`);
+    // Read before `unmount` as well as after: an index that cannot be read refuses before the plugin has cancelled
+    // anything, which is the common way step 2 fails. The second read is what the plugin left live.
+    const liveHooks = async (): Promise<HookRow[] | { error: string }> => {
+      try {
+        return hooks ? (await hooks.list(tenantId, agentId)).filter((h) => h.alias === alias && h.revokedAt === null) : [];
+      } catch (e) {
+        return { error: `could not check ${alias}'s inbound hooks, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}` };
+      }
+    };
+    const readable = await liveHooks();
+    if ("error" in readable) return refuse(readable.error);
+    const unmountError = plugin.unmount ? await this.#unmount(tenantId, agentId, alias) : null;
+    const live = await liveHooks();
+    if ("error" in live) return refuse(live.error);
+    for (const h of live) {
+      try {
+        // Null is a hook revoked since the list was read; its secret goes all the same.
+        await hooks!.revoke(h.hookId);
+        await this.dropHookSecret(tenantId, agentId, h.hookId);
+      } catch (e) {
+        return refuse(`could not revoke ${alias}'s inbound hook, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+      }
+    }
     // The row a credential attached here would have been kept under. This mount
     // does not reference it (refused above), but another may: a reference is a
     // name, and `agent:<alias>` can sit on any mount. Only an unreferenced row
@@ -2027,7 +2074,27 @@ export class AgentRuntime {
     const warned = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='held_warnings'").toArray().length > 0;
     if (warned) sql.exec("DELETE FROM held_warnings WHERE alias = ?", alias);
     this.#snapshotErrors()?.exec("DELETE FROM mount_snapshot_errors WHERE alias = ?", alias);
-    return { ok: true };
+    return unmountError ? { ok: true, unmountError } : { ok: true };
+  }
+
+  /**
+   * The plugin's `unmount`, under its timeout: null when it returned, else why not, in words for the person who
+   * removed the mount. A call past the deadline is not stopped (nothing can stop a promise); its late failure is
+   * caught so it is not an unhandled rejection, and what it does lands on a mount that is gone.
+   */
+  async #unmount(tenantId: string, agentId: string, alias: string): Promise<string | null> {
+    const ms = this.#deps.unmountTimeoutMs ?? UNMOUNT_TIMEOUT_MS;
+    const call = this.#gateway.unmount(tenantId, agentId, alias).then(() => null,
+      (e) => `${alias}'s plugin could not clean up: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<string>((resolve) => {
+      timer = setTimeout(() => resolve(`${alias}'s plugin did not finish cleaning up within ${ms} ms`), ms);
+    });
+    try {
+      return await Promise.race([call, timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

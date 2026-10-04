@@ -4047,7 +4047,10 @@ async function route(request: Request, env: Env): Promise<Response> {
           return consoleAnswer(request, plugins(d),
             { ok: true, changed: r.changed, hash: r.hash, tools: r.tools, skipped: r.skipped, toolsTakenAt });
         }
-        // Remove: 409 with the reason while anything depends on the mount (runtime `removeMount`).
+        // Remove: 409 with the reason while anything depends on the mount (runtime `removeMount`). A removal
+        // whose plugin could not clean up is still a removal, so 200, with the plugin's reason above the panel
+        // (escaped the way `/ui/sandbox/release` escapes one) and as `unmountError` for a JSON caller: what it
+        // left registered with its service is now that person's to cancel by hand.
         case "/ui/mount/remove": {
           const gate = await requireViewer(request, env);
           if (gate instanceof Response) return gate;
@@ -4059,7 +4062,12 @@ async function route(request: Request, env: Env): Promise<Response> {
           if (!alias) return consoleRefusal(request, "expected an alias", 400);
           const r = await stub.uiRemoveMount(gate.tenantId, agentId, alias);
           if (!r.ok) return consoleRefusal(request, r.error, r.conflict ? 409 : 400);
-          return consoleAnswer(request, plugins(await stub.uiPlugins(gate.tenantId, agentId)), { ok: true, alias, removed: true });
+          const panel = plugins(await stub.uiPlugins(gate.tenantId, agentId));
+          if (!r.unmountError) return consoleAnswer(request, panel, { ok: true, alias, removed: true });
+          const reason = r.unmountError.replace(/[&<>"']/g, (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
+          return consoleAnswer(request, `<div class="err">removed, but ${reason}</div>${panel}`,
+            { ok: true, alias, removed: true, unmountError: r.unmountError });
         }
         // A secret the owner keeps for a mount's {{name}} header slots, under `owner:`
         // (src/runtime/secrets.ts): by `state.secret_put`'s rules, but out of the agent's reach.

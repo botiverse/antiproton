@@ -1222,6 +1222,27 @@ export class ToolGateway {
   }
 
   /**
+   * Tell a mount's plugin the mount is being removed (`Plugin.unmount`), with the context a call on it would get,
+   * minus a task. Whether there was anything to ask; a plugin's throw propagates, and the caller decides what it
+   * means (`AgentRuntime.removeMount` records it and removes the mount anyway).
+   *
+   * Not behind the switch or the version pin that gate a pushed event: those keep strangers' events and
+   * unfamiliar code away from a mount that stays, and this is the last word to a mount that is going. What it
+   * registered with the service while it was switched on is still registered after a person switched it off.
+   */
+  async unmount(tenantId: string, agentId: string, alias: string): Promise<boolean> {
+    const mount = await this.#store.getMountByAlias(tenantId, agentId, alias);
+    if (!mount) return false;
+    const plugin = this.#plugins.get(mount.plugin);
+    if (!plugin?.unmount) return false;
+    const credential = mount.secretRef
+      ? await this.#secrets.resolve(mount.secretRef, { tenantId: mount.tenantId, agentId: mount.agentId })
+      : null;
+    await plugin.unmount(this.#contextFor({ tenantId, agentId, taskId: "" }, mount, credential));
+    return true;
+  }
+
+  /**
    * The agent's activity, to every mount whose plugin reports it (the raft
    * mount, in practice). The same gate as an inbound event minus the need to
    * receive: the mount exists, its plugin is switched on for this agent and
