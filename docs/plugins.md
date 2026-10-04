@@ -336,7 +336,9 @@ whole messages, lowest seq first, as stay under the parking line. Only those
 are acknowledged and recorded as seen: Raft's `since = n` acknowledges every
 pending row with seq ≤ n and a batch arrives in delivery order, not seq order,
 so the cursor is the smallest unshown seq less one (the largest shown when all
-fit), and Raft hands the rest out again first. A message too long to fit alone is handed over
+fit), and Raft hands the rest out again first. That cursor is kept under its
+own key and sent exactly as computed, since a later cut can rightly put it below
+the previous one and the SDK's `inbox.commit` never lowers its cursor. A message too long to fit alone is handed over
 alone and acknowledged, so the inbox moves, but not recorded as seen: the model
 got a parked preview, so a send into that conversation is still held. The CLI commands the SDK's text
 names are rewritten as tool calls in one place (`toolTerms`), a stopgap until

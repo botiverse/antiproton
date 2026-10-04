@@ -304,13 +304,22 @@ async function validPushSignature(body: Uint8Array, signature: string | undefine
 }
 
 /**
- * The SDK's state for this mount — committed and pending inbox cursors, the seen frontier, held-send
- * keys — kept as one record in the mount's database. The next pull acknowledges what was committed;
- * the frontier is what this agent was shown per conversation, which a send attests so a reply into a
- * conversation it has read is not held. All of it survives the object being a new process between calls.
+ * The SDK's state for this mount — inbox cursors, the seen frontier, held-send keys — kept as one record in
+ * the mount's database. Its inbox cursors are read only by a pull on a mount that has no `SINCE_KEY` yet,
+ * receive_events' own cursor; the frontier is what this agent was shown per conversation, which a send attests
+ * so a reply into a conversation it has read is not held. All of it survives the object being a new process between calls.
  */
 export const INBOX_STORE = "inbox";
 const STATE_KEY = "state";
+/**
+ * The `since` the next `receive_events` pull sends, as `{ since: number | null }`, apart from the SDK's state.
+ * Raft acknowledges with it every row of its previous response whose seq is at or below it, so it has to be
+ * exactly the cursor the last call computed, which a cut that showed only part of a response can put BELOW the
+ * one before (a lower seq handed out again, or newly, after an earlier cursor). The SDK's `inbox.commit` never
+ * lowers its cursor, so it cannot hold this one: it would keep the higher value and acknowledge rows the model
+ * was not shown. `null` sends no cursor, which acknowledges nothing.
+ */
+const SINCE_KEY = "since";
 
 function isRaftState(value: unknown): value is RaftState {
   const v = object(value);
@@ -909,7 +918,9 @@ export function handOver(batch: RaftInboxBatch): { result: Record<string, Json>;
   for (let k = queued.length; k >= (handedOff.length ? 0 : 1); k--) {
     if (fits(resultOf(k, true))) return pick(k, true);
   }
-  return pick(1, false);
+  // Nothing fits. With seq-less events, they alone are over the line: they are shown, having been acknowledged when
+  // handed out, and no queued message is, so none is acknowledged. Without them, the lowest is too long alone.
+  return pick(handedOff.length ? 0 : 1, false);
 }
 
 /**
@@ -969,7 +980,7 @@ export const raftPlugin: Plugin = {
   version: "1.0.0",
   /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
   database: {
-    version: 3, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY] } },
+    version: 3, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] } },
     /**
      * Version 2 kept the cursor and the frontier under their own keys; version 3 keeps the SDK's state record.
      * The version-2 cursor was the last batch handed to the model, not yet acknowledged, which is exactly the
@@ -1110,12 +1121,18 @@ export const raftPlugin: Plugin = {
     if (name === "receive_events") {
       const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
       const raft = raftFor(ctx);
-      // Cursor acknowledgement: nothing is acknowledged by being fetched. The cursor the previous call committed
-      // (kept in the mount's state, since the object may be a new process by now; `commit()` first promotes a
-      // pending cursor an older state left behind) goes as `since`, which is what acknowledges it on the Server.
-      // A pull that fails moves nothing, so the next call asks for the same messages again.
-      await raft.inbox.commit();
-      const since = raft.state.snapshot().cursor;
+      // Cursor acknowledgement: nothing is acknowledged by being fetched. The cursor the previous call computed
+      // (`SINCE_KEY`, kept in the mount's database, since the object may be a new process by now) goes as `since`,
+      // which is what acknowledges what that call showed. A pull that fails moves nothing, so the next call sends
+      // the same cursor and gets the same messages again.
+      //
+      // A mount with no such record yet takes the SDK's own cursor, `commit()` first promoting a pending one. Only the
+      // flow before this record existed wrote it, and that flow kept the cursor of a whole response, every message of
+      // which it had handed to the model, so sending it acknowledges what that flow handed over and nothing more.
+      const kept = object(await ctx.db.get(INBOX_STORE, SINCE_KEY));
+      let since: number | null;
+      if ("since" in kept) since = typeof kept.since === "number" ? kept.since : null;
+      else { await raft.inbox.commit(); since = raft.state.snapshot().cursor; }
       // The pull runs on a client whose state is not saved: the SDK books every message a pull returns as seen,
       // and only those `handOver` shows may be. As the model's own: receive_events is model-only, so the gateway
       // has already refused it from a program and from an approved call's replay.
@@ -1131,9 +1148,10 @@ export const raftPlugin: Plugin = {
         for (const m of given.shown) if (m.seq !== null) byTarget.set(m.target, [...(byTarget.get(m.target) ?? []), m.seq]);
         for (const [target, seqs] of byTarget) seen.recordExact(target, seqs);
       }
-      // What was shown is committed now and acknowledged by the next pull; one save carries the cursor and the record.
-      if (batch.ackMode === "cursor" && given.cursor !== null) await raft.inbox.commit({ cursor: given.cursor });
-      else if (given.attested && given.shown.length) await raft.state.save();
+      if (given.attested && given.shown.length) await raft.state.save();
+      // Exactly this call's cursor, lower than the last one or not: the next pull acknowledges what was shown here.
+      // A Server that acknowledged on read has nothing pending, so the next pull sends none.
+      await ctx.db.put(INBOX_STORE, { since: batch.ackMode === "cursor" ? given.cursor : null }, SINCE_KEY);
       return given.result;
     }
     if (name === "enable_push") {
