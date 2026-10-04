@@ -342,8 +342,16 @@ export function pdOutboxCases(withHost: WithDriveHost): DriveCase[] {
     check(next.dispatched.length === 0 || t1 >= due, `dispatched inside the redelivery interval: ${show(next.dispatched)}, the step ended ${due - t1} ms before it`);
     check(resumed.wakeInMs !== null && resumed.wakeInMs <= REDELIVERY, `the park passes the redelivery: ${show(resumed)}`);
     await sleep(due - Date.now());
-    for (let i = 0; i < 3; i++) await next.agent.step();
+    for (let i = 0; i < 3 && next.dispatched.length === 0; i++) await next.agent.step();
     check(show(next.dispatched) === show([job.id]), `dispatched at the redelivery: ${show(next.dispatched)}`);
+    // The redelivery's message takes the job, as the queue consumer does (cf/src/model-queue.ts, `withTake`). Until
+    // then the job is one nobody carries, and a sweep a redelivery interval later sends it again by design: steps
+    // slowed past that interval (a loaded machine) would read as a double dispatch.
+    check(await next.agent.takeJob(job.id, "worker") !== null, "the redelivered job was not taken");
+    // A full redelivery interval passes under the take, so only the take can stop the sweep resending it.
+    await sleep(REDELIVERY);
+    for (let i = 0; i < 2; i++) await next.agent.step();
+    check(show(next.dispatched) === show([job.id]), `dispatched again under the take: ${show(next.dispatched)}`);
     await pdTurn(storage, next.agent, null, [replying(SCRIPT[0]!.reply)]);
     check(show(next.dispatched) === show([job.id]), `dispatched by the end: ${show(next.dispatched)}`);
     check(show(usagePairs(storage)) === show(Q1_USAGE), `usage ${show(usagePairs(storage))}`);
