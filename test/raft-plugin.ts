@@ -617,9 +617,11 @@ async function raftBehindGateway(policy: unknown = null) {
   });
   const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
   const ctx = { tenantId: "tenant", agentId: "agent", taskId: "task" };
+  // The runtime's host makes every call in the session's turn, so each carries the turn's context id (`inTurn`).
+  const inTurn = { ...ctx, contextId: "ctx_turn" };
   const host = {
     seen: [] as any[],
-    async invoke(call: any) { host.seen.push(call); return gateway.invoke(ctx, call.tool, call.args, { ...(call.opts ?? {}), ...(call.callId ? { callId: call.callId } : {}) }) as any; },
+    async invoke(call: any) { host.seen.push(call); return gateway.invoke(inTurn, call.tool, call.args, { ...(call.opts ?? {}), ...(call.callId ? { callId: call.callId } : {}) }) as any; },
   };
   const offered = (aliases: string[]) => qualifyMountedTools(aliases.flatMap((alias) => raftPlugin.tools.map((t) => ({
     name: t.name, description: t.summary, parameters: t.parameters, address: `${alias}.${t.name}`,
@@ -965,12 +967,33 @@ await check("a program's read_messages asks Raft not to mark the page read, and 
   if (!(sent instanceof Interrupt)) throw new Error(`the program's read let the send through: ${JSON.stringify(sends)}`);
 });
 
-await check("the model's read_messages is unchanged: no consume parameter, and still records nothing as seen", async () => {
+await check("the model's own read_messages in its turn is unchanged: no consume parameter, and still records nothing as seen", async () => {
   const fresh = freshDb();
   const calls = one(json(200, SEEN_PAGE));
-  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 40 }, { ...ctx(), db: fresh.db });
+  const c = { ...ctx(), db: fresh.db, caller: { ...ctx().caller, contextId: "ctx_turn" } };
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 40 }, c);
   if (calls.length !== 1 || new URL(calls[0]!.url).searchParams.has("consume")) throw new Error(`request: ${calls[0]?.url}`);
   if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
+});
+
+await check("a read_messages call made in no session's turn (neither fromProgram nor contextId) leaves the page unread", async () => {
+  const calls = one(json(200, SEEN_PAGE));
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk" }, ctx());
+  if (calls.length !== 1 || new URL(calls[0]!.url).searchParams.get("consume") !== "false") throw new Error(`request: ${calls[0]?.url}`);
+});
+
+await check("an approved call's replay of read_messages, run with nobody reading it, leaves the page unread", async () => {
+  const g = await raftBehindGateway({ read: "approval" });
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: any) => { urls.push(String(url)); return json(200, SEEN_PAGE); }) as any;
+  const read: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__read_messages");
+  await read.execute("d", { target: "#wg-raft-sdk" }).catch(() => {});
+  const [card] = await g.store.listApprovals("tenant", "pending");
+  const whileHeld = urls.splice(0);
+  if (!card || whileHeld.length !== 0) throw new Error(`held: card=${JSON.stringify(card)} fetched=${whileHeld.length}`);
+  const ok: any = await g.gateway.applyApproval("tenant", card.operationId, "approved", "tygg");
+  if (!ok.ok || !ok.executed || ok.result?.status !== "succeeded") throw new Error(`approval: ${JSON.stringify(ok)}`);
+  if (urls.length !== 1 || new URL(urls[0]!).searchParams.get("consume") !== "false") throw new Error(`replay request: ${urls[0]}`);
 });
 
 await check("through the gateway, a run_js program's read_messages runs with consume=false and the model's without it", async () => {
