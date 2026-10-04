@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
@@ -2109,14 +2109,14 @@ await check("a leftover endpoint that could not be revoked says a retry may work
 /**
  * A Raft that dedupes keyed writes as the Server does: per route, a key it has seen with the same request replays the
  * first answer and acts nothing; with a different request it is refused (409 `idempotency_key_reused`). `acted` is
- * what landed; `keys` every key a request carried, in order.
+ * what landed; `keys` every key a request carried, in order; `forget()` is the key lifetime passing.
  */
 function keyedRaft() {
   const acted: Array<{ path: string; key: string }> = [];
   const keys: string[] = [];
   const first = new Map<string, { request: string; answer: unknown }>();
   // `lose`: the request is served (it lands) and its answer is lost on the way back, as a dropped connection loses it.
-  const raft = { acted, keys, lose: false };
+  const raft = { acted, keys, lose: false, forget: () => first.clear() };
   globalThis.fetch = (async (url: any, init?: any) => {
     const answered = await serve(url, init);
     if (raft.lose) throw new Error("socket closed before the answer");
@@ -2239,6 +2239,80 @@ await check("a held send the model repeats with no key keeps the held send's key
   await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, { ...inTurn(m.ctx), operationId: "op_again" });
   await raftPlugin.interrupts!.resume("messages_send", held.state, "send", { ...inTurn(m.ctx), operationId: "op_asked" });
   if (JSON.stringify(raft.keys) !== '["op_asked","op_other","op_asked","op_asked"]' || raft.acted.length !== 2) throw new Error(JSON.stringify(raft));
+});
+
+await check("a held send repeated and landed is not sent again by a \"send\" given after Raft forgot its key: the model is told to check first", async () => {
+  const real = Date.now;
+  const T0 = 1_790_000_000_000;
+  const HOUR = 3_600_000;
+  try {
+    Date.now = () => T0;
+    const m = mount();
+    const raft = keyedRaft();
+    const fetchSent = globalThis.fetch;
+    let first = true;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      if (first) { first = false; raft.keys.push(JSON.parse(String(init.body)).idempotencyKey); return HELD(); }
+      return fetchSent(url, init);
+    }) as any;
+    const asked = { ...inTurn(m.ctx), operationId: "op_asked" };
+    const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, asked) as any;
+    if (!(held instanceof Interrupt) || (held.state as any).heldAt !== T0) throw new Error(`state: ${JSON.stringify(held.state)}`);
+    // An hour later the model repeats the send instead of answering: it lands under the held send's key.
+    Date.now = () => T0 + HOUR;
+    await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, { ...inTurn(m.ctx), operationId: "op_again" });
+    if (raft.acted.length !== 1) throw new Error(`the repeat: ${JSON.stringify(raft)}`);
+    // Control: answered "send" within the key's lifetime, Raft still knows the key and answers the first send.
+    Date.now = () => T0 + KEY_LIFETIME_MS - 60_000;
+    const within = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", asked) as any;
+    if (within?.state !== "sent" || raft.keys.length !== 3 || raft.acted.length !== 1) throw new Error(`within: ${JSON.stringify({ within, raft })}`);
+    // A day after the question, Raft has forgotten the key: a "send" would post the message a second time.
+    raft.forget();
+    Date.now = () => T0 + KEY_LIFETIME_MS;
+    const late = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", asked) as any;
+    const said = "Nothing was done: this question was asked 24 hours or more ago, and Raft remembers a call's idempotencyKey for only 24 hours, " +
+      "so if the same call already went through it would now happen twice. Read #general with messages_read to see whether it is there, " +
+      "and call messages_send again only if it is not.";
+    if (late?.state !== "expired" || late.target !== "#general" || late.note !== said) throw new Error(`late: ${JSON.stringify(late)}`);
+    if (raft.keys.length !== 3 || raft.acted.length !== 1) throw new Error(`the late answer reached Raft: ${JSON.stringify(raft)}`);
+    // A reply names its conversation the same way.
+    const reply = await raftPlugin.interrupts!.resume("messages_reply",
+      { op: "messages.reply", args: { message: { target: "#ops" }, content: "done", idempotencyKey: "op_asked" }, heldAt: T0 }, "send", asked) as any;
+    if (reply?.state !== "expired" || reply.target !== "#ops" || !/Read #ops with messages_read/.test(reply.note) || raft.keys.length !== 3) {
+      throw new Error(`reply: ${JSON.stringify(reply)}`);
+    }
+  } finally { Date.now = real; }
+});
+
+await check("a call held again on resume keeps when it was first held; a state from before heldAt existed goes ahead", async () => {
+  const real = Date.now;
+  const T0 = 1_790_000_000_000;
+  try {
+    Date.now = () => T0;
+    const m = mount();
+    many(HELD(), HELD());
+    const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-held" }, inTurn(m.ctx)) as any;
+    Date.now = () => T0 + 3_600_000;
+    const again = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", inTurn(m.ctx)) as any;
+    if (!(again instanceof Interrupt) || (again.state as any).heldAt !== T0) throw new Error(`held again: ${JSON.stringify(again.state)}`);
+    // No heldAt: it cannot have outlived the restart that brought this code, so it is sent as it always was.
+    Date.now = () => T0 + 10 * KEY_LIFETIME_MS;
+    const { heldAt: _h, ...before } = held.state as any;
+    const calls = many(SENT());
+    const sent = await raftPlugin.interrupts!.resume("messages_send", before, "send", inTurn(m.ctx)) as any;
+    if (calls.length !== 1 || JSON.parse(String(calls[0]!.init.body)).idempotencyKey !== "k-held" || /expired/.test(JSON.stringify(sent))) {
+      throw new Error(`no heldAt: ${JSON.stringify(sent)}`);
+    }
+  } finally { Date.now = real; }
+});
+
+await check("the tools whose held call is keyed say that a late answer does nothing; the others do not", async () => {
+  const late = "An answer given 24 hours or more after the question does nothing: read the conversation, then call again if it is still wanted.";
+  for (const op of GENERATED.filter((o) => o.mayInterrupt)) {
+    const says = toolNamed(op.toolName)!.summary.includes(late);
+    if (says !== (op.idempotency.kind === "key")) throw new Error(`${op.toolName}: ${toolNamed(op.toolName)!.summary}`);
+  }
+  if (!toolNamed("messages_send")!.summary.includes(late) || !toolNamed("messages_reply")!.summary.includes(late)) throw new Error("the sends do not say it");
 });
 
 /** The key an uncertain failure tells the model to retry with, or null when it names none. */

@@ -499,6 +499,15 @@ export function pagingArg(op: RaftOperationSpec): "limit" | null {
 }
 
 const TOOL_NAME = new Map(RAFT_OPERATIONS.map((op) => [op.name, op.toolName]));
+
+/**
+ * How long Raft remembers an idempotency key: 24 hours. The SDK's README states it under "Retrying a create or a
+ * card" ("valid for **24 hours** … after that the key is forgotten, and the same key is a new request"), and its Agent
+ * API body schemas give a task write's and a card's key "the same rules as message send's". A held keyed write is
+ * not sent on an answer given this long after it was held (`interrupts.resume`): the same call repeated meanwhile
+ * may have landed under the key, and Raft would no longer know it.
+ */
+export const KEY_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const IDEMPOTENCY = { natural: "native", key: "key", none: "none" } as const;
 
 /** The answer that goes ahead with a held call: a message is sent; a task write proceeds. */
@@ -550,7 +559,10 @@ export function toolOf(op: RaftOperationSpec): ToolSchema {
   }
   const described = op.description.replace(/\b[a-z]+\.[a-z][A-Za-z]*\b/g, (name) => TOOL_NAME.get(name) ?? name);
   const held = op.mayInterrupt
-    ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.`
+    ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.` +
+      (op.idempotency.kind === "key"
+        ? ` An answer given ${KEY_LIFETIME_MS / 3_600_000} hours or more after the question does nothing: read the conversation, then call again if it is still wanted.`
+        : "")
     : "";
   return {
     name: op.toolName,
@@ -763,7 +775,7 @@ function isMessage(value: unknown): value is RaftMessage {
 
 /**
  * The arguments of a keyed operation (the manifest's `idempotency.kind === "key"`: a send, a reply, a task create,
- * an action card) with the key Raft dedupes on (for 24 hours, by the SDK's README for a create or a card):
+ * an action card) with the key Raft dedupes on (for `KEY_LIFETIME_MS`):
  * - the model's own `idempotencyKey` when it gave one. A model calling again after an outcome it could not know
  *   (a timeout, a 5xx) reuses its own key, so Raft answers the first call instead of acting twice; and a held
  *   message re-sent with the same key is that message going ahead, attesting what the question showed (`heldCall`).
@@ -818,7 +830,7 @@ function retryKey(op: RaftOperationSpec, out: RaftFailure, sent: Record<string, 
 
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
-  op: RaftOperationSpec, args: unknown, ctx: PluginContext, seen?: { upToSeq: number },
+  op: RaftOperationSpec, args: unknown, ctx: PluginContext, resumed: { seen?: { upToSeq: number }; heldAt?: number } = {},
 ): Promise<Json | Interrupt> {
   const input = argumentsFor(op, args);
   const caller = originOf(ctx);
@@ -831,12 +843,16 @@ async function runOperation(
   // which also do, are excluded and stay with receive_events).
   const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
   const keyed = await keyedInput(op, input, ctx, raft);
+  // Taken before the request, so it is never later than when Raft first saw the key.
+  const started = Date.now();
+  const { seen } = resumed;
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
   if (!out.ok) {
     const key = retryKey(op, out as RaftFailure, keyed);
     throw sdkFailure(out as RaftFailure, op.sideEffect !== "read", { tool: op.toolName, ...(key ? { key } : {}) });
   }
-  if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input);
+  // A call held again on resume keeps when it was first held: its key is the same one, as old as that.
+  if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input, resumed.heldAt ?? started);
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints
   // put in this mount's terms); `data` is the Server's projection and stays out, so a new server field cannot
   // silently enter the model's context.
@@ -857,12 +873,13 @@ async function runOperation(
  * message, or came without a boundary; then nothing is attested and the model reads the conversation first.
  *
  * The state is the call itself: the operation, its arguments with the interrupt's `resume.idempotencyKey` under
- * the operation's key argument when it has one, and for a message the `seen` boundary when the question showed
- * every new message. Plain data, no credential, and never shown: the question, its context and its answers carry
+ * the operation's key argument when it has one, for a message the `seen` boundary when the question showed
+ * every new message, and `heldAt`, when the call was first held (`KEY_LIFETIME_MS`). Plain data, no credential, and never shown: the question, its context and its answers carry
  * none of it, and the interrupt's `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
  */
 async function heldCall(
   op: RaftOperationSpec, raft: Raft, caller: { contextId?: string }, held: RaftInterrupt, input: Record<string, unknown>,
+  heldAt: number,
 ): Promise<Interrupt> {
   const n = held.newMessageCount;
   const attested = raft.frontier.inContext(caller.contextId).recordHeld(held);
@@ -885,7 +902,7 @@ async function heldCall(
     },
     answer: { choices: [go, "drop"] },
     state: {
-      op: op.name, args: { ...input, ...key } as Json,
+      op: op.name, args: { ...input, ...key } as Json, heldAt,
       ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
     },
   });
@@ -1167,7 +1184,8 @@ export const raftPlugin: Plugin = {
    * with the same arguments — under the interrupt's `resume.idempotencyKey` for a send — attesting what the
    * question showed, so it goes through unless the conversation moved again since, which asks again with the
    * newer messages. "drop" does nothing. Expiry and cancel do nothing either, so no `cancel` is declared: an
-   * in-process held call leaves nothing on the Server, and cancelling is not making the call.
+   * in-process held call leaves nothing on the Server, and cancelling is not making the call. Going ahead with a
+   * keyed write held `KEY_LIFETIME_MS` or longer ago does nothing either, and says why.
    */
   interrupts: {
     async resume(tool, state, answer, ctx) {
@@ -1189,8 +1207,28 @@ export const raftPlugin: Plugin = {
         };
       }
       if (answer !== go) throw new Error(`raft: the answer must be "${go}" or "drop", not ${JSON.stringify(answer)}`);
+      // A state with no `heldAt` was made before it was recorded. Such a state cannot reach this line: held calls
+      // live only in the object's memory (plugins/types.ts `Interrupt`) for about a minute (RUN_JS_RESUME_MS), and a
+      // deploy restarts the object, so none outlives the change that added it. It goes ahead as it always did, rather
+      // than refusing an answer for a reason that cannot apply to it.
+      const heldAt = typeof s.heldAt === "number" && Number.isFinite(s.heldAt) ? s.heldAt : undefined;
+      if (op.idempotency.kind === "key" && heldAt !== undefined && Date.now() - heldAt >= KEY_LIFETIME_MS) {
+        const where = typeof s.args.target === "string" ? s.args.target
+          : typeof object(s.args.message).target === "string" ? object(s.args.message).target as string : null;
+        const hours = KEY_LIFETIME_MS / 3_600_000;
+        return {
+          state: "expired", ...(where ? { target: where } : {}),
+          note: `Nothing was done: this question was asked ${hours} hours or more ago, and Raft remembers a call's ` +
+            `idempotencyKey for only ${hours} hours, so if the same call already went through it would now happen twice. ` +
+            `Read ${where ?? "the conversation"} with messages_read to see whether it is there, and call ${op.toolName} ` +
+            "again only if it is not.",
+        };
+      }
       const seen = object(s.seen);
-      return runOperation(op, s.args, ctx, typeof seen.upToSeq === "number" ? { upToSeq: seen.upToSeq } : undefined);
+      return runOperation(op, s.args, ctx, {
+        ...(typeof seen.upToSeq === "number" ? { seen: { upToSeq: seen.upToSeq } } : {}),
+        ...(heldAt !== undefined ? { heldAt } : {}),
+      });
     },
   },
 
