@@ -893,6 +893,13 @@ export class AgentRuntime {
         const hookId = newHookId();
         const made = await this.createHookSecret(tenantId, agentId, alias, hookId);
         if (!made.ok) throw new Error(made.error);
+        // Asked again here, right before the row that makes the URL live: a call that began before its mount's
+        // removal was decided passed every earlier check, and the removal's revoke pass may already be behind it.
+        // A row written after this check is the removal's second pass to find (`#removeDecided`).
+        if (this.#gateway.isRemoving(tenantId, agentId, alias)) {
+          await this.dropHookSecret(tenantId, agentId, hookId);
+          throw new Error(`${alias} is being removed; no hook was made`);
+        }
         await hooks.directory.create({ hookId, tenantId, agentId, alias });
         return { hookId, url: `${hooks.origin}/hooks/${hookId}`, secret: made.secret };
       },
@@ -1997,7 +2004,9 @@ export class AgentRuntime {
    *     `ctx.inbound` and find its hooks live.
    *  2. every hook of the alias still live is revoked, the way
    *     `ctx.inbound.revoke` does it: the index row first, so the URL stops
-   *     resolving, then the secret. A live hook is not a refusal: only the
+   *     resolving, then the secret — in two passes, the second just before
+   *     the delete, for a `ctx.inbound.create()` already past its last check
+   *     of the mark when the first list was read. A live hook is not a refusal: only the
    *     plugin's own tools or the operator can revoke one, so "revoke it
    *     first" would leave the owner with a mount they cannot delete; the hook
    *     is the runtime's resource, so the runtime closes it. If the index
@@ -2070,16 +2079,26 @@ export class AgentRuntime {
   ): Promise<{ ok: true; unmountError?: string } | { ok: false; error: string; conflict?: true }> {
     const sql = this.#deps.ctx.storage.sql;
     const unmountError = plugin.unmount ? await this.#unmount(tenantId, agentId, alias) : null;
-    const live = await liveHooks();
-    if ("error" in live) return refuse(live.error);
-    for (const h of live) {
-      try {
-        // Null is a hook revoked since the list was read; its secret goes all the same.
-        await hooks!.revoke(h.hookId);
-        await this.dropHookSecret(tenantId, agentId, h.hookId);
-      } catch (e) {
-        return refuse(`could not revoke ${alias}'s inbound hook, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    const revokeLive = async (): Promise<string | null> => {
+      const live = await liveHooks();
+      if ("error" in live) return live.error;
+      for (const h of live) {
+        try {
+          // Null is a hook revoked since the list was read; its secret goes all the same.
+          await hooks!.revoke(h.hookId);
+          await this.dropHookSecret(tenantId, agentId, h.hookId);
+        } catch (e) {
+          return `could not revoke ${alias}'s inbound hook, so it was not removed: ${String((e as Error)?.message ?? e).slice(0, 200)}`;
+        }
       }
+      return null;
+    };
+    // Twice. A `ctx.inbound.create()` that began before the removal was decided can be past its last check of the
+    // mark (`#inboundFor`) and still write its row after the first list was read; the second pass, right before the
+    // delete, revokes what such a call left. Either pass failing refuses, by the same rule.
+    for (let pass = 0; pass < 2; pass++) {
+      const failed = await revokeLive();
+      if (failed) return refuse(failed);
     }
     // The row a credential attached here would have been kept under. This mount
     // does not reference it (refused above), but another may: a reference is a

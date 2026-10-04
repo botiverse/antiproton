@@ -284,6 +284,11 @@ export class ToolGateway {
     return () => { this.#removing.delete(key); };
   }
 
+  /** Whether this mount is marked as being removed (`markRemoving`). */
+  isRemoving(tenantId: string, agentId: string, alias: string): boolean {
+    return this.#removing.has(`${tenantId}/${agentId}/${alias}`);
+  }
+
   /** alias.tool  →  exact mount.  plugin.tool  →  only if unambiguous. */
   async resolve(ctx: CallContext, raw: string): Promise<Resolution> {
     const ref = parseToolRef(raw);

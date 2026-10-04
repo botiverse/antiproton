@@ -418,7 +418,11 @@ const revokedHooks: unknown[] = [];
 const d1 = () => {
   const stmt = (sql: string) => {
     const s: any = {
-      bind: (...b: unknown[]) => { if (sql.startsWith("UPDATE inbound_hooks SET revoked_at")) revokedHooks.push(b[1]); return s; },
+      bind: (...b: unknown[]) => {
+        // A revoke marks the row, as D1's does, so the removal's second pass finds nothing left.
+        if (sql.startsWith("UPDATE inbound_hooks SET revoked_at")) { revokedHooks.push(b[1]); liveHooks = liveHooks.filter((h) => h.hook_id !== b[1]); }
+        return s;
+      },
       first: async () => null, run: async () => ({ meta: { changes: 1 } }),
       all: async () => ({ results: sql.includes("inbound_hooks") ? liveHooks : [] }),
     };

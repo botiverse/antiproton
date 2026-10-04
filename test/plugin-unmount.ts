@@ -73,8 +73,16 @@ const handed: Record<string, InboundHooks | undefined> = {};
 
 const SWEEP: Plugin = {
   id: "sweep", version: "1.0.0", consoleMount: true,
-  tools: [{ name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" }],
-  async invoke(_t, _a, ctx) { handed[ctx.alias] = ctx.inbound; return { has: !!ctx.inbound }; },
+  tools: [
+    { name: "grab", summary: "", parameters: {}, sideEffects: "read", idempotency: "native" },
+    { name: "make", summary: "", parameters: {}, sideEffects: "write", idempotency: "none" },
+  ],
+  async invoke(t, _a, ctx) {
+    handed[ctx.alias] = ctx.inbound;
+    // A tool call that makes a hook while it runs, as raft's enable_push does.
+    if (t === "make") return { hookId: (await ctx.inbound!.create()).hookId };
+    return { has: !!ctx.inbound };
+  },
   // Signed requests are seen and ignored: nothing is delivered, so no turn runs.
   database: { version: 1, stores: { s: {} } },
   async receive(event, secret) {
@@ -117,11 +125,20 @@ function reset() {
 async function runtime(opts: { unmountTimeoutMs?: number } = {}) {
   reset();
   const host = sqliteHost();
-  const real = d1InboundHooks(d1());
+  const db1 = d1();
+  const real = d1InboundHooks(db1);
   const labels = new Map<string, string>();
+  /** Set by a case to hold `directory.create` — the row that makes a hook's URL live — until it settles. */
+  const rowGate: { until: Promise<void> | null; reached: () => void; record: boolean } = { until: null, reached: () => {}, record: false };
   const directory = {
     ...real,
-    async revoke(id: string) { order.push(`revoke:${labels.get(id) ?? id}`); return real.revoke(id); },
+    // A hook this file did not make through `hook()` is the one made by a call in flight: "late".
+    async revoke(id: string) { order.push(`revoke:${labels.get(id) ?? "late"}`); return real.revoke(id); },
+    async create(r: { hookId: string; tenantId: string; agentId: string; alias: string }) {
+      if (rowGate.until) { rowGate.reached(); await rowGate.until; }
+      if (rowGate.record) order.push(`row:${labels.get(r.hookId) ?? "late"}`);
+      return real.create(r);
+    },
   };
   const rt: any = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
@@ -156,7 +173,7 @@ async function runtime(opts: { unmountTimeoutMs?: number } = {}) {
     ...directory,
     async list(t: string, a: string) { if (unmountCalls > 0) await until; return real.list(t, a); },
   });
-  return { rt, host, real, directory, holding, mount, hook, alive };
+  return { rt, host, db1, real, directory, holding, rowGate, mount, hook, alive };
 }
 
 /** The removal, or a named failure if it has not answered within `ms`: a hang is reported, not waited out. */
@@ -435,6 +452,120 @@ await check("route: /ui/mount/remove answers 200 with the plugin's reason when u
   must(r.status === 200 && j.removed === true && j.unmountError === "gh3's plugin could not clean up: the service said no", `json: ${r.status} ${text.slice(0, 300)}`);
   must(String(j.html).startsWith(`<div class="err">removed, but gh3&#39;s plugin could not clean up: the service said no</div>`), `html: ${String(j.html).slice(0, 200)}`);
   must(!(await d1InboundHooks(CONTROL_DB).lookup(made.hookId)), "the hook still resolves");
+});
+
+// ---- a hook made by a call already in flight when the removal is decided ------------
+//
+// Two layers close it. The mark check inside `ctx.inbound.create()`, right before the row is written, refuses a
+// create that was still before that point when the removal was decided. The removal's second revoke pass, just
+// before the delete, revokes a row written by a create that was already past it. The race is staged with an index
+// whose first list after `unmount` returns what it read, then lets the held create finish, then hands the stale
+// list to the first revoke pass — the window a real D1 round trip leaves open.
+
+/** A removal whose index lets `creating` finish between reading the first post-unmount list and returning it. */
+function racingIndex(directory: any, real: any, release: () => void, creating: () => Promise<unknown>) {
+  let lists = 0;
+  return {
+    ...directory,
+    async list(t: string, a: string) {
+      lists++;
+      const rows = await real.list(t, a);
+      order.push(`list:${lists}`);
+      if (lists === 2) { release(); await creating(); }
+      return rows;
+    },
+  };
+}
+
+/** Patch the store's delete into `order`, so a pass can be shown to run before it. */
+function recordDelete(rt: any) {
+  const del = rt.store.removeMount.bind(rt.store);
+  rt.store.removeMount = async (...a: unknown[]) => { order.push("delete"); return del(...a); };
+}
+
+/** The real `/hooks/<id>` route over the same D1 index, and whether it reached any agent's object. */
+async function routeAnswer(db1: D1Database, hookId: string) {
+  let reached = 0;
+  const r = await worker.fetch(new Request(`https://hooks.test/hooks/${hookId}`, { method: "POST", body: "{}" }),
+    { ...env, CONTROL_DB: db1, AGENT: { idFromName: (n: string) => n, get: () => { reached++; throw new Error("reached an object"); } } } as never);
+  return { status: r.status, reached };
+}
+
+await check("(a) a tool call that began before the removal and was held before the row: no live hook remains, and its URL is 404", async () => {
+  const { rt, host, db1, real, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  await hook("svc", "h0");
+  recordDelete(rt);
+  // Held while sealing its secret — before the mark check that guards the row.
+  let release!: () => void;
+  const until = new Promise<void>((r) => { release = r; });
+  let reached!: () => void;
+  const atSeal = new Promise<void>((r) => { reached = r; });
+  let lateId = "";
+  const put = rt.store.putSecret.bind(rt.store);
+  rt.store.putSecret = async (t: string, a: string, name: string, v: unknown) => {
+    if (name.startsWith("hook:")) { lateId = name.slice("hook:".length); reached(); await until; }
+    return put(t, a, name, v);
+  };
+  const call = rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "svc.make", {});
+  await atSeal;
+  order.length = 0;
+  const r = await rt.removeMount("t", "a", "svc", racingIndex(directory, real, release, () => call));
+  must(r.ok, `remove: ${show(r)}`);
+  const live = (await real.list("t", "a")).filter((h: any) => h.alias === "svc" && h.revokedAt === null);
+  must(live.length === 0, `live hooks left for the removed alias: ${live.length}; order ${show(order)}`);
+  const route = await routeAnswer(db1, lateId);
+  must(route.status === 404 && route.reached === 0, `the in-flight hook's URL: ${show(route)}`);
+  host.dispose();
+});
+
+await check("(b) a tool call already past the mark check, held at the row write: the second pass revokes it, after the first pass and before the delete", async () => {
+  const { rt, host, db1, real, directory, rowGate, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  await hook("svc", "h0");
+  recordDelete(rt);
+  let release!: () => void;
+  rowGate.until = new Promise<void>((r) => { release = r; });
+  const atRow = new Promise<void>((r) => { rowGate.reached = r; });
+  rowGate.record = true;
+  const call = rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "svc.make", {});
+  await atRow;
+  order.length = 0;
+  const r = await rt.removeMount("t", "a", "svc", racingIndex(directory, real, release, () => call));
+  must(r.ok, `remove: ${show(r)}`);
+  const made: any = await call;
+  const live = (await real.list("t", "a")).filter((h: any) => h.alias === "svc" && h.revokedAt === null);
+  must(live.length === 0, `live hooks left for the removed alias: ${live.length}; order ${show(order)}`);
+  // The pre-unmount read, unmount, the first pass's read (while the held row is written) and revoke, then the
+  // re-scan finding the late row, then the delete.
+  must(show(order) === show(["list:1", "unmount:start", "unmount:end", "list:2", "row:late", "revoke:h0", "list:3", "revoke:late", "delete"]),
+    `order: ${show(order)}`);
+  must(made.status === "succeeded", `control: the call did not make its hook, so nothing was left for the second pass: ${show(made)}`);
+  must((await routeAnswer(db1, made.result.hookId)).status === 404, "the late hook's URL still resolves");
+  host.dispose();
+});
+
+await check("the mark check alone: a create still before the row when the removal is decided is refused, and its secret dropped", async () => {
+  const { rt, host, real, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  let release!: () => void;
+  const until = new Promise<void>((r) => { release = r; });
+  let reached!: () => void;
+  const atSeal = new Promise<void>((r) => { reached = r; });
+  let lateId = "";
+  const put = rt.store.putSecret.bind(rt.store);
+  rt.store.putSecret = async (t: string, a: string, name: string, v: unknown) => {
+    if (name.startsWith("hook:")) { lateId = name.slice("hook:".length); reached(); await until; }
+    return put(t, a, name, v);
+  };
+  const call = rt.gateway().invoke({ tenantId: "t", agentId: "a", taskId: "k" }, "svc.make", {});
+  await atSeal;
+  const r = await rt.removeMount("t", "a", "svc", racingIndex(directory, real, release, () => call));
+  must(r.ok, `remove: ${show(r)}`);
+  const made: any = await call;
+  must(made.status !== "succeeded" && /svc is being removed; no hook was made/.test(show(made)), `the in-flight create: ${show(made)}`);
+  must(!(await rt.store.getSecret("t", "a", hookSecretName(lateId))), "its secret was kept");
+  host.dispose();
 });
 
 for (const h of hosts) h.dispose();
