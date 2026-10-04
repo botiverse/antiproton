@@ -92,6 +92,7 @@
     "test/raft-plugin.ts",
     "test/mount-offered.ts",
     "test/model-queue.ts",
+    "test/model-refusal.ts",
     "test/durable-agent.ts",
     "test/spec/durable-agent-spec.ts",
     "test/pd-tools.ts",

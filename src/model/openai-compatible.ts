@@ -1,4 +1,5 @@
 import type { ModelAdapter, ModelMessage, ModelResponse, ToolDefinition } from "./types.ts";
+import { chatShapeFor } from "./chat-request-shape.ts";
 
 /**
  * How long one `complete` may take, every attempt and backoff included, before it is abandoned.
@@ -12,6 +13,76 @@ import type { ModelAdapter, ModelMessage, ModelResponse, ToolDefinition } from "
  * a legitimate answer slower than that would have been at risk of the same kill anyway.
  */
 export const MODEL_CALL_DEADLINE_MS = 10 * 60_000;
+
+/**
+ * The provider statuses that say the request itself is wrong: malformed or unsupported (400, 422), not
+ * authorised (401, 403), or naming something that does not exist (404). Sending it again sends the same
+ * request, so it is refused the same way; a gpt-5.6-luna request with `max_tokens` was sent 12 times in
+ * about 7 s (3 attempts here, times the queue's 4 deliveries) before the turn failed with a message that
+ * did not say why (measured 2026-10-04). Any other 4xx is permanent too when the provider names it an
+ * `invalid_request_error`, except the statuses that say "not now": 408 (timeout), 409 (conflict) and 429
+ * (rate limit), which stay retryable with 5xx and network errors.
+ */
+const PERMANENT_STATUSES = new Set([400, 401, 403, 404, 422]);
+const RETRYABLE_4XX = new Set([408, 409, 429]);
+
+export function isPermanentRefusal(status: number, body: string): boolean {
+  if (PERMANENT_STATUSES.has(status)) return true;
+  return status >= 400 && status < 500 && !RETRYABLE_4XX.has(status) && /invalid_request_error/.test(body);
+}
+
+/** Longest provider message carried into the turn's error. */
+const REFUSAL_DETAIL_CHARS = 300;
+
+/**
+ * A provider's refusal of the request itself (`isPermanentRefusal`): not retried here, and answered to the
+ * job as a failed turn by the queue consumer (`callQueuedModel`, cf/src/model-request.ts) instead of going
+ * back to the queue.
+ *
+ * The message carries the status and the provider's own explanation, so the turn says what to fix. It is
+ * built from the response body only, never its headers; the request's own credentials are blanked in it,
+ * and so is anything shaped like a key or a bearer token, since an auth refusal can quote what it was sent.
+ * The wording does not match pi-ai's retryable-error patterns (`isRetryableAssistantError`,
+ * `utils/retry.js`), so neither engine's harness retries the failed turn either; test/model-refusal.ts
+ * checks that against both pi-ai versions.
+ */
+export class ModelRequestRefused extends Error {
+  readonly status: number;
+  /** The provider's error message, redacted and truncated. */
+  readonly detail: string;
+  readonly permanent = true;
+  constructor(status: number, body: string, secrets: string[] = []) {
+    const detail = refusalDetail(body, secrets);
+    super(`the model provider refused the request (HTTP ${status})${detail ? `: ${detail}` : ""}`);
+    this.name = "ModelRequestRefused";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+function refusalDetail(body: string, secrets: string[]): string {
+  let text = body;
+  try {
+    const e = (JSON.parse(body) as any)?.error;
+    // OpenAI's shape, which the gateway's /compat and DeepSeek both answer in: { error: { message, type, code } }.
+    const message = typeof e === "string" ? e : typeof e?.message === "string" ? e.message : undefined;
+    if (message !== undefined) {
+      const kind = [e?.type, e?.code].filter((v) => typeof v === "string" && v).join(", ");
+      text = kind ? `${message} (${kind})` : message;
+    }
+  } catch { /* not JSON: the body as sent */ }
+  for (const s of secrets) {
+    // The credential is the part after the scheme; a header value is `Bearer <token>`.
+    const bare = s.replace(/^Bearer\s+/i, "");
+    if (bare.length >= 4) text = text.split(bare).join("[redacted]");
+  }
+  text = text
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/=-]+/gi, "Bearer [redacted]")
+    .replace(/\b(sk|pk|rk)-[A-Za-z0-9_*-]{8,}/g, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > REFUSAL_DETAIL_CHARS ? `${text.slice(0, REFUSAL_DETAIL_CHARS)}…` : text;
+}
 
 /**
  * Normalises any OpenAI-compatible endpoint. Provider-specific extras
@@ -70,6 +141,16 @@ export class OpenAiCompatibleModel implements ModelAdapter {
     // so a request without the option is the request it always was.
     const reasoningDial = opts.reasoning === "off" ? { thinking: { type: "disabled" } }
       : opts.reasoning ? { reasoning_effort: opts.reasoning } : {};
+    // An OpenAI model's fields (src/model/chat-request-shape.ts); null for every other model, whose
+    // body below is exactly the one it always was.
+    const shape = chatShapeFor(this.#model, opts.reasoning);
+    const capAndDial: Record<string, unknown> = shape
+      ? {
+          [shape.tokensField]: maxTokens,
+          ...(shape.temperature ? { temperature: opts.temperature ?? 0 } : {}),
+          ...(shape.reasoningEffort !== undefined ? { reasoning_effort: shape.reasoningEffort } : {}),
+        }
+      : { max_tokens: maxTokens, temperature: opts.temperature ?? 0, ...reasoningDial };
     let lastErr: Error | null = null;
     // One signal for the whole call rather than one per attempt: three attempts each under the
     // deadline would add up past the limit the deadline exists to stay under. It reaches the body
@@ -89,9 +170,7 @@ export class OpenAiCompatibleModel implements ModelAdapter {
           body: JSON.stringify({
             model: this.#model,
             messages,
-            max_tokens: maxTokens,
-            temperature: opts.temperature ?? 0,
-            ...reasoningDial,
+            ...capAndDial,
             ...(opts.tools?.length
               ? {
                   tools: opts.tools.map((t) => ({
@@ -105,6 +184,9 @@ export class OpenAiCompatibleModel implements ModelAdapter {
         });
         if (!res.ok) {
           const body = await res.text();
+          if (isPermanentRefusal(res.status, body)) {
+            throw new ModelRequestRefused(res.status, body, [this.#apiKey, ...Object.values(this.#headers)]);
+          }
           const err = new Error(`model ${res.status}: ${body.slice(0, 300)}`);
           if (res.status >= 500 || res.status === 429) {
             lastErr = err;
@@ -152,6 +234,8 @@ export class OpenAiCompatibleModel implements ModelAdapter {
             `model call timed out: no complete response within the ${this.#deadlineMs / 1000} s total deadline` +
             (lastErr ? ` (last error before it: ${lastErr.message})` : ""));
         }
+        // The same request would be refused the same way: one call is the whole answer.
+        if (err instanceof ModelRequestRefused) throw err;
         lastErr = err as Error;
         if (attempt === 2) break;
         await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
