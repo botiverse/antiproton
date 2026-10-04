@@ -796,12 +796,17 @@ export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quote
   return unescapeMarks((out + masked.slice(at)).replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!));
 }
 
-/** `offeredTerms`'s placeholder opener, and the escape character itself, written so neither appears in the result. */
-function escapeMarks(text: string): string {
-  return text.replace(/[\uE000\uE002]/g, (c) => (c === "\uE000" ? "\uE002a" : "\uE002b"));
+/**
+ * `offeredTerms`'s placeholder opener, and the escape character itself, written so neither appears in the result. Every
+ * character written is a private-use one, never a word character: a tool name is matched only where no word character
+ * stands before it (`unofferedPattern`), so an escape that wrote a letter could complete one — a person's
+ * `\uE000ttachments_download_url(…)` read as `attachments_download_url(…)` and rewritten.
+ */
+export function escapeMarks(text: string): string {
+  return text.replace(/[\uE000\uE002]/g, (c) => (c === "\uE000" ? "\uE002\uE003" : "\uE002\uE004"));
 }
-function unescapeMarks(text: string): string {
-  return text.replace(/\uE002([ab])/g, (_, c: string) => (c === "a" ? "\uE000" : "\uE002"));
+export function unescapeMarks(text: string): string {
+  return text.replace(/\uE002([\uE003\uE004])/g, (_, c: string) => (c === "\uE003" ? "\uE000" : "\uE002"));
 }
 
 /**
