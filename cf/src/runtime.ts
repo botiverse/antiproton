@@ -177,6 +177,7 @@ import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
 import { createRaftPlugin } from "../../src/plugins/raft.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
+import { reminderPlugin } from "../../src/plugins/reminder.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
@@ -830,6 +831,7 @@ export class AgentRuntime {
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
       createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
+      reminderPlugin,
       ...(deps.extraPlugins ?? []),
       // Discovery agrees with dispatch: a withheld tool is not found by searching for it either.
       builtinToolsPlugin(this.store, () => plugins, deps.withholdTools ?? []),
