@@ -2588,6 +2588,41 @@ await check("the attachment download keeps the file in the agent's storage and s
   }
 });
 
+await check("a download address that is inward, or carries a user name, is refused before any fetch, and the error does not carry it", async () => {
+  for (const url of [
+    "https://169.254.169.254/latest/meta-data/?X-Amz-Signature=SIGsecret", "https://127.0.0.1/obj?X-Amz-Signature=SIGsecret",
+    "https://[::1]/obj?X-Amz-Signature=SIGsecret", "https://10.0.0.1.nip.io/obj?X-Amz-Signature=SIGsecret",
+    "https://localhost/obj?X-Amz-Signature=SIGsecret", "https://storage.internal/obj?X-Amz-Signature=SIGsecret",
+    "https://user:pass@storage.example/obj?X-Amz-Signature=SIGsecret",
+  ]) {
+    const fetched: string[] = [];
+    globalThis.fetch = (async (u: any) => {
+      const href = new URL(String(u)).href;
+      if (new URL(href).pathname === "/internal/agent-api/attachments/att-1/url") {
+        return json(200, { url, expiresAt: "2026-10-04T10:05:00Z", filename: "plan.pdf", mimeType: "application/pdf" });
+      }
+      fetched.push(href);
+      return new Response(FILE);
+    }) as any;
+    const store = fakeArtifacts();
+    const why = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store)).catch(() => {
+      throw new Error(`${url}: not refused (fetched ${JSON.stringify(fetched)})`);
+    });
+    const host = new URL(url).hostname;
+    if (fetched.length || store.puts.length) throw new Error(`${url}: fetched ${JSON.stringify(fetched)}, kept ${store.puts.length}`);
+    if (why.message.includes("SIGsecret") || why.message.includes(host) || why.message.includes("pass@")) throw new Error(`${url}: the error carries it: ${why.message}`);
+    if (!/nothing was fetched or kept/.test(why.message)) throw new Error(`${url}: ${why.message}`);
+  }
+  // Control: a public host on a port of its own is fetched.
+  const store = fakeArtifacts();
+  const publicUrl = "https://storage.example:8443/obj?X-Amz-Signature=SIGsecret";
+  globalThis.fetch = (async (u: any) => new URL(String(u)).pathname.endsWith("/url")
+    ? json(200, { url: publicUrl, expiresAt: "2026-10-04T10:05:00Z", filename: "plan.pdf", mimeType: "application/pdf" })
+    : new Response(FILE)) as any;
+  const out: any = await downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store);
+  if (out.bytes !== FILE.byteLength || store.puts.length !== 1) throw new Error(JSON.stringify(out));
+});
+
 await check("a Server that cannot mint a URL (CONFLICT) is answered by the binary download, in the same call", async () => {
   const store = fakeArtifacts();
   const seen = attachmentServer({ mint: "conflict" });

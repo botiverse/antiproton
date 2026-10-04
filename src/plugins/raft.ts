@@ -16,6 +16,7 @@ import {
   type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
 } from "@botiverse/raft-sdk";
 import { PARK_BYTES } from "./artifacts.ts";
+import { internalHost } from "./http.ts";
 import { toAgentRef } from "../store/refs.ts";
 import {
   interrupt, originProblem,
@@ -1143,11 +1144,20 @@ function capped(res: Response, over: () => void): Response {
 /**
  * The bytes behind a presigned URL. Nothing about the URL leaves this function — not in an error, not in the log —
  * and nothing of the mount's goes with it: no credential, and redirects stay manual, so a 3xx is a failure here.
+ *
+ * The URL is Raft's answer, not configuration, so it is checked before anything is fetched: https only; no user name
+ * or password in it (a presigned URL carries its grant in the query, and `user:pass@` is how a URL points somewhere
+ * other than it reads); and no host that is inward by construction, by the same rule the http and mcp plugins use
+ * (`internalHost`, src/plugins/http.ts: localhost, names under .local, .internal or home.arpa, private, link-local and metadata
+ * addresses, v4 carried in v6, the resolver services that answer with the address in the name). Any port is allowed,
+ * as in the http plugin: a port says nothing about where a host is.
  */
 async function fetchPresigned(url: string, ctx: PluginContext): Promise<Uint8Array> {
   let parsed: URL;
   try { parsed = new URL(url); } catch { throw new Error("Raft returned a download address that is not a URL; nothing was kept"); }
   if (parsed.protocol !== "https:") throw new Error("Raft returned a download address that is not https; nothing was kept");
+  if (parsed.username || parsed.password) throw new Error("Raft returned a download address that carries a user name or password; nothing was fetched or kept");
+  if (internalHost(parsed.hostname)) throw new Error("Raft returned a download address on a private or local network; nothing was fetched or kept");
   let over = false;
   let res: Response;
   try {
