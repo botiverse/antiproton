@@ -162,7 +162,7 @@ async function push(w: World, id: string, text: string, headers: Record<string, 
     method: "POST", headers: { "x-signed-with": w.secret, "content-type": "application/json", ...headers },
     body: body ?? JSON.stringify({ id, text }),
   }), w.env as never);
-  return { status: res.status, body: await res.text(), d1: w.d1.log.slice(before) };
+  return { status: res.status, body: await res.text(), retryAfter: res.headers.get("retry-after"), d1: w.d1.log.slice(before) };
 }
 
 /** What the model has been asked so far, as text: one string per job, in the order they were sent. Each is read once. */
@@ -376,11 +376,13 @@ await check("a push during a running turn is a steer: no second run, and the mod
   must(jobCount(w) === 2 && q.indexOf("PERSON-ANSWERED") > 0 && q.indexOf("STEER-PUSH") > q.indexOf("PERSON-ANSWERED"), `the turn's next request: ${q.indexOf("PERSON-ANSWERED")} ${q.indexOf("STEER-PUSH")}`);
 });
 
-await check("every refusal answers as it did: 401, 400, 202 ignored, 202 duplicate, 413, 503, 429, 404, 405, and none of them is queued", async () => {
+await check("every refusal answers as it did: 401, 400, 202 ignored, 202 duplicate, 413, 503, 429, 404, 405, none of them is queued, and only the 429 says when to retry", async () => {
   const w = await world();
-  must((await push(w, "warm", "warm the route")).status === 202, "control");
+  const warm = await push(w, "warm", "warm the route");
+  must(warm.status === 202 && warm.retryAfter === null, `control: ${show({ ...warm, d1: undefined })}`);
   const got: Array<[string, number, string]> = [];
-  const note = (name: string, r: { status: number; body: string }) => got.push([name, r.status, r.body]);
+  const retry: Array<[string, string | null]> = [];
+  const note = (name: string, r: { status: number; body: string; retryAfter: string | null }) => { got.push([name, r.status, r.body]); retry.push([name, r.retryAfter]); };
   note("rejected", await push(w, "r", "t", { "x-signed-with": "wrong" }));
   note("malformed", await push(w, "m", "t", { "x-malformed": "1" }));
   note("ignored", await push(w, "i", "t", {}, JSON.stringify({ id: "i", text: "t", ignore: true })));
@@ -389,10 +391,13 @@ await check("every refusal answers as it did: 401, 400, 202 ignored, 202 duplica
   note("failed", await push(w, "f", "t", { "x-throw": "1" }));
   const unknown = await worker.fetch(new Request(`https://x/hooks/${"A".repeat(43)}`, { method: "POST", body: "{}" }), w.env as never);
   got.push(["unknown", unknown.status, await unknown.text()]);
+  retry.push(["unknown", unknown.headers.get("retry-after")]);
   const shape = await worker.fetch(new Request("https://x/hooks/short", { method: "POST", body: "{}" }), w.env as never);
   got.push(["bad id", shape.status, await shape.text()]);
+  retry.push(["bad id", shape.headers.get("retry-after")]);
   const get = await worker.fetch(new Request(`https://x/hooks/${w.hookId}`), w.env as never);
   got.push(["GET", get.status, `${await get.text()}allow=${get.headers.get("allow")}`]);
+  retry.push(["GET", get.headers.get("retry-after")]);
   for (let i = 1; i < INBOUND_PER_MINUTE; i++) must((await push(w, `burst-${i}`, "b")).status === 202, `burst ${i}`);
   note("rate_limited", await push(w, "over", "t"));
   must(show(got) === show([
@@ -400,6 +405,9 @@ await check("every refusal answers as it did: 401, 400, 202 ignored, 202 duplica
     ["duplicate", 202, '{"outcome":"duplicate"}'], ["too_large", 413, '{"outcome":"too_large"}'], ["failed", 503, '{"outcome":"failed"}'],
     ["unknown", 404, ""], ["bad id", 404, ""], ["GET", 405, "allow=POST"], ["rate_limited", 429, '{"outcome":"rate_limited"}'],
   ]), show(got));
+  // The burst took well under a second, so the minute opens again in 60 s, give or take the second it took.
+  must(show(retry.filter(([n]) => n !== "rate_limited")) === show(retry.filter(([n]) => n !== "rate_limited").map(([n]) => [n, null])), `retry-after: ${show(retry)}`);
+  must(/^(59|60)$/.test(String(retry.find(([n]) => n === "rate_limited")?.[1])), `retry-after: ${show(retry)}`);
   must(pendingRows(w) === INBOUND_PER_MINUTE, `queued: ${pendingRows(w)}`);
 });
 
@@ -473,7 +481,7 @@ await check("while posting keeps failing, a push queued 30 minutes is given up w
   must(jobCount(w) === 0, "something was posted");
 });
 
-await check("a hook with 30 pushes queued is answered as the rate limit answers, and recorded with why", async () => {
+await check("a hook with 30 pushes queued is answered as the rate limit answers, and recorded with why; a busy queue whose head is due says retry in 3 s", async () => {
   const w = await world();
   const realNow = Date.now;
   try {
@@ -484,11 +492,122 @@ await check("a hook with 30 pushes queued is answered as the rate limit answers,
     }
     Date.now = () => realNow() + 30 * 3_000;
     const full = await push(w, "q30", "waiting");
-    must(full.status === 429 && full.body === '{"outcome":"rate_limited"}', `the 31st: ${show({ ...full, d1: undefined })}`);
+    must(full.status === 429 && full.body === '{"outcome":"rate_limited"}' && full.retryAfter === "3", `the 31st: ${show({ ...full, d1: undefined })}`);
   } finally { Date.now = realNow; }
   const last = (w.raw.sql.exec("SELECT outcome, reason FROM inbound_events ORDER BY rowid DESC LIMIT 1").toArray()[0] as any);
   must(last?.outcome === "rate_limited" && /30 pushes from this hook are already waiting/.test(last.reason), `record: ${show(last)}`);
   must(pendingRows(w) === 30, `queued: ${pendingRows(w)}`);
+});
+
+await check("a rate-limited push is told to retry when the minute lets it in; once the rate would, a full queue says 3 s", async () => {
+  const w = await world();
+  const realNow = Date.now;
+  const base = realNow();
+  const at = async (ms: number, id: string) => { Date.now = () => base + ms; return push(w, id, "r"); };
+  try {
+    // One a second: the rate fills at the 30th push, and those 30 also fill the queue (the alarm never runs).
+    for (let i = 0; i < INBOUND_PER_MINUTE; i++) must((await at(i * 1_000, `r${i}`)).status === 202, `push ${i}`);
+    const answers: Array<[number, number, string, string | null]> = [];
+    // The oldest counted push, at +0, stops counting at +60 000: the rate refuses until then, rounding up
+    // (30.3 s is 31, where rounding to nearest would say 30).
+    for (const ms of [29_700, 59_000, 59_999]) {
+      const r = await at(ms, `over-${ms}`);
+      answers.push([ms, r.status, r.body, r.retryAfter]);
+    }
+    // At +60 000 the rate lets it in, and the full queue refuses it instead.
+    const full = await at(60_000, "over-60000");
+    answers.push([60_000, full.status, full.body, full.retryAfter]);
+    const limited = '{"outcome":"rate_limited"}';
+    must(show(answers) === show([[29_700, 429, limited, "31"], [59_000, 429, limited, "1"], [59_999, 429, limited, "1"], [60_000, 429, limited, "3"]]), show(answers));
+  } finally { Date.now = realNow; }
+  const reasons = (w.raw.sql.exec("SELECT reason FROM inbound_events WHERE outcome = 'rate_limited' ORDER BY rowid").toArray() as any[]).map((r) => r.reason);
+  must(reasons.length === 4 && reasons.slice(0, 3).every((r) => /a minute/.test(r)) && /already waiting/.test(reasons[3]), `records: ${show(reasons)}`);
+});
+
+await check("a full queue stuck behind a failing head says to retry at the head's next try, not every 3 s; while a pass is posting it says 3", async () => {
+  const w = await world();
+  const engine = await w.D.runtime().agent(T, A);
+  (engine as any).say = () => Promise.reject(new Error("posting is down"));
+  const realNow = Date.now;
+  const base = realNow();
+  const at = (ms: number) => { Date.now = () => base + ms; };
+  const answers: Array<[string, number, string | null]> = [];
+  try {
+    // 29 queued two seconds apart, so the rate never trips; the head's first try fails at +60 s (next try
+    // in 30 s) and its second at +90 s (next try in 2 min, at +210 s).
+    for (let i = 0; i < 29; i++) { at(i * 2_000); must((await push(w, `s${i}`, "stuck")).status === 202, `push ${i}`); }
+    at(60_000); await w.D.alarm();
+    at(90_000); await w.D.alarm();
+    const head = (w.raw.sql.exec("SELECT attempts, next_at FROM inbound_pending ORDER BY seq LIMIT 1").toArray()[0] as any);
+    must(head.attempts === 2 && head.next_at === base + 210_000, `control: the head is waiting its 2-minute retry: ${show(head)}`);
+    must((await push(w, "s29", "stuck")).status === 202, "the 30th");
+    at(90_700);
+    const stuck = await push(w, "s30", "stuck");
+    answers.push(["stuck", stuck.status, stuck.retryAfter]);
+    // A pass at work is moving the queue. It claims the head (its next try set 5 min ahead) and then opens the
+    // harness, which takes most of a second, before the row reads `posting`: held there, then held in the post.
+    const rt = w.D.runtime() as any;
+    const open = rt.agent;
+    let opened: (() => void) | undefined, failed: (() => void) | undefined;
+    // Only the post's open is held; the step after the pass opens as usual.
+    rt.agent = (...a: unknown[]) => {
+      rt.agent = open;
+      return new Promise((resolve) => { opened = () => resolve(open.apply(rt, a)); });
+    };
+    (engine as any).say = () => new Promise<void>((_, fail) => { failed = () => fail(new Error("still down")); });
+    const row = () => (w.raw.sql.exec("SELECT state, next_at FROM inbound_pending ORDER BY seq LIMIT 1").toArray()[0] as any);
+    at(210_000);
+    const pass = w.D.alarm();
+    for (let i = 0; i < 100 && !opened; i++) await sleep(5);
+    must(opened && row().state === "queued" && row().next_at === base + 510_000, `control: claimed, opening the harness: ${show(row())}`);
+    const opening = await push(w, "s31", "stuck");
+    answers.push(["opening", opening.status, opening.retryAfter]);
+    opened();
+    for (let i = 0; i < 100 && !failed; i++) await sleep(5);
+    must(failed && row().state === "posting", `control: posting: ${show(row())}`);
+    const posting = await push(w, "s32", "stuck");
+    answers.push(["posting", posting.status, posting.retryAfter]);
+    failed();
+    await pass;
+  } finally { Date.now = realNow; }
+  must(show(answers) === show([["stuck", 429, "120"], ["opening", 429, "3"], ["posting", 429, "3"]]), show(answers));
+});
+
+await check("a full queue on one hook says to retry at the agent's head's next try when that head is another hook's", async () => {
+  const w = await world();
+  const rt = w.D.runtime();
+  await rt.store.addMount({ tenantId: T, agentId: A, alias: "p2", plugin: "pushy", installationId: "i", connectionId: null,
+    toolVersion: "1.0.0", publicConfig: {}, secretRef: null, policy: null });
+  const hookA = { id: w.hookId, secret: w.secret };
+  const idB = "B".repeat(43);
+  const made = await w.D.hookCreateSecret(T, A, "p2", idB) as { ok: boolean; secret?: string };
+  must(made.ok && made.secret, "hook B's secret");
+  w.d1.hooks.set(idB, { hook_id: idB, tenant_id: T, agent_id: A, alias: "p2", created_at: 1, revoked_at: null });
+  const hookB = { id: idB, secret: made.secret! };
+  const engine = await rt.agent(T, A);
+  (engine as any).say = () => Promise.reject(new Error("posting is down"));
+  const realNow = Date.now;
+  const base = realNow();
+  const at = (ms: number) => { Date.now = () => base + ms; };
+  const as = (h: { id: string; secret: string }) => { w.hookId = h.id; w.secret = h.secret; };
+  let full: Awaited<ReturnType<typeof push>>;
+  try {
+    // A's push is the agent's oldest; B queues 30 behind it, two seconds apart so B's rate never trips.
+    at(-1_000); as(hookA); must((await push(w, "a0", "A")).status === 202, "A's push");
+    as(hookB);
+    for (let i = 0; i < 30; i++) { at(i * 2_000); must((await push(w, `b${i}`, "B")).status === 202, `B's push ${i}`); }
+    // A's post fails at +60 s (next try in 30 s) and at +90 s (next try in 2 min, at +210 s); B's rows wait behind it.
+    at(60_000); await w.D.alarm();
+    at(90_000); await w.D.alarm();
+    const rows = w.raw.sql.exec("SELECT hook_id, attempts, next_at FROM inbound_pending ORDER BY seq").toArray() as any[];
+    must(rows.length === 31 && rows[0].hook_id === hookA.id && rows[0].attempts === 2 && rows[0].next_at === base + 210_000 &&
+      rows.slice(1).every((r) => r.hook_id === idB && r.attempts === 0 && r.next_at === 0),
+      `control: A's head waits its 2-minute retry, B's 30 untried behind it: ${show(rows.slice(0, 2))}`);
+    at(90_700);
+    full = await push(w, "b30", "B");
+  } finally { Date.now = realNow; }
+  // B's own oldest row is due now (it would say 3); what holds it is A's head, 119.3 s away.
+  must(full.status === 429 && full.body === '{"outcome":"rate_limited"}' && full.retryAfter === "120", `B's 31st: ${show({ ...full, d1: undefined })}`);
 });
 
 await check("provisioning and the model choice run once in a pass that posts, and not in one that only waits out a retry", async () => {

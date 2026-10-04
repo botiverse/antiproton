@@ -177,6 +177,32 @@ const ADDED_COLUMNS = [
 /** Storage handles already brought up to `ADDED_COLUMNS`: this runs on every push, the probe once per handle. */
 const columnsAdded = new WeakSet<object>();
 
+/**
+ * The bounds of `Retry-After` (seconds) on a 429 for a full queue (`queueRetryAfterS`). The floor is the
+ * answer for a queue that is moving: it empties in a few seconds, so a sender that waits this long usually
+ * finds room. The ceiling is the longest wait in `INBOUND_RETRY_MS` (10 min), so with today's schedule it
+ * never binds; it holds the answer there if that schedule grows.
+ */
+export const INBOUND_QUEUE_RETRY_AFTER_S = 3;
+export const INBOUND_QUEUE_RETRY_AFTER_MAX_S = 600;
+
+/**
+ * Seconds until a full queue can move, for `Retry-After`: until the head's next try (or its expiry, if that
+ * comes first, as the pass computes it), rounded up and held within 3–600 s. A queue fills only while posting
+ * is failing, and then the head waits 30 s, 2 min, 5 min, 10 min between tries; a sender told 3 s would be
+ * refused, and recorded, every 3 s of that. The head is the object's oldest row whichever hook it came from,
+ * since delivery order is strict across hooks.
+ *
+ * `passRunning`: a pass is posting right now. It claims the head (setting `nextAt` to the try after this
+ * one) before posting it, so the stored row then reads like one waiting out a failure; the queue is moving,
+ * and the answer is the floor. A head left `posting` with no pass is settled by the next pass at once.
+ */
+export function queueRetryAfterS(head: PendingInbound | null, now: number, passRunning: boolean): number {
+  if (!head || passRunning || head.state === "posting") return INBOUND_QUEUE_RETRY_AFTER_S;
+  const movesAt = Math.min(head.nextAt, head.receivedAt + INBOUND_MAX_AGE_MS);
+  return Math.min(INBOUND_QUEUE_RETRY_AFTER_MAX_S, Math.max(INBOUND_QUEUE_RETRY_AFTER_S, Math.ceil((movesAt - now) / 1000)));
+}
+
 export function ensureInboundTable(sql: SqlHost["sql"]) {
   sql.exec(TABLE);
   sql.exec(INDEX);
@@ -310,6 +336,27 @@ export function underRate(sql: SqlHost["sql"], hookId: string, now: number, perM
     hookId, now - 60_000, hookId, now - 60_000,
   ).toArray()[0] as any;
   return Number(row?.n ?? 0) < perMinute;
+}
+
+/**
+ * Seconds until `underRate` lets this hook deliver again, for `Retry-After` on a rate-limited push: the
+ * moment enough of the counted rows (the same rows `underRate` counts) have left the minute that the count
+ * is under `perMinute` again. Rounded up so a sender that waits exactly this long is not refused again. It is
+ * at least 1 with no clamp: a row counts only while `received_at > now - 60 s`, so it leaves strictly after
+ * `now`. Null when the hook is under the rate now.
+ */
+export function rateRetryAfterS(sql: SqlHost["sql"], hookId: string, now: number, perMinute: number = INBOUND_PER_MINUTE): number | null {
+  const since = now - 60_000;
+  const times = (sql.exec(
+    `SELECT received_at FROM inbound_events WHERE hook_id = ? AND ${TAKEN} AND received_at > ?` +
+    " UNION ALL SELECT received_at FROM inbound_pending WHERE hook_id = ? AND received_at > ? ORDER BY received_at",
+    hookId, since, hookId, since,
+  ).toArray() as any[]).map((r) => Number(r.received_at));
+  if (times.length < perMinute) return null;
+  // Counted while `received_at > now - 60 s`, so a row stops counting at `received_at + 60 s`; once the
+  // oldest `times.length - perMinute + 1` rows have, the count is `perMinute - 1`.
+  const opensAt = times[times.length - perMinute]! + 60_000;
+  return Math.ceil((opensAt - now) / 1000);
 }
 
 /** Whether this key was already accepted on this hook: queued now, or delivered or given up within the window. */
