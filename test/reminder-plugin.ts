@@ -754,6 +754,26 @@ await check("a registration that failed does not stay in flight: the next create
   must(svc.registrations.length === 1, `registrations ${svc.registrations.length}`);
 });
 
+await check("two creates that meet a lost registration at the same moment re-register once, and both reminders are kept and delivered", async () => {
+  // Both refusals arrive together, so both retries ask for a registration at once: only the flight keeps that to one.
+  const svc = fakeService({ registerDelayMs: 20, createDelays: [0, 15, 15] });
+  const plugin = createReminderPlugin({ ...DEPLOYMENT, service: svc.service, now: () => NOW });
+  const m = mount(plugin);
+  await m.call("create", { delayMinutes: 5, note: "first" });
+  svc.registrations.length = 0;
+  const [a, b] = await both(m);
+  must(svc.registrations.length === 1, `${svc.registrations.length} re-registrations: ${svc.registrations.map((r) => r.hookId).join(",")}`);
+  const hook = svc.registrations[0]!.hookId;
+  must(m.state().serviceHookId === hook && svc.reminders.get(a.id)?.target?.hookId === hook && svc.reminders.get(b.id)?.target?.hookId === hook,
+    `record ${m.state().serviceHookId}; reminders target ${svc.reminders.get(a.id)?.target?.hookId} and ${svc.reminders.get(b.id)?.target?.hookId}`);
+  const listed = (await m.call("list", {})).reminders.map((r: any) => r.id).sort();
+  must(JSON.stringify(listed) === JSON.stringify([a.id, b.id].sort()), `list shows ${JSON.stringify(listed)}`);
+  for (const r of [a, b]) {
+    const fired = await receive(plugin, push(goodPush({ hookId: hook, firingId: `${r.id}:1:1`, reminder: { id: r.id, title: "t", notes: "n", anchor: null } }), SECRET, { ts: at() }), SECRET, m.ctx);
+    must(fired.deliver, `${r.id}'s firing was not delivered: ${JSON.stringify(fired)}`);
+  }
+});
+
 // ---- what a failed registration leaves behind
 
 await check("a registration that cannot be recorded is deleted again, and its inbound hook revoked", async () => {
