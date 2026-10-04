@@ -18,7 +18,7 @@ import { DurableAgent, PdHost, POLL_BACKSTOP_MS, type DurableAgentOptions, type 
 import type { DurableSqlHost } from "../../src/store/pi-durable-sqlite.ts";
 import { createModels } from "pi-ai-1/models";
 import { consumeModelCalls, replyingUnknownJob, UnknownJob, type ModelJobStub, type ModelQueueDeps } from "../../cf/src/model-queue.ts";
-import type { DriveCase, TimerProbe, WithDriveHost } from "./durable-drive-spec.ts";
+import { movableClock, type DriveCase, type TimerProbe, type WithDriveHost } from "./durable-drive-spec.ts";
 
 /**
  * The poll interval of these objects: longer than a case may take, so a turn that completes after an answer
@@ -431,7 +431,10 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
   });
 
   add("wake", "a lost wake (none asked): the step after the answer parks for the poll, and the poll at the backstop completes the turn", async (storage) => {
-    const o = object(storage, [], { noWake: true, pollAfterMs: 400 });
+    // The poll is POLL_MS away and the clock is moved to it. With a 400 ms poll, a step after the answer that read more
+    // than 400 ms after the poll sleep began found the poll due and fetched the answer, and did not park.
+    const clock = movableClock();
+    const o = object(storage, [], { noWake: true, now: clock.now });
     const a = o.agent();
     await a.say("Q1");
     const parked = await a.step();
@@ -441,7 +444,7 @@ export function durableAgentCases(withHost: WithDriveHost, activeTimers: TimerPr
     const early = await a.step();
     check(early.wakeInMs !== null && o.polls.length === 0, `with no wake the step should park for the poll: ${show(early)}, polls ${show(o.polls)}`);
     check(show(turns(await a.entries({}))) === show(["user: Q1"]), "control: the answer arrived with no wake");
-    await sleep(early.wakeInMs);
+    clock.moveTo(clock.now() + early.wakeInMs);
     const done = await a.step();
     check(done.wakeInMs === null, `the backstop's step did not finish: ${show(done)}`);
     check(show(o.polls) === show([{ id: row!.id, ready: true }]), `polls ${show(o.polls)}`);

@@ -67,7 +67,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  * sleeping until T, so its intervals can be longer than any delay the machine adds between a sleep starting and the
  * read that parks it.
  */
-function movableClock() {
+export function movableClock() {
   let skew = 0;
   const now = () => Date.now() + skew;
   return { now, moveTo: (t: number) => { skew += Math.max(0, t - now()); } };
