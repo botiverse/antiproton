@@ -47,10 +47,14 @@ async function fakeObject(mode: CloseMode, events: object[]) {
   };
 }
 
-/** The client's own sockets: every open socket handle except the ones the fake object accepted. */
-function clientSockets(accepted: Set<Socket>): number {
+/**
+ * The client's sockets to this fake object: open socket handles whose far end is its port. Per object, so a
+ * socket a previous case left closing cannot leave the count and make a leak in this one read as a return
+ * to baseline.
+ */
+function clientSockets(obj: { port: number; accepted: Set<Socket> }): number {
   return (process as any)._getActiveHandles()
-    .filter((h: any) => h?.constructor?.name === "Socket" && h.remotePort && !accepted.has(h) && !h.destroyed).length;
+    .filter((h: any) => h?.constructor?.name === "Socket" && h.remotePort === obj.port && !obj.accepted.has(h) && !h.destroyed).length;
 }
 
 const said = (text: string) => ({ text });
@@ -68,10 +72,10 @@ function deps(port: number, poll: WaitDeps["poll"], extra: Partial<WaitDeps> = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Waits up to `ms` for the client's sockets to come back to `base`; returns what it last counted. */
-async function settlesTo(base: number, accepted: Set<Socket>, ms = 2_000): Promise<number> {
+async function settlesTo(base: number, obj: { port: number; accepted: Set<Socket> }, ms = 2_000): Promise<number> {
   const until = Date.now() + ms;
-  let n = clientSockets(accepted);
-  while (n !== base && Date.now() < until) { await sleep(25); n = clientSockets(accepted); }
+  let n = clientSockets(obj);
+  while (n !== base && Date.now() < until) { await sleep(25); n = clientSockets(obj); }
   return n;
 }
 
@@ -92,10 +96,10 @@ if (process.env.SWE_WAIT_CHILD_PORT) {
     await check(`an answer taken from poll leaves no socket open when the server ${mode === "keeps-tcp" ? "answers the close but keeps the connection" : "never answers the close"}`, async () => {
       const obj = await fakeObject(mode, pushed);
       try {
-        const base = clientSockets(obj.accepted);
+        const base = clientSockets(obj);
         const got = await waitForAnswer("t1", Date.now() + 10_000, deps(obj.port, async () => benchPollBody(settled, false, 0)));
         assert(got === "Fixed.", `the wait returned ${JSON.stringify(got)}, not the polled answer`);
-        const n = await settlesTo(base, obj.accepted);
+        const n = await settlesTo(base, obj);
         assert(n === base, `${n - base} client socket(s) still open after the wait returned (baseline ${base})`);
       } finally { obj.stop(); }
     });
@@ -105,10 +109,10 @@ if (process.env.SWE_WAIT_CHILD_PORT) {
     // Running throughout, so nothing settles and the deadline is what ends the wait.
     const obj = await fakeObject("keeps-tcp", pushed);
     try {
-      const base = clientSockets(obj.accepted);
+      const base = clientSockets(obj);
       const got = await waitForAnswer("t1", Date.now() + 300, deps(obj.port, async () => benchPollBody(settled, true, 0)));
       assert(got === null, `a running agent produced an answer: ${JSON.stringify(got)}`);
-      const n = await settlesTo(base, obj.accepted);
+      const n = await settlesTo(base, obj);
       assert(n === base, `${n - base} client socket(s) still open after the deadline (baseline ${base})`);
     } finally { obj.stop(); }
   });
@@ -116,23 +120,23 @@ if (process.env.SWE_WAIT_CHILD_PORT) {
   await check("a model failure pushed on the socket ends the wait and leaves no socket open", async () => {
     const obj = await fakeObject("keeps-tcp", [{ id: 3, kind: "model.failed", payload: { error: "boom" } }]);
     try {
-      const base = clientSockets(obj.accepted);
+      const base = clientSockets(obj);
       const d = deps(obj.port, async () => benchPollBody(settled, true, 0));
       const got = await waitForAnswer("t1", Date.now() + 10_000, d);
       assert(got === null && d.failed.get("t1") === "boom", `answer ${JSON.stringify(got)}, failed ${JSON.stringify(d.failed.get("t1"))}`);
-      const n = await settlesTo(base, obj.accepted);
+      const n = await settlesTo(base, obj);
       assert(n === base, `${n - base} client socket(s) still open after the failure (baseline ${base})`);
     } finally { obj.stop(); }
   });
 
-  await check("a server that completes the close is not cut short: its close arrives first", async () => {
+  await check("control: a server that completes the close brings the count back by itself, long before the grace", async () => {
     const obj = await fakeObject("proper", pushed);
     try {
-      const base = clientSockets(obj.accepted);
+      const base = clientSockets(obj);
       const got = await waitForAnswer("t1", Date.now() + 10_000, deps(obj.port, async () => benchPollBody(settled, false, 0), { closeGraceMs: 60_000 }));
       assert(got === "Fixed.", `the wait returned ${JSON.stringify(got)}`);
       // With a grace far longer than the check, only the server's own close can bring the count back.
-      const n = await settlesTo(base, obj.accepted);
+      const n = await settlesTo(base, obj);
       assert(n === base, `${n - base} client socket(s) still open after a proper close (baseline ${base})`);
     } finally { obj.stop(); }
   });
