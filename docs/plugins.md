@@ -342,8 +342,9 @@ hold it, the call is refused and the model told why, so it is usable only on a
 mount whose policy lets the agent call it without approval. Raft's `receive_events` declares it: it acknowledges the
 previous batch and records what it hands over as seen, so from a program the
 model would have acknowledged, and attested to having read, messages it never
-saw. So does `read_messages`, because Raft marks what a history read returns
-as read. A tool a server lists never carries it (the kernel admits only the
+saw. (`read_messages` does not: Raft marks a history read as read, so a
+program's call asks it not to, with `consume: false`, through
+`caller.fromProgram` below.) A tool a server lists never carries it (the kernel admits only the
 fields it knows).
 
 **Read `context.caller` for where a call came from.** Besides `tenantId`,

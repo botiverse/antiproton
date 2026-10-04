@@ -339,7 +339,7 @@ function stateStore(ctx: PluginContext): RaftStateStore {
  * read a history page closely enough to answer the read-before-send question is not something a page having
  * been fetched can say (docs/ax-design.md §3). What does attest is the hold's own question. This covers only the
  * frontier this mount keeps: the Server marks a history read as read on its side whatever the client keeps,
- * which is why read_messages is also `modelOnly`.
+ * unless the read says `consume: false`, which read_messages does when a run_js program calls it.
  */
 function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
   return createRaft({
@@ -678,7 +678,7 @@ export const raftPlugin: Plugin = {
         "Without a cursor it reads the latest messages; give at most one of before (older than a seq), after (newer than a seq) " +
         "or around (a seq or message id). hasOlder and hasNewer say whether more exist; oldestSeq and newestSeq are the cursors to page with. " +
         "Reading here does not count as having seen the conversation: a send_message there may still ask first, showing what is new. " +
-        "Raft marks what this reads as read, so only you can call it, not a run_js program, until Raft offers a read that leaves it unread (consume=false).",
+        "A run_js program's read leaves the messages unread.",
       parameters: {
         type: "object", additionalProperties: false,
         properties: {
@@ -692,9 +692,7 @@ export const raftPlugin: Plugin = {
       },
       sideEffects: "read",
       idempotency: "native",
-      // Raft marks a history read as read on its side, for every kind of target, with no parameter to stop it:
-      // from a program the messages would leave the model's unread state without the model seeing them.
-      modelOnly: true,
+      // Not modelOnly: a program's read is sent with `consume: false` (the handler), so Raft leaves it unread.
     },
     {
       name: "search_messages",
@@ -985,10 +983,12 @@ export const raftPlugin: Plugin = {
       }
       const limit = integer(a.limit, "limit", 1, MAX_HISTORY);
       // A client that saves nothing: this read does not count as the model having seen the conversation (see raftFor).
+      // A program's result may never reach the model, so its read also asks Raft not to mark the page read.
       const out = await raftFor(ctx, { state: false }).messages.read({
         target: a.target,
         ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}),
         ...(around !== undefined ? { around } : {}), ...(limit !== undefined ? { limit } : {}),
+        ...(ctx.caller.fromProgram === true ? { consume: false } : {}),
       });
       if (!out.ok) throw sdkFailure(out);
       const page = out.data;

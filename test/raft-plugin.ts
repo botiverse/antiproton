@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted } from "@botiverse/raft-sdk";
-import { raftPlugin, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
+import { raftPlugin, INBOX_STORE, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
 import { Interrupt, type PluginErrorFields } from "../src/plugins/types.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
@@ -130,11 +130,9 @@ await check("declares the inbox pull as a write that repeats safely, and the res
   // Only the model may pull: a program's pull would acknowledge and attest a batch the model never read.
   const pull = raftPlugin.tools.find((tool) => tool.name === "receive_events");
   if (pull?.modelOnly !== true) throw new Error(`receive_events is callable from a program: ${JSON.stringify(pull)}`);
-  const read = raftPlugin.tools.find((tool) => tool.name === "read_messages");
-  if (read?.modelOnly !== true) throw new Error(`read_messages is callable from a program: ${JSON.stringify(read)}`);
-  // Reads that consume nothing stay callable from code.
-  const others = raftPlugin.tools.filter((tool) => tool.name !== "receive_events" && tool.name !== "read_messages" && tool.modelOnly);
-  if (others.length) throw new Error(`model-only beyond receive_events and read_messages: ${others.map((t) => t.name).join(", ")}`);
+  // Everything else stays callable from code, read_messages included: a program's read is sent with consume=false.
+  const others = raftPlugin.tools.filter((tool) => tool.name !== "receive_events" && tool.modelOnly);
+  if (others.length) throw new Error(`model-only beyond receive_events: ${others.map((t) => t.name).join(", ")}`);
   // Under cursor acknowledgement a pull acknowledges the previous batch (a write) and repeating it hands back
   // the same batch (native), which is what lets a failed pull be retried.
   const receive = raftPlugin.tools.find((tool) => tool.name === "receive_events");
@@ -946,6 +944,47 @@ await check("read_messages does not count as the model having seen a conversatio
   await raftPlugin.invoke("receive_events", {}, control.ctx);
   const sent = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-receive" }, control.ctx) as any;
   if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`control: receive_events did not attest: ${JSON.stringify(controlSends)}`);
+});
+
+const SEEN_PAGE = { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
+  has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 };
+
+await check("a program's read_messages asks Raft not to mark the page read, and records nothing as seen", async () => {
+  const fresh = freshDb();
+  const c = { ...ctx(), db: fresh.db, caller: { tenantId: "tenant", agentId: "agent", taskId: "task", fromProgram: true } } as any;
+  const sends = freshnessServer({ history: json(200, SEEN_PAGE) });
+  const reads: string[] = [];
+  const serve = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init?: any) => { if (new URL(String(url)).pathname.endsWith("/history")) reads.push(String(url)); return serve(url, init); }) as any;
+  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 40 }, c) as any;
+  if (reads.length !== 1 || new URL(reads[0]!).searchParams.get("consume") !== "false") throw new Error(`request: ${reads[0]}`);
+  if (out.newestSeq !== 42) throw new Error(`result: ${JSON.stringify(out)}`);
+  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
+  // Nothing attests the page: a send after it, from the model, is still held.
+  const sent = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-program-read" }, { ...c, caller: ctx().caller });
+  if (!(sent instanceof Interrupt)) throw new Error(`the program's read let the send through: ${JSON.stringify(sends)}`);
+});
+
+await check("the model's read_messages is unchanged: no consume parameter, and still records nothing as seen", async () => {
+  const fresh = freshDb();
+  const calls = one(json(200, SEEN_PAGE));
+  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 40 }, { ...ctx(), db: fresh.db });
+  if (calls.length !== 1 || new URL(calls[0]!.url).searchParams.has("consume")) throw new Error(`request: ${calls[0]?.url}`);
+  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
+});
+
+await check("through the gateway, a run_js program's read_messages runs with consume=false and the model's without it", async () => {
+  const g = await raftBehindGateway();
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: any) => { urls.push(String(url)); return json(200, SEEN_PAGE); }) as any;
+  const out = await program(g.host, g.offered(["inbox"]), "const r = await tool`inbox.read_messages ${{ target: '#wg-raft-sdk' }}`; output(r.status); output(r.result?.newestSeq);");
+  if (out[0] !== "succeeded" || out[1] !== 42) throw new Error(`a program's read: ${JSON.stringify(out)}`);
+  const fromProgram = urls.splice(0);
+  if (fromProgram.length !== 1 || new URL(fromProgram[0]!).searchParams.get("consume") !== "false") throw new Error(`program request: ${fromProgram[0]}`);
+  const read: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__read_messages");
+  const direct = JSON.parse((await read.execute("d", { target: "#wg-raft-sdk" })).content[0].text);
+  if (direct.newestSeq !== 42) throw new Error(`the model's read: ${JSON.stringify(direct)}`);
+  if (urls.length !== 1 || new URL(urls[0]!).searchParams.has("consume")) throw new Error(`model request: ${urls[0]}`);
 });
 
 /** One result of `GET /internal/agent-api/search` as the Server sends it. */
