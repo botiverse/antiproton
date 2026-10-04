@@ -857,25 +857,32 @@ async function legacySend(
  *
  * The runtime parks a result whose `JSON.stringify` is longer than `PARK_BYTES` (cf/src/runtime.ts, where a mounted
  * call's result is measured whole: keys, escaping and all, not just the message text), and the model then reads a
- * preview, not the messages. So the result is measured here the same way, and only the longest run of whole
- * messages, oldest first, that keeps it under the line is shown. Only those are acknowledged: the cursor the next
- * pull sends is the last shown message's seq, and under cursor acks Raft acknowledges the rows of the batch at or
- * below it and hands the rest out again, first. A cut is made only after a message with a seq, since nothing
- * else can be acknowledged on its own (the SDK sorts a batch by seq, with the ones that have none last).
+ * preview, not the messages. So the result is measured here the same way, and only the messages that keep it under
+ * the line are shown, the rest left for the next call.
+ *
+ * Which ones, and the cursor, follow from how Raft acknowledges: `since = n` acknowledges every pending row with
+ * seq ≤ n, seq being the message's global seq, while a batch comes in delivery-queue order with conversations
+ * interleaved, not in seq order. So the messages are taken in ascending seq — here, not trusting the SDK's own sort
+ * to stay — and the shown ones are always a lowest-seq prefix. The cursor is the smallest unshown seq less one, or
+ * the largest shown seq when all of them fit: it can never cover a message the model was not shown. A message with
+ * no seq (a third-party event) has no place in that order and was acknowledged when it was handed out, so it is
+ * always shown and never decides the cursor.
  *
  * A message too long to fit even alone is handed over alone, acknowledged, and NOT recorded as seen: the result is
- * parked, so the model was given a preview and a reference, not the message. Left unacknowledged it would head
- * every later batch and the inbox would never move; acknowledged, nothing is lost, since the parked result holds it
- * whole and the conversation's history still has it, and with no seen record a send into that conversation is held
- * and shows the model what is new there before it goes. The same holds for a Server that acknowledges on read: it
- * has already taken the whole batch, so all of it is handed over, and recorded as seen only when it fits.
+ * parked, so the model was given a preview and a reference, not the message. It is the lowest seq, so left
+ * unacknowledged it would head every later batch and the inbox would never move; acknowledged, nothing is lost,
+ * since the parked result holds it whole and the conversation's history still has it, and with no seen record a
+ * send into that conversation is held and shows the model what is new there before it goes. The same holds for a
+ * Server that acknowledges on read: it has already taken the whole batch, so all of it is handed over, and
+ * recorded as seen only when it fits.
  */
-function handOver(batch: RaftInboxBatch): { result: Record<string, Json>; shown: RaftMessage[]; cursor: number | null; attested: boolean } {
-  const all = batch.messages;
-  const lines = all.map(modelLine);
+export function handOver(batch: RaftInboxBatch): { result: Record<string, Json>; shown: RaftMessage[]; cursor: number | null; attested: boolean } {
+  const queued = batch.messages.filter((m) => m.seq !== null).sort((x, y) => x.seq! - y.seq!);
+  const handedOff = batch.messages.filter((m) => m.seq === null);
   const onRead = batch.ackMode === "immediate";
+  const shownAt = (k: number) => [...queued.slice(0, k), ...handedOff];
   const resultOf = (k: number, attested: boolean): Record<string, Json> => {
-    const left = all.length - k;
+    const left = queued.length - k;
     const hasMore = batch.hasMore || left > 0;
     const notes = [
       // Kept short: it is read in the runtime's preview of a parked result, which cuts each string field.
@@ -884,7 +891,7 @@ function handOver(batch: RaftInboxBatch): { result: Record<string, Json>; shown:
       ...(hasMore ? ["More unread messages remain: call receive_events again until hasMore is false."] : []),
     ];
     return {
-      messages: lines.slice(0, k),
+      messages: shownAt(k).map(modelLine),
       hasMore,
       ...(notes.length ? { note: notes.join(" ") } : {}),
       // Raft's reply target names the newest message of the whole batch, which may not be among those shown.
@@ -894,15 +901,15 @@ function handOver(batch: RaftInboxBatch): { result: Record<string, Json>; shown:
     };
   };
   const fits = (r: Record<string, Json>) => JSON.stringify(r).length <= PARK_BYTES;
-  const cursorAt = (k: number) => (k === all.length ? batch.cursor : all[k - 1]!.seq);
-  const pick = (k: number, attested: boolean) => ({ result: resultOf(k, attested), shown: all.slice(0, k), cursor: cursorAt(k), attested });
-  if (onRead) return pick(all.length, fits(resultOf(all.length, true)));
-  for (let k = all.length; k >= 1; k--) {
-    if (cursorAt(k) === null && k < all.length) continue;
+  const cursorAt = (k: number) =>
+    queued.length === 0 ? null : k === queued.length ? queued[k - 1]!.seq : queued[k]!.seq! - 1;
+  const pick = (k: number, attested: boolean) => ({ result: resultOf(k, attested), shown: shownAt(k), cursor: cursorAt(k), attested });
+  if (onRead || queued.length === 0) return pick(queued.length, fits(resultOf(queued.length, true)));
+  // Showing no queued message is a cut only when something else is shown; otherwise the lowest is too long alone.
+  for (let k = queued.length; k >= (handedOff.length ? 0 : 1); k--) {
     if (fits(resultOf(k, true))) return pick(k, true);
   }
-  if (all.length === 0) return pick(0, true);
-  return pick(cursorAt(1) === null ? all.length : 1, false);
+  return pick(1, false);
 }
 
 /**

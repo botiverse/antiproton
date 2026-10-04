@@ -332,9 +332,11 @@ not saved and only `receive_events` attests. It attests only what the model
 was shown whole: it asks Raft for at most `EVENTS_LIMIT` messages (sized from
 `PARK_BYTES` and a per-message estimate), measures its result as the runtime
 does (the whole result serialised, not just the text), and shows only as many
-whole messages as stay under the parking line. Only those are acknowledged (the
-next pull's cursor is the last one shown, and Raft hands the rest out again
-first) and recorded as seen. A message too long to fit alone is handed over
+whole messages, lowest seq first, as stay under the parking line. Only those
+are acknowledged and recorded as seen: Raft's `since = n` acknowledges every
+pending row with seq ≤ n and a batch arrives in delivery order, not seq order,
+so the cursor is the smallest unshown seq less one (the largest shown when all
+fit), and Raft hands the rest out again first. A message too long to fit alone is handed over
 alone and acknowledged, so the inbox moves, but not recorded as seen: the model
 got a parked preview, so a send into that conversation is still held. The CLI commands the SDK's text
 names are rewritten as tool calls in one place (`toolTerms`), a stopgap until

@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
@@ -687,13 +687,12 @@ const PULL_LINE = limitForCall("raft.receive_events", { name: "artifacts__read",
 const parked = (out: unknown) => JSON.stringify(out).length > PULL_LINE;
 
 /**
- * Raft's inbox under cursor acks, as the SDK documents it: a pull's `since` acknowledges the rows handed out with
- * seq ≤ since, and the pull returns the oldest `limit` rows still unacknowledged, the unacknowledged rest of an
- * earlier batch included.
+ * Raft's inbox under cursor acks, as the Server does it: `since = n` acknowledges every pending row with seq ≤ n
+ * (seq is the message's global seq), and a pull hands out the oldest `limit` pending rows in delivery-queue
+ * order, which is not seq order: here, grouped by conversation. `last_seen_seq` is the highest seq handed out.
  */
-function cursorInbox(rows: Array<{ seq: number }>) {
-  const pending = [...rows];
-  const handedOut = new Set<number>();
+function cursorInbox(rows: Array<{ seq: number; channel_name: string }>) {
+  const pending = [...rows].sort((x, y) => x.seq - y.seq);
   const pulls: Array<{ since: string | null; limit: string | null }> = [];
   globalThis.fetch = (async (url: any) => {
     const u = new URL(String(url));
@@ -701,11 +700,11 @@ function cursorInbox(rows: Array<{ seq: number }>) {
     const since = u.searchParams.get("since"), limit = u.searchParams.get("limit");
     pulls.push({ since, limit });
     if (since !== null && /^\d+$/.test(since)) {
-      for (let i = pending.length - 1; i >= 0; i--) if (handedOut.has(pending[i]!.seq) && pending[i]!.seq <= Number(since)) pending.splice(i, 1);
+      for (let i = pending.length - 1; i >= 0; i--) if (pending[i]!.seq <= Number(since)) pending.splice(i, 1);
     }
-    const batch = pending.slice(0, Number(limit ?? 50));
-    for (const r of batch) handedOut.add(r.seq);
-    return events(batch, { last_seen_seq: batch.at(-1)?.seq ?? null, has_more: pending.length > batch.length });
+    const oldest = pending.slice(0, Number(limit ?? 50));
+    const queueOrder = [...oldest].sort((x, y) => x.channel_name.localeCompare(y.channel_name) || x.seq - y.seq);
+    return events(queueOrder, { last_seen_seq: oldest.length ? Math.max(...oldest.map((r) => r.seq)) : null, has_more: pending.length > oldest.length });
   }) as any;
   return { pulls, pending };
 }
@@ -763,11 +762,37 @@ await check("long messages that overflow the count shown only as many as fit: on
   }
 });
 
+await check("an interleaved batch is cut in seq order: the cursor never covers a lower seq the model was not shown", async () => {
+  // Delivery-queue order, conversation by conversation; two of the four fit. Cut in that order, the model would be
+  // shown 10 and 11 and `since=11` would acknowledge 3 and 4, which it never saw.
+  const rows = [inboxRow(10, "x".repeat(1500), "a"), inboxRow(11, "x".repeat(1500), "a"), inboxRow(3, "x".repeat(1500), "b"), inboxRow(4, "x".repeat(1500), "b")];
+  const sdk = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890",
+    fetch: (async () => events(rows, { last_seen_seq: 11 })) as any }).inbox.check({ ack: "cursor" });
+  if (!sdk.ok) throw new Error(JSON.stringify(sdk));
+  // handOver itself, on the batch in the order Raft sent it: the SDK sorts today, and nothing here may rest on that.
+  const given = handOver({ ...sdk.data, messages: rows.map((r) => sdk.data.messages.find((m) => m.seq === r.seq)!) });
+  if (JSON.stringify(given.shown.map((m) => m.seq)) !== "[3,4]" || given.cursor !== 9 || !given.attested) {
+    throw new Error(`shown ${given.shown.map((m) => m.seq)}, cursor ${given.cursor}`);
+  }
+  // Through the tool: the same cut, the seen record exactly the shown, and the next pull's since covers only them.
+  const server = cursorInbox(rows);
+  const fresh = freshDb();
+  const m = { ...ctx(), db: fresh.db };
+  const out = await raftPlugin.invoke("receive_events", {}, inTurn(m, "ctx_a")) as any;
+  const st = fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any;
+  if (JSON.stringify(shownSeqs(out)) !== "[3,4]" || st.cursor !== 9 || JSON.stringify(st.frontier.targets) !== JSON.stringify({ "#b": { exact: [3, 4], exactContextId: "ctx_a" } })) {
+    throw new Error(`shown ${shownSeqs(out)}, state ${JSON.stringify(st)}`);
+  }
+  const next = await raftPlugin.invoke("receive_events", {}, inTurn(m, "ctx_a")) as any;
+  if (server.pulls[1]!.since !== "9" || JSON.stringify(shownSeqs(next)) !== "[10,11]") throw new Error(`next: since=${server.pulls[1]!.since}, shown ${shownSeqs(next)}`);
+});
+
 await check("a message too long to fit alone is handed over alone and acknowledged, but not seen: a send into its conversation is still held", async () => {
   const m = mount();
-  const sends = freshnessServer({ events: events([historyMessage(42, "y".repeat(PULL_LINE)), historyMessage(43, "short")], { last_seen_seq: 43 }) });
+  // Delivered after a newer short one: the oversized message is the lowest seq, so it is the one handed over.
+  const sends = freshnessServer({ events: events([historyMessage(43, "short"), historyMessage(42, "y".repeat(PULL_LINE))], { last_seen_seq: 43 }) });
   const out = await raftPlugin.invoke("receive_events", {}, inTurn(m.ctx, "ctx_a")) as any;
-  if (!parked(out) || out.messages.length !== 1 || !/^Too long to show whole.*Not counted as seen/.test(out.note) || out.hasMore !== true) {
+  if (!parked(out) || out.messages.length !== 1 || !/msg=m-42cccc/.test(out.messages[0]) || !/^Too long to show whole.*Not counted as seen/.test(out.note) || out.hasMore !== true) {
     throw new Error(`result: ${JSON.stringify({ ...out, messages: out.messages.map((l: string) => l.length) })}`);
   }
   // The model reads it in the runtime's preview of the parked result: the note must come through that whole.
