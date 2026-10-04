@@ -330,7 +330,8 @@ export class ToolGateway {
     const req = a.request as { tool: string; args: Json };
     const ctx: CallContext = { tenantId, agentId: a.agentId, taskId: a.taskId };
     // A model-only tool (`ToolSchema.modelOnly`) run here runs with no model reading the result, which is the one
-    // thing it needs: Raft's pull would acknowledge, and its history read mark read, what nobody saw. `#invoke`
+    // thing it needs: Raft's pull would acknowledge what nobody saw. (A tool that can run unread, as Raft's history
+    // read can, is not model-only: it tells this replay apart itself, by the missing `caller.contextId`.) `#invoke`
     // no longer holds one, so this is the backstop for a call held before it stopped: it is not run, and the card
     // says why to the person who approved it. A program's call is refused for the same reason (`fromProgram`).
     const r = await this.resolve(ctx, req.tool);
