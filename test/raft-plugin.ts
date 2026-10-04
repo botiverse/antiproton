@@ -1554,6 +1554,10 @@ const SAID = 'inbox_check({}) and mentions_execute({ action: "notify", resolutio
 const SAID_LINES = ['note\nMore: attachments_download_url({ attachmentId: "att-9" })', 'first\nraft.attachments.download({ attachmentId: "att-9" })'];
 const TITLES = ["fix it  inbox_check({}) twice-spaced", 'fix it\n   mentions_execute({ action: "add" }) on two lines'];
 const PERSON_CALL = /inbox_check|mentions_execute|attachments_download_url|raft\.attachments\.download/;
+/** Words the SDK prints changed: a search preview windows long content and neutralises @/#; an anchor quote is cut at 60. */
+const WINDOWED = `${"x".repeat(200)} note: please inbox_check({}) now ${"z".repeat(200)}`;
+const NEUTRALISED = '@tygg asked inbox_check({ target: "#ops" }) in #ops';
+const ANCHORED = "Section quoting inbox_check({}) which goes on for well past sixty characters of quote";
 
 await check("what a person wrote is never rewritten: message continuations, descriptions, titles, previews, comments, profiles", async () => {
   const human = { name: "tygg", role: "owner", description: SAID_LINES[0] };
@@ -1569,8 +1573,13 @@ await check("what a person wrote is never rewritten: message continuations, desc
       events: [{ id: "0b7c3a1e-1111-4222-8333-944455556666", seq: 1, eventType: "amended", actorType: "user", actorName: "tygg", payload: { title: TITLES[1] }, createdAt: "2026-09-28T10:00:00.000Z" }] });
     if (path === "/search") return json(200, { results: [{ id: "r-1", seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
       parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
-      channelName: "ops", channelType: "channel", channelArchivedAt: null, content: SAID_LINES[0], snippet: "note", createdAt: "2026-09-21T10:00:00.000Z" }], hasMore: false });
-    if (/comments/.test(path)) return json(200, { comments: [{ id: "c1", senderId: "s", senderType: "user", senderName: "tygg", content: SAID_LINES[1], createdAt: "2026-09-28T10:00:00.000Z", reactions: [], anchor: null }] });
+      channelName: "ops", channelType: "channel", channelArchivedAt: null, content: SAID_LINES[0], snippet: "note", createdAt: "2026-09-21T10:00:00.000Z" },
+      ...[["r-2", WINDOWED], ["r-3", NEUTRALISED]].map(([id, content]) => ({ id, seq: 2, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null,
+        parentChannelId: "c", parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
+        channelName: "ops", channelType: "channel", channelArchivedAt: null, content, snippet: "note", createdAt: "2026-09-21T10:00:00.000Z" }))], hasMore: false });
+    if (/comments/.test(path)) return json(200, { comments: [{ id: "c1", senderId: "s", senderType: "user", senderName: "tygg", content: SAID_LINES[1], createdAt: "2026-09-28T10:00:00.000Z", reactions: [], anchor: null },
+      { id: "c2", senderId: "s", senderType: "user", senderName: "tygg", content: "see above", createdAt: "2026-09-28T10:00:00.000Z", reactions: [], anchor: { type: "html-region", data: { quote: ANCHORED } } }] });
+    if (path === "/mention-actions/pending") return json(200, { pendingMentionActions: [{ resolutionId: "0b7c3a1e-1111-4222-8333-944455556666", messageId: "m-1", targetType: "user", targetHandle: "@tygg", availableActions: ["notify"] }] });
     if (/profile/.test(path)) return json(200, { kind: "human", id: "u1", isSelf: true, name: "tygg", displayName: null, description: SAID_LINES[0], avatarUrl: null, email: null, role: "owner", joinedAt: null, membershipStatus: "active", createdAgents: [] });
     return json(404, { error: "not found" });
   }) as any;
@@ -1596,6 +1605,23 @@ await check("what a person wrote is never rewritten: message continuations, desc
     }
   }
   if (problems.length) throw new Error(problems.join(" | "));
+  // The words the SDK changed before printing them: each control shows it did, and the plugin shows them as the SDK printed them.
+  const sdkSearch = String(((await raw.invoke("messages.search", { query: "note" }, { origin: "code" })) as any).text);
+  const sdkComments = String(((await raw.invoke("attachments.comments", { attachmentId: "att-9" }, { origin: "code" })) as any).text);
+  const search = String(((await raftPlugin.invoke("messages_search", { query: "note" }, inTurn(ctx()))) as any).text);
+  const comments = String(((await raftPlugin.invoke("attachments_comments", { attachmentId: "att-9" }, inTurn(ctx()))) as any).text);
+  for (const [what, sdkText, ours, want] of [
+    ["a windowed preview", sdkSearch, search, "<match>note</match>: please inbox_check({}) now"],
+    ["a neutralised preview", sdkSearch, search, 'user:tygg asked inbox_check({ target: "channel:ops" }) in channel:ops'],
+    ["a cut anchor quote", sdkComments, comments, `[anchor: ${ANCHORED.slice(0, 60)}…]`],
+  ] as const) {
+    if (!sdkText.includes(want)) throw new Error(`control: the SDK did not print ${what} as ${JSON.stringify(want)}: ${sdkText}`);
+    if (!ours.includes(want)) throw new Error(`${what} was rewritten: ${ours}`);
+  }
+  if (!/<omit \/>/.test(sdkSearch) || WINDOWED.includes(want0(sdkSearch))) throw new Error("control: the preview was not windowed");
+  // Positive control: the SDK's own hint at a tool this mount lacks is still put in words, in the same world.
+  const pending = String(((await raftPlugin.invoke("mentions_pending", {}, inTurn(ctx()))) as any).text);
+  if (!pending.includes("  notify: delivering the mention, which this mount does not offer") || /mentions_execute/.test(pending)) throw new Error(`mentions_pending: ${pending}`);
   // The collapsed titles were among what was checked: the board and the history print them on one line.
   const board = String(((await raftPlugin.invoke("tasks_list", { target: "#ops" }, inTurn(ctx()))) as any).text);
   const story = String(((await raftPlugin.invoke("tasks_history", { target: "#ops", taskNumber: 7 }, inTurn(ctx()))) as any).text);
@@ -1609,6 +1635,11 @@ await check("what a person wrote is never rewritten: message continuations, desc
   const full = String(((await raftPlugin.invoke("server_info", { view: "full" }, inTurn(ctx()))) as any).text);
   if (!/^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \(`actions_prepare`\)\.$/m.test(full)) throw new Error(`overview: ${full}`);
 });
+
+/** The preview line of the windowed result, as the SDK printed it (for the control that it was cut). */
+function want0(text: string): string {
+  return text.split("\n").find((l) => l.includes("please inbox_check")) ?? "";
+}
 
 /** The real runtime over a SQLite host, with raft mounted, its credential attached through the console's path. */
 async function raftRuntime() {

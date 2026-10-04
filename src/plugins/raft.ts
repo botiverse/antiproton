@@ -732,8 +732,28 @@ function unofferedPattern(unoffered: ReadonlySet<string>): RegExp {
 }
 
 /**
+ * `@handle`, `#channel`, `dm:@peer` and `task #N` as the SDK neutralises them in what it quotes (a search preview), so
+ * a call a person wrote can be recognised after that: the same four replacements as the SDK's
+ * `neutralizeAgentRaftRefLiterals` (0.10.0), which it does not export. If the SDK changes them, a person's call with a
+ * reference in its arguments is rewritten in a preview, and the "never rewritten" test's preview case goes red.
+ */
+function neutralizedRefs(text: string): string {
+  return text.replace(/\bdm:@([A-Za-z0-9][A-Za-z0-9_-]*(?:~(?:agent|human))?)/g, "dm:user:$1").replace(/\btask #([0-9]+)\b/g, "task:$1")
+    .replace(/(^|[\n\s([{"'`;])@([A-Za-z0-9][A-Za-z0-9_-]*)/g, "$1user:$2").replace(/(^|[\n\s([{"'`;])#([A-Za-z][A-Za-z0-9_-]*)/g, "$1channel:$2");
+}
+
+/**
  * The SDK's text with every hint at a tool this mount does not offer written as what it stands for. `quoted` are the
- * strings a person wrote that the outcome carries (`quotedCalls`): set aside before, put back after.
+ * strings a person wrote that the outcome carries, in the forms the SDK may print them (`quotedCalls`).
+ *
+ * Two guards keep a person's words as written. Each quoted form found whole in the text is set aside first. And
+ * because the SDK also prints a person's words cut or changed — a search preview windowed and its references
+ * neutralised, an anchor quote cut at 60 characters — where no whole form is found, a call is left alone when its
+ * exact text (its name and the arguments `callEnd` finds) appears in any quoted form, or in its neutralised form
+ * (`neutralizedRefs`); and a call whose arguments do not close (cut off by a window) is never an SDK hint, which
+ * always closes, so it is left alone too. The trade-off: an SDK hint whose call text happens to be exactly what a
+ * person wrote stays as the SDK wrote it, and if the model calls it the gateway refuses it as a tool this mount does
+ * not have. That costs one refused call; rewriting would change someone's words.
  */
 export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quoted: readonly string[] = []): string {
   const kept: string[] = [];
@@ -743,6 +763,7 @@ export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quote
     masked = masked.split(q).join(`\uE000${kept.length}\uE001`);
     kept.push(q);
   }
+  const forms = [...new Set([...quoted, ...quoted.map(neutralizedRefs)])];
   const pattern = unofferedPattern(unoffered);
   let out = "";
   let at = 0;
@@ -751,8 +772,11 @@ export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quote
     const name = m[1]!;
     const after = m.index! + m[0].length;
     const end = masked[after] === "(" ? callEnd(masked, after) : after;
+    if (end === -1) continue;
+    const call = masked.slice(m.index, end);
+    if (forms.some((f) => f.includes(call))) continue;
     out += masked.slice(at, m.index) + (UNOFFERED_SAY[name] ?? UNOFFERED_DEFAULT);
-    at = end === -1 ? after : end;
+    at = end;
   }
   return (out + masked.slice(at)).replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!);
 }
