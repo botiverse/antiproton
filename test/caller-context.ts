@@ -28,6 +28,10 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { BACKGROUND_CONTEXT as bg } from "@earendil-works/chord/context";
 import { standInLoader } from "./spec/worker-stand-in.ts";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -191,6 +195,20 @@ for (const engine of ["pi085", "pd"] as const) {
       await r2.rt.ready();
       const after = (await seeOnce(w2, "a")).contextId;
       must(before && after === before, `restart moved it: ${before} → ${after}`);
+      // A second runtime in this process shares its modules; a restarted object does not. So the same storage is
+      // also read by a fresh process, which holds nothing of this one's.
+      const dir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "caller-context-"));
+      const file = join(dir, "object.db");
+      w.host.sql.exec("VACUUM INTO ?", file);
+      const fresh = execFileSync(process.execPath, ["--input-type=module", "-e", [
+        `import { DatabaseSync } from "node:sqlite";`,
+        `import { contextIdOf } from ${JSON.stringify(new URL("../src/runtime/context-id.ts", import.meta.url).pathname)};`,
+        `const db = new DatabaseSync(${JSON.stringify(file)});`,
+        `const sql = { exec: (q, ...b) => { const rows = db.prepare(q).all(...b); return { toArray: () => rows }; } };`,
+        `process.stdout.write(String(contextIdOf(sql, { tenantId: "t", agentId: "a", engine: ${JSON.stringify(engine)} })));`,
+      ].join("\n")], { encoding: "utf8" });
+      rmSync(dir, { recursive: true, force: true });
+      must(fresh === before, `a fresh process computes ${fresh}, the object ${before}`);
     } finally { w.host.dispose(); }
   });
 
