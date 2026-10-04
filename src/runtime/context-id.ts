@@ -18,7 +18,7 @@
  *   `buildContextEntries` starts there), `branch_summary` or `pi.reset` entry.
  *
  * So the id changes on exactly these: a new session, a compaction, a reset, a move between engines, a transcript
- * remade. Two ways a read can leave the model's context are NOT among them, and each is safe today only because of
+ * remade — and, on pi085, a branch summary, which nothing writes today. Two ways a read can leave the model's context are NOT among them, and each is safe today only because of
  * what the code around it does (docs/pi-upstream.md, "What `caller.contextId` rests on"):
  *
  * - pi085's tip moved back with `navigateTree`. The one caller, `resumeClientCalls` (src/runtime/client-calls.ts),

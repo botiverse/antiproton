@@ -362,7 +362,8 @@ on both engines and present only when they say something:
   turn, and a restarted object computes the same value, because it is derived
   from durable state (`src/runtime/context-id.ts`). It changes on exactly
   these: a new session, a compaction, a reset, a move between engines, and a
-  transcript that was remade. Two ways a read can leave the context do **not**
+  transcript that was remade — and, on pi085, a branch summary, which nothing
+  writes today. Two ways a read can leave the context do **not**
   change it, and neither drops a read today: pi085 moving the conversation's
   tip back (`navigateTree`, used only to resume a caller's paused functions,
   which carries every result along) and pi-durable's context edits (`omit` /

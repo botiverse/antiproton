@@ -440,13 +440,23 @@ await check("pi-durable: a context edit takes a read out of the context without 
 });
 
 /** Code that would write a pi-durable context edit: an entry's `edits`, or an edit's action. */
-const WRITES_EDITS = [/\bedits\s*:/, /\baction\s*:\s*["'`](?:omit|replace)["'`]/];
+/**
+ * Each pattern with an edit written the way it catches: a plain or quoted `edits` key, the shorthand property, the
+ * computed key (the action can then sit in a constant no pattern sees), and a literal action.
+ */
+const WRITES_EDITS: Array<[RegExp, string]> = [
+  [/(["'`]?)\bedits\1\s*:/, `{ kind: "x", edits: [{ target: 3, action: "omit" }] }`],
+  [/(["'`]?)\bedits\1\s*:/, `{ "kind": "x", "edits": [] }`],
+  [/[{,]\s*edits\s*[,}]/, `const edits = [e]; draft = { kind: "x", edits };`],
+  [/\[\s*["'`]edits["'`]\s*\]/, `draft["edits"] = [{ target: 3, action: OMIT }];`],
+  [/(["'`]?)\baction\1\s*:\s*["'`](?:omit|replace)["'`]/, `const edit = { target: 3, "action": "replace", messages: [] };`],
+];
 
 await check("nothing in src/ or cf/src writes a pi-durable context edit (the id does not change for one)", async () => {
   const { readdirSync, readFileSync, statSync } = await import("node:fs");
   const root = new URL("..", import.meta.url).pathname;
   // Control: the patterns find an edit written the way pi-durable's type spells it.
-  must(WRITES_EDITS.every((r) => r.test(`{ kind: "x", edits: [{ target: 3, action: "omit" }] }`)), "control: the patterns miss an edit");
+  for (const [r, sample] of WRITES_EDITS) must(r.test(sample), `control: ${r} misses ${sample}`);
   const found: string[] = [];
   const walk = (dir: string) => {
     for (const name of readdirSync(dir)) {
@@ -454,7 +464,7 @@ await check("nothing in src/ or cf/src writes a pi-durable context edit (the id 
       if (statSync(path).isDirectory()) { if (name !== "node_modules") walk(path); continue; }
       if (!/\.(ts|js|mjs)$/.test(name)) continue;
       readFileSync(path, "utf8").split("\n").forEach((line, i) => {
-        if (WRITES_EDITS.some((r) => r.test(line))) found.push(`${path.slice(root.length)}:${i + 1}: ${line.trim()}`);
+        if (WRITES_EDITS.some(([r]) => r.test(line))) found.push(`${path.slice(root.length)}:${i + 1}: ${line.trim()}`);
       });
     }
   };

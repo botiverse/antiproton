@@ -268,11 +268,12 @@ export interface PluginContext {
     /**
      * An opaque id for the model's current context window in this agent's session: the same on every call of one
      * context, never per turn, and recomputed from durable state, so a restart does not move it. It changes on a new
-     * session, a compaction, a reset, a move between engines or a remade transcript — those, not "whenever anything
-     * leaves the context": a pi085 `navigateTree` (used only where it keeps every read) and pi-durable context edits
-     * (unused) are not boundaries (src/runtime/context-id.ts lists both). Absent when the call is not made in a
-     * session's turn (an approved call's replay, provisioning, a bench shell, a background job's poll). Compare it
-     * for equality only: how it is made is not part of the contract.
+     * session, a compaction, a reset, a move between engines, a remade transcript, or (pi085) a branch summary,
+     * which nothing writes today — those, not "whenever anything leaves the context": a pi085 `navigateTree` (used
+     * only where it keeps every read) and pi-durable context edits (unused) are not boundaries
+     * (src/runtime/context-id.ts lists both). Absent when the call is not made in a session's turn (an approved
+     * call's replay, provisioning, a bench shell, a background job's poll). Compare it for equality only: how it is
+     * made is not part of the contract.
      */
     contextId?: string;
   };
