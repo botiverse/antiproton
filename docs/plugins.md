@@ -358,17 +358,19 @@ on both engines and present only when they say something:
   result the model has not necessarily seen; a tool a program must never reach
   declares `modelOnly` instead.
 - `contextId` — an opaque id for the model's current context window in this
-  agent's session. It stays the same across turns while what the model read
-  earlier in the session is still in its context, and changes with a new
-  session, a reset or a compaction; it is never per turn, and a restarted
-  object computes the same value, because it is derived from durable state
-  (the session, its transcript's identity and its newest context boundary:
-  `src/runtime/context-id.ts`). Scope "what the model has seen" by it and
-  compare it for equality only. It can change when nothing was lost — a
-  plugin then re-shows something — but it does not stay the same when
-  something was. Absent when the call is not made in a session's turn (an
-  approved call's replay, provisioning, a bench shell, a background job's
-  poll): treat that as "nothing is known to be seen".
+  agent's session. It is the same on every call of one context and never per
+  turn, and a restarted object computes the same value, because it is derived
+  from durable state (`src/runtime/context-id.ts`). It changes on exactly
+  these: a new session, a compaction, a reset, a move between engines, and a
+  transcript that was remade. Two ways a read can leave the context do **not**
+  change it, and neither drops a read today: pi085 moving the conversation's
+  tip back (`navigateTree`, used only to resume a caller's paused functions,
+  which carries every result along) and pi-durable's context edits (`omit` /
+  `replace`, which nothing writes; a test fails if something starts to). Scope
+  "what the model has seen" by it and compare it for equality only. Absent
+  when the call is not made in a session's turn (an approved call's replay,
+  provisioning, a bench shell, a background job's poll): treat that as
+  "nothing is known to be seen".
 
 **Bound a number, shape a header list.** A `number` setting can carry `min` and
 `max`; a value outside them is refused when the mount is written, as everything

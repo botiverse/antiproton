@@ -13,8 +13,8 @@
 import { AgentRuntime, hostCallOpts } from "../cf/src/runtime.ts";
 import { fromResponse, toRequest } from "../src/model/pi-bridge.ts";
 import type { ModelResponse } from "../src/model/types.ts";
-import type { Plugin, PluginContext } from "../src/plugins/types.ts";
-import { contextIdOf } from "../src/runtime/context-id.ts";
+import { interrupt, type Plugin, type PluginContext } from "../src/plugins/types.ts";
+import { contextIdOf, contextIdQuery } from "../src/runtime/context-id.ts";
 import { DurableAgent } from "../src/runtime/durable-agent.ts";
 import { DynamicWorkerExecutor } from "../src/runtime/dynamic-worker-executor.ts";
 import { QuickJsExecutor } from "../src/runtime/executor.ts";
@@ -44,6 +44,21 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, Math.max(0,
 
 type Caller = PluginContext["caller"];
 
+const planOf = (sql: { exec(q: string, ...b: unknown[]): { toArray(): any[] } }, query: string, ...b: unknown[]) =>
+  sql.exec(`EXPLAIN QUERY PLAN ${query}`, ...b).toArray().map((r) => String(r.detail));
+/** A plan step that reads a table without an index: the cost this read must not have on every call. */
+const unindexed = (plan: string[]) => plan.filter((d) => /^SCAN /.test(d) && d !== "SCAN CONSTANT ROW" && !/ USING (COVERING )?INDEX /.test(d));
+
+/** pi-durable's own context read for a pd session: the head marker it starts from, as `ContextView.head`. */
+async function pdContextHead(rt: AgentRuntime, session = "main"): Promise<number | undefined> {
+  const agent = await rt.agent("t", "a", session) as DurableAgent;
+  const host = agent.host;
+  const view = await host.withHarness(async (h) => (await host.handle(h, await host.conversation(session))).context(bg));
+  return view.head === undefined ? undefined : Number(view.head.id);
+}
+const newestHead = (sql: { exec(q: string): { toArray(): any[] } }) =>
+  Number(sql.exec("SELECT MAX(id) AS h FROM pd_entries WHERE head IS NOT NULL").toArray()[0].h);
+
 /** A plugin that records the caller of every call it runs. */
 function probe(seen: Array<{ tool: string; caller: Caller }>): Plugin {
   return {
@@ -51,8 +66,17 @@ function probe(seen: Array<{ tool: string; caller: Caller }>): Plugin {
     tools: [
       { name: "see", description: "Read.", parameters: { type: "object", properties: {} }, sideEffects: "read", idempotency: "none" },
       { name: "act", description: "Write.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
+      { name: "ask", description: "Asks first.", parameters: { type: "object", properties: {} }, sideEffects: "write", idempotency: "none" },
     ] as never,
-    async invoke(tool, _args, context) { seen.push({ tool, caller: JSON.parse(JSON.stringify(context.caller)) }); return { ok: tool }; },
+    async invoke(tool, _args, context) {
+      seen.push({ tool, caller: JSON.parse(JSON.stringify(context.caller)) });
+      if (tool === "ask") return interrupt({ question: "go on?", answer: { choices: ["yes", "no"] }, state: { asked: true } });
+      return { ok: tool };
+    },
+    interrupts: {
+      async resume(tool, _state, answer, context) { seen.push({ tool: `${tool}:resume`, caller: JSON.parse(JSON.stringify(context.caller)) }); return { answered: answer }; },
+      async cancel(tool, _state, context) { seen.push({ tool: `${tool}:cancel`, caller: JSON.parse(JSON.stringify(context.caller)) }); },
+    },
   };
 }
 
@@ -103,9 +127,10 @@ async function world(engine: "pi085" | "pd") {
 
 /**
  * One user message on `session`, the model answered by `script` in order (a summary job, with a fixed summary).
- * Returns when the object has nothing left to wake for.
+ * Returns when the object has nothing left to wake for, or, with `leaveHeld`, once the script is used up.
  */
-async function turn(r: Rt, text: string, script: ModelResponse[], session = "main") {
+type Reply = ModelResponse | ((req: ReturnType<typeof toRequest>) => ModelResponse);
+async function turn(r: Rt, text: string, script: Reply[], session = "main", o: { leaveHeld?: boolean } = {}) {
   let at = 0;
   await r.rt.postMessage("t", "a", text, "prompt", session);
   for (let guard = 0; guard < 200; guard++) {
@@ -117,12 +142,14 @@ async function turn(r: Rt, text: string, script: ModelResponse[], session = "mai
       if (!job) continue;
       const req = toRequest(job.context);
       const isSummary = req.messages.some((m) => m.role === "system" && String(m.content).includes(SUMMARIZER));
-      const res = isSummary ? say("the summary") : script[at++];
+      const next = isSummary ? say("the summary") : script[at++];
+      const res = typeof next === "function" ? next(req) : next;
       must(res, `the model was called more often than scripted (${at}); last: ${show(req.messages.slice(-1)).slice(0, 300)}`);
-      await r.rt.deliverAnswer("t", "a", id, fromResponse(res, { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
+      await r.rt.deliverAnswer("t", "a", id, fromResponse(res!, { api: job.model.api, provider: job.model.provider, id: job.model.id }, id), undefined);
     }
     if (pending.length) continue;
-    if (at >= script.length && (out?.wakeInMs === null || out?.wakeInMs === undefined)) return;
+    // `leaveHeld`: a question left unanswered keeps the object waking for its hold; the turn itself is over.
+    if (at >= script.length && (o.leaveHeld || out?.wakeInMs === null || out?.wakeInMs === undefined)) return;
     await sleep(Math.min(out?.wakeInMs ?? 20, 50));
   }
   throw new Error(`the turn did not settle; ${at} of ${script.length} answered`);
@@ -258,6 +285,9 @@ await check("pd: a compaction changes the contextId; it then holds across turns"
     await settle(w.r);
     const heads = w.host.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE head IS NOT NULL").toArray()[0] as { n: number };
     must(Number(heads.n) === 1, `control: the compaction placed ${heads.n} head markers; ${show(w.host.sql.exec("SELECT record FROM pd_tasks WHERE json_extract(record, '$.kind') = 'pi.compaction'").toArray().map((r) => JSON.parse(String((r as { record: unknown }).record)).state))}`);
+    // Upstream (docs/pi-upstream.md): pi-durable's context starts at the head marker the id hashes.
+    const head = await pdContextHead(w.r.rt);
+    must(head === newestHead(w.host.sql), `pi-durable's context starts at ${head}, the newest head marker is ${newestHead(w.host.sql)}`);
     const after = (await seeOnce(w, "c")).contextId;
     const later = (await seeOnce(w, "d")).contextId;
     must(first && after && after !== first, `compaction did not move it: ${first} → ${after}`);
@@ -276,6 +306,8 @@ await check("pd: a reset changes the contextId", async () => {
     await settle(w.r);
     const resets = w.host.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE json_extract(record, '$.kind') = 'pi.reset'").toArray()[0] as { n: number };
     must(Number(resets.n) === 1, `control: ${resets.n} reset entries`);
+    const head = await pdContextHead(w.r.rt);
+    must(head === newestHead(w.host.sql), `pi-durable's context starts at ${head}, the newest head marker is ${newestHead(w.host.sql)}`);
     const after = (await seeOnce(w, "b")).contextId;
     must(first && after && after !== first, `reset did not move it: ${first} → ${after}`);
   } finally { w.host.dispose(); }
@@ -303,9 +335,8 @@ await check("pi085: a context boundary entry in the transcript changes the conte
     must(id() === b, "a message after the compaction moved it");
     add(7, "custom", "pi.reset");
     must(id() !== b, "a pi.reset did not move it");
-    const plan = host.sql.exec(`EXPLAIN QUERY PLAN SELECT MAX(seq) AS b FROM ${t.entries} WHERE type IN ('compaction', 'branch_summary') OR custom_type = 'pi.reset'`)
-      .toArray().map((r) => String((r as { detail: unknown }).detail)).join("; ");
-    must(plan.includes(`${t.entries}_boundary`), `the boundary read does not use its index: ${plan}`);
+    const plan = planOf(host.sql, contextIdQuery("pi085"));
+    must(plan.some((d) => d.includes(`${t.entries}_boundary`)) && unindexed(plan).length === 0, `the read is not indexed: ${show(plan)}`);
   } finally { host.dispose(); }
 });
 
@@ -313,10 +344,198 @@ await check("pd: the head-marker read goes through pi-durable's partial index", 
   const w = await world("pd");
   try {
     await seeOnce(w, "a");
-    const plan = w.host.sql.exec("EXPLAIN QUERY PLAN SELECT MAX(id) AS h FROM pd_entries WHERE conversation_id = 0 AND head IS NOT NULL")
-      .toArray().map((r) => String((r as { detail: unknown }).detail)).join("; ");
-    must(plan.includes("entry_heads_by_conversation"), `the head read does not use its index: ${plan}`);
+    const plan = planOf(w.host.sql, contextIdQuery("pd"), "main");
+    must(plan.some((d) => d.includes("entry_heads_by_conversation")) && unindexed(plan).length === 0, `the read is not indexed: ${show(plan)}`);
   } finally { w.host.dispose(); }
+});
+
+// ---- what the id hashes as the transcript's identity ------------------------------------------------------------
+
+await check("migrate, revert and migrate again: pd's second conversation gets a new contextId though it has no head marker either; pi085 after the revert keeps its own", async () => {
+  const w = await world("pi085");
+  try {
+    const pi1 = (await seeOnce(w, "p1")).contextId;
+    const m1 = await w.r.rt.migrateEngine("t", "a", "migrate");
+    must(m1 && m1.ok && (m1 as { action: string }).action === "migrated", `migrate: ${show(m1)}`);
+    const pd1 = (await seeOnce(w, "d1")).contextId;
+    must(pd1 && pd1 !== pi1, `a move to pd kept pi085's id: ${pi1} → ${pd1}`);
+    await (await w.r.rt.agent("t", "a")).close();
+    const back = await w.r.rt.migrateEngine("t", "a", "revert");
+    must(back && back.ok && (back as { action: string }).action === "reverted", `revert: ${show(back)}`);
+    // pi085's transcript is the one it had before the move: what was read under pi1 is still in it.
+    const pi2 = (await seeOnce(w, "p2")).contextId;
+    must(pi2 === pi1, `pi085 after the revert: ${pi1} → ${pi2}`);
+    await sleep(2); // the conversation row's creation time is in milliseconds
+    const m2 = await w.r.rt.migrateEngine("t", "a", "migrate");
+    must(m2 && m2.ok && (m2 as { action: string }).action === "migrated", `migrate again: ${show(m2)}`);
+    // pd's tables were dropped: the same conversation id, and no head marker in either. What was read under pd1 is
+    // not in the imported transcript, so the id must not be pd1's.
+    const heads = w.host.sql.exec("SELECT COUNT(*) AS n FROM pd_entries WHERE head IS NOT NULL").toArray()[0] as { n: number };
+    must(Number(heads.n) === 0, `control: ${heads.n} head markers`);
+    const pd2 = (await seeOnce(w, "d2")).contextId;
+    must(pd2 && pd2 !== pd1 && pd2 !== pi1, `the second pd conversation: pd1 ${pd1}, pd2 ${pd2}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("pd: the conversation row's creation time is part of the id (a re-made row, same conversation id, no head marker)", async () => {
+  const w = await world("pd");
+  try {
+    const before = (await seeOnce(w, "a")).contextId;
+    w.host.sql.exec("UPDATE ap_conversations SET created_at = created_at + 1 WHERE task_id = 'main'");
+    const after = contextIdOf(w.host.sql, { tenantId: "t", agentId: "a", engine: "pd" });
+    must(before && after && after !== before, `a re-made row kept the id: ${before} → ${after}`);
+  } finally { w.host.dispose(); }
+});
+
+await check("pi085: a transcript dropped and remade under the same session gets a new contextId", async () => {
+  const host = sqliteHost();
+  try {
+    const t = piTables();
+    const fill = (prefix: string) => {
+      ensurePiTables(host.sql);
+      for (let seq = 1; seq <= 3; seq++) host.sql.exec(
+        `INSERT INTO ${t.entries}(id, parent_id, seq, timestamp, type, custom_type, body) VALUES (?,?,?,?,?,?,?)`,
+        `${prefix}${seq}`, seq === 1 ? null : `${prefix}${seq - 1}`, seq, seq, "message", null, "{}");
+    };
+    const id = () => contextIdOf(host.sql, { tenantId: "t", agentId: "a", engine: "pi085" });
+    fill("a");
+    const first = id();
+    host.sql.exec(`DROP TABLE ${t.entries}`);
+    must(id() === undefined, "a dropped transcript still has an id");
+    fill("b");
+    const second = id();
+    must(first && second && second !== first, `the remade transcript kept the id: ${first} → ${second}`);
+  } finally { host.dispose(); }
+});
+
+// ---- the upstream behaviours the id rests on (docs/pi-upstream.md, "What `caller.contextId` rests on") ------------
+
+await check("pi-agent-core: a session's context starts at its newest compaction entry", async () => {
+  const { buildContextEntries } = await import("../node_modules/@earendil-works/pi-agent-core/dist/harness/session/context.js" as string) as
+    { buildContextEntries(entries: Array<{ id: string; type: string }>): Array<{ id: string }> };
+  const e = (id: string, type: string) => ({ id, type });
+  const path = [e("m1", "message"), e("c1", "compaction"), e("m2", "message"), e("b1", "branch_summary"), e("c2", "compaction"), e("m3", "message"), e("x", "custom")];
+  must(show(buildContextEntries(path).map((x) => x.id)) === show(["c2", "m3", "x"]), `context: ${show(buildContextEntries(path).map((x) => x.id))}`);
+  must(show(buildContextEntries(path.slice(0, 1)).map((x) => x.id)) === show(["m1"]), "with no compaction the whole path is context");
+});
+
+await check("pi-durable: a context edit takes a read out of the context without a head marker, so the contextId does not change (why nothing may write one)", async () => {
+  const w = await world("pd");
+  try {
+    const before = (await seeOnce(w, "a")).contextId;
+    const target = Number(w.host.sql.exec("SELECT MIN(id) AS m FROM pd_entries WHERE json_extract(record, '$.kind') = 'pi.tool-result'").toArray()[0].m);
+    const agent = await w.r.rt.agent("t", "a") as DurableAgent;
+    const host = agent.host;
+    // Written here, in the test, as pi-durable's own types spell it: the guard below keeps src/ and cf/src from it.
+    await host.withHarness(async (h) =>
+      (await host.handle(h, await host.conversation("main"))).submit({ type: "write", entry: { kind: "test.edit", edits: [{ target: target as never, action: "omit" }] } }, bg));
+    await settle(w.r);
+    const ctx = await host.withHarness(async (h) => (await host.handle(h, await host.conversation("main"))).context(bg));
+    const at = ctx.entries.findIndex((x) => Number(x.id) === target);
+    must(at >= 0 && ctx.contributions[at]!.length === 0, `control: the edit did not omit the read (index ${at}, ${show(ctx.contributions[at])})`);
+    must(ctx.head === undefined, "the edit placed a head marker");
+    const after = contextIdOf(w.host.sql, { tenantId: "t", agentId: "a", engine: "pd" });
+    must(after === before, `the id moved after all (${before} → ${after}): the exception in context-id.ts no longer holds; update it`);
+  } finally { w.host.dispose(); }
+});
+
+/** Code that would write a pi-durable context edit: an entry's `edits`, or an edit's action. */
+const WRITES_EDITS = [/\bedits\s*:/, /\baction\s*:\s*["'`](?:omit|replace)["'`]/];
+
+await check("nothing in src/ or cf/src writes a pi-durable context edit (the id does not change for one)", async () => {
+  const { readdirSync, readFileSync, statSync } = await import("node:fs");
+  const root = new URL("..", import.meta.url).pathname;
+  // Control: the patterns find an edit written the way pi-durable's type spells it.
+  must(WRITES_EDITS.every((r) => r.test(`{ kind: "x", edits: [{ target: 3, action: "omit" }] }`)), "control: the patterns miss an edit");
+  const found: string[] = [];
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) { if (name !== "node_modules") walk(path); continue; }
+      if (!/\.(ts|js|mjs)$/.test(name)) continue;
+      readFileSync(path, "utf8").split("\n").forEach((line, i) => {
+        if (WRITES_EDITS.some((r) => r.test(line))) found.push(`${path.slice(root.length)}:${i + 1}: ${line.trim()}`);
+      });
+    }
+  };
+  let files = 0;
+  const count = (dir: string) => { for (const n of readdirSync(dir)) { const p = join(dir, n); if (statSync(p).isDirectory()) count(p); else files++; } };
+  for (const dir of ["src", "cf/src"]) { walk(join(root, dir)); count(join(root, dir)); }
+  must(files > 100, `control: only ${files} files under src/ and cf/src`);
+  must(found.length === 0, `pi-durable context edits are written here; make contextId change with them (docs/pi-upstream.md):\n      ${found.join("\n      ")}`);
+});
+
+// ---- the interrupt paths and a paused program ---------------------------------------------------------------
+
+const lastToolJson = (req: ReturnType<typeof toRequest>): Record<string, any> => {
+  const m = [...req.messages].reverse().find((x) => x.role === "tool");
+  must(m, "no tool result");
+  return JSON.parse(String(m!.content));
+};
+
+for (const engine of ["pi085", "pd"] as const) {
+  await check(`${engine}: a tool's question resumed by the model reaches the plugin with the contextId and no fromProgram; a dropped one's cancel too`, async () => {
+    const w = await world(engine);
+    try {
+      const direct = (await seeOnce(w, "d")).contextId;
+      await turn(w.r, "ask", [
+        call("c_ask", "probe__ask", {}),
+        (req) => call("c_res", "resume", { token: lastToolJson(req).token, answer: "yes" }),
+        say("done"),
+      ]);
+      const resumed = w.seen.find((x) => x.tool === "ask:resume");
+      must(resumed, `not resumed: ${show(w.seen.map((x) => x.tool))}`);
+      must(resumed!.caller.contextId === direct && !("fromProgram" in resumed!.caller), `resume caller: ${show(resumed!.caller)}`);
+      // A question nobody answers: its hold is dropped, and the plugin's cancel is told.
+      await turn(w.r, "ask again", [call("c_ask2", "probe__ask", {}), say("later")], "main", { leaveHeld: true });
+      must(w.r.rt.runJsContinuations.discardAll() === 1, "control: no question was held");
+      for (let i = 0; i < 100 && !w.seen.some((x) => x.tool === "ask:cancel"); i++) await sleep(5);
+      const cancelled = w.seen.find((x) => x.tool === "ask:cancel");
+      must(cancelled, `not cancelled: ${show(w.seen.map((x) => x.tool))}`);
+      must(cancelled!.caller.contextId === direct && !("fromProgram" in cancelled!.caller), `cancel caller: ${show(cancelled!.caller)}`);
+    } finally { w.host.dispose(); }
+  });
+
+  await check(`${engine}: a program's calls after \`await pause()\` is resumed still carry fromProgram: true and the contextId`, async () => {
+    const w = await world(engine);
+    try {
+      const direct = (await seeOnce(w, "d")).contextId;
+      const before = w.seen.length;
+      const source = "await tool`probe__see ${{}}`; const go = await pause('go on?'); await tool`probe__see ${{}}`; output(go);";
+      await turn(w.r, "program", [
+        call("c_js", "run_js", { source }),
+        (req) => call("c_res", "resume", { token: lastToolJson(req).token, answer: "yes" }),
+        say("done"),
+      ]);
+      const ran = w.seen.slice(before);
+      must(ran.length === 2, `the program's calls: ${show(ran)}`);
+      for (const x of ran) must(x.caller.fromProgram === true && x.caller.contextId === direct, `caller ${show(x.caller)}`);
+    } finally { w.host.dispose(); }
+  });
+}
+
+// ---- cost: one statement per call ---------------------------------------------------------------------------
+
+await check("contextIdOf runs one statement per call on either engine, never a sqlite_master probe, and an object with no tables reads as no id", async () => {
+  for (const engine of ["pi085", "pd"] as const) {
+    const w = await world(engine);
+    try {
+      await seeOnce(w, "a");
+      const statements: string[] = [];
+      const counting = { exec: (q: string, ...b: unknown[]) => { statements.push(q); return w.host.sql.exec(q, ...b); } };
+      const id = contextIdOf(counting, { tenantId: "t", agentId: "a", engine });
+      must(id && statements.length === 1 && !statements.some((q) => q.includes("sqlite_master")), `${engine}: ${statements.length} statements ${show(statements)}`);
+    } finally { w.host.dispose(); }
+  }
+  const empty = sqliteHost();
+  try {
+    for (const engine of ["pi085", "pd"] as const) {
+      must(contextIdOf(empty.sql, { tenantId: "t", agentId: "a", engine }) === undefined, `${engine}: an empty object has an id`);
+    }
+    let thrown = "";
+    try { contextIdOf({ exec: () => { throw new Error("disk I/O error"); } }, { tenantId: "t", agentId: "a", engine: "pd" }); } catch (e) { thrown = String(e); }
+    must(/disk I\/O/.test(thrown), "a failure other than a missing table was swallowed");
+  } finally { empty.dispose(); }
 });
 
 // ---- run_js on both executors, over the gateway with the production host's filter ------------------------------
