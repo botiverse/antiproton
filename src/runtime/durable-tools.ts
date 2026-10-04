@@ -38,11 +38,12 @@
  */
 import type { AgentHarnessTool } from "@earendil-works/pi-agent-core";
 import {
-  defineDoc, defineExtension,
+  defineDoc, defineExtension, GenerationTask, hook,
   type ConversationId, type Extension, type TaskId, type ToolExecutionApi, type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { ToolResultMessage } from "pi-ai-1";
+import { explainUnavailableResults, looksPdUnavailable } from "./unavailable-tool.ts";
 
 /** No bound of pi-durable's own: see "Output limits" above. */
 const UNBOUNDED = { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER } as const;
@@ -186,7 +187,39 @@ async function answerOf(api: ToolExecutionApi, context: Context): Promise<Client
   }
 }
 
-/** The extension a session's conversation selects: its tools, the caller's functions last (cf/src/runtime.ts `agent()`). */
-export function toolsExtension(name: string, tools: readonly AgentHarnessTool<undefined>[], clientTools: readonly ClientToolDef[] = []): Extension {
-  return defineExtension({ name, tools: [...tools.map((t) => durableTool(t)), ...clientTools.map((d) => clientTool(d))] });
+/**
+ * How a session explains a call to a tool it was not offered (src/runtime/unavailable-tool.ts): `explain` says
+ * why, and `confirm` says which of the candidate results — by tool call id, in the conversation — pi-durable
+ * recorded as its own `tool_unavailable` result (`PdHost.#unavailableResults`).
+ */
+export type UnavailableExplainer = {
+  explain(name: string): string;
+  confirm(conversationId: ConversationId, callIds: readonly string[]): ReadonlySet<string>;
+};
+
+/**
+ * The extension a session's conversation selects: its tools, the caller's functions last (cf/src/runtime.ts `agent()`),
+ * and, given `unavailable`, a `beforeRequest` hook that puts the explanation where pi-durable's unknown-tool result is.
+ * The hook's result is for that request only (pi-durable's `GenerationHooks`), so the stored entry stays pi-durable's.
+ */
+export function toolsExtension(
+  name: string, tools: readonly AgentHarnessTool<undefined>[], clientTools: readonly ClientToolDef[] = [], unavailable?: UnavailableExplainer,
+): Extension {
+  const registrations = [...tools.map((t) => durableTool(t)), ...clientTools.map((d) => clientTool(d))];
+  const current = new Set(registrations.map((t) => t.name));
+  return defineExtension({
+    name, tools: registrations,
+    ...(unavailable ? {
+      hooks: [hook(GenerationTask, {
+        beforeRequest: ({ messages }, api) => {
+          const candidates = messages.filter((m) => looksPdUnavailable(m, current)).map((m) => String((m as { toolCallId: unknown }).toolCallId));
+          if (candidates.length === 0) return undefined;
+          const confirmed = unavailable.confirm(api.conversationId, candidates);
+          const out = explainUnavailableResults(messages,
+            (m) => looksPdUnavailable(m, current) && confirmed.has(String((m as { toolCallId: unknown }).toolCallId)), unavailable.explain);
+          return out === messages ? undefined : { messages: out };
+        },
+      })],
+    } : {}),
+  });
 }

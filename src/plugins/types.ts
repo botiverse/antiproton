@@ -1780,6 +1780,22 @@ export interface Plugin {
   /** The tools every mount of this plugin offers; see `mountTools` for a plugin whose mounts differ. */
   tools: ToolSchema[];
   /**
+   * Tool names this plugin used to offer and no longer does: each old name to the name of the tool that took
+   * its place, or `null` when it was removed with nothing in its place.
+   *
+   * A model keeps calling a name it saw — an older turn, a note it wrote, a session opened before the change —
+   * and pi answers a name it does not know with its own fixed text ("Tool … is unavailable"), which reads as a
+   * passing fault: an agent retried a renamed tool three times on exactly that. The runtime replaces that
+   * text, before the next request, with what this table says (`explainUnavailableTool`,
+   * src/runtime/unavailable-tool.ts): renamed, and what to call instead; or removed. Without an entry the
+   * model is told only that the mount has no such tool.
+   *
+   * Names are the plugin's own (`ToolSchema.name`), not `<alias>__<tool>`. Every target is a name in `tools`,
+   * and no old name is a current one; a plugin's test should hold both, as test/unavailable-tool.ts does for
+   * raft. Static, like `tools`: a rename is a fact about the code, not about one mount.
+   */
+  retired?: Readonly<Record<string, string | null>>;
+  /**
    * The tools one mount offers, when they differ by mount; read through
    * {@link toolsOf}, never directly.
    *

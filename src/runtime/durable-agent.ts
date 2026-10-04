@@ -74,6 +74,7 @@ import { prefixedNamespace, SqlQualifier } from "../store/sql-namespace.ts";
 import { settle, type ExternalWaits, type SettleResult } from "./durable-drive.ts";
 import { ClientCallsDoc, toolsExtension, waitingCalls, type ClientToolDef } from "./durable-tools.ts";
 import { bridgeTools, type InterruptKeeping, type MountedTool, type ToolHost } from "./pi-tools.ts";
+import { isPdUnavailableEntry, pdUnavailableText } from "./unavailable-tool.ts";
 import { projectEntries } from "./pd-transcript.ts";
 import { type AgentEngine, type EngineEntry, type EngineEntryScan, type EngineStatus, type StepOutcome } from "./engine.ts";
 
@@ -249,11 +250,41 @@ export class PdHost {
    * (`DurableAgent.#conversation`). Installing again replaces the extension in place: the catalogue
    * moved, or the runtime rebuilt the agent.
    */
-  installTools(session: string, tools: Parameters<typeof toolsExtension>[1], clientTools: readonly ClientToolDef[] = []): string {
+  installTools(
+    session: string, tools: Parameters<typeof toolsExtension>[1], clientTools: readonly ClientToolDef[] = [],
+    explainUnavailable?: (name: string) => string,
+  ): string {
     const name = toolsExtensionName(session);
-    this.#registry.install(toolsExtension(name, tools, clientTools));
+    const unavailable = explainUnavailable
+      ? { explain: explainUnavailable, confirm: (id: ConversationId, callIds: readonly string[]) => this.#unavailableResults(id, callIds) }
+      : undefined;
+    this.#registry.install(toolsExtension(name, tools, clientTools, unavailable));
     this.#installed.add(session);
     return name;
+  }
+
+  /**
+   * Of these tool call ids, the ones whose results in the conversation are pi-durable's own `tool_unavailable`
+   * result (`isPdUnavailableEntry`, src/runtime/unavailable-tool.ts) — each entry with that id that carries
+   * pi-durable's text is one, so a real tool's result under a reused id is never taken for it. Read with a
+   * SELECT from the entries table, as `readPdRecords` reads it; asked only for a request that has a candidate.
+   */
+  #unavailableResults(conversationId: ConversationId, callIds: readonly string[]): ReadonlySet<string> {
+    const ids = [...new Set(callIds)];
+    const rows = this.#opts.storage.sql.exec(PD_NAMES.rewrite(
+      "SELECT record FROM entries WHERE conversation_id = ? AND json_extract(record, '$.kind') = 'pi.tool-result' " +
+      `AND json_extract(record, '$.model[0].toolCallId') IN (${ids.map(() => "?").join(", ")})`),
+    Number(conversationId), ...ids).toArray();
+    const verdict = new Map<string, boolean>();
+    for (const row of rows) {
+      const record = JSON.parse(String(row.record)) as { model?: Array<{ toolCallId?: unknown; toolName?: unknown; content?: unknown }> };
+      const m = record.model?.[0];
+      const id = String(m?.toolCallId);
+      const text = (m?.content as Array<{ text?: unknown }> | undefined)?.[0]?.text;
+      if (typeof m?.toolName !== "string" || text !== pdUnavailableText(m.toolName)) continue;
+      verdict.set(id, (verdict.get(id) ?? true) && isPdUnavailableEntry(record));
+    }
+    return new Set([...verdict].filter(([, ok]) => ok).map(([id]) => id));
   }
 
   extension(session: string) { return this.#registry.snapshot().extension(toolsExtensionName(session)); }
@@ -676,6 +707,8 @@ export interface DurableAgentOptions extends PdBinding {
   clientTools?: ClientToolDef[];
   /** What the model is shown where a turn was cancelled: the model message of the marker entry `cancel` writes. */
   cancelNote?: string;
+  /** PiAgent's option of the same name: the request says this where pi-durable's unknown-tool result is (`toolsExtension`). */
+  explainUnavailable?: (name: string) => string;
 }
 
 /** The extension holding a session's tools. */
@@ -734,7 +767,7 @@ export class DurableAgent implements AgentEngine {
       ...(opts.tools && opts.toolHost ? bridgeTools(opts.tools, opts.toolHost, opts.interrupts) : []),
       ...(opts.extraTools ?? []),
     ];
-    opts.host.installTools(opts.session ?? MAIN_SESSION, bridged, opts.clientTools ?? []);
+    opts.host.installTools(opts.session ?? MAIN_SESSION, bridged, opts.clientTools ?? [], opts.explainUnavailable);
     return new DurableAgent(opts);
   }
 

@@ -23,6 +23,7 @@ import type { AnsweredMessage } from "../model/pi-bridge.ts";
 import { ensureBackgroundTable } from "./background-jobs.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentHarness, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
+import { explainUnavailableResults, isPiUnavailableResult } from "./unavailable-tool.ts";
 import { LaneBusy } from "@earendil-works/pi-agent-core";
 import type { AgentHarness as Harness, AgentLane, OpenOperation } from "@earendil-works/pi-agent-core";
 import { StorageBackedSession } from "@earendil-works/pi-agent-core/harness/session";
@@ -172,6 +173,12 @@ export interface PiAgentOptions {
    *  list it is given, and a tool added later is a tool the reconcile
    *  removes on every reopen (2026-09-12: every agent lost run_js). */
   extraTools?: ReturnType<typeof bridgeTools>;
+  /**
+   * What to tell the model about a call to a tool it was not offered, in place of pi's own
+   * `Tool "…" is unavailable` (src/runtime/unavailable-tool.ts). Applied to each request as it goes
+   * out (`transform_context`); the transcript keeps pi's result as written. Absent: pi's text is sent.
+   */
+  explainUnavailable?: (name: string) => string;
   /** Wake whatever does the waiting. Failure here is not fatal: the job row is
    *  already durable, so a later pass can re-send it. */
   dispatch(jobId: string): Promise<void>;
@@ -269,6 +276,19 @@ export class PiAgent implements AgentEngine {
     // this hook before its model call, so declining here means none of them
     // writes an empty summary or dispatches a job.
     harness.hooks.on("before_compaction", () => ({ decline: true }));
+
+    // pi answers a call to a tool it does not have with its own line before any hook runs; the request
+    // that carries that result to the model says why instead (src/runtime/unavailable-tool.ts). The
+    // harness's tool list is fixed for its life (a new catalogue opens a new PiAgent), so it is the
+    // "offered now" the recogniser asks.
+    const explain = opts.explainUnavailable;
+    if (explain) {
+      const current = new Set(bridged.map((t) => t.name));
+      harness.hooks.on("transform_context", (event) => {
+        const messages = explainUnavailableResults(event.messages, (m) => isPiUnavailableResult(m, current), explain);
+        return messages === event.messages ? undefined : { messages: messages as typeof event.messages };
+      });
+    }
 
     const lane = await harness.lane(LANE, CTX);
     // pi keeps the names of the tools a session was configured with, and
