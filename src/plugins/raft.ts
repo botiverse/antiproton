@@ -375,12 +375,16 @@ function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
  * have landed (a repeat with the same key is still safe). A pull under cursor acknowledgement has nothing
  * to lose, since the batch it asked for is acknowledged only by the next pull.
  */
-function sdkFailure(out: RaftFailure, write = false): Error {
-  // The next action is the SDK's own sentence, so its command is rewritten wherever it stands; the message is left
-  // as it came (it may repeat what the caller asked for).
-  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${commandsAsTools(out.error.nextAction)}` : ""}`);
+function sdkFailure(out: RaftFailure, write = false, retry?: { tool: string; key: string }): Error {
   const unanswered = out.error.code === "TRANSPORT_ERROR" || out.error.code === "UNAVAILABLE" ||
     (out.error.status !== undefined && out.error.status >= 500);
+  // The next action is the SDK's own sentence, so its command is rewritten wherever it stands; the message is left
+  // as it came (it may repeat what the caller asked for). A keyed write that may have landed says the key it went
+  // out under (`retryKey`), so a retry is the same request and Raft answers the first one instead of acting twice.
+  const retried = write && unanswered && retry
+    ? ` It may still have gone through: to try again without doing it twice, call ${retry.tool} again with the same arguments and idempotencyKey ${JSON.stringify(retry.key)}.`
+    : "";
+  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${commandsAsTools(out.error.nextAction)}` : ""}${retried}`);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
   // follows `mayHaveLanded`, not the SDK's own retryable; whether the failure may clear is `transient`.
   const landed = write && unanswered;
@@ -763,6 +767,23 @@ async function continuesHeldSend(op: RaftOperationSpec, input: Record<string, un
   return held.some((c) => c.target === target && c.contentHash === hash);
 }
 
+/**
+ * The key a keyed write's failure tells the model to retry with: the key the request actually went out under. The
+ * SDK names it on a create's or a card's failure it says to retry (`next.kind: "retry_same_key"`). A send's or a
+ * reply's failure names no next step (0.9.0), so for those it is the key passed here, on a failure the SDK marks
+ * `retryable` — the same condition the SDK uses for the other two. A dedupe token, not a secret, whether the model's
+ * or the operation id. A held call's key is never shown: its question is answered, not retried. Unknown, and so not
+ * shown, when the SDK made the key for a send with no operation behind it.
+ */
+function retryKey(op: RaftOperationSpec, out: RaftFailure, sent: Record<string, unknown>): string | undefined {
+  if (op.idempotency.kind !== "key") return undefined;
+  const named = out.next?.kind === "retry_same_key" ? out.next.args?.idempotencyKey : undefined;
+  if (typeof named === "string" && named) return named;
+  const passed = sent[op.idempotency.arg];
+  // Trimmed, as the SDK trims it before sending.
+  return out.error.retryable && typeof passed === "string" && passed.trim() ? passed.trim() : undefined;
+}
+
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
 async function runOperation(
   op: RaftOperationSpec, args: unknown, ctx: PluginContext, seen?: { upToSeq: number },
@@ -779,7 +800,10 @@ async function runOperation(
   const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
   const keyed = await keyedInput(op, input, ctx, raft);
   const out = await raft.invoke(op.name, seen ? { ...keyed, seen } : keyed, caller);
-  if (!out.ok) throw sdkFailure(out as RaftFailure, op.sideEffect !== "read");
+  if (!out.ok) {
+    const key = retryKey(op, out as RaftFailure, keyed);
+    throw sdkFailure(out as RaftFailure, op.sideEffect !== "read", key ? { tool: op.toolName, key } : undefined);
+  }
   if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input);
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints
   // put in this mount's terms); `data` is the Server's projection and stays out, so a new server field cannot

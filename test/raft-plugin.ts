@@ -1861,7 +1861,15 @@ function keyedRaft() {
   const acted: Array<{ path: string; key: string }> = [];
   const keys: string[] = [];
   const first = new Map<string, { request: string; answer: unknown }>();
+  // `lose`: the request is served (it lands) and its answer is lost on the way back, as a dropped connection loses it.
+  const raft = { acted, keys, lose: false };
   globalThis.fetch = (async (url: any, init?: any) => {
+    const answered = await serve(url, init);
+    if (raft.lose) throw new Error("socket closed before the answer");
+    return answered;
+  }) as any;
+  return raft;
+  async function serve(url: any, init?: any) {
     const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
     const { idempotencyKey: key, seenUpToSeq: _s, seenExactSeqs: _e, ...request } = JSON.parse(String(init?.body ?? "{}"));
     keys.push(key);
@@ -1880,8 +1888,7 @@ function keyedRaft() {
     acted.push({ path, key });
     first.set(`${path}|${key}`, { request: JSON.stringify(request), answer });
     return json(200, answer);
-  }) as any;
-  return { acted, keys };
+  }
 }
 
 /** One call of each keyed tool, with the arguments a model would give it (no key). */
@@ -1976,6 +1983,57 @@ await check("a held send the model repeats with no key keeps the held send's key
   // Control: other content is another message, under its own operation's id.
   await raftPlugin.invoke("messages_send", { target: "#general", content: "something else" }, { ...inTurn(m.ctx), operationId: "op_other" });
   if (raft.keys.at(-1) !== "op_other" || landed() !== 2) throw new Error(`control: ${JSON.stringify(raft)}`);
+});
+
+/** The key an uncertain failure tells the model to retry with, or null when it names none. */
+const RETRY_WITH = /It may still have gone through: to try again without doing it twice, call (\w+) again with the same arguments and idempotencyKey "([^"]+)"\.$/;
+
+await check("a keyed write that landed but lost its answer names the key it went out under, and retrying with it lands once", async () => {
+  for (const [tool, args] of KEYED_CALLS) {
+    for (const [what, given] of [["no key of the model's", {}], ["the model's key", { idempotencyKey: "k-model-9" }]] as const) {
+      const raft = keyedRaft();
+      raft.lose = true;
+      const why = await failure(() => raftPlugin.invoke(tool, { ...args, ...given }, underOperation("op_lost")));
+      const named = why.message.match(RETRY_WITH);
+      const sentWith = raft.keys[0];
+      if (why.mayHaveLanded !== true || raft.acted.length !== 1 || !named || named[1] !== tool || named[2] !== sentWith) {
+        throw new Error(`${tool}, ${what}: sent with ${sentWith}, acted ${raft.acted.length}: ${why.message}`);
+      }
+      // The model retries as told, in a new call (a new operation): Raft answers the first request and acts nothing more.
+      raft.lose = false;
+      const out = await raftPlugin.invoke(tool, { ...args, idempotencyKey: named[2] }, underOperation("op_retry")) as any;
+      if (typeof out?.text !== "string" || raft.acted.length !== 1 || raft.keys.at(-1) !== sentWith) throw new Error(`${tool}, ${what}: retry ${JSON.stringify({ out, raft })}`);
+    }
+  }
+});
+
+await check("through the gateway, the model reads the retry key in the failure of a write that may have landed", async () => {
+  const g = await raftBehindGateway();
+  const raft = keyedRaft();
+  raft.lose = true;
+  const out: any = await g.gateway.invoke({ ...g.ctx, contextId: "ctx_turn" } as any, "inbox.tasks_create", { target: "#general", tasks: [{ title: "rotate keys" }] });
+  const named = String(out.error?.message ?? "").match(RETRY_WITH);
+  if (out.status !== "unknown" || !named || named[2] !== raft.keys[0] || named[2] !== out.operationId) throw new Error(JSON.stringify({ out, keys: raft.keys }));
+});
+
+await check("a keyed write's failure that is not a retry with the same key names no key", async () => {
+  for (const [tool, args] of KEYED_CALLS) {
+    for (const [what, answer] of [
+      ["a refusal", json(403, { error: "forbidden" })],
+      ["a key reused for another request", json(409, { error: "used", code: "idempotency_key_reused" })],
+      ["a bad request", json(400, { error: "bad" })],
+    ] as const) {
+      one(answer.clone());
+      const why = await failure(() => raftPlugin.invoke(tool, args, underOperation("op_refused")));
+      if (why.mayHaveLanded === true || /idempotencyKey|op_refused/.test(why.message)) throw new Error(`${tool}, ${what}: ${why.message}`);
+    }
+    // And a send with no operation and no key of the model's, whose key the SDK made: unknown here, so not named.
+    if (tool === "messages_send") {
+      globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
+      const why = await failure(() => raftPlugin.invoke(tool, args, inTurn(mount().ctx)));
+      if (why.mayHaveLanded !== true || RETRY_WITH.test(why.message)) throw new Error(`SDK-made key: ${why.message}`);
+    }
+  }
 });
 
 globalThis.fetch = originalFetch;
