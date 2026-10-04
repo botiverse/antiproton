@@ -755,6 +755,12 @@ does need one; see the GitHub example below.
    them to the service's own API with the mount's credential.
 3. **The service posts to the URL.** The runtime looks up the agent, and an
    unknown or revoked hook gets the same 404. The body may be at most 1 MB.
+   The worker keeps a hook's route for up to 5 minutes (`HOOK_ROUTE_TTL_MS`,
+   `cf/src/hook-route.ts`), so a push to a known hook does not wait on the
+   control plane. Revoking still takes effect at once: revoke drops the hook's
+   secret from the agent, and a routed push to a hook with no secret is checked
+   against the index again before it is answered. Only a revoke whose secret
+   drop failed leaves the route usable, for at most those 5 minutes.
 4. **The mount is checked the way a tool call is.** It must exist, its plugin
    must implement `receive`, the plugin must be switched on for this agent,
    and the mount's version must match. If any check fails, the event is
@@ -762,16 +768,21 @@ does need one; see the GitHub example below.
    the switch is the control for pushed events.
 5. **The runtime calls `receive`.**
 6. **The runtime acts on the answer:**
-   - it drops a delivery whose `dedupeKey` it has delivered in the last
-     24 hours;
-   - it drops deliveries past 30 a minute per hook;
-   - otherwise it posts `text` (cut at 4,000 characters) into the agent's
-     conversation, labelled as written outside the conversation and not by
-     the user.
+   - it drops a delivery whose `dedupeKey` it has accepted before: one still
+     queued, or one delivered or given up in the last 24 hours;
+   - it drops deliveries past 30 a minute per hook, counting queued ones;
+   - otherwise it queues `text` (cut at 4,000 characters) for the agent,
+     labelled as written outside the conversation and not by the user.
 
-   It answers the service as soon as the message is posted. The model runs
-   afterwards: an idle agent starts a turn, and a busy one takes the message
-   into the turn it is already running.
+   It answers the service as soon as the event is queued. The agent's next
+   alarm pass, armed before the answer leaves, posts queued events in the
+   order they arrived: an idle agent starts a turn, and a busy one takes the
+   message into the turn it is already running. The queue is in the agent's
+   own storage, so an eviction between the answer and the post loses nothing.
+   A post that fails is retried 5 times over about half an hour, then recorded
+   as `failed` with the reason. An event is never posted twice: if a pass ends
+   while handing an event over, it cannot tell whether the event arrived, and
+   records it as `failed` rather than posting it again.
 
 ### Hooks the plugin makes itself
 
@@ -875,17 +886,22 @@ direction that keeps traffic flowing:
 ### Outcomes
 
 Every event leaves a row in the agent's event record (kept 7 days) with its
-outcome and reason. The service only sees the status code:
+outcome and reason. The service only sees the status code and, in the body,
+`{"outcome": …}`. A queued event is answered `delivered`: the record shows it
+as `accepted` until it is posted, then as `delivered`, or as `failed` if it
+was given up.
 
 | Outcome | Status | When |
 |---|---|---|
-| delivered | 202 | posted to the agent |
+| delivered | 202 | queued for the agent (answered), posted to it (recorded) |
+| accepted | — | in the record only: queued, not yet posted |
 | ignored | 202 | `deliver: false` without `rejected`, or the mount check failed |
-| duplicate | 202 | same `dedupeKey` delivered in the last 24 hours |
+| duplicate | 202 | same `dedupeKey` accepted before (queued, or within 24 hours) |
 | rejected | 401 | `deliver: false, rejected: true` |
+| malformed | 400 | `deliver: false, malformed: true` |
 | too_large | 413 | body over 1 MB |
 | rate_limited | 429 | over 30 deliveries a minute for this hook |
-| failed | 503 | `receive` threw, or the hook has no secret |
+| failed | 503 | `receive` threw, or the hook has no secret; in the record also an accepted event that was given up (the service was already answered 202) |
 
 When an expected event never arrived, read the record with
 `GET /admin/hooks?tenantId=…&agentId=…`, which lists the agent's hooks and
@@ -916,7 +932,9 @@ revokes a hook.
 - **Make no network calls.** Services wait only a few seconds for an answer
   (ten for GitHub).
 
-The runtime side is held by `test/inbound.ts` and `test/inbound-gateway.ts`.
+The runtime side is held by `test/inbound.ts` and `test/inbound-gateway.ts`;
+the route, the queue and the alarm pass, through the worker and the whole
+object, by `test/hook-fast-ack.ts`.
 
 ### Example: GitHub
 

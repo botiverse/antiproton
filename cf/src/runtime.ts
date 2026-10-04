@@ -60,8 +60,9 @@ import { assertMountConfig, configFromForm, validateMount } from "../../src/runt
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
-  ensureInboundTable, hookSecretName, inboundMessage, newHookId, newHookSecret, recentInbound, recordInbound, seenBefore, underRate,
-  INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, type InboundOutcome,
+  acceptInbound, claimPendingInbound, ensureInboundTable, hookSecretName, inboundMessage, markPostingInbound, newHookId, newHookSecret,
+  nextPendingInbound, pendingInboundCount, recentInbound, recordInbound, requeueInbound, seenBefore, settleInbound, underRate,
+  INBOUND_MAX_BYTES, INBOUND_PER_MINUTE, INBOUND_POST_ATTEMPTS, type InboundOutcome, type PendingInbound,
 } from "../../src/runtime/inbound.ts";
 import type { InboundEvent, InboundHooks } from "../../src/plugins/types.ts";
 import { INBOUND_HOOKS_PER_MOUNT } from "../../src/plugins/types.ts";
@@ -183,6 +184,20 @@ import type { ModelResponse } from "../../src/model/types.ts";
  *  back into this object. `js.execute` needs the sandbox host, `tool.call` is
  *  short, and neither answers under the `:response` dedup key. */
 const OFFLOADABLE = ["model.request"];
+
+/** What one pass over the queued pushes did (`AgentRuntime.deliverPendingInbound`). */
+export interface InboundPass {
+  posted: number;
+  /** Rows settled as failed: given up after `INBOUND_POST_ATTEMPTS`, or found interrupted mid-post. */
+  failed: number;
+  /** Rows still queued when the pass ended. */
+  left: number;
+  /** When to come back for a row that could not be posted yet; null when none is waiting on a retry. */
+  retryInMs: number | null;
+  /** The longest any posted row waited between its answer and its post. */
+  waitedMs: number | null;
+  error: string | null;
+}
 
 export interface ModelJob {
   tenantId: string;
@@ -887,13 +902,21 @@ export class AgentRuntime {
   }
 
   /**
-   * One pushed event. Answered as soon as the message is posted: the model
-   * runs afterwards, on the object's own time, because the service wants its
-   * answer within seconds (GitHub: 10 s). Every event leaves a row, delivered
-   * or not, so an operator can see what arrived and why it went nowhere.
+   * One pushed event. Answered as soon as it is verified, deduplicated,
+   * rate-checked and queued (`inbound_pending`): the message is posted by the
+   * next alarm pass (`deliverPendingInbound`), because opening the harness and
+   * posting cost the waiting service most of a second, and the service wants
+   * its answer promptly (GitHub: 10 s). Every event leaves a row, delivered or
+   * not, so an operator can see what arrived and why it went nowhere.
+   *
+   * `routed: "cache"` says the worker found this hook in its route cache rather
+   * than the index. A hook with no secret is then answered `unrouted`, with
+   * nothing recorded, so the worker asks the index before answering: a revoked
+   * hook (whose secret revoke drops) still reads as unknown, as it did before
+   * the cache, and a live one with no secret is delivered again and recorded.
    */
   async receiveHook(tenantId: string, agentId: string, alias: string, hookId: string,
-    event: Omit<InboundEvent, "hookId"> | null): Promise<{ outcome: InboundOutcome }> {
+    event: Omit<InboundEvent, "hookId"> | null, routed: "cache" | "index" = "index"): Promise<{ outcome: InboundOutcome; unrouted?: true }> {
     await this.ready();
     const sql = this.#deps.ctx.storage.sql;
     ensureInboundTable(sql);
@@ -904,6 +927,7 @@ export class AgentRuntime {
     };
     if (!event) return done("too_large", `the body passed ${INBOUND_MAX_BYTES} bytes`);
     const secret = await this.#secrets.resolve(agentRef(hookSecretName(hookId)), { tenantId, agentId });
+    if (!secret && routed === "cache") return { outcome: "failed", unrouted: true };
     if (!secret) return done("failed", "this hook has no secret in the agent's store");
     let answer;
     try {
@@ -922,9 +946,76 @@ export class AgentRuntime {
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
-    // The re-take in the background: the service's request is waiting on this answer (`postMessage`).
-    await this.postMessage(tenantId, agentId, inboundMessage(alias, String(result.text)), "prompt", MAIN_SESSION, { retake: "background" });
-    return done("delivered", null, key);
+    // The claim on the key: in the same synchronous run as the two checks above, with no await between,
+    // so a second push with this key that is already past its own await finds this row (`acceptInbound`).
+    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now });
+    // The answer the service has always had for a push the agent will be given.
+    return { outcome: "delivered" };
+  }
+
+  #inboundPass: Promise<InboundPass> | null = null;
+
+  /**
+   * Hand queued pushes to the agent, oldest first, each as `postMessage(..., "prompt")`, which joins a running
+   * turn as a steer and starts one otherwise. One pass at a time: a second caller joins the running one, so
+   * two passes never post the same row.
+   *
+   * Never twice. A row is marked `posting` synchronously before the engine's write, with the harness already
+   * open, and settled as `delivered` once the post returns. A pass that dies before the mark leaves the row
+   * queued, claimed, and it is tried again after its wait; one that dies after it cannot tell whether the
+   * message landed, so the row is settled as `failed`, saying so, rather than posted a second time. A post
+   * that throws wrote nothing and is retried on its own row (`INBOUND_RETRY_MS`); its last failure settles it
+   * as `failed` with the reason. A row waiting for its retry holds back the rows behind it, keeping the order,
+   * and the pass says when to come back.
+   */
+  deliverPendingInbound(tenantId: string, agentId: string): Promise<InboundPass> {
+    if (this.#inboundPass) return this.#inboundPass;
+    const pass = this.#deliverInbound(tenantId, agentId).finally(() => { this.#inboundPass = null; });
+    this.#inboundPass = pass;
+    return pass;
+  }
+
+  async #deliverInbound(tenantId: string, agentId: string): Promise<InboundPass> {
+    await this.ready();
+    const sql = this.#deps.ctx.storage.sql;
+    ensureInboundTable(sql);
+    const storage = this.#deps.ctx.storage;
+    const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
+    const settle = (row: PendingInbound, outcome: "delivered" | "failed", reason?: string) =>
+      settleInbound(sql, transact, { ...row, tenantId, agentId, outcome, reason });
+    const out: InboundPass = { posted: 0, failed: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
+    for (;;) {
+      const head = nextPendingInbound(sql);
+      if (!head) break;
+      if (head.state === "posting") {
+        settle(head, "failed", "the pass handing it to the agent ended mid-way, so it may or may not have arrived; not posted again, so it cannot arrive twice");
+        out.failed++;
+        continue;
+      }
+      const now = Date.now();
+      if (head.nextAt > now) { out.retryInMs = head.nextAt - now; break; }
+      const row = claimPendingInbound(sql, head, now);
+      try {
+        await this.postMessage(tenantId, agentId, row.message, "prompt", MAIN_SESSION,
+          { retake: "background", beforeSay: () => markPostingInbound(sql, row.seq) });
+      } catch (e: any) {
+        const error = String(e?.message ?? e).slice(0, 300);
+        out.error = error;
+        if (row.attempts >= INBOUND_POST_ATTEMPTS) {
+          settle(row, "failed", `accepted, then not posted after ${row.attempts} attempts: ${error}`);
+          out.failed++;
+          continue;
+        }
+        requeueInbound(sql, row.seq, error);
+        out.retryInMs = Math.max(0, row.nextAt - Date.now());
+        break;
+      }
+      settle(row, "delivered");
+      out.posted++;
+      out.waitedMs = Math.max(out.waitedMs ?? 0, Date.now() - row.receivedAt);
+    }
+    out.left = pendingInboundCount(sql);
+    return out;
   }
 
   /** What arrived at this agent's hooks lately, newest first. No bodies are kept. */
@@ -2310,7 +2401,7 @@ export class AgentRuntime {
     tenantId: string, agentId: string, text: string,
     mode: "prompt" | "steer" | "followUp" = "prompt",
     session: string = MAIN_SESSION,
-    opts: { retake?: "await" | "background" } = {},
+    opts: { retake?: "await" | "background"; beforeSay?: () => void } = {},
   ) {
     // A new turn, so a tool list taken under another basis is taken again first (`retakeStaleSnapshots`), before the
     // harness is judged: a re-taken list changes the snapshot's hash, which is in `catalogueKey`, so the turn is built
@@ -2333,6 +2424,9 @@ export class AgentRuntime {
     // otherwise, so the next wake steps it. pd keeps no such list: its harness
     // holds the input, and a step drives every conversation (`step` below).
     if (!this.#isPd()) markSession(this.#deps.ctx.storage.sql, session, true);
+    // Synchronously before the engine's write, with the harness already open: what a caller retires here
+    // (`deliverPendingInbound`'s queued row) is gone exactly when the message is about to be written.
+    opts.beforeSay?.();
     const res: any = await agent.say(text, mode);
     return { ...messageLanded(res, mode), result: res };
   }
