@@ -1295,6 +1295,9 @@ export class ToolGateway {
     try {
       const listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential));
       snapshot = await admitTools(listed, Date.now());
+      // Taken for a plugin that wants an account while the mount has none: marked, so a later failure to list under
+      // a real credential does not keep it as that credential's list (`ToolSnapshot.withoutCredential`).
+      if (plugin.credential && !credential) snapshot.withoutCredential = true;
     } catch (e) {
       return { ok: false, error: `could not list ${alias}'s tools: ${String((e as Error)?.message ?? e).slice(0, 300)}` };
     }
@@ -1307,7 +1310,7 @@ export class ToolGateway {
     if (!now || now.installationId !== mount.installationId) {
       return { ok: false, stale: true, error: `${alias} was removed or replaced while its tools were being listed; nothing was kept` };
     }
-    const changed = now.toolSnapshot?.hash !== snapshot.hash;
+    const changed = now.toolSnapshot?.hash !== snapshot.hash || !!now.toolSnapshot?.withoutCredential !== !!snapshot.withoutCredential;
     // A write that fails is a failed snapshot, answered like one: the mount and
     // whatever list it had stay as they were, and the operator reads why.
     if (changed) {

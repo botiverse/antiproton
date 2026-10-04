@@ -1,24 +1,29 @@
 /**
  * Raft messaging for an agent running inside Antiproton.
  *
- * The QuickJS program sees structured tools. The Raft credential stays
- * in the host plugin and is attached only to the operator-configured Raft
- * origin. Responses are projected so a new server field cannot silently enter
- * the model's context.
+ * The tools are generated from the SDK's operation manifest (`RAFT_OPERATIONS`): one tool per operation,
+ * named by its `toolName`, described and typed by the manifest, and run through `raft.invoke`. What is
+ * written by hand here is what the manifest cannot say: which operations a hosted agent is not offered
+ * (`EXCLUDED`), how a paged result is kept under the parking line (`pagingCap`), which caller counts as
+ * the model (`originOf`), the question a held call asks, and the inbox pull and push tools, which are this
+ * runtime's plumbing rather than Raft operations. The Raft credential stays in the host plugin and is
+ * attached only to the operator-configured Raft origin.
  */
 import { clip, logEvent, routeOf } from "../core/log.ts";
-import type { Json } from "../core/types.ts";
-import { createRaft, isInterrupted, RAFT_STATE_SCHEMA, type Raft, type RaftMessage, type RaftState, type RaftStateStore, type RaftFailure } from "@botiverse/raft-sdk";
-import { interrupt, originProblem, type ActivityEvent, type InboundEvent, type InboundResult, type Interrupt, type Plugin, type PluginContext, type PluginErrorFields } from "./types.ts";
+import type { Json, MountRecord } from "../core/types.ts";
+import {
+  createRaft, isInterrupted, RAFT_OPERATIONS, RAFT_STATE_SCHEMA,
+  type Raft, type RaftInboxBatch, type RaftInterrupt, type RaftMessage, type RaftOperationSpec, type RaftState, type RaftStateStore, type RaftFailure,
+} from "@botiverse/raft-sdk";
+import { PARK_BYTES } from "./artifacts.ts";
+import {
+  interrupt, originProblem,
+  type ActivityEvent, type InboundEvent, type InboundResult, type Interrupt, type ListedTools, type Plugin, type PluginContext,
+  type PluginErrorFields, type ToolSchema,
+} from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_EVENTS = 200;
-/** The SDK's own page size, named here so the tool's description cannot disagree with it. */
-const DEFAULT_CHANNEL_PAGE = 50;
-const MAX_CHANNELS = 200;
-const MAX_HISTORY = 200;
-/** The Server's own cap: a larger limit is clamped there, and the result text then says so in CLI terms. */
-const MAX_SEARCH = 50;
 /**
  * Raft's push is a NOTICE that the inbox changed — the same "Inbox update" text
  * Raft's daemon injects into a managed agent — never the messages (tygg,
@@ -334,12 +339,10 @@ function stateStore(ctx: PluginContext): RaftStateStore {
 /**
  * A Raft SDK client for this mount: its origin, its credential, its timeout, and its saved state.
  *
- * `{ state: false }` gives a client whose state lives only for the call and is never saved. read_messages uses
- * it, because the SDK's `messages.read` advances the seen frontier that a send attests, and whether the model
- * read a history page closely enough to answer the read-before-send question is not something a page having
- * been fetched can say (docs/ax-design.md §3). What does attest is the hold's own question. This covers only the
- * frontier this mount keeps: the Server marks a history read as read on its side whatever the client keeps,
- * unless the read says `consume: false`, which read_messages does for every call but the model's own in its turn.
+ * `{ state: false }` gives a client whose state lives only for the call and is never saved: the snapshot's
+ * `identity.whoami` uses it, having nothing to record, and so does a history read, which must not count as seen
+ * (`runOperation` says why). Every other operation runs on the saved state, because what the model has seen is
+ * booked there per context (`originOf`) — by receive_events and by a held call's question — and a send attests it.
  */
 function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
   return createRaft({
@@ -373,7 +376,9 @@ function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
  * to lose, since the batch it asked for is acknowledged only by the next pull.
  */
 function sdkFailure(out: RaftFailure, write = false): Error {
-  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${out.error.nextAction}` : ""}`);
+  // The next action is the SDK's own sentence, so its command is rewritten wherever it stands; the message is left
+  // as it came (it may repeat what the caller asked for).
+  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${commandsAsTools(out.error.nextAction)}` : ""}`);
   const unanswered = out.error.code === "TRANSPORT_ERROR" || out.error.code === "UNAVAILABLE" ||
     (out.error.status !== undefined && out.error.status >= 500);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
@@ -406,25 +411,6 @@ function modelLine(m: RaftMessage): string {
   return line;
 }
 
-/**
- * Search results as the model reads them: the SDK's text, which is the CLI's, with the CLI's flags in its first
- * line said as this tool's parameters. That line's count says how to page and how to narrow, as `--offset`,
- * `--before`, `--limit` and the like, which a model would go looking for as a command. Only the part after the
- * quoted query is rewritten: the query is the model's own text, and the previews below are other people's.
- */
-function searchText(text: string, query: string): string {
-  const [head = "", ...rest] = text.split("\n");
-  const prefix = head.startsWith("No search results. (") ? "No search results. ("
-    : query ? `Search results for: ${JSON.stringify(query)} (` : "Filtered message results (";
-  // `JSON.stringify` matches the CLI's quoting only for a query with no quote or backslash in it; for any other,
-  // the head is left alone rather than rewritten from a guessed position.
-  if (!head.startsWith(prefix)) return text;
-  const tail = head.slice(prefix.length)
-    .replace(/page with --(offset|before) /g, "call search_messages again with $1 ")
-    .replace(/--(limit|sender|target|after|before|offset)\b/g, "$1");
-  return [prefix + tail, ...rest].join("\n");
-}
-
 function integer(value: unknown, name: string, min: number, max: number): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
@@ -433,24 +419,391 @@ function integer(value: unknown, name: string, min: number, max: number): number
   return value;
 }
 
+/**
+ * The manifest's operations a hosted agent is not offered, each with its reason. One table, so a reviewer
+ * reads every exclusion and its reason in one place; every other operation becomes a tool. `test/raft-plugin.ts`
+ * holds both directions — every manifest operation is generated or listed here, and every entry here names a
+ * real operation — so an operation a new SDK adds turns that test red until someone decides which side it
+ * belongs on.
+ *
+ * The manifest carries no channel or server administration (creating, updating or archiving a channel, adding
+ * or removing its members, updating the server): those are Agent API routes reachable only through the SDK's
+ * raw `routes`, which nothing here calls. A hosted agent proposes them with `actions_prepare`, for a person to
+ * confirm.
+ */
+export const EXCLUDED: Readonly<Record<string, string>> = {
+  "inbox.check": "the inbox is read with receive_events, which commits the batch it handed over and pulls the next in one call; a second reader would move the same cursor",
+  "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
+  "inbox.commit": "receive_events commits on its next call; a separate commit could acknowledge a batch before the model has read it",
+  "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
+  "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
+  "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
+};
+
+/** The operations this plugin offers as tools: the manifest, less `EXCLUDED`, in the manifest's order. */
+export const GENERATED: readonly RaftOperationSpec[] = RAFT_OPERATIONS.filter((op) => !Object.hasOwn(EXCLUDED, op.name));
 
 /**
- * One send, and what to do when the Server holds it: the conversation has messages this agent has not
- * seen. A held send is a question for the model — these arrived; send anyway, or drop? — so it comes
- * back as an `Interrupt` carrying the held messages, and the plugin's `interrupts.resume` takes the answer.
- *
- * The held messages are in the question, so the model sees them now: that is recorded before asking, so
- * the answer "send" (or the model sending the same message again itself, with the same key) attests them
- * instead of being held again. The SDK records nothing when the context was withheld, and then a send is
- * held again with the same count; that is the SDK's rule, not something this can attest for the model.
- *
- * The state is the send itself: target, content, the interrupt's `resume.idempotencyKey` (the original key),
- * and the `seen` boundary when the question showed every new message. Plain data, nothing a credential. It is
- * the shape 0.3.2's continuation produced (`{ target, content, idempotencyKey, seen? }`), so a send held before
- * an upgrade resumes the same way: going ahead is `messages.send` again with the original input under the same
- * key. Of the interrupt only `resume.idempotencyKey` and the hold's facts are used; its argv is not.
+ * The parking line, in rows. A result longer than `PARK_BYTES` (src/plugins/artifacts.ts, which the runtime's
+ * `offloadLimit` reads) is parked and the model is handed a preview. A page of `PAGE_ROWS` rows stays under it
+ * when a row takes `ROW_CHARS` characters of the result — one message line with its header and a few
+ * sentences. A bound on rows, not characters: one long message still parks, and nothing here can prevent that
+ * short of cutting the message.
  */
-async function sendMessage(
+const ROW_CHARS = 400;
+export const PAGE_ROWS = Math.floor(PARK_BYTES / ROW_CHARS);
+
+/**
+ * The argument that sets how much an operation returns, when the manifest says its result may be large: only
+ * `limit`. The other arguments in `output.boundBy` (a cursor, an offset, a view, a status filter) say where a
+ * page starts or what it shows, not how long it is, so an operation bounded only by those is not capped here.
+ */
+export function pagingArg(op: RaftOperationSpec): "limit" | null {
+  return op.output.mayBeLarge && op.output.boundBy.includes("limit") && op.inputSchema.properties?.limit ? "limit" : null;
+}
+
+const TOOL_NAME = new Map(RAFT_OPERATIONS.map((op) => [op.name, op.toolName]));
+const IDEMPOTENCY = { natural: "native", key: "key", none: "none" } as const;
+
+/** The answer that goes ahead with a held call: a message is sent; a task write proceeds. */
+function goAhead(op: RaftOperationSpec): "send" | "proceed" {
+  return op.name.startsWith("messages.") ? "send" : "proceed";
+}
+
+/**
+ * What this plugin refuses of an operation's arguments before any request, and the sentence its tool's
+ * description gains so the model knows before calling. The manifest's schema stays as it is; this narrows it.
+ */
+const ARGUMENT_CHECKS: Readonly<Record<string, { check(input: Record<string, unknown>): string | null; described: string }>> = {
+  // The three cards a model may prepare. The integration cards take ids a model has no way to know, and are made
+  // by Raft's own integration commands.
+  "actions.prepare": {
+    check: (input) => {
+      const type = (input.action as { type?: unknown } | undefined)?.type;
+      return type === "channel:create" || type === "channel:add_member" || type === "agent:create" ? null
+        : "action.type must be channel:create, channel:add_member or agent:create: the integration cards take ids you have no way to know, and are made by Raft's own integration commands";
+    },
+    described: " Only channel:create, channel:add_member and agent:create cards can be prepared here: the integration cards take ids you have no way to know, and are made by Raft's own integration commands.",
+  },
+};
+
+/**
+ * One manifest operation as a tool. The description is the manifest's, with an operation named by its dotted
+ * name (`tasks.unassign`) written as the tool name the model is offered (`tasks_unassign`), and, for an
+ * operation that may be held, the answers the question takes here. The parameters are the manifest's, with the
+ * paging argument capped (`pagingArg`). `sideEffect` decides the mount's policy half (an unknown value is a
+ * write); `modelOnly` is carried, so the gateway refuses it from a program as a second layer over the SDK's own
+ * MODEL_ONLY refusal; idempotency is the manifest's, `natural` being what this runtime calls `native`.
+ */
+export function toolOf(op: RaftOperationSpec): ToolSchema {
+  const parameters = structuredClone(op.inputSchema) as Record<string, any>;
+  const paging = pagingArg(op);
+  if (paging) {
+    const p = parameters.properties[paging];
+    p.maximum = Math.min(typeof p.maximum === "number" ? p.maximum : PAGE_ROWS, PAGE_ROWS);
+    p.description = `${p.description ? `${p.description} ` : ""}At most ${PAGE_ROWS} on this mount, and ${PAGE_ROWS} when omitted, so a page fits in the conversation.`;
+  }
+  const described = op.description.replace(/\b[a-z]+\.[a-z][A-Za-z]*\b/g, (name) => TOOL_NAME.get(name) ?? name);
+  const held = op.mayInterrupt
+    ? ` Held here, the call comes back as a question with those messages: answer "${goAhead(op)}" to go ahead as written, or "drop" to do nothing.`
+    : "";
+  return {
+    name: op.toolName,
+    summary: described + (ARGUMENT_CHECKS[op.name]?.described ?? "") + held,
+    parameters: parameters as Json,
+    sideEffects: op.sideEffect === "read" ? "read" : "write",
+    idempotency: IDEMPOTENCY[op.idempotency.kind] ?? "none",
+    ...(op.modelOnly ? { modelOnly: true as const } : {}),
+  };
+}
+
+const GENERATED_TOOLS: readonly ToolSchema[] = GENERATED.map(toolOf);
+const OPERATION_OF = new Map(GENERATED.map((op) => [op.toolName, op]));
+
+/**
+ * The caller as the SDK's `invoke` takes it. A call is the model's own only when it is made in the model's turn
+ * and not by a program: no `caller.fromProgram`, and a `caller.contextId`, which only a call in a session's turn
+ * carries. Every other call is "code": a run_js program, an approved call's replay (run with nobody reading the
+ * result), provisioning, a bench shell. Under "code" the SDK refuses a model-only operation with MODEL_ONLY
+ * before any request, and reads history with `consume: false`, recording nothing as seen. That is all "code"
+ * changes in the SDK (0.8.0's `invoke`): a send, a claim or a task write runs the same under either, attesting
+ * what was seen in the context it names. The context id goes along whatever the origin, so what a program sends
+ * is attested by what its model read in that context.
+ */
+export function originOf(ctx: PluginContext): { origin: "model" | "code"; contextId?: string } {
+  const contextId = ctx.caller.contextId;
+  const byModel = ctx.caller.fromProgram !== true && typeof contextId === "string";
+  return { origin: byModel ? "model" : "code", ...(typeof contextId === "string" ? { contextId } : {}) };
+}
+
+/**
+ * The arguments a caller may give an operation: what its manifest schema advertises, and nothing else. The SDK
+ * also accepts arguments it does not advertise — a send's `seen` overrides what the send attests, which is the
+ * hold's whole question — so one of those from a caller is dropped here, and only a resume this plugin made
+ * itself passes `seen`. The paging argument gets its cap and its default (`pagingArg`).
+ */
+function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unknown> {
+  if (args !== undefined && args !== null && (typeof args !== "object" || Array.isArray(args))) {
+    throw new Error(`${op.toolName} takes an object of arguments`);
+  }
+  const advertised = op.inputSchema.properties ?? {};
+  const input = Object.fromEntries(Object.entries(args ?? {}).filter(([name]) => Object.hasOwn(advertised, name)));
+  const refused = ARGUMENT_CHECKS[op.name]?.check(input);
+  if (refused) throw new Error(refused);
+  const paging = pagingArg(op);
+  if (paging) {
+    const value = input[paging];
+    if (value === undefined) input[paging] = PAGE_ROWS;
+    else if (typeof value === "number" && value > PAGE_ROWS) {
+      throw new Error(`${paging} is at most ${PAGE_ROWS} on this mount, so a page fits in the conversation; read further with the next page`);
+    }
+  }
+  return input;
+}
+
+/**
+ * The CLI commands the SDK's text names, in this mount's terms. The SDK's text is the CLI's output, so its hints say
+ * `raft message read --target "#ops" --before 41`, a command this mount does not have; a model would go looking for
+ * it. Each `raft <noun> <verb> …` is rewritten here, in one place, as the tool call it stands for
+ * (`messages_read({ target: "#ops", before: 41 })`), or in neutral words where no tool does it. A stopgap: once the
+ * SDK's `invoke` can write its hints as tool calls itself, `toolTerms` and `CLI_COMMANDS` are deleted together.
+ *
+ * Applied only where the SDK wrote the hint itself: a failure's next action, and the lines of an outcome's text that
+ * are hint lines (`SDK_HINT_LINES`). What a person wrote is never rewritten (`toolTerms`).
+ */
+export const CLI_COMMANDS: Readonly<Record<string, { op?: string; tool?: string; positional?: string; flags?: Record<string, string | [string, Json]>; say?: string }>> = {
+  "message read": { op: "messages.read", flags: { target: "target", after: "after", before: "before", around: "around", limit: "limit" } },
+  "message send": { op: "messages.send", flags: { target: "target", "attachment-id": "attachmentIds" } },
+  "message check": { tool: "receive_events" },
+  "inbox check": { op: "inbox.list", flags: { view: "view", before: "before", limit: "limit" } },
+  "server info": { op: "server.info", flags: { channels: ["view", "channels"], agents: ["view", "agents"], humans: ["view", "humans"], full: ["view", "full"], offset: "offset", limit: "limit", joined: ["joined", true] } },
+  "server update": { say: "a server setting a person with a server role changes" },
+  "user info": { op: "users.info", positional: "name", flags: { offset: "offset", limit: "limit" } },
+  "channel info": { op: "channels.info", positional: "target" },
+  "channel members": { op: "channels.members", positional: "target" },
+  "channel join": { op: "channels.join", positional: "target" },
+  "channel leave": { op: "channels.leave", positional: "target" },
+  "channel mute": { op: "channels.mute", positional: "target" },
+  "channel unmute": { op: "channels.unmute", positional: "target" },
+  "channel create": { say: "an action card for a person to confirm (actions_prepare)" },
+  "thread unfollow": { op: "threads.unfollow", positional: "target" },
+  "task claim": { op: "tasks.claim", flags: { target: "target", number: "taskNumbers" } },
+  "task show": { op: "tasks.show", flags: { target: "target", number: "taskNumber" } },
+  "task list": { op: "tasks.list", flags: { target: "target", status: "status" } },
+  "task update": { op: "tasks.updateStatus", flags: { target: "target", number: "taskNumber", status: "status" } },
+  "task unassign": { op: "tasks.unassign", flags: { target: "target", number: "taskNumber" } },
+  "mention pending": { op: "mentions.pending" },
+  "mention notify": { say: "delivering the mention, which this mount does not offer" },
+  "mention add": { say: "delivering the mention, which this mount does not offer" },
+  "manual get": { op: "manual.get", positional: "topic", flags: { intent: "intent", reason: "reason" } },
+  "manual search": { op: "manual.search", positional: "query", flags: { intent: "intent", reason: "reason" } },
+  "attachment view": { say: "the attachment viewer, which this mount does not have," },
+  "action prepare": { op: "actions.prepare" },
+};
+/** Arguments that are lists in the operation's schema, though the CLI takes one per flag. */
+const LIST_ARGUMENTS = new Set(["attachmentIds", "taskNumbers"]);
+const CLI_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|<[^>\n]*>|…|[^\s\x60'"<>()\[\]-](?:[^\s\x60()\[\]]*[^\s\x60.,;:()\[\]])?)`;
+const CLI_COMMAND = new RegExp(String.raw`\braft ([a-z][a-z-]*)(?: ([a-z][a-z-]*))?((?: +(?:--[a-z][a-z-]*(?: ${CLI_VALUE})?|"[^"\n]*"|<[^>\n]*>|@[\w.-]+|#[\w:.~-]+|[A-Za-z0-9_][\w.-]*\d[\w.-]*|[a-z0-9]+(?:-[a-z0-9]+)+|[\w.-]+(?= --)))*)`, "g");
+const CLI_TOKEN = new RegExp(String.raw`--([a-z][a-z-]*)|${CLI_VALUE}`, "g");
+
+/** A CLI command as the SDK writes one: `raft` and one of the CLI's nouns. */
+export const CLI_HINT = /\braft (?:message|server|inbox|user|task|mention|channel|thread|manual|attachment|action|profile|agent|integration)\b/;
+
+/**
+ * The lines in which the SDK's formatters write a command hint, by how each line starts. Only these lines are
+ * rewritten: a line that quotes what a person wrote — a message line (`[target=…`) or its continuation (`  │ `), a
+ * task's title or description, a channel's or a user's description, a search preview, an attachment comment —
+ * starts some other way, and is passed on as written. Each shape is one formatter's (0.8.0's), named beside it.
+ */
+const SDK_HINT_LINES: readonly RegExp[] = [
+  /^(?:Older|Newer) exist: raft message read /, // a history page's next window
+  /^More: raft /, // a paged listing's next page (inbox, server sections, channel info, users info)
+  /^Next: open the first conversation above: raft message read /, // the inbox listing's next step
+  /^ {2}open: raft message read /, // an inbox listing row's command
+  /^- raft (?:server|channel|user) info\b/, // the server summary's narrow queries
+  /^Full dump: raft server info --full$/, // the server summary
+  /^#\d+ → raft message send --target /, // created or claimed tasks' thread
+  /^raft message send --target "[^"\n]*"$/, // a converted task's thread
+  /^ {2}(?:notify|add|recovery): raft mention (?:notify|add) /, // pending mention actions
+  /^ {2}recovery: unavailable because the pending action id is invalid; inspect `raft mention pending`/,
+  /^Do not rerun `raft message send`; the message is already queued/,
+  /^Still unread: \d+ conversations?\. Run `raft inbox check` to list them\.$/,
+  /^More messages are pending\. Run `raft message check` again\.$/,
+  /^Visible public channels may appear even when `joined=false`\./, // the server overview's fixed guidance
+  /^Server-profile changes still use raft server update /,
+  /^To start a new DM: raft message send --target /,
+];
+
+/** One CLI command, wherever it stands in `text`, as the tool call it stands for: for text the SDK wrote whole. */
+export function commandsAsTools(text: string): string {
+  return text.replace(CLI_COMMAND, (whole, noun: string, verb: string | undefined, rest: string) => {
+    const entry = CLI_COMMANDS[`${noun} ${verb ?? ""}`.trim()];
+    const op = entry?.op && !Object.hasOwn(EXCLUDED, entry.op) ? TOOL_NAME.get(entry.op) : undefined;
+    const tool = entry?.tool ?? op;
+    // A command this mount has no tool for keeps no CLI word, and the hint loses nothing a tool could act on.
+    if (!tool) return entry?.say ?? (noun === "mention" ? CLI_COMMANDS["mention notify"]!.say! : "a Raft command this mount has no tool for");
+    const args: Record<string, Json> = {};
+    let flag: string | null = null;
+    let trailing = "";
+    const put = (name: string, raw: string) => {
+      const value: Json = /^\d+$/.test(raw) ? Number(raw) : raw.replace(/^["']|["']$/g, "");
+      args[name] = LIST_ARGUMENTS.has(name) ? [...((args[name] as Json[] | undefined) ?? []), value] : value;
+    };
+    for (const m of rest.matchAll(CLI_TOKEN)) {
+      if (m[1] !== undefined) {
+        const spec = entry?.flags?.[m[1]];
+        if (Array.isArray(spec)) { args[spec[0]] = spec[1]; flag = null; } else flag = spec ?? "";
+        continue;
+      }
+      if (flag !== null) { if (flag) put(flag, m[0]); flag = null; continue; }
+      if (entry?.positional && !(entry.positional in args)) put(entry.positional, m[0]);
+      else trailing += ` ${m[0]}`;
+    }
+    const shown = Object.entries(args).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(", ");
+    return `${tool}(${shown ? `{ ${shown} }` : ""})${trailing}`;
+  });
+}
+
+/**
+ * The SDK's text in this mount's terms: its hint lines (`SDK_HINT_LINES`) rewritten, every other line as it came.
+ * `quoted` are strings a person wrote that the outcome carries (its data's strings that name a CLI command): they are
+ * set aside before the lines are judged, so one that happens to start a line the way a hint does is still not
+ * rewritten, and put back after. A search preview, which the SDK reshapes, is skipped by its `<preview>` block.
+ */
+export function toolTerms(text: string, quoted: readonly string[] = []): string {
+  const kept: string[] = [];
+  let masked = text;
+  for (const q of [...new Set(quoted)].sort((x, y) => y.length - x.length)) {
+    if (!q || !masked.includes(q)) continue;
+    masked = masked.split(q).join(`\uE000${kept.length}\uE001`);
+    kept.push(q);
+  }
+  // A search result's preview is a person's words reshaped by the SDK (handles and channels neutralised), so it is not
+  // found among the data's strings; its lines are skipped by the block the formatter puts them in.
+  let preview = false;
+  return masked.split("\n").map((line) => {
+    if (line === "<preview>" || line === "</preview>") { preview = line === "<preview>"; return line; }
+    return !preview && SDK_HINT_LINES.some((shape) => shape.test(line)) ? commandsAsTools(line) : line;
+  }).join("\n")
+    .replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!);
+}
+
+/** The strings in an outcome's data that name a CLI command, and each of their lines: what `toolTerms` sets aside. */
+function quotedCommands(value: unknown, depth = 0, out: string[] = []): string[] {
+  if (depth > 8) return out;
+  if (typeof value === "string") {
+    if (CLI_HINT.test(value)) out.push(value, ...value.split(/\r\n|[\n\r]/).filter((l) => CLI_HINT.test(l)));
+  } else if (Array.isArray(value)) for (const v of value) quotedCommands(v, depth + 1, out);
+  else if (value && typeof value === "object") {
+    // The SDK's own command fields are hints, not quotes.
+    for (const [k, v] of Object.entries(value)) if (!/^(?:command|nextCommand|openCommand|text)$/.test(k)) quotedCommands(v, depth + 1, out);
+  }
+  return out;
+}
+
+/** A message the outcome carries, as `modelLine` reads it. */
+function isMessage(value: unknown): value is RaftMessage {
+  const m = value as RaftMessage | null;
+  return !!m && typeof m === "object" && typeof m.text === "string" && Array.isArray(m.attachments) && !!m.raw;
+}
+
+/** One operation, run through the SDK's `invoke` under the caller's origin and context. */
+async function runOperation(
+  op: RaftOperationSpec, args: unknown, ctx: PluginContext, seen?: { upToSeq: number },
+): Promise<Json | Interrupt> {
+  const input = argumentsFor(op, args);
+  const caller = originOf(ctx);
+  // A history read does not count as seen, whoever makes it: only receive_events attests. The SDK records a
+  // model-origin `messages.read` page as seen inside `invoke`, before this plugin hands the result on — and a page
+  // over PARK_BYTES is then parked, so the model has read a preview, not the page, while the record says it saw
+  // all of it. So an operation that books "seen" runs on a client whose state is not saved; what that costs is one
+  // extra hold on a send after reading history, which asks the model with the newer messages: the safe side.
+  // Only `messages.read` books it among the generated tools (the manifest's `consumes.model`; the inbox pulls,
+  // which also do, are excluded and stay with receive_events).
+  const raft = raftFor(ctx, op.consumes.model.includes("seen") ? { state: false } : {});
+  const out = await raft.invoke(op.name, seen ? { ...input, seen } : input, caller);
+  if (!out.ok) throw sdkFailure(out as RaftFailure, op.sideEffect !== "read");
+  if (isInterrupted(out)) return heldCall(op, raft, caller, out.interrupt, input);
+  // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints
+  // put in this mount's terms); `data` is the Server's projection and stays out, so a new server field cannot
+  // silently enter the model's context.
+  // A message's line is rebuilt by `modelLine` from the message itself (its attachment suffix is the SDK's, not the
+  // author's); everything else a person wrote is set aside by `toolTerms`.
+  const data = (out as { data?: unknown }).data as Record<string, unknown> | undefined;
+  const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
+  let text = out.text.trim();
+  for (const m of messages) text = text.replace(m.text, modelLine(m));
+  return { state: out.state, text: toolTerms(text, quotedCommands(data)) };
+}
+
+/**
+ * A held call, as a question for the model: the conversation has messages this agent has not seen. The held
+ * messages are in the question, so the model sees them now: that is recorded before asking (in the caller's
+ * context), so the answer "send"/"proceed" — or the model making the same call again — attests them instead of
+ * being held again. The SDK records nothing when the context was withheld, does not account for every new
+ * message, or came without a boundary; then nothing is attested and the model reads the conversation first.
+ *
+ * The state is the call itself: the operation, its arguments with the interrupt's `resume.idempotencyKey` under
+ * the operation's key argument when it has one, and for a message the `seen` boundary when the question showed
+ * every new message. Plain data, no credential, and never shown: the question, its context and its answers carry
+ * none of it, and the interrupt's `resume.argv`/`cancel`, which belong to the CLI, are not used at all.
+ */
+async function heldCall(
+  op: RaftOperationSpec, raft: Raft, caller: { contextId?: string }, held: RaftInterrupt, input: Record<string, unknown>,
+): Promise<Interrupt> {
+  const n = held.newMessageCount;
+  const attested = raft.frontier.inContext(caller.contextId).recordHeld(held);
+  if (attested) await raft.state.save();
+  const unshown = held.withheld ? n : Math.max(0, n - held.heldMessages.length - held.omittedMessageCount);
+  const go = goAhead(op);
+  const key = op.idempotency.kind === "key" && held.resume.idempotencyKey ? { [op.idempotency.arg]: held.resume.idempotencyKey } : {};
+  return interrupt({
+    question: `${n === 1 ? "A newer message" : `${n} newer messages`} arrived in ${held.target} since you last read it; ` +
+      (attested
+        ? (go === "send" ? "send your message anyway?" : `go ahead with ${op.toolName} anyway?`)
+        : `${unshown && unshown < n ? `${unshown} of them are not shown here, so ` : unshown ? "they are not shown here, so " : ""}` +
+          `read ${held.target} with messages_read first, then answer "${go}" to go ahead or "drop".`),
+    context: {
+      target: held.target, newMessages: n,
+      messages: held.heldMessages.map(modelLine),
+      ...(held.omittedMessageCount ? { omitted: held.omittedMessageCount } : {}),
+      ...(held.withheld ? { withheld: true } : {}),
+      ...(unshown ? { unshown } : {}),
+    },
+    answer: { choices: [go, "drop"] },
+    state: {
+      op: op.name, args: { ...input, ...key } as Json,
+      ...(go === "send" && attested && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
+    },
+  });
+}
+
+/**
+ * The resume path of `send_message`, the hand-written tool `messages_send` replaced, for a send held before that
+ * change and still waiting for its answer. Its state is `{ target, content, idempotencyKey, seen? }`, and going
+ * ahead is `messages.send` again with it, under the same key, exactly as the old tool did. To be removed in the
+ * next release, when no send held under the old tool can still be waiting.
+ */
+const LEGACY_SEND = "send_message";
+
+async function legacyResume(state: Json, answer: Json, ctx: PluginContext): Promise<Json | Interrupt> {
+  const s = object(state);
+  if (typeof s.target !== "string" || typeof s.content !== "string" || typeof s.idempotencyKey !== "string") {
+    throw new Error("raft: the held send's state is incomplete; call messages_send again");
+  }
+  if (answer === "drop") {
+    return { state: "dropped", target: s.target, note: "Not sent. To send something else, call messages_send with the new content and a new idempotencyKey." };
+  }
+  if (answer !== "send") throw new Error(`raft: the answer must be "send" or "drop", not ${JSON.stringify(answer)}`);
+  const seen = object(s.seen);
+  return legacySend(ctx, {
+    target: s.target, content: s.content, idempotencyKey: s.idempotencyKey,
+    ...(typeof seen.upToSeq === "number" ? { seen: { upToSeq: seen.upToSeq } } : {}),
+  });
+}
+
+/** The old tool's send, unchanged, so a held send resumes as it would have; removed with `legacyResume`. */
+async function legacySend(
   ctx: PluginContext,
   send: { target: string; content: string; idempotencyKey: string; seen?: { upToSeq: number } },
 ): Promise<Json | Interrupt> {
@@ -460,10 +813,6 @@ async function sendMessage(
   if (isInterrupted(out)) {
     const held = out.interrupt;
     const n = held.newMessageCount;
-    // Attesting says the model saw what it was held for, so it happens only when the question can show all
-    // of it. The SDK refuses (returns false, records nothing) when the context was withheld, does not account
-    // for every new message (`contextComplete` — the counts are the Server's, as the SDK reports them), or
-    // came without a boundary; then nothing is attested and the model reads the conversation first.
     const attested = raft.frontier.recordHeld(held);
     if (attested) await raft.state.save();
     const unshown = held.withheld ? n : Math.max(0, n - held.heldMessages.length - held.omittedMessageCount);
@@ -472,7 +821,7 @@ async function sendMessage(
         (attested
           ? "send your message anyway?"
           : `${unshown && unshown < n ? `${unshown} of them are not shown here, so ` : unshown ? "they are not shown here, so " : ""}` +
-            `read ${held.target} with receive_events first, then answer "send" to send your message or "drop".`),
+            `read ${held.target} with messages_read first, then answer "send" to send your message or "drop".`),
       context: {
         target: held.target, newMessages: n,
         messages: held.heldMessages.map(modelLine),
@@ -483,7 +832,6 @@ async function sendMessage(
       answer: { choices: ["send", "drop"] },
       state: {
         target: send.target, content: send.content, idempotencyKey: held.resume.idempotencyKey ?? send.idempotencyKey,
-        // What 0.3.2's continuation carried as `seen`: the boundary, when the question accounts for every new message.
         ...(held.contextComplete && held.seenUpToSeq !== null ? { seen: { upToSeq: held.seenUpToSeq } } : {}),
       },
     });
@@ -494,6 +842,58 @@ async function sendMessage(
     ...(out.data.recentUnread.length ? { recentUnread: out.data.recentUnread.map(modelLine) } : {}),
   };
 }
+
+/**
+ * The tools every mount has whatever its credential allows: the inbox pull and push, which are this runtime's
+ * plumbing rather than Raft operations, and are written here by hand.
+ */
+const OWN_TOOLS: readonly ToolSchema[] = [
+  {
+    name: "receive_events",
+    summary: "Read your queued Raft messages: the way to read after an inbox notice. Each message is one line, " +
+      "`[target=… msg=… time=… type=…] @sender: content`; reply with messages_send to that target. Raft hands out at most a few " +
+      "per conversation per call: while hasMore is true, call again. A batch is acknowledged by your next call, so a failed call " +
+      "loses nothing and may simply be repeated.",
+    parameters: {
+      type: "object", additionalProperties: false,
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: MAX_EVENTS },
+      },
+    },
+    // It acknowledges the previous batch, so it is a write; repeating it hands back the same batch.
+    sideEffects: "write",
+    idempotency: "native",
+    // It acknowledges and records as seen what it hands over, which only counts if the model reads it.
+    modelOnly: true,
+  },
+  {
+    name: "enable_push",
+    summary: "Create and register this mount's signed Raft push endpoint: Raft then notifies this agent when its inbox changes.",
+    parameters: { type: "object", additionalProperties: false, properties: {} },
+    sideEffects: "write",
+    idempotency: "none",
+  },
+  {
+    name: "disable_push",
+    summary: "Stop Raft from pushing this agent's messages through this mount.",
+    parameters: { type: "object", additionalProperties: false, properties: {} },
+    sideEffects: "write",
+    idempotency: "native",
+  },
+  {
+    name: "push_status",
+    summary: "Show whether Raft push is enabled for this mount and when a delivery last reached it.",
+    parameters: { type: "object", additionalProperties: false, properties: {} },
+    sideEffects: "read",
+    idempotency: "native",
+  },
+];
+
+/** Every tool a mount can be offered: what a mount with no snapshot is offered, and `raftPlugin.tools`. */
+const ALL_TOOLS: ToolSchema[] = [...OWN_TOOLS, ...GENERATED_TOOLS];
+
+/** What a mount whose credential has no capability at all is told, in its snapshot's `skipped`. */
+const EVERY_OPERATION = "(every Raft operation)";
 
 export const raftPlugin: Plugin = {
   id: "raft",
@@ -531,226 +931,90 @@ export const raftPlugin: Plugin = {
     required: true,
     summary: "A Raft agent credential for the agent account this mount represents.",
     shape: "token",
-    grants: "Send messages, receive queued events, read and search visible history, list and join visible channels, see their members, and post action cards as that Raft agent.",
+    grants: "As that Raft agent, and only as far as the credential's capabilities reach: send, read and search messages, receive queued events, " +
+      "join, leave and mute channels and see their members, react, work its task boards, read the Raft Manual, and post action cards for a person to confirm.",
     looksLike: [{ kind: "Raft agent credential", pattern: "sk_agent_[A-Za-z0-9_-]{16,}" }],
   },
-  tools: [
-    {
-      name: "send_message",
-      summary: "Send a message to a Raft channel, thread, or DM. The target is explicit; copy it from the `target=` of the message you answer. " +
-        "If newer messages arrived there that you have not seen, nothing is sent yet: the result is \"yielded\" with those messages " +
-        "and the question whether to send anyway. Read them, then resume with \"send\" to send it as written or \"drop\" to send " +
-        "nothing; to change the message, drop it and call send_message again with the new content and a new idempotencyKey.",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: {
-          target: { type: "string", description: "For example #general, #general:abcd1234, or dm:@name." },
-          content: { type: "string" },
-          idempotencyKey: { type: "string", description: "One key per message: the same content again uses the same key; changed content uses a new key." },
-        },
-        required: ["target", "content", "idempotencyKey"],
-      },
-      sideEffects: "write",
-      idempotency: "key",
-    },
-    {
-      name: "receive_events",
-      summary: "Read your queued Raft messages: the way to read after an inbox notice. Each message is one line, " +
-        "`[target=… msg=… time=… type=…] @sender: content`; reply with send_message to that target. Raft hands out at most a few " +
-        "per conversation per call: while hasMore is true, call again. A batch is acknowledged by your next call, so a failed call " +
-        "loses nothing and may simply be repeated.",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: {
-          limit: { type: "integer", minimum: 1, maximum: MAX_EVENTS },
-        },
-      },
-      // It acknowledges the previous batch, so it is a write; repeating it hands back the same batch.
-      sideEffects: "write",
-      idempotency: "native",
-      // It acknowledges and records as seen what it hands over, which only counts if the model reads it.
-      modelOnly: true,
-    },
-    {
-      name: "join_channel",
-      summary: "Join one visible regular Raft channel. DMs and thread targets are not channel memberships.",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: { target: { type: "string", description: "A regular channel such as #engineering." } },
-        required: ["target"],
-      },
-      sideEffects: "write",
-      idempotency: "native",
-    },
-    {
-      name: "enable_push",
-      summary: "Create and register this mount's signed Raft push endpoint: Raft then notifies this agent when its inbox changes.",
-      parameters: { type: "object", additionalProperties: false, properties: {} },
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "disable_push",
-      summary: "Stop Raft from pushing this agent's messages through this mount.",
-      parameters: { type: "object", additionalProperties: false, properties: {} },
-      sideEffects: "write",
-      idempotency: "native",
-    },
-    {
-      name: "prepare_action",
-      summary: "Post an action card in a Raft channel or DM for a person to confirm: creating a channel, adding members to one, " +
-        "or creating an agent. Nothing happens until a person clicks it there; they act with their own permissions. " +
-        "Use it for what you cannot or should not do yourself, and say in draftHint why you prepared it.",
-      parameters: {
-        type: "object", additionalProperties: false, required: ["target", "action"],
-        properties: {
-          target: { type: "string", description: "Where the card is posted, for example #general or dm:@name." },
-          action: {
-            oneOf: [
-              {
-                type: "object", additionalProperties: false, required: ["type", "name"],
-                properties: {
-                  type: { const: "channel:create" },
-                  name: { type: "string", maxLength: 80 },
-                  visibility: { enum: ["public", "private"] },
-                  description: { type: "string", maxLength: 500 },
-                  initialHumans: { type: "array", items: { type: "string" }, maxItems: 64, description: "handles or ids" },
-                  initialAgents: { type: "array", items: { type: "string" }, maxItems: 64, description: "handles or ids" },
-                  draftHint: { type: "string", maxLength: 2000 },
-                },
-              },
-              {
-                type: "object", additionalProperties: false, required: ["type", "channel"],
-                properties: {
-                  type: { const: "channel:add_member" },
-                  channel: { type: "string", description: "#name or id" },
-                  humans: { type: "array", items: { type: "string" }, maxItems: 64 },
-                  agents: { type: "array", items: { type: "string" }, maxItems: 64 },
-                  draftHint: { type: "string", maxLength: 2000 },
-                },
-              },
-              {
-                type: "object", additionalProperties: false, required: ["type", "name"],
-                properties: {
-                  type: { const: "agent:create" },
-                  name: { type: "string", maxLength: 60 },
-                  description: { type: "string", maxLength: 500 },
-                  draftHint: { type: "string", maxLength: 2000 },
-                },
-              },
-            ],
-          },
-        },
-      },
-      // Each call posts a card; a repeat posts another.
-      sideEffects: "write",
-      idempotency: "none",
-    },
-    {
-      name: "list_channels",
-      summary: "List the Raft server's channels you can see, one page at a time: each line is the channel, whether it is public " +
-        "or private, whether you have joined it, and its description. While hasMore is true, call again with nextOffset as offset.",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: {
-          offset: { type: "integer", minimum: 0, description: "Rows to skip; 0 is the first page." },
-          limit: { type: "integer", minimum: 1, maximum: MAX_CHANNELS, description: `Rows per page; ${DEFAULT_CHANNEL_PAGE} when omitted.` },
-          joined: { type: "boolean", description: "Only the channels you have joined." },
-        },
-      },
-      sideEffects: "read",
-      idempotency: "native",
-    },
-    {
-      name: "channel_members",
-      summary: "List the agents and humans in a Raft channel, with their server role (owner/admin) where they have one.",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: { target: { type: "string", description: "A channel such as #engineering; a DM (dm:@name) or thread target also works." } },
-        required: ["target"],
-      },
-      sideEffects: "read",
-      idempotency: "native",
-    },
-    {
-      name: "read_messages",
-      summary: "Read the history of a Raft channel, DM, or thread, one message per line as receive_events shows them. " +
-        "Without a cursor it reads the latest messages; give at most one of before (older than a seq), after (newer than a seq) " +
-        "or around (a seq or message id). hasOlder and hasNewer say whether more exist; oldestSeq and newestSeq are the cursors to page with. " +
-        "Reading here does not count as having seen the conversation: a send_message there may still ask first, showing what is new. " +
-        "A read not made by you in your turn, such as a run_js program's, leaves the messages unread.",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: {
-          target: { type: "string", description: "For example #general, #general:abcd1234, or dm:@name." },
-          before: { type: "integer", minimum: 0, description: "Messages older than this seq." },
-          after: { type: "integer", minimum: 0, description: "Messages newer than this seq." },
-          around: { oneOf: [{ type: "integer", minimum: 0 }, { type: "string" }], description: "A window around this seq or message id." },
-          limit: { type: "integer", minimum: 1, maximum: MAX_HISTORY },
-        },
-        required: ["target"],
-      },
-      sideEffects: "read",
-      idempotency: "native",
-      // Not modelOnly: any read but the model's own in its turn is sent with `consume: false` (the handler), so
-      // Raft leaves it unread for a program's call and an approved call's replay alike.
-    },
-    {
-      name: "search_messages",
-      summary: "Search Raft messages you can see, by text and/or by conversation or sender. Each result names its source, " +
-        "sender, time and a preview with the match marked; read the surrounding messages with read_messages before relying on one. " +
-        "While hasMore is true, call again with nextOffset as offset (or, sorted by recent, nextBefore as before).",
-      parameters: {
-        type: "object", additionalProperties: false,
-        properties: {
-          query: { type: "string", description: "Free text; may be left out when target or sender is given." },
-          target: { type: "string", description: "Only this channel, DM, or thread, for example #general." },
-          sender: { type: "string", description: "Only messages from this handle." },
-          sort: { enum: ["relevance", "recent"] },
-          before: { type: "string", description: "ISO timestamp, inclusive." },
-          after: { type: "string", description: "ISO timestamp, inclusive." },
-          limit: { type: "integer", minimum: 1, maximum: MAX_SEARCH },
-          offset: { type: "integer", minimum: 0 },
-        },
-      },
-      sideEffects: "read",
-      idempotency: "native",
-    },
-    {
-      name: "push_status",
-      summary: "Show whether Raft push is enabled for this mount and when a delivery last reached it.",
-      parameters: { type: "object", additionalProperties: false, properties: {} },
-      sideEffects: "read",
-      idempotency: "native",
-    },
-  ],
+  /** Every tool any mount can be offered; one mount's own list is `mountTools`. */
+  tools: ALL_TOOLS,
 
   /**
-   * A held send's question, answered. "send" sends the same message under the same key, attesting what
-   * the question showed (the state's `seen`, and the frontier `recordHeld` saved): so it goes through
-   * unless the conversation moved again since, which asks again with the newer messages. "drop" sends
-   * nothing; the model changes a message by dropping it and sending a new one. Expiry and cancel send
-   * nothing either, so no `cancel` is declared: an in-process held send leaves nothing on the Server, and
-   * cancelling is not calling send again. An in-process send's interrupt carries neither `resume.argv` nor
-   * `cancel`; those belong to the CLI and the command endpoint, and if one ever appears it is ignored here
-   * and never reaches the model's text.
+   * The tools this mount offers: its own tools, and the generated ones its snapshot lists — the operations whose
+   * every capability the mount's credential held when the snapshot was taken (`snapshotTools`). Only the names
+   * are read from the snapshot; each tool's description and schema are this build's, so the stored copy cannot
+   * offer a schema this code does not run.
+   *
+   * A mount with no snapshot is offered every generated tool. That is every mount made before tools were
+   * generated, which nothing recomputes, and one whose credential was seeded rather than attached: its model sees
+   * all of them, and a call its credential may not make is refused by Raft (CAPABILITY_NOT_AUTHORIZED) as it was
+   * before there was a filter. An empty snapshot is not "none taken": it offers only this plugin's own tools.
+   */
+  mountTools(mount: MountRecord): ToolSchema[] {
+    const snapshot = mount.toolSnapshot;
+    if (!snapshot) return ALL_TOOLS;
+    const allowed = new Set(snapshot.tools.map((t) => t.name));
+    return [...OWN_TOOLS, ...GENERATED_TOOLS.filter((t) => allowed.has(t.name))];
+  },
+
+  /**
+   * Which generated tools this mount's credential may use: an operation is listed only when the credential holds
+   * every capability it names (`identity.whoami` → `capabilities`, the credential's scopes). Asked when the mount
+   * is added, when an operator refreshes it, and whenever the mount's credential is attached, replaced or removed
+   * (`AgentRuntime.attachCredential`/`removeCredential`), so a credential that lost a scope stops offering its
+   * tools. No credential, or one Raft refuses, has no capabilities and lists nothing; Raft not answering is a
+   * throw, which leaves the stored list as it was (after a credential change too).
+   */
+  async snapshotTools(ctx: PluginContext): Promise<ListedTools> {
+    if (!ctx.credential) {
+      return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: "this mount has no Raft credential, so it has no capabilities" }] };
+    }
+    const me = await raftFor(ctx, { state: false }).identity.whoami();
+    if (!me.ok) {
+      if (me.status === 401 || me.status === 403) {
+        return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})` }] };
+      }
+      throw new Error(`could not ask Raft what this mount's credential may do: ${me.error.message}`);
+    }
+    const capabilities = new Set(me.data.capabilities);
+    const tools: ToolSchema[] = [];
+    const skipped: Array<{ name: string; reason: string }> = [];
+    for (const op of GENERATED) {
+      const missing = op.capability.filter((c) => !capabilities.has(c));
+      if (missing.length) skipped.push({ name: op.toolName, reason: `the credential lacks the Raft capability ${missing.join(", ")}` });
+      else tools.push(toolOf(op));
+    }
+    return { tools, skipped };
+  },
+
+  /**
+   * A held call's question, answered. "send" (a message) or "proceed" (a task write) makes the same call again
+   * with the same arguments — under the interrupt's `resume.idempotencyKey` for a send — attesting what the
+   * question showed, so it goes through unless the conversation moved again since, which asks again with the
+   * newer messages. "drop" does nothing. Expiry and cancel do nothing either, so no `cancel` is declared: an
+   * in-process held call leaves nothing on the Server, and cancelling is not making the call.
    */
   interrupts: {
     async resume(tool, state, answer, ctx) {
-      if (tool !== "send_message") throw new Error(`raft: ${tool} does not ask questions`);
+      if (tool === LEGACY_SEND) return legacyResume(state, answer, ctx);
+      const op = OPERATION_OF.get(tool);
+      if (!op?.mayInterrupt) throw new Error(`raft: ${tool} does not ask questions`);
       const s = object(state);
-      if (typeof s.target !== "string" || typeof s.content !== "string" || typeof s.idempotencyKey !== "string") {
-        throw new Error("raft: the held send's state is incomplete; call send_message again");
+      if (s.op !== op.name || !s.args || typeof s.args !== "object" || Array.isArray(s.args)) {
+        throw new Error(`raft: the held call's state is incomplete; call ${op.toolName} again`);
       }
+      const go = goAhead(op);
+      const target = typeof s.args.target === "string" ? { target: s.args.target } : {};
       if (answer === "drop") {
-        return { state: "dropped", target: s.target, note: "Not sent. To send something else, call send_message with the new content and a new idempotencyKey." };
+        return {
+          state: "dropped", ...target,
+          note: go === "send"
+            ? "Not sent. To send something else, call messages_send with the new content and a new idempotencyKey."
+            : `Nothing was done. Call ${op.toolName} again if it is still wanted.`,
+        };
       }
-      if (answer !== "send") throw new Error(`raft: the answer must be "send" or "drop", not ${JSON.stringify(answer)}`);
+      if (answer !== go) throw new Error(`raft: the answer must be "${go}" or "drop", not ${JSON.stringify(answer)}`);
       const seen = object(s.seen);
-      return sendMessage(ctx, {
-        target: s.target, content: s.content, idempotencyKey: s.idempotencyKey,
-        ...(typeof seen.upToSeq === "number" ? { seen: { upToSeq: seen.upToSeq } } : {}),
-      });
+      return runOperation(op, s.args, ctx, typeof seen.upToSeq === "number" ? { upToSeq: seen.upToSeq } : undefined);
     },
   },
 
@@ -771,13 +1035,9 @@ export const raftPlugin: Plugin = {
   },
 
   async invoke(name, args, ctx): Promise<Json> {
+    const op = OPERATION_OF.get(name);
+    if (op) return runOperation(op, args, ctx) as Promise<Json>;
     const a = object(args);
-    if (name === "send_message") {
-      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
-      if (typeof a.content !== "string" || !a.content.trim()) throw new Error("content is required");
-      if (typeof a.idempotencyKey !== "string" || !a.idempotencyKey.trim()) throw new Error("idempotencyKey is required");
-      return sendMessage(ctx, { target: a.target, content: a.content, idempotencyKey: a.idempotencyKey });
-    }
     if (name === "receive_events") {
       const limit = integer(a.limit, "limit", 1, MAX_EVENTS);
       const raft = raftFor(ctx);
@@ -785,10 +1045,15 @@ export const raftPlugin: Plugin = {
       // previous call handed to the model (kept as pending in the mount's state, since the object may be a
       // new process by now), and the pull sends that as `since`, which is what acknowledges it on the
       // Server. A pull that fails leaves the new batch pending, so the next call gets it again.
+      //
+      // The pull goes through `invoke` so that what it records as seen is booked under the caller's context id,
+      // the one a later send in that context attests with (`originOf`). As the model's own: receive_events is
+      // model-only, so the gateway has already refused it from a program and from an approved call's replay.
       await raft.inbox.commit();
-      const out = await raft.inbox.check({ ack: "cursor", ...(limit !== undefined ? { limit } : {}) });
-      if (!out.ok) throw sdkFailure(out);
-      const batch = out.data;
+      const out = await raft.invoke("inbox.check", { ack: "cursor", ...(limit !== undefined ? { limit } : {}) },
+        { origin: "model", ...(typeof ctx.caller.contextId === "string" ? { contextId: ctx.caller.contextId } : {}) });
+      if (!out.ok) throw sdkFailure(out as RaftFailure);
+      const batch = (out as { data: RaftInboxBatch }).data;
       return {
         messages: batch.messages.map(modelLine),
         hasMore: batch.hasMore,
@@ -797,21 +1062,6 @@ export const raftPlugin: Plugin = {
         // A Server that predates cursor acks acknowledged this batch already; say so rather than imply safety.
         ...(batch.ackMode === "immediate" ? { acknowledged: "on this read" } : {}),
       };
-    }
-    if (name === "join_channel") {
-      if (typeof a.target !== "string" || !a.target.startsWith("#") || a.target.includes(":")) {
-        throw new Error("target must be a regular channel in the form #channel-name");
-      }
-      const channelName = a.target.slice(1).trim();
-      if (!channelName) throw new Error("target must be a regular channel in the form #channel-name");
-      const { status, data } = await call(ctx, "GET", "/internal/agent-api/server");
-      const channels = Array.isArray(data.channels) ? data.channels.map(object) : [];
-      const channel = channels.find((candidate) => candidate.name === channelName);
-      if (!channel || typeof channel.id !== "string") throw new Error(`channel not found: ${a.target}`);
-      if (channel.joined === true) return { state: "already_joined", target: a.target, channelId: channel.id, status };
-      const joined = await call(ctx, "POST", `/internal/agent-api/channels/${encodeURIComponent(channel.id)}/join`);
-      if (joined.data.ok !== true) throw new Error("raft join response did not match the expected contract");
-      return { state: "joined", target: a.target, channelId: channel.id, status: joined.status };
     }
     if (name === "enable_push") {
       if (!ctx.inbound) throw new Error("this deployment cannot receive pushed Raft events");
@@ -911,136 +1161,6 @@ export const raftPlugin: Plugin = {
         registration: null,
       });
       return { enabled: false, remoteDeregistration, cleanupPending: staleHookIds.length };
-    }
-    if (name === "prepare_action") {
-      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required");
-      const action = object(a.action);
-      // The three a model may prepare. The integration cards take ids a model has no way to know, and are
-      // made by Raft's own integration commands.
-      if (action.type !== "channel:create" && action.type !== "channel:add_member" && action.type !== "agent:create") {
-        throw new Error("action.type must be channel:create, channel:add_member or agent:create");
-      }
-      const out = await raftFor(ctx).actions.prepare({ target: a.target, action } as never);
-      // A card that got no answer may have been posted; a refusal (Raft's contract, checked before sending,
-      // or the Server's) did nothing.
-      if (!out.ok) throw sdkFailure(out, true);
-      return {
-        prepared: true, target: out.data.target, messageId: out.data.messageId,
-        // The SDK's own sentence, which is the CLI's; its `next` names a CLI command this mount has no tool
-        // for, so it is not passed on.
-        text: out.text.trim(),
-        // Not "the outcome arrives in your inbox", though the SDK's `next.why` says so: as of 2026-09-29 Raft
-        // sends the preparer nothing when a card is executed, and a model told to wait would wait for ever.
-        note: "Nothing has happened yet. A person confirms the card in Raft, acting with their own permissions. " +
-          "You are not told when that happens; if it matters, check for its effect later.",
-      };
-    }
-    if (name === "list_channels") {
-      const offset = integer(a.offset, "offset", 0, Number.MAX_SAFE_INTEGER) ?? 0;
-      const limit = integer(a.limit, "limit", 1, MAX_CHANNELS) ?? DEFAULT_CHANNEL_PAGE;
-      if (a.joined !== undefined && typeof a.joined !== "boolean") throw new Error("joined must be true or false");
-      const joined = a.joined === true;
-      const out = await raftFor(ctx).server.info({ view: "channels", offset, limit, ...(joined ? { joined } : {}) });
-      if (!out.ok) throw sdkFailure(out);
-      // The SDK fetches the whole server and pages it itself; only the page goes on, never the agent and
-      // human lists that came with it.
-      const page = out.data.page;
-      const nextOffset = page && page.offset + page.limit < page.total ? page.offset + page.limit : null;
-      // The SDK's text is the CLI's, and its "More:" line names `raft server info`, a command this mount has
-      // no tool for; it is put in this tool's terms where it stands. Not found means the SDK's wording changed,
-      // and the test asserting the whole line goes red on that upgrade.
-      const cli = page?.nextCommand ? `More: ${page.nextCommand}` : null;
-      const ours = nextOffset !== null
-        ? `More: call list_channels with offset ${nextOffset}, limit ${page!.limit}${joined ? ", joined true" : ""}.`
-        : null;
-      let listing = out.text.trim();
-      if (ours) listing = cli && listing.includes(cli) ? listing.replace(cli, ours) : `${listing}\n${ours}`;
-      return {
-        text: listing,
-        total: page?.total ?? 0,
-        hasMore: nextOffset !== null,
-        ...(nextOffset !== null ? { nextOffset } : {}),
-      };
-    }
-    if (name === "channel_members") {
-      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required, for example #engineering");
-      const out = await raftFor(ctx).channels.members({ target: a.target });
-      if (!out.ok) throw sdkFailure(out);
-      // The SDK's text, which is the CLI's: agents and humans in their own sections, server role as a label.
-      return { target: a.target, text: out.text.trim() };
-    }
-    if (name === "read_messages") {
-      if (typeof a.target !== "string" || !a.target.trim()) throw new Error("target is required, for example #engineering");
-      const before = integer(a.before, "before", 0, Number.MAX_SAFE_INTEGER);
-      const after = integer(a.after, "after", 0, Number.MAX_SAFE_INTEGER);
-      if (a.around !== undefined && !(typeof a.around === "string" && a.around.trim()) &&
-          !(typeof a.around === "number" && Number.isSafeInteger(a.around) && a.around >= 0)) {
-        throw new Error("around must be a message seq or a message id");
-      }
-      const around = a.around as number | string | undefined;
-      // The SDK sends whichever it is given, and what the Server makes of two at once is not its contract.
-      if ([before, after, around].filter((c) => c !== undefined).length > 1) {
-        throw new Error("give at most one of before, after and around");
-      }
-      const limit = integer(a.limit, "limit", 1, MAX_HISTORY);
-      // A client that saves nothing: this read does not count as the model having seen the conversation (see raftFor).
-      // Raft marks the page read only for the model's own call in a session's turn (no `fromProgram`, a
-      // `contextId`). Any other call's result may never reach the model: a program's, an approved call's replay
-      // (run with nobody reading it), provisioning, a bench shell. Those ask Raft not to.
-      const byModel = ctx.caller.fromProgram !== true && typeof ctx.caller.contextId === "string";
-      const out = await raftFor(ctx, { state: false }).messages.read({
-        target: a.target,
-        ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}),
-        ...(around !== undefined ? { around } : {}), ...(limit !== undefined ? { limit } : {}),
-        ...(byModel ? {} : { consume: false }),
-      });
-      if (!out.ok) throw sdkFailure(out);
-      const page = out.data;
-      const seqs = page.messages.map((m) => m.seq).filter((s): s is number => s !== null);
-      // The SDK's text is the CLI's: each message's own line (`m.text`, the same formatter), then a hint naming
-      // `raft message read`, which this mount has no tool for. So the text is rebuilt from the lines
-      // receive_events gives (`modelLine`, which puts the CLI's attachment hint right) and the SDK's next step
-      // said in this tool's terms. The tests assert whole lines, so a change to the SDK's wording shows there.
-      const hint = out.next?.args && typeof out.next.args.after === "number"
-        ? `Newer exist: call read_messages with target ${page.target}, after ${out.next.args.after}.`
-        : out.next?.args && typeof out.next.args.before === "number"
-          ? `Older exist: call read_messages with target ${page.target}, before ${out.next.args.before}.`
-          : null;
-      const lines = page.messages.length ? page.messages.map(modelLine) : [out.text.trim()];
-      return {
-        target: page.target,
-        text: [...lines, ...(hint ? [hint] : [])].join("\n"),
-        hasOlder: page.hasOlder, hasNewer: page.hasNewer,
-        ...(seqs.length ? { oldestSeq: Math.min(...seqs), newestSeq: Math.max(...seqs) } : {}),
-      };
-    }
-    if (name === "search_messages") {
-      const strings = ["query", "target", "sender", "before", "after"] as const;
-      for (const field of strings) {
-        if (a[field] !== undefined && typeof a[field] !== "string") throw new Error(`${field} must be a string`);
-      }
-      if (a.sort !== undefined && a.sort !== "relevance" && a.sort !== "recent") throw new Error("sort must be relevance or recent");
-      const limit = integer(a.limit, "limit", 1, MAX_SEARCH);
-      const offset = integer(a.offset, "offset", 0, Number.MAX_SAFE_INTEGER);
-      const request = {
-        ...Object.fromEntries(strings.filter((f) => a[f] !== undefined).map((f) => [f, a[f] as string])),
-        ...(a.sort !== undefined ? { sort: a.sort as "relevance" | "recent" } : {}),
-        ...(limit !== undefined ? { limit } : {}), ...(offset !== undefined ? { offset } : {}),
-      };
-      // The SDK refuses a search with no query, target or sender itself, before any request.
-      const out = await raftFor(ctx).messages.search(request);
-      if (!out.ok) throw sdkFailure(out);
-      const { results, hasMore } = out.data;
-      const recent = request.sort === "recent";
-      const nextBefore = hasMore && recent ? results[results.length - 1]?.createdAt ?? null : null;
-      const nextOffset = hasMore && !recent ? (offset ?? 0) + results.length : null;
-      return {
-        text: searchText(out.text.trim(), out.data.query),
-        results: results.length,
-        hasMore,
-        ...(nextOffset !== null ? { nextOffset } : {}),
-        ...(typeof nextBefore === "string" ? { nextBefore } : {}),
-      };
     }
     if (name === "push_status") {
       const current = await loadPushState(ctx);

@@ -489,7 +489,7 @@ async function raftFixture() {
   const tools = bridgeTools(qualifyMountedTools(raftPlugin.tools.map((t) => ({
     name: t.name, address: `raft.${t.name}`, description: t.summary, parameters: t.parameters, sideEffects: t.sideEffects, idempotency: t.idempotency,
   }))), host, { continuations: reg, scope: "s" }) as any[];
-  return { send: tools.find((t) => t.name === "raft__send_message"), resume: resumeTool(reg, { scope: "s" }) as any, reg };
+  return { send: tools.find((t) => t.name === "raft__messages_send"), resume: resumeTool(reg, { scope: "s" }) as any, reg };
 }
 
 await check("raft: a held send yields send/drop with the newer messages; resume \"send\" sends it once, attesting what was shown", async () => {
@@ -522,8 +522,8 @@ await check("the prompt and resume's description say any tool may yield and resu
   const p = systemPrompt({ sandbox: true });
   must(/Any tool, called directly or from run_js, may also answer "yielded"/.test(p) && /resume answers the tool/.test(p), "the sandbox prompt");
   must(/a tool that asked you a question before acting/.test(RESUME_DESCRIPTION) && /drops a tool's question/.test(RESUME_DESCRIPTION), "resume's description");
-  const raftSend = raftPlugin.tools.find((t) => t.name === "send_message")!;
-  must(/resume with "send"/.test(raftSend.summary) && /drop it and call send_message again/.test(raftSend.summary), `raft's description: ${raftSend.summary}`);
+  const raftSend = raftPlugin.tools.find((t) => t.name === "messages_send")!;
+  must(/comes back as a question/.test(raftSend.summary) && /answer "send" to go ahead as written, or "drop"/.test(raftSend.summary), `raft's description: ${raftSend.summary}`);
 });
 
 // ---- the Durable Object runtime's wiring ----------------------------------

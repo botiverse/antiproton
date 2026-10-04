@@ -52,9 +52,11 @@ export interface ToolSchema {
    * would have acknowledged and attested messages it never saw — and skipped
    * the question a send asks when something new arrived, which is the model's
    * to answer (docs/ax-design.md §3, "Code cannot skip it"). Raft's
-   * `read_messages` is not: Raft marks a history read as read, but the read can
-   * ask it not to (`consume: false`), so the plugin does that for every call
-   * but the model's own in its turn (`caller.contextId`) instead.
+   * `messages_read` is not: Raft marks a history read as read, but the read can
+   * ask it not to (`consume: false`), so every call but the model's own in its
+   * turn (no `caller.fromProgram`, a `caller.contextId`) is run as code, which
+   * the SDK reads that way instead. A Raft tool generated from an operation
+   * the SDK's manifest marks model-only carries this flag too.
    *
    * Not a policy: an operator cannot allow it from code, because what it
    * protects is what the model saw, not what the operator permits.
@@ -85,6 +87,13 @@ export interface ToolSnapshot {
   tools: ToolSchema[];
   skipped: Array<{ name: string; reason: string }>;
   takenAt: number;
+  /**
+   * Present, and true, when the list was taken for a plugin that declares a `credential` while the mount had none
+   * (a mount is added before its account is attached). Such a list says what no credential may do, not what the
+   * next one may, so it is not kept as the "previous list" when the listing after an attach fails
+   * (`AgentRuntime.attachCredential`). Not covered by `hash`, which is about the list itself.
+   */
+  withoutCredential?: true;
 }
 
 /**
@@ -1709,7 +1718,11 @@ export interface Plugin {
   /**
    * List the tools a mount should offer, by asking whoever knows. Called when
    * the mount is created and when an operator asks for a refresh — never on a
-   * wake, a harness build or a call. The kernel admits the list (names an agent
+   * wake, a harness build or a call. For a plugin that also declares a
+   * `credential`, it is called again whenever the mount's credential is
+   * attached, replaced or removed, since what a credential may do can decide
+   * the list (raft); if that listing fails, the stored list stays as it was.
+   * The kernel admits the list (names an agent
    * can address, no duplicates), hashes it and stores it on the mount as its
    * {@link ToolSnapshot}; the stored copy is replaced only when the hash moved.
    *

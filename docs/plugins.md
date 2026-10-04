@@ -322,6 +322,36 @@ out are in the snapshot's `skipped`, shown on the mount's console page and in
 `tools.mounts`. The version pin is still the plugin's `version`: a snapshot
 changes what a mount offers, not which code runs it.
 
+**A plugin whose tools depend on the credential lists them per mount too.**
+`raft` is the one that does: its tools are generated from the Raft SDK's
+operation manifest (`RAFT_OPERATIONS`), one per operation, named by the
+manifest's `toolName`, and run through the SDK's `raft.invoke`. A history read
+(`messages_read`) never counts as seen: the SDK would record the page inside
+`invoke`, before the runtime may park it, so it runs on a client whose state is
+not saved and only `receive_events` attests. The CLI commands the SDK's text
+names are rewritten as tool calls in one place (`toolTerms`), a stopgap until
+the SDK can write them that way; only the SDK's own hint lines are touched, and
+what a person wrote (a message, a description, a title, a preview) is passed
+on as written. Its
+`snapshotTools` asks Raft what the mount's credential may do
+(`identity.whoami` → `capabilities`) and lists only the operations whose every
+capability the credential holds; `mountTools` offers those names, with each
+tool's description and schema taken from the running build, never from the
+stored copy. Because the list depends on the credential, the runtime takes it
+again whenever a mount's credential is attached, replaced or removed
+(`AgentRuntime.attachCredential`/`removeCredential`, for a plugin that declares
+both `snapshotTools` and a `credential`), so a credential that lost a scope
+stops offering the scope's tools. A listing that fails leaves the stored list
+as it was when a credential was behind it; a list taken with no credential
+(`ToolSnapshot.withoutCredential`, which a mount added before its account has)
+is cleared instead. A mount with no snapshot at all — one made before the
+tools were generated, one whose credential was seeded rather than attached, or
+one whose first listing under a credential failed — is offered
+every generated tool, and Raft refuses what its credential may not do. Which
+manifest operations are not offered, and why, is one table (`EXCLUDED` in
+`src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has
+an operation that is neither generated nor excluded.
+
 **`replay: "never"` overrides the read rule.** A tool that declares it is not
 run again on its own after an interruption, even when it is a read
 (`replayPolicy` asks it first). Declare it on a read whose claim to be harmless
@@ -342,11 +372,14 @@ hold it, the call is refused and the model told why, so it is usable only on a
 mount whose policy lets the agent call it without approval. Raft's `receive_events` declares it: it acknowledges the
 previous batch and records what it hands over as seen, so from a program the
 model would have acknowledged, and attested to having read, messages it never
-saw. (`read_messages` does not: Raft marks a history read as read, so every
+saw. (`messages_read` does not: Raft marks a history read as read, so every
 call but the model's own in its turn — no `caller.fromProgram`, a
-`caller.contextId`, both below — asks it not to, with `consume: false`. That
-covers a program's call and an approved call's replay.) A tool a server lists never carries it (the kernel admits only the
-fields it knows).
+`caller.contextId`, both below — runs as code, which the SDK reads with
+`consume: false` and books as seen nowhere. That covers a program's call and
+an approved call's replay. A Raft tool generated from an operation the
+manifest marks model-only carries the flag, so the gateway refuses it before
+the SDK's own `MODEL_ONLY` refusal is reached.) A tool a server lists never
+carries it (the kernel admits only the fields it knows).
 
 **Read `context.caller` for where a call came from.** Besides `tenantId`,
 `agentId` and `taskId` it carries two read-only fields, filled by the gateway
@@ -844,6 +877,7 @@ it distinguishes comes from a single plugin (`test/mount-config.ts`). Run
 | When an idle resource is taken, and the warning | `src/runtime/idle-lease.ts`, `test/idle-lease.ts` |
 | Examples | `src/plugins/demo.ts`, `http.ts`, `github.ts` |
 | Tools a mount learns from a server | `src/plugins/mcp.ts`, `src/runtime/mount-tools.ts`, `test/mcp-plugin.ts` |
+| Tools generated from a manifest, filtered by the credential | `src/plugins/raft.ts`, `test/raft-plugin.ts` |
 | Settings and activity tests | `test/mount-config.ts` |
 | Version and plugin-id refusals | `test/mount-pin.ts` |
 | Pushed events: limits and statuses | `src/runtime/inbound.ts` |
