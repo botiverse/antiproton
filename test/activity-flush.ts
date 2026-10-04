@@ -17,7 +17,7 @@ async function check(name: string, fn: () => Promise<void>) {
 }
 function must(cond: unknown, msg: string): asserts cond { if (!cond) throw new Error(msg); }
 const OWNER = { tenantId: "t1", agentId: "raft_a1" };
-const tool = (n: number): TraceRow => ({ at: 1_790_000_000_000 + n * 1000, ...OWNER, kind: "tool.call", spanId: `op_${n}`, status: "succeeded", verdict: "ok", ms: 5, attrs: { tool: "send_message", mount: "raft" } });
+const tool = (n: number): TraceRow => ({ at: 1_790_000_000_000 + n * 1000, ...OWNER, kind: "tool.call", spanId: `op_${n}`, status: "succeeded", verdict: "ok", ms: 5, attrs: { tool: "messages_send", mount: "raft" } });
 const answered = (n: number): TraceRow => ({ at: 1_790_000_000_000 + n * 1000, ...OWNER, kind: "model.call", spanId: `mj_${n}`, status: "stop", verdict: "ok", attrs: { model: "m" } });
 function gateway(mode: "send" | "skip" | "throw" = "send") {
   const g = {

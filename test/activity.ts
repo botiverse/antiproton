@@ -18,10 +18,10 @@ check("a delivered inbound row is the message that starts the turn; other inboun
 });
 
 check("a tool row is two events: the call dated its start and the result dated its end, named as the model names the tool", () => {
-  const ev = activityEvents("raft_a", [row(5, "tool.call", "succeeded", "ok", { ms: 2500, attrs: { tool: "send_message", mount: "raft" } })]);
+  const ev = activityEvents("raft_a", [row(5, "tool.call", "succeeded", "ok", { ms: 2500, attrs: { tool: "messages_send", mount: "raft" } })]);
   must(ev.length === 2, JSON.stringify(ev));
   const [pre, post] = ev;
-  must(pre!.hookEventName === "PreToolUse" && pre!.eventId === "raft_a:5:pre" && pre!.toolName === "raft__send_message" && pre!.occurredAt === new Date(T0 + 5000 - 2500).toISOString(), JSON.stringify(pre));
+  must(pre!.hookEventName === "PreToolUse" && pre!.eventId === "raft_a:5:pre" && pre!.toolName === "raft__messages_send" && pre!.occurredAt === new Date(T0 + 5000 - 2500).toISOString(), JSON.stringify(pre));
   must(post!.hookEventName === "PostToolUse" && post!.eventId === "raft_a:5" && post!.durationMs === 2500 && post!.errorClass === undefined && post!.occurredAt === new Date(T0 + 5000).toISOString(), JSON.stringify(post));
 });
 
@@ -69,11 +69,11 @@ check("in a real turn the tool call says which tool it is working on, on the Pre
   // The model asks for a tool (answer at 30s), the tool runs 30.005–30.2s, the model answers (stop at 31s).
   const ev = activityEvents("raft_a", [
     row(30, "model.call", "toolUse", "ok", { ms: 800 }),
-    { ...row(30, "tool.call", "succeeded", "ok", { ms: 195, attrs: { tool: "send_message", mount: "raft" } }), seq: 301, at: T0 + 30_200 },
+    { ...row(30, "tool.call", "succeeded", "ok", { ms: 195, attrs: { tool: "messages_send", mount: "raft" } }), seq: 301, at: T0 + 30_200 },
     row(31, "model.call", "stop", "ok", { ms: 700 }),
   ]);
   const pre = ev.find((e) => e.hookEventName === "PreToolUse");
-  must(pre?.status === "working" && pre.detail === "Using raft__send_message", JSON.stringify(pre));
+  must(pre?.status === "working" && pre.detail === "Using raft__messages_send", JSON.stringify(pre));
   must(ev.filter((e) => e.detail !== undefined).length === 1, `detail on other events: ${JSON.stringify(ev)}`);
 });
 

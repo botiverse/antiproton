@@ -1,7 +1,10 @@
 import { createHmac } from "node:crypto";
-import { createRaft, isInterrupted } from "@botiverse/raft-sdk";
-import { raftPlugin, INBOX_STORE, PUSH_KEY, PUSH_STORE } from "../src/plugins/raft.ts";
-import { Interrupt, type PluginErrorFields } from "../src/plugins/types.ts";
+import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
+import { raftPlugin, EXCLUDED, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf } from "../src/plugins/raft.ts";
+import { PARK_BYTES } from "../src/plugins/artifacts.ts";
+import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
+import { admitTools } from "../src/runtime/mount-tools.ts";
+import { AgentRuntime } from "../cf/src/runtime.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -125,28 +128,28 @@ async function failure(fn: () => Promise<unknown>): Promise<Error & PluginErrorF
   throw new Error("expected failure");
 }
 
-await check("declares the inbox pull as a write that repeats safely, and the rest as before", async () => {
+/** The tools this plugin writes by hand; every other tool is generated from the manifest. */
+const OWN = ["receive_events", "enable_push", "disable_push", "push_status"];
+const toolNamed = (name: string) => raftPlugin.tools.find((t) => t.name === name);
+const opNamed = (name: string) => RAFT_OPERATIONS.find((op) => op.name === name)!;
+/** A context in the model's own turn: no fromProgram, and a context id. */
+const inTurn = (c: any, contextId = "ctx_turn") => ({ ...c, caller: { ...c.caller, contextId } });
+
+await check("declares the inbox pull as a model-only write that repeats safely, and its push tools as before", async () => {
   if (raftPlugin.version !== "1.0.0") throw new Error(`unexpected plugin version: ${raftPlugin.version}`);
   // Only the model may pull: a program's pull would acknowledge and attest a batch the model never read.
-  const pull = raftPlugin.tools.find((tool) => tool.name === "receive_events");
+  const pull = toolNamed("receive_events");
   if (pull?.modelOnly !== true) throw new Error(`receive_events is callable from a program: ${JSON.stringify(pull)}`);
-  // Everything else stays callable from code, read_messages included: a program's read is sent with consume=false.
+  // Everything else stays callable from code: no generated operation is model-only (those the manifest marks so are excluded).
   const others = raftPlugin.tools.filter((tool) => tool.name !== "receive_events" && tool.modelOnly);
   if (others.length) throw new Error(`model-only beyond receive_events: ${others.map((t) => t.name).join(", ")}`);
   // Under cursor acknowledgement a pull acknowledges the previous batch (a write) and repeating it hands back
   // the same batch (native), which is what lets a failed pull be retried.
-  const receive = raftPlugin.tools.find((tool) => tool.name === "receive_events");
-  if (receive?.sideEffects !== "write" || receive.idempotency !== "native") {
-    throw new Error(`receive declaration: ${JSON.stringify(receive)}`);
-  }
-  if ("since" in ((receive.parameters as any).properties ?? {})) throw new Error("the model can still pass since; the cursor is the plugin's");
-  const send = raftPlugin.tools.find((tool) => tool.name === "send_message");
-  if (send?.sideEffects !== "write" || send.idempotency !== "key") throw new Error("send lost its key idempotency");
-  const join = raftPlugin.tools.find((tool) => tool.name === "join_channel");
-  if (join?.sideEffects !== "write" || join.idempotency !== "native") throw new Error("join lost native idempotency");
-  const enable = raftPlugin.tools.find((tool) => tool.name === "enable_push");
-  const disable = raftPlugin.tools.find((tool) => tool.name === "disable_push");
-  const status = raftPlugin.tools.find((tool) => tool.name === "push_status");
+  if (pull.sideEffects !== "write" || pull.idempotency !== "native") throw new Error(`receive declaration: ${JSON.stringify(pull)}`);
+  if ("since" in ((pull.parameters as any).properties ?? {})) throw new Error("the model can still pass since; the cursor is the plugin's");
+  const enable = toolNamed("enable_push");
+  const disable = toolNamed("disable_push");
+  const status = toolNamed("push_status");
   if (enable?.sideEffects !== "write" || enable.idempotency !== "none") throw new Error("enable_push declaration changed");
   if (disable?.sideEffects !== "write" || disable.idempotency !== "native") throw new Error("disable_push declaration changed");
   if (status?.sideEffects !== "read" || status.idempotency !== "native") throw new Error("push_status declaration changed");
@@ -154,22 +157,171 @@ await check("declares the inbox pull as a write that repeats safely, and the res
   if (serverUrl?.format !== "origin") throw new Error("serverUrl lost its origin guard");
 });
 
+/**
+ * The operations offered as tools, pinned by name. The plugin generates every manifest operation not in
+ * `EXCLUDED`, so without this list an operation a new SDK adds would become a tool with nobody deciding it.
+ */
+const EXPECTED_GENERATED = [
+  "identity.whoami", "inbox.list", "messages.read", "messages.send", "messages.reply", "messages.search", "messages.resolve",
+  "messages.react", "messages.unreact", "attachments.comments", "mentions.pending", "mentions.deliveries", "actions.prepare",
+  "manual.get", "manual.search", "tasks.claim", "tasks.list", "tasks.create", "tasks.unclaim", "tasks.assign", "tasks.unassign",
+  "tasks.updateStatus", "tasks.amend", "tasks.history", "tasks.convert", "tasks.delete", "channels.join", "channels.leave",
+  "channels.mute", "channels.unmute", "channels.members", "threads.list", "threads.unfollow", "server.info", "profile.show",
+];
+
+await check("every manifest operation is a generated tool or in the exclusion table, never both, and every exclusion names a real operation", async () => {
+  const names = RAFT_OPERATIONS.map((op) => op.name);
+  const excluded = Object.keys(EXCLUDED);
+  const unaccounted = names.filter((n) => !EXPECTED_GENERATED.includes(n) && !excluded.includes(n));
+  if (unaccounted.length) throw new Error(`neither generated nor excluded (decide which, and say why if excluded): ${unaccounted.join(", ")}`);
+  const unreal = [...excluded, ...EXPECTED_GENERATED].filter((n) => !names.includes(n));
+  if (unreal.length) throw new Error(`names no manifest operation: ${unreal.join(", ")}`);
+  const both = excluded.filter((n) => EXPECTED_GENERATED.includes(n));
+  if (both.length) throw new Error(`both generated and excluded: ${both.join(", ")}`);
+  const reasonless = excluded.filter((n) => typeof EXCLUDED[n] !== "string" || EXCLUDED[n]!.length < 20);
+  if (reasonless.length) throw new Error(`an exclusion without its reason: ${reasonless.join(", ")}`);
+  // What the plugin actually offers follows the table: each generated operation once, by its manifest toolName, and no excluded one.
+  const generated = GENERATED.map((op) => op.name);
+  if (JSON.stringify(generated) !== JSON.stringify(names.filter((n) => EXPECTED_GENERATED.includes(n)))) throw new Error(`generated: ${generated.join(", ")}`);
+  const offered = raftPlugin.tools.map((t) => t.name);
+  const want = [...OWN, ...RAFT_OPERATIONS.filter((op) => EXPECTED_GENERATED.includes(op.name)).map((op) => op.toolName)];
+  if (JSON.stringify(offered) !== JSON.stringify(want)) throw new Error(`offered: ${offered.join(", ")}`);
+  if (new Set(offered).size !== offered.length) throw new Error("two tools share a name");
+});
+
+/** The JSON Schema a generated tool may use: what every model provider takes, and what the manifest promises to stay within. */
+const SCHEMA_KEYWORDS = new Set(["type", "properties", "required", "items", "enum", "description", "additionalProperties", "minimum", "maximum", "minLength", "maxLength"]);
+const SCHEMA_TYPES = new Set(["object", "string", "integer", "number", "boolean", "array"]);
+function schemaProblems(schema: unknown, path: string): string[] {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [`${path}: not an inline schema object`];
+  const s = schema as Record<string, unknown>;
+  const out = Object.keys(s).filter((k) => !SCHEMA_KEYWORDS.has(k)).map((k) => `${path}: ${k}`);
+  if (s.type !== undefined && (typeof s.type !== "string" || !SCHEMA_TYPES.has(s.type))) out.push(`${path}: type ${JSON.stringify(s.type)}`);
+  if (s.type === undefined && s.enum === undefined) out.push(`${path}: neither a type nor an enum`);
+  if (s.enum !== undefined && (!Array.isArray(s.enum) || !s.enum.every((v) => ["string", "number", "boolean"].includes(typeof v)))) out.push(`${path}: enum ${JSON.stringify(s.enum)}`);
+  if (s.additionalProperties !== undefined && typeof s.additionalProperties !== "boolean") out.push(`${path}: additionalProperties is a schema`);
+  for (const k of ["minimum", "maximum", "minLength", "maxLength"]) if (s[k] !== undefined && typeof s[k] !== "number") out.push(`${path}: ${k}`);
+  if (s.description !== undefined && typeof s.description !== "string") out.push(`${path}: description`);
+  if (s.properties !== undefined) {
+    if (!s.properties || typeof s.properties !== "object" || Array.isArray(s.properties)) out.push(`${path}: properties`);
+    else for (const [name, sub] of Object.entries(s.properties)) out.push(...schemaProblems(sub, `${path}.${name}`));
+  }
+  if (s.required !== undefined && (!Array.isArray(s.required) || !s.required.every((r) => typeof r === "string" && Object.hasOwn((s.properties ?? {}) as object, r)))) {
+    out.push(`${path}: required ${JSON.stringify(s.required)}`);
+  }
+  if (s.items !== undefined) out.push(...schemaProblems(s.items, `${path}[]`));
+  if (s.type === "array" && s.items === undefined) out.push(`${path}: an array without items`);
+  return out;
+}
+
+await check("every tool's parameters stay inside the schema subset: inline objects, primitive types, enum, array — no $ref, oneOf, anyOf, allOf or const", async () => {
+  const problems = raftPlugin.tools.flatMap((t) => {
+    const p = t.parameters as any;
+    return [...(p?.type !== "object" ? [`${t.name}: not an object at the top`] : []), ...schemaProblems(p, t.name)];
+  });
+  if (problems.length) throw new Error(problems.join("; "));
+  // Positive control: the walker sees each kind of keyword it refuses, at any depth.
+  for (const bad of [{ $ref: "#/x" }, { oneOf: [] }, { anyOf: [] }, { allOf: [] }, { const: 1 }, { $defs: {} }, { type: ["string", "null"] }, { type: "null" }]) {
+    const nested = { type: "object", properties: { a: { type: "array", items: { type: "object", properties: { b: bad } } } } };
+    if (!schemaProblems(nested, "control").length) throw new Error(`the walker accepted ${JSON.stringify(bad)}`);
+  }
+});
+
+await check("the manifest's declarations map onto the tool: side effect, model-only, idempotency, description and schema", async () => {
+  for (const op of GENERATED) {
+    const t = toolNamed(op.toolName)!;
+    if (t.sideEffects !== op.sideEffect) throw new Error(`${op.name}: sideEffects ${t.sideEffects}`);
+    if ((t.modelOnly === true) !== op.modelOnly) throw new Error(`${op.name}: modelOnly ${t.modelOnly}`);
+    const want = { natural: "native", key: "key", none: "none" }[op.idempotency.kind];
+    if (t.idempotency !== want) throw new Error(`${op.name}: idempotency ${t.idempotency}`);
+    if (!t.summary.startsWith(op.description.slice(0, 12))) throw new Error(`${op.name}: description ${t.summary}`);
+    const props = Object.keys((t.parameters as any).properties ?? {});
+    if (JSON.stringify(props) !== JSON.stringify(Object.keys(op.inputSchema.properties ?? {}))) throw new Error(`${op.name}: parameters ${props.join()}`);
+    if (JSON.stringify((t.parameters as any).required ?? null) !== JSON.stringify(op.inputSchema.required ?? null)) throw new Error(`${op.name}: required`);
+  }
+  // The decisions the manifest makes that a hand-written tool once made differently.
+  if (toolNamed("tasks_create")?.idempotency !== "none" || toolNamed("actions_prepare")?.idempotency !== "none") throw new Error("tasks_create or actions_prepare repeats on its own");
+  if (toolNamed("messages_send")?.idempotency !== "key" || toolNamed("messages_send")?.sideEffects !== "write") throw new Error("messages_send lost its key idempotency");
+  const assign = toolNamed("tasks_assign")!.parameters as any;
+  if (!assign.required.includes("assignee") || !toolNamed("tasks_unassign")) throw new Error("tasks_assign no longer requires assignee, or tasks_unassign is gone");
+  // A dotted operation name in a description is written as the tool the model is offered.
+  if (!/tasks_unassign/.test(toolNamed("tasks_assign")!.summary) || /tasks\.unassign/.test(toolNamed("tasks_assign")!.summary)) throw new Error(toolNamed("tasks_assign")!.summary);
+  // Model-only and an unknown side effect, on the manifest's own model-only operation (excluded here, so not offered): carried and made a write.
+  const pull = toolOf(opNamed("inbox.check"));
+  if (pull.modelOnly !== true) throw new Error(`a model-only operation lost modelOnly when generated: ${JSON.stringify(pull)}`);
+  if (toolOf({ ...opNamed("profile.show"), sideEffect: "sometimes" as never }).sideEffects !== "write") throw new Error("an unknown side effect became a read");
+});
+
+await check("a model-only operation is refused from a program twice: by the gateway on modelOnly, and by the SDK as MODEL_ONLY before any request", async () => {
+  // The gateway layer: a mount offering a generated model-only operation, called from a run_js program.
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({ tenantId: "tenant", agentId: "agent", alias: "inbox", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: raftPlugin.version, publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null });
+  const withPull = { ...raftPlugin, mountTools: () => [...raftPlugin.tools, toolOf(opNamed("inbox.check"))] };
+  const gateway = new ToolGateway(store, [withPull], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return json(200, {}); }) as any;
+  const refused: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" } as any, "inbox.inbox_check", {}, { fromProgram: true });
+  if (refused.status !== "rejected" || refused.error?.code !== "not_from_a_program") throw new Error(`gateway: ${JSON.stringify(refused)}`);
+  // Control: the same call from the model gets past the gateway to the plugin (which offers no such operation of its own).
+  const passed: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "ctx_turn" } as any, "inbox.inbox_check", {});
+  if (passed.error?.code === "not_from_a_program") throw new Error(`the model's call was refused too: ${JSON.stringify(passed)}`);
+  // The SDK layer: under origin "code" a model-only operation fails with MODEL_ONLY and nothing is sent.
+  const raft = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" });
+  const out: any = await raft.invoke("inbox.check", {}, originOf({ caller: { tenantId: "t", agentId: "a", taskId: "k", fromProgram: true, contextId: "c" } } as any));
+  if (out.ok || out.error?.code !== "MODEL_ONLY" || fetched !== 0) throw new Error(`SDK: ${JSON.stringify(out)} fetched=${fetched}`);
+});
+
+await check("the origin is the model's only for a call in its turn that no program made; everything else is code", async () => {
+  const of = (caller: Record<string, unknown>) => originOf({ caller: { tenantId: "t", agentId: "a", taskId: "k", ...caller } } as any);
+  const cases: Array<[Record<string, unknown>, unknown]> = [
+    [{ contextId: "c1" }, { origin: "model", contextId: "c1" }],
+    [{ fromProgram: true, contextId: "c1" }, { origin: "code", contextId: "c1" }],
+    [{ fromProgram: true }, { origin: "code" }],
+    [{}, { origin: "code" }],
+  ];
+  for (const [caller, want] of cases) {
+    if (JSON.stringify(of(caller)) !== JSON.stringify(want)) throw new Error(`${JSON.stringify(caller)} → ${JSON.stringify(of(caller))}`);
+  }
+});
+
+/** A Server answer of the shape the SDK validates for one operation's request. */
+const HELD = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
+  heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
+const HELD_LINE = "[target=#general msg=abcdef12 time=2026-09-28 10:00:00Z type=human] @tygg: wait, one more thing";
+// The Server's held envelope as it is sent today: the message, with no conversation fields of its own.
+const HELD_BARE = (extra: Record<string, unknown> = {}) => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0,
+  freshnessContextMode: "inline", heldMessages: [{ seq: 20, id: "abcdef12-0000", channelId: "c-1", content: "a DM body", sender_type: "agent", sender_name: "cody" }], ...extra });
+const SENT = (n = 21) => json(200, { ok: true, state: "sent", messageId: `m-${n}`, messageSeq: n });
+
+/** One message of `GET /internal/agent-api/history` as the Server sends it. */
+function historyMessage(seq: number, content: string, extra: Record<string, unknown> = {}) {
+  return {
+    id: `m-${seq}cccccc`, seq, content, sender_type: "human", sender_name: "tygg", timestamp: "2026-09-28T10:00:00Z",
+    channel_name: "wg-raft-sdk", channel_type: "channel", ...extra,
+  };
+}
+function history(messages: unknown[], more: { has_older?: boolean; has_newer?: boolean; target?: string } = {}) {
+  return json(200, {
+    target: more.target ?? "#wg-raft-sdk", messages,
+    has_more: Boolean(more.has_older || more.has_newer), has_older: more.has_older ?? false, has_newer: more.has_newer ?? false,
+  });
+}
+
 await check("serverUrl rejects cleartext non-loopback origins before sending the credential", async () => {
   globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
-  const why = await failure(() => raftPlugin.invoke("send_message", {
+  const why = await failure(() => raftPlugin.invoke("messages_send", {
     target: "#general", content: "hello", idempotencyKey: "stable-http-rejection",
   }, ctx("sk_agent_test_1234567890", { serverUrl: "http://raft.example" })));
   if (!/https/.test(why.message) || /network reached/.test(why.message)) throw why;
 });
 
-await check("send uses the configured origin, keeps the credential host-side, and projects the response", async () => {
+await check("messages_send uses the configured origin, keeps the credential host-side, and answers with the SDK's state and text only", async () => {
   const calls = one(json(200, { ok: true, state: "sent", messageId: "m-1", messageSeq: 7, serverExtra: "also hidden" }));
-  const out = await raftPlugin.invoke("send_message", {
-    target: "#general", content: "hello", idempotencyKey: "stable-1",
-  }, ctx()) as any;
-  if (JSON.stringify(out) !== JSON.stringify({ state: "sent", messageId: "m-1", messageSeq: 7 })) {
-    throw new Error(`unexpected projection: ${JSON.stringify(out)}`);
-  }
+  const out = await raftPlugin.invoke("messages_send", { target: "#general", content: "hello", idempotencyKey: "stable-1" }, inTurn(ctx())) as any;
+  if (JSON.stringify(out) !== JSON.stringify({ state: "sent", text: "Message sent to #general. Message ID: m-1" })) throw new Error(`unexpected projection: ${JSON.stringify(out)}`);
   if (calls.length !== 1 || !calls[0]!.url.startsWith("https://raft.example/internal/agent-api/") || !/\/send$/.test(calls[0]!.url)) {
     throw new Error(`wrong request: ${JSON.stringify(calls.map((c) => c.url))}`);
   }
@@ -177,83 +329,78 @@ await check("send uses the configured origin, keeps the credential host-side, an
   if (headers.get("authorization") !== "Bearer sk_agent_test_1234567890") throw new Error("credential not attached");
   if (String(calls[0]!.init.body).includes("sk_agent_")) throw new Error("credential entered the JSON body");
   const body = JSON.parse(String(calls[0]!.init.body));
-  if (body.idempotencyKey !== "stable-1" || body.target !== "#general" || body.content !== "hello") {
-    throw new Error(`wrong send body: ${JSON.stringify(body)}`);
-  }
-  if (calls[0]!.init.redirect !== "manual") {
-    throw new Error(`fetch must use the Workers-compatible manual redirect guard: ${calls[0]!.init.redirect}`);
-  }
+  if (body.idempotencyKey !== "stable-1" || body.target !== "#general" || body.content !== "hello") throw new Error(`wrong send body: ${JSON.stringify(body)}`);
+  if (calls[0]!.init.redirect !== "manual") throw new Error(`fetch must use the Workers-compatible manual redirect guard: ${calls[0]!.init.redirect}`);
 });
 
-await check("a message with no conversation identity never reaches the model as a made-up target", async () => {
-  one(json(200, { ok: true, state: "sent", messageId: "m-5", messageSeq: 8, recentUnread: [{ content: "no channel fields" }] }));
-  const out = await raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-n" }, ctx()) as any;
-  if (/undefined|no channel fields/.test(JSON.stringify(out))) throw new Error(`an unplaceable message reached the result: ${JSON.stringify(out)}`);
+await check("an argument the manifest does not advertise never reaches the SDK: a caller cannot pass seen to skip the hold", async () => {
+  // `seen` is a code-only knob the SDK accepts on a send: it overrides what the send attests. From the model it would
+  // answer the hold's question for it. The control is a resume this plugin makes itself, which does pass it.
+  const calls = many(HELD());
+  const out = await raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-seen", seen: { upToSeq: 999 } }, inTurn(mount().ctx));
+  const body = JSON.parse(String(calls[0]!.init.body));
+  if (body.seenUpToSeq === 999 || "seen" in body || !(out instanceof Interrupt)) throw new Error(`the caller's seen went through: ${JSON.stringify(body)}`);
+  const m = mount();
+  const resumed = many(SENT());
+  await raftPlugin.interrupts!.resume("messages_send", { op: "messages.send", args: { target: "#general", content: "x", idempotencyKey: "k-seen" }, seen: { upToSeq: 20 } }, "send", inTurn(m.ctx));
+  if (JSON.parse(String(resumed[0]!.init.body)).seenUpToSeq !== 20) throw new Error(`control: the plugin's own resume did not attest: ${resumed[0]!.init.body}`);
 });
-
-const HELD = () => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0, freshnessContextMode: "inline",
-  heldMessages: [{ seq: 20, id: "abcdef12-0000", content: "wait, one more thing", sender_type: "human", sender_name: "tygg", channel_name: "general", channel_type: "channel", timestamp: "2026-09-28T10:00:00Z" }] });
-const HELD_LINE = "[target=#general msg=abcdef12 time=2026-09-28 10:00:00Z type=human] @tygg: wait, one more thing";
 
 await check("a held send is a question for the agent: send or drop, with the newer messages as lines, and nothing sent", async () => {
   const m = mount();
   const calls = many(HELD());
-  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-held" }, inTurn(m.ctx)) as any;
   if (!(held instanceof Interrupt)) throw new Error(`a held send must interrupt, got ${JSON.stringify(held)}`);
   if (!/newer message arrived in #general/.test(held.question) || JSON.stringify(held.answer) !== '{"choices":["send","drop"]}' ||
       (held.context as any)?.messages?.[0] !== HELD_LINE) {
     throw new Error(`the question: ${JSON.stringify(held)}`);
   }
   const st = held.state as any;
-  if (st.target !== "#general" || st.content !== "done" || st.idempotencyKey !== "k-held" || st.seen?.upToSeq !== 20) {
-    throw new Error(`the state must carry the send and its continuation: ${JSON.stringify(st)}`);
+  if (st.op !== "messages.send" || st.args?.target !== "#general" || st.args?.content !== "done" || st.args?.idempotencyKey !== "k-held" || st.seen?.upToSeq !== 20) {
+    throw new Error(`the state must carry the call and its continuation: ${JSON.stringify(st)}`);
   }
   if (calls.length !== 1) throw new Error(`only the held attempt reached Raft: ${calls.length}`);
 });
 
 await check("resume \"send\" sends the same message under the same key and attests what the question showed", async () => {
   const m = mount();
-  const calls = many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
-  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
-  // A fresh client, as it would be in a new process: the state is all it has.
-  const sent = await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx) as any;
+  const calls = many(HELD(), SENT());
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-held" }, inTurn(m.ctx)) as any;
+  const sent = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", inTurn(m.ctx)) as any;
   const second = JSON.parse(String(calls[1]!.init.body));
   if (sent.state !== "sent" || second.seenUpToSeq !== 20 || second.idempotencyKey !== "k-held" || second.content !== "done") {
     throw new Error(`the resumed send did not attest what the model saw: ${JSON.stringify({ sent, second })}`);
   }
 });
 
-await check("resume \"send\" attests from the state alone, even when the frontier was not saved", async () => {
+await check("a send with no key is held under the key the SDK made, and resume sends under that same key", async () => {
   const m = mount();
-  const calls = many(json(200, { ok: true, state: "sent", messageId: "m-3", messageSeq: 22 }));
-  const sent = await raftPlugin.interrupts!.resume("send_message",
-    { target: "#general", content: "done", idempotencyKey: "k-x", seen: { upToSeq: 20 } }, "send", m.ctx) as any;
-  const body = JSON.parse(String(calls[0]!.init.body));
-  if (sent.state !== "sent" || body.seenUpToSeq !== 20 || body.idempotencyKey !== "k-x") throw new Error(`not attested: ${JSON.stringify(body)}`);
+  const calls = many(HELD(), SENT());
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done" }, inTurn(m.ctx)) as any;
+  const made = JSON.parse(String(calls[0]!.init.body)).idempotencyKey;
+  if (typeof made !== "string" || (held.state as any).args?.idempotencyKey !== made) throw new Error(`state: ${JSON.stringify(held.state)} made=${made}`);
+  await raftPlugin.interrupts!.resume("messages_send", held.state, "send", inTurn(m.ctx));
+  if (JSON.parse(String(calls[1]!.init.body)).idempotencyKey !== made) throw new Error(`the resume used another key: ${calls[1]!.init.body}`);
 });
 
 await check("resume \"send\" into a conversation that moved again asks again, with the newer messages", async () => {
   const m = mount();
   many(HELD(), HELD());
-  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
-  const again = await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx) as any;
-  if (!(again instanceof Interrupt) || (again.state as any).idempotencyKey !== "k-held") throw new Error(`a second hold must ask again: ${JSON.stringify(again)}`);
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-held" }, inTurn(m.ctx)) as any;
+  const again = await raftPlugin.interrupts!.resume("messages_send", held.state, "send", inTurn(m.ctx)) as any;
+  if (!(again instanceof Interrupt) || (again.state as any).args?.idempotencyKey !== "k-held") throw new Error(`a second hold must ask again: ${JSON.stringify(again)}`);
 });
-
-// The Server's held envelope as it is sent today: the message, with no conversation fields of its own.
-const HELD_BARE = (extra: Record<string, unknown> = {}) => json(200, { ok: true, state: "held", newMessageCount: 1, seenUpToSeq: 20, omittedMessageCount: 0,
-  freshnessContextMode: "inline", heldMessages: [{ seq: 20, id: "abcdef12-0000", channelId: "c-1", content: "a DM body", sender_type: "agent", sender_name: "cody" }], ...extra });
 
 await check("a held message with no conversation fields of its own is shown under the send's target, and attested", async () => {
   const m = mount();
-  const calls = many(HELD_BARE(), json(200, { ok: true, state: "sent", messageId: "m-9", messageSeq: 21 }));
-  const held = await raftPlugin.invoke("send_message", { target: "dm:@cody", content: "done", idempotencyKey: "k-b" }, m.ctx) as any;
+  const calls = many(HELD_BARE(), SENT());
+  const held = await raftPlugin.invoke("messages_send", { target: "dm:@cody", content: "done", idempotencyKey: "k-b" }, inTurn(m.ctx)) as any;
   const lines = (held.context as any)?.messages ?? [];
   if (!(held instanceof Interrupt) || lines.length !== 1 || !/a DM body/.test(lines[0]) || !/send your message anyway/.test(held.question) ||
       (held.state as any).seen?.upToSeq !== 20) {
     throw new Error(`the held message was not shown, or not attested: ${JSON.stringify(held)}`);
   }
-  await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx);
+  await raftPlugin.interrupts!.resume("messages_send", held.state, "send", inTurn(m.ctx));
   if (JSON.parse(String(calls[1]!.init.body)).seenUpToSeq !== 20) throw new Error("the resend did not attest what was shown");
 });
 
@@ -264,57 +411,65 @@ for (const [why, extra] of [
   await check(`a held send ${why} attests nothing and tells the agent to read the conversation first`, async () => {
     const m = mount();
     const calls = many(HELD_BARE(extra), HELD_BARE(extra));
-    const held = await raftPlugin.invoke("send_message", { target: "dm:@cody", content: "done", idempotencyKey: "k-u" }, m.ctx) as any;
-    if (!(held instanceof Interrupt) || !/read dm:@cody with receive_events first/.test(held.question) || (held.state as any).seen !== undefined) {
+    const held = await raftPlugin.invoke("messages_send", { target: "dm:@cody", content: "done", idempotencyKey: "k-u" }, inTurn(m.ctx)) as any;
+    if (!(held instanceof Interrupt) || !/read dm:@cody with messages_read first/.test(held.question) || (held.state as any).seen !== undefined) {
       throw new Error(`an unattestable hold was treated as seen: ${JSON.stringify(held)}`);
     }
-    // Neither the answer nor a plain resend may claim the model saw it.
-    await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx);
+    await raftPlugin.interrupts!.resume("messages_send", held.state, "send", inTurn(m.ctx));
     const second = JSON.parse(String(calls[1]!.init.body));
     if (second.seenUpToSeq !== undefined) throw new Error(`the resend attested what was not shown: ${JSON.stringify(second)}`);
   });
 }
 
-await check("resume \"drop\" sends nothing", async () => {
-  const m = mount();
-  globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
-  const out = await raftPlugin.interrupts!.resume("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, "drop", m.ctx) as any;
-  if (out.state !== "dropped" || !/new idempotencyKey/.test(out.note)) throw new Error(`drop: ${JSON.stringify(out)}`);
-});
-
-await check("drop sends nothing, and the plugin declares no cancel: an in-process held send leaves nothing to clear", async () => {
+await check("drop sends nothing, and the plugin declares no cancel: an in-process held call leaves nothing to clear", async () => {
   const m = mount();
   one(HELD());
-  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-cancel" }, m.ctx) as any;
+  const held = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-cancel" }, inTurn(m.ctx)) as any;
   if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
   let sent = 0;
   globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
-  const dropped = await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx) as any;
-  if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
+  const dropped = await raftPlugin.interrupts!.resume("messages_send", held.state, "drop", inTurn(m.ctx)) as any;
+  if (dropped.state !== "dropped" || !/new idempotencyKey/.test(dropped.note)) throw new Error(JSON.stringify(dropped));
   if (raftPlugin.interrupts!.cancel !== undefined) throw new Error("the plugin grew a cancel; this case no longer says what it does");
   if (sent !== 0) throw new Error(`drop reached Raft ${sent} time(s)`);
+  const why = await failure(() => raftPlugin.interrupts!.resume("messages_send", held.state, "maybe", inTurn(m.ctx)));
+  if (!/must be "send" or "drop"/.test(why.message) || sent !== 0) throw why;
+  const notAsking = await failure(() => raftPlugin.interrupts!.resume("messages_read", held.state, "send", inTurn(m.ctx)));
+  if (!/does not ask questions/.test(notAsking.message)) throw notAsking;
 });
 
-await check("the held send's key and the CLI's draft flags never reach the model: not in the question, its context, or what resume and drop return", async () => {
+await check("the held call's key and the CLI's argv never reach the model: not in the question, its context, or what resume and drop return", async () => {
   // The key is distinctive so its presence in the SDK's interrupt is a positive control for the absence below.
   const KEY = "k-argv-sentinel-5e1d";
-  const CLI = ["--send-draft", "--discard-draft", "--expected-draft-key", KEY];
+  const CLI = ["--send-draft", "--discard-draft", "--expected-draft-key", "raft message", "raft task", KEY];
   one(HELD());
   const raw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" })
     .messages.send({ target: "#general", content: "done", idempotencyKey: KEY });
-  // An in-process held send: the original key to send again with, and no command form or cancel at all.
   if (!isInterrupted(raw) || raw.interrupt.resume.idempotencyKey !== KEY || raw.interrupt.resume.argv !== undefined || raw.interrupt.cancel !== undefined) {
     throw new Error(`control: the SDK's interrupt: ${JSON.stringify(raw)}`);
   }
-  const m = mount();
+  // A held task claim carries the CLI's argv in its resume: the control that the check below can see one.
   one(HELD());
-  const held = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: KEY }, m.ctx) as any;
-  if (!(held instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(held)}`);
-  // What run_js and resume show the model of a question: question, context and answer (the state stays host-side).
-  const shown: Array<[string, unknown]> = [["the question", { question: held.question, context: held.context, answer: held.answer }]];
-  one(json(200, { ok: true, state: "sent", messageId: "m-argv", messageSeq: 21 }));
-  shown.push(["resume send", await raftPlugin.interrupts!.resume("send_message", held.state, "send", m.ctx)]);
-  shown.push(["resume drop", await raftPlugin.interrupts!.resume("send_message", held.state, "drop", m.ctx)]);
+  const claimRaw = await createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" }).tasks.claim({ target: "#general", taskNumbers: [7] });
+  const argv = isInterrupted(claimRaw) ? claimRaw.interrupt.resume.argv ?? [] : [];
+  if (!argv.includes("claim") || !argv.includes("--number")) throw new Error(`control: the claim's interrupt: ${JSON.stringify(claimRaw)}`);
+  // The argv's flags and the command it spells, as the model would be shown them.
+  CLI.push(...argv.filter((a) => a.startsWith("--")), argv.join(" "));
+  const shown: Array<[string, unknown]> = [];
+  for (const [tool, args, go] of [
+    ["messages_send", { target: "#general", content: "done", idempotencyKey: KEY }, "send"],
+    ["tasks_claim", { target: "#general", taskNumbers: [7] }, "proceed"],
+  ] as const) {
+    const m = mount();
+    one(HELD());
+    const held = await raftPlugin.invoke(tool, args, inTurn(m.ctx)) as any;
+    if (!(held instanceof Interrupt)) throw new Error(`${tool} not held: ${JSON.stringify(held)}`);
+    // What run_js and resume show the model of a question: question, context and answer (the state stays host-side).
+    shown.push([`${tool}'s question`, { question: held.question, context: held.context, answer: held.answer }]);
+    one(go === "send" ? SENT() : json(200, { results: [{ taskNumber: 7, success: true }] }));
+    shown.push([`${tool} resumed`, await raftPlugin.interrupts!.resume(tool, held.state, go, inTurn(m.ctx))]);
+    shown.push([`${tool} dropped`, await raftPlugin.interrupts!.resume(tool, held.state, "drop", inTurn(m.ctx))]);
+  }
   for (const [where, value] of shown) {
     const text = JSON.stringify(value);
     const leaked = CLI.filter((piece) => text.includes(piece));
@@ -338,7 +493,7 @@ await check("the held send's question is the plugin's own: the SDK's held text, 
   }
   const m = mount();
   one(held());
-  const asked = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-context" }, m.ctx) as any;
+  const asked = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-context" }, inTurn(m.ctx)) as any;
   if (!(asked instanceof Interrupt)) throw new Error(`not held: ${JSON.stringify(asked)}`);
   const shown = JSON.stringify({ question: asked.question, context: asked.context, answer: asked.answer });
   for (const piece of [SENTINEL, "raft message read", raw.interrupt.context, raw.text]) {
@@ -346,8 +501,22 @@ await check("the held send's question is the plugin's own: the SDK's held text, 
   }
 });
 
-await check("a send held under SDK 0.3.2, still waiting across the upgrade, resumes and drops as before", async () => {
-  // The state 0.3.2's plugin recorded: the send plus `out.data.continuation` ({ idempotencyKey, seen? }).
+await check("a held task claim asks proceed or drop, and proceed makes the identical claim again", async () => {
+  const m = mount();
+  const calls = many(HELD(), json(200, { results: [{ taskNumber: 7, success: true }] }));
+  const held = await raftPlugin.invoke("tasks_claim", { target: "#general", taskNumbers: [7] }, inTurn(m.ctx)) as any;
+  if (!(held instanceof Interrupt) || JSON.stringify(held.answer) !== '{"choices":["proceed","drop"]}' || !/go ahead with tasks_claim anyway/.test(held.question)) {
+    throw new Error(`the question: ${JSON.stringify(held)}`);
+  }
+  if ("idempotencyKey" in ((held.state as any).args ?? {}) || "seen" in (held.state as any)) throw new Error(`a claim carries a send's continuation: ${JSON.stringify(held.state)}`);
+  const out = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "proceed", inTurn(m.ctx)) as any;
+  if (calls.length !== 2 || calls[1]!.init.body !== calls[0]!.init.body || out.state !== "claimed") throw new Error(`resume: ${JSON.stringify({ out, bodies: calls.map((c) => c.init.body) })}`);
+  const dropped = await raftPlugin.interrupts!.resume("tasks_claim", held.state, "drop", inTurn(m.ctx)) as any;
+  if (dropped.state !== "dropped" || !/Nothing was done/.test(dropped.note)) throw new Error(JSON.stringify(dropped));
+});
+
+await check("a send held under the old send_message tool, still waiting across the change, resumes and drops as before", async () => {
+  // The state the hand-written send_message recorded: the send plus its continuation ({ idempotencyKey, seen? }).
   const old = { target: "#general", content: "done", idempotencyKey: "k-032", seen: { upToSeq: 20 } };
   const m = mount();
   const calls = many(json(200, { ok: true, state: "sent", messageId: "m-032", messageSeq: 21 }));
@@ -360,42 +529,36 @@ await check("a send held under SDK 0.3.2, still waiting across the upgrade, resu
   const plain = many(json(200, { ok: true, state: "sent", messageId: "m-033", messageSeq: 22 }));
   await raftPlugin.interrupts!.resume("send_message", withoutSeen, "send", m.ctx);
   if (JSON.parse(String(plain[0]!.init.body)).idempotencyKey !== "k-032") throw new Error(`no-seen resume: ${plain[0]!.init.body}`);
+  // Held again on resume, it asks again under the old tool, so the next answer comes back here too; its key stays host-side.
+  one(HELD());
+  const again = await raftPlugin.interrupts!.resume("send_message", old, "send", m.ctx) as any;
+  if (!(again instanceof Interrupt) || (again.state as any).idempotencyKey !== "k-032" || JSON.stringify({ q: again.question, c: again.context }).includes("k-032")) {
+    throw new Error(`held again: ${JSON.stringify(again)}`);
+  }
   globalThis.fetch = (async () => { throw new Error("network reached on drop"); }) as any;
   const dropped = await raftPlugin.interrupts!.resume("send_message", old, "drop", m.ctx) as any;
-  if (dropped.state !== "dropped") throw new Error(JSON.stringify(dropped));
+  if (dropped.state !== "dropped" || !/messages_send/.test(dropped.note)) throw new Error(JSON.stringify(dropped));
+  const bad = await failure(() => raftPlugin.interrupts!.resume("send_message", old, "maybe", m.ctx));
+  if (!/must be "send" or "drop"/.test(bad.message)) throw bad;
 });
 
 await check("a Server conflict on a send is an ordinary refusal: not retryable, nothing landed", async () => {
   one(json(409, { errorCode: "conflict", message: "conflict" }));
-  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-conflict" }, ctx()));
+  const why = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-conflict" }, inTurn(ctx())));
   if (why.retryable !== false || why.transient !== false || why.mayHaveLanded === true) {
     throw new Error(`marks: retryable=${why.retryable} transient=${why.transient} mayHaveLanded=${why.mayHaveLanded} ${why.message}`);
   }
 });
 
-await check("resume refuses an answer that is neither send nor drop, and sends nothing", async () => {
-  const m = mount();
-  globalThis.fetch = (async () => { throw new Error("network reached on a bad answer"); }) as any;
-  const why = await failure(() => raftPlugin.interrupts!.resume("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, "maybe", m.ctx));
-  if (!/must be "send" or "drop"/.test(why.message)) throw why;
-});
-
 await check("the same send again with the same key, outside resume, still attests the held messages and goes through", async () => {
   const m = mount();
-  const calls = many(HELD(), json(200, { ok: true, state: "sent", messageId: "m-2", messageSeq: 21 }));
-  await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx);
-  // A second invocation is a fresh client, as it would be in a new process: what the model was shown survives in the database.
-  const sent = await raftPlugin.invoke("send_message", { target: "#general", content: "done", idempotencyKey: "k-held" }, m.ctx) as any;
+  const calls = many(HELD(), SENT());
+  await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-held" }, inTurn(m.ctx));
+  const sent = await raftPlugin.invoke("messages_send", { target: "#general", content: "done", idempotencyKey: "k-held" }, inTurn(m.ctx)) as any;
   const second = JSON.parse(String(calls[1]!.init.body));
   if (sent.state !== "sent" || second.seenUpToSeq !== 20 || second.idempotencyKey !== "k-held") {
     throw new Error(`the resend did not attest what the model saw: ${JSON.stringify({ sent, second })}`);
   }
-});
-
-await check("send requires a stable idempotency key before reaching Raft", async () => {
-  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
-  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "hello" }, ctx()));
-  if (!/idempotencyKey/.test(why.message)) throw why;
 });
 
 /** A /events answer in the shape the Raft SDK validates. */
@@ -474,30 +637,22 @@ await check("a version-2 mount's cursor and frontier become the SDK's state: the
   if (tables.get(scope, "inbox", "cursor") !== undefined || tables.get(scope, "inbox", "frontier") !== undefined) throw new Error("version-2 keys survived");
 });
 
-await check("prepare_action posts one of the three model-preparable cards and says nothing has happened yet", async () => {
+await check("actions_prepare posts the card the manifest describes, as a write that never repeats on its own", async () => {
   const calls = one(json(200, { messageId: "abcdef12-3456", metadata: { kind: "action-card" } }));
-  const out = await raftPlugin.invoke("prepare_action", {
+  const out = await raftPlugin.invoke("actions_prepare", {
     target: "#general", action: { type: "channel:create", name: "launch-room", draftHint: "for Thursday's launch" },
-  }, ctx()) as any;
-  if (out.prepared !== true || out.messageId !== "abcdef12-3456" || !/Nothing has happened yet/.test(out.note) ||
-      !/Action card posted to #general/.test(out.text) || /raft message read/.test(JSON.stringify(out)) || /arrives in your inbox/.test(out.note)) {
-    throw new Error(JSON.stringify(out));
-  }
+  }, inTurn(ctx())) as any;
+  if (out.state === undefined || !/Action card posted to #general/.test(out.text)) throw new Error(JSON.stringify(out));
   const body = JSON.parse(String(calls[0]!.init.body));
   if (!/\/internal\/agent-api\/prepare-action$/.test(calls[0]!.url) || body.target !== "#general" || body.action?.type !== "channel:create" ||
       body.action.name !== "launch-room" || body.action.draftHint !== "for Thursday's launch") {
     throw new Error(`request: ${calls[0]!.url} ${JSON.stringify(body)}`);
   }
-  const tool = raftPlugin.tools.find((x) => x.name === "prepare_action");
-  if (tool?.sideEffects !== "write" || tool.idempotency !== "none") throw new Error(`declaration: ${JSON.stringify(tool)}`);
-  // An integration card needs ids a model cannot know; it is refused before anything is sent.
+  // A card Raft's contract refuses (a name too long) is refused by the SDK before sending, and landed nothing.
   let sent = 0;
   globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
-  const why = await failure(() => raftPlugin.invoke("prepare_action", { target: "#general", action: { type: "integration:register_app", name: "x", returnUrl: "https://x" } }, ctx()));
-  if (sent !== 0 || !/channel:create, channel:add_member or agent:create/.test(why.message)) throw new Error(`integration card: sent=${sent} ${why.message}`);
-  // A card Raft's contract refuses (a name too long) is refused by the SDK before sending, naming no body.
-  const tooLong = await failure(() => raftPlugin.invoke("prepare_action", { target: "#general", action: { type: "channel:create", name: "x".repeat(81) } }, ctx()));
-  if (sent !== 0 || tooLong.mayHaveLanded === true) throw new Error(`contract refusal: sent=${sent} ${tooLong.message}`);
+  const tooLong = await failure(() => raftPlugin.invoke("actions_prepare", { target: "#general", action: { type: "channel:create", name: "x".repeat(121) } }, inTurn(ctx())));
+  if (sent !== 0 || tooLong.mayHaveLanded === true || !/Invalid request/.test(tooLong.message)) throw new Error(`contract refusal: sent=${sent} ${tooLong.message}`);
 });
 
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
@@ -659,7 +814,7 @@ await check("controls: the model's own pull runs, and a program's call to a tool
   const direct = JSON.parse((await pull.execute("d", {})).content[0].text);
   if (!Array.isArray(direct.messages) || g.fetched() !== 1) throw new Error(`the model's pull: ${JSON.stringify(direct)} fetched=${g.fetched()}`);
   globalThis.fetch = (async () => json(200, { channel: { ref: "#launch-room", type: "channel" }, agents: [], humans: [] })) as any;
-  const out = await program(g.host, g.offered(["inbox"]), "const r = await tool`raft.channel_members ${{ target: '#launch-room' }}`; output(r.status);");
+  const out = await program(g.host, g.offered(["inbox"]), "const r = await tool`raft.channels_members ${{ target: '#launch-room' }}`; output(r.status);");
   if (out[0] !== "succeeded") throw new Error(`a program's members call: ${JSON.stringify(out)}`);
 });
 
@@ -675,38 +830,8 @@ await check("a model-only tool the mount's policy or the model's confirm would h
   }
   // Control: under the same write policy, an ordinary write is held for a person as before.
   const g = await raftBehindGateway({ write: "approval" });
-  const join: any = await g.gateway.invoke(g.ctx, "inbox.join_channel", { target: "#launch-room" });
+  const join: any = await g.gateway.invoke(g.ctx, "inbox.channels_join", { target: "#launch-room" });
   if (join.status !== "pending" || (await g.store.listApprovals("tenant", "pending")).length !== 1) throw new Error(`join: ${JSON.stringify(join)}`);
-});
-
-await check("join resolves a visible channel, then joins its encoded id", async () => {
-  const seen: string[] = [];
-  let n = 0;
-  globalThis.fetch = (async (url: any) => {
-    seen.push(String(url));
-    return n++ === 0
-      ? json(200, { channels: [{ id: "id/with space", name: "engineering", joined: false }], privateDetails: "hidden" })
-      : json(200, { ok: true, attention: { internal: "hidden" } });
-  }) as any;
-  const out = await raftPlugin.invoke("join_channel", { target: "#engineering" }, ctx()) as any;
-  if (out.state !== "joined" || out.channelId !== "id/with space") throw new Error(JSON.stringify(out));
-  if (seen[1] !== "https://raft.example/internal/agent-api/channels/id%2Fwith%20space/join") {
-    throw new Error(`join URL: ${seen[1]}`);
-  }
-});
-
-await check("join returns already_joined without a mutation", async () => {
-  const calls = one(json(200, { channels: [{ id: "c-1", name: "general", joined: true }] }));
-  const out = await raftPlugin.invoke("join_channel", { target: "#general" }, ctx()) as any;
-  if (out.state !== "already_joined" || calls.length !== 1) throw new Error(JSON.stringify({ out, calls }));
-});
-
-await check("join refuses DMs and thread targets before reaching Raft", async () => {
-  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
-  for (const target of ["dm:@tygg", "#general:abcd1234", "general"]) {
-    const why = await failure(() => raftPlugin.invoke("join_channel", { target }, ctx()));
-    if (!/regular channel/.test(why.message)) throw why;
-  }
 });
 
 /** The Server's overview as `GET /internal/agent-api/server` answers it: the SDK pages its channels itself. */
@@ -716,193 +841,73 @@ function server(channels: unknown[]) {
     agents: [{ name: "other-agent", status: "online" }], humans: [{ name: "tygg", role: "owner" }],
   });
 }
-const CHANNELS = [
-  { id: "c1", name: "general", joined: true, type: "channel", description: "Everyone" },
-  { id: "c2", name: "secret", joined: true, type: "private" },
-  { id: "c3", name: "eng", joined: false, type: "channel" },
-];
 
-await check("list_channels and channel_members are reads that repeat safely", async () => {
-  for (const name of ["list_channels", "channel_members"]) {
-    const tool = raftPlugin.tools.find((x) => x.name === name);
-    if (tool?.sideEffects !== "read" || tool.idempotency !== "native" || tool.replay !== undefined) {
-      throw new Error(`${name} declaration: ${JSON.stringify(tool)}`);
-    }
-  }
+await check("channels_join resolves a visible channel through the server, then joins it", async () => {
+  const seen: string[] = [];
+  let n = 0;
+  globalThis.fetch = (async (url: any) => {
+    seen.push(String(url));
+    return n++ === 0 ? server([{ id: "c-9", name: "engineering", joined: false, type: "channel" }]) : json(200, { ok: true });
+  }) as any;
+  const out = await raftPlugin.invoke("channels_join", { target: "#engineering" }, inTurn(ctx())) as any;
+  if (typeof out.text !== "string" || seen.length !== 2 || !/\/channels\/c-9\/join$/.test(seen[1]!)) throw new Error(JSON.stringify({ out, seen }));
 });
 
-await check("list_channels passes offset and limit to the SDK and says how to get the next page in its own terms", async () => {
-  const calls = one(server(CHANNELS));
-  const first = await raftPlugin.invoke("list_channels", { limit: 2 }, ctx()) as any;
-  const lines = String(first.text).split("\n");
-  const want = [
-    "#general [public, joined] — Everyone",
-    "#secret [private, joined]",
-    "Showing 1-2 of 3.",
-    "More: call list_channels with offset 2, limit 2.",
-  ];
-  if (lines[0] !== "## Server Channels" || JSON.stringify(lines.slice(-4)) !== JSON.stringify(want)) throw new Error(`first page: ${first.text}`);
-  if (first.hasMore !== true || first.nextOffset !== 2 || first.total !== 3) throw new Error(JSON.stringify(first));
-  if (/raft server info/.test(first.text)) throw new Error(`names a CLI command this mount lacks: ${first.text}`);
-  if (/other-agent|tygg/.test(JSON.stringify(first))) throw new Error(`the server's member lists leaked: ${JSON.stringify(first)}`);
-  if (calls[0]!.url !== "https://raft.example/internal/agent-api/server" || calls[0]!.init.method !== "GET") throw new Error(`request: ${calls[0]!.url}`);
-
-  one(server(CHANNELS));
-  const last = await raftPlugin.invoke("list_channels", { offset: 2, limit: 2 }, ctx()) as any;
-  if (!String(last.text).endsWith("#eng [public, not joined]\nShowing 3-3 of 3.") || /#general|More:/.test(last.text) ||
-      last.hasMore !== false || "nextOffset" in last) {
-    throw new Error(`last page: ${JSON.stringify(last)}`);
-  }
-
-  one(server(CHANNELS));
-  const joined = await raftPlugin.invoke("list_channels", { joined: true, limit: 1 }, ctx()) as any;
-  if (!String(joined.text).endsWith("#general [public, joined] — Everyone\nShowing 1-1 of 2.\nMore: call list_channels with offset 1, limit 1, joined true.") ||
-      /#eng/.test(joined.text)) {
-    throw new Error(`joined only: ${joined.text}`);
-  }
-});
-
-await check("list_channels on a server with no visible channels says none, and that there is nothing more", async () => {
-  one(server([]));
-  const out = await raftPlugin.invoke("list_channels", {}, ctx()) as any;
-  if (!String(out.text).endsWith("(none)\nShowing 0-0 of 0.") || out.hasMore !== false || out.total !== 0 || /More:/.test(out.text)) {
-    throw new Error(JSON.stringify(out));
-  }
-});
-
-await check("list_channels refuses a bad page before reaching Raft", async () => {
-  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
-  for (const args of [{ offset: -1 }, { limit: 0 }, { limit: 201 }, { offset: 1.5 }, { joined: "yes" }]) {
-    const why = await failure(() => raftPlugin.invoke("list_channels", args, ctx()));
-    if (!/offset must|limit must|joined must/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
-  }
-});
-
-await check("channel_members lists agents and humans with their role labels, asking for the channel named", async () => {
+await check("channels_members lists agents and humans with their role labels, asking for the channel named", async () => {
   const calls = one(json(200, {
     channel: { ref: "#launch-room", type: "channel" },
     agents: [{ name: "piper", status: "online" }],
     humans: [{ name: "tygg", role: "owner", description: "runs it" }, { name: "bo", role: "member" }],
   }));
-  const out = await raftPlugin.invoke("channel_members", { target: "#launch-room" }, ctx()) as any;
-  const want = [
-    "## Channel Members", "", "Channel: #launch-room (channel)", "Members means join/post authority for this surface.", "",
-    "### Agents", "Server and stored channel roles are shown separately when available.", "  - @piper (online)", "",
-    "### Humans", "Server and stored channel roles are shown separately when available.", "  - @tygg (owner) — runs it", "  - @bo",
-  ];
-  if (out.target !== "#launch-room" || JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want)) throw new Error(out.text);
+  const out = await raftPlugin.invoke("channels_members", { target: "#launch-room" }, inTurn(ctx())) as any;
+  if (!/@piper \(online\)/.test(out.text) || !/@tygg \(owner\) — runs it/.test(out.text)) throw new Error(out.text);
   if (calls[0]!.url !== "https://raft.example/internal/agent-api/channel-members?channel=%23launch-room") throw new Error(`request: ${calls[0]!.url}`);
-  globalThis.fetch = (async () => { throw new Error("network reached"); }) as any;
-  const why = await failure(() => raftPlugin.invoke("channel_members", { target: " " }, ctx()));
-  if (!/target is required/.test(why.message)) throw why;
-});
-
-await check("channel_members passes Raft's refusal on as a failure that landed nothing", async () => {
+  // Raft's refusal of a read landed nothing.
   one(json(404, { error: "channel not found", code: "NOT_FOUND" }));
-  const why = await failure(() => raftPlugin.invoke("channel_members", { target: "#nowhere" }, ctx()));
+  const why = await failure(() => raftPlugin.invoke("channels_members", { target: "#nowhere" }, inTurn(ctx())));
   if (why.mayHaveLanded === true || why.retryable === true) throw new Error(`a read claimed it may have landed: ${why.message}`);
+  // An argument the schema refuses is refused by the SDK before any request, naming the field and not the value.
+  let sent = 0;
+  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
+  const bad = await failure(() => raftPlugin.invoke("channels_members", { target: 42 }, inTurn(ctx())));
+  if (sent !== 0 || !/target/.test(bad.message) || /42/.test(bad.message)) throw new Error(`bad target: sent=${sent} ${bad.message}`);
 });
 
-/** One message of `GET /internal/agent-api/history` as the Server sends it. */
-function historyMessage(seq: number, content: string, extra: Record<string, unknown> = {}) {
-  return {
-    id: `m-${seq}cccccc`, seq, content, sender_type: "human", sender_name: "tygg", timestamp: "2026-09-28T10:00:00Z",
-    channel_name: "wg-raft-sdk", channel_type: "channel", ...extra,
-  };
-}
-function history(messages: unknown[], more: { has_older?: boolean; has_newer?: boolean; target?: string } = {}) {
-  return json(200, {
-    target: more.target ?? "#wg-raft-sdk", messages,
-    has_more: Boolean(more.has_older || more.has_newer), has_older: more.has_older ?? false, has_newer: more.has_newer ?? false,
-  });
-}
-const line = (seq: number, content: string) =>
-  `[target=#wg-raft-sdk msg=m-${seq}cccc time=2026-09-28 10:00:00Z type=human] @tygg: ${content}`;
-
-await check("read_messages and search_messages are reads that repeat safely", async () => {
-  for (const name of ["read_messages", "search_messages"]) {
-    const tool = raftPlugin.tools.find((x) => x.name === name);
-    if (tool?.sideEffects !== "read" || tool.idempotency !== "native" || tool.replay !== undefined) {
-      throw new Error(`${name} declaration: ${JSON.stringify(tool)}`);
-    }
-  }
-});
-
-await check("read_messages passes before and limit through, and says how to read older in its own terms", async () => {
-  const calls = one(history([historyMessage(41, "one"), historyMessage(42, "two", { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true }));
-  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", before: 43, limit: 7 }, ctx()) as any;
-  const url = new URL(calls[0]!.url);
-  if (url.pathname !== "/internal/agent-api/history" || url.searchParams.get("channel") !== "#wg-raft-sdk" ||
-      url.searchParams.get("before") !== "43" || url.searchParams.get("limit") !== "7" ||
-      url.searchParams.has("after") || url.searchParams.has("around")) {
+await check("messages_search passes its parameters through and answers with the SDK's text", async () => {
+  const calls = one(json(200, { results: [], hasMore: false }));
+  const out = await raftPlugin.invoke("messages_search", { query: "launch plan", target: "#wg-raft-sdk", sort: "recent", limit: 2, offset: 4 }, inTurn(ctx())) as any;
+  const p = new URL(calls[0]!.url).searchParams;
+  if (p.get("q") !== "launch plan" || p.get("channel") !== "#wg-raft-sdk" || p.get("sort") !== "recent" || p.get("limit") !== "2" || p.get("offset") !== "4") {
     throw new Error(`request: ${calls[0]!.url}`);
   }
-  // The attachment is said as receive_events says it, not as the CLI's `raft attachment view`.
-  const want = [line(41, "one"), `${line(42, "two")} [1 attachment: plan.pdf — this mount has no tool to open attachments]`, "Older exist: call read_messages with target #wg-raft-sdk, before 41."];
-  if (JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want)) throw new Error(`text: ${out.text}`);
-  if (/raft message read/.test(out.text)) throw new Error(`names a CLI command this mount lacks: ${out.text}`);
-  if (out.target !== "#wg-raft-sdk" || out.hasOlder !== true || out.hasNewer !== false || out.oldestSeq !== 41 || out.newestSeq !== 42) {
-    throw new Error(`cursors: ${JSON.stringify(out)}`);
+  if (out.text !== "No search results. (truncated=false)") throw new Error(JSON.stringify(out));
+});
+
+/** The operations whose result the manifest says may be large and that page by `limit`: the ones capped here. */
+const CAPPED = ["inbox.list", "messages.read", "messages.search", "attachments.comments", "mentions.pending", "server.info"];
+
+await check("a paged result stays under the parking line: limit is capped and defaulted on every operation that pages by it", async () => {
+  if (PAGE_ROWS < 1 || PAGE_ROWS * 400 > PARK_BYTES) throw new Error(`PAGE_ROWS=${PAGE_ROWS} against PARK_BYTES=${PARK_BYTES}`);
+  const capped = GENERATED.filter((op) => pagingArg(op) !== null).map((op) => op.name);
+  if (JSON.stringify(capped) !== JSON.stringify(CAPPED)) throw new Error(`capped: ${capped.join(", ")}`);
+  for (const name of CAPPED) {
+    const limit = (toolNamed(opNamed(name).toolName)!.parameters as any).properties.limit;
+    if (limit.maximum !== PAGE_ROWS || !new RegExp(`At most ${PAGE_ROWS} on this mount`).test(limit.description)) throw new Error(`${name}: ${JSON.stringify(limit)}`);
   }
-});
-
-await check("read_messages passes after through, and says how to read newer in its own terms", async () => {
-  const calls = one(history([historyMessage(78, "three")], { has_newer: true }));
-  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 77 }, ctx()) as any;
-  const url = new URL(calls[0]!.url);
-  if (url.searchParams.get("after") !== "77" || url.searchParams.has("before") || url.searchParams.has("limit")) throw new Error(`request: ${calls[0]!.url}`);
-  const want = [line(78, "three"), "Newer exist: call read_messages with target #wg-raft-sdk, after 78."];
-  if (JSON.stringify(String(out.text).split("\n")) !== JSON.stringify(want) || out.hasNewer !== true) throw new Error(`text: ${out.text}`);
-});
-
-await check("read_messages passes around through, as a seq or a message id, into a thread target", async () => {
-  const calls = one(history([historyMessage(55, "in the thread")], { target: "#wg-raft-sdk:abcd1234" }));
-  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk:abcd1234", around: 55 }, ctx()) as any;
-  const url = new URL(calls[0]!.url);
-  if (url.searchParams.get("channel") !== "#wg-raft-sdk:abcd1234" || url.searchParams.get("around") !== "55") throw new Error(`request: ${calls[0]!.url}`);
-  if (out.target !== "#wg-raft-sdk:abcd1234" || /exist:/.test(out.text) || out.hasOlder !== false || out.hasNewer !== false) {
-    throw new Error(JSON.stringify(out));
-  }
-  const byId = one(history([historyMessage(55, "in the thread")]));
-  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", around: "m-55cccccc" }, ctx());
-  if (new URL(byId[0]!.url).searchParams.get("around") !== "m-55cccccc") throw new Error(`request: ${byId[0]!.url}`);
-});
-
-await check("read_messages on an empty window says so, with no cursors", async () => {
-  one(history([]));
-  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 99 }, ctx()) as any;
-  if (out.text !== "No messages in #wg-raft-sdk." || out.hasOlder !== false || "oldestSeq" in out || "newestSeq" in out) {
-    throw new Error(JSON.stringify(out));
-  }
-});
-
-await check("read_messages and channel_members refuse a target that is not a non-empty string in their own words, before reaching Raft", async () => {
-  // The SDK refuses an empty target itself, in words that also say "target is required"; a target that is not a
-  // string reaches it as a TypeError (`request.target?.trim is not a function`). So the plugin's own sentence,
-  // which names the form to use, is what is asserted.
+  // Omitted, the page is the cap; over it, refused before any request.
+  const calls = one(history([]));
+  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(ctx()));
+  if (new URL(calls[0]!.url).searchParams.get("limit") !== String(PAGE_ROWS)) throw new Error(`default: ${calls[0]!.url}`);
   let sent = 0;
   globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
-  for (const tool of ["read_messages", "channel_members"]) {
-    for (const target of [42, undefined, " "]) {
-      const why = await failure(() => raftPlugin.invoke(tool, target === undefined ? {} : { target }, ctx()));
-      if (why.message !== "target is required, for example #engineering") throw new Error(`${tool} ${JSON.stringify(target)}: ${why.message}`);
-    }
-  }
-  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
-});
-
-await check("read_messages refuses two cursors, a bad limit, and a bad cursor before reaching Raft", async () => {
-  let sent = 0;
-  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
-  for (const args of [{ before: 43, after: 12 }, { before: 43, around: 30 }, { after: 12, around: "m-1" }]) {
-    const why = await failure(() => raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", ...args }, ctx()));
-    if (!/at most one of before, after and around/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
-  }
-  for (const args of [{ limit: 0 }, { limit: 201 }, { limit: 2.5 }, { before: -1 }, { after: "12" }, { around: "" }, { around: 1.5 }, { target: "" }]) {
-    const why = await failure(() => raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", ...args }, ctx()));
-    if (!/limit must|before must|after must|around must|target is required/.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
-  }
-  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
+  const over = await failure(() => raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk", limit: PAGE_ROWS + 1 }, inTurn(ctx())));
+  if (sent !== 0 || !/at most/.test(over.message)) throw new Error(`over the cap: sent=${sent} ${over.message}`);
+  // What the cap is for: a full page of ordinary messages comes back under the line at which a result is parked.
+  const body = "A message of ordinary length, a few sentences long, the way people write in a channel. ".repeat(3);
+  one(history(Array.from({ length: PAGE_ROWS }, (_, i) => historyMessage(100 + i, body))));
+  const page = await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(ctx()));
+  const size = JSON.stringify(page).length;
+  if (size > PARK_BYTES) throw new Error(`a full page of ${body.length}-character messages is ${size} characters; the parking line is ${PARK_BYTES}`);
 });
 
 /**
@@ -913,8 +918,8 @@ function freshnessServer(answers: { history?: Response; events?: Response }) {
   const sends: any[] = [];
   globalThis.fetch = (async (url: any, init?: any) => {
     const path = new URL(String(url)).pathname;
-    if (path.endsWith("/history")) return answers.history!;
-    if (path.endsWith("/events")) return answers.events!;
+    if (path.endsWith("/history")) return answers.history!.clone();
+    if (path.endsWith("/events")) return answers.events!.clone();
     const body = JSON.parse(String(init?.body));
     sends.push(body);
     const attested = (body.seenUpToSeq ?? 0) >= 42 || (body.seenExactSeqs ?? []).includes(42);
@@ -926,67 +931,69 @@ function freshnessServer(answers: { history?: Response; events?: Response }) {
   return sends;
 }
 
-await check("read_messages does not count as the model having seen a conversation: a send after it is still held", async () => {
-  // Called from run_js, a read's result may never reach the model, so it must not resolve the read-before-send
-  // question that only the model may answer. The Server's model-seen boundary is in the answer, as Raft sends it.
-  const m = mount();
-  const sends = freshnessServer({
-    history: json(200, { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
-      has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 }),
-  });
-  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk" }, m.ctx);
-  const out = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-read" }, m.ctx);
-  if (!(out instanceof Interrupt)) throw new Error(`the read let the send through: attested ${JSON.stringify({ upTo: sends[0]?.seenUpToSeq, exact: sends[0]?.seenExactSeqs })}`);
-  // Positive control: the same conversation handed over by receive_events is what the model reads, and that
-  // send goes through, so the fake Server above can tell the two apart.
-  const control = mount();
-  const controlSends = freshnessServer({
-    events: events([historyMessage(42, "wait, one more thing")], { last_seen_seq: 42 }),
-  });
-  await raftPlugin.invoke("receive_events", {}, control.ctx);
-  const sent = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-receive" }, control.ctx) as any;
-  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`control: receive_events did not attest: ${JSON.stringify(controlSends)}`);
-});
-
 const SEEN_PAGE = { target: "#wg-raft-sdk", messages: [historyMessage(41, "one"), historyMessage(42, "wait, one more thing")],
   has_more: false, has_older: false, has_newer: false, last_read_seq: 42, model_seen_up_to_seq: 42 };
 
-await check("a program's read_messages asks Raft not to mark the page read, and records nothing as seen", async () => {
-  const fresh = freshDb();
-  const c = { ...ctx(), db: fresh.db, caller: { tenantId: "tenant", agentId: "agent", taskId: "task", fromProgram: true } } as any;
+await check("the model's own messages_read in its turn consumes, and counts as seen in that context only", async () => {
+  const m = mount();
+  const reads: string[] = [];
+  freshnessServer({ history: json(200, SEEN_PAGE) });
+  const serve = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init?: any) => { if (new URL(String(url)).pathname.endsWith("/history")) reads.push(String(url)); return serve(url, init); }) as any;
+  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(m.ctx, "ctx_a"));
+  if (reads.length !== 1 || new URL(reads[0]!).searchParams.has("consume")) throw new Error(`request: ${reads[0]}`);
+  // The same context: the read attests, and the send goes through.
+  const sent = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "y", idempotencyKey: "k-a" }, inTurn(m.ctx, "ctx_a")) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`the model's read did not attest its own context: ${JSON.stringify(sent)}`);
+  // Another context (a compaction since, say) does not inherit the read: the send is held.
+  const other = mount();
+  freshnessServer({ history: json(200, SEEN_PAGE) });
+  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, inTurn(other.ctx, "ctx_a"));
+  const elsewhere = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "x", idempotencyKey: "k-b" }, inTurn(other.ctx, "ctx_b"));
+  if (!(elsewhere instanceof Interrupt)) throw new Error("a read in one context attested a send in another");
+});
+
+await check("a program's messages_read, made in a turn and so carrying a context id, still reads with consume=false and counts nothing as seen", async () => {
+  // fromProgram alone decides it: the context id is present here, as it is on every call run_js makes in a turn.
+  const m = mount();
   const sends = freshnessServer({ history: json(200, SEEN_PAGE) });
   const reads: string[] = [];
   const serve = globalThis.fetch;
   globalThis.fetch = (async (url: any, init?: any) => { if (new URL(String(url)).pathname.endsWith("/history")) reads.push(String(url)); return serve(url, init); }) as any;
-  const out = await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 40 }, c) as any;
+  const program = { ...m.ctx, caller: { ...m.ctx.caller, fromProgram: true, contextId: "ctx_turn" } };
+  const out = await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk", after: 40 }, program) as any;
   if (reads.length !== 1 || new URL(reads[0]!).searchParams.get("consume") !== "false") throw new Error(`request: ${reads[0]}`);
-  if (out.newestSeq !== 42) throw new Error(`result: ${JSON.stringify(out)}`);
-  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
-  // Nothing attests the page: a send after it, from the model, is still held.
-  const sent = await raftPlugin.invoke("send_message", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-program-read" }, { ...c, caller: ctx().caller });
+  if (!/wait, one more thing/.test(out.text)) throw new Error(`result: ${JSON.stringify(out)}`);
+  // Nothing attests the page: the model's send in the same context is still held.
+  const sent = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-program-read" }, inTurn(m.ctx, "ctx_turn"));
   if (!(sent instanceof Interrupt)) throw new Error(`the program's read let the send through: ${JSON.stringify(sends)}`);
 });
 
-await check("the model's own read_messages in its turn is unchanged: no consume parameter, and still records nothing as seen", async () => {
-  const fresh = freshDb();
+await check("a messages_read made in no session's turn (neither fromProgram nor contextId) leaves the page unread", async () => {
   const calls = one(json(200, SEEN_PAGE));
-  const c = { ...ctx(), db: fresh.db, caller: { ...ctx().caller, contextId: "ctx_turn" } };
-  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk", after: 40 }, c);
-  if (calls.length !== 1 || new URL(calls[0]!.url).searchParams.has("consume")) throw new Error(`request: ${calls[0]?.url}`);
-  if (fresh.tables.get(fresh.scope, INBOX_STORE, "state") !== undefined) throw new Error("the read saved the mount's Raft state");
-});
-
-await check("a read_messages call made in no session's turn (neither fromProgram nor contextId) leaves the page unread", async () => {
-  const calls = one(json(200, SEEN_PAGE));
-  await raftPlugin.invoke("read_messages", { target: "#wg-raft-sdk" }, ctx());
+  await raftPlugin.invoke("messages_read", { target: "#wg-raft-sdk" }, ctx());
   if (calls.length !== 1 || new URL(calls[0]!.url).searchParams.get("consume") !== "false") throw new Error(`request: ${calls[0]?.url}`);
 });
 
-await check("an approved call's replay of read_messages, run with nobody reading it, leaves the page unread", async () => {
+await check("receive_events books what it hands over in the caller's context, so a reply in that context is not held", async () => {
+  const m = mount();
+  const sends = freshnessServer({ events: events([historyMessage(42, "wait, one more thing")], { last_seen_seq: 42 }) });
+  await raftPlugin.invoke("receive_events", {}, inTurn(m.ctx, "ctx_a"));
+  const sent = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-after-receive" }, inTurn(m.ctx, "ctx_a")) as any;
+  if (sent instanceof Interrupt || sent.state !== "sent") throw new Error(`receive_events did not attest its context: ${JSON.stringify(sends)}`);
+  // Control: the same pull in another context does not attest a send in this one.
+  const c = mount();
+  freshnessServer({ events: events([historyMessage(42, "wait, one more thing")], { last_seen_seq: 42 }) });
+  await raftPlugin.invoke("receive_events", {}, inTurn(c.ctx, "ctx_old"));
+  const held = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "done", idempotencyKey: "k-ctl" }, inTurn(c.ctx, "ctx_a"));
+  if (!(held instanceof Interrupt)) throw new Error("control: a pull in another context attested this one");
+});
+
+await check("an approved call's replay of messages_read, run with nobody reading it, leaves the page unread", async () => {
   const g = await raftBehindGateway({ read: "approval" });
   const urls: string[] = [];
   globalThis.fetch = (async (url: any) => { urls.push(String(url)); return json(200, SEEN_PAGE); }) as any;
-  const read: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__read_messages");
+  const read: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__messages_read");
   await read.execute("d", { target: "#wg-raft-sdk" }).catch(() => {});
   const [card] = await g.store.listApprovals("tenant", "pending");
   const whileHeld = urls.splice(0);
@@ -996,83 +1003,139 @@ await check("an approved call's replay of read_messages, run with nobody reading
   if (urls.length !== 1 || new URL(urls[0]!).searchParams.get("consume") !== "false") throw new Error(`replay request: ${urls[0]}`);
 });
 
-await check("through the gateway, a run_js program's read_messages runs with consume=false and the model's without it", async () => {
+await check("through the gateway, a run_js program's messages_read runs with consume=false and the model's without it", async () => {
   const g = await raftBehindGateway();
   const urls: string[] = [];
   globalThis.fetch = (async (url: any) => { urls.push(String(url)); return json(200, SEEN_PAGE); }) as any;
-  const out = await program(g.host, g.offered(["inbox"]), "const r = await tool`inbox.read_messages ${{ target: '#wg-raft-sdk' }}`; output(r.status); output(r.result?.newestSeq);");
-  if (out[0] !== "succeeded" || out[1] !== 42) throw new Error(`a program's read: ${JSON.stringify(out)}`);
+  const out = await program(g.host, g.offered(["inbox"]), "const r = await tool`inbox.messages_read ${{ target: '#wg-raft-sdk' }}`; output(r.status); output(r.result?.state);");
+  if (out[0] !== "succeeded" || out[1] !== "page") throw new Error(`a program's read: ${JSON.stringify(out)}`);
   const fromProgram = urls.splice(0);
   if (fromProgram.length !== 1 || new URL(fromProgram[0]!).searchParams.get("consume") !== "false") throw new Error(`program request: ${fromProgram[0]}`);
-  const read: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__read_messages");
+  const read: any = bridgeTools(g.offered(["inbox"]), g.host as any).find((t) => t.name === "inbox__messages_read");
   const direct = JSON.parse((await read.execute("d", { target: "#wg-raft-sdk" })).content[0].text);
-  if (direct.newestSeq !== 42) throw new Error(`the model's read: ${JSON.stringify(direct)}`);
+  if (direct.state !== "page") throw new Error(`the model's read: ${JSON.stringify(direct)}`);
   if (urls.length !== 1 || new URL(urls[0]!).searchParams.has("consume")) throw new Error(`model request: ${urls[0]}`);
 });
 
-/** One result of `GET /internal/agent-api/search` as the Server sends it. */
-function searchResult(n: number) {
-  return {
-    id: `r-${n}`, seq: n, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
-    parentChannelName: "wg-raft-sdk", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human",
-    senderName: "tygg", channelName: "wg-raft-sdk", channelType: "channel", channelArchivedAt: null,
-    content: "the launch plan is ready", snippet: "launch", createdAt: `2026-09-2${n}T10:00:00.000Z`,
-  };
+/** The Agent API's credential context (`GET /internal/agent-api/context`), which `identity.whoami` reads. */
+function context(capabilities: string[]) {
+  return json(200, {
+    agent: { id: "agent-1", name: "raft-bot", displayName: null, description: null, runtime: "external", external: true },
+    server: { id: "server-1", slug: "s", name: "S" }, credential: { capabilities }, prompt: null,
+  });
+}
+const allowedBy = (caps: string[]) => GENERATED.filter((op) => op.capability.every((c) => caps.includes(c))).map((op) => op.toolName);
+
+await check("a mount's snapshot lists only the operations whose every capability its credential holds", async () => {
+  const calls = one(context(["read", "send"]));
+  const listed = await raftPlugin.snapshotTools!(ctx());
+  if (!/\/internal\/agent-api\/context$/.test(calls[0]!.url)) throw new Error(`asked: ${calls[0]!.url}`);
+  const names = listed.tools.map((t) => t.name);
+  if (JSON.stringify(names) !== JSON.stringify(allowedBy(["read", "send"]))) throw new Error(`listed: ${names.join(", ")}`);
+  // channels.join needs channels and read; a task operation needs tasks: neither is offered, and each says which scope it lacks.
+  if (!names.includes("messages_send") || !names.includes("messages_read") || names.includes("channels_join") || names.includes("tasks_list")) throw new Error(names.join(", "));
+  const join = listed.skipped?.find((s) => s.name === "channels_join");
+  if (!join || !/lacks the Raft capability channels$/.test(join.reason)) throw new Error(`skipped: ${JSON.stringify(listed.skipped)}`);
+  // No credential, or one Raft refuses, has no capabilities at all; Raft not answering is a throw, which keeps the stored list.
+  const none = await raftPlugin.snapshotTools!(ctx(null));
+  if (none.tools.length !== 0 || !/no Raft credential/.test(none.skipped?.[0]?.reason ?? "")) throw new Error(JSON.stringify(none));
+  one(json(401, { error: "unauthorized" }));
+  const refused = await raftPlugin.snapshotTools!(ctx());
+  if (refused.tools.length !== 0 || !/refused/.test(refused.skipped?.[0]?.reason ?? "")) throw new Error(JSON.stringify(refused));
+  one(json(503, { error: "down" }));
+  await failure(() => raftPlugin.snapshotTools!(ctx()));
+});
+
+await check("mountTools offers the snapshot's operations and the plugin's own tools; a mount with no snapshot is offered every generated tool", async () => {
+  const snap = await admitTools(await (async () => { one(context(["read"])); return raftPlugin.snapshotTools!(ctx()); })(), 0);
+  const base: any = { tenantId: "t", agentId: "a", alias: "raft", plugin: "raft" };
+  const offered = toolsOf(raftPlugin, { ...base, toolSnapshot: snap }).map((t) => t.name);
+  if (JSON.stringify(offered) !== JSON.stringify([...OWN, ...allowedBy(["read"])])) throw new Error(`offered: ${offered.join(", ")}`);
+  // Only names are read from the snapshot: each tool is this build's, model-only flag and all.
+  const own = toolsOf(raftPlugin, { ...base, toolSnapshot: snap }).find((t) => t.name === "receive_events");
+  if (own?.modelOnly !== true || toolsOf(raftPlugin, { ...base, toolSnapshot: snap }).some((t) => t.replay === "never")) throw new Error("a tool came from the stored copy");
+  const empty = await admitTools({ tools: [] }, 0);
+  if (JSON.stringify(toolsOf(raftPlugin, { ...base, toolSnapshot: empty }).map((t) => t.name)) !== JSON.stringify(OWN)) throw new Error("an empty snapshot offered generated tools");
+  for (const missing of [null, undefined]) {
+    const all = toolsOf(raftPlugin, { ...base, toolSnapshot: missing }).map((t) => t.name);
+    if (JSON.stringify(all) !== JSON.stringify(raftPlugin.tools.map((t) => t.name))) throw new Error(`no snapshot (${missing}): ${all.join(", ")}`);
+  }
+  // The gateway asks the same list: an operation the snapshot left out is an unknown tool on that mount.
+  const store = new SqliteStore(":memory:");
+  await store.init();
+  await store.createAgent("tenant", "agent");
+  await store.addMount({ tenantId: "tenant", agentId: "agent", alias: "inbox", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: raftPlugin.version, publicConfig: { serverUrl: "https://raft.example" }, secretRef: "secret:raft", policy: null });
+  await store.updateMountToolSnapshot("tenant", "agent", "inbox", snap);
+  const gateway = new ToolGateway(store, [raftPlugin], new Set([raftPlugin.id]), { async resolve() { return "sk_agent_test_1234567890"; } });
+  let fetched = 0;
+  globalThis.fetch = (async () => { fetched++; return json(200, {}); }) as any;
+  const out: any = await gateway.invoke({ tenantId: "tenant", agentId: "agent", taskId: "task", contextId: "c" } as any, "inbox.tasks_list", { mine: true });
+  if (out.status !== "rejected" || out.error?.code !== "unknown_tool" || fetched !== 0) throw new Error(`tasks_list on a read-only mount: ${JSON.stringify(out)}`);
+});
+
+/** The real runtime over a SQLite host, with raft mounted, its credential attached through the console's path. */
+async function raftRuntime() {
+  const host = sqliteHost();
+  const rt: any = new AgentRuntime({
+    ctx: { storage: host } as any, bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any, extraPlugins: [],
+    secretKek: Buffer.from(new Uint8Array(32)).toString("base64"),
+  } as any);
+  await rt.store.init();
+  rt.ready = async () => {};
+  await rt.store.createAgent("t", "a");
+  await rt.store.setPluginChoice("t", "a", "raft", "enable");
+  await rt.store.addMount({ tenantId: "t", agentId: "a", alias: "raft", plugin: "raft", installationId: "i", connectionId: null,
+    toolVersion: raftPlugin.version, publicConfig: { serverUrl: "https://raft.example" }, secretRef: null, policy: null });
+  const offered = async () => toolsOf(raftPlugin, (await rt.store.getMountByAlias("t", "a", "raft"))!).map((t: any) => t.name);
+  return { rt, offered };
+}
+/** Raft as the attach path meets it: the identity check, then the credential's context, with the capabilities given. */
+function raftServer(capabilities: () => string[] | "down") {
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/internal/agent-api") return json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" });
+    if (path === "/internal/agent-api/context") { const c = capabilities(); return c === "down" ? json(503, { error: "down" }) : context(c); }
+    throw new Error(`unexpected request: ${path}`);
+  }) as any;
 }
 
-await check("search_messages passes every parameter through and says how to page in its own terms", async () => {
-  const calls = one(json(200, { results: [searchResult(1), searchResult(2)], hasMore: true }));
-  const out = await raftPlugin.invoke("search_messages", {
-    query: "launch plan", target: "#wg-raft-sdk", sender: "tygg", sort: "relevance",
-    after: "2026-09-01T00:00:00Z", before: "2026-09-30T00:00:00Z", limit: 2, offset: 4,
-  }, ctx()) as any;
-  const p = new URL(calls[0]!.url).searchParams;
-  const sent = Object.fromEntries(p.entries());
-  const want = { q: "launch plan", channel: "#wg-raft-sdk", sender: "tygg", sort: "relevance", before: "2026-09-30T00:00:00Z", after: "2026-09-01T00:00:00Z", limit: "2", offset: "4" };
-  if (new URL(calls[0]!.url).pathname !== "/internal/agent-api/search" || JSON.stringify(sent, Object.keys(want).sort()) !== JSON.stringify(want, Object.keys(want).sort())) {
-    throw new Error(`request: ${calls[0]!.url}`);
-  }
-  const lines = String(out.text).split("\n");
-  if (lines[0] !== 'Search results for: "launch plan" (2 results · truncated=true · more results exist, call search_messages again with offset 6)') {
-    throw new Error(`head: ${lines[0]}`);
-  }
-  if (!lines.includes('<result ref="msg:r-1">') || !lines.includes("the <match>launch plan</match> is ready") || /--\w/.test(out.text)) {
-    throw new Error(`body: ${out.text}`);
-  }
-  if (out.results !== 2 || out.hasMore !== true || out.nextOffset !== 6 || "nextBefore" in out) throw new Error(JSON.stringify(out));
+await check("attaching, replacing and removing a mount's credential re-lists its tools, so a scope the credential lost stops being offered", async () => {
+  const { rt, offered } = await raftRuntime();
+  let caps: string[] | "down" = ["read", "send", "channels", "tasks"];
+  raftServer(() => caps);
+  const first = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" });
+  if (!first.ok) throw new Error(`attach: ${JSON.stringify(first)}`);
+  if (JSON.stringify(await offered()) !== JSON.stringify([...OWN, ...allowedBy(caps)])) throw new Error(`after attach: ${(await offered()).join(", ")}`);
+  if (!(await offered()).includes("tasks_list")) throw new Error("control: the full credential does not offer tasks_list");
+  // Replaced by a credential that lost tasks and channels: those tools go.
+  caps = ["read", "send"];
+  const second = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_second_1234567890" });
+  if (!second.ok) throw new Error(`replace: ${JSON.stringify(second)}`);
+  const narrowed = await offered();
+  if (narrowed.includes("tasks_list") || narrowed.includes("channels_join") || !narrowed.includes("messages_send")) throw new Error(`after replace: ${narrowed.join(", ")}`);
+  // Replaced while Raft cannot say what the new one may do: the old list is not kept for it.
+  caps = "down";
+  await rt.attachCredential("t", "a", "raft", { token: "sk_agent_third_12345678901" });
+  if (JSON.stringify(await offered()) !== JSON.stringify(OWN)) throw new Error(`after an unlistable replace: ${(await offered()).join(", ")}`);
+  if (!/listing the tools again failed/.test(rt.snapshotError("raft") ?? "") && !/could not ask Raft/.test(rt.snapshotError("raft") ?? "")) throw new Error(`no reason kept: ${rt.snapshotError("raft")}`);
+  // Removed: no credential, no capabilities.
+  caps = ["read", "send"];
+  await rt.attachCredential("t", "a", "raft", { token: "sk_agent_fourth_1234567890" });
+  if (!(await offered()).includes("messages_send")) throw new Error("control: re-attached credential offers nothing");
+  if (!(await rt.removeCredential("t", "a", "raft"))) throw new Error("remove refused");
+  if (JSON.stringify(await offered()) !== JSON.stringify(OWN)) throw new Error(`after remove: ${(await offered()).join(", ")}`);
 });
 
-await check("search_messages sorted by recent pages by before, and a page at the cap names parameters, not flags", async () => {
-  one(json(200, { results: [searchResult(3)], hasMore: true }));
-  const recent = await raftPlugin.invoke("search_messages", { sender: "tygg", sort: "recent", limit: 1 }, ctx()) as any;
-  const head = String(recent.text).split("\n")[0]!;
-  if (!head.startsWith("Filtered message results (1 result · truncated=true · more results exist, call search_messages again with before 2026-09-23T10:00:00.000Z (pages OLDER only;") ||
-      recent.nextBefore !== "2026-09-23T10:00:00.000Z" || "nextOffset" in recent) {
-    throw new Error(JSON.stringify(recent));
-  }
-  one(json(200, { results: Array.from({ length: 3 }, (_, i) => searchResult(i + 1)), hasMore: false }));
-  const capped = await raftPlugin.invoke("search_messages", { query: "plan", limit: 3 }, ctx()) as any;
-  const cappedHead = String(capped.text).split("\n")[0]!;
-  if (!cappedHead.includes("exactly the limit 3 that was requested") || !cappedHead.endsWith("re-run with a higher limit to tell the two apart)") || /--/.test(cappedHead) || "nextOffset" in capped) {
-    throw new Error(cappedHead);
-  }
-});
-
-await check("search_messages with no results says so; without query, target or sender it is refused before reaching Raft", async () => {
-  one(json(200, { results: [], hasMore: false }));
-  const out = await raftPlugin.invoke("search_messages", { query: "nothing like it" }, ctx()) as any;
-  if (out.text !== "No search results. (truncated=false)" || out.results !== 0 || out.hasMore !== false || "nextOffset" in out) throw new Error(JSON.stringify(out));
-  let sent = 0;
-  globalThis.fetch = (async () => { sent++; return json(200, {}); }) as any;
-  const refusals: Array<[Record<string, unknown>, RegExp]> = [
-    [{}, /query, or filter by target or sender/], [{ query: "x", limit: 51 }, /limit must/], [{ query: "x", limit: 0 }, /limit must/],
-    [{ query: "x", offset: -1 }, /offset must/], [{ query: "x", sort: "oldest" }, /sort must/], [{ query: 5 }, /query must/],
-  ];
-  for (const [args, reason] of refusals) {
-    const why = await failure(() => raftPlugin.invoke("search_messages", args, ctx()));
-    if (!reason.test(why.message)) throw new Error(`${JSON.stringify(args)}: ${why.message}`);
-  }
-  if (sent !== 0) throw new Error(`${sent} request(s) reached Raft`);
+await check("a credential Raft refuses on attach changes neither the credential nor the tool list", async () => {
+  const { rt, offered } = await raftRuntime();
+  raftServer(() => ["read"]);
+  await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" });
+  const before = await offered();
+  globalThis.fetch = (async () => json(401, { error: "unauthorized" })) as any;
+  const r = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_bad_12345678901" });
+  if (r.ok) throw new Error(`a refused key was kept: ${JSON.stringify(r)}`);
+  if (JSON.stringify(await offered()) !== JSON.stringify(before)) throw new Error(`the list moved: ${(await offered()).join(", ")}`);
 });
 
 await check("the mount setting cannot redirect a credential to a path or embedded user", async () => {
@@ -1340,7 +1403,7 @@ await check("a notice for a mount whose push is off, or for another Raft agent, 
 await check("a 400 on a batch is the batch's own fault: sent once, status and all, and it throws", async () => {
   const on = mount({ enabled: true, agentId: "agent-1", agentName: "raft-bot", lastReached: null });
   const events = [
-    { eventId: "raft_x:1:pre", hookEventName: "PreToolUse" as const, occurredAt: "2026-09-29T05:00:00.000Z", toolName: "raft__send_message", status: "working" as const },
+    { eventId: "raft_x:1:pre", hookEventName: "PreToolUse" as const, occurredAt: "2026-09-29T05:00:00.000Z", toolName: "raft__messages_send", status: "working" as const },
     { eventId: "raft_x:2:status:start", occurredAt: "2026-09-29T05:00:01.000Z", status: "thinking" as const },
   ];
   const once = one(json(400, { errorCode: "event_field_unknown" }));
@@ -1509,13 +1572,17 @@ await check("push_status safely normalizes a corrupt persisted record", async ()
  */
 await check("a send that got no answer says it may have landed, and does not say it will clear", async () => {
   globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
-  const why = await failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-u" }, ctx()));
+  const why = await failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-u" }, inTurn(ctx())));
   if (why.mayHaveLanded !== true) throw new Error(`uncertainty was lost: mayHaveLanded=${why.mayHaveLanded}`);
   const refused = await (async () => {
     one(json(403, { error: "forbidden" }));
-    return failure(() => raftPlugin.invoke("send_message", { target: "#general", content: "x", idempotencyKey: "k-r" }, ctx()));
+    return failure(() => raftPlugin.invoke("messages_send", { target: "#general", content: "x", idempotencyKey: "k-r" }, inTurn(ctx())));
   })();
   if (refused.mayHaveLanded === true) throw new Error("a refusal was reported as possibly landed");
+  // A read that got no answer landed nothing.
+  globalThis.fetch = (async () => { throw new Error("socket closed"); }) as any;
+  const read = await failure(() => raftPlugin.invoke("messages_read", { target: "#general" }, inTurn(ctx())));
+  if (read.mayHaveLanded === true) throw new Error("a read was reported as possibly landed");
 });
 
 
