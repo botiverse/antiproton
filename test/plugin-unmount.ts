@@ -343,11 +343,50 @@ await check("a second removal of the same mount while one runs (a double click) 
   host.dispose();
 });
 
-await check("a rename while the mount is being removed is refused, and the removal completes", async () => {
+// renameMount asks whether the mount is being removed twice: once right after reading the mount, and again right
+// before the store's rename, since the activity read between them awaits. Each check has its own case below,
+// named by the moment it covers. A rename that starts during a removal is refused by either check, so the first
+// case pins check 1 by what only it does: refusing before the activity read is asked at all.
+await check("rename check 1, after the mount is read: a rename that starts while the mount is being removed is refused before the activity read, and the removal completes", async () => {
   const { rt, host, directory, mount } = await runtime();
   await mount("sweep", "svc");
   const { removal, open } = await heldRemoval(rt, "svc", directory);
+  const gw = rt.gateway();
+  const activity = gw.mountActivity.bind(gw);
+  let asked = 0;
+  gw.mountActivity = async (...a: unknown[]) => { asked++; return activity(...a); };
   const renamed = await rt.renameMount("t", "a", "svc", "svc2");
+  must(!renamed.ok && renamed.error === "svc is being removed; it cannot be renamed", `the rename: ${show(renamed)}`);
+  must(asked === 0, `the rename asked for the mount's activity ${asked} time(s) before refusing`);
+  open();
+  const r = await removal;
+  must(show(r) === show({ ok: true }), `the removal: ${show(r)}`);
+  must(!(await rt.store.getMountByAlias("t", "a", "svc")) && !(await rt.store.getMountByAlias("t", "a", "svc2")), "a mount survived under either name");
+  host.dispose();
+});
+
+await check("rename check 2, after the activity read: a removal that starts while a rename waits on that read gets the rename refused, and completes", async () => {
+  const { rt, host, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  // Hold the rename at the one await between its two checks: the activity read (`mountActivity`). Only that
+  // first call is held; the removal's own activity read passes straight through.
+  const gw = rt.gateway();
+  const activity = gw.mountActivity.bind(gw);
+  let release!: () => void;
+  const until = new Promise<void>((r) => { release = r; });
+  let reached!: () => void;
+  const atRead = new Promise<void>((r) => { reached = r; });
+  let calls = 0;
+  gw.mountActivity = async (...a: unknown[]) => {
+    if (++calls === 1) { reached(); await until; }
+    return activity(...a);
+  };
+  const renaming = rt.renameMount("t", "a", "svc", "svc2");
+  await atRead;
+  // The first check has passed; now the removal sets the mark, and is held in unmount.
+  const { removal, open } = await heldRemoval(rt, "svc", directory);
+  release();
+  const renamed = await renaming;
   must(!renamed.ok && renamed.error === "svc is being removed; it cannot be renamed", `the rename: ${show(renamed)}`);
   open();
   const r = await removal;
