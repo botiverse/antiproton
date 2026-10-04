@@ -168,7 +168,7 @@ import { keptDelete, keptList, keptNameProblem, keptPut, keptValueProblem, state
 import { sandboxPlugin, SANDBOX_ALIAS } from "../../src/plugins/sandbox.ts";
 import { builtinToolsPlugin } from "../../src/plugins/builtin.ts";
 import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/artifacts.ts";
-import { raftPlugin } from "../../src/plugins/raft.ts";
+import { createRaftPlugin } from "../../src/plugins/raft.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
@@ -769,7 +769,7 @@ export class AgentRuntime {
       // The key is read when a secret tool runs, not now: `#kek` is set a few lines below.
       statePlugin(this.store, this.#artifacts as any, deps.bucketName, () => this.#kek),
       artifactsPlugin(this.#artifacts as any, deps.bucketName),
-      raftPlugin,
+      createRaftPlugin({ artifacts: this.#artifacts }),
       mcpPlugin,
       ...(deps.extraPlugins ?? []),
       // Discovery agrees with dispatch: a withheld tool is not found by searching for it either.
