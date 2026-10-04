@@ -87,6 +87,13 @@ export interface ToolSnapshot {
   tools: ToolSchema[];
   skipped: Array<{ name: string; reason: string }>;
   takenAt: number;
+  /**
+   * Present, and true, when the list was taken for a plugin that declares a `credential` while the mount had none
+   * (a mount is added before its account is attached). Such a list says what no credential may do, not what the
+   * next one may, so it is not kept as the "previous list" when the listing after an attach fails
+   * (`AgentRuntime.attachCredential`). Not covered by `hash`, which is about the list itself.
+   */
+  withoutCredential?: true;
 }
 
 /**

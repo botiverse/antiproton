@@ -1018,15 +1018,24 @@ export class AgentRuntime {
    * raft lists only the operations its credential's capabilities allow (`Plugin.snapshotTools`). The list is asked
    * for again now, for a plugin that both lists its tools and takes a credential, and replaced when the answer
    * moved, so a credential that lost a scope stops offering what the scope allowed. When the listing fails, the
-   * stored list is left as it was — the previous credential's, or none, which for raft offers every tool, as at
-   * deploy — and Raft refuses what the credential may not do; why it failed is on the mount's page
+   * stored list is left as it was if a credential was behind it; one taken with no credential is cleared, and a
+   * mount with no list is offered every tool for raft, as at deploy — and Raft refuses what the credential may not
+   * do; why it failed is on the mount's page
    * (`snapshotError`), and an operator's refresh asks again.
    */
   async #toolsAfterCredentialChange(tenantId: string, agentId: string, alias: string) {
     const mount = await this.store.getMountByAlias(tenantId, agentId, alias);
     const plugin = mount ? this.#plugins.find((p) => p.id === mount.plugin) : undefined;
     if (!plugin?.snapshotTools || !plugin.credential) return null;
-    return this.#snapshot(tenantId, agentId, alias);
+    const r = await this.#snapshot(tenantId, agentId, alias);
+    // A list taken while the mount had no credential is not a previous list: it says what no credential may do.
+    // Failing to list for the credential that just arrived leaves the mount as one with no list, which is offered
+    // everything, as at deploy — the provisioning order (mount added, then its account attached) meets exactly this.
+    if (!r.ok && !("stale" in r) && mount!.toolSnapshot?.withoutCredential) {
+      try { await this.store.updateMountToolSnapshot(tenantId, agentId, alias, null); }
+      catch (e) { console.error(`could not clear ${alias}'s credential-less tool list:`, e); }
+    }
+    return r;
   }
 
   /**

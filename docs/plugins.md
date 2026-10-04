@@ -342,9 +342,11 @@ again whenever a mount's credential is attached, replaced or removed
 (`AgentRuntime.attachCredential`/`removeCredential`, for a plugin that declares
 both `snapshotTools` and a `credential`), so a credential that lost a scope
 stops offering the scope's tools. A listing that fails leaves the stored list
-as it was: the previous credential's, or none. A mount with no snapshot at
-all — one made before the tools were generated, one whose credential was
-seeded rather than attached, or one whose first listing failed — is offered
+as it was when a credential was behind it; a list taken with no credential
+(`ToolSnapshot.withoutCredential`, which a mount added before its account has)
+is cleared instead. A mount with no snapshot at all — one made before the
+tools were generated, one whose credential was seeded rather than attached, or
+one whose first listing under a credential failed — is offered
 every generated tool, and Raft refuses what its credential may not do. Which
 manifest operations are not offered, and why, is one table (`EXCLUDED` in
 `src/plugins/raft.ts`); `test/raft-plugin.ts` turns red when the manifest has

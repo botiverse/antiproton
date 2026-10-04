@@ -1302,6 +1302,31 @@ await check("attaching, replacing and removing a mount's credential re-lists its
   if (JSON.stringify(await offered()) !== JSON.stringify(OWN)) throw new Error(`after remove: ${(await offered()).join(", ")}`);
 });
 
+await check("provisioning's order — mount added with no credential, then its account attached while Raft cannot list — offers every tool, as at deploy", async () => {
+  const { rt, offered } = await raftRuntime();
+  await rt.store.removeMount("t", "a", "raft", null);
+  if (await rt.store.getMountByAlias("t", "a", "raft")) throw new Error("fixture: the mount is still there");
+  let caps: string[] | "down" = "down";
+  raftServer(() => caps);
+  // The mount, as provisioning adds it: no account yet, so its list says no credential can do anything.
+  const added = await rt.addMount("t", "a", { alias: "raft", plugin: "raft", config: { serverUrl: "https://raft.example" } });
+  const empty = (await rt.store.getMountByAlias("t", "a", "raft"))?.toolSnapshot;
+  if (!added.ok || empty?.withoutCredential !== true || empty.tools.length !== 0) throw new Error(`added: ${JSON.stringify(added)} ${JSON.stringify(empty)}`);
+  if (JSON.stringify(await offered()) !== JSON.stringify(OWN)) throw new Error(`before the account: ${(await offered()).join(", ")}`);
+  // The account arrives while Raft cannot say what it may do: not the credential-less list, but every tool.
+  const r = await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" });
+  if (!r.ok) throw new Error(`attach: ${JSON.stringify(r)}`);
+  if ((await rt.store.getMountByAlias("t", "a", "raft"))?.toolSnapshot) throw new Error("the credential-less list was kept");
+  if (JSON.stringify(await offered()) !== JSON.stringify(raftPlugin.tools.map((t) => t.name))) throw new Error(`after a failed listing: ${(await offered()).join(", ")}`);
+  // Control: the same order with Raft answering lists what the credential may do, and the list is not marked.
+  caps = ["read", "send"];
+  await rt.attachCredential("t", "a", "raft", { token: "sk_agent_second_1234567890" });
+  const listed = (await rt.store.getMountByAlias("t", "a", "raft"))?.toolSnapshot;
+  if (!listed || listed.withoutCredential || JSON.stringify(await offered()) !== JSON.stringify([...OWN, ...allowedBy(["read", "send"])])) {
+    throw new Error(`listed: ${JSON.stringify(listed?.withoutCredential)} ${(await offered()).join(", ")}`);
+  }
+});
+
 await check("a mount whose first listing fails, with no list before it, is offered every tool, as at deploy", async () => {
   const { rt, offered } = await raftRuntime();
   raftServer(() => "down");
