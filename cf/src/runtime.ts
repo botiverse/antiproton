@@ -195,6 +195,8 @@ export interface InboundPass {
   posted: number;
   /** Rows settled as failed: given up after `INBOUND_POST_ATTEMPTS`, or found interrupted mid-post. */
   failed: number;
+  /** Rows settled as ignored, unposted: accepted by a mount that has since been removed. */
+  ignored: number;
   /** Rows still queued when the pass ended. */
   left: number;
   /** When to come back for a row that could not be posted yet; null when none is waiting on a retry. */
@@ -718,6 +720,12 @@ export const RETAKE_BACKOFF_MS = 10 * 60_000;
  * Running out does not block the removal; it is reported like a failure.
  */
 export const UNMOUNT_TIMEOUT_MS = 10_000;
+/**
+ * How soon the inbound pass comes back for a queued push whose mount is being removed
+ * (`AgentRuntime.deliverPendingInbound`). A removal takes up to `UNMOUNT_TIMEOUT_MS` plus a few index writes;
+ * two seconds keeps the pushes behind it from waiting much past its end without spinning the alarm.
+ */
+export const INBOUND_REMOVING_RETRY_MS = 2_000;
 
 /** The refusal's text when `e` is one, or null. `e` is whatever a catch holds, so it is asked before it is
  *  read: an object with a `message` is read there, anything else is read as itself. */
@@ -1012,7 +1020,7 @@ export class AgentRuntime {
     const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
     const settle = (row: PendingInbound, outcome: "delivered" | "failed" | "ignored", reason?: string) =>
       settleInbound(sql, transact, { ...row, tenantId, agentId, outcome, reason });
-    const out: InboundPass = { posted: 0, failed: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
+    const out: InboundPass = { posted: 0, failed: 0, ignored: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
     // Too old to be worth reading, wherever they stand: a long outage must not end in notices hours late.
     for (const seq of expiredPendingInbound(sql, Date.now())) {
       const row = pendingInboundRow(sql, seq);
@@ -1031,6 +1039,14 @@ export class AgentRuntime {
         continue;
       }
       const now = Date.now();
+      // Its mount is being removed right now: neither posted nor settled yet. Once the removal is done the check
+      // below gives it up; if the removal is called off, it is posted as usual. Order is strict, so the rows
+      // behind it wait too, for the few seconds a removal takes (`UNMOUNT_TIMEOUT_MS` bounds the longest part),
+      // and `retryInMs` brings the pass back, so the row is never left without an alarm.
+      if (this.#gateway.isRemoving(tenantId, agentId, head.alias)) {
+        out.retryInMs = INBOUND_REMOVING_RETRY_MS;
+        break;
+      }
       // Accepted by a mount that is gone — removed, or removed and added again under the alias — since the
       // service was answered: not the agent's to read, and never worth a retry. Null can only be a row queued
       // before the column existed: `acceptInbound` is the one INSERT and always stamps it (`receiveHook`), so a
@@ -1040,6 +1056,7 @@ export class AgentRuntime {
         const mount = await this.store.getMountByAlias(tenantId, agentId, head.alias);
         if (!mount || mount.installationId !== head.installationId) {
           settle(head, "ignored", "the mount that received it was removed");
+          out.ignored++;
           continue;
         }
       }

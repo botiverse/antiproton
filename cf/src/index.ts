@@ -2085,7 +2085,7 @@ export class AgentDO extends DurableObject<Env> {
     });
     if (out.retryInMs !== null) await this.#wake(Date.now() + out.retryInMs);
     logEvent("hook.deliver", {
-      tenantId, agentId, ms: Date.now() - started, posted: out.posted, failed: out.failed, left: out.left,
+      tenantId, agentId, ms: Date.now() - started, posted: out.posted, failed: out.failed, ignored: out.ignored, left: out.left,
       waitedMs: out.waitedMs ?? undefined, retryInMs: out.retryInMs ?? undefined, error: out.error ?? undefined,
     });
   }

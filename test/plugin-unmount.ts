@@ -461,6 +461,48 @@ await check("the same, with the alias added again before the pass: a different i
   host.dispose();
 });
 
+await check("a push queued before the removal waits while unmount runs (not posted, not settled, the pass comes back), then is ignored once the mount is gone", async () => {
+  const { pendingInboundCount } = await import("../src/runtime/inbound.ts");
+  const { INBOUND_REMOVING_RETRY_MS } = await import("../cf/src/runtime.ts");
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  await acceptedPush(rt, "svc", h);
+  const { removal, open } = await heldRemoval(rt, "svc", directory);
+  const during = await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0 && during.posted === 0 && during.ignored === 0, `the pass during unmount: ${show(during)}, posted ${show(posted)}`);
+  must(pendingInboundCount(host.sql) === 1 && during.left === 1, `the row is no longer queued: ${show(during)}`);
+  must(during.retryInMs === INBOUND_REMOVING_RETRY_MS, `the pass did not ask to come back: ${show(during)}`);
+  must(!(await rt.inboundLog(5)).some((e: any) => e.hookId === h.hookId && e.outcome !== "accepted"), "the row was settled during unmount");
+  open();
+  must((await removal).ok, "the removal failed");
+  const after = await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0 && after.ignored === 1 && after.left === 0, `the pass after: ${show(after)}, posted ${show(posted)}`);
+  const rec = (await rt.inboundLog(5)).find((e: any) => e.hookId === h.hookId);
+  must(rec?.outcome === "ignored" && rec?.reason === GONE, `record: ${show(rec)}`);
+  host.dispose();
+});
+
+await check("a push held back by a removal that is then called off (a revoke failed) is posted by the next pass", async () => {
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  await acceptedPush(rt, "svc", h);
+  const { removal, open } = await heldRemoval(rt, "svc", { ...directory, revoke: async () => { throw new Error("D1 write failed"); } });
+  const during = await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0 && during.left === 1, `the pass during unmount: ${show(during)}`);
+  open();
+  const r = await removal;
+  must(!r.ok && /could not revoke/.test(r.error), `control: the removal was not called off: ${show(r)}`);
+  const after = await rt.deliverPendingInbound("t", "a");
+  must((posted.length as number) === 1 && after.posted === 1 && after.left === 0, `the pass after: ${show(after)}, posted ${show(posted)}`);
+  host.dispose();
+});
+
 await check("a freshly accepted push carries the current mount's installation, read from the row itself", async () => {
   const { nextPendingInbound } = await import("../src/runtime/inbound.ts");
   const { rt, host, mount, hook } = await runtime();
