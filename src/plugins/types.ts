@@ -619,6 +619,22 @@ export function isExclusive(p: Pick<Plugin, "holds">): boolean {
 }
 
 /**
+ * Whether one call reads or writes, for choosing a mount policy's half: the
+ * plugin's {@link Plugin.classify} when it has one, failing closed to "write";
+ * the tool's declared `sideEffects` when it does not. One function, so the
+ * fail-closed rule is stated once rather than at every caller.
+ */
+export function callSideEffects(
+  p: Pick<Plugin, "classify">, tool: string, args: Json, declared: "read" | "write",
+): "read" | "write" {
+  if (!p.classify) return declared;
+  let answer: unknown;
+  try { answer = p.classify(tool, args); }
+  catch { return "write"; }
+  return answer === "read" || answer === "write" ? answer : "write";
+}
+
+/**
  * The tools one mount offers: the plugin's answer for that mount when it gives
  * one, its static list otherwise.
  *
@@ -1763,6 +1779,27 @@ export interface Plugin {
    * other return is the result itself.
    */
   invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json | Backgrounded | Interrupt>;
+  /**
+   * Whether THIS call reads or writes, for a tool whose answer depends on its
+   * arguments. Read through {@link callSideEffects}, never directly.
+   *
+   * `ToolSchema.sideEffects` is one answer per tool, and a mount's policy picks
+   * its read or write half from it. That breaks for one tool that runs many
+   * commands — a generic `raft` tool forwarding argv reads with one call and
+   * sends with the next — since either declaration is wrong for half its calls:
+   * "read" lets a send past "writes need approval", "write" holds every look.
+   * This answers per call, from the arguments, before the policy is asked.
+   *
+   * Fails closed: `undefined`, a throw, or anything but "read" or "write" is
+   * taken as "write", so a command the plugin did not recognise is held where
+   * writes are held, and a broken classifier costs an approval, never a write
+   * that skipped one. Synchronous and local: it must not reach a server.
+   * Absent: the tool's declared `sideEffects`, as before.
+   *
+   * It selects the policy half and nothing else. Replay, the duplicate-attempt
+   * guard and the rest still read the declared `sideEffects`.
+   */
+  classify?(tool: string, args: Json): "read" | "write" | undefined;
 
 
 
