@@ -45,6 +45,8 @@ const POLL_AFTER_MS = 300;
  * object calls again instead of parking.
  */
 const RETRY_BASE_MS = 30_000;
+/** How long a case waits for a park only the onSleep notice can bring: past any slowness seen under load. */
+const NOTICE_WAIT_MS = 10_000;
 const PROVIDER = "queue";
 const MODEL = "m1";
 
@@ -451,17 +453,24 @@ export function durableDriveCases(withHost: WithDriveHost, activeTimers: TimerPr
     h.resume();
     const verdicts: ParkVerdict[] = [];
     let timersAtPark = -1;
-    // A recheck longer than the deadline: only a commit or the onSleep notice can bring the read that parks.
+    // A recheck longer than the case: only a commit or the onSleep notice can bring the read that parks, and no
+    // commit follows the sleep. So the park is the assertion, not how long it took: a bound of 2 s failed under load
+    // (2712 ms) with the notice working, and the recheck would park this too, at 60 s, if the notice did not wake settle.
     const started = Date.now();
-    const r = await settle(h, {
-      context: bg, minParkMs: 1, recheckMs: 60_000, deadlineMs: 5_000, subscribe: w.subscribe,
-      onVerdict: (v) => { verdicts.push(v); if (v.verdict === "park" && activeTimers) timersAtPark = activeTimers(); },
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const noPark = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no park in ${NOTICE_WAIT_MS} ms with the recheck at 60 s: the notice did not wake settle`)), NOTICE_WAIT_MS);
+      // Not the engine's timer: unref'd, so node's live-timer probe does not count it (workerd has no unref).
+      (timer as { unref?: () => void }).unref?.();
     });
+    const r = await Promise.race([settle(h, {
+      context: bg, minParkMs: 1, recheckMs: 60_000, deadlineMs: NOTICE_WAIT_MS, subscribe: w.subscribe,
+      onVerdict: (v) => { verdicts.push(v); if (v.verdict === "park" && activeTimers) timersAtPark = activeTimers(); },
+    }), noPark]).finally(() => clearTimeout(timer));
     const p = parked(r);
     check(p.parkedUntil === napUntil && napUntil > started, `parked until ${p.parkedUntil}, the task asked for ${napUntil}`);
     check(p.sleepers.length === 1 && p.sleepers[0]?.phase === "nap", `sleepers ${show(p.sleepers)}`);
     check(w.sleeps.length === 1 && w.sleeps[0]?.until === napUntil, `onSleep notices ${show(w.sleeps)}`);
-    check(Date.now() - started < 2_000, `parked after ${Date.now() - started} ms: the notice did not wake settle`);
     if (activeTimers) {
       check(timersAtPark > 0, `no live timer seen before close: ${timersAtPark}`);
       check(activeTimers() === 0, `live timers after close: ${activeTimers()}`);
