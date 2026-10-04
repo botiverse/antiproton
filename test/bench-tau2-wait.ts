@@ -132,6 +132,51 @@ if (process.env.TAU2_WAIT_CHILD_PORT) {
     });
   }
 
+  // A failed model call ends the turn there and then: the wait returns null with the reason recorded, on the
+  // one connection it had. Before, the push path reconnected at the same cursor and was sent the failure
+  // again, in a loop, until the deadline; the poll path reconnected once and waited the deadline out.
+  for (const mode of ["keeps-tcp", "never-answers"] as const) {
+    await check(`a model.failed pushed on the socket ends the wait at once, on one connection, when the server ${how(mode)}`, async () => {
+      const obj = await fakeObject(mode, [{ id: 4, kind: "model.failed", payload: { error: "boom" } }]);
+      try {
+        const base = clientSockets(obj);
+        const { d, delivered } = deps(obj.port, async () => benchPollBody(settled, true, 0));
+        const t0 = Date.now();
+        const got = await pushForAnswer("t1", Date.now() + 3_000, d);
+        const ms = Date.now() - t0;
+        assert(got === null, `a failed turn produced an answer: ${JSON.stringify(got)}`);
+        // Both readings in one message, so a red run shows the reconnects as well as the time.
+        assert(ms < 1_000 && obj.accepted.size <= 1,
+          `the wait took ${ms} ms to return after the failure, over ${obj.accepted.size} connection(s) to the object`);
+        assert(d.failed.get("t1") === "boom", `failed is ${JSON.stringify(d.failed.get("t1"))}, not the pushed error`);
+        assert(same(delivered, zero()), `delivered ${JSON.stringify(delivered)}`);
+        const n = await settlesTo(base, obj);
+        assert(n === base, `${n - base} client socket(s) still open after the wait returned (baseline ${base})`);
+      } finally { obj.stop(); }
+    });
+
+    await check(`a model.failed the poll fallback found ends the wait at once, on one connection, when the server ${how(mode)}`, async () => {
+      const obj = await fakeObject(mode, toolCall);
+      try {
+        const base = clientSockets(obj);
+        const failedAfter: PollEvent[] = [{ sequence: 1, kind: "message" }, { sequence: 4, kind: "model.failed" }];
+        const { d, delivered } = deps(obj.port, async () => benchPollBody(failedAfter, false, 0), { lookEveryMs: 100 });
+        const t0 = Date.now();
+        const got = await pushForAnswer("t1", Date.now() + 3_000, d);
+        const ms = Date.now() - t0;
+        assert(got === null, `a failed turn produced an answer: ${JSON.stringify(got)}`);
+        // Both readings in one message, so a red run shows the reconnects as well as the time.
+        assert(ms < 1_000 && obj.accepted.size <= 1,
+          `the wait took ${ms} ms to return after the failure, over ${obj.accepted.size} connection(s) to the object`);
+        assert(d.failed.has("t1"), "the poll's failure was not recorded");
+        assert(d.seen.get("t1") === 4, `the cursor is ${d.seen.get("t1")}, not the failure's sequence 4`);
+        assert(same(delivered, { ...zero(), pollAnswered: 1 }), `delivered ${JSON.stringify(delivered)}`);
+        const n = await settlesTo(base, obj);
+        assert(n === base, `${n - base} client socket(s) still open after the wait returned (baseline ${base})`);
+      } finally { obj.stop(); }
+    });
+  }
+
   await check("a wait that runs out of time leaves no socket open either", async () => {
     // Running throughout, and nothing answers on the socket, so the deadline is what ends the wait.
     const obj = await fakeObject("keeps-tcp", toolCall);

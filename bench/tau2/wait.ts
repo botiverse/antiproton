@@ -54,6 +54,8 @@ export async function pushForAnswer(taskId: string, deadline: number, deps: Push
   while (Date.now() < deadline) {
     const answer = await oneSocket(taskId, deadline, deps);
     if (answer !== null) return answer;
+    // A failed model call ends the turn; reconnecting would only hear the failure again (or nothing) until the deadline.
+    if (deps.failed.has(taskId)) return null;
   }
   return null;
 }
