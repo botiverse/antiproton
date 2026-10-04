@@ -2077,6 +2077,12 @@ export interface Plugin {
    * - **Then the runtime revokes every hook of the mount still live**, so a hook the plugin forgot, or could not
    *   reach because it failed, does not stay a public URL pointing at a removed alias.
    *
+   * - **Not gated by the switch or the version pin** that pushed events pass: switching a plugin off stops its
+   *   tools and its deliveries, not the cleanup owed for what it registered while it was on.
+   *
+   * Cleanup only: cancel registrations, subscriptions, reminders. It never wakes the agent, posts a message or
+   * calls a model — that is what makes running it for a switched-off plugin safe.
+   *
    * Never a tool: the model cannot call it. Absent: nothing is asked, and the runtime still revokes the hooks.
    */
   unmount?(ctx: PluginContext): Promise<void>;

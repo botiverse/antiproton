@@ -586,6 +586,12 @@ reading the ids it kept in `ctx.db`. What the runtime promises:
   with the reason and can be tried again; `unmount` will have run, so make it
   safe to run a second time over what it already cancelled.
 
+It runs even when the plugin is switched off or the agent is pinned to another
+version: switching off stops tools and deliveries, not the cleanup owed for what
+the plugin registered while it was on. That is safe because `unmount` is
+**cleanup only** — cancel registrations, subscriptions, reminders — and never
+wakes the agent, posts a message or calls a model.
+
 Revoking through `ctx.inbound` inside `unmount` is allowed and changes nothing
 about the order; telling the service to stop sending is the part only the
 plugin can do. `test/plugin-unmount.ts` holds these rules.
