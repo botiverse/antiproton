@@ -26,11 +26,12 @@ import { applyRetailAction, WRITE_TOOLS, type RetailDB } from "./retail.ts";
 import { canonJson as canon, canonArgs, actionMatch as grade } from "./grade.ts";
 import { createHash } from "node:crypto";
 import { beginRun, driverCommit, recordRun, teeRun, workerBuild, workerModel } from "../record.ts";
-import { decideFromPoll, stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
+import { stallAtDeadline, type StallEvidence } from "../poll-fallback.ts";
 import { endingsAllRows, failingRowsByEndingAndCause } from "./endings.ts";
 import { passLines, passRecord } from "./passk.ts";
 import { runOrder, runPlan } from "./plan.ts";
-import { deafnessBudget, hearPollDecision, hearSocketEvent, readDeafness } from "./deafness.ts";
+import { deafnessBudget, readDeafness } from "./deafness.ts";
+import { pushForAnswer as pushForAnswerOn, type Delivered } from "./wait.ts";
 import { benchEngine, objectsShape, sumActivity, taskObject } from "../objects.ts";
 
 for (const l of readFileSync(`${homedir()}/.secrets/antiproton.env`, "utf8").split("\n")) {
@@ -136,87 +137,16 @@ async function pollForAnswer(taskId: string): Promise<string | null> {
   return null;
 }
 
-/** The turn is over when the model replies with text and no tool call — which
- *  is the same rule the object applies, read from the same event stream the
- *  console reads.
- *
- *  Reconnects rather than gives up. A socket that drops mid-turn is not an
- *  agent that stalled, and scoring it as one would blame the harness for the
- *  network; the cursor means a reconnect resumes where it left off instead of
- *  replaying the previous turn's answer and ending the conversation early. */
+/** WAIT=push: the socket wait itself is bench/tau2/wait.ts; this passes it the runner's state. */
 async function pushForAnswer(taskId: string): Promise<string | null> {
-  const deadline = Date.now() + TURN_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const answer = await oneSocket(taskId, deadline);
-    if (answer !== null) return answer;
-  }
-  return null;
-}
-
-function oneSocket(taskId: string, deadline: number): Promise<string | null> {
-  // The token goes on the upgrade too: /bench/* is gated (task #15), and a
-  // refused upgrade reaches a WebSocket client only as close 1006 with no body,
-  // which this runner then scored as a stalled agent.
-  const ws = new (WebSocket as any)(BASE.replace(/^http/, "ws") + withObj(
-    `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${seen.get(taskId) ?? 0}`, objOf(taskId)), { headers: { "x-harness-token": TOKEN } }) as WebSocket;
-  return new Promise<string | null>((resolve) => {
-    let done = false;
-    const stop = (v: string | null) => {
-      if (done) return;
-      done = true;
-      clearInterval(keepalive); clearTimeout(timer);
-      try { ws.close(); } catch { /* already gone */ }
-      resolve(v);
-    };
-    // The object answers a ping, which is the only thing keeping an idle
-    // connection from being closed underneath a slow model call.
-    const keepalive = setInterval(() => {
-      try { ws.send("ping"); } catch { /* closing */ }
-      // A lost push must not become a stall: the object may have answered already (bench/poll-fallback.ts).
-      void api(`/bench/poll?taskId=${taskId}`, {}, objOf(taskId)).then((poll: any) => {
-        count(taskId, "pollAnswered");
-        const d = decideFromPoll(poll, seen.get(taskId) ?? 0);
-        if (!d) return;
-        const heard = hearPollDecision(d, deafness.deaf("poll"));
-        if (heard.kind === "ignored") { if (VERBOSE) console.log("    (ignoring the poll's answer on purpose)"); return; }
-        seen.set(taskId, heard.seen!);
-        if (heard.kind === "failed") { failed.set(taskId, "the model call failed (seen by poll after a lost push)"); stop(null); }
-        else { if (!done) count(taskId, "poll"); stop((heard as { text: string }).text); }
-      }, () => {
-        // Only the request failing counts here; the socket or the next tick will do.
-        count(taskId, "pollFailed");
-      }).catch(() => { /* a fault in handling an answer is not a failed poll */ });
-    }, 20_000);
-    const timer = setTimeout(() => stop(null), Math.max(0, deadline - Date.now()));
-    // A socket that ends before this turn's answer is a drop, whatever comes next.
-    const drop = () => { if (!done) count(taskId, "dropped"); stop(null); };
-    ws.onerror = drop;
-    ws.onclose = drop;
-    ws.onmessage = (ev: MessageEvent) => {
-      let e: any;
-      try { e = JSON.parse(String(ev.data)); } catch { return; }
-      if (e.kind === "pong") return;
-      // A failed model call ends the turn as surely as an answer does, and
-      // waiting out the timeout would report it as a stall — which blames the
-      // wrong thing.
-      if (e.kind === "model.failed") {
-        failed.set(taskId, String(e.payload?.error ?? "the model call failed"));
-        stop(null);
-        return;
-      }
-      // What to do with it, including whether the cursor moves, lives in bench/tau2/deafness.ts so that
-      // the ordering is a function a test can call rather than a shape only this closure knows.
-      const heard = hearSocketEvent(e, deafness.deaf("socket"));
-      if (heard.kind === "ignored") {
-        if (VERBOSE) console.log("    (ignoring the socket's answer on purpose)");
-        return;
-      }
-      if (heard.seen !== null) seen.set(taskId, heard.seen);
-      if (heard.kind === "answer") {
-        if (!done) count(taskId, "push");
-        stop(heard.text);
-      }
-    };
+  return pushForAnswerOn(taskId, Date.now() + TURN_TIMEOUT_MS, {
+    socketUrl: (taskId, after) => BASE.replace(/^http/, "ws") + withObj(
+      `/bench/events?tenantId=bench&agentId=b_${taskId}&after=${after}`, objOf(taskId)),
+    headers: { "x-harness-token": TOKEN },
+    poll: (taskId) => api(`/bench/poll?taskId=${taskId}`, {}, objOf(taskId)),
+    seen, failed, count,
+    deaf: (to) => deafness.deaf(to),
+    say: VERBOSE ? (line) => console.log(line) : undefined,
   });
 }
 
@@ -224,15 +154,6 @@ function oneSocket(taskId: string, deadline: number): Promise<string | null> {
  *  previous turn's answer and end the conversation a turn early. */
 const seen = new Map<string, number>();
 
-/**
- * Which path brought each turn's answer, and how often each path was given
- * the chance. `poll: 0` alone cannot tell "no push was lost" from "the
- * fallback never ran". `pollAnswered` and `pollFailed`
- * count the fallback's polls that came back and that failed, so both zero
- * means none was sent; `dropped` counts sockets that closed or failed before
- * an answer.
- */
-type Delivered = { push: number; poll: number; pollAnswered: number; pollFailed: number; dropped: number };
 const delivered = new Map<string, Delivered>();
 function count(taskId: string, what: keyof Delivered) {
   const d = delivered.get(taskId) ?? { push: 0, poll: 0, pollAnswered: 0, pollFailed: 0, dropped: 0 };
