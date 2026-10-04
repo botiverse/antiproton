@@ -833,7 +833,7 @@ does need one; see the GitHub example below.
    with the reason. Events wait in order, so while posting keeps failing the
    queue grows: an event queued for 30 minutes is recorded as `failed` wherever
    it stands, and a hook with 30 events queued is answered 429, as the rate
-   limit answers. An event is never posted twice: if a pass ends
+   limit answers, with `Retry-After: 3`. An event is never posted twice: if a pass ends
    while handing an event over, it cannot tell whether the event arrived, and
    records it as `failed` rather than posting it again.
 
@@ -957,7 +957,7 @@ was given up.
 | rejected | 401 | `deliver: false, rejected: true` |
 | malformed | 400 | `deliver: false, malformed: true` |
 | too_large | 413 | body over 1 MB |
-| rate_limited | 429 | over 30 deliveries a minute for this hook, or 30 already queued |
+| rate_limited | 429 | over 30 deliveries a minute for this hook, or 30 already queued; `Retry-After` says when to try again: for the rate, the whole seconds until the minute lets one more in; for the queue, 3 |
 | failed | 503 | `receive` threw, or the hook has no secret; in the record also an accepted event that was given up (the service was already answered 202) |
 
 When an expected event never arrived, read the record with
