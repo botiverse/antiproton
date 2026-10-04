@@ -757,7 +757,14 @@ function neutralizedRefs(text: string): string {
  */
 export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quoted: readonly string[] = []): string {
   const kept: string[] = [];
-  let masked = text;
+  // A search result's preview is a person's words and nothing else: the SDK (0.10.0 `formatAgentSearchResults`) puts
+  // `renderSearchPreview` alone between a `<preview>` line and a `</preview>` line, and that renders only the content,
+  // windowed, with its references neutralised and `<match>`/`<omit />` marks added, never a hint. A person cannot end
+  // the block early: the SDK escapes `<preview>`, `</preview>`, `<match>` and `<result>` tags in what it quotes there
+  // (`escapeSearchComponentLiterals`), so no line of theirs is exactly `</preview>`. The marks it adds are why the
+  // verbatim check below cannot see a call inside a preview (a hit wrapped in `<match>` splits it), so the whole block
+  // is set aside, first, before anything a person wrote could be mistaken for the tags.
+  let masked = text.replace(/^<preview>\n[\s\S]*?\n<\/preview>$/gm, (block) => { kept.push(block); return `\uE000${kept.length - 1}\uE001`; });
   for (const q of [...new Set(quoted)].sort((x, y) => y.length - x.length)) {
     if (!q || !masked.includes(q)) continue;
     masked = masked.split(q).join(`\uE000${kept.length}\uE001`);
