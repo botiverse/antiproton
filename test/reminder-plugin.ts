@@ -974,6 +974,8 @@ await check("through receiveHook: a push is delivered once under the outside-con
   const second = await rt.receiveHook("t", "a", "rem", inboundHookId, event(now + 60));
   must(second.outcome === "duplicate", `the retried push was ${second.outcome}, not a duplicate`);
   must(received.length === 2, `receive ran ${received.length} times`);
+  // Since #752 a push is accepted first and handed to the agent by the delivery pass.
+  await rt.deliverPendingInbound("t", "a");
   must(posted.length === 1, `posted ${posted.length} messages`);
   const lines = posted[0]!.split("\n");
   must(lines[0]!.startsWith("[incoming event from the `rem` mount") && lines[1]!.startsWith("Reminder (") && lines.slice(2).every((l) => l.startsWith("> ")),
