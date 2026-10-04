@@ -348,11 +348,19 @@ answered, before anything is recorded as seen. A response lost after Raft built
 it is Raft's pending batch, so after any failure the next pull acknowledges
 nothing, and the worst a failure costs is that batch handed out again. A message too long to fit alone is handed over
 alone and acknowledged, so the inbox moves, but not recorded as seen: the model
-got a parked preview, so a send into that conversation is still held. The CLI commands the SDK's text
-names are rewritten as tool calls in one place (`toolTerms`), a stopgap until
-the SDK can write them that way; only the SDK's own hint lines are touched, and
-what a person wrote (a message, a description, a title, a preview) is passed
-on as written. A tool's description and every parameter description in its
+got a parked preview, so a send into that conversation is still held. Every client is
+made with the SDK's `hints: "tool"`, so its hints are tool calls
+(`messages_read({ target: "#ops" })`), named by the manifest's `toolName`
+without the mount's alias, as every other tool reference in Raft's text is. A
+hint naming a tool the mount does not offer (an `EXCLUDED` operation, or the
+SDK's code-only `raft.<operation>(…)`) is put in words in one place
+(`offeredTerms`); what a person wrote (a message, a description, a title, a
+preview) is passed on as written. A hint at a tool the credential does not
+reach is not caught there — a call carries no record of its mount's list — and
+calling it is refused by the gateway. `attachments_download_url` fetches the
+file Raft points at into the agent's object storage (at most
+`ATTACHMENT_MAX_BYTES`) and returns its `artifact://` reference, never the
+URL; it stays in `EXCLUDED` until Raft serves the route. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do

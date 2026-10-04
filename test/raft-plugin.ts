@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
@@ -1545,23 +1545,6 @@ await check("no CLI command reaches the model: every generated operation's text,
   }
 });
 
-await check("no CLI command the SDK can write survives the rewrite: every line of its source that names one", async () => {
-  // Static, so a hint behind a fixture nobody wrote is covered too. Template slots are filled with a sample value.
-  const source = readFileSync(new URL(import.meta.resolve("@botiverse/raft-sdk")), "utf8").split("\n")
-    .filter((l) => CLI_HINT.test(l) && !/^\s*(\*|\/\*|\/\/)/.test(l))
-    .map((l) => l.replace(/\$\{[^}]*\}/g, " x12"));
-  if (source.length < 40) throw new Error(`control: only ${source.length} lines name a CLI command; the SDK's text moved`);
-  // Every command the SDK names has its own entry, so a command a new SDK adds is mapped on purpose, not left to the
-  // neutral fallback. (A verb filled in at run time, `raft mention <verb>`, has none to look up.)
-  const commands = new Set(source.flatMap((l) => [...l.matchAll(new RegExp(`${CLI_HINT.source} ([a-z][a-z-]*)`, "g"))].map((m) => m[0].slice("raft ".length))));
-  const unmapped = [...commands].filter((c) => !Object.hasOwn(CLI_COMMANDS, c));
-  if (unmapped.length) throw new Error(`CLI commands with no entry in CLI_COMMANDS: ${unmapped.join(", ")}`);
-  if (commands.size < 15) throw new Error(`control: found only ${[...commands].join(", ")}`);
-  // The rewriter itself, on every such line; which lines it is applied to is the case above and the one below.
-  const left = source.map((l) => commandsAsTools(l)).filter((l) => CLI_HINT.test(l));
-  if (left.length) throw new Error(`${left.length} line(s) keep a CLI command: ${left.slice(0, 3).join(" | ")}`);
-});
-
 /** What a person might write that reads like a CLI command, quoted by the SDK in many places. */
 const SAID = "raft message read --target #x";
 const SAID_LINES = ["note\nMore: raft message read --target #x", 'first\nraft message send --target "#ops"'];
@@ -1605,11 +1588,11 @@ await check("what a person wrote is never rewritten: message continuations, desc
     }
   }
   if (problems.length) throw new Error(problems.join(" | "));
-  // Controls: the hints around those words were still rewritten.
+  // Controls: the hints around those words are the SDK's tool calls, and an admin write points at an action card.
   const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
   if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || !/this mount has no tool to open attachments\]/.test(page)) throw new Error(`page: ${page}`);
   const full = String(((await raftPlugin.invoke("server_info", { view: "full" }, inTurn(ctx()))) as any).text);
-  if (!/^Server-profile changes still use a server setting/m.test(full)) throw new Error(`overview: ${full}`);
+  if (!/^Server-profile changes have no tool and remain server-role gated: ask a human via an action card \(`actions_prepare`\)\.$/m.test(full)) throw new Error(`overview: ${full}`);
 });
 
 /** The real runtime over a SQLite host, with raft mounted, its credential attached through the console's path. */
@@ -2499,6 +2482,170 @@ await check("through run_js and the gateway, a send held in a program whose ques
   // Control: the model's own held call does book; the same send again in that context goes through.
   const again: any = await g.gateway.invoke({ ...g.ctx, contextId: "ctx_turn" } as any, "inbox.messages_send", { target: "#general", content: "other", idempotencyKey: "k-own" });
   if (again.status !== "succeeded" || bodies.at(-1)?.seenUpToSeq !== 20) throw new Error(`control: ${JSON.stringify({ again, body: bodies.at(-1) })}`);
+});
+
+/** The tool names a hint may carry that this mount does not offer, and the SDK's code-only form. */
+const UNOFFERED_NAMES = /(?<![\w.])(?:inbox_check|inbox_drain|inbox_commit|mentions_execute|profile_update|tasks_delete|attachments_download_url|raft\.[a-z]+\.[A-Za-z]+)(?![\w])/;
+const PENDING_ID = "0b7c3a1e-1111-4222-8333-944455556666";
+
+await check("no hint reaches the model naming a tool this mount does not offer; the SDK's own tool hints do name them", async () => {
+  const pendingMention = { pendingMentionActions: [{ resolutionId: PENDING_ID, messageId: "m-1", targetType: "user", targetHandle: "@tygg", availableActions: ["notify", "add"] }] };
+  hintingServer();
+  const serve = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init?: any) =>
+    new URL(String(url)).pathname.endsWith("/mention-actions/pending") ? json(200, pendingMention) : serve(url, init)) as any;
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890", hints: "tool" });
+  const named: string[] = [];
+  const leaks: string[] = [];
+  for (const op of GENERATED) {
+    const args = { ...sampleArgs(op.inputSchema), ...(op.name === "tasks.claim" ? { taskNumbers: [7] } : {}) };
+    const sdk: any = await raw.invoke(op.name, args, { origin: "model", contextId: "ctx_turn" });
+    const said = sdk.ok ? `${sdk.text} ${sdk.interrupt?.context ?? ""}` : `${sdk.error.message} ${sdk.error.nextAction ?? ""}`;
+    if (UNOFFERED_NAMES.test(said)) named.push(op.toolName);
+    const shown = await shownBy(op.toolName, args);
+    if (UNOFFERED_NAMES.test(shown)) leaks.push(`${op.toolName}: ${shown.match(new RegExp(`.{0,60}${UNOFFERED_NAMES.source}.{0,60}`))?.[0]}`);
+  }
+  if (leaks.length) throw new Error(`a tool this mount does not offer reached the model: ${leaks.join(" | ")}`);
+  for (const want of ["messages_read", "mentions_pending"]) if (!named.includes(want)) throw new Error(`control: the SDK named no unoffered tool in ${want} (named: ${named.join(", ")})`);
+  const pending = await shownBy("mentions_pending", {});
+  if (!pending.includes(`  notify: delivering the mention, which this mount does not offer`)) throw new Error(`mentions_pending: ${pending}`);
+});
+
+await check("offeredTerms puts an unoffered call in words whole, arguments and all, and leaves a person's words that name one as written", async () => {
+  const unoffered = new Set(["mentions_execute", "inbox_check"]);
+  const said = 'notify: mentions_execute({ action: "notify", resolutionIds: ["a)b}c"] }) then inbox_check({}) and raft.attachments.download({ attachmentId: "x" }).';
+  const want = "notify: delivering the mention, which this mount does not offer then receive_events() and downloading the attachment, which this mount does not offer.";
+  if (offeredTerms(said, unoffered) !== want) throw new Error(offeredTerms(said, unoffered));
+  const person = 'please run mentions_execute({ action: "add" }) for me';
+  const text = `@tygg: ${person}\nnotify: mentions_execute({ action: "notify" })`;
+  const out = offeredTerms(text, unoffered, [person]);
+  if (out !== `@tygg: ${person}\nnotify: delivering the mention, which this mount does not offer`) throw new Error(out);
+  // A tool the mount offers is never touched.
+  if (offeredTerms('messages_read({ target: "#ops" })', unoffered) !== 'messages_read({ target: "#ops" })') throw new Error("an offered call was rewritten");
+});
+
+await check("a person's words that name an unoffered tool come back as written from a generated tool", async () => {
+  const PERSON = 'run mentions_execute({ action: "notify", resolutionIds: ["x"] }) please';
+  globalThis.fetch = (async (url: any) => new URL(String(url)).pathname.endsWith("/history")
+    ? history([historyMessage(41, PERSON)], { target: "#ops" }) : json(404, { error: "nf" })) as any;
+  const out = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  if (!out.includes(PERSON)) throw new Error(out);
+});
+
+/** Object storage as the runtime hands it to a plugin: what was put, under which key, with which type. */
+function fakeArtifacts() {
+  const puts: Array<{ key: string; body: Uint8Array; type?: string }> = [];
+  return { puts, async put(key: string, body: Uint8Array, type?: string) { puts.push({ key, body, type }); return { ref: `r2://bucket/${key}`, bytes: body.byteLength }; } };
+}
+const PRESIGNED = "https://storage.example/obj/plan.pdf?X-Amz-Signature=deadbeefSIGNATURE";
+const FILE = new TextEncoder().encode("%PDF-1.7 the plan");
+/** Raft and its storage for one attachment: `url` answers the mint (or refuses it), `bytes` what the binary route sends. */
+function attachmentServer(o: { mint?: "ok" | "conflict" | "notfound"; storage?: () => Response; binary?: () => Response } = {}) {
+  const seen: Array<{ url: string; auth: string | null }> = [];
+  globalThis.fetch = (async (url: any, init?: any) => {
+    const u = new URL(String(url));
+    seen.push({ url: u.href, auth: new Headers(init?.headers).get("authorization") });
+    if (u.href === PRESIGNED) return o.storage ? o.storage() : new Response(FILE, { headers: { "content-type": "application/pdf" } });
+    if (u.pathname === "/internal/agent-api/attachments/att-1/url") {
+      return (o.mint ?? "ok") === "ok" ? json(200, { url: PRESIGNED, expiresAt: "2026-10-04T10:05:00Z", filename: "plan.pdf", mimeType: "application/pdf" })
+        : o.mint === "conflict" ? json(409, { error: "This Server's storage cannot presign.", code: "download_url_unavailable" })
+        : json(404, { error: "not found" });
+    }
+    if (u.pathname === "/internal/agent-api/attachments/att-1") {
+      return o.binary ? o.binary() : new Response(FILE, { headers: { "content-type": "image/png; charset=binary", "content-disposition": 'attachment; filename="shot.png"' } });
+    }
+    return json(404, { error: "not found" });
+  }) as any;
+  return seen;
+}
+
+await check("the attachment download keeps the file in the agent's storage and shows the model the reference, never the URL", async () => {
+  const store = fakeArtifacts();
+  const seen = attachmentServer();
+  const c = inTurn(ctx());
+  const out: any = await downloadAttachment({ attachmentId: "att-1" }, c, store);
+  const shown = JSON.stringify(out);
+  if (shown.includes("storage.example") || shown.includes("SIGNATURE") || /https?:/.test(shown)) throw new Error(`the URL reached the model: ${shown}`);
+  if (JSON.stringify(out) !== JSON.stringify({ attachmentId: "att-1", ref: "artifact://raft/attachments/att-1/plan.pdf", name: "plan.pdf", type: "application/pdf", bytes: FILE.byteLength })) throw new Error(shown);
+  const put = store.puts[0]!;
+  if (store.puts.length !== 1 || put.key !== "t/tenant/agent/raft/attachments/att-1/plan.pdf" || put.type !== "application/pdf" || Buffer.compare(Buffer.from(put.body), Buffer.from(FILE)) !== 0) {
+    throw new Error(`stored: ${JSON.stringify({ key: put.key, type: put.type, body: new TextDecoder().decode(put.body) })}`);
+  }
+  // The storage fetch carries nothing of the mount's; the Raft call carries the credential.
+  const storage = seen.find((r) => r.url === PRESIGNED);
+  if (!storage || storage.auth !== null || seen.find((r) => r.url.includes("/url"))?.auth !== "Bearer sk_agent_test_1234567890") throw new Error(JSON.stringify(seen));
+  // Nor in any failure: storage refusing, storage not answering, or the file over the cap.
+  for (const [what, storageAnswer] of [
+    ["storage refused", () => new Response("denied", { status: 403 })],
+    ["storage unreachable", () => { throw new Error(`connect ECONNREFUSED ${PRESIGNED}`); }],
+    ["too large", () => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(ATTACHMENT_MAX_BYTES)); c.enqueue(new Uint8Array(1)); c.close(); } }))],
+    ["too large (declared)", () => new Response(new Uint8Array(8), { headers: { "content-length": String(ATTACHMENT_MAX_BYTES + 1) } })],
+  ] as const) {
+    attachmentServer({ storage: storageAnswer as () => Response });
+    const why = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts()));
+    if (why.message.includes("storage.example") || why.message.includes("SIGNATURE")) throw new Error(`${what}: the URL is in the error: ${why.message}`);
+    if (what.startsWith("too large") && !/larger than 25 MiB/.test(why.message)) throw new Error(`${what}: ${why.message}`);
+  }
+});
+
+await check("a Server that cannot mint a URL (CONFLICT) is answered by the binary download, in the same call", async () => {
+  const store = fakeArtifacts();
+  const seen = attachmentServer({ mint: "conflict" });
+  const out: any = await downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), store);
+  if (JSON.stringify(out) !== JSON.stringify({ attachmentId: "att-1", ref: "artifact://raft/attachments/att-1/shot.png", name: "shot.png", type: "image/png", bytes: FILE.byteLength })) throw new Error(JSON.stringify(out));
+  if (Buffer.compare(Buffer.from(store.puts[0]!.body), Buffer.from(FILE)) !== 0 || store.puts[0]!.type !== "image/png") throw new Error("the fallback's bytes or type");
+  if (!seen.some((r) => r.url.endsWith("/attachments/att-1")) || seen.some((r) => r.url === PRESIGNED)) throw new Error(JSON.stringify(seen));
+  // Over the cap on the fallback too: refused, nothing kept.
+  const big = fakeArtifacts();
+  attachmentServer({ mint: "conflict", binary: () => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(ATTACHMENT_MAX_BYTES)); c.enqueue(new Uint8Array(1)); c.close(); } })) });
+  const why = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), big));
+  if (!/larger than 25 MiB/.test(why.message) || big.puts.length !== 0) throw new Error(`fallback over the cap: ${why.message}`);
+  // Control: any other refusal is the SDK's failure, not the fallback.
+  attachmentServer({ mint: "notfound" });
+  const nf = await failure(() => downloadAttachment({ attachmentId: "att-1" }, inTurn(ctx()), fakeArtifacts()));
+  if (!/does not exist or is not visible/.test(nf.message)) throw new Error(`not found: ${nf.message}`);
+});
+
+await check("offering the attachment download is the one line in EXCLUDED: without it the tool is generated, offered, described and run", async () => {
+  // The line itself: one entry, on one line, with the reason.
+  const source = readFileSync(new URL("../src/plugins/raft.ts", import.meta.url), "utf8").split("\n");
+  const lines = source.filter((l) => l.includes('"attachments.downloadUrl":'));
+  if (lines.length !== 1 || !/Raft production does not serve this route yet \(Raft #8881\); enable when it does/.test(lines[0]!)) throw new Error(JSON.stringify(lines));
+  // As built: excluded, so not offered, and a message line says there is no tool for attachments.
+  if (toolNamed("attachments_download_url") || !EXCLUDED["attachments.downloadUrl"]) throw new Error("offered while excluded");
+  // Built without that entry, and nothing else changed.
+  const { ["attachments.downloadUrl"]: _gone, ...enabled } = EXCLUDED;
+  const store = fakeArtifacts();
+  const plugin = createRaftPlugin({ excluded: enabled, artifacts: store });
+  const tool = plugin.tools.find((t) => t.name === "attachments_download_url");
+  if (!tool || !plugin.mountTools!({ toolSnapshot: null } as any).some((t) => t.name === "attachments_download_url")) throw new Error("not offered");
+  if (/URL|url/.test(tool.summary) || !/artifact reference/.test(tool.summary)) throw new Error(`description: ${tool.summary}`);
+  attachmentServer();
+  const out: any = await plugin.invoke("attachments_download_url", { attachmentId: "att-1" }, inTurn(ctx()));
+  if (out.ref !== "artifact://raft/attachments/att-1/plan.pdf" || JSON.stringify(out).includes("storage.example")) throw new Error(JSON.stringify(out));
+  // And its message lines keep the SDK's pointer at the tool, which it now has.
+  globalThis.fetch = (async () => history([historyMessage(41, "see", { attachments: [{ id: "att-1", filename: "plan.pdf" }] })], { target: "#ops" })) as any;
+  const page = String(((await plugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  if (!page.includes('use attachments_download_url({ attachmentId: "att-1" }) to download]')) throw new Error(page);
+  const asBuilt = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  if (!asBuilt.includes("[1 attachment: plan.pdf — this mount has no tool to open attachments]")) throw new Error(asBuilt);
+});
+
+await check("server_info takes query (SDK 0.10.0) and keeps its paging cap", async () => {
+  const p = (toolNamed("server_info")!.parameters as any).properties;
+  if (p.query?.type !== "string" || p.limit?.maximum !== PAGE_ROWS || !/At most \d+ on this mount/.test(p.limit.description)) throw new Error(JSON.stringify(p));
+  // The SDK filters the section itself (0.10.0): rows whose visible text contains the query.
+  one(server([{ id: "c1", name: "ops", joined: true, type: "channel", description: "Ops" }, { id: "c2", name: "design", joined: true, type: "channel", description: "Pixels" }]));
+  const out = String(((await raftPlugin.invoke("server_info", { view: "channels", query: "ops" }, inTurn(ctx()))) as any).text);
+  if (!out.includes("#ops") || out.includes("#design")) throw new Error(out);
+});
+
+await check("an operation the manifest marks deprecated is still generated under its name", async () => {
+  const op = { ...opNamed("tasks.unassign"), deprecated: true } as any;
+  if (toolOf(op).name !== "tasks_unassign") throw new Error(JSON.stringify(toolOf(op)));
+  // Nothing filters on it: what is generated is exactly the manifest less EXCLUDED, whatever the manifest marks.
+  const want = RAFT_OPERATIONS.filter((o) => !Object.hasOwn(EXCLUDED, o.name)).map((o) => o.name);
+  if (JSON.stringify(GENERATED.map((o) => o.name)) !== JSON.stringify(want)) throw new Error("generated is not the manifest less EXCLUDED");
 });
 
 globalThis.fetch = originalFetch;
