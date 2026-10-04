@@ -132,7 +132,8 @@ await check("an instance whose fix is absent: pytest exits 1, the script exits 0
       return settleShell({ status: "succeeded", result: { state: exitCode === 0 ? "succeeded" : "failed", exitCode, output: r.stdout.toString() } },
         async () => { throw new Error("nothing was backgrounded"); }, { deadlineAt: Date.now() + 60_000 });
     };
-    const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log));
+    // The test patch's scratch copy goes to the testbed too, not to a /tmp other runs share.
+  const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log).replaceAll("/tmp/swe-test.patch", join(tb.dir, "test.patch")));
     must(graded.status === "succeeded" && graded.result.exitCode === 0, `the grading script failed as a command: ${show(graded)}`);
     const text = gunzipSync(await readBoxFile(async (c) => {
       const a = await shell(c);
@@ -163,7 +164,8 @@ async function gradeInBox(tb: ReturnType<typeof testbed>, inst: GradedInstance, 
     if (a.status !== "succeeded") throw new Error(show(a));
     return String(a.result.output);
   };
-  const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log));
+  // The test patch's scratch copy goes to the testbed too, not to a /tmp other runs share.
+  const graded = await shell(gradeCommand(inst, tb.repo).replaceAll(GRADE_LOG, log).replaceAll("/tmp/swe-test.patch", join(tb.dir, "test.patch")));
   // readGradeLog reads GRADE_LOG itself, so the box's path is mapped to the scratch one on the way in.
   const report = gradeFromLog(inst, await gradeLogFrom(graded, (c) => run(c.replaceAll(GRADE_LOG, log))));
   return { graded, report };
@@ -197,6 +199,11 @@ await check("a log that cannot be written (ENOSPC, from /dev/full): the script f
   try {
     const log = join(tb.dir, "grade.log");
     symlinkSync("/dev/full", log);
+    // A gzip that succeeds without reading its input, which from /dev/full would never end: only the log's
+    // own check can stop this script, and without it the grade is the misleading "markers are missing".
+    writeFileSync(join(tb.dir, "empty.gz"), gzipSync(Buffer.alloc(0)));
+    writeFileSync(join(tb.bin, "gzip"), ["#!/bin/sh", `cat '${join(tb.dir, "empty.gz")}'`].join("\n"));
+    chmodSync(join(tb.bin, "gzip"), 0o755);
     const { graded, report } = await gradeInBox(tb, fixed(tb), log);
     must(graded.status === "failed" && String(graded.result?.output).includes(`${OUTPUT_NOT_WRITTEN}: writing the log failed`),
       `the script did not fail with its marker: ${show(graded)}`);
