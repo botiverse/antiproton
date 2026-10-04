@@ -1,11 +1,11 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, EVENTS_LIMIT, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
-import { AgentRuntime } from "../cf/src/runtime.ts";
+import { AgentRuntime, limitForCall, tooLargeResult } from "../cf/src/runtime.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -672,11 +672,113 @@ await check("actions_prepare posts the card the manifest describes, as a write t
 await check("a truncated pull says so in words, and a complete one carries no such note", async () => {
   const m = mount();
   const calls = one(events([{ message_id: "m-9aaaaaa", seq: 12, content: "x", sender_type: "human", sender_name: "t", timestamp: "2026-09-28T10:00:00.000Z", channel_name: "g", channel_type: "channel" }], { last_seen_seq: 12, has_more: true }));
-  const out = await raftPlugin.invoke("receive_events", { limit: 10 }, m.ctx) as any;
+  const out = await raftPlugin.invoke("receive_events", { limit: 4 }, m.ctx) as any;
   if (out.hasMore !== true || !/call receive_events again until hasMore is false/.test(out.note) || calls.length !== 1) throw new Error(JSON.stringify(out));
   one(events([], { last_seen_seq: 12 }));
   const done = await raftPlugin.invoke("receive_events", {}, m.ctx) as any;
   if (done.hasMore !== false || "note" in done) throw new Error(JSON.stringify(done));
+});
+
+/**
+ * The line the runtime holds a receive_events result to, with a reader mounted (cf/src/runtime.ts `limitForCall`), and
+ * the size it measures: the result serialised whole, as the runtime does before comparing (`JSON.stringify(res.result)`).
+ */
+const PULL_LINE = limitForCall("raft.receive_events", { name: "artifacts__read", address: "artifacts.read" });
+const parked = (out: unknown) => JSON.stringify(out).length > PULL_LINE;
+
+/**
+ * Raft's inbox under cursor acks, as the SDK documents it: a pull's `since` acknowledges the rows handed out with
+ * seq ≤ since, and the pull returns the oldest `limit` rows still unacknowledged, the unacknowledged rest of an
+ * earlier batch included.
+ */
+function cursorInbox(rows: Array<{ seq: number }>) {
+  const pending = [...rows];
+  const handedOut = new Set<number>();
+  const pulls: Array<{ since: string | null; limit: string | null }> = [];
+  globalThis.fetch = (async (url: any) => {
+    const u = new URL(String(url));
+    if (!u.pathname.endsWith("/events")) throw new Error(`unexpected request: ${u.pathname}`);
+    const since = u.searchParams.get("since"), limit = u.searchParams.get("limit");
+    pulls.push({ since, limit });
+    if (since !== null && /^\d+$/.test(since)) {
+      for (let i = pending.length - 1; i >= 0; i--) if (handedOut.has(pending[i]!.seq) && pending[i]!.seq <= Number(since)) pending.splice(i, 1);
+    }
+    const batch = pending.slice(0, Number(limit ?? 50));
+    for (const r of batch) handedOut.add(r.seq);
+    return events(batch, { last_seen_seq: batch.at(-1)?.seq ?? null, has_more: pending.length > batch.length });
+  }) as any;
+  return { pulls, pending };
+}
+const inboxRow = (seq: number, content: string, channel = "wg-raft-sdk") => ({
+  id: `m${String(seq).padStart(7, "0")}`, seq, content, sender_type: "human", sender_name: "tygg",
+  timestamp: "2026-09-28T10:00:00Z", channel_name: channel, channel_type: "channel",
+});
+const shownSeqs = (out: any) => (out.messages as string[]).map((l) => Number(/msg=m0*(\d+)/.exec(l)![1]));
+
+await check("a 200-message inbox comes over in pulls that each stay under the parking line, each acknowledging exactly what it showed", async () => {
+  if (EVENTS_LIMIT < 1 || EVENTS_LIMIT >= 200) throw new Error(`EVENTS_LIMIT is ${EVENTS_LIMIT}`);
+  const rows = Array.from({ length: 200 }, (_, i) => inboxRow(i + 1, `status update number ${i + 1}: the build is green and the deploy went out`, ["a", "b", "c"][i % 3]));
+  const server = cursorInbox(rows);
+  const m = mount();
+  const got: number[] = [];
+  let calls = 0, out: any;
+  do {
+    out = await raftPlugin.invoke("receive_events", {}, inTurn(m.ctx, "ctx_a"));
+    calls++;
+    if (parked(out)) throw new Error(`pull ${calls} would be parked: ${JSON.stringify(out).length} > ${PULL_LINE}`);
+    const pull = server.pulls.at(-1)!;
+    if (pull.limit !== String(EVENTS_LIMIT)) throw new Error(`pull ${calls} asked for limit=${pull.limit}`);
+    // The cursor sent is the last message the previous call showed.
+    if (calls > 1 && pull.since !== String(got.at(-1))) throw new Error(`pull ${calls} sent since=${pull.since}, last shown ${got.at(-1)}`);
+    got.push(...shownSeqs(out));
+  } while (out.hasMore && calls < 100);
+  if (JSON.stringify(got) !== JSON.stringify(rows.map((r) => r.seq))) throw new Error(`delivered ${got.length}: ${got.slice(0, 20).join(",")}…`);
+  // The last batch is acknowledged by the pull after it.
+  await raftPlugin.invoke("receive_events", {}, inTurn(m.ctx, "ctx_a"));
+  if (server.pending.length !== 0 || server.pulls.at(-1)!.since !== "200") throw new Error(`left: ${server.pending.length}, since=${server.pulls.at(-1)!.since}`);
+});
+
+await check("long messages that overflow the count shown only as many as fit: only those are acknowledged and seen, the rest come first next time", async () => {
+  // EVENTS_LIMIT messages of the same length, each far over the per-row estimate.
+  const rows = Array.from({ length: EVENTS_LIMIT }, (_, i) => inboxRow(i + 1, "x".repeat(900), i % 2 ? "b" : "a"));
+  const server = cursorInbox(rows);
+  const fresh = freshDb();
+  const m = { ...ctx(), db: fresh.db };
+  const out = await raftPlugin.invoke("receive_events", {}, inTurn(m, "ctx_a")) as any;
+  const shown = shownSeqs(out);
+  const k = shown.length;
+  if (k < 1 || k >= rows.length) throw new Error(`shown ${k} of ${rows.length}`);
+  if (parked(out)) throw new Error(`the result would be parked: ${JSON.stringify(out).length}`);
+  // The most that fit: one more line of the same length would have crossed the line.
+  if (JSON.stringify(out).length + JSON.stringify(out.messages[0]).length + 1 <= PULL_LINE) throw new Error(`room for one more: ${JSON.stringify(out).length}`);
+  if (out.hasMore !== true || !new RegExp(`${rows.length - k} more messages? w(?:as|ere) left unacknowledged`).test(out.note) || "replyTarget" in out) {
+    throw new Error(`result: ${JSON.stringify({ ...out, messages: k })}`);
+  }
+  const st = fresh.tables.get(fresh.scope, INBOX_STORE, "state") as any;
+  const booked = Object.values(st.frontier.targets).flatMap((t: any) => t.exact ?? []).sort((x: number, y: number) => x - y);
+  if (JSON.stringify(booked) !== JSON.stringify(shown) || st.cursor !== shown.at(-1)) throw new Error(`state: ${JSON.stringify(st)} shown ${shown}`);
+  const next = await raftPlugin.invoke("receive_events", {}, inTurn(m, "ctx_a")) as any;
+  if (server.pulls[1]!.since !== String(shown.at(-1)) || shownSeqs(next)[0] !== shown.at(-1)! + 1) {
+    throw new Error(`next pull: since=${server.pulls[1]!.since}, first ${shownSeqs(next)[0]}`);
+  }
+});
+
+await check("a message too long to fit alone is handed over alone and acknowledged, but not seen: a send into its conversation is still held", async () => {
+  const m = mount();
+  const sends = freshnessServer({ events: events([historyMessage(42, "y".repeat(PULL_LINE)), historyMessage(43, "short")], { last_seen_seq: 43 }) });
+  const out = await raftPlugin.invoke("receive_events", {}, inTurn(m.ctx, "ctx_a")) as any;
+  if (!parked(out) || out.messages.length !== 1 || !/^Too long to show whole.*Not counted as seen/.test(out.note) || out.hasMore !== true) {
+    throw new Error(`result: ${JSON.stringify({ ...out, messages: out.messages.map((l: string) => l.length) })}`);
+  }
+  // The model reads it in the runtime's preview of the parked result: the note must come through that whole.
+  const wrapper = tooLargeResult(out, JSON.stringify(out), { ref: "artifact://t/x.json", readBack: "artifacts__read" }) as any;
+  if (wrapper.preview.note !== out.note) throw new Error(`the preview cut the note: ${JSON.stringify(wrapper.preview)}`);
+  const held = await raftPlugin.invoke("messages_send", { target: "#wg-raft-sdk", content: "ok", idempotencyKey: "k-long" }, inTurn(m.ctx, "ctx_a"));
+  if (!(held instanceof Interrupt)) throw new Error(`a parked message was attested: ${JSON.stringify(sends)}`);
+  const pulls: string[] = [];
+  globalThis.fetch = (async (url: any) => { pulls.push(String(url)); return events([]); }) as any;
+  await raftPlugin.invoke("receive_events", {}, inTurn(m.ctx, "ctx_a"));
+  if (new URL(pulls[0]!).searchParams.get("since") !== "42") throw new Error(`the oversized message was not acknowledged alone: ${pulls[0]}`);
 });
 
 await check("a failed pull loses nothing: the cursor stays, and the next pull asks for the same batch again", async () => {

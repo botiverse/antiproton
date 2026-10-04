@@ -328,7 +328,15 @@ operation manifest (`RAFT_OPERATIONS`), one per operation, named by the
 manifest's `toolName`, and run through the SDK's `raft.invoke`. A history read
 (`messages_read`) never counts as seen: the SDK would record the page inside
 `invoke`, before the runtime may park it, so it runs on a client whose state is
-not saved and only `receive_events` attests. The CLI commands the SDK's text
+not saved and only `receive_events` attests. It attests only what the model
+was shown whole: it asks Raft for at most `EVENTS_LIMIT` messages (sized from
+`PARK_BYTES` and a per-message estimate), measures its result as the runtime
+does (the whole result serialised, not just the text), and shows only as many
+whole messages as stay under the parking line. Only those are acknowledged (the
+next pull's cursor is the last one shown, and Raft hands the rest out again
+first) and recorded as seen. A message too long to fit alone is handed over
+alone and acknowledged, so the inbox moves, but not recorded as seen: the model
+got a parked preview, so a send into that conversation is still held. The CLI commands the SDK's text
 names are rewritten as tool calls in one place (`toolTerms`), a stopgap until
 the SDK can write them that way; only the SDK's own hint lines are touched, and
 what a person wrote (a message, a description, a title, a preview) is passed

@@ -23,7 +23,6 @@ import {
 } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
-const MAX_EVENTS = 200;
 /**
  * Raft's push is a NOTICE that the inbox changed — the same "Inbox update" text
  * Raft's daemon injects into a managed agent — never the messages (tygg,
@@ -432,9 +431,9 @@ function integer(value: unknown, name: string, min: number, max: number): number
  * confirm.
  */
 export const EXCLUDED: Readonly<Record<string, string>> = {
-  "inbox.check": "the inbox is read with receive_events, which commits the batch it handed over and pulls the next in one call; a second reader would move the same cursor",
+  "inbox.check": "the inbox is read with receive_events, which commits what it showed and pulls the next in one call; a second reader would move the same cursor",
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
-  "inbox.commit": "receive_events commits on its next call; a separate commit could acknowledge a batch before the model has read it",
+  "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
   "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
   "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
   "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
@@ -452,6 +451,15 @@ export const GENERATED: readonly RaftOperationSpec[] = RAFT_OPERATIONS.filter((o
  */
 const ROW_CHARS = 400;
 export const PAGE_ROWS = Math.floor(PARK_BYTES / ROW_CHARS);
+
+/**
+ * The most messages one `receive_events` asks Raft for (the `/events` `limit`), and its default: as many rows
+ * of `ROW_CHARS` as fit under `PARK_BYTES` once `EVENTS_FRAME_CHARS` is set aside for the rest of the result
+ * (its keys, `hasMore`, a note, a reply target). A count, so it only makes the usual batch fit; long messages
+ * can still overflow it, and `handOver` then shows fewer.
+ */
+const EVENTS_FRAME_CHARS = 400;
+export const EVENTS_LIMIT = Math.floor((PARK_BYTES - EVENTS_FRAME_CHARS) / ROW_CHARS);
 
 /**
  * The argument that sets how much an operation returns, when the manifest says its result may be large: only
@@ -844,6 +852,60 @@ async function legacySend(
 }
 
 /**
+ * What one `receive_events` hands the model out of the batch Raft returned, what it acknowledges, and whether it
+ * records the shown messages as seen.
+ *
+ * The runtime parks a result whose `JSON.stringify` is longer than `PARK_BYTES` (cf/src/runtime.ts, where a mounted
+ * call's result is measured whole: keys, escaping and all, not just the message text), and the model then reads a
+ * preview, not the messages. So the result is measured here the same way, and only the longest run of whole
+ * messages, oldest first, that keeps it under the line is shown. Only those are acknowledged: the cursor the next
+ * pull sends is the last shown message's seq, and under cursor acks Raft acknowledges the rows of the batch at or
+ * below it and hands the rest out again, first. A cut is made only after a message with a seq, since nothing
+ * else can be acknowledged on its own (the SDK sorts a batch by seq, with the ones that have none last).
+ *
+ * A message too long to fit even alone is handed over alone, acknowledged, and NOT recorded as seen: the result is
+ * parked, so the model was given a preview and a reference, not the message. Left unacknowledged it would head
+ * every later batch and the inbox would never move; acknowledged, nothing is lost, since the parked result holds it
+ * whole and the conversation's history still has it, and with no seen record a send into that conversation is held
+ * and shows the model what is new there before it goes. The same holds for a Server that acknowledges on read: it
+ * has already taken the whole batch, so all of it is handed over, and recorded as seen only when it fits.
+ */
+function handOver(batch: RaftInboxBatch): { result: Record<string, Json>; shown: RaftMessage[]; cursor: number | null; attested: boolean } {
+  const all = batch.messages;
+  const lines = all.map(modelLine);
+  const onRead = batch.ackMode === "immediate";
+  const resultOf = (k: number, attested: boolean): Record<string, Json> => {
+    const left = all.length - k;
+    const hasMore = batch.hasMore || left > 0;
+    const notes = [
+      // Kept short: it is read in the runtime's preview of a parked result, which cuts each string field.
+      ...(attested ? [] : ["Too long to show whole; read the stored copy as the note beside this preview says. Not counted as seen, so a send there first shows what is new."]),
+      ...(attested && left > 0 ? [`${left} more message${left === 1 ? " was" : "s were"} left unacknowledged so this result is not cut; they come first on your next call.`] : []),
+      ...(hasMore ? ["More unread messages remain: call receive_events again until hasMore is false."] : []),
+    ];
+    return {
+      messages: lines.slice(0, k),
+      hasMore,
+      ...(notes.length ? { note: notes.join(" ") } : {}),
+      // Raft's reply target names the newest message of the whole batch, which may not be among those shown.
+      ...(batch.replyTarget && left === 0 ? { replyTarget: batch.replyTarget } : {}),
+      // A Server that predates cursor acks acknowledged this batch already; say so rather than imply safety.
+      ...(onRead ? { acknowledged: "on this read" } : {}),
+    };
+  };
+  const fits = (r: Record<string, Json>) => JSON.stringify(r).length <= PARK_BYTES;
+  const cursorAt = (k: number) => (k === all.length ? batch.cursor : all[k - 1]!.seq);
+  const pick = (k: number, attested: boolean) => ({ result: resultOf(k, attested), shown: all.slice(0, k), cursor: cursorAt(k), attested });
+  if (onRead) return pick(all.length, fits(resultOf(all.length, true)));
+  for (let k = all.length; k >= 1; k--) {
+    if (cursorAt(k) === null && k < all.length) continue;
+    if (fits(resultOf(k, true))) return pick(k, true);
+  }
+  if (all.length === 0) return pick(0, true);
+  return pick(cursorAt(1) === null ? all.length : 1, false);
+}
+
+/**
  * The tools every mount has whatever its credential allows: the inbox pull and push, which are this runtime's
  * plumbing rather than Raft operations, and are written here by hand.
  */
@@ -851,19 +913,19 @@ const OWN_TOOLS: readonly ToolSchema[] = [
   {
     name: "receive_events",
     summary: "Read your queued Raft messages: the way to read after an inbox notice. Each message is one line, " +
-      "`[target=… msg=… time=… type=…] @sender: content`; reply with messages_send to that target. Raft hands out at most a few " +
-      "per conversation per call: while hasMore is true, call again. A batch is acknowledged by your next call, so a failed call " +
-      "loses nothing and may simply be repeated.",
+      "`[target=… msg=… time=… type=…] @sender: content`; reply with messages_send to that target. A call hands out at most " +
+      `${EVENTS_LIMIT} messages, fewer when they are long, and Raft at most a few per conversation: while hasMore is true, call again. ` +
+      "What a call showed you is acknowledged by your next call, so a failed call loses nothing and may simply be repeated.",
     parameters: {
       type: "object", additionalProperties: false,
       properties: {
-        limit: { type: "integer", minimum: 1, maximum: MAX_EVENTS },
+        limit: { type: "integer", minimum: 1, maximum: EVENTS_LIMIT },
       },
     },
     // It acknowledges the previous batch, so it is a write; repeating it hands back the same batch.
     sideEffects: "write",
     idempotency: "native",
-    // It acknowledges and records as seen what it hands over, which only counts if the model reads it.
+    // It acknowledges and records as seen what it shows, which only counts if the model reads it.
     modelOnly: true,
   },
   {
@@ -1039,29 +1101,33 @@ export const raftPlugin: Plugin = {
     if (op) return runOperation(op, args, ctx) as Promise<Json>;
     const a = object(args);
     if (name === "receive_events") {
-      const limit = integer(a.limit, "limit", 1, MAX_EVENTS);
+      const limit = integer(a.limit, "limit", 1, EVENTS_LIMIT) ?? EVENTS_LIMIT;
       const raft = raftFor(ctx);
-      // Cursor acknowledgement: nothing is acknowledged by being fetched. This call commits the batch the
-      // previous call handed to the model (kept as pending in the mount's state, since the object may be a
-      // new process by now), and the pull sends that as `since`, which is what acknowledges it on the
-      // Server. A pull that fails leaves the new batch pending, so the next call gets it again.
-      //
-      // The pull goes through `invoke` so that what it records as seen is booked under the caller's context id,
-      // the one a later send in that context attests with (`originOf`). As the model's own: receive_events is
-      // model-only, so the gateway has already refused it from a program and from an approved call's replay.
+      // Cursor acknowledgement: nothing is acknowledged by being fetched. The cursor the previous call committed
+      // (kept in the mount's state, since the object may be a new process by now; `commit()` first promotes a
+      // pending cursor an older state left behind) goes as `since`, which is what acknowledges it on the Server.
+      // A pull that fails moves nothing, so the next call asks for the same messages again.
       await raft.inbox.commit();
-      const out = await raft.invoke("inbox.check", { ack: "cursor", ...(limit !== undefined ? { limit } : {}) },
-        { origin: "model", ...(typeof ctx.caller.contextId === "string" ? { contextId: ctx.caller.contextId } : {}) });
+      const since = raft.state.snapshot().cursor;
+      // The pull runs on a client whose state is not saved: the SDK books every message a pull returns as seen,
+      // and only those `handOver` shows may be. As the model's own: receive_events is model-only, so the gateway
+      // has already refused it from a program and from an approved call's replay.
+      const out = await raftFor(ctx, { state: false }).invoke("inbox.check",
+        { ack: "cursor", limit, ...(since !== null ? { since } : {}) }, { origin: "model" });
       if (!out.ok) throw sdkFailure(out as RaftFailure);
       const batch = (out as { data: RaftInboxBatch }).data;
-      return {
-        messages: batch.messages.map(modelLine),
-        hasMore: batch.hasMore,
-        ...(batch.hasMore ? { note: "More unread messages remain: call receive_events again until hasMore is false." } : {}),
-        ...(batch.replyTarget ? { replyTarget: batch.replyTarget } : {}),
-        // A Server that predates cursor acks acknowledged this batch already; say so rather than imply safety.
-        ...(batch.ackMode === "immediate" ? { acknowledged: "on this read" } : {}),
-      };
+      const given = handOver(batch);
+      // Booked under the caller's context id, the one a later send in that context attests with (`originOf`).
+      if (given.attested) {
+        const seen = raft.frontier.inContext(typeof ctx.caller.contextId === "string" ? ctx.caller.contextId : undefined);
+        const byTarget = new Map<string, number[]>();
+        for (const m of given.shown) if (m.seq !== null) byTarget.set(m.target, [...(byTarget.get(m.target) ?? []), m.seq]);
+        for (const [target, seqs] of byTarget) seen.recordExact(target, seqs);
+      }
+      // What was shown is committed now and acknowledged by the next pull; one save carries the cursor and the record.
+      if (batch.ackMode === "cursor" && given.cursor !== null) await raft.inbox.commit({ cursor: given.cursor });
+      else if (given.attested && given.shown.length) await raft.state.save();
+      return given.result;
     }
     if (name === "enable_push") {
       if (!ctx.inbound) throw new Error("this deployment cannot receive pushed Raft events");
