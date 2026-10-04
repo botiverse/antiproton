@@ -134,7 +134,7 @@ await check("a full queue's Retry-After is the head's next try, rounded up and h
   const t = 1_800_000_000_000;
   const head = (nextAt: number, more: Partial<{ state: "queued" | "posting"; receivedAt: number }> = {}) => ({
     seq: 1, hookId: "h1", alias: "gh", dedupeKey: "k", message: "m", receivedAt: t - 60_000, state: "queued" as const,
-    attempts: 2, nextAt, lastError: "posting is down", ...more,
+    attempts: 2, nextAt, lastError: "posting is down", installationId: null, ...more,
   });
   const got = [
     queueRetryAfterS(null, t, false),
