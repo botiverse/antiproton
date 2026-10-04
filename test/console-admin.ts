@@ -74,8 +74,12 @@ check("the model block names the default, its provider and endpoint, and lists e
   const options = [...html.matchAll(/<option value="([^"]+)"/g)].map((m) => m[1]);
   must(options.length === 2 && options.every((o) => o === "deepseek"), `only an available provider may be offered, once per form: ${options}`);
   const both = adminPanel({ default: DEFAULT, providers: [PROVIDERS[1]!, PROVIDERS[0]!], overrides: [] });
-  const first = both.match(/<select name="provider"><option value="([^"]+)"/)?.[1];
+  const first = both.match(/<select name="provider"[^>]*><option value="([^"]+)"/)?.[1];
   must(first === "deepseek", `the default provider must be what an untouched select sends: ${first}`);
+  const placeholders = [...both.matchAll(/name="model"[^>]*placeholder="([^"]+)"/g)].map((m) => m[1]);
+  must(placeholders.length === 2 && placeholders.every((p) => p === "deepseek-flash"), `the model example must fit the selected (default) provider, which refuses a vendor/ name: ${placeholders}`);
+  must(/<option value="cloudflare" data-example="openai\/gpt-5">/.test(both) && /onchange="this\.form\.model\.placeholder=this\.selectedOptions\[0\]\.dataset\.example"/.test(both),
+    "choosing a vendor/model provider must switch the example to a vendor/model name");
   must(/MODEL_PROVIDERS refused: bad/.test(adminPanel({ default: DEFAULT, providers: [], providersError: "bad", overrides: [] })), "a refused declaration must be shown");
 });
 
@@ -103,7 +107,7 @@ check("the set forms post to the fragment and the override form takes tenant and
   must(/name="action" value="set-default"/.test(html), "a form sets the default");
   must(/name="action" value="set-override"/.test(html), "a form adds an override");
   must(/name="tenantId"/.test(html) && /name="agentId"/.test(html), "the override form takes both ids");
-  must((html.match(/<select name="provider">/g) ?? []).length === 2, "both set forms take a provider");
+  must((html.match(/<select name="provider"[ >]/g) ?? []).length === 2, "both set forms take a provider");
   must(!/undefined|null|NaN/.test(html), "nothing may render as undefined, null or NaN");
 });
 

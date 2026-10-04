@@ -11,8 +11,8 @@
  * credential each mount resolves to, and who is allowed to spend what.
  */
 import { contextWindowFor } from "../../src/model/context-windows.ts";
-import { OPERATOR_MODEL_REF, operatorRefFor, operatorRequest, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
-import { DEFAULT_PROVIDER, providerFor, type ModelChoice } from "../../src/model/providers.ts";
+import { operatorRefFor, providerOfRef, type OperatorModel } from "../../src/model/operator-request.ts";
+import { DEFAULT_PROVIDER, providerFor, type ModelChoice, type ModelProviders } from "../../src/model/providers.ts";
 import { DurableObjectStore } from "../../src/store/durable-object.ts";
 import { DynamicWorkerExecutor } from "../../src/runtime/dynamic-worker-executor.ts";
 import type { AgentEngine } from "../../src/runtime/engine.ts";
@@ -57,7 +57,6 @@ function taskEndedRefusal(address: string): { status: "rejected"; error: { code:
 }
 import { ToolGateway, type InvokeOpts } from "../../src/runtime/gateway.ts";
 import { assertMountConfig, configFromForm, validateMount } from "../../src/runtime/mount-config.ts";
-import { ModelResolver } from "../../src/runtime/model-resolver.ts";
 import { envSecrets } from "../../src/runtime/gateway.ts";
 import { agentSecrets, agentRef, importKek, isAgentRef, open, OWNER_PREFIX, seal, secretRefKind, type Sealed } from "../../src/runtime/secrets.ts";
 import {
@@ -406,14 +405,10 @@ class BoundArtifacts {
   }
 }
 
-/** The reference that maps to the operator's configured key, for the default
- *  provider; another provider's is this plus `:<id>` (operatorRefFor). A tenant
- *  that wants its own account uses its own reference instead. */
-export const OPERATOR_SECRET_REF = OPERATOR_MODEL_REF;
 /** Whether a binding spends the operator's model account, through any provider. */
 export const isOperatorModelRef = (ref: string) => providerOfRef(ref) !== null;
-/** Same idea for the sandbox account. Kept distinct so a tenant can be moved
- *  onto its own run9 project without touching its model binding. */
+/** The operator's sandbox account. Kept distinct from the model's reference so a
+ *  tenant can be moved onto its own run9 project without touching its model binding. */
 export const OPERATOR_RUN9_REF = "operator:run9";
 /** The operator's Exa key, for the web search every agent is seeded with. */
 export const OPERATOR_EXA_REF = "operator:exa";
@@ -775,7 +770,6 @@ export class AgentRuntime {
   #executor: DynamicWorkerExecutor;
   /** Programs suspended at a pause, for every session of this agent; memory only (run-js-resume.ts). */
   #continuations: RunJsContinuations;
-  #models: ModelResolver;
   #artifacts: BoundArtifacts;
   #ready = false;
 
@@ -829,16 +823,6 @@ export class AgentRuntime {
       ttlMs: deps.runJsResumeMs,
       onHold: (at) => { void Promise.resolve(deps.keepAlive?.(at)).catch(() => {}); },
     });
-    // Credentials come from the same resolver mounts use, so a model key is
-    // dereferenced server-side and never travels with the binding.
-    // A binding on the operator's reference is called the way the queued call is (operatorRequest): the
-    // provider its reference names decides the URL and what is sent. The URL is the provider's as declared
-    // now, not the one the binding recorded, so a credential only ever goes where it is declared to go.
-    const op = deps.operatorModel;
-    this.#models = new ModelResolver(this.store, envSecrets, op ? {
-      owns: isOperatorModelRef,
-      request: (b) => operatorRequest(op, { provider: providerOfRef(b.secretRef)!, model: b.model }),
-    } : undefined);
   }
 
   /** The run_js programs suspended in this object's memory: what keeps it awake (step). */
@@ -1978,6 +1962,11 @@ export class AgentRuntime {
    * (model_overrides). The provider must be one the deployment declares; the binding records its URL for
    * whoever reads the row, and names the provider in its reference (operatorRefFor).
    */
+  /** The providers the operator's account reaches, to decide whether a choice can be bound (planBinding); null without one. */
+  operatorProviders(): ModelProviders | null {
+    return this.#deps.operatorModel?.providers ?? null;
+  }
+
   async bindOperatorModel(tenantId: string, agentId: string | null = null, choice?: ModelChoice | null) {
     await this.ready();
     const m = this.#deps.operatorModel;

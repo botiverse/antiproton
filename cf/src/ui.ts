@@ -1856,13 +1856,16 @@ export function adminPanel(d: {
   // Only a provider whose secrets are set is offered; the default is listed first, so it is what an
   // untouched select sends.
   const offered = d.providers.filter((p) => p.available).sort((a, b) => Number(b.id === d.default.provider) - Number(a.id === d.default.provider));
-  const providerField = `<label><span>provider</span><select name="provider">${offered.map((p) =>
-    `<option value="${esc(p.id)}">${esc(p.id)}${p.modelFormat === "vendor/model" ? " (vendor/model)" : ""}</option>`).join("")}</select></label>`;
+  // The model field's example follows the selected provider: the default refuses a `vendor/` name, a
+  // gateway requires one, so one fixed example would be wrong for one of them.
+  const example = (format: string) => (format === "vendor/model" ? "openai/gpt-5" : "deepseek-flash");
+  const providerField = `<label><span>provider</span><select name="provider" onchange="this.form.model.placeholder=this.selectedOptions[0].dataset.example">${offered.map((p) =>
+    `<option value="${esc(p.id)}" data-example="${example(p.modelFormat)}">${esc(p.id)}${p.modelFormat === "vendor/model" ? " (vendor/model)" : ""}</option>`).join("")}</select></label>`;
   const setForm = (action: string, fields: string, button: string) => `
     <form class="admin-set" hx-post="/ui/admin" ${target}>
       <input type="hidden" name="action" value="${action}">${fields}
       ${providerField}
-      <label><span>model</span><input type="text" name="model" required autocomplete="off" spellcheck="false" placeholder="anthropic/claude-sonnet-5"></label>
+      <label><span>model</span><input type="text" name="model" required autocomplete="off" spellcheck="false" placeholder="${example(offered[0]?.modelFormat ?? "model")}"></label>
       <div class="row"><button type="submit">${button}</button></div>
     </form>`;
   const idField = (name: string, label: string) =>

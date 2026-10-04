@@ -4,12 +4,10 @@
  * deepseek/ model and no key for a vendor the gateway holds one for; a binding or a take from before
  * providers read as DeepSeek's; and a `vendor/model` name sized by the model's own window.
  */
-import { bindingIsCurrent, callQueuedModel, choiceOf, operatorModelOf, operatorModelRequest } from "../cf/src/model-request.ts";
-import { isOperatorModelRef } from "../cf/src/runtime.ts";
+import { bindingIsCurrent, callQueuedModel, choiceOf, operatorModelOf, operatorModelRequest, planBinding } from "../cf/src/model-request.ts";
 import { providerStatus } from "../src/model/providers.ts";
 import { OpenAiCompatibleModel } from "../src/model/openai-compatible.ts";
 import { contextWindowFor } from "../src/model/context-windows.ts";
-import { ModelResolver } from "../src/runtime/model-resolver.ts";
 import { operatorRefFor, operatorRequest, providerOfRef } from "../src/model/operator-request.ts";
 import { PiAgent } from "../src/runtime/pi-agent.ts";
 import { sqliteHost } from "../src/store/sqlite-host.ts";
@@ -90,32 +88,6 @@ await check("the client sends the extra headers, and no authorization when it ha
   must(seen[1]!.authorization === "Bearer dk", JSON.stringify(seen[1]));
 });
 
-/** A resolver over one stored binding, wired the way cf/src/runtime.ts wires it. */
-function resolverFor(binding: { model: string; baseUrl: string; secretRef: string }, env: Record<string, unknown> = ENV) {
-  const op = operatorModelOf(env as any);
-  const store: any = { getModelBinding: async () => ({ provider: "openai-compatible", ...binding }) };
-  const secrets: any = { resolve: async () => { throw new Error("the operator's binding was resolved as a plain key"); } };
-  return new ModelResolver(store, secrets, { owns: isOperatorModelRef, request: (b) => operatorRequest(op, { provider: providerOfRef(b.secretRef)!, model: b.model }) });
-}
-
-await check("an agent bound to openai/ under cloudflare is called at the gateway with its token and no DeepSeek key, end to end", async () => {
-  const rec = recording();
-  try { await (await resolverFor({ model: "openai/gpt-5", baseUrl: GW, secretRef: "operator:model:cloudflare" }).resolve({ tenantId: "t", agentId: "a" })).complete([{ role: "user", content: "hi" }]); }
-  finally { rec.restore(); }
-  const s = rec.seen[0];
-  must(s?.url === `${GW}/chat/completions` && s.model === "openai/gpt-5" && !("authorization" in s.headers) && s.headers["cf-aig-authorization"] === "Bearer gt"
-    && !JSON.stringify(s.headers).includes("dk"), JSON.stringify(rec.seen));
-});
-
-await check("a binding written before providers (operator:model, no provider) is DeepSeek's, called exactly as before, even with a gateway declared", async () => {
-  must(providerOfRef("operator:model") === "deepseek" && operatorRefFor("deepseek") === "operator:model", "the bare reference is not the default provider's");
-  const rec = recording();
-  try { await (await resolverFor({ model: "deepseek-flash", baseUrl: "https://api.deepseek.com", secretRef: "operator:model" }).resolve({ tenantId: "t", agentId: "a" })).complete([{ role: "user", content: "hi" }]); }
-  finally { rec.restore(); }
-  const s = rec.seen[0];
-  must(s?.url === "https://api.deepseek.com/chat/completions" && s.model === "deepseek-flash" && s.headers.authorization === "Bearer dk" && !("cf-aig-authorization" in s.headers), JSON.stringify(rec.seen));
-});
-
 function job(operatorModel: string | null, operatorProvider?: string | null) {
   return {
     model: { api: "offloaded", provider: "queue", id: "bound-model" }, operatorModel,
@@ -165,6 +137,32 @@ await check("an existing agent's binding is current exactly when provider, model
   must(!bindingIsCurrent({ ...legacy, secretRef: "operator:model:cloudflare" }, { provider: "deepseek", model: "deepseek-flash" }, ps), "a move back to the default provider was not seen");
   must(!bindingIsCurrent({ ...legacy, baseUrl: "https://old.example" }, { provider: "deepseek", model: "deepseek-flash" }, ps), "an endpoint change was not seen");
   must(bindingIsCurrent({ model: "openai/gpt-5", baseUrl: GW, secretRef: "operator:model:cloudflare" }, { provider: "cloudflare", model: "openai/gpt-5" }, ps), "a current gateway binding was found stale");
+});
+
+await check("the bare operator reference is the default provider's, and only the operator's references name a provider", () => {
+  must(providerOfRef("operator:model") === "deepseek" && operatorRefFor("deepseek") === "operator:model", "the bare reference is not the default provider's");
+  must(providerOfRef("operator:model:cloudflare") === "cloudflare" && operatorRefFor("cloudflare") === "operator:model:cloudflare", "another provider's reference");
+  must(providerOfRef("agent:k") === null && providerOfRef("operator:run9") === null && providerOfRef("operator:model:") === null, "a reference that is not the operator's model account named a provider");
+});
+
+await check("one bind decision for every path: own credentials and unread choices are kept, a refused choice keeps an existing binding and says why", () => {
+  const ps = operatorModelOf(ENV).providers;
+  const gwBinding = { model: "openai/gpt-5", baseUrl: GW, secretRef: "operator:model:cloudflare" };
+  const own = { model: "x", baseUrl: "https://own.example", secretRef: "agent:key" };
+  const removed = { provider: "openrouter", model: "openai/gpt-5" };
+  const wrongForm = { provider: "cloudflare", model: "deepseek-flash" };
+  const plan = (b: any, c: any, o = {}) => JSON.stringify(planBinding(b, c, ps, o));
+  must(plan(own, { provider: "deepseek", model: "deepseek-flash" }) === '{"bind":false}', "an agent's own credential was rebound");
+  must(plan(gwBinding, null) === '{"bind":false}', "an unread choice moved an existing agent");
+  must(plan(null, null) === '{"bind":true}', "an agent with no binding was left unbound when its choice could not be read");
+  for (const c of [removed, wrongForm]) {
+    const kept = planBinding(gwBinding, c, ps, { onlyIfStale: true });
+    must(!kept.bind && /unknown provider openrouter|named vendor\/model/.test(kept.refused ?? ""), `a refused choice replaced the binding: ${JSON.stringify(kept)}`);
+    const fresh = planBinding(null, c, ps);
+    must(fresh.bind && !!fresh.refused, `a new agent's refused choice was not reported: ${JSON.stringify(fresh)}`);
+  }
+  must(plan(gwBinding, { provider: "cloudflare", model: "openai/gpt-5" }, { onlyIfStale: true }) === '{"bind":false}', "a current binding was rewritten");
+  must(plan(gwBinding, { provider: "deepseek", model: "deepseek-flash" }, { onlyIfStale: true }) === '{"bind":true,"choice":{"provider":"deepseek","model":"deepseek-flash"}}', "a stale binding was kept");
 });
 
 await check("pi085 meters a queued answer under the model the consumer called, not the model its job asked for, when the two differ", async () => {

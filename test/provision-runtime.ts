@@ -142,6 +142,15 @@ await check("adopt binds the operator's model as chosen for the agent, and the d
   must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC)).ok, "adopt a third time");
   const back = await rt.store.getModelBinding("t", "raft_m1");
   must(back?.model === "deepseek-flash" && back.secretRef === "operator:model" && back.baseUrl === "https://model.example/v1", `no choice did not fall back to the default: ${JSON.stringify(back)}`);
+  // A choice the providers refuse (a provider since removed, a name in the wrong form) keeps the existing
+  // binding and reports why, as #bindModel does, rather than failing the adopt.
+  must((await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, { provider: "gw", model: "openai/gpt-5" })).ok, "adopt onto the gateway");
+  for (const refused of [{ provider: "gone", model: "openai/gpt-5" }, { provider: "gw", model: "gpt-5" }]) {
+    const r = await adoptProvisionedAgent(rt, "t", "raft_m1", SPEC, refused);
+    const kept = await rt.store.getModelBinding("t", "raft_m1");
+    must(r.ok && "modelRefused" in r && /unknown provider gone|vendor\/model/.test(String(r.modelRefused)), `a refused choice failed the adopt or was not reported: ${JSON.stringify(r)}`);
+    must(kept?.model === "openai/gpt-5" && kept.secretRef === "operator:model:gw", `a refused choice replaced the binding: ${JSON.stringify(kept)}`);
+  }
   // A new agent whose choice could not be read still gets a binding: the default.
   must((await adoptProvisionedAgent(rt, "t", "raft_m2", SPEC, null)).ok && (await rt.store.getModelBinding("t", "raft_m2"))?.model === "deepseek-flash", "a new agent was left unbound");
   host.dispose();

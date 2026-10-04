@@ -16,7 +16,7 @@ import { sqliteHost } from "../src/store/sqlite-host.ts";
 import { MAIN_SESSION } from "../src/store/pi-storage.ts";
 import { ensureAgentTables } from "../src/runtime/pi-agent.ts";
 import { setLogSink } from "../src/core/log.ts";
-import { operatorModelOf } from "../cf/src/model-request.ts";
+import { callQueuedModel, operatorModelOf } from "../cf/src/model-request.ts";
 
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
 async function check(name: string, fn: () => Promise<void>) {
@@ -30,12 +30,14 @@ const REQUEST = { model: { api: "offloaded", provider: "openai-compatible", id: 
 
 async function runtime(providers?: unknown[]) {
   const host = sqliteHost();
+  // The one environment both sides read, as in the Worker: the object's operator model and the queue consumer's call.
+  const env = { DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash",
+    ...(providers ? { MODEL_PROVIDERS: providers, GW_TOKEN: "gt" } : {}) } as any;
   const rt = new AgentRuntime({
     ctx: { storage: { sql: host.sql, transactionSync: host.transactionSync } } as any,
     bucket: {} as any, bucketName: "b", models: { resolve: () => null } as any,
     secretKek: Buffer.from(new Uint8Array(32).fill(3)).toString("base64"),
-    operatorModel: operatorModelOf({ DEEPSEEK_BASE_URL: "https://model.example/v1", DEEPSEEK_API_KEY: "operator-key", HARNESS_MODEL: "deepseek-flash",
-      ...(providers ? { MODEL_PROVIDERS: providers, GW_TOKEN: "gt" } : {}) } as any),
+    operatorModel: operatorModelOf(env),
   } as any);
   await rt.ready();
   // An agent with a model binding, as provisioning makes one: the runtime opens a session only for that.
@@ -52,7 +54,7 @@ async function runtime(providers?: unknown[]) {
     "INSERT INTO pi_model_jobs(id, request, created_at, session) VALUES (?,?,?,?)", id, JSON.stringify(REQUEST), Date.now(), session));
   const answerOf = (id: string) =>
     (host.sql.exec("SELECT answer FROM pi_model_jobs WHERE id = ?", id).toArray()[0] as { answer: string | null } | undefined)?.answer;
-  return { rt, host, opened, addJob, answerOf };
+  return { rt, host, opened, addJob, answerOf, env };
 }
 
 /** The object's two RPC methods over a real runtime, translated as the object does. */
@@ -121,6 +123,49 @@ await check("runtime: a take names the provider the agent is bound to, so the co
   try { await rt.bindOperatorModel(T, A, { provider: "gw", model: "gpt-5" }); } catch (e) { refused = String((e as Error).message); }
   must(/vendor\/model/.test(refused), `a binding was written for a name its provider refuses: ${refused || "no refusal"}`);
   host.dispose();
+});
+
+const PROVIDERS = [
+  { id: "deepseek", baseUrl: "https://model.example/v1", auth: { secret: "DEEPSEEK_API_KEY", header: "authorization" } },
+  { id: "gw", baseUrl: "https://gw.example/compat", auth: { secret: "GW_TOKEN", header: "cf-aig-authorization" }, modelFormat: "vendor/model",
+    passKeys: { "deepseek/": "DEEPSEEK_API_KEY" } },
+];
+
+/** Take a job from the real runtime and hand it to the real consumer call, recording what reached fetch. */
+async function callThrough(r: Awaited<ReturnType<typeof runtime>>, jobId: string) {
+  r.addJob(jobId, SESSION);
+  const job = await r.rt.takeJob(T, A, jobId);
+  const seen: Array<{ url: string; headers: Record<string, string>; model: string }> = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init?: any) => {
+    seen.push({ url: String(url), headers: Object.fromEntries(new Headers(init?.headers ?? {}).entries()), model: JSON.parse(init.body).model });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} }), { headers: { "content-type": "application/json" } });
+  }) as any;
+  try { await callQueuedModel(r.env, { ...(job as object), context: { systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 0 }] } }, jobId); }
+  finally { globalThis.fetch = real; }
+  return seen[0]!;
+}
+
+await check("live path: an agent bound to openai/ under the gateway is called at the gateway's current URL with its token and no DeepSeek key, whatever URL its binding recorded", async () => {
+  const r = await runtime(PROVIDERS);
+  await r.rt.bindOperatorModel(T, A, { provider: "gw", model: "openai/gpt-5" });
+  // A binding row whose recorded URL is not the provider's: a credential goes only where it is declared to go now.
+  const b = (await r.rt.store.getModelBinding(T, A))!;
+  await r.rt.store.setModelBinding({ ...b, baseUrl: "https://stale.example/compat" });
+  const s = await callThrough(r, "job-live");
+  must(s.url === "https://gw.example/compat/chat/completions" && s.model === "openai/gpt-5" && s.headers["cf-aig-authorization"] === "Bearer gt"
+    && !("authorization" in s.headers) && !JSON.stringify(s).includes("operator-key"), JSON.stringify(s));
+  r.host.dispose();
+});
+
+await check("live path: a binding written before providers (operator:model) is DeepSeek's, called as before, with a gateway declared", async () => {
+  const r = await runtime(PROVIDERS);
+  // The row exactly as the code before providers wrote it.
+  await r.rt.store.setModelBinding({ tenantId: T, agentId: A, provider: "openai-compatible", model: "deepseek-flash", baseUrl: "https://model.example/v1", secretRef: "operator:model" });
+  const s = await callThrough(r, "job-legacy");
+  must(s.url === "https://model.example/v1/chat/completions" && s.model === "deepseek-flash" && s.headers.authorization === "Bearer operator-key"
+    && !("cf-aig-authorization" in s.headers), JSON.stringify(s));
+  r.host.dispose();
 });
 
 await check("runtime: a known job is taken and answered in its own session, unchanged", async () => {

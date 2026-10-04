@@ -1,10 +1,11 @@
 import { DEFAULT_PROVIDER, providerRequest, type ModelChoice, type ModelProviders } from "./providers.ts";
 
 /**
- * The operator's model call: where it goes, with which key and headers — one answer for every path
- * that spends the operator's account (the queued call in cf/src/index.ts, and `ModelResolver` for a
- * binding on the operator's reference). Which provider serves which model, and what each one is sent,
- * is the deployment's declaration (src/model/providers.ts).
+ * The operator's model call: where it goes, with which key and headers. Every model call an agent makes
+ * is a queued job, called by the queue consumer (`callQueuedModel`, cf/src/model-request.ts) with the
+ * provider and model the agent's binding names. The runtime builds no `ModelResolver`: since pi's loop
+ * (2df66b3) nothing in it calls a model directly, and a resolver it built was never read. Which provider serves
+ * which model, and what each one is sent, is the deployment's declaration (src/model/providers.ts).
  */
 export interface OperatorModel {
   /** The deployment's default model, under DEFAULT_PROVIDER. */

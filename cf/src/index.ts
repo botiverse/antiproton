@@ -99,8 +99,8 @@ import { repairPush } from "./provision/handlers.ts";
 import { inboundStatus, lowerHeaders, newHookId, readCapped } from "../../src/runtime/inbound.ts";
 import { HTMX_SRC, staticAsset } from "./static.ts";
 import { clip, logEvent, routeOf, setLogSink } from "../../src/core/log.ts";
-import { bindingIsCurrent, callQueuedModel, choiceOf, operatorModelOf } from "./model-request.ts";
-import { DEFAULT_PROVIDER, modelProblem, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
+import { callQueuedModel, choiceOf, operatorModelOf, planBinding } from "./model-request.ts";
+import { DEFAULT_PROVIDER, providerStatus, type ModelChoice } from "../../src/model/providers.ts";
 import { consumeModelCalls, isUnknownJobReply, replyingUnknownJob, type ModelQueueDeps, type QueuedModelCall, type UnknownJobReply } from "./model-queue.ts";
 import {
   page, trajectory, approvals, conversation, eventList, storage, memoryPanel, sandboxPanel, adminPanel,
@@ -2029,19 +2029,9 @@ export class AgentDO extends DurableObject<Env> {
   async #bindModel(rt: AgentRuntime, tenantId: string, agentId: string, opts: { onlyIfStale?: boolean } = {}) {
     const b = await rt.store.getModelBinding(tenantId, agentId);
     if (b && !isOperatorModelRef(b.secretRef)) return;
-    const choice = await this.#modelFor(tenantId, agentId);
-    if (b && choice === null) return;
-    const providers = operatorModelOf(this.env).providers;
-    if (b && opts.onlyIfStale && choice && bindingIsCurrent(b, choice, providers)) return;
-    // A choice the declaration refuses (its provider since removed, a name in the wrong form) is treated like
-    // one that could not be read: an existing binding stays, since a page open or a hook delivery is no place
-    // to fail on the admin's configuration. A new agent has nothing to keep, and is refused with the reason.
-    const problem = choice && modelProblem(providers, choice);
-    if (problem) {
-      console.warn(`model choice for ${agentId} refused: ${problem.slice(0, 200)}`);
-      if (b) return;
-    }
-    await rt.bindOperatorModel(tenantId, agentId, choice);
+    const plan = planBinding(b, await this.#modelFor(tenantId, agentId), operatorModelOf(this.env).providers, opts);
+    if (plan.refused) console.warn(`model choice for ${agentId} refused: ${plan.refused.slice(0, 200)}`);
+    if (plan.bind) await rt.bindOperatorModel(tenantId, agentId, plan.choice);
   }
 
   async hookReceive(tenantId: string, agentId: string, alias: string, hookId: string,

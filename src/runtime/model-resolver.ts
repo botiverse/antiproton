@@ -17,10 +17,10 @@ import type { SecretResolver } from "./gateway.ts";
  * store, the credential behind a `secret_ref` that only the server dereferences
  * — so a key never reaches a prompt, a checkpoint or a trajectory.
  */
-/** Which references are the operator's model account, and how a binding on one is called. */
+/** The operator's reference, and how a binding on it is called. */
 export interface OperatorBinding {
-  owns(ref: string): boolean;
-  request(b: { model: string; secretRef: string }): { baseUrl: string; apiKey: string; model: string; headers: Record<string, string> };
+  ref: string;
+  request(b: { baseUrl: string; model: string }): { baseUrl: string; apiKey: string; model: string; headers: Record<string, string> };
 }
 
 export interface ModelCaller {
@@ -38,9 +38,9 @@ export class ModelResolver {
   #operator?: OperatorBinding;
 
   /**
-   * `operator`: how a binding on the operator's reference is called. Its URL, key, headers and even whether
-   * a key is sent depend on the provider and the model (src/model/providers.ts), so it is built whole
-   * rather than from a resolved key.
+   * `operator`: how a binding on the operator's reference is called. Its key, headers and even whether
+   * a key is sent depend on the model (src/model/operator-request.ts), so it is built whole rather than
+   * from a resolved key.
    */
   constructor(store: StorageAdapter, secrets: SecretResolver, operator?: OperatorBinding) {
     this.#store = store;
@@ -65,8 +65,8 @@ export class ModelResolver {
     const hit = this.#cache.get(key);
     if (hit) return hit;
 
-    if (this.#operator?.owns(b.secretRef)) {
-      const model = new OpenAiCompatibleModel(this.#operator.request({ model: b.model, secretRef: b.secretRef }));
+    if (this.#operator && b.secretRef === this.#operator.ref) {
+      const model = new OpenAiCompatibleModel(this.#operator.request({ baseUrl: b.baseUrl, model: b.model }));
       this.#cache.set(key, model);
       return model;
     }

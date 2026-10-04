@@ -28,6 +28,11 @@ await check("a declaration is refused for duplicate ids, plain http, a secret va
     [[{ ...DEEPSEEK, baseUrl: "https://user:pw@api.deepseek.com" }], /carries a credential/, "a credential in the URL"],
     [[{ ...DEEPSEEK, auth: { secret: "sk-0123456789abcdef", header: "authorization" } }], /names a Worker secret/, "a key as the secret's name"],
     [[DEEPSEEK, { ...CLOUDFLARE, passKeys: { "deepseek/": "sk-live-abc" } }], /names a Worker secret/, "a key as a pass-through secret's name"],
+    [[{ ...DEEPSEEK, auth: { secret: "AKIAIOSFODNN7EXAMPLE", header: "authorization" } }], /names a Worker secret/, "an upper-case credential as the secret's name"],
+    [[{ ...DEEPSEEK, auth: { secret: "KEY_20260101", header: "authorization" } }], /names a Worker secret/, "a digit run as the secret's name"],
+    [[DEEPSEEK, { ...CLOUDFLARE, passKeys: { "deepseek": "DEEPSEEK_API_KEY" } }], /one vendor and its slash/, "a pass-through prefix without its slash"],
+    [[DEEPSEEK, { ...CLOUDFLARE, passKeys: { "openai/o": "DEEPSEEK_API_KEY" } }], /one vendor and its slash/, "a pass-through prefix reaching into the model"],
+    [[DEEPSEEK, { ...CLOUDFLARE, passKeys: { "../": "DEEPSEEK_API_KEY" } }], /one vendor and its slash/, "a .. pass-through prefix"],
     [[{ ...DEEPSEEK, apiKey: "sk-0123" }], /unknown field apiKey/, "a key in a field of its own"],
     [[{ ...DEEPSEEK, auth: { secret: "DEEPSEEK_API_KEY", header: "authorization", value: "sk" } }], /auth is \{ secret, header \}/, "a value beside the secret's name"],
     [[{ ...DEEPSEEK, passKeys: { "x/": "X_KEY" } }], /cannot pass vendor keys/, "a pass-through key and the provider's own credential in one header"],
@@ -65,13 +70,36 @@ await check("a new provider is configuration and one secret: OpenRouter is calle
   must(st.map((p) => `${p.id}:${p.available}`).join() === "deepseek:true,cloudflare:true,openrouter:false", JSON.stringify(st));
 });
 
-await check("a pass-through key goes with the longest prefix it matches, and with no other", () => {
+await check("a pass-through key goes with the model's own vendor segment, exactly and case-sensitively, and with no other", () => {
   const ps = providersFrom({
-    MODEL_PROVIDERS: [DEEPSEEK, { ...CLOUDFLARE, passKeys: { "deepseek/": "DEEPSEEK_API_KEY", "openai/": "OPENAI_KEY", "openai/o": "OPENAI_O_KEY" } }],
-    DEEPSEEK_API_KEY: "dk", AI_GATEWAY_TOKEN: "gt", OPENAI_KEY: "ok", OPENAI_O_KEY: "ook",
+    MODEL_PROVIDERS: [DEEPSEEK, { ...CLOUDFLARE, passKeys: { "deepseek/": "DEEPSEEK_API_KEY", "openai/": "OPENAI_KEY" } }],
+    DEEPSEEK_API_KEY: "dk", AI_GATEWAY_TOKEN: "gt", OPENAI_KEY: "ok",
   });
   const key = (model: string) => providerRequest(ps, { provider: "cloudflare", model }).apiKey;
-  must(key("openai/gpt-5") === "ok" && key("openai/o3") === "ook" && key("deepseek/deepseek-flash") === "dk" && key("anthropic/claude-sonnet-5") === "", "the wrong key travelled");
+  must(key("openai/gpt-5") === "ok" && key("deepseek/deepseek-flash") === "dk" && key("anthropic/claude-sonnet-5") === "", "the wrong key travelled");
+  for (const model of ["deepseek-evil/x", "DeepSeek/deepseek-flash", "deepseekx/y"]) {
+    must(key(model) === "", `DeepSeek's key travelled with ${model}`);
+  }
+});
+
+await check("a vendor/model name with an empty, . or .. segment, a leading or trailing slash, whitespace or a control character is refused, and nothing is sent", () => {
+  const ps = providersFrom({ MODEL_PROVIDERS: [DEEPSEEK, CLOUDFLARE], DEEPSEEK_API_KEY: "dk", AI_GATEWAY_TOKEN: "gt" });
+  for (const model of ["deepseek/../openai/x", "deepseek/./x", "openai//gpt-5", "/openai/gpt-5", "openai/gpt-5/", "openai/", "openai/gpt 5", "openai/gpt-5\n", "openai/gpt\u00005", "openai/gpt\t5", "../x"]) {
+    must(modelProblem(ps, { provider: "cloudflare", model }) !== null, `${JSON.stringify(model)} was accepted`);
+    let sent = true;
+    try { providerRequest(ps, { provider: "cloudflare", model }); } catch { sent = false; }
+    must(!sent, `${JSON.stringify(model)} built a request`);
+  }
+  must(modelProblem(ps, { provider: "cloudflare", model: "workers-ai/@cf/meta/llama-3.1-8b" }) === null, "a deeper vendor path was refused");
+  must(modelProblem(ps, { provider: "deepseek", model: ".." }) !== null, "a bare .. was accepted");
+});
+
+await check("an operator model without providers (built by hand) is refused with a reason, not a TypeError", () => {
+  const ps = undefined as never;
+  must(/no model providers were given/.test(modelProblem(ps, { provider: "deepseek", model: "m" }) ?? ""), "no reason");
+  let msg = "";
+  try { providerRequest(ps, { provider: "deepseek", model: "m" }); } catch (e) { msg = String(e); }
+  must(/no model providers were given/.test(msg) && !/TypeError/.test(msg), msg);
 });
 
 await check("a provider's status names its secrets' absence, never their values", () => {

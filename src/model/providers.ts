@@ -36,10 +36,12 @@ export interface ProviderConfig {
    */
   modelFormat?: ModelFormat;
   /**
-   * A vendor key this deployment holds and passes through for models under one prefix, as `Authorization`:
-   * `{ "deepseek/": "DEEPSEEK_API_KEY" }`. A model under no listed prefix is sent with no `Authorization`
-   * at all, so a gateway uses the key it stores for that vendor — a key in the request would take
-   * precedence over the stored one and reach the other vendor.
+   * A vendor key this deployment holds and passes through for one vendor's models, as `Authorization`:
+   * `{ "deepseek/": "DEEPSEEK_API_KEY" }`. A prefix is exactly one vendor segment and its `/`, and it
+   * matches a model's vendor segment exactly and case-sensitively: a bare-string prefix (`deepseek`) would
+   * also match `deepseek-evil/x` and hand that vendor DeepSeek's key. A model of any other vendor is sent
+   * with no `Authorization` at all, so a gateway uses the key it stores for that vendor — a key in the
+   * request would take precedence over the stored one and reach the other vendor.
    */
   passKeys?: Record<string, string>;
 }
@@ -69,9 +71,14 @@ export interface ProviderStatus {
   missing: string[];
 }
 
-// A secret is named the way a Worker binding is. A credential pasted where its name belongs has a shape
-// this refuses (lower case, `-`, a prefix like `sk-`), so it is not carried around as a "name".
+// A secret is named the way a Worker binding is: upper-case words joined by `_`. A credential pasted where
+// its name belongs usually has a shape this refuses — lower case, `-`, a prefix like `sk-`, or a long
+// unbroken run (a word of 16+ characters, or 4+ digits in a row, as in AKIAIOSFODNN7EXAMPLE). It is a
+// shape check, not a proof: an upper-case value made of short words passes, and only review of the
+// config catches that.
 const SECRET_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+const SECRET_LIKE = /[A-Z0-9]{16,}|[0-9]{4,}/;
+const VENDOR_PREFIX = /^[A-Za-z0-9][A-Za-z0-9._-]*\/$/;
 const HEADER = /^[a-z][a-z0-9-]{0,63}$/;
 const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:@\/-]{0,127}$/;
@@ -118,7 +125,9 @@ export function parseProviders(raw: unknown): ProviderConfig[] {
       if (p.auth?.header === "authorization") throw new Error(`${o.id} sends its own credential as authorization, so it cannot pass vendor keys there`);
       p.passKeys = {};
       for (const [prefix, name] of Object.entries(k)) {
-        if (!prefix) throw new Error(`${o.id}.passKeys has an empty prefix`);
+        if (!VENDOR_PREFIX.test(prefix) || prefix === "./" || prefix === "../") {
+          throw new Error(`${o.id}.passKeys prefix ${JSON.stringify(prefix)} is one vendor and its slash, like "deepseek/"`);
+        }
         p.passKeys[prefix] = secretName(name, `${o.id}.passKeys[${prefix}]`);
       }
     }
@@ -156,7 +165,7 @@ function secretsOf(p: ProviderConfig): string[] {
 }
 
 export function providerStatus(ps: ModelProviders): ProviderStatus[] {
-  return ps.configs.map((p) => {
+  return (ps?.configs ?? []).map((p) => {
     const missing = secretsOf(p).filter((n) => !ps.secrets[n]);
     return { id: p.id, endpoint: hostOf(p.baseUrl), modelFormat: p.modelFormat ?? "model", available: missing.length === 0, missing };
   });
@@ -167,14 +176,20 @@ export function providerStatus(ps: ModelProviders): ProviderStatus[] {
  * write and the call itself, so a name refused at one is refused at the other.
  */
 export function modelProblem(ps: ModelProviders, choice: ModelChoice): string | null {
+  // An OperatorModel built by hand rather than by operatorModelOf has no providers; say so, not a TypeError.
+  if (!ps || !Array.isArray(ps.configs)) return "no model providers were given (build the operator model with operatorModelOf)";
   if (ps.error) return `the deployment's providers are misconfigured: ${ps.error}`;
   const p = ps.configs.find((c) => c.id === choice.provider);
   if (!p) return `unknown provider ${choice.provider}; this deployment has ${ps.configs.map((c) => c.id).join(", ")}`;
+  // MODEL admits no whitespace or control character. Segments are checked as well, because the vendor
+  // segment decides which key travels (passKeys) and a gateway may resolve `..` as a path: `deepseek/../openai/x`
+  // must not be DeepSeek's.
   if (!MODEL.test(choice.model)) return `${JSON.stringify(choice.model)} is not a model name`;
-  const slash = choice.model.indexOf("/");
+  const segments = choice.model.split("/");
+  if (segments.some((g) => g === "" || g === "." || g === "..")) return `${JSON.stringify(choice.model)} has an empty, . or .. segment`;
   if ((p.modelFormat ?? "model") === "vendor/model") {
-    if (slash <= 0 || slash === choice.model.length - 1) return `a ${p.id} model is named vendor/model, like openai/gpt-5`;
-  } else if (slash !== -1) {
+    if (segments.length < 2) return `a ${p.id} model is named vendor/model, like openai/gpt-5`;
+  } else if (segments.length !== 1) {
     return `a ${p.id} model is a bare name, with no vendor/ prefix`;
   }
   return null;
@@ -200,9 +215,10 @@ export function providerRequest(ps: ModelProviders, choice: ModelChoice):
     if (p.auth.header === "authorization") apiKey = value;
     else headers[p.auth.header] = `Bearer ${value}`;
   }
-  // The longest matching prefix, so `openai/` and `openai/o` can name different keys.
-  const prefix = Object.keys(p.passKeys ?? {}).filter((k) => choice.model.startsWith(k)).sort((a, b) => b.length - a.length)[0];
-  if (prefix !== undefined) apiKey = ps.secrets[p.passKeys![prefix]!]!;
+  // The model's own vendor segment, exactly: a prefix is one vendor and its slash (parseProviders).
+  const vendor = `${choice.model.split("/")[0]}/`;
+  const pass = Object.prototype.hasOwnProperty.call(p.passKeys ?? {}, vendor) ? p.passKeys![vendor] : undefined;
+  if (pass !== undefined) apiKey = ps.secrets[pass]!;
   return { baseUrl: p.baseUrl, apiKey, model: choice.model, headers };
 }
 
@@ -217,7 +233,7 @@ function httpsUrl(v: unknown, what: string): string {
 }
 
 function secretName(v: unknown, what: string): string {
-  if (typeof v !== "string" || !SECRET_NAME.test(v)) throw new Error(`${what} names a Worker secret (like DEEPSEEK_API_KEY), never its value`);
+  if (typeof v !== "string" || !SECRET_NAME.test(v) || SECRET_LIKE.test(v)) throw new Error(`${what} names a Worker secret (like DEEPSEEK_API_KEY), never its value`);
   return v;
 }
 
