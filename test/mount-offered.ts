@@ -33,7 +33,9 @@ const tool = (name: string): ToolSchema =>
 function lister(opts: { credential?: boolean } = {}) {
   const s = {
     all: ["a", "b", "c"], listed: ["a"], basis: "basis-1" as string | undefined,
-    fail: null as null | "throw" | "hang", listings: 0,
+    fail: null as null | "throw" | "hang" | "hold", listings: 0,
+    /** Releases the listings held under `fail: "hold"`; each answers with the list as it was when it started. */
+    release: [] as Array<() => void>,
     seen: [] as Array<{ where: string; offered: readonly string[] | undefined; has: boolean }>,
   };
   const note = (where: string, c: PluginContext) => s.seen.push({ where, offered: c.offered, has: "offered" in c });
@@ -52,7 +54,9 @@ function lister(opts: { credential?: boolean } = {}) {
       note("snapshotTools", c);
       if (s.fail === "throw") throw new Error("the far end is down");
       if (s.fail === "hang") return new Promise(() => {});
-      return { tools: s.listed.map(tool) };
+      const answer = { tools: s.listed.map(tool) };
+      if (s.fail === "hold") return new Promise((resolve) => { s.release.push(() => resolve(answer)); });
+      return answer;
     },
     ...(opts.credential ? { credential: { required: true, summary: "a key", shape: "token" } as never } : {}),
     async invoke(name, _args, c) {
@@ -160,6 +164,7 @@ async function runtimeWorld(opts: { credential?: boolean } = {}) {
     autoRelease: false, extraPlugins: [l.plugin],
     loader: standIn.loader, makeToolBinding: standIn.makeToolBinding,
     operatorModel: { baseUrl: "https://model.example/v1", apiKey: "operator-key", model: "m1" },
+    offloadModel: async () => {},
     secretKek: Buffer.from(new Uint8Array(32)).toString("base64"),
   } as never);
   await rt.ready();
@@ -170,7 +175,9 @@ async function runtimeWorld(opts: { credential?: boolean } = {}) {
   await rt.bindOperatorModel("t", "a");
   const mount = async () => (await rt.store.getMountByAlias("t", "a", "m"))!;
   const offered = async () => toolsOf(l.plugin, await mount()).map((t) => t.name);
-  return { l, rt, mount, offered };
+  /** A new turn, as a person's message starts one. */
+  const turn = (text = "hello") => rt.postMessage("t", "a", text, "prompt");
+  return { l, rt, mount, offered, turn };
 }
 
 await check("a deploy that moves the basis: the next turn re-takes the list before the tools are built, and the new tool is offered", async () => {
@@ -180,7 +187,7 @@ await check("a deploy that moves the basis: the next turn re-takes the list befo
   // The new build offers b too, and says so with a new basis.
   w.l.s.listed = ["a", "b"];
   w.l.s.basis = "basis-2";
-  await w.rt.agent("t", "a");
+  await w.turn();
   must(w.l.s.listings === 2, `listings after the turn: ${w.l.s.listings}`);
   must(show(await w.offered()) === show(["a", "b"]), `offered after the turn: ${show(await w.offered())}`);
   must((await w.mount()).toolSnapshot?.basis === "basis-2" && w.rt.snapshotError("m") === null, `kept: ${show((await w.mount()).toolSnapshot)} ${w.rt.snapshotError("m")}`);
@@ -188,7 +195,7 @@ await check("a deploy that moves the basis: the next turn re-takes the list befo
 
 await check("a snapshot under the plugin's own basis is not listed again: no call reaches the plugin, turn after turn", async () => {
   const w = await runtimeWorld();
-  await w.rt.agent("t", "a");
+  await w.turn();
   await w.rt.retakeStaleSnapshots("t", "a");
   await w.rt.retakeStaleSnapshots("t", "a");
   must(w.l.s.listings === 1, `listings: ${w.l.s.listings}`);
@@ -206,7 +213,7 @@ await check("a re-take that fails keeps the old list, says why on the mount's pa
   must(/the far end is down/.test(w.rt.snapshotError("m") ?? ""), `snapshotError: ${w.rt.snapshotError("m")}`);
   // Within the back-off: no attempt, whether by the step itself or by a turn.
   await w.rt.retakeStaleSnapshots("t", "a");
-  await w.rt.agent("t", "a");
+  await w.turn();
   must(w.l.s.listings === 2, `re-attempted within the back-off: ${w.l.s.listings}`);
   // Past it, with the far end back: asked again, and the new list is kept.
   const realNow = Date.now;
@@ -249,7 +256,7 @@ await check("a mount with no snapshot is not listed at a turn: it is offered eve
   const w = await runtimeWorld();
   await w.rt.store.updateMountToolSnapshot("t", "a", "m", null);
   w.l.s.basis = "basis-2";
-  await w.rt.agent("t", "a");
+  await w.turn();
   must(w.l.s.listings === 1 && (await w.mount()).toolSnapshot === null, `listings ${w.l.s.listings}, ${show((await w.mount()).toolSnapshot)}`);
   must(show(await w.offered()) === show(["a", "b", "c"]), `offered: ${show(await w.offered())}`);
 });
@@ -259,7 +266,7 @@ await check("a stale list not yet re-taken offers only the tools this build stil
   // Taken by a build that had a tool this one removed (z), under a basis this build does not have.
   await w.rt.store.updateMountToolSnapshot("t", "a", "m", { ...(await admitTools({ tools: [tool("a"), tool("z")] }, 0)), basis: "basis-0" });
   w.l.s.fail = "throw";
-  await w.rt.agent("t", "a");
+  await w.turn();
   must(show(await w.offered()) === show(["a"]), `offered: ${show(await w.offered())}`);
 });
 
@@ -281,6 +288,81 @@ await check("a re-take never swaps a list taken under a credential for one taken
   } finally { Date.now = realNow; }
   must(w.l.s.listings === listings + 1 && (await w.mount()).toolSnapshot?.basis === "basis-1", `control: ${w.l.s.listings} ${show((await w.mount()).toolSnapshot)}`);
 });
+
+
+await check("only a turn's start lists again: a steer, a follow-up, opening the harness (status, transcript), a branch read and a job's take or delivery do not", async () => {
+  const w = await runtimeWorld();
+  await w.turn("first");
+  w.l.s.listed = ["a", "b"];
+  w.l.s.basis = "basis-2";
+  const quiet: Array<[string, () => Promise<unknown>]> = [
+    ["steer", () => w.rt.postMessage("t", "a", "and also", "steer")],
+    ["followUp", () => w.rt.postMessage("t", "a", "then", "followUp")],
+    ["agent (status, entries)", async () => { const a = await w.rt.agent("t", "a"); await a.running(); await a.entries({ order: "asc" }); }],
+    ["branchEntries", () => w.rt.branchEntries("t", "a", "main")],
+    ["takeJob", () => w.rt.takeJob("t", "a", "job-none", "taker").catch(() => null)],
+    ["deliverAnswer", () => w.rt.deliverAnswer("t", "a", "job-none", "x", "taker").catch(() => null)],
+  ];
+  for (const [what, go] of quiet) {
+    await go();
+    must(w.l.s.listings === 1, `${what} listed: ${w.l.s.listings}`);
+  }
+  // Control: a turn's start does.
+  await w.turn("second");
+  must(w.l.s.listings === 2 && show(await w.offered()) === show(["a", "b"]), `the turn: ${w.l.s.listings} ${show(await w.offered())}`);
+});
+
+await check("two turns starting at once share one listing", async () => {
+  const w = await runtimeWorld();
+  w.l.s.listed = ["a", "b"];
+  w.l.s.basis = "basis-2";
+  w.l.s.fail = "hold";
+  const both = Promise.all([w.rt.retakeStaleSnapshots("t", "a"), w.rt.retakeStaleSnapshots("t", "a")]);
+  await new Promise((r) => setTimeout(r, 20));
+  must(w.l.s.release.length === 1, `listings in flight: ${w.l.s.release.length}`);
+  w.l.s.fail = null;
+  w.l.s.release.splice(0).forEach((go) => go());
+  await both;
+  must(w.l.s.listings === 2 && show(await w.offered()) === show(["a", "b"]), `after: ${w.l.s.listings} ${show(await w.offered())}`);
+  // Through the turn path too: two prompts at once, one listing.
+  w.l.s.basis = "basis-3";
+  w.l.s.fail = "hold";
+  const turns = Promise.all([w.turn("one"), w.turn("two")]);
+  await new Promise((r) => setTimeout(r, 20));
+  must(w.l.s.release.length === 1, `turns' listings in flight: ${w.l.s.release.length}`);
+  w.l.s.fail = null;
+  w.l.s.release.splice(0).forEach((go) => go());
+  await turns;
+  must(w.l.s.listings === 3, `turns' listings: ${w.l.s.listings}`);
+});
+
+for (const change of ["replaced", "removed"] as const) {
+  await check(`a re-take still listing when the credential is ${change} does not write over the list taken for the change`, async () => {
+    const w = await runtimeWorld({ credential: true });
+    const first = await w.rt.attachCredential("t", "a", "m", { token: "first-credential-123456" });
+    must(first.ok && show(await w.offered()) === show(["a"]), `control: attach: ${show(first)} ${show(await w.offered())}`);
+    // A deploy moved the basis; the turn's re-take starts under the first credential and is held.
+    w.l.s.basis = "basis-2";
+    w.l.s.fail = "hold";
+    const retake = w.rt.retakeStaleSnapshots("t", "a");
+    await new Promise((r) => setTimeout(r, 20));
+    must(w.l.s.release.length === 1, `control: the re-take is in flight: ${w.l.s.release.length}`);
+    // Meanwhile the credential changes, and its own listing lands.
+    w.l.s.fail = null;
+    // As raft lists: the new credential reaches more; no credential lists nothing.
+    w.l.s.listed = change === "replaced" ? ["a", "b", "c"] : [];
+    if (change === "replaced") must((await w.rt.attachCredential("t", "a", "m", { token: "second-credential-123456" })).ok, "replace refused");
+    else must(await w.rt.removeCredential("t", "a", "m"), "remove refused");
+    const after = (await w.mount()).toolSnapshot;
+    const want = change === "replaced" ? ["a", "b", "c"] : [];
+    must(show(await w.offered()) === show(want) && after?.basis === "basis-2", `control: the change's list: ${show(await w.offered())} ${show(after)}`);
+    // The held listing answers with the first credential's list, late.
+    w.l.s.release.splice(0).forEach((go) => go());
+    await retake;
+    must(show((await w.mount()).toolSnapshot) === show(after), `the late re-take wrote: ${show((await w.mount()).toolSnapshot)}`);
+    must(show(await w.offered()) === show(want), `offered: ${show(await w.offered())}`);
+  });
+}
 
 for (const r of results) console.log(`  ${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${r.name}${r.error ? `\n      ${r.error}` : ""}`);
 console.log(`  ${"─".repeat(56)}\n  ${results.filter((r) => r.ok).length} passed, ${results.filter((r) => !r.ok).length} failed`);

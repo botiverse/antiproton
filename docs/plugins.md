@@ -327,11 +327,14 @@ changes what a mount offers, not which code runs it.
 return.** A snapshot is taken only on the occasions above, so a deploy that adds
 a tool reaches no mount whose list already exists. `toolsBasis` is a static
 string that moves whenever the set of tools this build can offer moves (raft's
-is a digest of its generated tool names, so an SDK upgrade, a change to
+is a digest of each tool's name and the capabilities it needs, so an SDK
+upgrade that adds an operation or changes what one needs, a change to
 `EXCLUDED` or a build with or without object storage changes it). The kernel
-stores it on every snapshot it takes (`ToolSnapshot.basis`), and at the start
-of each turn, before the agent's tool list is built (`AgentRuntime.agent` →
-`retakeStaleSnapshots`, `cf/src/runtime.ts`), lists again any mount whose
+stores it on every snapshot it takes (`ToolSnapshot.basis`), and when a turn
+starts, before the agent's tool list is built (`AgentRuntime.postMessage` with
+`prompt` → `retakeStaleSnapshots`, `cf/src/runtime.ts`; never on a steer, a
+follow-up, a job's delivery or a read that opens the harness, none of which
+may wait on a far end; two turn starts at once share one pass), lists again any mount whose
 snapshot's basis is not its plugin's — a snapshot with no basis counts as
 different; a mount with no snapshot is left alone, being offered every tool
 already; a switched-off plugin is skipped. The listing is bounded by
@@ -340,8 +343,13 @@ already; a switched-off plugin is skipped. The listing is bounded by
 removed is not offered — the reason goes where every failed listing's does
 (`snapshotError`, on the mount's page), and the mount is not tried again for
 that basis for `RETAKE_BACKOFF_MS` (10 minutes, kept in the object's memory).
-A list taken under a credential is never replaced by one taken without it just
-because the credential did not resolve at that moment. A plugin whose list
+A list taken under a credential is kept, and the re-take reported as failed,
+when the credential did not resolve at that moment, when the far end refused it
+(the listing says so with `ListedTools.refused`), or when the list came back
+empty; an operator's refresh and a credential change still take such an answer
+as it is. And a re-take writes nothing if the mount's list was replaced while it
+ran (a credential attached, replaced or removed, an operator's refresh): the
+newer list stands. A plugin whose list
 depends only on its server (`mcp.ts`) declares no basis: nothing in the build
 changes that list.
 

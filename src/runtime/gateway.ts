@@ -8,7 +8,7 @@ import type { Plugin, PluginContext, MountActivity, MountUsage, InboundEvent, In
 import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclusive } from "../plugins/types.ts";
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
-import type { PluginErrorFields } from "../plugins/types.ts";
+import type { PluginErrorFields, ToolSnapshot } from "../plugins/types.ts";
 import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
@@ -153,6 +153,12 @@ export interface InvokeOpts {
 }
 
 type Resolution = { mount: MountRecord; tool: string } | { error: ToolError };
+
+/** Whether two stored tool lists are the same record: what a re-take compares before it writes (`refreshMountTools`). */
+function sameSnapshot(a: ToolSnapshot | null | undefined, b: ToolSnapshot | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.hash === b.hash && a.takenAt === b.takenAt && !!a.withoutCredential === !!b.withoutCredential && a.basis === b.basis;
+}
 
 /**
  * What a mount may do without a human.
@@ -1320,9 +1326,23 @@ export class ToolGateway {
     let snapshot;
     try {
       const listed = await plugin.snapshotTools(this.#contextFor({ tenantId, agentId, taskId: "tool-snapshot" }, mount, credential, false, undefined, true));
+      // A re-take keeps a list a credential was behind unless the new answer is about that credential's reach: the far
+      // end refusing it (`ListedTools.refused`) says nothing about what it may do, and one unreachable or refused
+      // moment must not shrink a working list for good — the basis the shrunken list would carry stops every later
+      // re-take. Likewise a credentialed list that comes back empty: kept, and reported, until a person refreshes
+      // (an operator's refresh and a credential change still take the answer as it is).
+      const prior = mount.toolSnapshot;
+      if (opts?.keepCredentialed && prior && !prior.withoutCredential && prior.tools.length > 0 && (listed.refused || listed.tools.length === 0)) {
+        return {
+          ok: false,
+          error: listed.refused
+            ? `${alias}'s credential was refused while its tools were listed again; the list taken under it is kept`
+            : `${alias}'s tools were listed again and came back empty; the list taken under its credential is kept`,
+        };
+      }
       snapshot = await admitTools(listed, Date.now());
       // Which of the plugin's tool sets this list was taken under, so a build whose set moved re-takes it at the
-      // next turn (`Plugin.toolsBasis`, `AgentRuntime` `#retakeStaleSnapshots`). Not covered by `hash`, like
+      // next turn (`Plugin.toolsBasis`, `AgentRuntime.retakeStaleSnapshots`). Not covered by `hash`, like
       // `withoutCredential`: it is about the plugin, not the list.
       if (plugin.toolsBasis !== undefined) snapshot.basis = plugin.toolsBasis;
       // Taken for a plugin that wants an account while the mount has none: marked, so a later failure to list under
@@ -1339,6 +1359,14 @@ export class ToolGateway {
     const now = await this.#store.getMountByAlias(tenantId, agentId, alias);
     if (!now || now.installationId !== mount.installationId) {
       return { ok: false, stale: true, error: `${alias} was removed or replaced while its tools were being listed; nothing was kept` };
+    }
+    // A re-take nobody asked for answers for the list it started from, and nothing else: if that list was replaced
+    // while this one was being taken — a credential attached, replaced or removed, an operator's refresh, each of
+    // which keeps the `installationId` and lists again — the newer list is the truer one, and writing over it would
+    // stick, since it would carry the current basis and no later turn would ask again. The listing may outlive the
+    // runtime's timeout (it runs to the plugin's own), so this is checked here, at the write.
+    if (opts?.keepCredentialed && !sameSnapshot(now.toolSnapshot, mount.toolSnapshot)) {
+      return { ok: false, stale: true, error: `${alias}'s tools were listed again by someone else while this listing ran; theirs is kept` };
     }
     const changed = now.toolSnapshot?.hash !== snapshot.hash || !!now.toolSnapshot?.withoutCredential !== !!snapshot.withoutCredential ||
       now.toolSnapshot?.basis !== snapshot.basis;

@@ -1308,13 +1308,17 @@ export async function downloadAttachment(
 }
 
 /**
- * The basis of a raft snapshot (`Plugin.toolsBasis`): a digest of the names of every tool this build can offer, sorted,
- * so it moves exactly when the set does — an SDK upgrade that adds or removes an operation, a change to `EXCLUDED`, a
- * plugin built with or without object storage — and not when a description or a schema is reworded, which a snapshot
- * never carried anyway (`mountTools` reads only its names).
+ * The basis of a raft snapshot (`Plugin.toolsBasis`): a digest of every tool this build can offer, each as its name and
+ * the capabilities it needs, sorted, so it moves exactly when what a listing could return moves — an SDK upgrade that
+ * adds or removes an operation or changes the capability one needs (which changes which credentials list it), a change
+ * to `EXCLUDED`, a plugin built with or without object storage — and not when a description or a schema is reworded,
+ * which a snapshot never carried anyway (`mountTools` reads only its names). The same set in any order gives the same
+ * basis. Exported for the test that holds both.
  */
-function toolsBasisOf(tools: readonly ToolSchema[]): string {
-  return `raft-tools:${createHash("sha256").update(JSON.stringify(tools.map((t) => t.name).sort())).digest("hex").slice(0, 16)}`;
+export function toolsBasisOf(tools: ReadonlyArray<{ name: string; capability?: readonly string[] }>): string {
+  const canonical = tools.map((t) => [t.name, [...(t.capability ?? [])].sort()] as const)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `raft-tools:${createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 16)}`;
 }
 
 /** What a mount whose credential has no capability at all is told, in its snapshot's `skipped`. */
@@ -1372,11 +1376,11 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
     id: "raft",
     version: "1.0.0",
     /**
-     * Which tools this build can offer, as one string: it moves when the SDK's manifest, `EXCLUDED` or the presence
-     * of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next
+     * Which tools this build can offer, and what each needs, as one string: it moves when the SDK's manifest
+     * (an operation or its capability), `EXCLUDED` or the presence of object storage changes the generated set, and a snapshot taken under another basis is re-taken at the next
      * turn (`Plugin.toolsBasis`), so a tool a deploy added reaches a mount without anyone refreshing it.
      */
-    toolsBasis: toolsBasisOf(allTools),
+    toolsBasis: toolsBasisOf([...OWN_TOOLS.map((t) => ({ name: t.name })), ...offerable.map((op) => ({ name: op.toolName, capability: op.capability }))]),
     /** The push registration this mount holds: whether it exists is listable, what it holds is not. */
     database: {
       version: 3, stores: { [PUSH_STORE]: { listed: [PUSH_KEY] }, [INBOX_STORE]: { listed: [STATE_KEY, SINCE_KEY] } },
@@ -1452,7 +1456,7 @@ export function createRaftPlugin(deps: { artifacts?: RaftArtifacts | null; exclu
       const me = await raftFor(ctx, { state: false }).identity.whoami();
       if (!me.ok) {
         if (me.status === 401 || me.status === 403) {
-          return { tools: [], skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})` }] };
+          return { tools: [], refused: true, skipped: [{ name: EVERY_OPERATION, reason: `Raft refused this mount's credential (HTTP ${me.status})` }] };
         }
         throw new Error(`could not ask Raft what this mount's credential may do: ${me.error.message}`);
       }

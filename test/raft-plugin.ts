@@ -1,11 +1,11 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES } from "../src/plugins/raft.ts";
+import { raftPlugin as raftWithoutStorage, EXCLUDED, EVENTS_LIMIT, GENERATED, handOver, INBOX_STORE, KEY_LIFETIME_MS, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, offeredTerms, escapeMarks, unescapeMarks, createRaftPlugin, downloadAttachment, ATTACHMENT_MAX_BYTES, toolsBasisOf } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
 import { admitTools } from "../src/runtime/mount-tools.ts";
-import { AgentRuntime, limitForCall, tooLargeResult } from "../cf/src/runtime.ts";
+import { AgentRuntime, limitForCall, tooLargeResult, RETAKE_BACKOFF_MS } from "../cf/src/runtime.ts";
 import { ToolGateway } from "../src/runtime/gateway.ts";
 import { SqliteStore } from "../src/store/sqlite.ts";
 import { PluginDbTables } from "../src/store/plugin-db.ts";
@@ -23,6 +23,8 @@ const raftPlugin = createRaftPlugin({ artifacts: { async put() { throw new Error
 const originalFetch = globalThis.fetch;
 const PUSH_SECRET = "raft-push-secret-for-tests";
 const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+
+function must(cond: unknown, msg: string): void { if (!cond) throw new Error(msg); }
 
 async function check(name: string, fn: () => Promise<void>) {
   try { await fn(); results.push({ name, ok: true }); }
@@ -3070,6 +3072,63 @@ await check("a plugin built with no object storage does not offer the download a
   if (!raftPlugin.toolsBasis || raftPlugin.toolsBasis === raftWithoutStorage.toolsBasis || createRaftPlugin({ artifacts: fakeArtifacts() }).toolsBasis !== raftPlugin.toolsBasis) {
     throw new Error(`bases: ${raftPlugin.toolsBasis} ${raftWithoutStorage.toolsBasis}`);
   }
+});
+
+await check("a turn's re-take that Raft refuses, or that lists nothing, keeps the working list, says why, and backs off; an operator's refresh still takes it", async () => {
+  const { rt, offered } = await raftRuntime();
+  const every = ["read", "send", "reactions", "mentions", "tasks", "knowledge", "channels"];
+  let answer: "ok" | "refuse" | "empty" = "ok";
+  let asked = 0;
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/internal/agent-api") return json(200, { agentId: "agent-1", agentName: "raft-bot", agentDisplayName: null, serverId: "server-1" });
+    if (path === "/internal/agent-api/context") {
+      asked++;
+      return answer === "refuse" ? json(401, { error: "unauthorized" }) : context(answer === "empty" ? [] : every);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }) as any;
+  must((await rt.attachCredential("t", "a", "raft", { token: "sk_agent_first_1234567890" })).ok, "attach");
+  const working = await offered();
+  must(working.length === raftPlugin.tools.length && working.length > OWN.length + 30, `control: the credential reaches every tool: ${working.length}`);
+  const stale = async () => {
+    const m = (await rt.store.getMountByAlias("t", "a", "raft"))!;
+    await rt.store.updateMountToolSnapshot("t", "a", "raft", { ...m.toolSnapshot!, basis: "raft-tools:an-older-build" });
+  };
+  for (const [what, mode, reason] of [["refused", "refuse", /refused/], ["empty", "empty", /came back empty/]] as const) {
+    await stale();
+    answer = mode;
+    const before = asked;
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + (what === "empty" ? RETAKE_BACKOFF_MS + 1 : 0);
+      await rt.retakeStaleSnapshots("t", "a");
+      must(asked === before + 1, `${what}: control: Raft was asked: ${asked - before}`);
+      must(JSON.stringify(await offered()) === JSON.stringify(working), `${what}: the list shrank to ${(await offered()).length}: ${(await offered()).join(", ")}`);
+      must(reason.test(rt.snapshotError("raft") ?? ""), `${what}: snapshotError: ${rt.snapshotError("raft")}`);
+      await rt.retakeStaleSnapshots("t", "a");
+      must(asked === before + 1, `${what}: asked again within the back-off`);
+    } finally { Date.now = realNow; }
+  }
+  // An operator's refresh is not a re-take: a refused credential lists nothing, as it always has.
+  answer = "refuse";
+  await rt.refreshMountTools("t", "a", "raft");
+  must(JSON.stringify(await offered()) === JSON.stringify(OWN), `operator refresh: ${(await offered()).join(", ")}`);
+});
+
+await check("the basis covers each tool's name and the capability it needs, in any order", async () => {
+  const tools = GENERATED.map((op) => ({ name: op.toolName, capability: op.capability }));
+  const base = toolsBasisOf(tools);
+  must(toolsBasisOf([...OWN.map((name) => ({ name })), ...tools]) === raftPlugin.toolsBasis, `control: the plugin's basis is made this way: ${raftPlugin.toolsBasis}`);
+  // Same names and capabilities, other orders (the tools reversed, a capability list reversed): the same basis.
+  const reordered = [...tools].reverse().map((t) => ({ ...t, capability: [...t.capability].reverse() }));
+  must(toolsBasisOf(reordered) === base, "the order moved the basis");
+  // One operation's capability changed, names untouched: a different basis.
+  const i = tools.findIndex((t) => t.name === "messages_read");
+  const moved = tools.map((t, k) => (k === i ? { ...t, capability: [...t.capability, "channels"] } : t));
+  must(toolsBasisOf(moved) !== base, "a capability change left the basis as it was");
+  // And a name change does too.
+  must(toolsBasisOf(tools.slice(1)) !== base, "a removed tool left the basis as it was");
 });
 
 globalThis.fetch = originalFetch;

@@ -108,7 +108,7 @@ export interface ToolSnapshot {
    * The plugin's {@link Plugin.toolsBasis} when the list was taken: which tool set the code that took it could offer.
    * The runtime re-takes, at the start of a turn, a snapshot whose basis is not the running plugin's — absent counts
    * as different — because a list taken by an older build lacks whatever a newer one added, and nothing else asks
-   * again (`AgentRuntime` `#retakeStaleSnapshots`, cf/src/runtime.ts). Not covered by `hash`, which is about the
+   * again (`AgentRuntime.retakeStaleSnapshots`, cf/src/runtime.ts). Not covered by `hash`, which is about the
    * list itself.
    */
   basis?: string;
@@ -121,6 +121,15 @@ export interface ToolSnapshot {
 export interface ListedTools {
   tools: ToolSchema[];
   skipped?: Array<{ name: string; reason: string }>;
+  /**
+   * Present, and true, when the far end refused the mount's credential, so `tools` (normally empty) says what a
+   * refused credential may do rather than what this one may. Taken as it is on a credential change and an operator's
+   * refresh — a refused new credential lists nothing. A re-take nobody asked for (the runtime's, at a turn's start)
+   * keeps a list a credential was behind instead and reports the refusal (`ToolGateway.refreshMountTools`), since one
+   * refused moment must not shrink a working list for good. A flag rather than a reading of `skipped`, whose reasons
+   * are words for a person.
+   */
+  refused?: true;
 }
 
 /**
@@ -1801,7 +1810,7 @@ export interface Plugin {
    *
    * The kernel stores it on every snapshot it takes ({@link ToolSnapshot.basis}), and at the start of a turn, before
    * the tool list is built, re-takes the snapshot of a mount whose stored basis differs — or is absent — with a
-   * short timeout, keeping the old list when that fails (cf/src/runtime.ts, `#retakeStaleSnapshots`). Without it a
+   * short timeout, keeping the old list when that fails (cf/src/runtime.ts, `AgentRuntime.retakeStaleSnapshots`). Without it a
    * deploy that adds a tool reaches no mount whose list was already taken, since nothing else asks again. Static,
    * like `version`, because it is compared on every turn and must not cost a call. A plugin whose list depends only
    * on the far end (an MCP server) leaves it out: nothing in the build changes that list.

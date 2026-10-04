@@ -755,6 +755,8 @@ export class AgentRuntime {
   #gateway: ToolGateway;
   /** The last failed re-take per mount (`tenant/agent/alias`), under which basis and when; see `RETAKE_BACKOFF_MS`. */
   #retakeFailed = new Map<string, { basis: string; at: number }>();
+  /** The re-take pass running for an agent (`tenant/agent`), which a second turn start joins rather than repeats. */
+  #retaking = new Map<string, Promise<void>>();
   #secrets!: import("../../src/runtime/gateway.ts").SecretResolver;
   #kek: Promise<CryptoKey | null> = Promise.resolve(null);
   #unchecked = new Map<string, string>();
@@ -1778,13 +1780,28 @@ export class AgentRuntime {
    * with no snapshot is left alone: it is offered every tool already. Each re-take goes through `#snapshot`, so it is
    * written only when the list or its marks moved, with `RETAKE_TIMEOUT_MS` as its bound; a failure or a timeout keeps
    * the old list, which `mountTools` still reads against this build's tools (a removed tool is not offered), records
-   * why (`snapshotError`), and is not tried again for that basis for `RETAKE_BACKOFF_MS`. A list taken under a
-   * credential is never replaced by one taken without it because the credential did not resolve this time
-   * (`keepCredentialed`, the rule `ToolSnapshot.withoutCredential` states for an attach).
+   * why (`snapshotError`), and is not tried again for that basis for `RETAKE_BACKOFF_MS`. Under `keepCredentialed`
+   * the gateway also treats as a failure a credentialed list that would be replaced because the credential did not
+   * resolve, was refused (`ListedTools.refused`) or listed nothing, and writes nothing (`stale`, no back-off) when the
+   * mount's list was replaced by someone else while the listing ran — the listing can outlive the timeout here.
    *
-   * Public so a test can ask for exactly this step; `agent` is the caller that matters.
+   * Asked only where a turn starts (`postMessage` with `prompt`, which every new turn goes through: a person's message,
+   * an Agents API input, an inbound event, a finished background job), never in `agent`: that also opens the harness
+   * behind a steer, a job's take and delivery, a status read and a transcript read, none of which may wait on a far
+   * end's listing. Two turn starts at once share one pass (`#retaking`), so a mount is listed once, not once per caller.
+   *
+   * Public so a test can ask for exactly this step.
    */
-  async retakeStaleSnapshots(tenantId: string, agentId: string): Promise<void> {
+  retakeStaleSnapshots(tenantId: string, agentId: string): Promise<void> {
+    const key = `${tenantId}/${agentId}`;
+    const running = this.#retaking.get(key);
+    if (running) return running;
+    const pass = this.#retakeStale(tenantId, agentId).finally(() => this.#retaking.delete(key));
+    this.#retaking.set(key, pass);
+    return pass;
+  }
+
+  async #retakeStale(tenantId: string, agentId: string): Promise<void> {
     const byId = new Map(this.#plugins.map((p) => [p.id, p]));
     const stale = (await this.store.listMounts(tenantId, agentId)).filter((m) => {
       const p = byId.get(m.plugin);
@@ -1800,7 +1817,7 @@ export class AgentRuntime {
     });
     if (!due.length) return;
     // The gateway refuses to list for a mount whose pin is not the registry's, and the build that moved the basis
-    // usually moved the version too; `agent` would repin anyway, a few lines later.
+    // usually moved the version too; `agent` would repin anyway, when the turn opens the harness.
     if (due.some((m) => this.pluginVersion(m.plugin) !== m.toolVersion)) await this.repinMounts(tenantId, agentId);
     for (const m of due) {
       const key = `${tenantId}/${agentId}/${m.alias}`;
@@ -1821,7 +1838,8 @@ export class AgentRuntime {
         await this.#snapshotFailed(tenantId, agentId, m.alias,
           `could not list ${m.alias}'s tools: no answer within ${RETAKE_TIMEOUT_MS} ms at the start of a turn; the previous list is kept`);
       }
-      if (r === "timeout" || !r.ok) this.#retakeFailed.set(key, { basis, at: Date.now() });
+      // Stale: someone else's newer list stood, which is no failure of this mount's listing and needs no back-off.
+      if (r === "timeout" || (!r.ok && !("stale" in r))) this.#retakeFailed.set(key, { basis, at: Date.now() });
       else this.#retakeFailed.delete(key);
     }
   }
@@ -1990,9 +2008,6 @@ export class AgentRuntime {
    */
   async agent(tenantId: string, agentId: string, session: string = MAIN_SESSION): Promise<AgentEngine> {
     await this.ready();
-    // Before the cached harness is judged: a re-taken list changes the snapshot's hash, which is in `catalogueKey`,
-    // so the turn that re-took it is built with the new tools (or, if one is running, the next one is).
-    await this.retakeStaleSnapshots(tenantId, agentId);
     const key = `${tenantId}/${agentId}`;
     const cacheKey = `${key}#${session}`;
     const cached = this.#agents.get(cacheKey);
@@ -2280,6 +2295,14 @@ export class AgentRuntime {
     mode: "prompt" | "steer" | "followUp" = "prompt",
     session: string = MAIN_SESSION,
   ) {
+    // A new turn, so a tool list taken under another basis is taken again first (`retakeStaleSnapshots`), before the
+    // harness is judged: a re-taken list changes the snapshot's hash, which is in `catalogueKey`, so the turn is built
+    // with the new tools (or, if one is still running and this lands as a steer, the next one is). Not for a steer or
+    // a follow-up, which add to a turn rather than start one.
+    if (mode === "prompt") {
+      await this.ready();
+      await this.retakeStaleSnapshots(tenantId, agentId);
+    }
     const agent = await this.agent(tenantId, agentId, session);
     // A conversation that has just been spoken to has work until a step says
     // otherwise, so the next wake steps it. pd keeps no such list: its harness
