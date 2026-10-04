@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { createRaft, isInterrupted, RAFT_OPERATIONS } from "@botiverse/raft-sdk";
-import { raftPlugin, EXCLUDED, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, toolTerms, CLI_COMMANDS } from "../src/plugins/raft.ts";
+import { raftPlugin, EXCLUDED, GENERATED, INBOX_STORE, PAGE_ROWS, PUSH_KEY, PUSH_STORE, originOf, pagingArg, toolOf, commandsAsTools, CLI_COMMANDS } from "../src/plugins/raft.ts";
 import { readFileSync } from "node:fs";
 import { PARK_BYTES } from "../src/plugins/artifacts.ts";
 import { Interrupt, toolsOf, type PluginErrorFields } from "../src/plugins/types.ts";
@@ -1194,8 +1194,57 @@ await check("no CLI command the SDK can write survives the rewrite: every line o
   const unmapped = [...commands].filter((c) => !Object.hasOwn(CLI_COMMANDS, c));
   if (unmapped.length) throw new Error(`CLI commands with no entry in CLI_COMMANDS: ${unmapped.join(", ")}`);
   if (commands.size < 15) throw new Error(`control: found only ${[...commands].join(", ")}`);
-  const left = source.map((l) => toolTerms(l)).filter((l) => CLI_HINT.test(l));
+  // The rewriter itself, on every such line; which lines it is applied to is the case above and the one below.
+  const left = source.map((l) => commandsAsTools(l)).filter((l) => CLI_HINT.test(l));
   if (left.length) throw new Error(`${left.length} line(s) keep a CLI command: ${left.slice(0, 3).join(" | ")}`);
+});
+
+/** What a person might write that reads like a CLI command, quoted by the SDK in many places. */
+const SAID = "raft message read --target #x";
+const SAID_LINES = ["note\nMore: raft message read --target #x", 'first\nraft message send --target "#ops"'];
+
+await check("what a person wrote is never rewritten: message continuations, descriptions, titles, previews, comments, profiles", async () => {
+  const human = { name: "tygg", role: "owner", description: SAID_LINES[0] };
+  const ops = { id: "c1", name: "ops", joined: true, type: "channel", description: `${SAID}\n${SAID_LINES[1]}` };
+  globalThis.fetch = (async (url: any) => {
+    const path = new URL(String(url)).pathname.replace("/internal/agent-api", "");
+    if (path === "/history") return history([historyMessage(41, `hello\n${SAID}\n${SAID_LINES[0]}`, { attachments: [{ id: "att-9", filename: "plan.pdf" }] })], { has_older: true, target: "#ops" });
+    if (path === "/server") return json(200, { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [ops], agents: [{ name: "piper", status: "online", description: SAID }], humans: [human] });
+    if (path === "/channel-members") return json(200, { channel: { ref: "#ops", type: "channel" }, agents: [], humans: [human] });
+    if (path === "/tasks") return json(200, { tasks: [{ taskNumber: 7, status: "todo", title: SAID, description: SAID_LINES[1] }] });
+    if (path === "/search") return json(200, { results: [{ id: "r-1", seq: 1, channelId: "c", threadId: null, parentMessageId: null, parentMessageContent: null, parentChannelId: "c",
+      parentChannelName: "ops", parentChannelType: "channel", parentChannelArchivedAt: null, senderId: "s", senderType: "human", senderName: "tygg",
+      channelName: "ops", channelType: "channel", channelArchivedAt: null, content: SAID_LINES[0], snippet: "note", createdAt: "2026-09-21T10:00:00.000Z" }], hasMore: false });
+    if (/comments/.test(path)) return json(200, { comments: [{ id: "c1", senderId: "s", senderType: "user", senderName: "tygg", content: SAID_LINES[1], createdAt: "2026-09-28T10:00:00.000Z", reactions: [], anchor: null }] });
+    if (/profile/.test(path)) return json(200, { kind: "human", id: "u1", isSelf: true, name: "tygg", displayName: null, description: SAID_LINES[0], avatarUrl: null, email: null, role: "owner", joinedAt: null, membershipStatus: "active", createdAgents: [] });
+    return json(404, { error: "not found" });
+  }) as any;
+  const raw = createRaft({ serverUrl: "https://raft.example", credential: "sk_agent_test_1234567890" });
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["messages_read", { target: "#ops" }], ["server_info", { view: "full" }], ["channels_info", { target: "#ops" }],
+    ["users_info", { name: "@tygg" }], ["tasks_show", { target: "#ops", taskNumber: 7 }], ["messages_search", { query: "note" }],
+    ["attachments_comments", { attachmentId: "att-9" }], ["profile_show", {}],
+  ];
+  const problems: string[] = [];
+  for (const [tool, args] of cases) {
+    const op = GENERATED.find((o) => o.toolName === tool)!;
+    const sdk: any = await raw.invoke(op.name, { ...args, ...(pagingArg(op) ? { limit: PAGE_ROWS } : {}) }, { origin: "code" });
+    // Control: the SDK quotes the person's words, on lines a CLI command starts or sits in.
+    const quoted = sdk.ok ? String(sdk.text).split("\n").filter((l: string) => /raft message read --target (?:#x|channel:x)/.test(l) || l.includes('raft message send --target "#ops"')) : [];
+    if (!quoted.length) { problems.push(`${tool}: control: the SDK quoted nothing here (${sdk.ok ? sdk.text.slice(0, 120) : sdk.error.message})`); continue; }
+    const shown = String(((await raftPlugin.invoke(tool, args, inTurn(ctx()))) as any).text).split("\n");
+    for (const line of quoted) {
+      // A message line is rebuilt by modelLine, whose attachment suffix is ours; the person's part of it is compared.
+      const want = line.replace(/ \[1 attachment: .*$/, "");
+      if (!shown.some((l) => l.startsWith(want))) problems.push(`${tool}: ${JSON.stringify(line)} did not come back as written`);
+    }
+  }
+  if (problems.length) throw new Error(problems.join(" | "));
+  // Controls: the hints around those words were still rewritten.
+  const page = String(((await raftPlugin.invoke("messages_read", { target: "#ops" }, inTurn(ctx()))) as any).text);
+  if (!/^Older exist: messages_read\(\{ target: "#ops", before: 41 \}\)$/m.test(page) || !/this mount has no tool to open attachments\]/.test(page)) throw new Error(`page: ${page}`);
+  const full = String(((await raftPlugin.invoke("server_info", { view: "full" }, inTurn(ctx()))) as any).text);
+  if (!/^Server-profile changes still use a server setting/m.test(full)) throw new Error(`overview: ${full}`);
 });
 
 /** The real runtime over a SQLite host, with raft mounted, its credential attached through the console's path. */

@@ -376,7 +376,9 @@ function raftFor(ctx: PluginContext, options: { state?: false } = {}): Raft {
  * to lose, since the batch it asked for is acknowledged only by the next pull.
  */
 function sdkFailure(out: RaftFailure, write = false): Error {
-  const e = new Error(toolTerms(`${out.error.message}${out.error.nextAction ? ` — ${out.error.nextAction}` : ""}`));
+  // The next action is the SDK's own sentence, so its command is rewritten wherever it stands; the message is left
+  // as it came (it may repeat what the caller asked for).
+  const e = new Error(`${out.error.message}${out.error.nextAction ? ` — ${commandsAsTools(out.error.nextAction)}` : ""}`);
   const unanswered = out.error.code === "TRANSPORT_ERROR" || out.error.code === "UNAVAILABLE" ||
     (out.error.status !== undefined && out.error.status >= 500);
   // `retryable` is still what the gateway reads as "may have landed" (it records such a call as unknown), so it
@@ -565,8 +567,8 @@ function argumentsFor(op: RaftOperationSpec, args: unknown): Record<string, unkn
  * (`messages_read({ target: "#ops", before: 41 })`), or in neutral words where no tool does it. A stopgap: once the
  * SDK's `invoke` can write its hints as tool calls itself, `toolTerms` and `CLI_COMMANDS` are deleted together.
  *
- * Applied to text the SDK wrote — an outcome's text, a failure's message — and never to a line that is a message
- * (`[target=…`), which is what a person wrote and is passed on as written.
+ * Applied only where the SDK wrote the hint itself: a failure's next action, and the lines of an outcome's text that
+ * are hint lines (`SDK_HINT_LINES`). What a person wrote is never rewritten (`toolTerms`).
  */
 export const CLI_COMMANDS: Readonly<Record<string, { op?: string; tool?: string; positional?: string; flags?: Record<string, string | [string, Json]>; say?: string }>> = {
   "message read": { op: "messages.read", flags: { target: "target", after: "after", before: "before", around: "around", limit: "limit" } },
@@ -603,11 +605,37 @@ const CLI_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|<[^>\n]*>|…|[^\s\x60'"<>()
 const CLI_COMMAND = new RegExp(String.raw`\braft ([a-z][a-z-]*)(?: ([a-z][a-z-]*))?((?: +(?:--[a-z][a-z-]*(?: ${CLI_VALUE})?|"[^"\n]*"|<[^>\n]*>|@[\w.-]+|#[\w:.~-]+|[A-Za-z0-9_][\w.-]*\d[\w.-]*|[a-z0-9]+(?:-[a-z0-9]+)+|[\w.-]+(?= --)))*)`, "g");
 const CLI_TOKEN = new RegExp(String.raw`--([a-z][a-z-]*)|${CLI_VALUE}`, "g");
 
-export function toolTerms(text: string): string {
-  return text.split("\n").map((line) => line.startsWith("[target=")
-    // A message line is a person's words, but its attachment suffix is the SDK's.
-    ? line.replace(/ — use raft attachment view to download\]/g, " — this mount has no tool to open attachments]")
-    : line.replace(CLI_COMMAND, (whole, noun: string, verb: string | undefined, rest: string) => {
+/** A CLI command as the SDK writes one: `raft` and one of the CLI's nouns. */
+export const CLI_HINT = /\braft (?:message|server|inbox|user|task|mention|channel|thread|manual|attachment|action|profile|agent|integration)\b/;
+
+/**
+ * The lines in which the SDK's formatters write a command hint, by how each line starts. Only these lines are
+ * rewritten: a line that quotes what a person wrote — a message line (`[target=…`) or its continuation (`  │ `), a
+ * task's title or description, a channel's or a user's description, a search preview, an attachment comment —
+ * starts some other way, and is passed on as written. Each shape is one formatter's (0.8.0's), named beside it.
+ */
+const SDK_HINT_LINES: readonly RegExp[] = [
+  /^(?:Older|Newer) exist: raft message read /, // a history page's next window
+  /^More: raft /, // a paged listing's next page (inbox, server sections, channel info, users info)
+  /^Next: open the first conversation above: raft message read /, // the inbox listing's next step
+  /^ {2}open: raft message read /, // an inbox listing row's command
+  /^- raft (?:server|channel|user) info\b/, // the server summary's narrow queries
+  /^Full dump: raft server info --full$/, // the server summary
+  /^#\d+ → raft message send --target /, // created or claimed tasks' thread
+  /^raft message send --target "[^"\n]*"$/, // a converted task's thread
+  /^ {2}(?:notify|add|recovery): raft mention (?:notify|add) /, // pending mention actions
+  /^ {2}recovery: unavailable because the pending action id is invalid; inspect `raft mention pending`/,
+  /^Do not rerun `raft message send`; the message is already queued/,
+  /^Still unread: \d+ conversations?\. Run `raft inbox check` to list them\.$/,
+  /^More messages are pending\. Run `raft message check` again\.$/,
+  /^Visible public channels may appear even when `joined=false`\./, // the server overview's fixed guidance
+  /^Server-profile changes still use raft server update /,
+  /^To start a new DM: raft message send --target /,
+];
+
+/** One CLI command, wherever it stands in `text`, as the tool call it stands for: for text the SDK wrote whole. */
+export function commandsAsTools(text: string): string {
+  return text.replace(CLI_COMMAND, (whole, noun: string, verb: string | undefined, rest: string) => {
     const entry = CLI_COMMANDS[`${noun} ${verb ?? ""}`.trim()];
     const op = entry?.op && !Object.hasOwn(EXCLUDED, entry.op) ? TOOL_NAME.get(entry.op) : undefined;
     const tool = entry?.tool ?? op;
@@ -632,7 +660,50 @@ export function toolTerms(text: string): string {
     }
     const shown = Object.entries(args).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(", ");
     return `${tool}(${shown ? `{ ${shown} }` : ""})${trailing}`;
-  })).join("\n");
+  });
+}
+
+/**
+ * The SDK's text in this mount's terms: its hint lines (`SDK_HINT_LINES`) rewritten, every other line as it came.
+ * `quoted` are strings a person wrote that the outcome carries (its data's strings that name a CLI command): they are
+ * set aside before the lines are judged, so one that happens to start a line the way a hint does is still not
+ * rewritten, and put back after. A search preview, which the SDK reshapes, is skipped by its `<preview>` block.
+ */
+export function toolTerms(text: string, quoted: readonly string[] = []): string {
+  const kept: string[] = [];
+  let masked = text;
+  for (const q of [...new Set(quoted)].sort((x, y) => y.length - x.length)) {
+    if (!q || !masked.includes(q)) continue;
+    masked = masked.split(q).join(`\uE000${kept.length}\uE001`);
+    kept.push(q);
+  }
+  // A search result's preview is a person's words reshaped by the SDK (handles and channels neutralised), so it is not
+  // found among the data's strings; its lines are skipped by the block the formatter puts them in.
+  let preview = false;
+  return masked.split("\n").map((line) => {
+    if (line === "<preview>" || line === "</preview>") { preview = line === "<preview>"; return line; }
+    return !preview && SDK_HINT_LINES.some((shape) => shape.test(line)) ? commandsAsTools(line) : line;
+  }).join("\n")
+    .replace(/\uE000(\d+)\uE001/g, (_, i: string) => kept[Number(i)]!);
+}
+
+/** The strings in an outcome's data that name a CLI command, and each of their lines: what `toolTerms` sets aside. */
+function quotedCommands(value: unknown, depth = 0, out: string[] = []): string[] {
+  if (depth > 8) return out;
+  if (typeof value === "string") {
+    if (CLI_HINT.test(value)) out.push(value, ...value.split(/\r\n|[\n\r]/).filter((l) => CLI_HINT.test(l)));
+  } else if (Array.isArray(value)) for (const v of value) quotedCommands(v, depth + 1, out);
+  else if (value && typeof value === "object") {
+    // The SDK's own command fields are hints, not quotes.
+    for (const [k, v] of Object.entries(value)) if (!/^(?:command|nextCommand|openCommand|text)$/.test(k)) quotedCommands(v, depth + 1, out);
+  }
+  return out;
+}
+
+/** A message the outcome carries, as `modelLine` reads it. */
+function isMessage(value: unknown): value is RaftMessage {
+  const m = value as RaftMessage | null;
+  return !!m && typeof m === "object" && typeof m.text === "string" && Array.isArray(m.attachments) && !!m.raw;
 }
 
 /** One operation, run through the SDK's `invoke` under the caller's origin and context. */
@@ -655,7 +726,13 @@ async function runOperation(
   // The SDK's text is the outcome as the model reads it (the CLI's output for the same operation, its command hints
   // put in this mount's terms); `data` is the Server's projection and stays out, so a new server field cannot
   // silently enter the model's context.
-  return { state: out.state, text: toolTerms(out.text.trim()) };
+  // A message's line is rebuilt by `modelLine` from the message itself (its attachment suffix is the SDK's, not the
+  // author's); everything else a person wrote is set aside by `toolTerms`.
+  const data = (out as { data?: unknown }).data as Record<string, unknown> | undefined;
+  const messages = [...(Array.isArray(data?.messages) ? data.messages : []), data?.message].filter(isMessage);
+  let text = out.text.trim();
+  for (const m of messages) text = text.replace(m.text, modelLine(m));
+  return { state: out.state, text: toolTerms(text, quotedCommands(data)) };
 }
 
 /**

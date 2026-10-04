@@ -330,7 +330,9 @@ manifest's `toolName`, and run through the SDK's `raft.invoke`. A history read
 `invoke`, before the runtime may park it, so it runs on a client whose state is
 not saved and only `receive_events` attests. The CLI commands the SDK's text
 names are rewritten as tool calls in one place (`toolTerms`), a stopgap until
-the SDK can write them that way. Its
+the SDK can write them that way; only the SDK's own hint lines are touched, and
+what a person wrote (a message, a description, a title, a preview) is passed
+on as written. Its
 `snapshotTools` asks Raft what the mount's credential may do
 (`identity.whoami` → `capabilities`) and lists only the operations whose every
 capability the credential holds; `mountTools` offers those names, with each
