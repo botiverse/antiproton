@@ -1408,6 +1408,13 @@ export class AgentRuntime {
     if (!MOUNT_ALIAS.test(to)) return { ok: false, error: `an alias is ${MOUNT_ALIAS}` };
     const mount = await this.store.getMountByAlias(tenantId, agentId, from);
     if (!mount) return { ok: false, error: `no mount named ${from}` };
+    // Not while the mount is being removed (`removeMount`). A removal keys its mark and its hook revokes by
+    // alias, and renaming frees the alias: the one way those alias-keyed parts could meet a different mount.
+    // The old mount would also live on under the new name with its cleanup already done, while its hooks,
+    // still filed under the old alias, would point at whatever mount takes that alias next. Asked here and
+    // again right before the store's rename, since the activity read between them awaits.
+    const removing = `${from} is being removed; it cannot be renamed`;
+    if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
     const safety = renameSafety(
       await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, from),
       Date.now(),
@@ -1422,6 +1429,7 @@ export class AgentRuntime {
     // something the deployment owns, under a name that has nothing to do with
     // this mount's alias.
     const own = isAgentRef(mount.secretRef);
+    if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
     const r = await this.store.renameMount(tenantId, agentId, from, to, own ? { newRef: agentRef(to) } : null);
     // The last snapshot error is keyed by the alias too, and is about the same mount under its new name.
     if (r.ok) this.#snapshotErrors()?.exec("UPDATE mount_snapshot_errors SET alias = ? WHERE alias = ?", to, from);

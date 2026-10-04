@@ -340,6 +340,41 @@ await check("a second removal of the same mount while one runs (a double click) 
   host.dispose();
 });
 
+await check("a rename while the mount is being removed is refused, and the removal completes", async () => {
+  const { rt, host, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  const { removal, open } = await heldRemoval(rt, "svc", directory);
+  const renamed = await rt.renameMount("t", "a", "svc", "svc2");
+  must(!renamed.ok && renamed.error === "svc is being removed; it cannot be renamed", `the rename: ${show(renamed)}`);
+  open();
+  const r = await removal;
+  must(show(r) === show({ ok: true }), `the removal: ${show(r)}`);
+  must(!(await rt.store.getMountByAlias("t", "a", "svc")) && !(await rt.store.getMountByAlias("t", "a", "svc2")), "a mount survived under either name");
+  host.dispose();
+});
+
+await check("a removal delayed past its refusals that meets a re-added mount stops before unmount: the new mount's plugin is never asked", async () => {
+  const { rt, host, real, directory, mount } = await runtime();
+  await mount("sweep", "svc");
+  // Held at its first index read, after it read the mount and passed the other refusals.
+  let release!: () => void;
+  const until = new Promise<void>((r) => { release = r; });
+  let reached!: () => void;
+  const atRead = new Promise<void>((r) => { reached = r; });
+  const slow = { ...directory, async list(t: string, a: string) { reached(); await until; return real.list(t, a); } };
+  const removal = rt.removeMount("t", "a", "svc", slow);
+  await atRead;
+  must(await rt.store.removeMount("t", "a", "svc", null), "control: the row was not there to delete");
+  must((await rt.addConsoleMount("t", "a", "sweep", "svc", {})).ok, "the re-add failed");
+  const fresh = await rt.store.getMountByAlias("t", "a", "svc");
+  release();
+  const r = await removal;
+  must(unmountCalls === 0, `unmount ran ${unmountCalls} time(s), for a mount this removal never judged`);
+  must(!r.ok && r.error === CHANGED, `the removal: ${show(r)}`);
+  must((await rt.store.getMountByAlias("t", "a", "svc"))?.installationId === fresh.installationId, "the new mount is gone");
+  host.dispose();
+});
+
 await check("a mount removed and added again while the removal's unmount runs: the removal stops, and the new mount and its hook are untouched", async () => {
   const { rt, host, real, directory, mount } = await runtime();
   await mount("sweep", "svc");
