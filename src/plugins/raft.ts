@@ -476,7 +476,6 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "inbox.drain": "pulls until the inbox is empty and hands it all over in one result, with no bound; receive_events pages the same inbox",
   "inbox.commit": "receive_events commits only the messages it showed, which its next pull acknowledges; a separate commit could acknowledge a batch before the model has read it",
   "mentions.add": "it changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare)",
-  "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare). Deprecated since 0.11.0; its notify half is mentions.notify, which is offered",
   "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
   "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
 };
@@ -701,7 +700,6 @@ const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   inbox_check: "receive_events()",
   // Since 0.11.0 the SDK's notify hint names mentions_notify, which is offered; its add hint names mentions_add.
   mentions_add: "adding them to the conversation, which this mount does not offer",
-  mentions_execute: "delivering the mention, which this mount does not offer",
   // Offered as built; reached only on a mount whose exclusion table leaves the download out.
   attachments_download_url: "downloading the attachment, which this mount does not offer",
   "raft.attachments.download": "downloading the attachment, which this mount does not offer",
