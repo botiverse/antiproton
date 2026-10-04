@@ -288,6 +288,32 @@ export interface PluginContext {
     contextId?: string;
   };
   /**
+   * The gateway's id for the operation this context serves: an opaque string, compared for equality only, which a
+   * plugin may hand to a service as an idempotency key so that the gateway running the same operation again does not
+   * do the thing twice.
+   *
+   * The SAME id reaches the plugin for every step of one operation: its `invoke`; the `invoke` an approval runs after
+   * a person decides (`applyApproval` runs the recorded request under the operation id the model was told it was held
+   * under); `interrupts.resume` and `interrupts.cancel` of a question it asked, however many questions follow; and
+   * `background.poll` / `background.cancel` of the work it started. A run_js program's call has an id derived from
+   * the run_js call and the call's position in the program (`${toolCallId}:${n}`), so a program re-run under the same
+   * model call reaches the same ids in the same order — and the gateway, finding each already begun, answers
+   * `already_attempted` without reaching the plugin again (`idempotencyKey`, src/runtime/gateway.ts).
+   *
+   * A DIFFERENT id for every new model tool call, including the model trying the same thing again: that is a new
+   * request, and deduplicating it would lose what the model asked for. A pi-durable recovery that re-runs a
+   * replay-safe tool re-runs the model's call, which the gateway records as a new operation, so it too gets a new id;
+   * a tool that is not replay-safe is not re-run after a crash on either engine. One operation may do more than one
+   * thing: a plugin that makes several separate writes in one operation (one per step, say) has to tell them apart
+   * itself, e.g. by suffixing this id.
+   *
+   * Set by the gateway alone: nothing a model or a program writes reaches it (run_js builds a call's options field by
+   * field, and the production host forwards no `operationId`). Absent where the context serves no operation:
+   * `promptContribution`, `Holding.activity`/`activities`/`usage`/`release`/`files`, `receive`, `snapshotTools`, a
+   * bench runner's poll of a job it holds only the handle of.
+   */
+  operationId?: string;
+  /**
    * The name this mount was given, which is the only name the model knows.
    *
    * The harness dispatches on `<alias>.<tool>`, and the alias is the operator's
