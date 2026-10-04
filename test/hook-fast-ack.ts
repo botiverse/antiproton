@@ -292,7 +292,11 @@ await check("a pass that dies before the post is retried after its wait and post
   void v.D.alarm();
   await sleep(100);
   v.evict();
-  await settle(v, 1);
+  // Past the row's retry wait, so a row left to be tried again would be.
+  try {
+    Date.now = () => realNow() + 31_000;
+    await settle(v, 2);
+  } finally { Date.now = realNow; }
   must(await timesAsked(v, "DIES-INSIDE") === 1, `asked ${await timesAsked(v, "DIES-INSIDE")} times`);
   const rows = v.raw.sql.exec("SELECT outcome, reason FROM inbound_events").toArray() as any[];
   must(rows.length === 1 && rows[0].outcome === "failed" && /may or may not have arrived/.test(rows[0].reason), `record: ${show(rows)}`);
