@@ -161,15 +161,39 @@ export const INBOUND_MAX_AGE_MS = 30 * 60_000;
  */
 export const INBOUND_QUEUE_MAX = 30;
 
+/**
+ * Columns added after a table was first made, in src/store/ap-store.ts's shape: each is added, nullable, where
+ * it is missing (an object whose table predates it). `installation_id` is the mount that accepted a push
+ * (`acceptInbound`); a row queued before it existed reads null.
+ */
+const ADDED_COLUMNS = [
+  { table: "inbound_pending", column: "installation_id", sql: "ALTER TABLE inbound_pending ADD COLUMN installation_id TEXT" },
+];
+
+/** Storage handles already brought up to `ADDED_COLUMNS`: this runs on every push, the probe once per handle. */
+const columnsAdded = new WeakSet<object>();
+
 export function ensureInboundTable(sql: SqlHost["sql"]) {
   sql.exec(TABLE);
   sql.exec(INDEX);
   sql.exec(PENDING);
+  if (columnsAdded.has(sql)) return;
+  for (const a of ADDED_COLUMNS) {
+    try { sql.exec(`SELECT ${a.column} FROM ${a.table} WHERE 0`); } catch { sql.exec(a.sql); }
+  }
+  columnsAdded.add(sql);
 }
 
 export interface PendingInbound {
   seq: number; hookId: string; alias: string; dedupeKey: string; message: string;
   receivedAt: number; state: "queued" | "posting"; attempts: number; nextAt: number; lastError: string | null;
+  /**
+   * The installation of the mount that accepted it (`MountRecord.installationId`). The pass that posts it
+   * checks the alias still names that installation, and gives it up as `ignored` when not: the mount was
+   * removed, perhaps added again, since the service was answered. Null on a row queued before the column
+   * existed, which is posted as it would have been.
+   */
+  installationId: string | null;
 }
 
 /**
@@ -177,9 +201,11 @@ export interface PendingInbound {
  * synchronous run as `seenBefore` and `underRate` — no await between — and a second push with the same key,
  * however close behind, finds the first already there.
  */
-export function acceptInbound(sql: SqlHost["sql"], row: { hookId: string; alias: string; dedupeKey: string | null; message: string; now: number }) {
-  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at) VALUES (?, ?, ?, ?, ?)",
-    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now);
+export function acceptInbound(sql: SqlHost["sql"], row: {
+  hookId: string; alias: string; dedupeKey: string | null; message: string; now: number; installationId?: string | null;
+}) {
+  sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at, installation_id) VALUES (?, ?, ?, ?, ?, ?)",
+    row.hookId, row.alias, row.dedupeKey ?? `${LOCAL_KEY}${crypto.randomUUID()}`, row.message, row.now, row.installationId ?? null);
 }
 
 /** The prefix of a key made here for a push its plugin named none for; such a key is never a duplicate of anything. */
@@ -188,7 +214,7 @@ export const LOCAL_KEY = "local:";
 /** The oldest push not yet settled; arrival order is delivery order. */
 export function nextPendingInbound(sql: SqlHost["sql"]): PendingInbound | null {
   return readPending(sql.exec(
-    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error FROM inbound_pending ORDER BY seq LIMIT 1",
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id FROM inbound_pending ORDER BY seq LIMIT 1",
   ).toArray()[0]);
 }
 
@@ -197,6 +223,7 @@ function readPending(r: any): PendingInbound | null {
     seq: Number(r.seq), hookId: String(r.hook_id), alias: String(r.alias), dedupeKey: String(r.dedupe_key),
     message: String(r.message), receivedAt: Number(r.received_at), state: r.state === "posting" ? "posting" : "queued",
     attempts: Number(r.attempts), nextAt: Number(r.next_at), lastError: r.last_error === null ? null : String(r.last_error),
+    installationId: r.installation_id === null || r.installation_id === undefined ? null : String(r.installation_id),
   } : null;
 }
 
@@ -220,7 +247,7 @@ export function expiredPendingInbound(sql: SqlHost["sql"], now: number): number[
 /** One queued row by its seq, or null when it is gone. */
 export function pendingInboundRow(sql: SqlHost["sql"], seq: number): PendingInbound | null {
   return readPending(sql.exec(
-    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error FROM inbound_pending WHERE seq = ?", seq,
+    "SELECT seq, hook_id, alias, dedupe_key, message, received_at, state, attempts, next_at, last_error, installation_id FROM inbound_pending WHERE seq = ?", seq,
   ).toArray()[0]);
 }
 
@@ -253,7 +280,7 @@ export function requeueInbound(sql: SqlHost["sql"], seq: number, error: string) 
  * gone, in one transaction, so the key is held by one or the other throughout.
  */
 export function settleInbound(sql: SqlHost["sql"], transact: <T>(fn: () => T) => T, row: PendingInbound & {
-  tenantId: string; agentId: string; outcome: "delivered" | "failed"; reason?: string | null;
+  tenantId: string; agentId: string; outcome: "delivered" | "failed" | "ignored"; reason?: string | null;
 }) {
   transact(() => {
     sql.exec("DELETE FROM inbound_pending WHERE seq = ?", row.seq);

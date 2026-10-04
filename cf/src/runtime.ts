@@ -967,13 +967,16 @@ export class AgentRuntime {
     if ("skipped" in answer) return done("ignored", answer.skipped);
     const result = answer.result;
     if (!result.deliver) return done(result.rejected ? "rejected" : result.malformed ? "malformed" : "ignored", result.reason);
+    // Which installation accepted it, read before the synchronous run below (which must not await): the pass
+    // that posts it gives it up if the alias names another by then (`#deliverInbound`).
+    const installationId = (await this.store.getMountByAlias(tenantId, agentId, alias))?.installationId ?? null;
     const key = result.dedupeKey ?? null;
     if (key && seenBefore(sql, hookId, key, now)) return done("duplicate", null, key);
     if (!underRate(sql, hookId, now)) return done("rate_limited", `more than ${INBOUND_PER_MINUTE} a minute`, key);
     if (queueFull(sql, hookId)) return done("rate_limited", `${INBOUND_QUEUE_MAX} pushes from this hook are already waiting to be posted`, key);
     // The claim on the key: in the same synchronous run as the two checks above, with no await between,
     // so a second push with this key that is already past its own await finds this row (`acceptInbound`).
-    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now });
+    acceptInbound(sql, { hookId, alias, dedupeKey: key, message: inboundMessage(alias, String(result.text)), now, installationId });
     // The answer the service has always had for a push the agent will be given.
     return { outcome: "delivered" };
   }
@@ -1007,7 +1010,7 @@ export class AgentRuntime {
     ensureInboundTable(sql);
     const storage = this.#deps.ctx.storage;
     const transact = <T>(fn: () => T): T => storage.transactionSync ? storage.transactionSync(fn) : fn();
-    const settle = (row: PendingInbound, outcome: "delivered" | "failed", reason?: string) =>
+    const settle = (row: PendingInbound, outcome: "delivered" | "failed" | "ignored", reason?: string) =>
       settleInbound(sql, transact, { ...row, tenantId, agentId, outcome, reason });
     const out: InboundPass = { posted: 0, failed: 0, left: 0, retryInMs: null, waitedMs: null, error: null };
     // Too old to be worth reading, wherever they stand: a long outage must not end in notices hours late.
@@ -1028,6 +1031,18 @@ export class AgentRuntime {
         continue;
       }
       const now = Date.now();
+      // Accepted by a mount that is gone — removed, or removed and added again under the alias — since the
+      // service was answered: not the agent's to read, and never worth a retry. Null can only be a row queued
+      // before the column existed: `acceptInbound` is the one INSERT and always stamps it (`receiveHook`), so a
+      // null is never read as "mount removed" — it is posted as it would have been, and pushes accepted across
+      // the deploy are not dropped.
+      if (head.installationId !== null) {
+        const mount = await this.store.getMountByAlias(tenantId, agentId, head.alias);
+        if (!mount || mount.installationId !== head.installationId) {
+          settle(head, "ignored", "the mount that received it was removed");
+          continue;
+        }
+      }
       // The head is the oldest row, so its expiry is the queue's first.
       if (head.nextAt > now) { out.retryInMs = Math.min(head.nextAt, head.receivedAt + INBOUND_MAX_AGE_MS) - now; break; }
       // Only a pass that is about to post prepares for it (the caller's provisioning), and only once.

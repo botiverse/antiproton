@@ -415,6 +415,95 @@ await check("building unmount's context throws: recorded as the reason, and the 
   host.dispose();
 });
 
+// ---- pushes accepted before the removal, posted after it -----------------------------
+
+/** A push the mount accepts (202), queued for the agent; the pass that posts it has not run yet. */
+async function acceptedPush(rt: any, alias: string, h: { hookId: string; secret: string }) {
+  const r = await rt.receiveHook("t", "a", alias, h.hookId, { headers: { "x-signed-with": h.secret, "x-deliver": "1" }, body: new Uint8Array([1]) });
+  must(r.outcome === "delivered", `control: the push was not accepted: ${show(r)}`);
+}
+const GONE = "the mount that received it was removed";
+
+await check("a push accepted before the removal is not handed to the agent after it: settled as ignored, with the reason", async () => {
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  await acceptedPush(rt, "svc", h);
+  must((await rt.removeMount("t", "a", "svc", directory)).ok, "remove");
+  const pass = await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0, `the agent was given: ${show(posted)}`);
+  const rec = (await rt.inboundLog(5)).find((e: any) => e.hookId === h.hookId);
+  must(rec?.outcome === "ignored" && rec?.reason === GONE, `record: ${show(rec)}`);
+  must(pass.left === 0, `still queued: ${show(pass)}`);
+  host.dispose();
+});
+
+await check("the same, with the alias added again before the pass: a different installation, still ignored", async () => {
+  const { rt, host, directory, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  await acceptedPush(rt, "svc", h);
+  must((await rt.removeMount("t", "a", "svc", directory)).ok, "remove");
+  await mount("sweep", "svc");
+  await rt.deliverPendingInbound("t", "a");
+  must(posted.length === 0, `the agent was given: ${show(posted)}`);
+  const rec = (await rt.inboundLog(5)).find((e: any) => e.hookId === h.hookId);
+  must(rec?.outcome === "ignored" && rec?.reason === GONE, `record: ${show(rec)}`);
+  // Control: a push the new mount accepts is posted.
+  const h2 = await hook("svc", "h2");
+  await acceptedPush(rt, "svc", h2);
+  await rt.deliverPendingInbound("t", "a");
+  must((posted.length as number) === 1, `the new mount's own push: ${show(posted)}`);
+  host.dispose();
+});
+
+await check("a freshly accepted push carries the current mount's installation, read from the row itself", async () => {
+  const { nextPendingInbound } = await import("../src/runtime/inbound.ts");
+  const { rt, host, mount, hook } = await runtime();
+  await mount("sweep", "svc");
+  const h = await hook("svc", "h");
+  await acceptedPush(rt, "svc", h);
+  const current = (await rt.store.getMountByAlias("t", "a", "svc")).installationId;
+  must(typeof current === "string" && current.startsWith("console:svc:"), `control: ${current}`);
+  const row = nextPendingInbound(host.sql);
+  must(row?.hookId === h.hookId && row.installationId === current, `the queued row stamps ${show(row?.installationId)}, the mount is ${current}`);
+  host.dispose();
+});
+
+await check("an old inbound_pending table gains the column, nullable, and its rows read null", async () => {
+  const { ensureInboundTable, nextPendingInbound } = await import("../src/runtime/inbound.ts");
+  // The table in the shape #752 created, with a row in it, then the current code's ensure.
+  const old = sqliteHost();
+  old.sql.exec(`CREATE TABLE inbound_pending (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, hook_id TEXT NOT NULL, alias TEXT NOT NULL, dedupe_key TEXT NOT NULL,
+    message TEXT NOT NULL, received_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+    UNIQUE(hook_id, dedupe_key))`);
+  old.sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at) VALUES ('h', 'svc', 'k', 'm', 1)");
+  ensureInboundTable(old.sql);
+  const row = nextPendingInbound(old.sql);
+  must(row?.installationId === null && row.message === "m", `the old row: ${show(row)}`);
+  old.dispose();
+});
+
+await check("a hand-inserted row with no installation (queued before the deploy) is posted normally, even with its mount gone", async () => {
+  const { ensureInboundTable } = await import("../src/runtime/inbound.ts");
+  const { rt, host } = await runtime();
+  const posted: string[] = [];
+  rt.postMessage = async (_t: string, _a: string, text: string) => { posted.push(text); };
+  ensureInboundTable(host.sql);
+  host.sql.exec("INSERT INTO inbound_pending(hook_id, alias, dedupe_key, message, received_at, installation_id) VALUES ('old-hook', 'gone', 'k1', 'from before the deploy', ?, NULL)", Date.now());
+  await rt.deliverPendingInbound("t", "a");
+  must(show(posted) === show(["from before the deploy"]), `posted: ${show(posted)}`);
+  const rec = (await rt.inboundLog(5)).find((e: any) => e.hookId === "old-hook");
+  must(rec?.outcome === "delivered", `record: ${show(rec)}`);
+  host.dispose();
+});
+
 await check("a plugin without unmount, with a live hook: removed, not refused with \"revoke first\", and the hook is revoked", async () => {
   const { rt, host, directory, mount, hook, alive } = await runtime();
   await mount("plain", "p");
