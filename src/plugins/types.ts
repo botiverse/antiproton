@@ -52,8 +52,9 @@ export interface ToolSchema {
    * would have acknowledged and attested messages it never saw — and skipped
    * the question a send asks when something new arrived, which is the model's
    * to answer (docs/ax-design.md §3, "Code cannot skip it"). Raft's
-   * `read_messages` is the other: Raft marks what a history read returns as
-   * read.
+   * `read_messages` is not: Raft marks a history read as read, but the read can
+   * ask it not to (`consume: false`), so the plugin does that for every call
+   * but the model's own in its turn (`caller.contextId`) instead.
    *
    * Not a policy: an operator cannot allow it from code, because what it
    * protects is what the model saw, not what the operator permits.
