@@ -181,6 +181,28 @@ await check("what it refuses is the charset, and a legal rename still goes throu
   must(await rt.store.getMountByAlias("t", "a", "web-3"), "the legal rename answered ok without moving the mount");
 });
 
+await check("the mount Raft provisioned cannot be renamed; a raft mount elsewhere, or another plugin under its alias, can", async () => {
+  const raftAt = async (alias: string, plugin: "raft" | "http") => {
+    const rt = await realRuntime();
+    if (plugin === "raft") await rt.store.setPluginChoice("t", "a", "raft", "enable");
+    const added = await rt.addMount("t", "a", plugin === "raft"
+      ? { alias, plugin: "raft", config: { serverUrl: "https://api.raft.example" } }
+      : { alias, plugin: "http", config: { account: "open web" } });
+    must(added.ok, `control: ${plugin} under ${alias} was not added: ${JSON.stringify(added)}`);
+    return rt;
+  };
+  const provisioned = await raftAt("raft", "raft");
+  const refused = await provisioned.renameMount("t", "a", "raft", "inbox");
+  must(!refused.ok && refused.error === "raft is the mount Raft provisioned; it cannot be renamed", `the provisioned mount: ${JSON.stringify(refused)}`);
+  must(await provisioned.store.getMountByAlias("t", "a", "raft") && !(await provisioned.store.getMountByAlias("t", "a", "inbox")), "the refused rename moved the mount");
+  for (const [alias, plugin] of [["raft", "http"], ["inbox", "raft"]] as const) {
+    const rt = await raftAt(alias, plugin);
+    const r = await rt.renameMount("t", "a", alias, "renamed");
+    must(r.ok, `${plugin} under ${alias} could not be renamed: ${JSON.stringify(r)}`);
+    must(await rt.store.getMountByAlias("t", "a", "renamed"), `${plugin} under ${alias}: answered ok without moving`);
+  }
+});
+
 console.log(`\n  Adding a mount by hand\n  ${"─".repeat(56)}`);
 for (const r of results) {
   console.log(r.ok ? `  \x1b[32m✓\x1b[0m ${r.name}` : `  \x1b[31m✗\x1b[0m ${r.name}\n      \x1b[31m${r.error}\x1b[0m`);

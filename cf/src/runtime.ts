@@ -178,6 +178,7 @@ import { artifactsPlugin, PARK_BYTES, READ_WHOLE_MAX } from "../../src/plugins/a
 import { createRaftPlugin } from "../../src/plugins/raft.ts";
 import { mcpPlugin } from "../../src/plugins/mcp.ts";
 import { createReminderPlugin } from "../../src/plugins/reminder.ts";
+import { PROVISION_MOUNT_ALIAS } from "./provision/steps.ts";
 import { toAgentRef } from "../../src/store/refs.ts";
 import type { Plugin, PluginChoice } from "../../src/plugins/types.ts";
 import type { ToolInterrupt, ToolResult } from "../../src/core/tools.ts";
@@ -1440,6 +1441,14 @@ export class AgentRuntime {
     // again right before the store's rename, since the activity read between them awaits.
     const removing = `${from} is being removed; it cannot be renamed`;
     if (this.#gateway.isRemoving(tenantId, agentId, from)) return { ok: false, error: removing };
+    // Not the mount Raft provisioned: its alias is the address Raft uses to attach and remove credentials, build tool
+    // addresses and keep push state (cf/src/provision/steps.ts; uiAttachCredential and uiRemoveCredential in
+    // cf/src/index.ts), and the reminder plugin reads it to tell an agent on Raft (src/plugins/reminder.ts). Alias AND
+    // plugin, since the alias alone may name anything an operator put there. Identity by installationId, so a rename
+    // would not matter, is #756.
+    if (from === PROVISION_MOUNT_ALIAS && mount.plugin === "raft") {
+      return { ok: false, error: `${from} is the mount Raft provisioned; it cannot be renamed` };
+    }
     const safety = renameSafety(
       await this.#gateway.mountActivity({ tenantId, agentId, taskId: LEGACY_TASK }, from),
       Date.now(),

@@ -411,6 +411,24 @@ export interface ReminderDeployment {
   clientCredential: string | null;
 }
 
+/**
+ * Where provisioning puts an agent's Raft mount (`PROVISION_MOUNT_ALIAS`, cf/src/provision/steps.ts). Named here
+ * rather than imported: a plugin does not import the Worker.
+ */
+const RAFT_ALIAS = "raft";
+export const ON_RAFT = "This agent is on Raft: its reminders go through Raft's own channel, and this reminder mount would add a second " +
+  "way to wake it. Ask whoever runs this deployment to remove the reminder mount.";
+
+/**
+ * Whether this agent is hosted on Raft, which wakes it through its own channel: a second wake-up path through a
+ * reminder hook would deliver every reminder twice over two routes. Asked as the mount under provisioning's alias AND
+ * its plugin, since an operator may give the alias to anything. The known limit: the signal is provisioning's alias,
+ * so a Raft mount renamed to another alias is not seen.
+ */
+async function onRaft(ctx: PluginContext): Promise<boolean> {
+  return (await ctx.sibling(RAFT_ALIAS))?.plugin === "raft";
+}
+
 export const NO_CREDENTIAL = "this deployment has no reminder-app credential configured; nothing was sent";
 export const NO_ORIGIN = "this deployment has no reminder-app origin configured; nothing was sent";
 
@@ -721,6 +739,8 @@ export function createReminderPlugin(deps: { service?: ReminderService; now?: ()
         const note = typeof a.note === "string" ? a.note.trim() : "";
         if (!note) throw new Error("note is required: write what the reminder should tell you");
         if (note.length > NOTE_MAX) throw new Error(`note has ${note.length} characters; the limit is ${NOTE_MAX}`);
+        // Before anything is registered or sent. Only create: list and delete stay, so what was set can be cleaned up.
+        if (await onRaft(ctx)) throw new Error(ON_RAFT);
         const { due, schedule } = dueTime(a, now());
         const conn = connection(ctx, deployment);
         // One key for the whole call, retry included: a create refused with unknown_hook does not use up its key.
