@@ -619,6 +619,27 @@ export function isExclusive(p: Pick<Plugin, "holds">): boolean {
 }
 
 /**
+ * Whether one call reads or writes, for choosing a mount policy's half. The
+ * declared `sideEffects` is the ceiling: a declared read is a read, and the
+ * plugin's {@link Plugin.classify} is not asked; a declared write is lowered to
+ * a read only when `classify` answers exactly "read", and stays a write for
+ * anything else — `undefined`, another value, a throw, or a `classify` that
+ * throws on being read. One function, so the rule is stated once.
+ */
+export function callSideEffects(
+  p: Pick<Plugin, "classify">, tool: string, args: Json, declared: "read" | "write",
+): "read" | "write" {
+  if (declared === "read") return "read";
+  try {
+    const classify = p.classify;
+    if (!classify) return "write";
+    return classify.call(p, tool, args) === "read" ? "read" : "write";
+  } catch {
+    return "write";
+  }
+}
+
+/**
  * The tools one mount offers: the plugin's answer for that mount when it gives
  * one, its static list otherwise.
  *
@@ -1763,6 +1784,30 @@ export interface Plugin {
    * other return is the result itself.
    */
   invoke(tool: string, args: Json, ctx: PluginContext): Promise<Json | Backgrounded | Interrupt>;
+  /**
+   * Whether THIS call reads or writes, for a tool whose answer depends on its
+   * arguments. Read through {@link callSideEffects}, never directly.
+   *
+   * `ToolSchema.sideEffects` is one answer per tool, and a mount's policy picks
+   * its read or write half from it. That breaks for one tool that runs many
+   * commands — a generic `raft` tool forwarding argv reads with one call and
+   * sends with the next: declared "write", every look is held where writes are.
+   * This lets a call be a read for the policy, from its arguments.
+   *
+   * The declared `sideEffects` is the ceiling: `classify` can only lower a
+   * declared "write" to "read", never raise a declared "read", and is not even
+   * asked for one. Replay and the duplicate-attempt guard keep reading the
+   * declaration, so a declared read that a call raised to a write would still
+   * be rerun on its own after a crash, under a new operation id, and land
+   * twice. So a tool that uses this declares "write".
+   *
+   * Fails closed: only exactly "read" lowers; `undefined`, a throw, or any
+   * other value leaves the call a write, so a command the plugin did not
+   * recognise is held where writes are held. Synchronous and local: it must
+   * not reach a server. Absent: the declared `sideEffects`, as before. It
+   * selects the policy half and nothing else.
+   */
+  classify?(tool: string, args: Json): "read" | "write" | undefined;
 
 
 

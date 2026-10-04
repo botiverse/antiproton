@@ -119,6 +119,18 @@ write is repeated only when its `idempotency` is `native` (`replayPolicy` in
 `src/runtime/pi-tools.ts`). Declare `native` only when calling the tool twice
 really leaves the same result as calling it once.
 
+**A tool that both reads and writes classifies each call.** One tool that runs
+many commands (a generic tool forwarding a command line, say) cannot pick one
+`sideEffects`: declared "write", every read it makes is held where writes are.
+Declare it "write" and implement `classify(tool, args)` on the plugin: a call
+it answers exactly "read" is a read for the mount's policy (`callSideEffects`
+in `src/plugins/types.ts`). The declaration is the ceiling — `classify` can
+only lower a declared write, and is not asked for a declared read — because
+replay and the duplicate-attempt guard keep reading the declaration: a
+declared read raised to a write would be rerun after a crash under a new
+operation id and land twice. It fails closed: `undefined`, a throw, or any
+other value leaves the call a write.
+
 **Errors are for the model.** Throw an `Error` whose message says what went
 wrong and what to do instead; the gateway returns it as a `tool_error`. When a
 request may have reached the service before failing (a timeout, a 5xx), set

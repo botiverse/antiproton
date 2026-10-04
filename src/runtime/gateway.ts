@@ -9,7 +9,7 @@ import { type ActivityEvent, type SandboxForm, holdingOf, backgroundOf, isExclus
 import { Backgrounded, Interrupt, interruptsOf } from "../plugins/types.ts";
 import { answerSpecOf } from "./run-js-resume.ts";
 import type { PluginErrorFields } from "../plugins/types.ts";
-import { pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
+import { callSideEffects, pluginEnabled, LEASE_KEY, toolsOf } from "../plugins/types.ts";
 import { admitTools } from "./mount-tools.ts";
 import { isReleased, leaseRow, releasedFacts } from "../trace/seams.ts";
 import { openPluginDatabase } from "./plugin-db.ts";
@@ -773,7 +773,9 @@ export class ToolGateway {
     });
 
     const facts = () => (opts.callId === undefined ? {} : { callId: opts.callId });
-    const verdict = opts.approved ? "allow" : confirm ? "approval" : policyFor(r.mount.policy, r.tool, schema.sideEffects);
+    // A declared write may be a read for the policy, per call, when the plugin says so (`Plugin.classify`).
+    const verdict = opts.approved ? "allow" : confirm ? "approval"
+      : policyFor(r.mount.policy, r.tool, callSideEffects(plugin, r.tool, args, schema.sideEffects));
     if (verdict === "deny") {
       // The operation was recorded above, before the policy was asked, so a
       // refusal has to end it or the row stays "pending" for ever — an attempt
