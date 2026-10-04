@@ -360,7 +360,7 @@ reach is not caught there — a call carries no record of its mount's list — a
 calling it is refused by the gateway. `attachments_download_url` fetches the
 file Raft points at into the agent's object storage (at most
 `ATTACHMENT_MAX_BYTES`) and returns its `artifact://` reference, never the
-URL; it stays in `EXCLUDED` until Raft serves the route. A tool's description and every parameter description in its
+URL; it is offered (Raft serves the route), falling back to `attachments.download` when the Server cannot mint a URL. A tool's description and every parameter description in its
 schema name operations by their tool names, never by the manifest's dotted
 names, SDK field paths or CLI flags (`inMountTerms`). Its
 `snapshotTools` asks Raft what the mount's credential may do

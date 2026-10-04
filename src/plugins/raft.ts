@@ -426,9 +426,10 @@ function sdkFailure(
 /**
  * One message as the model reads it: the SDK's canonical line, with the two things it says that may not be true on
  * this mount put right. The SDK ends a message that has attachments with "use attachments_download_url(…) to
- * download"; while this mount does not offer that tool (`EXCLUDED`), a model would go looking for it, so here the
- * attachments are named and the missing tool is said. And a message whose content Raft left out because it was too
- * large renders as a sender and nothing after the colon, which reads as an empty message; here it says the content
+ * download"; on a mount built with an exclusion table that leaves that tool out (not the default `EXCLUDED`, which
+ * offers it), a model would go looking for it, so there the attachments are named and the missing tool is said.
+ * And a message whose content Raft left out because it was too large renders as a sender and nothing after the
+ * colon, which reads as an empty message; here it says the content
  * was left out. Both are fixed by rebuilding the suffix from the message's own fields and replaced where the SDK put
  * it; the tests assert whole lines, so a change to the SDK's wording shows as a failing test rather than a doubled
  * suffix. A person's words in the line are never touched: only the SDK's suffix is replaced.
@@ -478,7 +479,6 @@ export const EXCLUDED: Readonly<Record<string, string>> = {
   "mentions.execute": "its add action changes a conversation's membership; membership changes go through an action card a person confirms (actions_prepare). Deprecated since 0.11.0; its notify half is mentions.notify, which is offered",
   "profile.update": "changes the account's public identity (display name, description, avatar); identity changes go through an action card a person confirms",
   "tasks.delete": "destructive, and new: agents could not delete tasks before; offered when someone asks for it",
-  "attachments.downloadUrl": "Raft production does not serve this route yet (Raft #8881); enable when it does",
 };
 
 /**
@@ -702,6 +702,7 @@ const UNOFFERED_SAY: Readonly<Record<string, string>> = {
   // Since 0.11.0 the SDK's notify hint names mentions_notify, which is offered; its add hint names mentions_add.
   mentions_add: "adding them to the conversation, which this mount does not offer",
   mentions_execute: "delivering the mention, which this mount does not offer",
+  // Offered as built; reached only on a mount whose exclusion table leaves the download out.
   attachments_download_url: "downloading the attachment, which this mount does not offer",
   "raft.attachments.download": "downloading the attachment, which this mount does not offer",
 };
@@ -800,7 +801,7 @@ export function offeredTerms(text: string, unoffered: ReadonlySet<string>, quote
  * `offeredTerms`'s placeholder opener, and the escape character itself, written so neither appears in the result. Every
  * character written is a private-use one, never a word character: a tool name is matched only where no word character
  * stands before it (`unofferedPattern`), so an escape that wrote a letter could complete one — a person's
- * `\uE000ttachments_download_url(…)` read as `attachments_download_url(…)` and rewritten.
+ * `\uE000ttachments_download_url(…)` read as `attachments_download_url(…)` and rewritten (on a mount not offering it).
  */
 export function escapeMarks(text: string): string {
   return text.replace(/[\uE000\uE002]/g, (c) => (c === "\uE000" ? "\uE002\uE003" : "\uE002\uE004"));
